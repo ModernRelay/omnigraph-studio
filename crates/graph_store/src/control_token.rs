@@ -27,14 +27,18 @@ pub struct PlaneHandle {
     pub(crate) route: String,
     pub(crate) http: Arc<dyn HttpClient>,
     pub(crate) held: Arc<Mutex<Option<OAuthSource>>>,
+    /// Its sign-in is in the organization a profile pins; Omnigraph Cloud's default's is in the
+    /// one its token names.
+    pub(crate) pinned: bool,
 }
 
 impl PlaneHandle {
-    pub(crate) fn new(route: String, http: Arc<dyn HttpClient>) -> Self {
+    pub(crate) fn new(route: String, http: Arc<dyn HttpClient>, pinned: bool) -> Self {
         Self {
             route,
             http,
             held: Arc::default(),
+            pinned,
         }
     }
 
@@ -59,7 +63,9 @@ pub(crate) struct ControlTokenSource {
     /// The profile and organization of a cluster no CLI target names: its control plane's.
     profile: Option<String>,
     organization: Option<String>,
-    plane: PlaneHandle,
+    /// The control planes that may give its token, in order: the profile's, then Omnigraph
+    /// Cloud's default, whose sign-in gives one only when it is in `organization`.
+    planes: Vec<PlaneHandle>,
     cluster_id: String,
     /// The cluster's data endpoint: a token for any other is dropped.
     endpoint: String,
@@ -70,31 +76,32 @@ pub(crate) struct ControlTokenSource {
 }
 
 impl ControlTokenSource {
-    /// The source of the CLI target whose export is `cli`, while its control plane holds no
-    /// sign-in.
+    /// The source of a CLI target whose export is `cli`, while none of `planes` holds a sign-in
+    /// in the target's organization.
     pub(crate) fn new(
         cli: Arc<dyn TokenSource>,
-        plane: PlaneHandle,
+        planes: Vec<PlaneHandle>,
         cluster_id: String,
         endpoint: String,
     ) -> Self {
-        Self::with(Some(cli), None, None, plane, cluster_id, endpoint)
+        let organization = cli.organization();
+        Self::with(Some(cli), None, organization, planes, cluster_id, endpoint)
     }
 
-    /// The source of a cluster no CLI target names, in `profile`'s `organization`: only the
-    /// control plane gives its token.
+    /// The source of a cluster no CLI target names, in `organization`, listed by `plane` (a
+    /// profile's, or Omnigraph Cloud's default): only the control plane gives its token.
     pub(crate) fn of_plane(
-        profile: String,
-        organization: String,
+        profile: Option<String>,
+        organization: Option<String>,
         plane: PlaneHandle,
         cluster_id: String,
         endpoint: String,
     ) -> Self {
         Self::with(
             None,
-            Some(profile),
-            Some(organization),
-            plane,
+            profile,
+            organization,
+            vec![plane],
             cluster_id,
             endpoint,
         )
@@ -104,7 +111,7 @@ impl ControlTokenSource {
         cli: Option<Arc<dyn TokenSource>>,
         profile: Option<String>,
         organization: Option<String>,
-        plane: PlaneHandle,
+        planes: Vec<PlaneHandle>,
         cluster_id: String,
         endpoint: String,
     ) -> Self {
@@ -112,7 +119,7 @@ impl ControlTokenSource {
             cli,
             profile,
             organization,
-            plane,
+            planes,
             cluster_id,
             endpoint,
             asked: Mutex::new(None),
@@ -123,16 +130,18 @@ impl ControlTokenSource {
 
 impl TokenSource for ControlTokenSource {
     fn token(&self, hurry: Arc<AtomicBool>) -> BoxFuture<'static, Result<Token, NoToken>> {
-        let Some(source) = self.plane.held() else {
-            return match &self.cli {
+        let held: Vec<(PlaneHandle, OAuthSource)> = self
+            .planes
+            .iter()
+            .filter_map(|plane| plane.held().map(|source| (plane.clone(), source)))
+            .collect();
+        let cli = self.cli.clone();
+        if held.is_empty() {
+            return match cli {
                 Some(cli) => cli.token(hurry),
-                None => futures::future::ready(Err(NoToken {
-                    why: "Sign in to the organization's control plane to reach this cluster".into(),
-                    passing: false,
-                }))
-                .boxed(),
+                None => futures::future::ready(Err(no_sign_in())).boxed(),
             };
-        };
+        }
         let now = SystemTime::now();
         {
             let mut asked = self.asked.lock().unwrap_or_else(PoisonError::into_inner);
@@ -151,23 +160,47 @@ impl TokenSource for ControlTokenSource {
             }
             *asked = Some(now);
         }
-        let plane = self.plane.clone();
+        let expected = self.organization.clone();
         let cluster_id = self.cluster_id.clone();
         let endpoint = self.endpoint.clone();
         async move {
-            let mut answer = issue(&plane, &source, &cluster_id, &endpoint).await;
-            // One silent refresh of the control plane's own token (spec 021, Errors).
-            if matches!(answer, Err(ControlError::Unauthenticated(_))) {
-                source.note_refused();
-                answer = issue(&plane, &source, &cluster_id, &endpoint).await;
+            for (plane, source) in held {
+                // Omnigraph Cloud's default gives the token only in the cluster's organization,
+                // which its token names once it is issued or refreshed.
+                if !plane.pinned
+                    && let Some(expected) = &expected
+                {
+                    if source.organization().is_none() {
+                        source.token(Arc::new(AtomicBool::new(false))).await.ok();
+                    }
+                    if source.organization().as_ref() != Some(expected) {
+                        continue;
+                    }
+                }
+                let mut answer = issue(&plane, &source, &cluster_id, &endpoint).await;
+                // One silent refresh of the control plane's own token (spec 021, Errors).
+                if matches!(answer, Err(ControlError::Unauthenticated(_))) {
+                    source.note_refused();
+                    answer = issue(&plane, &source, &cluster_id, &endpoint).await;
+                }
+                let answer = answer.map_err(|error| NoToken {
+                    why: format!("The control plane gave no data token: {error}"),
+                    passing: error.is_passing(),
+                })?;
+                return leased(answer.data);
             }
-            let answer = answer.map_err(|error| NoToken {
-                why: format!("The control plane gave no data token: {error}"),
-                passing: error.is_passing(),
-            })?;
-            leased(answer.data)
+            match cli {
+                Some(cli) => cli.token(hurry).await,
+                None => Err(no_sign_in()),
+            }
         }
         .boxed()
+    }
+
+    /// Held back as a managed login is, whether or not a profile names it: a cluster whose 401
+    /// offers its own sign-in is signed in to instead (spec 016).
+    fn waits_for_server_sign_in(&self) -> bool {
+        true
     }
 
     fn login_profile(&self) -> Option<String> {
@@ -195,6 +228,13 @@ impl TokenSource for ControlTokenSource {
         if let Some(cli) = &self.cli {
             cli.note_refused();
         }
+    }
+}
+
+fn no_sign_in() -> NoToken {
+    NoToken {
+        why: "Sign in to the organization's control plane to reach this cluster".into(),
+        passing: false,
     }
 }
 
@@ -300,10 +340,11 @@ mod tests {
         let plane = PlaneHandle::new(
             "https://control.test".into(),
             control(asked.clone(), "https://acme.test"),
+            true,
         );
         let source = ControlTokenSource::new(
             Arc::new(Cli(exported.clone())),
-            plane,
+            vec![plane],
             "01C".into(),
             "https://acme.test".into(),
         );

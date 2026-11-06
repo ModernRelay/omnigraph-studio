@@ -22,7 +22,8 @@ pub(crate) fn places(
     cx: &App,
 ) -> Vec<Place> {
     let mut places = Vec::new();
-    for plane in planes {
+    for (plane, _) in shown(planes, cx) {
+        let plane = &plane;
         let id = plane.entity_id();
         places.push(Place::Plane(id));
         if let Some(Listing::Listed(listed)) = plane.read(cx).listing() {
@@ -34,6 +35,43 @@ pub(crate) fn places(
         }
     }
     places
+}
+
+/// The planes shown: each, but a profile's that Omnigraph Cloud's default covers, with its
+/// profiles named under the default instead (spec 021, One plane for one pair).
+pub(crate) fn shown(
+    planes: &[Entity<ControlPlane>],
+    cx: &App,
+) -> Vec<(Entity<ControlPlane>, Vec<String>)> {
+    let cloud = planes.iter().find(|plane| {
+        let plane = plane.read(cx);
+        plane.is_default() && plane.holds_sign_in()
+    });
+    let covers = |plane: &Entity<ControlPlane>| {
+        let Some(cloud) = cloud else { return false };
+        let (cloud, plane) = (cloud.read(cx), plane.read(cx));
+        !plane.is_default()
+            && cloud.route.trim_end_matches('/') == plane.route.trim_end_matches('/')
+            && cloud.organization().is_some()
+            && cloud.organization() == plane.organization()
+    };
+    let covered: Vec<String> = planes
+        .iter()
+        .filter(|plane| covers(plane))
+        .flat_map(|plane| plane.read(cx).profiles.clone())
+        .collect();
+    planes
+        .iter()
+        .filter(|plane| !covers(plane))
+        .map(|plane| {
+            let profiles = if plane.read(cx).is_default() {
+                covered.clone()
+            } else {
+                plane.read(cx).profiles.clone()
+            };
+            (plane.clone(), profiles)
+        })
+        .collect()
 }
 
 /// ↵ on a control plane's line: signs in, cancels a sign-in under way, or reads the clusters
@@ -78,12 +116,15 @@ pub(crate) struct ClusterRow {
 
 /// The CLI command that keeps `cluster` as a target of `profile` (constitution VI).
 pub(crate) fn add_command(cluster: &ClusterView, profile: Option<&str>) -> String {
-    format!(
-        "omnigraph target add {} --cluster {} --profile {}",
-        cluster.name,
-        cluster.cluster_id,
-        profile.unwrap_or("<profile>")
-    )
+    let command = format!(
+        "omnigraph target add {} --cluster {}",
+        cluster.name, cluster.cluster_id
+    );
+    match profile {
+        Some(profile) => format!("{command} --profile {profile}"),
+        // The CLI's default profile.
+        None => command,
+    }
 }
 
 /// The row for `cluster`, given the CLI's managed targets.
@@ -174,10 +215,12 @@ pub(crate) fn render(
     if planes.is_empty() {
         return None;
     }
-    let blocks: Vec<AnyElement> = planes
-        .iter()
+    let blocks: Vec<AnyElement> = shown(planes, cx)
+        .into_iter()
         .enumerate()
-        .map(|(index, plane)| render_plane(index, plane, managed, cursor, cx))
+        .map(|(index, (plane, profiles))| {
+            render_plane(index, &plane, &profiles, managed, cursor, cx)
+        })
         .collect();
     Some(
         v_flex()
@@ -197,33 +240,51 @@ pub(crate) fn render(
 fn render_plane(
     index: usize,
     plane: &Entity<ControlPlane>,
+    profiles: &[String],
     managed: &[ManagedTarget],
     cursor: Option<&Place>,
     cx: &mut Context<OpenGraphModal>,
 ) -> AnyElement {
     let at = cursor == Some(&Place::Plane(plane.entity_id()));
-    let (route, profiles, organization, state) = {
+    let (route, cloud, organization, state) = {
         let p = plane.read(cx);
         (
             p.route.clone(),
-            p.profiles.clone(),
-            p.organization.clone(),
+            p.is_default(),
+            p.organization(),
             p.sign_in_state().clone(),
         )
     };
     let host = oauth_host(&route);
-    let profiles = match profiles.as_slice() {
-        [one] => format!("CLI profile {one}"),
-        many => format!("CLI profiles {}", many.join(", ")),
+    let named = match profiles {
+        [] => None,
+        [one] => Some(format!("CLI profile {one}")),
+        many => Some(format!("CLI profiles {}", many.join(", "))),
     };
+    // Omnigraph Cloud says its organization once a sign-in names one; a profile's names it.
+    let title = if cloud {
+        "Omnigraph Cloud".to_owned()
+    } else {
+        organization.clone().unwrap_or_default()
+    };
+    let meta = [
+        Some(host.clone()),
+        organization.clone().filter(|_| cloud),
+        named,
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" · ");
+    let organization = organization.unwrap_or_else(|| "your organization".to_owned());
     let heading = MenuRow::new(SharedString::from(format!("plane-{index}")))
         .height(size::FEED_ROW)
         .toggle_state(at)
         .child(
             v_flex()
                 .min_w_0()
-                .child(ds::text::body(organization.clone()))
-                .child(ds::text::meta(format!("{host} · {profiles}")).truncate()),
+                .child(ds::text::body(title))
+                .child(ds::text::meta(meta).truncate()),
         );
     let mut block = v_flex().gap(px(space::XXS)).child(heading);
     let plane = plane.clone();
@@ -260,6 +321,7 @@ fn render_plane(
             block = block.child(render_listing(
                 index,
                 &plane,
+                profiles,
                 managed,
                 &organization,
                 cursor,
@@ -306,10 +368,10 @@ fn render_plane(
             );
         }
         SignIn::Offered { why, .. } => {
-            block = block.child(sign_in_line(index, &plane, &host, why, cx));
+            block = block.child(sign_in_line(index, &plane, &host, why, cloud, cx));
         }
         SignIn::NotOffered => {
-            block = block.child(sign_in_line(index, &plane, &host, None, cx));
+            block = block.child(sign_in_line(index, &plane, &host, None, cloud, cx));
         }
     }
     block.into_any_element()
@@ -321,6 +383,7 @@ fn sign_in_line(
     plane: &Entity<ControlPlane>,
     host: &str,
     why: Option<String>,
+    cloud: bool,
     cx: &mut Context<OpenGraphModal>,
 ) -> AnyElement {
     let plane = plane.clone();
@@ -332,9 +395,11 @@ fn sign_in_line(
             h_flex()
                 .debug_selector(|| "control-plane-sign-in".into())
                 .gap(px(space::XS))
-                .child(fill(ds::text::meta(
-                    "Sign in to list this organization's clusters",
-                )))
+                .child(fill(ds::text::meta(if cloud {
+                    "Sign in to list your organization's clusters"
+                } else {
+                    "Sign in to list this organization's clusters"
+                })))
                 .child(
                     ds::button(SharedString::from(format!("plane-{index}-sign-in")), "Sign in")
                         .style(ButtonStyle::Subtle)
@@ -352,19 +417,17 @@ fn sign_in_line(
 fn render_listing(
     index: usize,
     plane: &Entity<ControlPlane>,
+    profiles: &[String],
     managed: &[ManagedTarget],
     organization: &str,
     cursor: Option<&Place>,
     cx: &mut Context<OpenGraphModal>,
 ) -> AnyElement {
     let plane_id = plane.entity_id();
-    let (profiles, host, listing) = {
+    let profiles = profiles.to_vec();
+    let (host, listing) = {
         let p = plane.read(cx);
-        (
-            p.profiles.clone(),
-            oauth_host(&p.route),
-            p.listing().cloned(),
-        )
+        (oauth_host(&p.route), p.listing().cloned())
     };
     match listing.as_ref() {
         None | Some(Listing::Reading) => div()
@@ -374,9 +437,14 @@ fn render_listing(
         Some(Listing::Failed(error)) => {
             let said = failure(error, organization);
             match error {
-                ControlError::Unauthenticated(_) => {
-                    sign_in_line(index, plane, &host, Some(said), cx)
-                }
+                ControlError::Unauthenticated(_) => sign_in_line(
+                    index,
+                    plane,
+                    &host,
+                    Some(said),
+                    plane.read(cx).is_default(),
+                    cx,
+                ),
                 _ => div()
                     .px(px(space::MD))
                     .child(ds::text::error_note(said))
@@ -544,6 +612,11 @@ mod tests {
         assert_eq!(
             add_command(&ready, Some("work")),
             "omnigraph target add acme --cluster 01C --profile work"
+        );
+        // Listed by Omnigraph Cloud with no profile: the CLI's default profile.
+        assert_eq!(
+            add_command(&ready, None),
+            "omnigraph target add acme --cluster 01C"
         );
         assert_eq!(
             cluster_row(&cluster("provisioning", None), &[]),

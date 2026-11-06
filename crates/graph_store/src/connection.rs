@@ -521,7 +521,9 @@ impl Connection {
     /// ([`Self::standby`]). Notes the organization a sign-in must be in.
     fn hold_back(&mut self, source: Option<Arc<dyn TokenSource>>) -> Option<Arc<dyn TokenSource>> {
         let profile = source.as_ref().and_then(|source| source.login_profile());
-        let login = profile.is_some();
+        let login = source
+            .as_ref()
+            .is_some_and(|source| source.waits_for_server_sign_in());
         // A managed login of the same profile whose organization the CLI would not say this time
         // (a read it missed) keeps the one said before, so a sign-in held for it stays; one the
         // CLI says names none, or another profile's, takes what it names.

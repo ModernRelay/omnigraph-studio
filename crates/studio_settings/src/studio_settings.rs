@@ -374,6 +374,9 @@ impl Default for ModelSettings {
     }
 }
 
+/// Omnigraph Cloud's control plane, which Studio offers by default (spec 021).
+pub const OMNIGRAPH_CLOUD: &str = "https://platform.omnigraph.dev";
+
 /// The whole settings document. Each field's doc comment is its row's description in the
 /// settings tab, and its `schemars` attributes give the title, section, range and control
 /// ([`fields`]).
@@ -422,6 +425,10 @@ pub struct StudioSettings {
     /// the usual install folders, and runs the first that fits.
     #[schemars(title = "Omnigraph CLI", extend("x-section" = "Connection"))]
     pub omnigraph_cli: Option<String>,
+    /// The Omnigraph Cloud control plane Studio offers to sign in to and lists the clusters of,
+    /// besides those your CLI profiles name. Empty turns it off.
+    #[schemars(title = "Omnigraph Cloud", extend("x-section" = "Connection"))]
+    pub omnigraph_cloud: String,
     #[schemars(extend("x-section" = "Agent"))]
     pub agent: AgentSettings,
     #[schemars(extend("x-section" = "Models"))]
@@ -487,6 +494,7 @@ impl Default for StudioSettings {
             studio: StudioOptions::default(),
             servers: BTreeMap::new(),
             omnigraph_cli: None,
+            omnigraph_cloud: OMNIGRAPH_CLOUD.to_owned(),
             agent: AgentSettings::default(),
             models: ModelSettings::default(),
             graphs: BTreeMap::new(),

@@ -4,7 +4,8 @@ Status: in progress; the control plane accepts Studio's sign-in (CP1, live 2026-
 Built: `control_client`; a profile's control-plane sign-in and its cluster list in the Open
 dialog, on the keyboard's path; data tokens from the control plane; a cluster no CLI target
 names opened for this run; a cluster's state and latest deployment in the connection chip's
-card. Not yet: managed clusters on Windows, where the CLI's listing lands none · 2026-11-05
+card; Omnigraph Cloud as a default control plane, which reaches clusters without the CLI and
+so on Windows · 2026-11-05
 
 ## Problem
 
@@ -190,21 +191,25 @@ only to the endpoint it names." `docs/architecture.md`'s layer table gains the c
 | Data token | 15 s, 64 KiB, TTL 900 s, renewed 60 s before expiry |
 | Token after a cluster's 401 | Once a minute at most |
 
-### Planned: Omnigraph Cloud by default
+### Omnigraph Cloud by default
 
-Today a control plane exists for Studio only when a CLI profile names it. Someone who uses
-Omnigraph Cloud without the CLI, or on Windows, where the CLI's listing lands no managed target,
-sees none. The next slice gives Studio one control plane of its own:
+Without it, a control plane exists for Studio only when a CLI profile names it, so someone
+who uses Omnigraph Cloud without the CLI, or on Windows, where the CLI's listing lands no
+managed target, sees none. Studio has one control plane of its own:
 
-- **Where it is.** A setting, `control_plane.default`, defaults to `https://platform.omnigraph.dev`
+- **Where it is.** A setting, `omnigraph_cloud`, defaults to `https://platform.omnigraph.dev`
   and is shown as "Omnigraph Cloud". Empty turns it off. It is one address Studio ships with,
   not a list Studio keeps: the clusters still come from the control plane (I), and each CLI
   profile's route still makes its own control plane as today.
 - **No organization before sign-in.** The default has no profile, so it names no organization.
   It signs in as any control plane does (its metadata, Studio's client, `resource=<route>`),
   but with no organization pinned. The token's `org_id` names it, and that organization is
-  held from then on. To use another one, sign in again; the sign-in service asks which
-  organization when the account is in several (open question 5).
+  held from then on. To use another one, sign in again.
+- **The organization is asked for each time.** Every control-plane sign-in sends
+  `prompt=login`. AuthKit asks which organization as the person signs in, and skips that while
+  the browser is signed in already, so without it a second profile's sign-in got the first's
+  organization and was refused. `prompt=consent` does not bring the question back. A cluster's
+  own sign-in (spec 016) sends no `prompt`.
 - **Its keychain item** is `omnigraph-control:<route>`, with no organization: one cloud sign-in
   at a time, which names its organization when the token is refreshed at launch.
 - **One plane for one pair.** When a CLI profile names the same route and the organization the
@@ -230,7 +235,7 @@ sees none. The next slice gives Studio one control plane of its own:
 | Studio signs in to the control plane as its own client | Sign in with the `client_id` the control plane publishes, as the CLI does | The control plane could not tell Studio from the CLI, the same objection that made Studio its own OAuth client for clusters (spec 016; RFC #1017, A2) |
 | Call the API from Studio | Run `omnigraph cluster list --json` and its siblings | The CLI holds its operator lock for each command, needs a login it can renew without a terminal (it answered `refresh_outcome_unknown` here), and exports no token on Windows |
 | The control plane found through `credentials status`'s `route` | Parse `~/.omnigraph/config.yaml` | Spec 003: Studio reads no operator file. The profile already names its route and organization, without a secret |
-| Omnigraph Cloud as a default control plane, besides the profiles' (planned) | Only the profiles' routes, as at first | Without the CLI, or on Windows, nobody could reach Omnigraph Cloud from Studio. One shipped address is a setting, not a server list, and the token names the organization |
+| Omnigraph Cloud as a default control plane, besides the profiles' | Only the profiles' routes, as at first | Without the CLI, or on Windows, nobody could reach Omnigraph Cloud from Studio. One shipped address is a setting, not a server list, and the token names the organization |
 | A cluster without a CLI target opens for this run only | Register it as a target from Studio | Studio keeps no server list (spec 003); registering is the CLI's, and Studio shows its command |
 | Data tokens of 900 s | The 3600 s default, or 86400 s like a cached `cluster token` | Removing admission does not retract a data token; the shorter it lives, the sooner a removal holds |
 | Read only, plus the data token, in the first slice | Deployments, members and cluster lifecycle | Each is a write with its own outcome rules, and the CLI already does them; reading first shows whether people want them here |
@@ -292,8 +297,9 @@ sees none. The next slice gives Studio one control plane of its own:
 3. How a person in several organizations signs in to the profile's (spec 016, question 4).
 4. Whether the list should show clusters the person may see but not open (no admission): the
    control plane lists them; `POST /tokens` then answers 403.
-5. For the default control plane: whether the sign-in service asks an account in several
-   organizations which one when no organization is pinned, and which it picks if it does not.
+5. Settled (2026-11-05): an account in several organizations is asked which one only as it
+   signs in. A signed-in browser gets the organization it is in, so Studio sends
+   `prompt=login`.
 
 ## Validation log
 
@@ -314,6 +320,8 @@ sees none. The next slice gives Studio one control plane of its own:
 | 2026-11-05 | `control_client`'s types and routes match the live document | `/openapi.json` pinned as `crates/control_client/openapi/control-plane-0.1.0.json`; `cargo test -p control_client` | Still `0.1.0`, now 37 routes (39 on 2026-11-03; the four Studio sends unchanged); every declared field and enum value in the document, every required one declared |
 | 2026-11-05 | Studio signs in to a profile's control plane and lists its clusters (debug build, live) | Open dialog, profile `managed-og`, sign-in through the browser, the keychain write allowed | Six clusters: five purged (now counted, not listed), `modernrelay-og-cluster` "CLI target · Ready". Its chip's card: "Ready", "Latest deployment dispatched · observed just now" |
 | 2026-11-05 | Nothing names an organization or account in words (CP3) | `/openapi.json`: `Organization`, `AuthSession`, `Directory`; the token's claims | `Organization` is `{organization_id}`; the session has `account_id`, `principal_id`, `subject`; the token has `sub` and `org_id` only |
+| 2026-11-05 | A second profile's sign-in gets the organization the browser is signed in to | Live sign-in for profile `omnigraph…` (`org_01M67VZM…`) after one for `managed-og` (`org_01M1V5…`) | AuthKit asked nothing; the token named `org_01M1V5…`, which Studio refused |
+| 2026-11-05 | `prompt=login` makes AuthKit ask the organization; `consent` does not, and `organization_id` is dropped | `curl` of `/oauth2/authorize` with each (AuthKit keeps `prompt`, not `organization_id`); live sign-ins as Studio's client with `prompt=consent`, then `prompt=login` | `consent`: not asked. `login`: asked, and the token named the organization chosen (`org_01M67SX1…`); `GET /v1/clusters` 200 |
 
 ## Corrections
 

@@ -1273,11 +1273,13 @@ fn tooltip_for(
     platform: Platform,
 ) -> String {
     if *source == ServerSource::ControlPlane {
+        let profile = profile
+            .map(|profile| format!(" --profile {profile}"))
+            .unwrap_or_default();
         return format!(
             "Studio asks the organization's control plane for this cluster's token, keeps it in \
              memory and asks again before it ends. Opened for this run: to keep it, add it as a \
-             CLI target with `omnigraph target add {name} --cluster <id> --profile {}`.",
-            profile.unwrap_or("<profile>")
+             CLI target with `omnigraph target add {name} --cluster <id>{profile}`."
         );
     }
     if let Some(profile) = profile {

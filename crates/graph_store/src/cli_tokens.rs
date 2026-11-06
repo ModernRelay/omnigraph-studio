@@ -203,6 +203,12 @@ pub trait TokenSource: Send + Sync + 'static {
         None
     }
 
+    /// Whether the connection holds this back until the server's 401 says it offers no
+    /// sign-in of its own (spec 016): a managed target's login, or a control plane's data token.
+    fn waits_for_server_sign_in(&self) -> bool {
+        self.login_profile().is_some()
+    }
+
     /// The organization a sign-in to the server must be in, when this is a managed target's
     /// login: the one its profile names.
     fn organization(&self) -> Option<String> {

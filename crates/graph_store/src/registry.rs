@@ -522,9 +522,45 @@ impl ConnectionRegistry {
     /// CLI's files sees: it lists the targets with that CLI and asks every token again.
     fn follow_cli_setting(&mut self, cx: &mut Context<Self>) {
         self.take_cli_setting(cx);
+        self.take_cloud_setting(cx);
         self._cli_setting = Some(cx.observe_global::<studio_settings::StudioSettings>(
-            |this, cx| this.take_cli_setting(cx),
+            |this, cx| {
+                this.take_cli_setting(cx);
+                this.take_cloud_setting(cx);
+            },
         ));
+    }
+
+    /// Keeps Omnigraph Cloud's control plane at the address the settings name
+    /// (`omnigraph_cloud`), after the profiles': none when it is empty, and a new one when it
+    /// changes, the old one retired with its sign-in left for a launch (spec 021).
+    fn take_cloud_setting(&mut self, cx: &mut Context<Self>) {
+        let route = cx
+            .try_global::<studio_settings::StudioSettings>()
+            .map(|settings| settings.omnigraph_cloud.trim().to_owned())
+            .unwrap_or_default();
+        self.set_cloud(route, cx);
+    }
+
+    /// Makes `route` Omnigraph Cloud's control plane, or none when it is empty.
+    pub(crate) fn set_cloud(&mut self, route: String, cx: &mut Context<Self>) {
+        let held = self
+            .control_planes
+            .iter()
+            .position(|plane| plane.read(cx).is_default());
+        if let Some(at) = held {
+            if self.control_planes[at].read(cx).route == route {
+                return;
+            }
+            let old = self.control_planes.remove(at);
+            old.update(cx, |plane, cx| plane.retire(cx));
+        }
+        if !route.is_empty() {
+            let context = self.sign_in.clone();
+            self.control_planes
+                .push(cx.new(|cx| ControlPlane::cloud(route, context, cx)));
+        }
+        cx.notify();
     }
 
     fn take_cli_setting(&mut self, cx: &mut Context<Self>) {
@@ -776,18 +812,6 @@ impl ConnectionRegistry {
         made
     }
 
-    /// Brings the CLI's servers in line with the targets the CLI lists, and says whether
-    /// anything changed. An address is one server (spec 003), so a CLI server is its address: a
-    /// target renamed on the same endpoint renames the connection in place, which the windows
-    /// open on it keep, each graph's saved state staying under the name it was opened with until
-    /// it is opened again ([`crate::GraphSession::overrides_key`]); its sign-in, the old name's,
-    /// is dropped ([`Connection::rename`]). A new address is a new connection, with the graphs
-    /// Studio remembered for its target's name, or for the name at the address it left; an
-    /// address no longer listed leaves the list (a window open on it keeps its connection); a
-    /// target whose entry or token file changed asks the CLI for its token again; a target's
-    /// graph is added. Targets that could not be listed change no server. What could not be
-    /// listed or used, a server that cannot be added included, is a change only when it differs
-    /// from what was kept.
     /// The connection to `cluster`, a cluster of `plane`'s organization no CLI target names,
     /// opened for this run (spec 021, Listing clusters): one already reaching its data endpoint
     /// is it. Its data token is the control plane's, and its own sign-in is still preferred where
@@ -812,8 +836,8 @@ impl ConnectionRegistry {
             let plane = plane.read(cx);
             (
                 plane.handle()?,
-                plane.profiles.first()?.clone(),
-                plane.organization.clone(),
+                plane.profiles.first().cloned(),
+                plane.organization(),
             )
         };
         let source: Arc<dyn TokenSource> = Arc::new(ControlTokenSource::of_plane(
@@ -867,7 +891,34 @@ impl ConnectionRegistry {
             .control_planes
             .iter()
             .find(|plane| plane.read(cx).profiles.contains(&target.profile))?;
+        // Signed in only through Omnigraph Cloud's default, in the profile's organization: that
+        // sign-in reads the cluster's state.
+        let plane = match plane.read(cx).holds_sign_in() {
+            true => plane,
+            false => self.cloud_covering(plane, cx).unwrap_or(plane),
+        };
         Some((plane.clone(), target.cluster_id.clone()))
+    }
+
+    /// Omnigraph Cloud's default when it holds a sign-in in `plane`'s route and organization: the
+    /// one control plane the two are (spec 021, One plane for one pair).
+    pub fn cloud_covering(
+        &self,
+        plane: &Entity<ControlPlane>,
+        cx: &App,
+    ) -> Option<&Entity<ControlPlane>> {
+        let (route, organization) = {
+            let plane = plane.read(cx);
+            (plane.route.clone(), plane.organization())
+        };
+        self.control_planes.iter().find(|cloud| {
+            let cloud = cloud.read(cx);
+            cloud.is_default()
+                && cloud.holds_sign_in()
+                && cloud.route.trim_end_matches('/') == route.trim_end_matches('/')
+                && cloud.organization().is_some()
+                && cloud.organization() == organization
+        })
     }
 
     /// The token source of the CLI server `server`: the CLI's export, which a managed target
@@ -885,24 +936,28 @@ impl ConnectionRegistry {
         else {
             return Some(source);
         };
-        let handle = self.control_planes.iter().find_map(|plane| {
-            let plane = plane.read(cx);
-            plane
-                .profiles
-                .contains(profile)
-                .then(|| plane.handle())
-                .flatten()
-        });
-        let Some(handle) = handle else {
+        // The profile's control plane, then Omnigraph Cloud's default, whose sign-in gives the
+        // token only in the target's organization.
+        let handles: Vec<_> = self
+            .control_planes
+            .iter()
+            .filter_map(|plane| {
+                let plane = plane.read(cx);
+                (plane.profiles.contains(profile) || plane.is_default())
+                    .then(|| plane.handle())
+                    .flatten()
+            })
+            .collect();
+        if handles.is_empty() {
             return Some(source);
-        };
+        }
         let endpoint = target
             .endpoint
             .clone()
             .unwrap_or_else(|| server.url.clone());
         Some(Arc::new(ControlTokenSource::new(
             source,
-            handle,
+            handles,
             target.cluster_id.clone(),
             endpoint,
         )))
@@ -933,9 +988,10 @@ impl ConnectionRegistry {
         let mut gone = Vec::new();
         self.control_planes.retain(|plane| {
             let plane_read = plane.read(cx);
-            let stays = named
-                .iter()
-                .any(|(r, o, _)| *r == plane_read.route && *o == plane_read.organization);
+            let stays = plane_read.is_default()
+                || named
+                    .iter()
+                    .any(|(r, o, _)| *r == plane_read.route && *o == plane_read.organization);
             if !stays {
                 gone.push(plane.clone());
             }
@@ -948,7 +1004,7 @@ impl ConnectionRegistry {
         for (route, organization, names) in named {
             let held = self.control_planes.iter().find(|plane| {
                 let plane = plane.read(cx);
-                plane.route == route && plane.organization == organization
+                !plane.is_default() && plane.route == route && plane.organization == organization
             });
             match held {
                 Some(plane) => {
@@ -962,7 +1018,14 @@ impl ConnectionRegistry {
                 None => {
                     changed = true;
                     let context = self.sign_in.clone();
-                    self.control_planes.push(
+                    // Before Omnigraph Cloud's default, which stays last.
+                    let at = self
+                        .control_planes
+                        .iter()
+                        .position(|plane| plane.read(cx).is_default())
+                        .unwrap_or(self.control_planes.len());
+                    self.control_planes.insert(
+                        at,
                         cx.new(|cx| ControlPlane::new(route, organization, names, context, cx)),
                     );
                 }
@@ -971,6 +1034,18 @@ impl ConnectionRegistry {
         changed
     }
 
+    /// Brings the CLI's servers in line with the targets the CLI lists, and says whether
+    /// anything changed. An address is one server (spec 003), so a CLI server is its address: a
+    /// target renamed on the same endpoint renames the connection in place, which the windows
+    /// open on it keep, each graph's saved state staying under the name it was opened with until
+    /// it is opened again ([`crate::GraphSession::overrides_key`]); its sign-in, the old name's,
+    /// is dropped ([`Connection::rename`]). A new address is a new connection, with the graphs
+    /// Studio remembered for its target's name, or for the name at the address it left; an
+    /// address no longer listed leaves the list (a window open on it keeps its connection); a
+    /// target whose entry or token file changed asks the CLI for its token again; a target's
+    /// graph is added. Targets that could not be listed change no server. What could not be
+    /// listed or used, a server that cannot be added included, is a change only when it differs
+    /// from what was kept.
     fn apply_cli_targets(
         &mut self,
         targets: CliTargets,
@@ -1511,6 +1586,57 @@ mod tests {
         let mut other = cluster.clone();
         other.data_endpoint = Some("https://other.graphs.test".into());
         assert!(open(&unsigned, &other, cx).is_none());
+    }
+
+    /// Omnigraph Cloud's plane follows the setting: one at its address, after the profiles',
+    /// kept across listings, replaced when the address changes and gone when it is empty.
+    #[gpui::test]
+    async fn omnigraph_cloud_follows_its_setting(cx: &mut TestAppContext) {
+        let (registry, _) = cx.update(ConnectionRegistry::init_for_tests);
+        let planes = |cx: &mut TestAppContext| {
+            registry.read_with(cx, |registry, cx| {
+                registry
+                    .control_planes
+                    .iter()
+                    .map(|plane| {
+                        let plane = plane.read(cx);
+                        (plane.route.clone(), plane.is_default())
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        registry.update(cx, |r, cx| r.set_cloud("https://cloud.test".into(), cx));
+        let first = registry.read_with(cx, |r, _| r.control_planes[0].entity_id());
+        apply(
+            &registry,
+            CliTargets {
+                servers: Some(Vec::new()),
+                profiles: vec![crate::cli_config::ProfileOwner {
+                    profile: "work".into(),
+                    route: Some("https://control.test".into()),
+                    organization: Some("org_1".into()),
+                }],
+                ..CliTargets::default()
+            },
+            cx,
+        );
+        assert_eq!(
+            planes(cx),
+            [
+                ("https://control.test".to_owned(), false),
+                ("https://cloud.test".to_owned(), true)
+            ]
+        );
+        registry.update(cx, |r, cx| r.set_cloud("https://cloud.test".into(), cx));
+        assert_eq!(
+            registry.read_with(cx, |r, _| r.control_planes[1].entity_id()),
+            first,
+            "the same address keeps its plane"
+        );
+        registry.update(cx, |r, cx| r.set_cloud("https://other.test".into(), cx));
+        assert_eq!(planes(cx)[1], ("https://other.test".to_owned(), true));
+        registry.update(cx, |r, cx| r.set_cloud(String::new(), cx));
+        assert_eq!(planes(cx), [("https://control.test".to_owned(), false)]);
     }
 
     /// Profiles on one control plane and organization share it; one no longer named is retired.

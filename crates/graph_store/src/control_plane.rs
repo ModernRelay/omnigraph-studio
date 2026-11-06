@@ -32,7 +32,11 @@ pub enum Listing {
 pub struct ControlPlane {
     /// Its origin, `owner.route` as the CLI says it.
     pub route: String,
+    /// The organization a CLI profile pins it to; empty for Omnigraph Cloud's default, whose
+    /// sign-in's token names one ([`Self::organization`]).
     pub organization: String,
+    /// Omnigraph Cloud, offered whether or not a CLI profile names it (`omnigraph_cloud`).
+    is_default: bool,
     /// The CLI profiles that name it.
     pub profiles: Vec<String>,
     context: Option<SignInContext>,
@@ -64,6 +68,7 @@ impl ControlPlane {
             },
             route,
             organization,
+            is_default: false,
             profiles,
             context,
             service: None,
@@ -76,7 +81,7 @@ impl ControlPlane {
         this.handle = this
             .context
             .as_ref()
-            .map(|context| PlaneHandle::new(this.route.clone(), context.elsewhere.clone()));
+            .map(|context| PlaneHandle::new(this.route.clone(), context.elsewhere.clone(), true));
         this.take_up_kept(cx);
         this
     }
@@ -97,9 +102,41 @@ impl ControlPlane {
         self.oauth = source;
     }
 
-    /// The keychain item of its sign-in (spec 021, Signing in).
+    /// Omnigraph Cloud's control plane at `route`, which no profile pins to an organization: its
+    /// sign-in's token names one (spec 021, Omnigraph Cloud by default).
+    pub fn cloud(route: String, context: Option<SignInContext>, cx: &mut Context<Self>) -> Self {
+        let mut this = Self::new(route, String::new(), Vec::new(), None, cx);
+        this.is_default = true;
+        this.context = context;
+        this.handle = this
+            .context
+            .as_ref()
+            .map(|context| PlaneHandle::new(this.route.clone(), context.elsewhere.clone(), false));
+        this.take_up_kept(cx);
+        this
+    }
+
+    /// Whether it is Omnigraph Cloud's default.
+    pub fn is_default(&self) -> bool {
+        self.is_default
+    }
+
+    /// Its organization: the one a profile pins, else the one its sign-in's token names.
+    pub fn organization(&self) -> Option<String> {
+        if !self.organization.is_empty() {
+            return Some(self.organization.clone());
+        }
+        self.oauth.as_ref().and_then(OAuthSource::organization)
+    }
+
+    /// The keychain item of its sign-in (spec 021, Signing in): one per route and organization,
+    /// and one for Omnigraph Cloud's default.
     pub fn key(&self) -> String {
-        key(&self.route, &self.organization)
+        if self.is_default {
+            cloud_key(&self.route)
+        } else {
+            key(&self.route, &self.organization)
+        }
     }
 
     pub fn sign_in_state(&self) -> &SignIn {
@@ -144,7 +181,7 @@ impl ControlPlane {
             let Ok(refresh) = String::from_utf8(secret) else {
                 return;
             };
-            let found = discover(&context, &route, &organization).await;
+            let found = discover(&context, &route, pinned(&organization)).await;
             this.update(cx, |this, cx| {
                 this.signing_in = None;
                 match found {
@@ -194,7 +231,7 @@ impl ControlPlane {
             let route = self.route.clone();
             let organization = self.organization.clone();
             self.signing_in = Some(cx.spawn(async move |this, cx| {
-                let found = discover(&context, &route, &organization).await;
+                let found = discover(&context, &route, pinned(&organization)).await;
                 this.update(cx, |this, cx| {
                     this.signing_in = None;
                     match found {
@@ -572,6 +609,16 @@ pub fn key(route: &str, organization: &str) -> String {
     format!("omnigraph-control:{route}#{organization}")
 }
 
+/// The organization a sign-in must be in: a profile's, or none for Omnigraph Cloud's default.
+fn pinned(organization: &str) -> Option<&str> {
+    (!organization.is_empty()).then_some(organization)
+}
+
+/// The keychain item of Omnigraph Cloud's default sign-in at `route`.
+pub fn cloud_key(route: &str) -> String {
+    format!("omnigraph-control:{route}")
+}
+
 /// The clusters, read with the sign-in's access token.
 async fn list(
     http: &Arc<dyn HttpClient>,
@@ -602,7 +649,7 @@ async fn list(
 async fn discover(
     context: &SignInContext,
     route: &str,
-    organization: &str,
+    organization: Option<&str>,
 ) -> Result<Service, Refusal> {
     let at = url::Url::parse(route).map_err(|error| Refusal::lasting(error.to_string()))?;
     let metadata = format!(
@@ -614,7 +661,7 @@ async fn discover(
         clients,
         metadata,
         context.identities.clone(),
-        Some(organization.to_owned()),
+        organization.map(str::to_owned),
     )
     .await?;
     if service.resource.resource.trim_end_matches('/') != route.trim_end_matches('/') {
@@ -625,6 +672,10 @@ async fn discover(
         )));
     }
     service.organization_of = "this profile";
+    // AuthKit asks which organization as the person signs in, and skips that while the
+    // browser is signed in already: the organization an earlier sign-in chose would be given
+    // again. `consent` alone does not ask; `login` does (spec 021, validation log).
+    service.prompt = Some("login");
     Ok(service)
 }
 
@@ -896,6 +947,10 @@ mod tests {
         let query: HashMap<String, String> = opened.query_pairs().into_owned().collect();
         assert_eq!(query["client_id"], CLIENT);
         assert_eq!(query["resource"], ROUTE);
+        assert_eq!(
+            query["prompt"], "login",
+            "the organization is asked for each time"
+        );
         assert_eq!(query["code_challenge_method"], "S256");
         served.lock().unwrap().codes.insert("c1".into());
         let callback = url::Url::parse(&query["redirect_uri"]).unwrap();
@@ -1084,7 +1139,7 @@ mod tests {
         let handle = plane.read_with(cx, |p, _| p.handle()).unwrap();
         let source = ControlTokenSource::new(
             Arc::new(Cli),
-            handle.clone(),
+            vec![handle.clone()],
             "01C".into(),
             "https://acme.graphs.test".into(),
         );
@@ -1102,7 +1157,7 @@ mod tests {
         // A token for another endpoint than the cluster's is dropped.
         let elsewhere = ControlTokenSource::new(
             Arc::new(Cli),
-            handle.clone(),
+            vec![handle.clone()],
             "01C".into(),
             "https://other.graphs.test".into(),
         );
@@ -1163,6 +1218,124 @@ mod tests {
         let log = served.lock().unwrap().log.clone();
         assert_eq!(log.iter().filter(|l| *l == "detail").count(), 1);
         assert_eq!(log.iter().filter(|l| *l == "status").count(), 1);
+    }
+
+    /// The CLI's export for a target in `0`'s organization.
+    struct CliIn(&'static str);
+
+    impl crate::cli_tokens::TokenSource for CliIn {
+        fn token(
+            &self,
+            _: Arc<AtomicBool>,
+        ) -> futures::future::BoxFuture<
+            'static,
+            Result<crate::cli_tokens::Token, crate::cli_tokens::NoToken>,
+        > {
+            use futures::FutureExt as _;
+            futures::future::ready(Ok(crate::cli_tokens::Token::typed("from-the-cli".into())))
+                .boxed()
+        }
+
+        fn login_profile(&self) -> Option<String> {
+            Some("work".into())
+        }
+
+        fn organization(&self) -> Option<String> {
+            Some(self.0.into())
+        }
+    }
+
+    fn cloud(context: SignInContext, cx: &mut TestAppContext) -> Entity<ControlPlane> {
+        cx.new(|cx| ControlPlane::cloud(ROUTE.into(), Some(context), cx))
+    }
+
+    /// Omnigraph Cloud's default pins no organization: its sign-in, in whichever one, is kept
+    /// under the route alone, and the token names the organization.
+    #[gpui::test]
+    fn the_clouds_sign_in_learns_its_organization(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let served = Arc::new(Mutex::new(Served {
+            org: "org_2".into(),
+            ..Default::default()
+        }));
+        let keychain = Arc::new(MemoryKeychain::default());
+        let plane = cloud(context(&served, keychain.clone()), cx);
+        cx.run_until_parked();
+        assert!(served.lock().unwrap().requests.is_empty());
+        plane.read_with(cx, |p, _| {
+            assert!(p.is_default());
+            assert_eq!(p.organization(), None);
+            assert_eq!(p.key(), cloud_key(ROUTE));
+        });
+        plane.update(cx, |p, cx| p.sign_in(cx));
+        until(cx, "the browser", |cx| cx.opened_url().is_some());
+        let browser = approve(&served, &cx.opened_url().unwrap());
+        until(cx, "the sign-in", |cx| signed_in(&plane, cx));
+        browser.join().unwrap();
+        plane.read_with(cx, |p, _| {
+            assert_eq!(p.organization().as_deref(), Some("org_2"))
+        });
+        let item = keychain
+            .items
+            .lock()
+            .unwrap()
+            .get(&cloud_key(ROUTE))
+            .cloned();
+        assert_eq!(item, Some(("user_1".into(), b"r1".to_vec())));
+    }
+
+    /// A kept cloud sign-in is taken up at launch, and names its organization once refreshed.
+    #[gpui::test]
+    fn a_kept_cloud_sign_in_names_its_organization_once_refreshed(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let served = Arc::new(Mutex::new(Served::default()));
+        served.lock().unwrap().refresh.insert("kept".into());
+        let keychain = Arc::new(MemoryKeychain::default());
+        keychain
+            .items
+            .lock()
+            .unwrap()
+            .insert(cloud_key(ROUTE), ("user_1".into(), b"kept".to_vec()));
+        let plane = cloud(context(&served, keychain), cx);
+        until(cx, "the kept sign-in", |cx| signed_in(&plane, cx));
+        plane.update(cx, |p, cx| p.read_clusters(cx));
+        until(cx, "the list", |cx| {
+            plane.read_with(cx, |p, _| matches!(p.listing(), Some(Listing::Listed(_))))
+        });
+        plane.read_with(cx, |p, _| {
+            assert_eq!(p.organization().as_deref(), Some(ORG))
+        });
+    }
+
+    /// A managed target takes the cloud sign-in's data token only in its own organization; in
+    /// another, the CLI's export stands.
+    #[gpui::test]
+    fn the_cloud_gives_data_tokens_only_in_the_targets_organization(cx: &mut TestAppContext) {
+        use crate::control_token::ControlTokenSource;
+        cx.executor().allow_parking();
+        let served = Arc::new(Mutex::new(Served::default()));
+        served.lock().unwrap().refresh.insert("kept".into());
+        let keychain = Arc::new(MemoryKeychain::default());
+        keychain
+            .items
+            .lock()
+            .unwrap()
+            .insert(cloud_key(ROUTE), ("user_1".into(), b"kept".to_vec()));
+        let plane = cloud(context(&served, keychain), cx);
+        until(cx, "the kept sign-in", |cx| signed_in(&plane, cx));
+        let handle = plane.read_with(cx, |p, _| p.handle()).unwrap();
+        let source = |org: &'static str| {
+            ControlTokenSource::new(
+                Arc::new(CliIn(org)),
+                vec![handle.clone()],
+                "01C".into(),
+                "https://acme.graphs.test".into(),
+            )
+        };
+        let theirs = smol::block_on(source("org_other").token(Arc::default())).unwrap();
+        assert_eq!(theirs.into_string(), "from-the-cli");
+        let ours = smol::block_on(source(ORG).token(Arc::default())).unwrap();
+        assert_eq!(ours.into_string(), "data-token");
     }
 
     #[gpui::test]

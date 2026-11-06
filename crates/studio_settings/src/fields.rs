@@ -442,6 +442,7 @@ mod tests {
                 "studio.show_performance",
                 "studio.auto_update",
                 "omnigraph_cli",
+                "omnigraph_cloud",
                 "agent.command",
                 "agent.ask_before_writes",
                 "models.fast",
