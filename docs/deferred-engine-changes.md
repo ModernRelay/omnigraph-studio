@@ -33,6 +33,7 @@ it goes through Omnigraph's own RFC process.
 | E36 | A change page that resumes its work: every page of the feed, a diff or a commit's changes plans, resolves and sorts again ([#970](https://github.com/ModernRelay/omnigraph/issues/970)) | 008, 009 | Asks for the largest page (8,192 changes), so most reviews are one page |
 | E37 | A commit found by id without checking out every live branch's `__manifest`: a commit only a branch holds costs 6 to 9 s more to name than its branch ([#972](https://github.com/ModernRelay/omnigraph/issues/972)) | 008, 009 | Names commits by id, which pins the read; naming the branch would need a second read when it moves |
 | E38 | A work bound on a change-feed page: a page works through up to 128 commits and the HTTP API has no parameter to lower it ([#1157](https://github.com/ModernRelay/omnigraph/issues/1157)) | 008 | Reads the feed in pages of up to 8,192 changes, each waited for up to five minutes |
+| E39 | A page of a wide type that reads only what it returns: a sorted page sorts on its keys and then reads its rows, and a filter on `@id` or a key reads only the rows it keeps. On 100,000 rows of 95 columns a sorted first page takes 0.9 s and a point read 0.4 s | 004 | Reads a page in one query; a row a page read is answered from the session's memo |
 
 Every server Studio supports serves these (checked against `v0.14.0`'s OpenAPI document, 2026-10-24):
 

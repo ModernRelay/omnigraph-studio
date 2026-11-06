@@ -548,6 +548,9 @@ kept answers.
     describes an empty cell, so a file stored in one is checked at the head just before it is
     sent and goes unbound, and a value set elsewhere in between is overwritten.
 - Per-row history beyond the commits that the change feed can cheaply return.
+- E39, a page of a wide type that reads only what it returns: on a 95-column type of 100,000
+  rows the first page takes about a second, nearly all of it the server's sort
+  (`docs/perf/20261106-report.md`).
 
 ## Validation log
 
