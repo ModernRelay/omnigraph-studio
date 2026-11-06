@@ -3526,7 +3526,13 @@ impl Workspace {
         let trigger = ButtonLike::new("graph-switcher");
         let trigger = match cluster {
             Some((plane, cluster_id)) => trigger.tip_fn(move |_, cx| {
-                let content = studio_ui::ds::tooltip(tooltip.clone());
+                // A card's title truncates to its width: the address is the title, and the
+                // state and actor the line under it.
+                let rest = tooltip
+                    .strip_prefix(&format!("{url} · "))
+                    .unwrap_or(&tooltip)
+                    .to_owned();
+                let content = studio_ui::ds::tooltip(url.clone()).meta(rest);
                 match ControlPlane::card(&plane, cluster_id.clone(), cx) {
                     Some(card) => content
                         .detail(move |cx| {

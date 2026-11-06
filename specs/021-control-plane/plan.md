@@ -190,13 +190,47 @@ only to the endpoint it names." `docs/architecture.md`'s layer table gains the c
 | Data token | 15 s, 64 KiB, TTL 900 s, renewed 60 s before expiry |
 | Token after a cluster's 401 | Once a minute at most |
 
+### Planned: Omnigraph Cloud by default
+
+Today a control plane exists for Studio only when a CLI profile names it. Someone who uses
+Omnigraph Cloud without the CLI, or on Windows, where the CLI's listing lands no managed target,
+sees none. The next slice gives Studio one control plane of its own:
+
+- **Where it is.** A setting, `control_plane.default`, defaults to `https://platform.omnigraph.dev`
+  and is shown as "Omnigraph Cloud". Empty turns it off. It is one address Studio ships with,
+  not a list Studio keeps: the clusters still come from the control plane (I), and each CLI
+  profile's route still makes its own control plane as today.
+- **No organization before sign-in.** The default has no profile, so it names no organization.
+  It signs in as any control plane does (its metadata, Studio's client, `resource=<route>`),
+  but with no organization pinned. The token's `org_id` names it, and that organization is
+  held from then on. To use another one, sign in again; the sign-in service asks which
+  organization when the account is in several (open question 5).
+- **Its keychain item** is `omnigraph-control:<route>`, with no organization: one cloud sign-in
+  at a time, which names its organization when the token is refreshed at launch.
+- **One plane for one pair.** When a CLI profile names the same route and the organization the
+  default's sign-in is in, the two are one control plane. The profile's row is shown, and the
+  sign-in is kept under the default's item.
+- **The Open dialog** shows "Omnigraph Cloud · Sign in to list your organization's clusters"
+  while no profile names a control plane, and below the profiles' when one does. Every cluster
+  there is "Not a CLI target". It opens for this run with the control plane's data token, or
+  with the cluster's own sign-in where its 401 offers one. Its command to keep it is
+  `omnigraph target add <name> --cluster <id>`, with the CLI's default profile.
+- **Windows.** This path needs no CLI, so managed clusters work on Windows through it.
+- **Code.** `ControlPlane.organization` becomes optional (pinned by a profile, or learned
+  from the token). The registry makes the default's plane when the setting names a route,
+  and merges it with a profile's plane once both are known. `studio_settings` gains the
+  setting. No new crate, and no new outside request beyond what this spec allows.
+- **Tests.** A default sign-in learns its organization from the token. A profile on the same
+  pair merges into it. An empty setting makes no plane. Nothing is sent before a sign-in.
+
 ## Decisions
 
 | Decision | Rejected alternatives | Why |
 |---|---|---|
 | Studio signs in to the control plane as its own client | Sign in with the `client_id` the control plane publishes, as the CLI does | The control plane could not tell Studio from the CLI, the same objection that made Studio its own OAuth client for clusters (spec 016; RFC #1017, A2) |
 | Call the API from Studio | Run `omnigraph cluster list --json` and its siblings | The CLI holds its operator lock for each command, needs a login it can renew without a terminal (it answered `refresh_outcome_unknown` here), and exports no token on Windows |
-| The control plane found through `credentials status`'s `route` | Parse `~/.omnigraph/config.yaml`; a setting with the URL | Spec 003: Studio reads no operator file. The profile already names its route and organization, without a secret |
+| The control plane found through `credentials status`'s `route` | Parse `~/.omnigraph/config.yaml` | Spec 003: Studio reads no operator file. The profile already names its route and organization, without a secret |
+| Omnigraph Cloud as a default control plane, besides the profiles' (planned) | Only the profiles' routes, as at first | Without the CLI, or on Windows, nobody could reach Omnigraph Cloud from Studio. One shipped address is a setting, not a server list, and the token names the organization |
 | A cluster without a CLI target opens for this run only | Register it as a target from Studio | Studio keeps no server list (spec 003); registering is the CLI's, and Studio shows its command |
 | Data tokens of 900 s | The 3600 s default, or 86400 s like a cached `cluster token` | Removing admission does not retract a data token; the shorter it lives, the sooner a removal holds |
 | Read only, plus the data token, in the first slice | Deployments, members and cluster lifecycle | Each is a write with its own outcome rules, and the CLI already does them; reading first shows whether people want them here |
@@ -241,6 +275,10 @@ only to the endpoint it names." `docs/architecture.md`'s layer table gains the c
   procedure: the token issuer follows the provider's custom domain, so a new domain refuses
   every token from the old one at once. The API and each cluster accept both issuers until the
   old one's last access token has expired (300 s), then drop the old one.
+- **CP3, the control plane**: name the organization and the account in what Studio can read
+  (`/v1/auth/session` gains the organization's `name` and the account's `email`, or a route
+  gives them). Today the `Organization` schema is only `{organization_id}`, and the token's
+  `sub` is a user ID, so Studio shows `org_…` and says "Signed in" without saying as whom.
 - **CP2, the control plane**: say whether its `openapi.json` is a stable contract Studio may pin
   (it is `0.1.0`), and how a breaking change is announced.
 
@@ -254,6 +292,8 @@ only to the endpoint it names." `docs/architecture.md`'s layer table gains the c
 3. How a person in several organizations signs in to the profile's (spec 016, question 4).
 4. Whether the list should show clusters the person may see but not open (no admission): the
    control plane lists them; `POST /tokens` then answers 403.
+5. For the default control plane: whether the sign-in service asks an account in several
+   organizations which one when no organization is pinned, and which it picks if it does not.
 
 ## Validation log
 
@@ -272,6 +312,8 @@ only to the endpoint it names." `docs/architecture.md`'s layer table gains the c
 | 2026-11-05 | The API is an OAuth resource with RFC 9728 metadata (CP1) | `curl https://platform.omnigraph.dev/.well-known/oauth-protected-resource`, and `GET /v1/clusters` without a bearer | 200: `resource: https://platform.omnigraph.dev`, `authorization_servers: ["https://login.platform.omnigraph.dev"]`, `bearer_methods_supported: ["header"]`; 401 with `WWW-Authenticate: Bearer resource_metadata="https://platform.omnigraph.dev/.well-known/oauth-protected-resource"` |
 | 2026-11-05 | The API accepts a token issued to Studio's client (CP1) | A live sign-in as Studio's client (PKCE S256, loopback redirect, `resource=https://platform.omnigraph.dev`), then `GET /v1/clusters` with the access token; claims decoded locally, the token neither printed nor kept | A refresh token issued; `aud` the API's resource, `iss` the OAuth server; `GET /v1/clusters` 200 |
 | 2026-11-05 | `control_client`'s types and routes match the live document | `/openapi.json` pinned as `crates/control_client/openapi/control-plane-0.1.0.json`; `cargo test -p control_client` | Still `0.1.0`, now 37 routes (39 on 2026-11-03; the four Studio sends unchanged); every declared field and enum value in the document, every required one declared |
+| 2026-11-05 | Studio signs in to a profile's control plane and lists its clusters (debug build, live) | Open dialog, profile `managed-og`, sign-in through the browser, the keychain write allowed | Six clusters: five purged (now counted, not listed), `modernrelay-og-cluster` "CLI target · Ready". Its chip's card: "Ready", "Latest deployment dispatched · observed just now" |
+| 2026-11-05 | Nothing names an organization or account in words (CP3) | `/openapi.json`: `Organization`, `AuthSession`, `Directory`; the token's claims | `Organization` is `{organization_id}`; the session has `account_id`, `principal_id`, `subject`; the token has `sub` and `org_id` only |
 
 ## Corrections
 

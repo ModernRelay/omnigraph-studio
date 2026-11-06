@@ -229,14 +229,16 @@ fn render_plane(
     let plane = plane.clone();
     let id = |what: &str| SharedString::from(format!("plane-{index}-{what}"));
     match state {
-        SignIn::SignedIn { account, .. } => {
+        // The account is the token's subject, an id that means nothing to the person: the
+        // control plane names no email or name for it yet (spec 021, CP3).
+        SignIn::SignedIn { .. } => {
             let refresh = plane.clone();
             let out = plane.clone();
             block = block.child(
                 h_flex()
                     .px(px(space::MD))
                     .gap(px(space::XS))
-                    .child(ds::text::meta(format!("Signed in as {account}")).truncate())
+                    .child(fill(ds::text::meta("Signed in")))
                     .child(
                         ds::button(id("refresh"), "Refresh")
                             .style(ButtonStyle::Subtle)
@@ -264,15 +266,22 @@ fn render_plane(
                 cx,
             ));
         }
-        SignIn::Waiting { service } | SignIn::Finishing { service } => {
+        // Finishing: the service answered, and the keychain is keeping the sign-in; macOS may be
+        // asking whether Studio may. It is not cancelled from here.
+        SignIn::Finishing { .. } => {
+            block = block.child(div().px(px(space::MD)).child(fill(ds::text::meta(
+                "Keeping the sign-in in your keychain…",
+            ))));
+        }
+        SignIn::Waiting { service } => {
             let cancel = plane.clone();
             block = block.child(
                 h_flex()
                     .px(px(space::MD))
                     .gap(px(space::XS))
-                    .child(ds::text::meta(format!(
+                    .child(fill(ds::text::meta(format!(
                         "Signing in at {service} in your browser…"
-                    )))
+                    ))))
                     .child(
                         ds::button(id("cancel"), "Cancel")
                             .style(ButtonStyle::Subtle)
@@ -323,7 +332,9 @@ fn sign_in_line(
             h_flex()
                 .debug_selector(|| "control-plane-sign-in".into())
                 .gap(px(space::XS))
-                .child(ds::text::meta("Sign in to list this organization's clusters"))
+                .child(fill(ds::text::meta(
+                    "Sign in to list this organization's clusters",
+                )))
                 .child(
                     ds::button(SharedString::from(format!("plane-{index}-sign-in")), "Sign in")
                         .style(ButtonStyle::Subtle)
@@ -374,9 +385,12 @@ fn render_listing(
         }
         Some(Listing::Listed(listed)) => {
             let clusters = &listed.data.clusters;
+            // A purged cluster is gone for good: counted, not listed.
+            let purged = clusters.iter().filter(|c| is_purged(c)).count();
             let mut rows: Vec<AnyElement> = clusters
                 .iter()
                 .enumerate()
+                .filter(|(_, cluster)| !is_purged(cluster))
                 .map(|(row, cluster)| {
                     let shown = cluster_row(cluster, managed);
                     let mut item =
@@ -429,7 +443,18 @@ fn render_listing(
                     .into_any_element(),
                 );
             }
-            if rows.is_empty() {
+            if purged > 0 {
+                rows.push(
+                    div()
+                        .px(px(space::MD))
+                        .child(ds::text::meta(match purged {
+                            1 => "1 purged cluster not shown".to_owned(),
+                            n => format!("{n} purged clusters not shown"),
+                        }))
+                        .into_any_element(),
+                );
+            }
+            if clusters.is_empty() {
                 rows.push(
                     div()
                         .px(px(space::MD))
@@ -449,6 +474,17 @@ fn render_listing(
                 .into_any_element()
         }
     }
+}
+
+/// Whether `cluster` was purged: deleted for good, with nothing to open or undo.
+pub(crate) fn is_purged(cluster: &ClusterView) -> bool {
+    cluster.state == "purged"
+}
+
+/// A line's text beside its buttons: it takes the width they leave and truncates, so the
+/// buttons always show.
+fn fill(text: Label) -> Div {
+    div().flex_1().min_w_0().child(text.truncate())
 }
 
 fn oauth_host(route: &str) -> String {
@@ -521,6 +557,12 @@ mod tests {
         let off = cluster_row(&cluster("data_access_off", None), &[]);
         assert_eq!(off.meta, "No data endpoint · Data access off");
         assert!(off.dimmed);
+    }
+
+    #[test]
+    fn a_purged_cluster_is_counted_not_listed() {
+        assert!(is_purged(&cluster("purged", None)));
+        assert!(!is_purged(&cluster("ready", Some("https://acme.test"))));
     }
 
     #[test]
