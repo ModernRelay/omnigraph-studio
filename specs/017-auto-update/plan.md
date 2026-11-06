@@ -131,8 +131,9 @@ them by exchanging its bundle with the update's.
   update archive, signature or `latest.json`, and is never `latest`, so no updater and no
   `omnigraph studio` installs it: it is downloaded on purpose, from
   `releases/download/edge/<name>`. An edge app's updater still offers it a full release newer
-  than the workspace version it was built at. Main's commits have no CI run of their own, so
-  an edge build is checked only by building on every platform (2026-11-05).
+  than the workspace version it was built at. CI runs on every push to main too, and an edge
+  build is made only once CI passed on its commit; the edge job waits for a run still going
+  (2026-11-05).
 - **Signed, or a pre-release.** With the Apple secrets set, a tag's release fails before
   `gh release create` unless the macOS app passes `codesign --verify --deep --strict` against
   the CLI's requirement with Studio's team, and the disk image passes `xcrun stapler validate`.

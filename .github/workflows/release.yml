@@ -12,8 +12,8 @@ name: Release
 # a pre-release that is never `latest` and carries no latest.json and no update signature, so
 # no updating Studio and no `omnigraph studio` installs it: it is for people who download it on
 # purpose, at `releases/download/edge/<name>` under the version-free names. Each new edge build
-# replaces the last, release and tag. Main's commits have no CI run of their own (ci.yml runs on
-# pull requests), so an edge build is checked only by building on every platform.
+# replaces the last, release and tag. It is built only once ci.yml's run on that commit of main
+# has passed; the edge job waits for a run still going.
 #
 # macOS builds are signed and notarized when the Apple secrets below are set, and signed ad hoc
 # otherwise. A tag's release is the latest only when they are set: without them it is published
@@ -61,11 +61,16 @@ concurrency:
 
 jobs:
   # Whether this run publishes an edge build: the schedule, or a dispatch with `edge`, on main,
-  # and only when `edge` does not already hold main's tip.
+  # and only when `edge` does not already hold main's tip and CI passed on it.
   edge:
     name: Edge
     if: github.event_name == 'schedule' || inputs.edge
     runs-on: ubuntu-24.04
+    # Long enough for CI on main's tip to finish.
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      actions: read
     outputs:
       publish: ${{ steps.fresh.outputs.publish }}
     steps:
@@ -80,9 +85,28 @@ jobs:
           held=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/edge" --jq .object.sha 2>/dev/null || true)
           if [[ "$held" == "$GITHUB_SHA" ]]; then
             echo "edge already holds ${GITHUB_SHA::7}; nothing to publish"
-          else
-            echo "publish=true" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+          # CI's run for this push of main; a commit with none (pushed before CI ran on main) is
+          # not built.
+          while :; do
+            run=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --commit "$GITHUB_SHA" \
+              --event push --limit 1 --json status,conclusion,url \
+              --jq '.[0] // empty | "\(.status) \(.conclusion) \(.url)"')
+            if [[ -z "$run" ]]; then
+              echo "CI has no run on ${GITHUB_SHA::7}; no edge build" >&2
+              exit 1
+            fi
+            read -r status conclusion url <<< "$run"
+            [[ "$status" == completed ]] && break
+            echo "CI on ${GITHUB_SHA::7} is $status: $url"
+            sleep 60
+          done
+          if [[ "$conclusion" != success ]]; then
+            echo "CI on ${GITHUB_SHA::7} ended $conclusion; no edge build: $url" >&2
+            exit 1
+          fi
+          echo "publish=true" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build (${{ matrix.target }})
@@ -390,7 +414,7 @@ jobs:
           cat > notes.md <<NOTES
           Omnigraph Studio built from main at ${GITHUB_SHA::7} ($date). The newest edge build replaces this one every day that main has changed.
 
-          An edge build is checked only by building on every platform, not by the tests a release passes. Studio does not update an edge build to the next edge build: download it again here. Its updater still offers it a full release whose version is newer than its own.
+          An edge build has passed CI on its commit. Studio does not update an edge build to the next edge build: download it again here. Its updater still offers it a full release whose version is newer than its own.
 
           | File | Platform |
           |---|---|
