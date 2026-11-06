@@ -1,0 +1,15 @@
+[package]
+name = "studio_perf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/studio_perf.rs"
+
+# Standard library only: every layer may count and trace, the crates without GPUI among them.
+[dependencies]
+
+[lints]
+workspace = true

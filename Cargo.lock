@@ -202,6 +202,7 @@ dependencies = [
  "serde_norway",
  "smol",
  "studio_actions",
+ "studio_perf",
  "studio_settings",
  "studio_theme",
  "studio_ui",
@@ -1729,6 +1730,7 @@ dependencies = [
  "serde",
  "serde_json",
  "studio_actions",
+ "studio_perf",
  "studio_settings",
  "studio_theme",
  "studio_ui",
@@ -4148,6 +4150,7 @@ dependencies = [
  "graph_store",
  "serde_json",
  "studio_actions",
+ "studio_perf",
  "studio_settings",
  "studio_theme",
  "studio_ui",
@@ -4167,6 +4170,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smol",
+ "studio_perf",
  "url",
  "zed-reqwest",
 ]
@@ -4353,6 +4357,7 @@ dependencies = [
  "menu",
  "serde_json",
  "studio_actions",
+ "studio_perf",
  "studio_theme",
  "studio_ui",
  "studio_workspace",
@@ -7917,6 +7922,7 @@ dependencies = [
  "project",
  "serde_json",
  "studio_actions",
+ "studio_perf",
  "studio_settings",
  "studio_theme",
  "studio_ui",
@@ -8362,6 +8368,7 @@ dependencies = [
  "serde_json",
  "smallvec",
  "studio_actions",
+ "studio_perf",
  "studio_theme",
  "studio_ui",
  "studio_workspace",
@@ -8464,6 +8471,7 @@ dependencies = [
  "serde",
  "serde_json",
  "studio_actions",
+ "studio_perf",
  "studio_settings",
  "studio_theme",
  "studio_ui",
@@ -9723,6 +9731,7 @@ dependencies = [
  "settings",
  "smol",
  "studio_actions",
+ "studio_perf",
  "studio_settings",
  "studio_theme",
  "studio_ui",
@@ -9744,6 +9753,10 @@ dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "studio_perf"
+version = "0.4.0"
 
 [[package]]
 name = "studio_settings"
@@ -9830,6 +9843,7 @@ dependencies = [
  "serde",
  "serde_json",
  "studio_actions",
+ "studio_perf",
  "studio_settings",
  "studio_theme",
  "studio_ui",
@@ -10798,6 +10812,7 @@ dependencies = [
  "serde",
  "serde_json",
  "studio_actions",
+ "studio_perf",
  "studio_settings",
  "studio_theme",
  "studio_ui",

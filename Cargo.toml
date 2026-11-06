@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/studio",
     "crates/studio_actions",
+    "crates/studio_perf",
     "crates/studio_settings",
     "crates/studio_theme",
     "crates/studio_ui",
@@ -48,6 +49,7 @@ unicode-segmentation = "1.13"
 tree-sitter-gq = { path = "grammars/tree-sitter-gq" }
 tree-sitter-pg = { path = "grammars/tree-sitter-pg" }
 studio_actions = { path = "crates/studio_actions" }
+studio_perf = { path = "crates/studio_perf" }
 studio_settings = { path = "crates/studio_settings" }
 studio_theme = { path = "crates/studio_theme" }
 studio_ui = { path = "crates/studio_ui" }

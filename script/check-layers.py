@@ -9,6 +9,7 @@ import tomllib
 
 LAYERS = {
     "studio_actions": 0,
+    "studio_perf": 0,
     "studio_settings": 1,
     "studio_theme": 1,
     "graph_client": 2,
@@ -33,6 +34,7 @@ LAYERS = {
     "studio": 6,
 }
 NO_GPUI = {
+    "studio_perf",
     "graph_client",
     "control_client",
     "gq_language",

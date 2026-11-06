@@ -12,6 +12,7 @@ other: what two features share moves down a layer.
 | Layer | Crates | Role | Allowed dependencies |
 |---|---|---|---|
 | 0 | `studio_actions` | Every action type, with doc comments that become palette descriptions | `gpui` |
+| 0 | `studio_perf` | Measuring (`docs/drawing.md`): counters declared where they count (requests by route, queries by Studio's name for them, views drawn, allocations), spans for scenarios, steps and frames that carry what the counters added, and one collector that prints a table, writes a Chrome trace, or answers a test. Off, a counter is one relaxed load. Holds no token, query text or row data. **No `gpui`** | standard library only |
 | 1 | `studio_settings`, `studio_theme` | Typed layered settings; graph tokens over Zed's themes, set up through Zed's `theme_settings`, the themes Studio bundles, and Studio's icons in place of Zed's | `gpui`, `settings`, `theme`, `theme_settings`, `assets`, serde |
 | 2 | `graph_client` | Every request to an Omnigraph server: contract header, DTOs for the 0.14 API, write outcomes, change-feed paging. **No `gpui`** | Zed `http_client` (Apache-2.0), serde |
 | 2 | `control_client` | Every request to a managed control plane (spec 021): the organization's clusters, a cluster's detail and status, and a cluster's data token, with a control-plane token and never a graph token. DTOs checked against the control plane's pinned OpenAPI document. **No `gpui`** | Zed `http_client`, serde |
