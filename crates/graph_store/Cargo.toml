@@ -14,6 +14,7 @@ gpui = { workspace = true }
 graph_client = { workspace = true }
 oauth_client = { workspace = true }
 control_client = { workspace = true }
+chrono = { workspace = true }
 gq_language = { workspace = true }
 http_client = { workspace = true }
 reqwest_client = { workspace = true }

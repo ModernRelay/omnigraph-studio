@@ -15,6 +15,7 @@ use http_client::HttpClient;
 use oauth_client::{Clients, Refusal};
 
 use crate::cli_tokens::TokenSource as _;
+use crate::control_token::PlaneHandle;
 use crate::sign_in::{self, End, Kept, OAuthSource, Service, SignIn, SignInContext};
 
 /// What the control plane last answered for the organization's clusters.
@@ -40,6 +41,8 @@ pub struct ControlPlane {
     signing_in: Option<Task<()>>,
     listing: Option<Listing>,
     reading: Option<Task<()>>,
+    /// What its clusters' token sources read its sign-in through.
+    handle: Option<PlaneHandle>,
 }
 
 impl ControlPlane {
@@ -66,9 +69,30 @@ impl ControlPlane {
             signing_in: None,
             listing: None,
             reading: None,
+            handle: None,
         };
+        this.handle = this
+            .context
+            .as_ref()
+            .map(|context| PlaneHandle::new(this.route.clone(), context.elsewhere.clone()));
         this.take_up_kept(cx);
         this
+    }
+
+    /// What a cluster's data token source reads its sign-in through ([`ControlTokenSource`]):
+    /// `None` without a sign-in context, as in tests of other crates.
+    ///
+    /// [`ControlTokenSource`]: crate::control_token::ControlTokenSource
+    pub fn handle(&self) -> Option<PlaneHandle> {
+        self.handle.clone()
+    }
+
+    /// Holds `source` as its sign-in, for itself and its clusters' token sources.
+    fn hold(&mut self, source: Option<OAuthSource>) {
+        if let Some(handle) = &self.handle {
+            handle.hold(source.clone());
+        }
+        self.oauth = source;
     }
 
     /// The keychain item of its sign-in (spec 021, Signing in).
@@ -135,7 +159,7 @@ impl ControlPlane {
                             account: subject,
                         };
                         this.service = Some(service);
-                        this.oauth = Some(source);
+                        this.hold(Some(source));
                     }
                     Err(refusal) => {
                         this.sign_in = SignIn::Offered {
@@ -239,7 +263,9 @@ impl ControlPlane {
                 };
                 cx.notify();
                 let (before, done) = context.turns.next(&key);
-                (before, done, this.oauth.take())
+                let previous = this.oauth.clone();
+                this.hold(None);
+                (before, done, previous)
             }) else {
                 return;
             };
@@ -266,7 +292,7 @@ impl ControlPlane {
                     service: service.host(),
                     account,
                 };
-                this.oauth = Some(source.clone());
+                this.hold(Some(source.clone()));
                 // What was listed was another account's.
                 this.listing = None;
                 cx.notify();
@@ -306,7 +332,9 @@ impl ControlPlane {
         self.signing_in = None;
         self.reading = None;
         self.listing = None;
-        if let Some(source) = self.oauth.take() {
+        let held = self.oauth.clone();
+        self.hold(None);
+        if let Some(source) = held {
             let before = self
                 .context
                 .as_ref()
@@ -549,6 +577,25 @@ mod tests {
                     (400, json!({"error": "invalid_grant"}))
                 }
             }
+            ("POST", u) if u == format!("{ROUTE}/v1/clusters/01C/tokens") => match bearer {
+                Some(token) if served.accepted.contains(&token) => {
+                    served.log.push(format!("data token {body}"));
+                    let expires =
+                        (chrono::Utc::now() + chrono::Duration::seconds(900)).to_rfc3339();
+                    (
+                        200,
+                        json!({
+                            "data": {"version": 2, "token": "data-token", "endpoint": "https://acme.graphs.test",
+                                     "expires_at": expires, "kid": "k", "actor": "user_1"},
+                            "meta": {"provenance": "service_db", "assurance": "observed", "stale": false, "observed_at": "2026-11-05T00:00:00Z"},
+                        }),
+                    )
+                }
+                _ => (
+                    401,
+                    json!({"type": "unauthenticated", "title": "Unauthenticated", "status": 401}),
+                ),
+            },
             ("GET", u) if u == format!("{ROUTE}/v1/clusters") => match bearer {
                 Some(token) if served.accepted.contains(&token) => (
                     200,
@@ -786,6 +833,77 @@ mod tests {
             .get(&key(ROUTE, ORG))
             .cloned();
         assert_eq!(item, Some(("user_1".into(), b"r1".to_vec())));
+    }
+
+    /// The CLI's export, as a managed target's login.
+    struct Cli;
+
+    impl crate::cli_tokens::TokenSource for Cli {
+        fn token(
+            &self,
+            _: Arc<AtomicBool>,
+        ) -> futures::future::BoxFuture<
+            'static,
+            Result<crate::cli_tokens::Token, crate::cli_tokens::NoToken>,
+        > {
+            use futures::FutureExt as _;
+            futures::future::ready(Ok(crate::cli_tokens::Token::typed("from-the-cli".into())))
+                .boxed()
+        }
+    }
+
+    #[gpui::test]
+    fn a_held_sign_in_gives_the_clusters_data_tokens(cx: &mut TestAppContext) {
+        use crate::control_token::ControlTokenSource;
+        cx.executor().allow_parking();
+        let served = Arc::new(Mutex::new(Served::default()));
+        served.lock().unwrap().refresh.insert("kept".into());
+        let keychain = Arc::new(MemoryKeychain::default());
+        keychain
+            .items
+            .lock()
+            .unwrap()
+            .insert(key(ROUTE, ORG), ("user_1".into(), b"kept".to_vec()));
+        let plane = plane(context(&served, keychain), cx);
+        until(cx, "the kept sign-in", |cx| signed_in(&plane, cx));
+        let handle = plane.read_with(cx, |p, _| p.handle()).unwrap();
+        let source = ControlTokenSource::new(
+            Arc::new(Cli),
+            handle.clone(),
+            "01C".into(),
+            "https://acme.graphs.test".into(),
+        );
+        let token = smol::block_on(source.token(Arc::default())).unwrap();
+        assert_eq!(token.lease().unwrap().holder, "user_1");
+        assert_eq!(token.into_string(), "data-token");
+        assert!(
+            served
+                .lock()
+                .unwrap()
+                .log
+                .contains(&r#"data token {"version":2,"ttl_seconds":900}"#.to_owned())
+        );
+
+        // A token for another endpoint than the cluster's is dropped.
+        let elsewhere = ControlTokenSource::new(
+            Arc::new(Cli),
+            handle.clone(),
+            "01C".into(),
+            "https://other.graphs.test".into(),
+        );
+        let refused = smol::block_on(elsewhere.token(Arc::default())).unwrap_err();
+        assert!(refused.why.contains("another address"), "{}", refused.why);
+
+        // Refused by the cluster, the next is not asked for within the minute.
+        source.note_refused();
+        let paused = smol::block_on(source.token(Arc::default())).unwrap_err();
+        assert!(paused.passing);
+
+        // Signed out, the CLI's export is the source again.
+        plane.update(cx, |p, cx| p.sign_out(cx));
+        cx.run_until_parked();
+        let token = smol::block_on(source.token(Arc::default())).unwrap();
+        assert_eq!(token.into_string(), "from-the-cli");
     }
 
     #[gpui::test]

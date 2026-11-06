@@ -10,6 +10,7 @@ pub mod cli_config;
 mod cli_tokens;
 mod connection;
 pub mod control_plane;
+mod control_token;
 mod degrees;
 pub mod deletes;
 mod entity_groups;

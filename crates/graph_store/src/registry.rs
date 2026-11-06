@@ -19,12 +19,13 @@ use http_client::HttpClient;
 use serde::{Deserialize, Serialize};
 
 use crate::cli_config::{
-    self, CliAuth, CliServer, CliTargets, CliTransport, FileStamp, ManagedTarget, Platform,
-    ProfileOwner,
+    self, CliAuth, CliCredential, CliServer, CliTargets, CliTransport, FileStamp, ManagedTarget,
+    Platform, ProfileOwner,
 };
 use crate::cli_tokens::{self, CliTokenSource, TargetDigests, Token, TokenSource};
 use crate::connection::{Connection, ServerEntry, ServerSource};
 use crate::control_plane::ControlPlane;
+use crate::control_token::ControlTokenSource;
 use crate::sign_in::{self, PlatformKeychain, SignInContext};
 
 /// How often the CLI's files are checked for a change, as Studio's settings file is.
@@ -783,6 +784,95 @@ impl ConnectionRegistry {
     /// graph is added. Targets that could not be listed change no server. What could not be
     /// listed or used, a server that cannot be added included, is a change only when it differs
     /// from what was kept.
+    /// The connection to `cluster`, a cluster of `plane`'s organization no CLI target names,
+    /// opened for this run (spec 021, Listing clusters): one already reaching its data endpoint
+    /// is it. Its data token is the control plane's, and its own sign-in is still preferred where
+    /// its 401 offers one. `None` without a data endpoint, or a control plane Studio cannot sign
+    /// in to here.
+    pub fn open_cluster(
+        &mut self,
+        plane: &Entity<ControlPlane>,
+        cluster: &control_client::ClusterView,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<Connection>> {
+        let endpoint = cluster.data_endpoint.clone()?;
+        let same = |url: &str| url.trim_end_matches('/') == endpoint.trim_end_matches('/');
+        if let Some(open) = self
+            .connections
+            .iter()
+            .find(|connection| same(&connection.read(cx).server.url))
+        {
+            return Some(open.clone());
+        }
+        let (handle, profile, organization) = {
+            let plane = plane.read(cx);
+            (
+                plane.handle()?,
+                plane.profiles.first()?.clone(),
+                plane.organization.clone(),
+            )
+        };
+        let source: Arc<dyn TokenSource> = Arc::new(ControlTokenSource::of_plane(
+            profile,
+            organization,
+            handle,
+            cluster.cluster_id.clone(),
+            endpoint.clone(),
+        ));
+        let entry = ServerEntry {
+            name: cluster.name.clone(),
+            url: endpoint,
+            source: ServerSource::ControlPlane,
+            known_graphs: Vec::new(),
+        };
+        let connection = Connection::new(entry, None, self.http.clone())
+            .ok()?
+            .with_token_source(Some(source))
+            .with_sign_in(self.sign_in.clone());
+        let connection = cx.new(|_| connection);
+        self.connections.push(connection.clone());
+        cx.notify();
+        Some(connection)
+    }
+
+    /// The token source of the CLI server `server`: the CLI's export, which a managed target
+    /// whose profile names a control plane takes from that control plane while it holds a
+    /// sign-in (spec 021, The data token).
+    fn token_source_for(&self, server: &CliServer, cx: &App) -> Option<Arc<dyn TokenSource>> {
+        let source = (self.token_sources)(server)?;
+        let CliAuth::Token(CliCredential::Managed { profile, .. }) = &server.auth else {
+            return Some(source);
+        };
+        let Some(target) = self
+            .managed_targets
+            .iter()
+            .find(|target| target.name == server.name)
+        else {
+            return Some(source);
+        };
+        let handle = self.control_planes.iter().find_map(|plane| {
+            let plane = plane.read(cx);
+            plane
+                .profiles
+                .contains(profile)
+                .then(|| plane.handle())
+                .flatten()
+        });
+        let Some(handle) = handle else {
+            return Some(source);
+        };
+        let endpoint = target
+            .endpoint
+            .clone()
+            .unwrap_or_else(|| server.url.clone());
+        Some(Arc::new(ControlTokenSource::new(
+            source,
+            handle,
+            target.cluster_id.clone(),
+            endpoint,
+        )))
+    }
+
     /// Keeps one control plane for each route and organization the profiles name: a new pair
     /// gets one, which takes up a sign-in the keychain kept; one no longer named is retired, its
     /// sign-in left in the keychain for the next launch (spec 021).
@@ -955,7 +1045,7 @@ impl ConnectionRegistry {
                     }
                 });
                 if self.cli_kept.get(&url) != Some(&kept) {
-                    let source = (self.token_sources)(&server);
+                    let source = self.token_source_for(&server, cx);
                     connection.update(cx, |connection, cx| connection.take_token_from(source, cx));
                     self.cli_kept.insert(url, kept);
                     changed = true;
@@ -992,7 +1082,7 @@ impl ConnectionRegistry {
                     continue;
                 }
             };
-            let source = (self.token_sources)(&server);
+            let source = self.token_source_for(&server, cx);
             match Connection::new(entry, None, http) {
                 Ok(connection) => {
                     let connection = connection
@@ -1323,6 +1413,69 @@ mod tests {
         registry.update(cx, |registry, cx| {
             registry.apply_cli_targets(files, Vec::new(), cx)
         })
+    }
+
+    /// A cluster no CLI target names opens for this run, once, reached at its data endpoint
+    /// with the control plane's token; one without a data endpoint, or a control plane Studio
+    /// cannot sign in to, opens nothing (spec 021).
+    #[gpui::test]
+    async fn a_cluster_no_target_names_opens_for_this_run(cx: &mut TestAppContext) {
+        let (registry, _) = cx.update(ConnectionRegistry::init_for_tests);
+        let context = crate::sign_in::SignInContext {
+            elsewhere: http_client::FakeHttpClient::with_404_response(),
+            keychain: Arc::new(crate::sign_in::MemoryKeychain::default()),
+            turns: Default::default(),
+            identities: oauth_client::ClientIdentities {
+                metadata_document: Some("https://studio.test/client.json".into()),
+                registered: Vec::new(),
+                development: None,
+            },
+        };
+        let plane = |context: Option<crate::sign_in::SignInContext>, cx: &mut TestAppContext| {
+            cx.new(|cx| {
+                ControlPlane::new(
+                    "https://control.test".into(),
+                    "org_1".into(),
+                    vec!["work".into()],
+                    context,
+                    cx,
+                )
+            })
+        };
+        let signed = plane(Some(context), cx);
+        let cluster: control_client::ClusterView = serde_json::from_value(serde_json::json!({
+            "cluster_id": "01C", "name": "acme", "incarnation": "01I",
+            "canonical_root": "s3://b/c", "binding": {"mode": "github", "repository": "a/g"},
+            "state": "ready", "cell": {"namespace": "ns", "cluster": "cell"},
+            "created_by": "u", "created_at": "2026-11-01T00:00:00Z",
+            "data_endpoint": "https://acme.graphs.test",
+        }))
+        .unwrap();
+        let open = |plane: &Entity<ControlPlane>,
+                    cluster: &control_client::ClusterView,
+                    cx: &mut TestAppContext| {
+            registry.update(cx, |registry, cx| registry.open_cluster(plane, cluster, cx))
+        };
+        let first = open(&signed, &cluster, cx).expect("opened");
+        first.read_with(cx, |connection, _| {
+            assert_eq!(connection.server.name, "acme");
+            assert_eq!(connection.server.url, "https://acme.graphs.test");
+            assert_eq!(connection.server.source, ServerSource::ControlPlane);
+            // Held back, as a managed target's login is, until the cluster's 401 says whether
+            // it offers a sign-in of its own (spec 016).
+            assert_eq!(connection.login_profile(), None);
+        });
+        let again = open(&signed, &cluster, cx).expect("the same");
+        assert_eq!(again.entity_id(), first.entity_id());
+        assert_eq!(registry.read_with(cx, |r, _| r.connections.len()), 1);
+
+        let mut provisioning = cluster.clone();
+        provisioning.data_endpoint = None;
+        assert!(open(&signed, &provisioning, cx).is_none());
+        let unsigned = plane(None, cx);
+        let mut other = cluster.clone();
+        other.data_endpoint = Some("https://other.graphs.test".into());
+        assert!(open(&unsigned, &other, cx).is_none());
     }
 
     /// Profiles on one control plane and organization share it; one no longer named is retired.

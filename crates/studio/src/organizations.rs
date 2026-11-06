@@ -12,7 +12,57 @@ use studio_ui::ds::Tipped as _;
 use studio_ui::ds::{self, MenuRow, size, space};
 use ui::prelude::*;
 
-use crate::open_graph::OpenGraphModal;
+use crate::open_graph::{OpenGraphModal, Place};
+
+/// The places the keyboard reaches in the organizations, in order: each control plane's line,
+/// then its clusters that open for this run.
+pub(crate) fn places(
+    planes: &[Entity<ControlPlane>],
+    managed: &[ManagedTarget],
+    cx: &App,
+) -> Vec<Place> {
+    let mut places = Vec::new();
+    for plane in planes {
+        let id = plane.entity_id();
+        places.push(Place::Plane(id));
+        if let Some(Listing::Listed(listed)) = plane.read(cx).listing() {
+            for cluster in &listed.data.clusters {
+                if cluster_row(cluster, managed).opens {
+                    places.push(Place::Cluster(id, cluster.cluster_id.clone()));
+                }
+            }
+        }
+    }
+    places
+}
+
+/// ↵ on a control plane's line: signs in, cancels a sign-in under way, or reads the clusters
+/// again.
+pub(crate) fn enter(plane: &mut ControlPlane, cx: &mut gpui::Context<ControlPlane>) {
+    match plane.sign_in_state() {
+        SignIn::SignedIn { .. } => plane.read_clusters(cx),
+        SignIn::Waiting { .. } | SignIn::Reading => plane.cancel_sign_in(cx),
+        SignIn::Finishing { .. } | SignIn::Unavailable(_) => {}
+        SignIn::Offered { .. } | SignIn::NotOffered => plane.sign_in(cx),
+    }
+}
+
+/// The cluster `cluster_id` of the plane's list, while it is shown.
+pub(crate) fn cluster(
+    plane: &Entity<ControlPlane>,
+    cluster_id: &str,
+    cx: &App,
+) -> Option<ClusterView> {
+    match plane.read(cx).listing() {
+        Some(Listing::Listed(listed)) => listed
+            .data
+            .clusters
+            .iter()
+            .find(|cluster| cluster.cluster_id == cluster_id)
+            .cloned(),
+        _ => None,
+    }
+}
 
 /// How a cluster of the list is shown (spec 021, Listing clusters).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,6 +71,19 @@ pub(crate) struct ClusterRow {
     pub meta: String,
     /// Shown dimmed: it has no data endpoint, so there is nothing to open.
     pub dimmed: bool,
+    /// Clicking it opens the cluster for this run: no CLI target names it, and it has a data
+    /// endpoint.
+    pub opens: bool,
+}
+
+/// The CLI command that keeps `cluster` as a target of `profile` (constitution VI).
+pub(crate) fn add_command(cluster: &ClusterView, profile: Option<&str>) -> String {
+    format!(
+        "omnigraph target add {} --cluster {} --profile {}",
+        cluster.name,
+        cluster.cluster_id,
+        profile.unwrap_or("<profile>")
+    )
 }
 
 /// The row for `cluster`, given the CLI's managed targets.
@@ -34,11 +97,13 @@ pub(crate) fn cluster_row(cluster: &ClusterView, managed: &[ManagedTarget]) -> C
             name: cluster.name.clone(),
             meta: format!("CLI target {} · {state}", target.name),
             dimmed: cluster.data_endpoint.is_none(),
+            opens: false,
         },
         (None, Some(_)) => ClusterRow {
             name: cluster.name.clone(),
             meta: format!("Not a CLI target · {state}"),
             dimmed: false,
+            opens: true,
         },
         (None, None) => ClusterRow {
             name: cluster.name.clone(),
@@ -48,6 +113,7 @@ pub(crate) fn cluster_row(cluster: &ClusterView, managed: &[ManagedTarget]) -> C
                 format!("No data endpoint · {state}")
             },
             dimmed: true,
+            opens: false,
         },
     }
 }
@@ -102,6 +168,7 @@ pub(crate) fn failure(error: &ControlError, organization: &str) -> String {
 pub(crate) fn render(
     planes: &[Entity<ControlPlane>],
     managed: &[ManagedTarget],
+    cursor: Option<&Place>,
     cx: &mut Context<OpenGraphModal>,
 ) -> Option<AnyElement> {
     if planes.is_empty() {
@@ -110,7 +177,7 @@ pub(crate) fn render(
     let blocks: Vec<AnyElement> = planes
         .iter()
         .enumerate()
-        .map(|(index, plane)| render_plane(index, plane, managed, cx))
+        .map(|(index, plane)| render_plane(index, plane, managed, cursor, cx))
         .collect();
     Some(
         v_flex()
@@ -131,8 +198,10 @@ fn render_plane(
     index: usize,
     plane: &Entity<ControlPlane>,
     managed: &[ManagedTarget],
+    cursor: Option<&Place>,
     cx: &mut Context<OpenGraphModal>,
 ) -> AnyElement {
+    let at = cursor == Some(&Place::Plane(plane.entity_id()));
     let (route, profiles, organization, state) = {
         let p = plane.read(cx);
         (
@@ -147,11 +216,15 @@ fn render_plane(
         [one] => format!("CLI profile {one}"),
         many => format!("CLI profiles {}", many.join(", ")),
     };
-    let heading = v_flex()
-        .px(px(space::MD))
-        .min_w_0()
-        .child(ds::text::body(organization.clone()))
-        .child(ds::text::meta(format!("{host} · {profiles}")).truncate());
+    let heading = MenuRow::new(SharedString::from(format!("plane-{index}")))
+        .height(size::FEED_ROW)
+        .toggle_state(at)
+        .child(
+            v_flex()
+                .min_w_0()
+                .child(ds::text::body(organization.clone()))
+                .child(ds::text::meta(format!("{host} · {profiles}")).truncate()),
+        );
     let mut block = v_flex().gap(px(space::XXS)).child(heading);
     let plane = plane.clone();
     let id = |what: &str| SharedString::from(format!("plane-{index}-{what}"));
@@ -182,7 +255,14 @@ fn render_plane(
                             })),
                     ),
             );
-            block = block.child(render_listing(index, &plane, managed, &organization, cx));
+            block = block.child(render_listing(
+                index,
+                &plane,
+                managed,
+                &organization,
+                cursor,
+                cx,
+            ));
         }
         SignIn::Waiting { service } | SignIn::Finishing { service } => {
             let cancel = plane.clone();
@@ -263,8 +343,10 @@ fn render_listing(
     plane: &Entity<ControlPlane>,
     managed: &[ManagedTarget],
     organization: &str,
+    cursor: Option<&Place>,
     cx: &mut Context<OpenGraphModal>,
 ) -> AnyElement {
+    let plane_id = plane.entity_id();
     let (profiles, host, listing) = {
         let p = plane.read(cx);
         (
@@ -297,7 +379,7 @@ fn render_listing(
                 .enumerate()
                 .map(|(row, cluster)| {
                     let shown = cluster_row(cluster, managed);
-                    let item =
+                    let mut item =
                         MenuRow::new(SharedString::from(format!("plane-{index}-cluster-{row}")))
                             .height(size::FEED_ROW)
                             .child(
@@ -306,6 +388,22 @@ fn render_listing(
                                     .child(ds::text::body(shown.name))
                                     .child(ds::text::meta(shown.meta).truncate()),
                             );
+                    if shown.opens {
+                        item = item.toggle_state(
+                            cursor == Some(&Place::Cluster(plane_id, cluster.cluster_id.clone())),
+                        );
+                        let plane = plane.clone();
+                        let cluster = cluster.clone();
+                        let command = add_command(&cluster, profiles.first().map(String::as_str));
+                        item = item
+                            .aria_label(format!(
+                                "Open {} for this run. To keep it, add it as a CLI target: {command}",
+                                cluster.name
+                            ))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_cluster(&plane, &cluster, window, cx)
+                            }));
+                    }
                     if shown.dimmed {
                         div().opacity(0.5).child(item).into_any_element()
                     } else {
@@ -399,18 +497,25 @@ mod tests {
             ClusterRow {
                 name: "acme".into(),
                 meta: "CLI target prod · Ready".into(),
-                dimmed: false
+                dimmed: false,
+                opens: false,
             }
         );
         // Another incarnation of the same cluster is not the target's.
         let other = [target("prod", "work", "01C", "01OLD")];
         assert_eq!(cluster_row(&ready, &other).meta, "Not a CLI target · Ready");
+        assert!(cluster_row(&ready, &other).opens);
+        assert_eq!(
+            add_command(&ready, Some("work")),
+            "omnigraph target add acme --cluster 01C --profile work"
+        );
         assert_eq!(
             cluster_row(&cluster("provisioning", None), &[]),
             ClusterRow {
                 name: "acme".into(),
                 meta: "Provisioning".into(),
-                dimmed: true
+                dimmed: true,
+                opens: false,
             }
         );
         let off = cluster_row(&cluster("data_access_off", None), &[]);

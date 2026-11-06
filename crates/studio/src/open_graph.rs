@@ -23,8 +23,13 @@ use ui::prelude::*;
 
 /// Where the keyboard is in the dialog: a server, one of the chosen server's graphs, or a field.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Place {
+pub(crate) enum Place {
     Server(EntityId),
+    /// A control plane's line: ↵ signs in, cancels a sign-in under way, or reads its clusters
+    /// again (spec 021).
+    Plane(EntityId),
+    /// A cluster of a control plane's list that opens for this run, by its `cluster_id`.
+    Cluster(EntityId, String),
     Graph(String),
     /// The field for a new token, shown when the server refused the token.
     Token,
@@ -311,6 +316,11 @@ impl OpenGraphModal {
             .iter()
             .map(|connection| Place::Server(connection.entity_id()))
             .collect();
+        places.extend(crate::organizations::places(
+            &self.planes,
+            &self.managed,
+            cx,
+        ));
         if let Some(selected) = &self.selected {
             let connection = selected.read(cx);
             if connection.asks_token() {
@@ -387,7 +397,9 @@ impl OpenGraphModal {
                 }
                 window.focus(&self.focus_handle, cx);
             }
-            Place::Graph(_) => window.focus(&self.focus_handle, cx),
+            Place::Graph(_) | Place::Plane(_) | Place::Cluster(..) => {
+                window.focus(&self.focus_handle, cx)
+            }
             Place::Token => window.focus(&self.replacement_token.focus_handle(cx), cx),
             Place::GraphId => window.focus(&self.graph_id.focus_handle(cx), cx),
         }
@@ -414,7 +426,7 @@ impl OpenGraphModal {
                     self.graphs_scroll.scroll_to_item(at);
                 }
             }
-            Place::Token | Place::GraphId => {}
+            Place::Token | Place::GraphId | Place::Plane(_) | Place::Cluster(..) => {}
         }
         self.cursor = Some(place);
         cx.notify();
@@ -461,6 +473,26 @@ impl OpenGraphModal {
                 Some(Place::Graph(id)) if !self.graph_id.focus_handle(cx).is_focused(window) => {
                     self.open(id, window, cx)
                 }
+                Some(Place::Plane(id)) if !self.graph_id.focus_handle(cx).is_focused(window) => {
+                    if let Some(plane) = self.planes.iter().find(|p| p.entity_id() == id) {
+                        plane.update(cx, crate::organizations::enter);
+                    }
+                }
+                Some(Place::Cluster(id, cluster_id))
+                    if !self.graph_id.focus_handle(cx).is_focused(window) =>
+                {
+                    let found =
+                        self.planes
+                            .iter()
+                            .find(|p| p.entity_id() == id)
+                            .and_then(|plane| {
+                                crate::organizations::cluster(plane, &cluster_id, cx)
+                                    .map(|cluster| (plane.clone(), cluster))
+                            });
+                    if let Some((plane, cluster)) = found {
+                        self.open_cluster(&plane, &cluster, window, cx);
+                    }
+                }
                 _ => {
                     let graph_id = self.graph_id.read(cx).text(cx);
                     self.open(graph_id, window, cx);
@@ -478,7 +510,37 @@ impl OpenGraphModal {
         cx.notify();
     }
 
-    fn select(
+    /// Opens `cluster`, which no CLI target names, for this run, and chooses it (spec 021).
+    pub(crate) fn open_cluster(
+        &mut self,
+        plane: &Entity<ControlPlane>,
+        cluster: &control_client::ClusterView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let opened = ConnectionRegistry::global(cx)
+            .update(cx, |registry, cx| registry.open_cluster(plane, cluster, cx));
+        match opened {
+            Some(connection) => {
+                let connections = ConnectionRegistry::global(cx).read(cx).connections.clone();
+                self.follow(connections, window, cx);
+                self.select(connection, window, cx);
+            }
+            None => {
+                self.error = Some(
+                    format!(
+                        "Studio could not open {}: sign in to its organization's control plane \
+                         first.",
+                        cluster.name
+                    )
+                    .into(),
+                );
+                cx.notify();
+            }
+        }
+    }
+
+    pub(crate) fn select(
         &mut self,
         connection: Entity<Connection>,
         window: &mut Window,
@@ -663,7 +725,8 @@ impl OpenGraphModal {
 
     fn render_servers(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let connections = self.connections.clone();
-        let organizations = crate::organizations::render(&self.planes, &self.managed, cx);
+        let organizations =
+            crate::organizations::render(&self.planes, &self.managed, self.cursor.as_ref(), cx);
         // A third of the wide modal; the graphs take the rest.
         v_flex()
             .w(px(size::MODAL_WIDE / 3.))
@@ -1209,6 +1272,14 @@ fn tooltip_for(
     profile: Option<&str>,
     platform: Platform,
 ) -> String {
+    if *source == ServerSource::ControlPlane {
+        return format!(
+            "Studio asks the organization's control plane for this cluster's token, keeps it in \
+             memory and asks again before it ends. Opened for this run: to keep it, add it as a \
+             CLI target with `omnigraph target add {name} --cluster <id> --profile {}`.",
+            profile.unwrap_or("<profile>")
+        );
+    }
     if let Some(profile) = profile {
         return format!(
             "Studio uses the token the Omnigraph CLI gives for this cluster from its profile \
@@ -1230,7 +1301,7 @@ fn tooltip_for(
              yet ({}), so the CLI cannot keep this one for it.",
             cli_config::PIPE_ONLY
         ),
-        ServerSource::Environment => "Used until Studio quits.".into(),
+        ServerSource::Environment | ServerSource::ControlPlane => "Used until Studio quits.".into(),
     }
 }
 
@@ -1241,6 +1312,7 @@ fn source_label(source: &ServerSource, profile: Option<&str>) -> String {
         (ServerSource::Cli, Some(profile)) => format!("CLI target, CLI profile {profile}"),
         (ServerSource::Cli, None) => "CLI target".to_owned(),
         (ServerSource::Environment, _) => "environment".to_owned(),
+        (ServerSource::ControlPlane, _) => "from the control plane, for this run".to_owned(),
     }
 }
 
@@ -2167,6 +2239,45 @@ mod tests {
         assert!(cx.debug_bounds("control-plane-sign-in").is_some());
         assert!(cx.debug_bounds("control-plane-clusters").is_none());
         assert!(plane.read_with(cx, |plane, _| plane.listing().is_none()));
+    }
+
+    /// ↓ from the last server reaches a control plane's line, before the chosen server's
+    /// graphs; ↵ there asks the plane to sign in (constitution VIII).
+    #[gpui::test]
+    fn the_keyboard_reaches_a_control_plane(cx: &mut TestAppContext) {
+        let alpha = server(&["one"], cx);
+        let (modal, cx) = dialog(vec![alpha.clone()], cx);
+        let plane = cx.new(|cx| {
+            ControlPlane::new(
+                "https://control.test".into(),
+                "org_1".into(),
+                vec!["work".into()],
+                None,
+                cx,
+            )
+        });
+        modal.update(cx, |modal, cx| {
+            modal.follow_planes(vec![plane.clone()], Vec::new(), cx)
+        });
+        let places = modal.read_with(cx, |modal, cx| modal.places(cx));
+        assert_eq!(
+            places[..2],
+            [
+                Place::Server(alpha.entity_id()),
+                Place::Plane(plane.entity_id())
+            ]
+        );
+        cx.dispatch_action(menu::SelectNext);
+        assert_eq!(
+            modal.read_with(cx, |modal, _| modal.cursor.clone()),
+            Some(Place::Plane(plane.entity_id()))
+        );
+        // Without a sign-in context there is nothing to sign in with: ↵ leaves it offered.
+        cx.dispatch_action(menu::Confirm);
+        assert!(plane.read_with(cx, |plane, _| matches!(
+            plane.sign_in_state(),
+            SignIn::Offered { .. }
+        )));
     }
 
     /// A server with more graphs than the dialog holds scrolls them within it: the id field and
