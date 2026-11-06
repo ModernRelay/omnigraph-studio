@@ -9,8 +9,10 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use control_client::{ClusterList, ControlClient, ControlError, Envelope};
-use gpui::{Context, Task};
+use control_client::{
+    ClusterDetail, ClusterList, ClusterStatus, ControlClient, ControlError, Envelope,
+};
+use gpui::{App, AppContext as _, Context, Entity, Task};
 use http_client::HttpClient;
 use oauth_client::{Clients, Refusal};
 
@@ -386,6 +388,185 @@ impl ControlPlane {
     }
 }
 
+/// How often a cluster's status is read while its card shows (spec 021, Limits).
+const STATUS_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A cluster's state and latest delivery, read while the connection chip's card shows it: once,
+/// then every 30 seconds, until the card closes and lets this go (spec 021, A cluster's state).
+pub struct ClusterCard {
+    pub cluster_id: String,
+    detail: Option<Result<Envelope<ClusterDetail>, ControlError>>,
+    status: Option<Result<Envelope<ClusterStatus>, ControlError>>,
+    _reading: Task<()>,
+}
+
+impl ClusterCard {
+    /// The card's lines, as the person reads them: the cluster's state, then its latest
+    /// delivery and when the control plane observed it ("as of …" when its answer is stale).
+    pub fn lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        match &self.detail {
+            Some(Ok(detail)) => lines.push(format!(
+                "{} · {}",
+                detail.data.cluster.name,
+                sentence_case(&detail.data.cluster.state)
+            )),
+            Some(Err(error)) => lines.push(error.to_string()),
+            None => lines.push("Reading the cluster's state…".to_owned()),
+        }
+        match &self.status {
+            Some(Ok(status)) => {
+                let observed = ago(&status.meta.observed_at);
+                let line = match &status.data.delivery {
+                    Some(delivery) => format!(
+                        "Latest deployment {} · observed {observed}",
+                        delivery.delivery.replace('_', " ")
+                    ),
+                    None => format!("No deployment yet · observed {observed}"),
+                };
+                lines.push(if status.meta.stale {
+                    format!("{line} (as of {})", status.meta.observed_at)
+                } else {
+                    line
+                });
+            }
+            Some(Err(error)) if self.detail.as_ref().is_some_and(Result::is_ok) => {
+                lines.push(error.to_string())
+            }
+            _ => {}
+        }
+        lines
+    }
+}
+
+impl ControlPlane {
+    /// A card reading the cluster `cluster_id`'s state while it is held; `None` without a
+    /// sign-in, so nothing is sent.
+    pub fn card(
+        plane: &Entity<Self>,
+        cluster_id: String,
+        cx: &mut App,
+    ) -> Option<Entity<ClusterCard>> {
+        let (source, route, http) = {
+            let plane = plane.read(cx);
+            (
+                plane.oauth.clone()?,
+                plane.route.clone(),
+                plane.context.as_ref()?.elsewhere.clone(),
+            )
+        };
+        Some(cx.new(|cx: &mut Context<ClusterCard>| {
+            let id = cluster_id.clone();
+            let reading = cx.spawn(async move |card, cx| {
+                let detail = with_access(&http, &route, &source, |client| {
+                    let id = id.clone();
+                    async move { client.cluster(&id).await }
+                })
+                .await;
+                if card
+                    .update(cx, |card, cx| {
+                        card.detail = Some(detail);
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                loop {
+                    let status = with_access(&http, &route, &source, |client| {
+                        let id = id.clone();
+                        async move { client.status(&id).await }
+                    })
+                    .await;
+                    if card
+                        .update(cx, |card, cx| {
+                            card.status = Some(status);
+                            cx.notify();
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    cx.background_executor().timer(STATUS_EVERY).await;
+                }
+            });
+            ClusterCard {
+                cluster_id,
+                detail: None,
+                status: None,
+                _reading: reading,
+            }
+        }))
+    }
+}
+
+/// One request with the sign-in's access token, and one silent refresh after a 401.
+async fn with_access<T, F, Fut>(
+    http: &Arc<dyn HttpClient>,
+    route: &str,
+    source: &OAuthSource,
+    request: F,
+) -> Result<T, ControlError>
+where
+    F: Fn(ControlClient) -> Fut,
+    Fut: std::future::Future<Output = Result<T, ControlError>>,
+{
+    let mut refreshed = false;
+    loop {
+        let token = source
+            .token(Arc::new(AtomicBool::new(false)))
+            .await
+            .map_err(|no| {
+                if no.passing {
+                    ControlError::Unavailable {
+                        status: None,
+                        why: no.why,
+                    }
+                } else {
+                    ControlError::Unauthenticated(None)
+                }
+            })?;
+        let answer = request(ControlClient::new(
+            http.clone(),
+            route,
+            token.into_string(),
+        )?)
+        .await;
+        match answer {
+            Err(ControlError::Unauthenticated(_)) if !refreshed => {
+                refreshed = true;
+                source.note_refused();
+            }
+            answer => return answer,
+        }
+    }
+}
+
+/// `state` as the person reads it: the first letter up, `_` as a space.
+fn sentence_case(state: &str) -> String {
+    let words = state.replace('_', " ");
+    let mut chars = words.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => "Unknown state".to_owned(),
+    }
+}
+
+/// How long ago the RFC 3339 time `at` was, in words: "just now", "12 min ago", "3 h ago", or
+/// the time as given when it does not parse.
+fn ago(at: &str) -> String {
+    let Ok(then) = chrono::DateTime::parse_from_rfc3339(at) else {
+        return at.to_owned();
+    };
+    let seconds = (chrono::Utc::now() - then.with_timezone(&chrono::Utc)).num_seconds();
+    match seconds {
+        s if s < 60 => "just now".to_owned(),
+        s if s < 3600 => format!("{} min ago", s / 60),
+        s if s < 86_400 => format!("{} h ago", s / 3600),
+        s => format!("{} d ago", s / 86_400),
+    }
+}
+
 /// The keychain item of the sign-in to the control plane at `route` for `organization`.
 pub fn key(route: &str, organization: &str) -> String {
     format!("omnigraph-control:{route}#{organization}")
@@ -456,7 +637,7 @@ mod tests {
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use futures::AsyncReadExt as _;
-    use gpui::{AppContext as _, Entity, TestAppContext};
+    use gpui::{Entity, TestAppContext};
     use http_client::http::Response;
     use http_client::{AsyncBody, FakeHttpClient};
     use oauth_client::ClientIdentities;
@@ -596,6 +777,40 @@ mod tests {
                     json!({"type": "unauthenticated", "title": "Unauthenticated", "status": 401}),
                 ),
             },
+            ("GET", u)
+                if u == format!("{ROUTE}/v1/clusters/01C")
+                    && bearer.as_ref().is_some_and(|t| served.accepted.contains(t)) =>
+            {
+                let mut detail = cluster();
+                detail["service_observation"] = json!({
+                    "cluster_id": "01C", "incarnation": "01I", "lifecycle_provenance": "service_db",
+                    "lifecycle_state": "ready", "latest_operation_id": null, "latest_operation_kind": null,
+                    "latest_operation_state": null, "latest_operation_created_at": null, "deletion_id": null,
+                    "undo_deadline": null, "cleanup_requires_zero_retention": null,
+                    "health_provenance": "telemetry", "observed_at": null, "freshness": "fresh",
+                    "serving_health": "ready", "backup": null, "observability_url": null,
+                });
+                served.log.push("detail".into());
+                (
+                    200,
+                    json!({"data": detail, "meta": {"provenance": "service_db", "assurance": "observed", "stale": false, "observed_at": "2026-11-05T00:00:00Z"}}),
+                )
+            }
+            ("GET", u)
+                if u == format!("{ROUTE}/v1/clusters/01C/status")
+                    && bearer.as_ref().is_some_and(|t| served.accepted.contains(t)) =>
+            {
+                served.log.push("status".into());
+                (
+                    200,
+                    json!({
+                        "data": {"cluster_id": "01C", "incarnation": "01I", "source": {}, "requested": null, "observed": null,
+                                 "delivery": {"deployment_id": "d", "native_deployment_id": "n", "preview_id": "p",
+                                              "delivery": "converged", "archive": "a", "first_attempt_deadline": "2026-11-05T00:00:00Z", "observation": {}}},
+                        "meta": {"provenance": "service_db", "assurance": "observed", "stale": true, "observed_at": "2026-11-05T00:00:00Z"},
+                    }),
+                )
+            }
             ("GET", u) if u == format!("{ROUTE}/v1/clusters") => match bearer {
                 Some(token) if served.accepted.contains(&token) => (
                     200,
@@ -904,6 +1119,50 @@ mod tests {
         cx.run_until_parked();
         let token = smol::block_on(source.token(Arc::default())).unwrap();
         assert_eq!(token.into_string(), "from-the-cli");
+    }
+
+    #[gpui::test]
+    fn a_clusters_card_reads_its_state_and_latest_deployment(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let served = Arc::new(Mutex::new(Served::default()));
+        let unsigned = plane(context(&served, Arc::new(MemoryKeychain::default())), cx);
+        cx.run_until_parked();
+        assert!(
+            cx.update(|cx| ControlPlane::card(&unsigned, "01C".into(), cx))
+                .is_none()
+        );
+        assert!(served.lock().unwrap().requests.is_empty());
+
+        served.lock().unwrap().refresh.insert("kept".into());
+        let keychain = Arc::new(MemoryKeychain::default());
+        keychain
+            .items
+            .lock()
+            .unwrap()
+            .insert(key(ROUTE, ORG), ("user_1".into(), b"kept".to_vec()));
+        let plane = plane(context(&served, keychain), cx);
+        until(cx, "the kept sign-in", |cx| signed_in(&plane, cx));
+        let card = cx
+            .update(|cx| ControlPlane::card(&plane, "01C".into(), cx))
+            .unwrap();
+        until(cx, "the card", |cx| {
+            card.read_with(cx, |card, _| card.lines().len() == 2)
+        });
+        let lines = card.read_with(cx, |card, _| card.lines());
+        assert_eq!(lines[0], "acme · Ready");
+        assert!(
+            lines[1].starts_with("Latest deployment converged · observed "),
+            "{}",
+            lines[1]
+        );
+        assert!(
+            lines[1].ends_with("(as of 2026-11-05T00:00:00Z)"),
+            "{}",
+            lines[1]
+        );
+        let log = served.lock().unwrap().log.clone();
+        assert_eq!(log.iter().filter(|l| *l == "detail").count(), 1);
+        assert_eq!(log.iter().filter(|l| *l == "status").count(), 1);
     }
 
     #[gpui::test]

@@ -3,8 +3,8 @@
 Status: in progress; the control plane accepts Studio's sign-in (CP1, live 2026-11-05).
 Built: `control_client`; a profile's control-plane sign-in and its cluster list in the Open
 dialog, on the keyboard's path; data tokens from the control plane; a cluster no CLI target
-names opened for this run. Not yet: a cluster's state in the connection chip, and managed
-clusters on Windows (the CLI's listing lands none there) · 2026-11-05
+names opened for this run; a cluster's state and latest deployment in the connection chip's
+card. Not yet: managed clusters on Windows, where the CLI's listing lands none · 2026-11-05
 
 ## Problem
 

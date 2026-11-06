@@ -92,6 +92,9 @@ pub struct ConnectionRegistry {
     pub control_planes: Vec<Entity<ControlPlane>>,
     /// The managed targets as the CLI last listed them, landed or not: which cluster each names.
     pub managed_targets: Vec<ManagedTarget>,
+    /// The clusters opened from a control plane's list for this run: each connection, its
+    /// control plane and its `cluster_id`.
+    opened: Vec<(gpui::EntityId, Entity<ControlPlane>, String)>,
     /// Why the environment's server could not be added at start, which stays one of the
     /// [`Self::notices`] for the run.
     environment_notice: Option<String>,
@@ -563,6 +566,7 @@ impl ConnectionRegistry {
             known: KnownGraphs::default(),
             control_planes: Vec::new(),
             managed_targets: Vec::new(),
+            opened: Vec::new(),
             sign_in: None,
             saving: false,
             _watch: None,
@@ -831,8 +835,39 @@ impl ConnectionRegistry {
             .with_sign_in(self.sign_in.clone());
         let connection = cx.new(|_| connection);
         self.connections.push(connection.clone());
+        self.opened.push((
+            connection.entity_id(),
+            plane.clone(),
+            cluster.cluster_id.clone(),
+        ));
         cx.notify();
         Some(connection)
+    }
+
+    /// The control plane and `cluster_id` of `connection`'s cluster, when it is a managed
+    /// cluster: a CLI target's, by the target's profile, or one opened from a list.
+    pub fn control_cluster(
+        &self,
+        connection: &Entity<Connection>,
+        cx: &App,
+    ) -> Option<(Entity<ControlPlane>, String)> {
+        let id = connection.entity_id();
+        if let Some((_, plane, cluster)) = self.opened.iter().find(|(opened, ..)| *opened == id) {
+            return Some((plane.clone(), cluster.clone()));
+        }
+        let server = &connection.read(cx).server;
+        if server.source != ServerSource::Cli {
+            return None;
+        }
+        let target = self
+            .managed_targets
+            .iter()
+            .find(|target| target.name == server.name)?;
+        let plane = self
+            .control_planes
+            .iter()
+            .find(|plane| plane.read(cx).profiles.contains(&target.profile))?;
+        Some((plane.clone(), target.cluster_id.clone()))
     }
 
     /// The token source of the CLI server `server`: the CLI's export, which a managed target

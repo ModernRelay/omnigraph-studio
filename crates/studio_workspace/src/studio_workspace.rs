@@ -27,8 +27,8 @@ use gpui::{
     WindowControlArea, WindowHandle, deferred, div, point,
 };
 use graph_store::{
-    AccessAction, AccessScope, ConnectionRegistry, ConnectionState, GraphSession, Loadable,
-    OutcomeKind, SessionEvent,
+    AccessAction, AccessScope, ConnectionRegistry, ConnectionState, ControlPlane, GraphSession,
+    Loadable, OutcomeKind, SessionEvent,
 };
 use studio_actions::graph::{
     OpenAsCanvas, OpenAsHistory, OpenAsMap, OpenAsPage, OpenAsReview, OpenAsSource, OpenAsTable,
@@ -3515,40 +3515,68 @@ impl Workspace {
                 studio_ui::clause(reason)
             );
         }
-        let trigger = ButtonLike::new("graph-switcher")
-            .tip(studio_ui::ds::tooltip(tooltip))
-            .child(
-                h_flex()
-                    .px(px(studio_ui::ds::space::XS))
-                    .gap(px(studio_ui::ds::space::SM))
-                    .items_center()
-                    // A ready server's dot beats while the window is in front.
-                    .child(studio_ui::ds::live_dot(
-                        "connection-dot",
-                        color.color(cx),
-                        self._beats.is_some().then_some(self.beat),
-                        cx,
-                    ))
-                    .child(studio_ui::ds::text::muted(server).single_line())
-                    .when_some(graph, |row, graph| {
-                        row.child(studio_ui::ds::text::body("/").color(Color::Disabled))
-                            .child(studio_ui::ds::text::body(graph).single_line())
-                    })
-                    .when(unavailable.is_some(), |row| {
-                        row.child(studio_ui::ds::dot(Color::Warning))
-                    })
-                    // Ready, the dot says so; anything else is spelled out.
-                    .when(!ready, |row| {
-                        row.child(studio_ui::ds::text::muted(state).single_line())
-                    })
-                    .when(others > 0, |row| {
-                        row.child(studio_ui::ds::sidebar_count(format!(
-                            "+{}",
-                            studio_ui::plural(others, "graph", "graphs")
-                        )))
-                    })
-                    .child(studio_ui::ds::icon::meta(IconName::ChevronUpDown)),
-            );
+        // A managed cluster's card also says its state and latest deployment, read while it shows
+        // (spec 021, A cluster's state).
+        let cluster = self.session.as_ref().and_then(|session| {
+            let connection = session.read(cx).connection.clone();
+            ConnectionRegistry::try_global(cx)?
+                .read(cx)
+                .control_cluster(&connection, cx)
+        });
+        let trigger = ButtonLike::new("graph-switcher");
+        let trigger = match cluster {
+            Some((plane, cluster_id)) => trigger.tip_fn(move |_, cx| {
+                let content = studio_ui::ds::tooltip(tooltip.clone());
+                match ControlPlane::card(&plane, cluster_id.clone(), cx) {
+                    Some(card) => content
+                        .detail(move |cx| {
+                            v_flex()
+                                .children(
+                                    card.read(cx)
+                                        .lines()
+                                        .into_iter()
+                                        .map(studio_ui::ds::text::meta),
+                                )
+                                .into_any_element()
+                        })
+                        .into_view(cx),
+                    None => content.into_view(cx),
+                }
+            }),
+            None => trigger.tip(studio_ui::ds::tooltip(tooltip)),
+        };
+        let trigger = trigger.child(
+            h_flex()
+                .px(px(studio_ui::ds::space::XS))
+                .gap(px(studio_ui::ds::space::SM))
+                .items_center()
+                // A ready server's dot beats while the window is in front.
+                .child(studio_ui::ds::live_dot(
+                    "connection-dot",
+                    color.color(cx),
+                    self._beats.is_some().then_some(self.beat),
+                    cx,
+                ))
+                .child(studio_ui::ds::text::muted(server).single_line())
+                .when_some(graph, |row, graph| {
+                    row.child(studio_ui::ds::text::body("/").color(Color::Disabled))
+                        .child(studio_ui::ds::text::body(graph).single_line())
+                })
+                .when(unavailable.is_some(), |row| {
+                    row.child(studio_ui::ds::dot(Color::Warning))
+                })
+                // Ready, the dot says so; anything else is spelled out.
+                .when(!ready, |row| {
+                    row.child(studio_ui::ds::text::muted(state).single_line())
+                })
+                .when(others > 0, |row| {
+                    row.child(studio_ui::ds::sidebar_count(format!(
+                        "+{}",
+                        studio_ui::plural(others, "graph", "graphs")
+                    )))
+                })
+                .child(studio_ui::ds::icon::meta(IconName::ChevronUpDown)),
+        );
         PopoverMenu::new("graph-switcher-menu")
             .anchor(gpui::Anchor::TopLeft)
             .attach(gpui::Anchor::BottomLeft)
