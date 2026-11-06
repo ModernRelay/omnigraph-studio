@@ -485,7 +485,10 @@ fn render_listing(
                         }));
                 }
                 rows.push(if shown.dimmed {
-                    div().opacity(0.5).child(item).into_any_element()
+                    div()
+                        .opacity(ds::opacity::DIMMED)
+                        .child(item)
+                        .into_any_element()
                 } else {
                     item.into_any_element()
                 });
