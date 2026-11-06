@@ -458,6 +458,7 @@ mod tests {
                 "Browsing",
                 "Connection",
                 "Updates",
+                "Omnigraph Cloud",
                 "Agent",
                 "Models"
             ]

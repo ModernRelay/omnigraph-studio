@@ -169,7 +169,7 @@ pub(crate) fn missing_targets<'a>(
 }
 
 /// A cluster's `state` as the person reads it: the first letter up, `_` as a space.
-fn state_label(state: &str) -> String {
+pub(crate) fn state_label(state: &str) -> String {
     let words = state.replace('_', " ");
     let mut chars = words.chars();
     match chars.next() {
@@ -305,7 +305,7 @@ pub(crate) fn nav(
 }
 
 /// What a control plane is called in the sidebar: Omnigraph Cloud, or its host.
-fn plane_name(route: &str, cloud: bool) -> String {
+pub(crate) fn plane_name(route: &str, cloud: bool) -> String {
     if cloud {
         "Omnigraph Cloud".to_owned()
     } else {
@@ -608,7 +608,7 @@ fn organization_pane(
 }
 
 /// "1 purged cluster not shown", "5 purged clusters not shown".
-fn purged_note(purged: usize) -> String {
+pub(crate) fn purged_note(purged: usize) -> String {
     match purged {
         1 => "1 purged cluster not shown".to_owned(),
         n => format!("{n} purged clusters not shown"),
@@ -616,7 +616,7 @@ fn purged_note(purged: usize) -> String {
 }
 
 /// A cluster's dot: green when ready, amber while it changes, grey otherwise.
-fn state_color(state: &str) -> Color {
+pub(crate) fn state_color(state: &str) -> Color {
     match state {
         "ready" => Color::Success,
         "provisioning" | "updating" | "restoring" | "pausing" | "resuming" => Color::Warning,
@@ -629,7 +629,7 @@ pub(crate) fn is_purged(cluster: &ClusterView) -> bool {
     cluster.state == "purged"
 }
 
-fn oauth_host(route: &str) -> String {
+pub(crate) fn oauth_host(route: &str) -> String {
     url::Url::parse(route)
         .ok()
         .and_then(|url| url.host_str().map(str::to_owned))

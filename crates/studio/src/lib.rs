@@ -3,6 +3,7 @@
 
 mod about;
 mod activity;
+mod cloud_settings;
 pub mod deep_link;
 #[cfg(debug_assertions)]
 mod design_gallery;

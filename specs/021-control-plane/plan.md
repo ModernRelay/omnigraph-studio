@@ -161,6 +161,25 @@ a sign-in on the web for each organization. Without a control-plane sign-in, a c
 offers its own is signed in to as before. When the plane signs in later, a cluster that asked
 for its own sign-in and holds none takes the plane's token; one that holds a sign-in keeps it.
 
+### The settings page
+
+Settings has an Omnigraph Cloud section: the `omnigraph_cloud` address, and under it, for each
+control plane Studio holds:
+
+- **Account.** What the sign-in holds, with Sign in, Cancel, or Sign out and Refresh, and the
+  CLI profiles that use the plane.
+- **Each organization**, by name, with the CLI profiles in it, and a card of its clusters (purged
+  ones counted, not listed). A cluster shows its state and CLI target, Copy MCP link, and its MCP
+  link, data endpoint, id and repository, each copied with a click.
+- **Manage**, on each cluster, opens a section under it, one cluster at a time: its state and
+  latest delivery, read as the connection chip's card reads them while the section is open, and
+  the CLI command for each change Studio does not make (VI): status, history, push, plan, apply
+  and delete, through the CLI target that names the cluster, or first the `omnigraph target add`
+  that keeps it as one. Making these changes in Studio is spec 022.
+
+The lists are read when the section shows and let go when it no longer does, as the Open
+dialog's are. Nothing is read on a timer.
+
 ### Errors
 
 | Answer | Shown |
@@ -257,7 +276,7 @@ of the client, cluster sign-ins included.
 
 - Deployment history, plans and the delivery event stream (`/history`, `/plans`,
   `/deployments/{id}/events`) as a view.
-- Cluster create, adopt, delete and undo; configuration push; members and invitations.
+- Cluster create, adopt, delete and undo; configuration push; members and invitations: spec 022.
 - `observed` in a cluster's status, until the document types it.
 - Managed agents reaching a cluster's `mcp_url` through Studio's sign-in (spec 016, A3).
 - No Omnigraph engine change is needed; nothing here goes in
@@ -341,6 +360,7 @@ of the client, cluster sign-ins included.
 | 2026-11-05 | The authorize request cannot name an organization | WorkOS Connect reference, `GET /oauth2/authorize` | Parameters: `client_id`, `nonce`, `redirect_uri`, `response_type`, `scope`, `state`, PKCE. No organization, no `prompt`: `prompt=login` asking is undocumented |
 | 2026-11-05 | A person has one organization through Studio's client at a time, and every token of it follows | WorkOS Connect reference, token exchange ("`org_id` reflects the organization currently associated with the user's consent"); a live experiment: a sign-in in A, a second choosing B, then a refresh of each | Both sign-ins shared one consent (`sid`); the refresh of the token issued in A named B. Cluster sign-ins (spec 016) use the same client and consent |
 | 2026-11-05 | The control plane scopes every request to the token's `org_id` | Its source, read with its owners' access | Membership of `org_id` checked; no request names an organization; nothing lists a person's organizations |
+| 2026-11-06 | The settings page copies a cluster's MCP link and lets its lists go | `cargo test -p studio the_page_copies_a_clusters_mcp_link` | The click puts `https://acme.test/mcp` on the clipboard; hidden, the plane holds no organizations |
 | 2026-11-06 | A control plane's sign-in is preferred over a cluster's own | `cargo test -p graph_store a_control_plane_sign_in_is_preferred`, which fails with the preference removed | The plane's token connects a cluster that offers its own sign-in, made before or after the plane signed in, and one that offered its own already; nothing opens a browser |
 
 ## Corrections

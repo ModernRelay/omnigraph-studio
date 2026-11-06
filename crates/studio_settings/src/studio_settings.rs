@@ -427,7 +427,7 @@ pub struct StudioSettings {
     pub omnigraph_cli: Option<String>,
     /// The Omnigraph Cloud control plane Studio offers to sign in to and lists the clusters of,
     /// besides those your CLI profiles name. Empty turns it off.
-    #[schemars(title = "Omnigraph Cloud", extend("x-section" = "Connection"))]
+    #[schemars(title = "Address", extend("x-section" = "Omnigraph Cloud"))]
     pub omnigraph_cloud: String,
     #[schemars(extend("x-section" = "Agent"))]
     pub agent: AgentSettings,

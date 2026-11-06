@@ -49,6 +49,10 @@ pub struct SettingsView {
     key_test: Option<Task<()>>,
     /// The settings as values, read again when they change rather than at every frame.
     values: SettingsValues,
+    /// The Omnigraph Cloud page's account and clusters (spec 021), under its address.
+    cloud: Entity<crate::cloud_settings::CloudPage>,
+    /// Whether that page showed at the last draw: its lists are held only while it does.
+    cloud_shown: bool,
     /// The window's graph changing, which the tab follows.
     _workspace_subscription: Option<Subscription>,
     /// The session's schema changing, which "Node names" lists the types of.
@@ -67,6 +71,10 @@ type Options = Rc<[(SharedString, Value)]>;
 
 /// The section naming each type's nodes (spec 002, "Node names"), offered with a graph open.
 const NODE_NAMES: &str = "Node names";
+
+/// The section of the Omnigraph Cloud address, which also shows its account and clusters
+/// (spec 021, The settings page).
+const CLOUD: &str = "Omnigraph Cloud";
 
 /// A text setting's field. It writes when the person presses Enter or leaves it, not on every
 /// key, and when the tab closes or Studio quits with typing in it; it shows the setting's value
@@ -204,6 +212,8 @@ impl SettingsView {
             key_notice: None,
             key_test: None,
             values: StudioSettings::get(cx).values(),
+            cloud: cx.new(crate::cloud_settings::CloudPage::new),
+            cloud_shown: false,
             _workspace_subscription: None,
             _session_subscription: None,
             _subscriptions: subscriptions,
@@ -1011,6 +1021,13 @@ impl Render for SettingsView {
                 )
             })
             .filter(|(_, rows)| !rows.is_empty());
+        // The Omnigraph Cloud page holds its lists only while it shows.
+        let cloud_shown = !searching && chosen == CLOUD;
+        if cloud_shown != self.cloud_shown {
+            self.cloud_shown = cloud_shown;
+            let cloud = self.cloud.clone();
+            cx.defer(move |cx| cloud.update(cx, |page, cx| page.set_shown(cloud_shown, cx)));
+        }
         let empty = groups.is_empty() && node_names.is_none();
         let body = v_flex()
             .w_full()
@@ -1087,6 +1104,7 @@ impl Render for SettingsView {
                     )))
                     .child(ds::card(cx).px(px(space::XL)).children(rows))
             }))
+            .when(cloud_shown, |body| body.child(self.cloud.clone()))
             .when(empty, |body| {
                 body.child(
                     div()
