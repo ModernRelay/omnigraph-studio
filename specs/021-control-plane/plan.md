@@ -267,6 +267,7 @@ only to the endpoint it names." `docs/architecture.md`'s layer table gains the c
 | 2026-11-03 | The CLI lists a profile's clusters, and needs a current login to | `omnigraph cluster list --profile NAME --json` | `refresh_outcome_unknown`: the login could not be renewed without a terminal |
 | 2026-11-05 | The API is an OAuth resource with RFC 9728 metadata (CP1) | `curl https://platform.omnigraph.dev/.well-known/oauth-protected-resource`, and `GET /v1/clusters` without a bearer | 200: `resource: https://platform.omnigraph.dev`, `authorization_servers: ["https://login.platform.omnigraph.dev"]`, `bearer_methods_supported: ["header"]`; 401 with `WWW-Authenticate: Bearer resource_metadata="https://platform.omnigraph.dev/.well-known/oauth-protected-resource"` |
 | 2026-11-05 | The API accepts a token issued to Studio's client (CP1) | A live sign-in as Studio's client (PKCE S256, loopback redirect, `resource=https://platform.omnigraph.dev`), then `GET /v1/clusters` with the access token; claims decoded locally, the token neither printed nor kept | A refresh token issued; `aud` the API's resource, `iss` the OAuth server; `GET /v1/clusters` 200 |
+| 2026-11-05 | `control_client`'s types and routes match the live document | `/openapi.json` pinned as `crates/control_client/openapi/control-plane-0.1.0.json`; `cargo test -p control_client` | Still `0.1.0`, now 37 routes (39 on 2026-11-03; the four Studio sends unchanged); every declared field and enum value in the document, every required one declared |
 
 ## Corrections
 

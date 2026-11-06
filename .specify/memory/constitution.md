@@ -1,8 +1,8 @@
 # Omnigraph Studio constitution
 
-Version 1.3.0 · ratified 2026-10-11 · amended 2026-10-17 (IV: ↵ and Undo for what Studio can
+Version 1.4.0 · ratified 2026-10-11 · amended 2026-10-17 (IV: ↵ and Undo for what Studio can
 put back) · amended 2026-10-18 (IV: ↵ for what loses no data) · amended 2026-10-22 (I: the
-updater's requests) · amended 2026-10-24 (X: Omnigraph `v0.14.0` and later) · amended 2026-10-30 (I: model calls) · amended 2026-11-01 (XIII: one rule for what a pick does)
+updater's requests) · amended 2026-10-24 (X: Omnigraph `v0.14.0` and later) · amended 2026-10-30 (I: model calls) · amended 2026-11-01 (XIII: one rule for what a pick does) · amended 2026-11-05 (I: control-plane calls)
 
 Omnigraph Studio is a native desktop app for exploring and changing Omnigraph graphs: type
 tables, a relationship tree, a graph canvas, a `.gq` query editor, branches, review, merge and
@@ -19,7 +19,9 @@ offline; parsing is language intelligence, not data access.
 *In practice:* one client crate owns every request to a server. Every request sends the
 `omnigraph-http-api` contract header and every response is checked for it. `studio_update`
 alone fetches Studio's own releases (spec 017), and `model` alone calls OpenRouter, with a
-task's input and never a graph token (spec 019). A response without the contract header has
+task's input and never a graph token (spec 019). `control_client` alone calls a managed
+control plane, with a control-plane token and never a graph token; a data token it is given
+goes only to the endpoint it names (spec 021). A response without the contract header has
 an unknown effect.
 
 ## II. One snapshot per view

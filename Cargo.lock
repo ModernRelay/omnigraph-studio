@@ -1865,6 +1865,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "control_client"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "futures",
+ "http_client",
+ "serde",
+ "serde_json",
+ "smol",
+ "url",
+]
+
+[[package]]
 name = "convert_case"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
