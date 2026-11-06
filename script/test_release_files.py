@@ -43,6 +43,14 @@ class ReleaseFiles(unittest.TestCase):
         self.assertFalse((self.dist / "Omnigraph-Studio-arm64.app.tar.gz").exists(),
                          "the update file is found through latest.json, not by name")
 
+    def test_an_edge_build_carries_only_the_version_free_files(self):
+        into = self.dist / "edge"
+        into.mkdir()
+        release_files.stable_copies(self.dist, "0.3.0", into)
+        self.assertEqual(sorted(p.name for p in into.iterdir()), sorted(
+            stable for stable, _ in release_files.FIRST_INSTALL),
+            "no update archive and no latest.json, so no updater installs it")
+
     def test_a_missing_first_install_file_stops_the_release(self):
         (self.dist / "omnigraph-studio-0.3.0-windows-x86_64.zip").unlink()
         with self.assertRaises(SystemExit):

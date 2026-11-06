@@ -10,6 +10,11 @@ sign` writes as base64). While the committed update key is empty no platform is 
 update to install, and Studio offers the download instead; once it holds the key, a release
 without the `.sig` stops here, since every Studio would otherwise stop updating without a
 word. GITHUB_REPOSITORY names the repository.
+
+    script/release-files.py --edge built 0.4.0 dist
+
+writes only the version-free first-install files, into `dist`, for the `edge` release: no
+version names, no update archive and no latest.json, so an edge build reaches no updater.
 """
 import datetime
 import json
@@ -32,12 +37,14 @@ UPDATES = [
 ]
 
 
-def stable_copies(dist, version):
+def stable_copies(dist, version, into=None):
+    """Copy each first-install file to its version-free name, in `into` (default `dist`)."""
+    into = into or dist
     for stable, versioned in FIRST_INSTALL:
         source = dist / versioned.format(v=version)
         if not source.is_file():
             sys.exit(f"release-files: {source.name} is missing; every release carries it")
-        shutil.copyfile(source, dist / stable)
+        shutil.copyfile(source, into / stable)
 
 
 def manifest(dist, version, repository, date, keyed=False):
@@ -65,8 +72,15 @@ def manifest(dist, version, repository, date, keyed=False):
 
 
 def main():
+    if len(sys.argv) == 5 and sys.argv[1] == "--edge":
+        built, version, into = pathlib.Path(sys.argv[2]), sys.argv[3], pathlib.Path(sys.argv[4])
+        into.mkdir(parents=True, exist_ok=True)
+        stable_copies(built, version, into)
+        print(f"edge: {len(FIRST_INSTALL)} version-free files of {version}")
+        return
     if len(sys.argv) != 4:
-        sys.exit("usage: script/release-files.py <dist> <version> <update-key.pub>")
+        sys.exit("usage: script/release-files.py <dist> <version> <update-key.pub>\n"
+                 "       script/release-files.py --edge <built> <version> <dist>")
     dist, version = pathlib.Path(sys.argv[1]), sys.argv[2]
     keyed = bool(pathlib.Path(sys.argv[3]).read_text().strip())
     repository = os.environ.get("GITHUB_REPOSITORY", "ModernRelay/omnigraph-studio")

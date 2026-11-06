@@ -7,6 +7,14 @@ name: Release
 # Run it by hand (`gh workflow run release.yml --ref main`) to build the same files without
 # publishing them, to check a release before tagging it.
 #
+# Once a day it builds main's tip and publishes it as the `edge` release, unless `edge` already
+# holds that commit; `gh workflow run release.yml --ref main -f edge=true` does it now. `edge` is
+# a pre-release that is never `latest` and carries no latest.json and no update signature, so
+# no updating Studio and no `omnigraph studio` installs it: it is for people who download it on
+# purpose, at `releases/download/edge/<name>` under the version-free names. Each new edge build
+# replaces the last, release and tag. Main's commits have no CI run of their own (ci.yml runs on
+# pull requests), so an edge build is checked only by building on every platform.
+#
 # macOS builds are signed and notarized when the Apple secrets below are set, and signed ad hoc
 # otherwise. A tag's release is the latest only when they are set: without them it is published
 # as a pre-release, which neither Studio's updater nor `omnigraph studio` reads (both take
@@ -33,7 +41,15 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  schedule:
+    # Daily, off the hour that scheduled workflows crowd.
+    - cron: "41 4 * * *"
   workflow_dispatch:
+    inputs:
+      edge:
+        description: Publish the build as the edge release (main only)
+        type: boolean
+        default: false
 
 # Only the publish job writes; the builds and the signing read.
 permissions:
@@ -44,8 +60,35 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Whether this run publishes an edge build: the schedule, or a dispatch with `edge`, on main,
+  # and only when `edge` does not already hold main's tip.
+  edge:
+    name: Edge
+    if: github.event_name == 'schedule' || inputs.edge
+    runs-on: ubuntu-24.04
+    outputs:
+      publish: ${{ steps.fresh.outputs.publish }}
+    steps:
+      - id: fresh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "$GITHUB_REF" != refs/heads/main ]]; then
+            echo "an edge build is made from main, not $GITHUB_REF" >&2
+            exit 1
+          fi
+          held=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/edge" --jq .object.sha 2>/dev/null || true)
+          if [[ "$held" == "$GITHUB_SHA" ]]; then
+            echo "edge already holds ${GITHUB_SHA::7}; nothing to publish"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
     name: Build (${{ matrix.target }})
+    needs: edge
+    # Every tag and check run builds; an edge run only when it has something to publish.
+    if: ${{ !cancelled() && (needs.edge.result == 'skipped' || needs.edge.outputs.publish == 'true') }}
     strategy:
       fail-fast: false
       matrix:
@@ -174,7 +217,8 @@ jobs:
   sign-update:
     name: Sign the update
     needs: build
-    if: github.event_name == 'push'
+    # `edge` is skipped on a tag, so each job after it names the results it waits on.
+    if: ${{ !cancelled() && github.event_name == 'push' && needs.build.result == 'success' }}
     runs-on: ubuntu-24.04
     environment: update-signing
     steps:
@@ -239,7 +283,7 @@ jobs:
   publish:
     name: Publish
     needs: [build, sign-update]
-    if: github.event_name == 'push'
+    if: ${{ !cancelled() && github.event_name == 'push' && needs.build.result == 'success' && needs.sign-update.result == 'success' }}
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -306,3 +350,61 @@ jobs:
           fi
           gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
             --title "Omnigraph Studio $version" --notes-file notes.md "${flags[@]}"
+
+  # Replaces the `edge` release with this build of main, under the release's version-free names
+  # only. It never writes latest.json, so the edge build reaches no updater.
+  publish-edge:
+    name: Publish edge
+    needs: [edge, build]
+    if: ${{ !cancelled() && needs.edge.outputs.publish == 'true' && needs.build.result == 'success' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: built
+          merge-multiple: true
+
+      - name: Version-free files and checksums
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          python3 script/release-files.py --edge built "$version" dist
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SIGNED: ${{ secrets.APPLE_CERTIFICATE_P12 != '' }}
+        run: |
+          date=$(git show -s --format=%cs HEAD)
+          if [[ "$SIGNED" == "true" ]]; then
+            mac="The macOS app is signed with a Developer ID and notarized."
+          else
+            mac="The macOS app is signed ad hoc, not notarized. macOS blocks it the first time: open System Settings → Privacy & Security and choose Open Anyway, or run \`xattr -dr com.apple.quarantine \"/Applications/Omnigraph Studio.app\"\` after moving it to Applications."
+          fi
+          cat > notes.md <<NOTES
+          Omnigraph Studio built from main at ${GITHUB_SHA::7} ($date). The newest edge build replaces this one every day that main has changed.
+
+          An edge build is checked only by building on every platform, not by the tests a release passes. Studio does not update an edge build to the next edge build: download it again here. Its updater still offers it a full release whose version is newer than its own.
+
+          | File | Platform |
+          |---|---|
+          | \`Omnigraph-Studio-arm64.dmg\` | macOS 11 or later, Apple silicon |
+          | \`omnigraph-studio-linux-x86_64.tar.gz\` | Linux x86_64, glibc 2.35 or later |
+          | \`omnigraph-studio-linux-aarch64.tar.gz\` | Linux arm64, glibc 2.35 or later |
+          | \`omnigraph-studio-windows-x86_64.zip\` | Windows 10 (1809) or later, x86_64 |
+
+          Each is at \`https://github.com/$GITHUB_REPOSITORY/releases/download/edge/<name>\`. \`SHA256SUMS\` lists every file's checksum.
+
+          $mac
+          NOTES
+          # The release and its tag move to this commit: the old ones go first, so the tag is
+          # made again at this commit.
+          gh release delete edge --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes 2>/dev/null || true
+          gh release create edge dist/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Omnigraph Studio edge" --notes-file notes.md --prerelease --latest=false

@@ -124,6 +124,15 @@ them by exchanging its bundle with the update's.
 
 - **Full releases.** A tagged release with a signed app is published without `--prerelease`,
   so GitHub's `latest` names it. A `0.x` version already says that things may change.
+- **Edge builds.** Once a day the release workflow builds main's tip and publishes it as the
+  `edge` pre-release, unless `edge` already holds that commit (`gh workflow run release.yml
+  --ref main -f edge=true` does it now). Each build replaces the last, release and tag. It
+  carries the four first-install files under their version-free names and `SHA256SUMS`, and no
+  update archive, signature or `latest.json`, and is never `latest`, so no updater and no
+  `omnigraph studio` installs it: it is downloaded on purpose, from
+  `releases/download/edge/<name>`. An edge app's updater still offers it a full release newer
+  than the workspace version it was built at. Main's commits have no CI run of their own, so
+  an edge build is checked only by building on every platform (2026-11-05).
 - **Signed, or a pre-release.** With the Apple secrets set, a tag's release fails before
   `gh release create` unless the macOS app passes `codesign --verify --deep --strict` against
   the CLI's requirement with Studio's team, and the disk image passes `xcrun stapler validate`.
@@ -363,7 +372,8 @@ next launch is the new version.
   as an NSIS installer built by it (`format: nsis`), which also gives Windows the package
   identity issue #3 asks for. Both reuse the same manifest and keys.
 - Intel Macs: there is no x86_64 macOS build (issue #3 asks whether to support them).
-- Release channels (beta, nightly), delta updates, and a policy that turns updates off for
+- An edge channel in the updater (an edge Studio offered the next edge build), a beta channel,
+  delta updates, and a policy that turns updates off for
   every person on a machine.
 - Rotating the update key: a new public key ships in a release signed with the old one.
 - No Omnigraph engine change is needed; `docs/deferred-engine-changes.md` is unchanged.
@@ -406,6 +416,7 @@ next launch is the new version.
 | 2026-10-22 | Restart asks as Quit does, and the item, actions and menu are wired | `studio_workspace` `restarting_to_update_with_unsaved_work_asks_first`, `the_status_item_is_drawn_in_the_status_bar`; `studio` `update_status::each_state_says_what_the_spec_says` and the keymap test, which runs `studio::init`; the snapshot example dispatching `studio_update::CheckForUpdates` on `script/dev-server` | A dialog "Restart to update Omnigraph Studio?" naming the unsaved tab; the item drawn; the copy of every state; "Updates are off in a development build." at the right of the status bar |
 | 2026-10-22 | The whole workspace stays green | `cargo test --workspace --no-fail-fast`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all --check`, the layer, spelling and design-token checks | 926 passed, 0 failed, 5 ignored (885 before); the rest clean |
 | 2026-10-22 | The dependencies pass the audit, apart from advisories `main` already has | `cargo deny check` (0.20.2) | Licenses, bans and sources pass. Advisories fail on RUSTSEC-2026-0370 to 0372, 0378, 0379 and 0381 to 0383, in `rustls-webpki` 0.103.15, `wasmtime` 48.0.6, `webpki-roots`, `webpki-root-certs` and `zbus`, every one in `main`'s `Cargo.lock` at the same version |
+| 2026-11-05 | An edge build reaches no updater | `script/release-files.py --edge` on the five built files of 0.4.0; `python3 script/test_release_files.py`; `actionlint .github/workflows/release.yml` | Only the four version-free first-install files, no `.app.tar.gz` and no `latest.json`; 7 tests pass; no new finding beyond the `sha256sum *` note the tag release already has |
 
 ## Corrections
 
