@@ -386,6 +386,24 @@ fn sign_in_line(
     cloud: bool,
     cx: &mut Context<OpenGraphModal>,
 ) -> AnyElement {
+    // After a refused sign-in or a sign-out, the next asks which organization, which takes a
+    // sign-in on the web: the button says so.
+    let choose = plane.read(cx).asks_organization();
+    let (label, tip) = if choose {
+        (
+            "Choose organization",
+            format!(
+                "Opens {host} in your browser, where you sign in again and choose the organization."
+            ),
+        )
+    } else {
+        (
+            "Sign in",
+            format!(
+                "Opens {host} in your browser to sign in to this organization's control plane."
+            ),
+        )
+    };
     let plane = plane.clone();
     v_flex()
         .px(px(space::MD))
@@ -401,14 +419,12 @@ fn sign_in_line(
                     "Sign in to list this organization's clusters"
                 })))
                 .child(
-                    ds::button(SharedString::from(format!("plane-{index}-sign-in")), "Sign in")
+                    ds::button(SharedString::from(format!("plane-{index}-sign-in")), label)
                         .style(ButtonStyle::Subtle)
-                        .tip(ds::tooltip(format!(
-                            "Opens {host} in your browser to sign in to this organization's control plane."
-                        )))
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            plane.update(cx, |p, cx| p.sign_in(cx))
-                        })),
+                        .tip(ds::tooltip(tip))
+                        .on_click(
+                            cx.listener(move |_, _, _, cx| plane.update(cx, |p, cx| p.sign_in(cx))),
+                        ),
                 ),
         )
         .into_any_element()

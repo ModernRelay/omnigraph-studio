@@ -45,6 +45,10 @@ pub struct ControlPlane {
     oauth: Option<OAuthSource>,
     /// The sign-in, or a launch's read of its keychain item, under way.
     signing_in: Option<Task<()>>,
+    /// The next sign-in asks which organization (`prompt=login`): the last one failed (another
+    /// organization's token among the reasons) or was signed out of. AuthKit asks only as the
+    /// person signs in, so otherwise a signed-in browser gives its organization at once.
+    ask_organization: bool,
     listing: Option<Listing>,
     reading: Option<Task<()>>,
     /// What its clusters' token sources read its sign-in through.
@@ -74,6 +78,7 @@ impl ControlPlane {
             service: None,
             oauth: None,
             signing_in: None,
+            ask_organization: false,
             listing: None,
             reading: None,
             handle: None,
@@ -114,6 +119,11 @@ impl ControlPlane {
             .map(|context| PlaneHandle::new(this.route.clone(), context.elsewhere.clone(), false));
         this.take_up_kept(cx);
         this
+    }
+
+    /// Whether the next sign-in asks which organization, at the cost of a sign-in on the web.
+    pub fn asks_organization(&self) -> bool {
+        self.ask_organization
     }
 
     /// Whether it is Omnigraph Cloud's default.
@@ -253,6 +263,11 @@ impl ControlPlane {
             }));
             return;
         };
+        // Asking which organization costs a full sign-in on the web: only when it is needed.
+        let service = Service {
+            prompt: self.ask_organization.then_some("login"),
+            ..service
+        };
         let browser = match sign_in::browser(
             &service,
             oauth_client::host_of(&self.route),
@@ -282,8 +297,9 @@ impl ControlPlane {
                     this.update(cx, |this, cx| {
                         this.signing_in = None;
                         // What the details named may be what failed: the next sign-in reads them
-                        // again.
+                        // again, and asks which organization, as this one may have been another's.
                         this.service = None;
+                        this.ask_organization = true;
                         this.sign_in = SignIn::Offered {
                             service: service.host(),
                             why: Some(why),
@@ -327,6 +343,7 @@ impl ControlPlane {
             let account = source.account();
             let taken = this.update(cx, |this, cx| {
                 this.signing_in = None;
+                this.ask_organization = false;
                 this.sign_in = SignIn::SignedIn {
                     service: service.host(),
                     account,
@@ -369,6 +386,10 @@ impl ControlPlane {
 
     fn end(&mut self, how: End, cx: &mut Context<Self>) {
         self.signing_in = None;
+        // Signed out, the next sign-in may be to another organization: it asks.
+        if how == End::SignOut {
+            self.ask_organization = true;
+        }
         self.reading = None;
         self.listing = None;
         let held = self.oauth.clone();
@@ -672,10 +693,6 @@ async fn discover(
         )));
     }
     service.organization_of = "this profile";
-    // AuthKit asks which organization as the person signs in, and skips that while the
-    // browser is signed in already: the organization an earlier sign-in chose would be given
-    // again. `consent` alone does not ask; `login` does (spec 021, validation log).
-    service.prompt = Some("login");
     Ok(service)
 }
 
@@ -947,10 +964,6 @@ mod tests {
         let query: HashMap<String, String> = opened.query_pairs().into_owned().collect();
         assert_eq!(query["client_id"], CLIENT);
         assert_eq!(query["resource"], ROUTE);
-        assert_eq!(
-            query["prompt"], "login",
-            "the organization is asked for each time"
-        );
         assert_eq!(query["code_challenge_method"], "S256");
         served.lock().unwrap().codes.insert("c1".into());
         let callback = url::Url::parse(&query["redirect_uri"]).unwrap();
@@ -1041,6 +1054,8 @@ mod tests {
         let plane = plane(context(&served, keychain.clone()), cx);
         plane.update(cx, |p, cx| p.sign_in(cx));
         until(cx, "the browser", |cx| cx.opened_url().is_some());
+        // A first sign-in asks nothing: a signed-in browser gives its organization at once.
+        assert_eq!(prompt_of(&cx.opened_url().unwrap()), None);
         let browser = approve(&served, &cx.opened_url().unwrap());
         until(cx, "the refusal", |cx| {
             plane.read_with(cx, |p, _| {
@@ -1057,8 +1072,34 @@ mod tests {
                 "The sign-in was for org_2, and this profile is in org_1."
             );
             assert!(!p.holds_sign_in());
+            assert!(
+                p.asks_organization(),
+                "the next sign-in asks which organization"
+            );
         });
         assert!(keychain.items.lock().unwrap().is_empty());
+
+        // The next asks which organization, and the person chooses the profile's.
+        served.lock().unwrap().org = ORG.into();
+        plane.update(cx, |p, cx| p.sign_in(cx));
+        until(cx, "the browser again", |cx| {
+            cx.opened_url().is_some_and(|url| prompt_of(&url).is_some())
+        });
+        let asked = cx.opened_url().unwrap();
+        assert_eq!(prompt_of(&asked).as_deref(), Some("login"));
+        let browser = approve(&served, &asked);
+        until(cx, "the sign-in", |cx| signed_in(&plane, cx));
+        browser.join().unwrap();
+        plane.read_with(cx, |p, _| assert!(!p.asks_organization()));
+    }
+
+    /// The `prompt` a sign-in's page sends: none unless the organization is asked for.
+    fn prompt_of(opened: &str) -> Option<String> {
+        url::Url::parse(opened)
+            .unwrap()
+            .query_pairs()
+            .find(|(key, _)| key == "prompt")
+            .map(|(_, value)| value.into_owned())
     }
 
     #[gpui::test]

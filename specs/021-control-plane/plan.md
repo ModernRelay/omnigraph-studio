@@ -205,11 +205,13 @@ managed target, sees none. Studio has one control plane of its own:
   It signs in as any control plane does (its metadata, Studio's client, `resource=<route>`),
   but with no organization pinned. The token's `org_id` names it, and that organization is
   held from then on. To use another one, sign in again.
-- **The organization is asked for each time.** Every control-plane sign-in sends
-  `prompt=login`. AuthKit asks which organization as the person signs in, and skips that while
-  the browser is signed in already, so without it a second profile's sign-in got the first's
-  organization and was refused. `prompt=consent` does not bring the question back. A cluster's
-  own sign-in (spec 016) sends no `prompt`.
+- **The organization is asked for when it is needed.** AuthKit asks which organization only as
+  the person signs in, and skips that while the browser is signed in already, so a second
+  profile's sign-in gets the browser's organization. Asking costs a full sign-in on the web, so
+  a sign-in sends no `prompt` first. After a refused sign-in (another organization's token) or
+  a sign-out, the next sends `prompt=login`, and its button reads "Choose organization".
+  `prompt=consent` and `select_account` do not bring the question back. A cluster's own
+  sign-in (spec 016) sends no `prompt`.
 - **Its keychain item** is `omnigraph-control:<route>`, with no organization: one cloud sign-in
   at a time, which names its organization when the token is refreshed at launch.
 - **One plane for one pair.** When a CLI profile names the same route and the organization the
@@ -299,7 +301,7 @@ managed target, sees none. Studio has one control plane of its own:
    control plane lists them; `POST /tokens` then answers 403.
 5. Settled (2026-11-05): an account in several organizations is asked which one only as it
    signs in. A signed-in browser gets the organization it is in, so Studio sends
-   `prompt=login`.
+   `prompt=login` when a sign-in must choose: after a refusal or a sign-out.
 
 ## Validation log
 
@@ -322,6 +324,7 @@ managed target, sees none. Studio has one control plane of its own:
 | 2026-11-05 | Nothing names an organization or account in words (CP3) | `/openapi.json`: `Organization`, `AuthSession`, `Directory`; the token's claims | `Organization` is `{organization_id}`; the session has `account_id`, `principal_id`, `subject`; the token has `sub` and `org_id` only |
 | 2026-11-05 | A second profile's sign-in gets the organization the browser is signed in to | Live sign-in for profile `omnigraph…` (`org_01M67VZM…`) after one for `managed-og` (`org_01M1V5…`) | AuthKit asked nothing; the token named `org_01M1V5…`, which Studio refused |
 | 2026-11-05 | `prompt=login` makes AuthKit ask the organization; `consent` does not, and `organization_id` is dropped | `curl` of `/oauth2/authorize` with each (AuthKit keeps `prompt`, not `organization_id`); live sign-ins as Studio's client with `prompt=consent`, then `prompt=login` | `consent`: not asked. `login`: asked, and the token named the organization chosen (`org_01M67SX1…`); `GET /v1/clusters` 200 |
+| 2026-11-05 | `prompt=login` asks at the cost of a full web sign-in; `select_account` asks nothing | Live sign-ins as Studio's client with each | `login`: a sign-in on the web every time; `select_account`: signed straight in to the browser's organization |
 
 ## Corrections
 
