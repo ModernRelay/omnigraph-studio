@@ -17,13 +17,24 @@
 //! after notifying the workspace (or redrawing everything) and prints their times;
 //! `measure:<n>,scroll=<dy>` first scrolls at the window's centre each frame (a zoom on the
 //! canvas; `scroll=<dx>:<dy>` scrolls sideways too), and `measure:<n>,drag=<dx>:<dy>` drags from the centre by that much a frame (a pan),
-//! both back and forth every 30 frames; `measure:<n>,type` types a letter into the focused
+//! both back and forth every 30 frames (`,at=<x>:<y>` starts either there instead, a panel's
+//! edge for a resize); `measure:<n>,type` types a letter into the focused
 //! field and takes it back, alternately. Each also prints the main thread's CPU time per
 //! frame, which a busy machine does not inflate. `SNAPSHOT_WAIT_MS` (default 1500) is how
 //! long to let each step's network work finish; `SNAPSHOT_SIZE` is `WIDTHxHEIGHT` (default
 //! 1440x900). Remembered tabs are not restored unless `OMNIGRAPH_STUDIO_NO_RESTORE=0`. The run
 //! keeps its state in a fresh temporary directory unless `OMNIGRAPH_STUDIO_DATA` names one, so
 //! it neither reads nor writes the app's settings, tabs or conversations.
+//!
+//! After each step it prints a `step` line (`report:<name>` names the next step): how long until
+//! the requests it started had all ended (`settled`, wall time, indicative), the main thread's
+//! CPU time and allocations over the step, the requests by route with their bytes, the views
+//! drawn, and the time and allocations of the frame drawn after it. `measure` adds allocations
+//! and views drawn per frame, which are exact where times are not. `heap` is what every thread
+//! holds allocated after the step, for growth across steps that should give back what they took
+//! (a tab opened and closed). With `OMNIGRAPH_STUDIO_TRACE`
+//! naming a file, the run's spans (requests, decoding, frames) are written there as Chrome trace
+//! JSON (`studio_perf`).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -33,6 +44,183 @@ use gpui::{
     MouseMoveEvent, MouseUpEvent, PlatformInput, ScrollDelta, ScrollEvent, ScrollSource,
     TouchPhase, point, px, size,
 };
+
+/// Counts the allocations made on each thread into `studio_perf`'s counters, so a step's and a
+/// frame's are known exactly, and keeps the heap every thread holds as a gauge (Zed's
+/// `bench_metrics::CountingAllocator`; divan's `AllocProfiler`). Counting takes no lock and
+/// allocates nothing.
+struct CountingAllocator;
+
+static ALLOCATIONS: studio_perf::Counter =
+    studio_perf::Counter::new("alloc", "allocations", studio_perf::Unit::Count);
+static ALLOCATED: studio_perf::Counter =
+    studio_perf::Counter::new("alloc", "bytes", studio_perf::Unit::Bytes);
+static HEAP: studio_perf::Gauge = studio_perf::Gauge::new("heap", studio_perf::Unit::Bytes);
+
+fn note_allocation(bytes: usize) {
+    ALLOCATIONS.add(1);
+    ALLOCATED.add(bytes as u64);
+}
+
+// SAFETY: every call is passed to the system allocator unchanged.
+unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        note_allocation(layout.size());
+        HEAP.add(layout.size() as i64);
+        // SAFETY: the caller's contract, passed on.
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        HEAP.add(-(layout.size() as i64));
+        // SAFETY: the caller's contract, passed on.
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        note_allocation(layout.size());
+        HEAP.add(layout.size() as i64);
+        // SAFETY: the caller's contract, passed on.
+        unsafe { std::alloc::System.alloc_zeroed(layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        note_allocation(new_size);
+        HEAP.add(new_size as i64 - layout.size() as i64);
+        // SAFETY: the caller's contract, passed on.
+        unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+/// A request's counters are kept by its method (`graph_client::route`).
+fn is_request(group: &str) -> bool {
+    group.chars().all(|c| c.is_ascii_uppercase())
+}
+
+/// Requests ended so far, on every route.
+fn requests_ended() -> u64 {
+    studio_perf::counters()
+        .filter(|counter| is_request(counter.group))
+        .map(|counter| counter.total())
+        .sum()
+}
+
+/// What one step did: a `studio_perf` step span, which carries every counter's count from before
+/// it to after it settled, and how long its actions waited on their requests.
+struct Step {
+    span: studio_perf::Span,
+    started: Instant,
+    /// Each action's time from its start until its last request ended, added up.
+    busy: Duration,
+    cpu: Duration,
+}
+
+impl Step {
+    fn begin(name: &str) -> Self {
+        Self {
+            span: studio_perf::step("step", name.to_owned()),
+            started: Instant::now(),
+            busy: Duration::ZERO,
+            cpu: thread_cpu_time(),
+        }
+    }
+
+    /// Adds an action that began at `began` and whose last request ended at `last` ([`settle`]).
+    fn note(&mut self, began: Instant, last: Option<Instant>) {
+        if let Some(last) = last {
+            self.busy += last.saturating_duration_since(began);
+        }
+    }
+
+    /// Ends the step and prints its line, from what the step span carries: `settled` is when
+    /// its last request ended, then the frame drawn after it.
+    fn report(self, cx: &mut HeadlessAppContext, handle: AnyWindowHandle) {
+        let cpu = thread_cpu_time() - self.cpu;
+        let Some(step) = self.span.end() else {
+            return;
+        };
+        let frame_start = Instant::now();
+        let frame = studio_perf::step("frame", "after step");
+        cx.update_window(handle, |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        })
+        .expect("draw the frame after a step");
+        let frame = frame.end().expect("measuring is on");
+        let frame_time = frame_start.elapsed();
+        let named = |group: &str| -> Vec<String> {
+            step.attached
+                .iter()
+                .filter(|a| a.group == group)
+                .map(|a| format!("{}×{}", a.name, a.all))
+                .collect()
+        };
+        let requests: Vec<String> = step
+            .attached
+            .iter()
+            .filter(|a| is_request(a.group))
+            .map(|a| format!("{} {}×{}", a.group, a.name, a.all))
+            .collect();
+        let count: u64 = step
+            .attached
+            .iter()
+            .filter(|a| is_request(a.group))
+            .map(|a| a.all)
+            .sum();
+        let here =
+            |record: &studio_perf::Record, name| record.get("alloc", name).map_or(0, |a| a.here);
+        eprintln!(
+            "step\t{}\tsettled {:.1} ms\tcpu {:.1} ms\tallocs {} ({:.1} MB)\trequests {count} ({:.1} KB) [{}]\tqueries [{}]\tdraws [{}]\tframe {:.1} ms, {} views, {} allocs\theap {:.1} MB",
+            step.name,
+            self.busy.as_secs_f64() * 1000.,
+            cpu.as_secs_f64() * 1000.,
+            here(&step, "allocations"),
+            here(&step, "bytes") as f64 / 1e6,
+            step.sum("received").0 as f64 / 1e3,
+            requests.join(", "),
+            named("query").join(", "),
+            named("draw").join(", "),
+            frame_time.as_secs_f64() * 1000.,
+            frame.sum("draw").0,
+            here(&frame, "allocations"),
+            HEAP.get() as f64 / 1e6,
+        );
+        let _ = self.started;
+    }
+}
+
+/// Ends an action: one outside a named step (`adhoc`) is reported at once, one inside the step
+/// `report:` opened adds to it.
+fn end_action(
+    open: &mut Option<Step>,
+    adhoc: Option<Step>,
+    began: Instant,
+    last: Option<Instant>,
+    cx: &mut HeadlessAppContext,
+    handle: AnyWindowHandle,
+) {
+    match adhoc {
+        Some(mut step) => {
+            step.note(began, last);
+            step.report(cx, handle);
+        }
+        None => {
+            if let Some(step) = open {
+                step.note(began, last);
+            }
+        }
+    }
+}
+
+/// Reports the step `report:` opened, if one is open.
+fn close_step(open: &mut Option<Step>, cx: &mut HeadlessAppContext, handle: AnyWindowHandle) {
+    if let Some(step) = open.take() {
+        step.report(cx, handle);
+    }
+}
 
 /// The calling thread's CPU time so far.
 #[cfg(unix)]
@@ -137,15 +325,26 @@ fn click(
 
 /// Runs the app for `wait` of real time. The headless dispatcher's clock is simulated, so it is
 /// moved forward as real time passes and timers (debounced saves, toasts) fire as in the app.
-fn settle(cx: &mut HeadlessAppContext, wait: Duration) {
-    let step = Duration::from_millis(25);
+///
+/// Returns when the last request under way ended, if any ran: a step's network work.
+fn settle(cx: &mut HeadlessAppContext, wait: Duration) -> Option<Instant> {
+    let step = Duration::from_millis(5);
     let deadline = Instant::now() + wait;
+    let requests = requests_ended;
+    let mut seen = requests();
+    let mut last = None;
     while Instant::now() < deadline {
         cx.run_until_parked();
+        let now = requests();
+        if studio_perf::REQUESTS_UNDER_WAY.get() > 0 || now != seen {
+            seen = now;
+            last = Some(Instant::now());
+        }
         std::thread::sleep(step);
         cx.advance_clock(step);
     }
     cx.run_until_parked();
+    last
 }
 
 fn main() {
@@ -170,6 +369,9 @@ fn main() {
         // SAFETY: no other thread exists yet.
         unsafe { std::env::set_var("OMNIGRAPH_STUDIO_DATA", &dir) };
     }
+    // Every span is kept, and every counter counts, from here on.
+    studio_perf::init();
+    studio_perf::collect(true);
     let mut args = std::env::args().skip(1);
     let out = args.next().unwrap_or_else(|| "snapshot.png".into());
     let actions: Vec<String> = args.collect();
@@ -187,6 +389,7 @@ fn main() {
         })
         .unwrap_or((1440.0_f32, 900.0_f32));
 
+    let startup = Step::begin("start");
     let text_system = gpui_platform::current_platform(true).text_system();
     let mut cx = HeadlessAppContext::with_platform(
         text_system,
@@ -206,13 +409,20 @@ fn main() {
     // while a window is active (the branch-head poll) run.
     cx.update_window(handle, |_, window, _| window.activate_window())
         .expect("activate the snapshot window");
-    settle(&mut cx, wait);
+    // Start: from before GPUI starts until the window's first reads have ended.
+    let mut startup = startup;
+    let began = startup.started;
+    startup.note(began, settle(&mut cx, wait));
+    startup.report(&mut cx, handle);
+    // The step `report:<name>` opened, which the actions after it add to until the next.
+    let mut open: Option<Step> = None;
 
     for spec in actions {
         // `measure:<n>` draws n frames, each after the workspace (the window's root view) is
         // notified, as a toast or a hover in the frame would, and prints the draw times;
         // `measure:<n>,refresh` redraws everything each time, cached views included.
         if let Some(rest) = spec.strip_prefix("measure:") {
+            close_step(&mut open, &mut cx, handle);
             let mut parts = rest.split(',').map(str::trim);
             let frames: usize = parts
                 .next()
@@ -222,6 +432,7 @@ fn main() {
             let mut typing = false;
             let mut scroll: Option<(f32, f32)> = None;
             let mut drag: Option<(f32, f32)> = None;
+            let mut at: Option<(f32, f32)> = None;
             for part in parts {
                 if part == "refresh" {
                     refresh = true;
@@ -235,6 +446,9 @@ fn main() {
                         ),
                         None => (0., delta.parse().expect("scroll=<pixels>")),
                     });
+                } else if let Some(point) = part.strip_prefix("at=") {
+                    let (x, y) = point.split_once(':').expect("at=<x>:<y>");
+                    at = Some((x.parse().expect("at x"), y.parse().expect("at y")));
                 } else if let Some(delta) = part.strip_prefix("drag=") {
                     let (dx, dy) = delta.split_once(':').expect("drag=<dx>:<dy>");
                     drag = Some((dx.parse().expect("drag dx"), dy.parse().expect("drag dy")));
@@ -242,7 +456,10 @@ fn main() {
             }
             // Input goes to the window's centre: each frame first handles one scroll or one move
             // of a held button, as a frame of a real zoom or pan does, then draws.
-            let center = point(px(width / 2.), px(height / 2.));
+            let center = match at {
+                Some((x, y)) => point(px(x), px(y)),
+                None => point(px(width / 2.), px(height / 2.)),
+            };
             if drag.is_some() {
                 cx.update_window(handle, |_, window, cx| {
                     window.dispatch_event(
@@ -260,12 +477,21 @@ fn main() {
             }
             let mut times = Vec::with_capacity(frames);
             let mut cpu_times = Vec::with_capacity(frames);
+            let mut frame_allocations = Vec::with_capacity(frames);
+            // The measure is a step of its own, each frame one inside it: what each counted
+            // (views drawn, allocations, requests) comes back attached to it.
+            let measure = studio_perf::step("measure", spec.clone());
+            let cpu_total = thread_cpu_time();
             for frame in 0..frames {
                 // Back and forth every 30 frames, so the view stays where it can be measured.
                 let sign = if (frame / 30) % 2 == 0 { 1. } else { -1. };
+                // A frame is one update that delivers the input; as it ends, GPUI (headless, in
+                // its test mode) draws what the input changed, once, as an app's next frame
+                // would. Timed from outside, so the draw is in it.
+                let frame_span = studio_perf::step("frame", "measure");
+                let start = Instant::now();
+                let cpu_start = thread_cpu_time();
                 cx.update_window(handle, |root, window, cx| {
-                    let start = Instant::now();
-                    let cpu_start = thread_cpu_time();
                     if typing {
                         // Typing into the focused field: a letter, then taking it back.
                         let key = if frame % 2 == 0 { "a" } else { "backspace" };
@@ -303,11 +529,12 @@ fn main() {
                     } else {
                         cx.notify(root.entity_id());
                     }
-                    window.draw(cx).clear(cx);
-                    times.push(start.elapsed());
-                    cpu_times.push(thread_cpu_time() - cpu_start);
                 })
                 .expect("draw a frame");
+                times.push(start.elapsed());
+                cpu_times.push(thread_cpu_time() - cpu_start);
+                let frame = frame_span.end().expect("measuring is on");
+                frame_allocations.push(frame.get("alloc", "allocations").map_or(0, |a| a.here));
             }
             if drag.is_some() {
                 cx.update_window(handle, |_, window, cx| {
@@ -323,8 +550,11 @@ fn main() {
                 })
                 .expect("release the drag");
             }
+            let cpu_total = thread_cpu_time() - cpu_total;
+            let drawn = measure.end().expect("measuring is on");
             times.sort();
             cpu_times.sort();
+            frame_allocations.sort();
             let at = |times: &[Duration], q: f32| times[((times.len() - 1) as f32 * q) as usize];
             let kind = match (typing, scroll, drag, refresh) {
                 (true, _, _, _) => " (type)",
@@ -346,18 +576,52 @@ fn main() {
                 at(&cpu_times, 0.95),
                 at(&cpu_times, 0.99),
             );
+            // Exact counts, which a busy machine or a coarse thread clock do not blur: the
+            // allocations a frame made on the main thread, the views it drew, and the main
+            // thread's CPU time over all the frames, which a clock that ticks in 10 ms (gVisor)
+            // still measures.
+            let views: Vec<String> = drawn
+                .attached
+                .iter()
+                .filter(|a| a.group == "draw")
+                .map(|a| format!("{} {:.2}", a.name, a.all as f64 / frames as f64))
+                .collect();
+            let requests: u64 = drawn
+                .attached
+                .iter()
+                .filter(|a| is_request(a.group))
+                .map(|a| a.all)
+                .sum();
+            let median_allocations = frame_allocations[frames / 2];
+            let p95_allocations = frame_allocations[((frames - 1) as f32 * 0.95) as usize];
+            eprintln!(
+                "measure counts{kind}: cpu mean {:.2?} | allocs median {median_allocations}, p95 {p95_allocations}, max {} | views drawn per frame [{}] | requests {requests}",
+                cpu_total / frames as u32,
+                frame_allocations[frames - 1],
+                views.join(", "),
+            );
             continue;
         }
+        if let Some(next) = spec.strip_prefix("report:") {
+            close_step(&mut open, &mut cx, handle);
+            open = Some(Step::begin(next));
+            continue;
+        }
+        let adhoc = open.is_none().then(|| Step::begin(&spec));
+        let began = Instant::now();
         if let Some(path) = spec.strip_prefix("shot:") {
             let image = cx.capture_screenshot(handle).expect("render the window");
             image.save(path).expect("write the PNG");
             continue;
         }
         if let Some(ms) = spec.strip_prefix("wait:") {
-            settle(
+            let last = settle(
                 &mut cx,
                 Duration::from_millis(ms.trim().parse().expect("wait is milliseconds")),
             );
+            if let Some(step) = &mut open {
+                step.note(began, last);
+            }
             continue;
         }
         if let Some((x, y)) = spec
@@ -379,7 +643,8 @@ fn main() {
                 );
             })
             .expect("move the pointer");
-            settle(&mut cx, wait);
+            let last = settle(&mut cx, wait);
+            end_action(&mut open, adhoc, began, last, &mut cx, handle);
             continue;
         }
         if let Some(keys) = spec.strip_prefix("key:") {
@@ -391,7 +656,8 @@ fn main() {
                 .expect("press a key");
                 cx.run_until_parked();
             }
-            settle(&mut cx, wait);
+            let last = settle(&mut cx, wait);
+            end_action(&mut open, adhoc, began, last, &mut cx, handle);
             continue;
         }
         if let Some(points) = spec.strip_prefix("drag:") {
@@ -412,7 +678,8 @@ fn main() {
                 point(px(x2), px(y2)),
                 modifiers,
             );
-            settle(&mut cx, wait);
+            let last = settle(&mut cx, wait);
+            end_action(&mut open, adhoc, began, last, &mut cx, handle);
             continue;
         }
         if let Some(at) = spec.strip_prefix("click:") {
@@ -432,7 +699,8 @@ fn main() {
                 MouseButton::Left
             };
             click(&mut cx, handle, point(px(x), px(y)), modifiers, button);
-            settle(&mut cx, wait);
+            let last = settle(&mut cx, wait);
+            end_action(&mut open, adhoc, began, last, &mut cx, handle);
             continue;
         }
         let (name, data) = match spec.strip_prefix("type:") {
@@ -463,10 +731,15 @@ fn main() {
             window.dispatch_action(action, cx);
         })
         .expect("dispatch an action");
-        settle(&mut cx, wait);
+        let last = settle(&mut cx, wait);
+        end_action(&mut open, adhoc, began, last, &mut cx, handle);
     }
 
+    close_step(&mut open, &mut cx, handle);
     let image = cx.capture_screenshot(handle).expect("render the window");
     image.save(&out).expect("write the PNG");
+    if let Some(path) = studio_perf::write_trace().expect("write the trace") {
+        eprintln!("trace: {}", path.display());
+    }
     println!("{out}");
 }
