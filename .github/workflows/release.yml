@@ -427,8 +427,19 @@ jobs:
 
           $mac
           NOTES
-          # The release and its tag move to this commit: the old ones go first, so the tag is
-          # made again at this commit.
+          # GitHub refuses the workflow token, which can never hold the `workflows` permission, a
+          # new tag on a commit whose workflow files differ from main's current ones. When main's
+          # workflows changed during the build, nothing is published; the next run builds the
+          # newer tip.
+          git fetch --quiet origin main
+          if ! git diff --quiet "$GITHUB_SHA" FETCH_HEAD -- .github/workflows; then
+            echo "::notice::main's workflow files changed after ${GITHUB_SHA::7}, so it cannot be tagged; the next run builds the newer tip"
+            exit 0
+          fi
+          # The release and its tag move to this commit: the old ones go first, and the tag is
+          # pushed before the release, so the release never depends on GitHub creating it.
           gh release delete edge --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes 2>/dev/null || true
-          gh release create edge dist/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+          git tag -f edge "$GITHUB_SHA"
+          git push --quiet origin refs/tags/edge
+          gh release create edge dist/* --repo "$GITHUB_REPOSITORY" --verify-tag \
             --title "Omnigraph Studio edge" --notes-file notes.md --prerelease --latest=false
