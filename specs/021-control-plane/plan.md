@@ -1,6 +1,6 @@
 # 021: Studio speaks to the managed control plane
 
-Status: draft; waits on the control plane accepting Studio's sign-in (CP1) · 2026-11-03
+Status: draft; the control plane accepts Studio's sign-in (CP1, live 2026-11-05) · 2026-11-05
 
 ## Problem
 
@@ -58,9 +58,9 @@ token. The control plane answers all of this over HTTP; Studio does not ask it.
     live: all three answer 200, and `GET /v1/clusters` without a bearer answers
     `401 unauthenticated`.
   - Every `/v1` call takes `Authorization: Bearer` with a human access token from its own
-    sign-in (the one the CLI uses), in an organization the person is a current member of. It
-    accepts only tokens issued to its own application, so **a token issued to Studio's client
-    today is refused** (CP1). A graph data token is refused too.
+    sign-in (the one the CLI uses), in an organization the person is a current member of. Since
+    CP1 it also accepts a token issued to Studio's client by the OAuth server for the resource
+    `https://platform.omnigraph.dev`. A graph data token or a cluster's token is refused.
   - `GET /v1/clusters` lists the clusters of the token's organization that the caller may see
     the status of. Each is a `ClusterView`: `cluster_id`, `incarnation`, `name`, `state`
     (`provisioning`, `ready`, …), `created_at`, `created_by`, `binding`, `cell`, and, only while
@@ -209,11 +209,11 @@ only to the endpoint it names." `docs/architecture.md`'s layer table gains the c
 
 ### Prerequisites outside Studio
 
-- **CP1, the control plane**: accept a standard OAuth access token from Studio on its own API.
-  Today the API accepts only tokens from its own sign-in, issued to its own application; the
-  OAuth sign-in Studio uses (spec 016, the same identity provider's OAuth server) is accepted
-  only by clusters. Until CP1, Studio's control-plane sign-in is refused, and nothing in this
-  plan turns on. What it needs:
+- **CP1, the control plane** (live in production 2026-11-05; see the validation log): accept a
+  standard OAuth access token from Studio on its own API. Before it, the API accepted only
+  tokens from its own sign-in, issued to its own application; the OAuth sign-in Studio uses
+  (spec 016, the same identity provider's OAuth server) was accepted only by clusters. What it
+  needed:
   1. **A resource for the API.** The API is an OAuth resource of its own,
      `https://platform.omnigraph.dev`, registered with the identity provider (not as its
      default resource). It serves RFC 9728 metadata at `/.well-known/oauth-protected-resource`
@@ -265,6 +265,8 @@ only to the endpoint it names." `docs/architecture.md`'s layer table gains the c
 | 2026-11-03 | Clusters are given the OAuth server's issuer | `curl` of production clusters' `/.well-known/oauth-protected-resource/mcp` | Each names `authorization_servers: ["https://login.platform.omnigraph.dev"]` |
 | 2026-11-03 | A token issued to Studio's client names the document's URL as its client | A live sign-in as Studio's client (PKCE S256, loopback redirect, `resource` a production cluster's `…/mcp`); the access token's claims decoded locally, the token neither printed nor kept | `client_id` the metadata document's URL; `aud` the requested resource; `org_id` the profile's organization; `sid` a consent; 300 s; RS256 with no `typ` |
 | 2026-11-03 | The CLI lists a profile's clusters, and needs a current login to | `omnigraph cluster list --profile NAME --json` | `refresh_outcome_unknown`: the login could not be renewed without a terminal |
+| 2026-11-05 | The API is an OAuth resource with RFC 9728 metadata (CP1) | `curl https://platform.omnigraph.dev/.well-known/oauth-protected-resource`, and `GET /v1/clusters` without a bearer | 200: `resource: https://platform.omnigraph.dev`, `authorization_servers: ["https://login.platform.omnigraph.dev"]`, `bearer_methods_supported: ["header"]`; 401 with `WWW-Authenticate: Bearer resource_metadata="https://platform.omnigraph.dev/.well-known/oauth-protected-resource"` |
+| 2026-11-05 | The API accepts a token issued to Studio's client (CP1) | A live sign-in as Studio's client (PKCE S256, loopback redirect, `resource=https://platform.omnigraph.dev`), then `GET /v1/clusters` with the access token; claims decoded locally, the token neither printed nor kept | A refresh token issued; `aud` the API's resource, `iss` the OAuth server; `GET /v1/clusters` 200 |
 
 ## Corrections
 
