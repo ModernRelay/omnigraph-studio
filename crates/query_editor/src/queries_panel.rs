@@ -416,6 +416,7 @@ impl QueriesPanel {
 
 impl Render for QueriesPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        studio_perf::count!("draw", "QueriesPanel");
         if let Some(session) = self.session.clone()
             && self.catalog_asked != Some(session.entity_id())
         {

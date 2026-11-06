@@ -435,6 +435,7 @@ impl BranchList {
 
 impl Render for BranchList {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        studio_perf::count!("draw", "BranchList");
         let Some(session) = self.session.clone() else {
             return v_flex().into_any_element();
         };

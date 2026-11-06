@@ -25,6 +25,7 @@ runtime-shaders = ["gpui_platform/runtime_shaders"]
 perf = ["gpui/profiler"]
 
 [dependencies]
+studio_perf = { workspace = true }
 serde_json = { workspace = true }
 control_client = { workspace = true }
 log = { workspace = true }

@@ -5235,6 +5235,7 @@ impl Focusable for NodePeek {
 
 impl Render for NodePeek {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        studio_perf::count!("draw", "NodePeek");
         if std::mem::take(&mut self.node_owed) {
             cx.defer_in(window, |this, _, cx| this.load_node(cx));
         }

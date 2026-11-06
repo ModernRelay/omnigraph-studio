@@ -512,6 +512,7 @@ struct DockHost {
 
 impl Render for DockHost {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        studio_perf::count!("draw", "DockHost");
         if self.scrolls_itself {
             return div().id("dock-host").size_full().child(self.view.clone());
         }
@@ -4923,6 +4924,7 @@ fn toast_text(entry: &graph_store::OutcomeEntry) -> String {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        studio_perf::count!("draw", "Workspace");
         // Every change to tabs or panels re-renders the workspace, so this sees all of them. The
         // workspace also renders whenever anything inside it notifies (a streamed reply, a
         // hover), so the state is compared at most every `SAVE_CHECK`, not on every frame.

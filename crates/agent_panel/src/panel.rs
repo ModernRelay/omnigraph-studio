@@ -2927,6 +2927,7 @@ fn activity_summary(thoughts: usize, tools: usize) -> String {
 
 impl Render for AgentPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        studio_perf::count!("draw", "AgentPanel");
         if std::mem::take(&mut self.start_owed) {
             cx.defer_in(window, |this, _, cx| this.start_if_idle(cx));
         }

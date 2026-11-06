@@ -34,6 +34,17 @@ pub use open_graph::OpenGraphModal;
 
 /// Sets up settings, themes, the editor, keymaps, the server registry and every feature.
 pub fn init(cx: &mut App) {
+    // A trace asked for with OMNIGRAPH_STUDIO_TRACE is written when Studio quits.
+    if studio_perf::collecting() {
+        cx.on_app_quit(|_| async {
+            match studio_perf::write_trace() {
+                Ok(Some(path)) => log::info!("wrote the trace to {}", path.display()),
+                Ok(None) => {}
+                Err(error) => log::warn!("could not write the trace: {error}"),
+            }
+        })
+        .detach();
+    }
     studio_theme::init_settings_store(cx);
     studio_settings::init(cx);
     studio_theme::init_themes(cx);

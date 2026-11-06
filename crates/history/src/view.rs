@@ -2093,6 +2093,7 @@ impl HistoryRows {
 
 impl Render for HistoryRows {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        studio_perf::count!("draw", "HistoryRows");
         #[cfg(test)]
         {
             self.renders += 1;
@@ -2115,6 +2116,7 @@ impl HistoryView {
 
 impl Render for HistoryView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        studio_perf::count!("draw", "HistoryView");
         // Drawn, so shown: the view reads what it owes once the frame is out, not inside it.
         if !self.owed.is_empty() && !std::mem::replace(&mut self.owed_due, true) {
             cx.defer_in(window, |this, _, cx| {

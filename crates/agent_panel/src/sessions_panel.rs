@@ -799,6 +799,7 @@ impl SessionsPanel {
 
 impl Render for SessionsPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        studio_perf::count!("draw", "SessionsPanel");
         let Some(graph) = self.graph(cx) else {
             return v_flex().into_any_element();
         };

@@ -3082,6 +3082,7 @@ fn to_world(screen: Point<Pixels>, viewport: Bounds<Pixels>, center: Vec2, zoom:
 
 impl Render for GraphCanvas {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        studio_perf::count!("draw", "GraphCanvas");
         // What the session's events left to read is read once the walk is drawn, and what its
         // changes left to lay out is laid out.
         if self.draws_exploration() && self.exploration.read(cx).owes_reads() {

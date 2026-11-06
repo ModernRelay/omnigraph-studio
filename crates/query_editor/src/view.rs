@@ -713,6 +713,7 @@ impl QueryResults {
 
 impl Render for QueryResults {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        studio_perf::count!("draw", "QueryResults");
         #[cfg(test)]
         {
             self.renders += 1;
@@ -749,6 +750,7 @@ impl QueryProblems {
 
 impl Render for QueryProblems {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        studio_perf::count!("draw", "QueryProblems");
         #[cfg(test)]
         {
             self.renders += 1;
@@ -4836,6 +4838,7 @@ impl QueryEditor {
 
 impl Render for QueryEditor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        studio_perf::count!("draw", "QueryEditor");
         // Recolours the language when the theme has changed since it last coloured it.
         if self.parsed {
             crate::syntax::language(crate::syntax::Syntax::Gq, cx);

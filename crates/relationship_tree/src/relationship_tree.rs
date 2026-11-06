@@ -1617,6 +1617,7 @@ impl RelationshipTree {
 
 impl Render for RelationshipTree {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        studio_perf::count!("draw", "RelationshipTree");
         // What the session's events left to read is read once the tree is drawn.
         if self.exploration.read(cx).owes_reads() {
             let exploration = self.exploration.clone();

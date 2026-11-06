@@ -1409,6 +1409,7 @@ fn add_type_rows(
 
 impl Render for CommandPalette {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        studio_perf::count!("draw", "CommandPalette");
         let count = self.matches.len();
         // Only a scope that shows nodes waits on them.
         let searching = self.searching_shown();

@@ -4644,6 +4644,7 @@ async fn merge_shown(
 
 impl Render for ReviewView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        studio_perf::count!("draw", "ReviewView");
         // Drawn, so shown: the dry run owed is read once the frame is out, not inside it.
         if std::mem::take(&mut self.preview_owed) {
             cx.defer_in(window, |this, _, cx| this.preview_moved(cx));

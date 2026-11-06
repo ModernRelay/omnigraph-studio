@@ -1021,6 +1021,7 @@ fn describe(error: &ReadError) -> String {
 /// The list's rows: a header for each run of one type, then its cards.
 impl Render for CommitView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        studio_perf::count!("draw", "CommitView");
         if std::mem::take(&mut self.read_owed) {
             cx.defer_in(window, |this, _, cx| {
                 this.read_commit(cx);

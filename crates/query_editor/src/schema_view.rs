@@ -187,6 +187,7 @@ fn declaration(source: &str, type_name: &str) -> Option<std::ops::Range<usize>> 
 
 impl Render for SchemaView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        studio_perf::count!("draw", "SchemaView");
         if self.parsed {
             // Recolours the language when the theme has changed since it last coloured it.
             language(Syntax::Pg, cx);

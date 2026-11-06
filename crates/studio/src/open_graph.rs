@@ -1340,6 +1340,7 @@ fn first_choice(connections: &[Entity<Connection>], cx: &App) -> Option<Entity<C
 
 impl Render for OpenGraphModal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        studio_perf::count!("draw", "OpenGraphModal");
         let servers = self.render_servers(cx).into_any_element();
         let body = if self.adding {
             self.render_add(cx).into_any_element()

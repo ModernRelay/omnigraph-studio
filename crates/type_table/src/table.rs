@@ -957,10 +957,6 @@ pub struct TypeTable {
     diff_owed: bool,
     diff_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
-    /// How often the table drew, for the test that moving through the offers draws it and
-    /// leaves the grid alone.
-    #[cfg(test)]
-    renders: usize,
     /// How many reads landed only to be sent again ([`Self::own_write_since`]). A read sent
     /// again at a commit that changed nothing it depends on is answered from the session's
     /// kept answers without a request, so the tests count it here.
@@ -1277,7 +1273,6 @@ impl TypeTable {
             diff_task: None,
             _subscriptions: subscriptions,
             #[cfg(test)]
-            renders: 0,
             #[cfg(test)]
             reads_sent_again: 0,
         };
@@ -10646,10 +10641,7 @@ fn set_value(row: &mut Row, column: &str, value: Value) {
 
 impl Render for TypeTable {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        #[cfg(test)]
-        {
-            self.renders += 1;
-        }
+        studio_perf::count!("draw", "TypeTable");
         if std::mem::take(&mut self.rows_owed) {
             cx.defer_in(window, |this, _, cx| this.read_rows(cx));
         }
@@ -10786,9 +10778,6 @@ impl Render for TypeTable {
 struct TableGrid {
     table: WeakEntity<TypeTable>,
     _table_changed: Subscription,
-    /// How often the grid was drawn, for the test that typing leaves it alone.
-    #[cfg(test)]
-    renders: usize,
 }
 
 impl TableGrid {
@@ -10800,18 +10789,13 @@ impl TableGrid {
         cx.new(|cx| TableGrid {
             table: table.downgrade(),
             _table_changed: cx.observe(&table, |_, _, cx| cx.notify()),
-            #[cfg(test)]
-            renders: 0,
         })
     }
 }
 
 impl Render for TableGrid {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        #[cfg(test)]
-        {
-            self.renders += 1;
-        }
+        studio_perf::count!("draw", "TableGrid");
         self.table
             .update(cx, |table, cx| table.render_body(window, cx))
             .unwrap_or_else(|_| gpui::Empty.into_any_element())
@@ -10932,8 +10916,9 @@ mod tests {
 
     use crate::test_support::{PEOPLE, changed, session, session_followed};
 
-    fn grid_renders(table: &Entity<TypeTable>, cx: &mut VisualTestContext) -> usize {
-        table.read_with(cx, |table, cx| table.grid.read(cx).renders)
+    /// How often the grid was drawn since `draws` began (`studio_perf`'s draw counters).
+    fn grid_renders(draws: &studio_perf::Capture) -> u64 {
+        draws.count("draw", "TableGrid")
     }
 
     /// The people a fake server answers, by the token a read carries: one person named for the
@@ -11808,6 +11793,7 @@ mod tests {
     /// table announces draws it again.
     #[gpui::test]
     async fn typing_in_a_field_leaves_the_grid_as_it_was(cx: &mut TestAppContext) {
+        let draws = studio_perf::capture();
         cx.update(|cx| {
             studio_theme::init_test(cx);
             editor::init(cx);
@@ -11828,24 +11814,24 @@ mod tests {
         table.read_with(cx, |table, _| assert_eq!(table.rows.len(), 2));
 
         // The grid follows the table, also when it was made with the table.
-        let before = grid_renders(&table, cx);
+        let before = grid_renders(&draws);
         table.update(cx, |_, cx| cx.notify());
         cx.run_until_parked();
-        assert_eq!(grid_renders(&table, cx), before + 1);
+        assert_eq!(grid_renders(&draws), before + 1);
 
         // The first key also switches GPUI to keyboard input, which draws the whole window
         // once; the keys after it are the ones counted.
         table.update_in(cx, |table, window, cx| table.open_filter_draft(window, cx));
         cx.simulate_input("A");
         cx.run_until_parked();
-        let before = grid_renders(&table, cx);
+        let before = grid_renders(&draws);
         cx.simulate_input("d");
         cx.run_until_parked();
         table.read_with(cx, |table, cx| {
             assert_eq!(table.filter_editor.read(cx).text(cx), "Ad")
         });
         assert_eq!(
-            grid_renders(&table, cx),
+            grid_renders(&draws),
             before,
             "the filter field drew the grid"
         );
@@ -11855,19 +11841,19 @@ mod tests {
             table.set_draft_property("active".into(), window, cx)
         });
         cx.run_until_parked();
-        let (before, drew) = (
-            grid_renders(&table, cx),
-            table.read_with(cx, |table, _| table.renders),
-        );
+        let (before, drew) = (grid_renders(&draws), draws.count("draw", "TypeTable"));
         table.update(cx, |table, cx| table.move_suggestion(1, cx));
         cx.run_until_parked();
         table.read_with(cx, |table, _| {
             let offers = &table.filter_draft.as_ref().unwrap().offers;
             assert_eq!(offers.len(), 2);
             assert_eq!(offers.highlighted(), Some(0));
-            assert!(table.renders > drew, "the offers were drawn again");
         });
-        assert_eq!(grid_renders(&table, cx), before, "the offers drew the grid");
+        assert!(
+            draws.count("draw", "TypeTable") > drew,
+            "the offers were drawn again"
+        );
+        assert_eq!(grid_renders(&draws), before, "the offers drew the grid");
 
         table.update_in(cx, |table, window, cx| {
             table.filter_draft = None;
@@ -11875,14 +11861,14 @@ mod tests {
             table.start_edit(Cursor { row: 0, col }, window, cx);
         });
         cx.run_until_parked();
-        let before = grid_renders(&table, cx);
+        let before = grid_renders(&draws);
         cx.simulate_input("Ada L");
         cx.run_until_parked();
         table.read_with(cx, |table, cx| {
             assert_eq!(table.cell_editor.read(cx).text(cx), "Ada L")
         });
         assert_eq!(
-            grid_renders(&table, cx),
+            grid_renders(&draws),
             before,
             "the cell editor drew the grid"
         );
@@ -11897,14 +11883,14 @@ mod tests {
             table.start_edit(Cursor { row: 1, col }, window, cx);
         });
         cx.run_until_parked();
-        let before = grid_renders(&table, cx);
+        let before = grid_renders(&draws);
         table.update(cx, |table, cx| {
             let editing = table.editing.as_ref().expect("the boolean is edited");
             let select = editing.select.as_ref().expect("with a select").view.clone();
             select.update(cx, |select, cx| select.highlight(1, cx));
         });
         cx.run_until_parked();
-        assert_eq!(grid_renders(&table, cx), before, "the select drew the grid");
+        assert_eq!(grid_renders(&draws), before, "the select drew the grid");
     }
 
     /// A filter opened for editing still filters the rows, and every page read, until it is
@@ -13390,6 +13376,7 @@ mod tests {
     /// cell editor scrolls the editor's text (spec 004).
     #[gpui::test]
     async fn a_sideways_wheel_scrolls_the_columns_not_the_rows(cx: &mut TestAppContext) {
+        let draws = studio_perf::capture();
         cx.update(|cx| {
             studio_theme::init_test(cx);
             editor::init(cx);
@@ -13447,7 +13434,7 @@ mod tests {
         // A key leaves the pointer's hover false; the wheel is still the rows' area's.
         cx.simulate_keystrokes("escape");
         cx.run_until_parked();
-        let drawn = grid_renders(&table, cx);
+        let drawn = grid_renders(&draws);
         cx.update(|window, cx| {
             window.dispatch_event(wheel(over_rows, (-120., 0.), gpui::TouchPhase::Moved), cx);
         });
@@ -13455,7 +13442,7 @@ mod tests {
         let (x, y) = offsets(cx);
         assert_eq!(y, px(0.), "the rows did not move");
         assert_eq!(x, px(-120.), "the columns moved by the wheel's width");
-        assert!(grid_renders(&table, cx) > drawn, "the grid drew the move");
+        assert!(grid_renders(&draws) > drawn, "the grid drew the move");
         // Drawn again, they stay.
         table.update(cx, |_, cx| cx.notify());
         cx.run_until_parked();
@@ -15151,6 +15138,53 @@ mod tests {
             .filter(|name| *name == "studio_value_counts")
             .count();
         assert_eq!(groups, 1, "{names:?}");
+    }
+
+    /// Opening a table reads its first page once, then each relationship column's counts and
+    /// first neighbours once, for the rows read: one read per column and kind, never one per
+    /// row, and none twice. A guard on what opening a table costs the server
+    /// (`script/measure-frames --scenarios`, "open a type's table").
+    #[gpui::test]
+    async fn opening_a_table_reads_each_relationship_once(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let schema = "node Person {\n  slug: String @key\n  name: String\n}\n\
+                      node Company {\n  slug: String @key\n}\n\
+                      edge WorksAt: Person -> Company\n\
+                      edge Knows: Person -> Person\n";
+        let (session, _) = crate::test_support::session_routing(
+            schema,
+            |request| match request["name"].as_str() {
+                Some("studio_page") => serde_json::json!([
+                    {"n": {"@id": "p1", "slug": "p1", "name": "Ada"}},
+                    {"n": {"@id": "p2", "slug": "p2", "name": "Grace"}},
+                ]),
+                _ => serde_json::json!([]),
+            },
+            cx,
+        );
+        cx.run_until_parked();
+        // `studio_perf`'s request counters, on this test's thread only.
+        let reads = studio_perf::capture();
+        let (_table, _cx) = people_table(&session, cx);
+        // WorksAt out, Knows out and Knows in: three relationship columns. The fake server's
+        // snapshot holds no counts, so the table counts its rows too.
+        assert_eq!(
+            reads.group("query"),
+            [
+                ("studio_count", 1),
+                ("studio_page", 1),
+                ("studio_page_degrees", 3),
+                ("studio_page_neighbours", 3),
+            ],
+        );
+        assert_eq!(
+            reads.count("POST", "/graphs/{graph_id}/query"),
+            8,
+            "one request for each query, and none else"
+        );
     }
 
     /// The key of p1's name, the cell these tests edit.

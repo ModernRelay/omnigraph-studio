@@ -172,6 +172,7 @@ impl Item for NodePage {
 
 impl Render for NodePage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        studio_perf::count!("draw", "NodePage");
         v_flex()
             .id("node-page")
             .key_context("NodePage")

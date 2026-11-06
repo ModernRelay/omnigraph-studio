@@ -110,6 +110,7 @@ fn rows_of(schema: &SchemaModel) -> Vec<Row> {
 
 impl Render for TypesList {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        studio_perf::count!("draw", "TypesList");
         let Some(session) = self.session.clone() else {
             return v_flex().into_any_element();
         };

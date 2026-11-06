@@ -9,6 +9,7 @@ publish.workspace = true
 path = "src/type_table.rs"
 
 [dependencies]
+studio_perf = { workspace = true }
 gpui = { workspace = true }
 collections = { workspace = true }
 ui = { workspace = true }

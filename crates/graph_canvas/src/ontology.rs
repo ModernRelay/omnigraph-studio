@@ -958,6 +958,7 @@ pub(crate) fn ontology_key(graph_id: &str) -> SharedString {
 
 impl Render for OntologyPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        studio_perf::count!("draw", "OntologyPage");
         let schema = self.session.read(cx).schema.clone();
         let view = self.view.clone();
         // A type in focus that the schema no longer has shows the domains.

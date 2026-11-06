@@ -132,6 +132,7 @@ impl ActivityLog {
 
 impl Render for ActivityLog {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        studio_perf::count!("draw", "ActivityLog");
         #[cfg(test)]
         {
             self.renders += 1;

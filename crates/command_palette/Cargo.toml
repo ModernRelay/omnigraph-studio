@@ -9,6 +9,7 @@ publish.workspace = true
 path = "src/command_palette.rs"
 
 [dependencies]
+studio_perf = { workspace = true }
 gpui = { workspace = true }
 ui = { workspace = true }
 editor = { workspace = true }

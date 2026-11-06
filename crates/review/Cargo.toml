@@ -9,6 +9,7 @@ publish.workspace = true
 path = "src/review.rs"
 
 [dependencies]
+studio_perf = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 gpui = { workspace = true }
