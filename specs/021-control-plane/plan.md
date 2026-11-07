@@ -161,13 +161,18 @@ a sign-in on the web for each organization. Without a control-plane sign-in, a c
 offers its own is signed in to as before. When the plane signs in later, a cluster that asked
 for its own sign-in and holds none takes the plane's token; one that holds a sign-in keeps it.
 
-### The settings page
+### The settings pages
 
-Settings has an Omnigraph Cloud section: the `omnigraph_cloud` address, and under it, for each
-control plane Studio holds:
+Omnigraph Cloud and the clusters are two sections of Settings, since clusters need not be
+Omnigraph Cloud's: a CLI profile may name another control plane (2026-11-06; the first version
+put both on one page).
 
-- **Account.** What the sign-in holds, with Sign in, Cancel, or Sign out and Refresh, and the
-  CLI profiles that use the plane.
+- **Omnigraph Cloud**: the `omnigraph_cloud` address, and under it Omnigraph Cloud's sign-in:
+  what it holds, with Sign in, Cancel, or Sign out and Refresh, and the CLI profiles that use
+  it. Nothing is listed here.
+- **Clusters**, after it: every control plane Studio holds, each under its name ("Omnigraph
+  Cloud", or its host). A plane not signed in to shows its Sign in; another plane than
+  Omnigraph Cloud shows its sign-in over its organizations, since it has no section of its own.
 - **Each organization**, by name, with the CLI profiles in it, and a card of its clusters (purged
   ones counted, not listed). A cluster shows its state and CLI target, Copy MCP link, and its MCP
   link, data endpoint, id and repository, each copied with a click.
@@ -177,8 +182,8 @@ control plane Studio holds:
   and delete, through the CLI target that names the cluster, or first the `omnigraph target add`
   that keeps it as one. Making these changes in Studio is spec 022.
 
-The lists are read when the section shows and let go when it no longer does, as the Open
-dialog's are. Nothing is read on a timer.
+The lists are read when Clusters shows and let go when it no longer does, as the Open dialog's
+are. Nothing is read on a timer.
 
 ### Errors
 

@@ -49,10 +49,10 @@ pub struct SettingsView {
     key_test: Option<Task<()>>,
     /// The settings as values, read again when they change rather than at every frame.
     values: SettingsValues,
-    /// The Omnigraph Cloud page's account and clusters (spec 021), under its address.
+    /// Omnigraph Cloud's sign-in, under its address, and the Clusters page (spec 021).
     cloud: Entity<crate::cloud_settings::CloudPage>,
-    /// Whether that page showed at the last draw: its lists are held only while it does.
-    cloud_shown: bool,
+    /// Which of those pages showed at the last draw: the lists are held only while Clusters does.
+    cloud_shown: Option<crate::cloud_settings::Part>,
     /// The window's graph changing, which the tab follows.
     _workspace_subscription: Option<Subscription>,
     /// The session's schema changing, which "Node names" lists the types of.
@@ -72,9 +72,12 @@ type Options = Rc<[(SharedString, Value)]>;
 /// The section naming each type's nodes (spec 002, "Node names"), offered with a graph open.
 const NODE_NAMES: &str = "Node names";
 
-/// The section of the Omnigraph Cloud address, which also shows its account and clusters
-/// (spec 021, The settings page).
+/// The section of the Omnigraph Cloud address, which also shows its sign-in (spec 021, The
+/// settings pages).
 const CLOUD: &str = "Omnigraph Cloud";
+
+/// Every control plane's clusters, Omnigraph Cloud's or not (spec 021, The settings pages).
+const CLUSTERS: &str = "Clusters";
 
 /// A text setting's field. It writes when the person presses Enter or leaves it, not on every
 /// key, and when the tab closes or Studio quits with typing in it; it shows the setting's value
@@ -213,7 +216,7 @@ impl SettingsView {
             key_test: None,
             values: StudioSettings::get(cx).values(),
             cloud: cx.new(crate::cloud_settings::CloudPage::new),
-            cloud_shown: false,
+            cloud_shown: None,
             _workspace_subscription: None,
             _session_subscription: None,
             _subscriptions: subscriptions,
@@ -928,6 +931,15 @@ impl Render for SettingsView {
                     .any(|f| f.section == *section)
             })
             .collect();
+        // Clusters follows Omnigraph Cloud: it has no setting of its own, so a graph's scope,
+        // which lists only what a graph may override, leaves it out.
+        if scope == Scope::All {
+            let at = sections
+                .iter()
+                .position(|section| *section == CLOUD)
+                .map_or(sections.len(), |at| at + 1);
+            sections.insert(at, CLUSTERS);
+        }
         let named = self.named_graph(cx);
         if named.is_some() {
             sections.push(NODE_NAMES);
@@ -1022,14 +1034,19 @@ impl Render for SettingsView {
             })
             .filter(|(_, rows)| !rows.is_empty());
         let scoped = scope_applies(chosen, searching, &scope);
-        // The Omnigraph Cloud page holds its lists only while it shows.
-        let cloud_shown = !searching && chosen == CLOUD;
+        // The Clusters page holds its lists only while it shows.
+        let cloud_shown = match chosen {
+            _ if searching => None,
+            CLOUD => Some(crate::cloud_settings::Part::Account),
+            CLUSTERS => Some(crate::cloud_settings::Part::Clusters),
+            _ => None,
+        };
         if cloud_shown != self.cloud_shown {
             self.cloud_shown = cloud_shown;
             let cloud = self.cloud.clone();
             cx.defer(move |cx| cloud.update(cx, |page, cx| page.set_shown(cloud_shown, cx)));
         }
-        let empty = groups.is_empty() && node_names.is_none();
+        let empty = groups.is_empty() && node_names.is_none() && cloud_shown.is_none();
         let body = v_flex()
             .w_full()
             .max_w(px(ds::size::READING_WIDTH))
@@ -1105,7 +1122,7 @@ impl Render for SettingsView {
                     )))
                     .child(ds::card(cx).px(px(space::XL)).children(rows))
             }))
-            .when(cloud_shown, |body| body.child(self.cloud.clone()))
+            .when(cloud_shown.is_some(), |body| body.child(self.cloud.clone()))
             .when(empty, |body| {
                 body.child(
                     div()

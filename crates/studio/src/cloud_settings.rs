@@ -1,8 +1,9 @@
-//! The Omnigraph Cloud page of Settings (spec 021, The settings page): under the control plane's
-//! address, the sign-in it holds and every organization it lists, each cluster with its state,
-//! its MCP link, data endpoint, id and repository, each copied with a click. The lists are read
-//! when the page shows and let go when it no longer does, as the Open dialog's are: Studio keeps
-//! no list of its own. A cluster's Manage section reads its state and latest delivery while it is
+//! Two pages of Settings (spec 021, The settings pages). Omnigraph Cloud: under its address, the
+//! sign-in Studio holds there. Clusters: every control plane's organizations and clusters,
+//! Omnigraph Cloud's or one a CLI profile names, which need not be Omnigraph Cloud; each cluster
+//! with its state, its MCP link, data endpoint, id and repository, each copied with a click. The
+//! lists are read while Clusters shows and let go when it no longer does, as the Open dialog's
+//! are: Studio keeps no list of its own. A cluster's Manage section reads its state and latest delivery while it is
 //! open, and gives the CLI command for each change Studio does not make itself (constitution
 //! VI): push, plan, apply and delete.
 
@@ -19,12 +20,21 @@ use ui::prelude::*;
 
 use crate::organizations;
 
-/// The page: the control planes the registry holds, followed while the tab lives.
+/// Which of the two pages Settings shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Part {
+    /// Omnigraph Cloud's sign-in.
+    Account,
+    /// Every control plane's clusters.
+    Clusters,
+}
+
+/// The pages: the control planes the registry holds, followed while the tab lives.
 pub struct CloudPage {
     planes: Vec<Entity<ControlPlane>>,
     managed: Vec<ManagedTarget>,
-    /// Whether Settings shows the page now: only then are the lists read and held.
-    shown: bool,
+    /// The page Settings shows now, if either: the lists are read and held only for Clusters.
+    part: Option<Part>,
     followed: Vec<(EntityId, Subscription)>,
     /// The cluster whose Manage section is open, at most one.
     managing: Option<Managing>,
@@ -45,7 +55,7 @@ impl CloudPage {
         let mut this = Self {
             planes: Vec::new(),
             managed: Vec::new(),
-            shown: false,
+            part: None,
             followed: Vec::new(),
             managing: None,
             _subscriptions: Vec::new(),
@@ -57,7 +67,7 @@ impl CloudPage {
         }
         // Closing Settings lets the lists go.
         this._subscriptions.push(cx.on_release(|this, cx| {
-            if this.shown {
+            if this.lists_held() {
                 for plane in &this.planes {
                     plane.update(cx, |plane, cx| plane.forget_clusters(cx));
                 }
@@ -92,15 +102,17 @@ impl CloudPage {
                 continue;
             }
             let watch = cx.observe(plane, |this, plane, cx| {
-                if !this.shown {
+                if this.part.is_none() {
                     return;
                 }
-                // A sign-in that landed while the page shows lists its organizations.
-                read_if_signed_in(&plane, cx);
+                // A sign-in that landed while Clusters shows lists its organizations.
+                if this.lists_held() {
+                    read_if_signed_in(&plane, cx);
+                }
                 cx.notify();
             });
             self.followed.push((id, watch));
-            if self.shown {
+            if self.lists_held() {
                 read_if_signed_in(plane, cx);
             }
         }
@@ -109,20 +121,28 @@ impl CloudPage {
         cx.notify();
     }
 
-    /// Settings shows the page, or stops showing it: the lists are read, or let go.
-    pub fn set_shown(&mut self, shown: bool, cx: &mut Context<Self>) {
-        if self.shown == shown {
+    fn lists_held(&self) -> bool {
+        self.part == Some(Part::Clusters)
+    }
+
+    /// Settings shows one of the pages, or neither: the lists are read while Clusters shows,
+    /// and let go when it no longer does.
+    pub fn set_shown(&mut self, part: Option<Part>, cx: &mut Context<Self>) {
+        if self.part == part {
             return;
         }
-        self.shown = shown;
-        if !shown {
+        let held = self.lists_held();
+        self.part = part;
+        if !self.lists_held() {
             self.managing = None;
         }
-        for plane in &self.planes {
-            if shown {
-                read_if_signed_in(plane, cx);
-            } else {
-                plane.update(cx, |plane, cx| plane.forget_clusters(cx));
+        if held != self.lists_held() {
+            for plane in &self.planes {
+                if self.lists_held() {
+                    read_if_signed_in(plane, cx);
+                } else {
+                    plane.update(cx, |plane, cx| plane.forget_clusters(cx));
+                }
             }
         }
         cx.notify();
@@ -175,32 +195,40 @@ fn read_if_signed_in(plane: &Entity<ControlPlane>, cx: &mut gpui::App) {
 
 impl Render for CloudPage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let many = self.planes.len() > 1;
         let planes = self.planes.clone();
-        v_flex()
-            .w_full()
-            .gap(px(space::BETWEEN))
-            .when(planes.is_empty(), |page| {
-                page.child(ds::text::muted(
-                    "Omnigraph Cloud is off, and no CLI profile names a control plane. Set its \
-                     address above to sign in.",
-                ))
-            })
-            .children(
-                planes
-                    .iter()
-                    .map(|plane| self.render_plane(plane, many, cx)),
-            )
+        let page = v_flex().w_full().gap(px(space::BETWEEN));
+        match self.part {
+            Some(Part::Account) => {
+                let cloud = planes.iter().find(|plane| plane.read(cx).is_default());
+                match cloud {
+                    Some(plane) => page.child(
+                        ds::card(cx)
+                            .px(px(space::XL))
+                            .child(account_row(plane, "Account", cx)),
+                    ),
+                    None => page.child(ds::text::muted(
+                        "Omnigraph Cloud is off. Set its address above to sign in.",
+                    )),
+                }
+            }
+            Some(Part::Clusters) => page
+                .when(planes.is_empty(), |page| {
+                    page.child(ds::text::muted(
+                        "No control plane lists clusters: set Omnigraph Cloud's address, or \
+                         name a control plane in a CLI profile.",
+                    ))
+                })
+                .children(planes.iter().map(|plane| self.render_plane(plane, cx))),
+            None => page,
+        }
     }
 }
 
 impl CloudPage {
-    fn render_plane(
-        &self,
-        plane: &Entity<ControlPlane>,
-        many: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    /// A control plane's clusters on the Clusters page, under its name: its organizations once
+    /// signed in, or its sign-in while not. Omnigraph Cloud's sign-in is on its own page; another
+    /// plane's, which a CLI profile names, is here, over its organizations.
+    fn render_plane(&self, plane: &Entity<ControlPlane>, cx: &mut Context<Self>) -> AnyElement {
         let (route, cloud, state, profiles, listed) = {
             let p = plane.read(cx);
             (
@@ -213,58 +241,75 @@ impl CloudPage {
         };
         let id = plane.entity_id().as_u64();
         let name = organizations::plane_name(&route, cloud);
-        let account = ds::card(cx)
-            .px(px(space::XL))
-            .child(account_row(plane, &state, &profiles, id, cx));
-        let body: AnyElement = match (&state, listed) {
+        let signed_in = matches!(state, SignIn::SignedIn { .. });
+        let account = (!signed_in || !cloud).then(|| {
+            ds::card(cx)
+                .px(px(space::XL))
+                .child(account_row(plane, "Sign-in", cx))
+        });
+        let body: Option<AnyElement> = match (&state, listed) {
             (SignIn::SignedIn { .. }, Some(Organizations::Listed(listed))) if listed.is_empty() => {
-                ds::text::muted("You are a member of no organization here.").into_any_element()
+                Some(
+                    ds::text::muted("You are a member of no organization here.").into_any_element(),
+                )
             }
-            (SignIn::SignedIn { .. }, Some(Organizations::Listed(listed))) => v_flex()
-                .gap(px(space::BETWEEN))
-                .children(listed.iter().map(|organization| {
-                    let label = organization
-                        .name
-                        .clone()
-                        .unwrap_or_else(|| organization.organization_id.clone());
-                    self.render_organization(
-                        plane,
-                        &organization.organization_id,
-                        label,
-                        &profiles,
-                        cx,
-                    )
-                }))
-                .into_any_element(),
+            (SignIn::SignedIn { .. }, Some(Organizations::Listed(listed))) => Some(
+                v_flex()
+                    .gap(px(space::BETWEEN))
+                    .children(listed.iter().map(|organization| {
+                        let label = organization
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| organization.organization_id.clone());
+                        self.render_organization(
+                            plane,
+                            &organization.organization_id,
+                            label,
+                            &profiles,
+                            cx,
+                        )
+                    }))
+                    .into_any_element(),
+            ),
             (SignIn::SignedIn { .. }, Some(Organizations::Failed(error))) => {
                 let p = plane.clone();
-                h_flex()
-                    .gap(px(space::CONTROLS))
-                    .child(ds::text::error_note(organizations::failure(
-                        &error,
-                        "this control plane",
-                    )))
-                    .child(ds::row_button(("cloud-retry", id), "Try again").on_click(
-                        cx.listener(move |_, _, _, cx| p.update(cx, |p, cx| p.read_clusters(cx))),
-                    ))
-                    .into_any_element()
+                Some(
+                    h_flex()
+                        .gap(px(space::CONTROLS))
+                        .child(ds::text::error_note(organizations::failure(
+                            &error,
+                            "this control plane",
+                        )))
+                        .child(ds::row_button(("cloud-retry", id), "Try again").on_click(
+                            cx.listener(move |_, _, _, cx| {
+                                p.update(cx, |p, cx| p.read_clusters(cx))
+                            }),
+                        ))
+                        .into_any_element(),
+                )
             }
             (SignIn::SignedIn { .. }, _) => {
-                ds::text::muted("Reading your organizations…").into_any_element()
+                Some(ds::text::muted("Reading your organizations…").into_any_element())
             }
-            _ => div().into_any_element(),
+            _ => None,
         };
-        // Every card on the page is a section gap from the next; a plane's name, when there are
-        // several, sits close over its account card.
+        // The plane's name sits close over its first card; every card is a section gap from the
+        // next.
+        let mut cards: Vec<AnyElement> = account
+            .map(IntoElement::into_any_element)
+            .into_iter()
+            .chain(body)
+            .collect();
+        let first = (!cards.is_empty()).then(|| cards.remove(0));
         v_flex()
             .gap(px(space::BETWEEN))
             .child(
                 v_flex()
                     .gap(px(space::SM))
-                    .when(many, |group| group.child(ds::text::meta(name)))
-                    .child(account),
+                    .child(ds::text::meta(name))
+                    .children(first),
             )
-            .child(body)
+            .children(cards)
             .into_any_element()
     }
 
@@ -346,12 +391,20 @@ impl CloudPage {
 /// The sign-in's row: what it holds, and Sign in, Cancel or Sign out with Refresh.
 fn account_row(
     plane: &Entity<ControlPlane>,
-    state: &SignIn,
-    profiles: &[(String, Option<String>)],
-    id: u64,
+    title: &'static str,
     cx: &mut Context<CloudPage>,
 ) -> AnyElement {
-    let host = organizations::oauth_host(&plane.read(cx).route);
+    let (route, state, profiles) = {
+        let p = plane.read(cx);
+        (
+            p.route.clone(),
+            p.sign_in_state().clone(),
+            p.profiles.clone(),
+        )
+    };
+    let state = &state;
+    let id = plane.entity_id().as_u64();
+    let host = organizations::oauth_host(&route);
     let named = (!profiles.is_empty()).then(|| {
         let named = profiles
             .iter()
@@ -433,7 +486,7 @@ fn account_row(
     };
     ds::setting_row(
         ("cloud-account", id),
-        "Account",
+        title,
         format!("{description}{}", named.unwrap_or_default()),
         control,
         None,
@@ -654,8 +707,8 @@ mod tests {
         })
     }
 
-    /// The page shows each organization's clusters with a Copy MCP link that copies the
-    /// cluster's link, and lets the lists go when Settings stops showing it.
+    /// The Clusters page shows each organization's clusters with a Copy MCP link that copies the
+    /// cluster's link; Omnigraph Cloud's page shows none, and the lists go when Clusters does.
     #[gpui::test]
     fn the_page_copies_a_clusters_mcp_link_and_lets_the_lists_go(cx: &mut TestAppContext) {
         cx.update(studio_theme::init_test);
@@ -664,7 +717,7 @@ mod tests {
         let plane = signed_in_plane(cx);
         page.update(cx, |page, cx| {
             page.planes = vec![plane.clone()];
-            page.set_shown(true, cx);
+            page.set_shown(Some(Part::Clusters), cx);
         });
         cx.run_until_parked();
         let copy = cx
@@ -686,10 +739,13 @@ mod tests {
         cx.run_until_parked();
         assert!(page.read_with(cx, |page, _| page.managing.is_none()));
 
-        page.update(cx, |page, cx| {
-            page.managing = None;
-            page.set_shown(false, cx)
-        });
+        // Omnigraph Cloud's page shows its sign-in alone: no clusters, and their lists let go.
+        page.update(cx, |page, cx| page.set_shown(Some(Part::Account), cx));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("copy-mcp-01C").is_none());
+        assert!(plane.read_with(cx, |plane, _| plane.organizations().is_none()));
+        assert!(page.read_with(cx, |page, _| page.managing.is_none()));
+        page.update(cx, |page, cx| page.set_shown(None, cx));
         cx.run_until_parked();
         assert!(plane.read_with(cx, |plane, _| plane.organizations().is_none()));
     }
