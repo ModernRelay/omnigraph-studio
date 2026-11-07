@@ -378,23 +378,31 @@ pub async fn run(
 ) {
     let stderr = Arc::new(Mutex::new(VecDeque::<String>::new()));
     let routes = SharedRoutes::default();
-    let result = connect(
-        launch,
-        commands,
-        stderr.clone(),
-        routes.clone(),
-        opening.clone(),
-    )
-    .await;
-    let failed = result.is_err();
-    let message = match result {
-        Ok(()) => "The agent session ended.".to_owned(),
-        Err(error) => format!("The agent stopped: {}", error_words(&error)),
+    let (message, failed) = match located(launch) {
+        Err(message) => (message, true),
+        Ok(launch) => {
+            let result = connect(
+                launch,
+                commands,
+                stderr.clone(),
+                routes.clone(),
+                opening.clone(),
+            )
+            .await;
+            match result {
+                Ok(()) => ("The agent session ended.".to_owned(), false),
+                Err(error) => (format!("The agent stopped: {}", error_words(&error)), true),
+            }
+        }
     };
-    let stderr = stderr
+    let mut stderr = stderr
         .lock()
         .map(|lines| lines.iter().cloned().collect::<Vec<_>>().join("\n"))
         .unwrap_or_default();
+    // The library puts what the agent printed in its error when it exits: shown once.
+    if message.contains(stderr.trim()) {
+        stderr.clear();
+    }
     let mut listeners: Vec<_> = routes
         .lock()
         .map(|routes| routes.sessions.values().cloned().collect())
@@ -408,6 +416,22 @@ pub async fn run(
                 failed,
             })
             .ok();
+    }
+}
+
+/// `launch` with its program found and a PATH to run with ([`crate::program::resolve`]), or what
+/// to tell the conversations when the program is nowhere on that PATH.
+fn located(mut launch: AgentLaunch) -> Result<AgentLaunch, String> {
+    let Some(program) = launch.command.first_mut() else {
+        // `connect` says that no command is set.
+        return Ok(launch);
+    };
+    match crate::program::resolve(program, &mut launch.env) {
+        Ok(found) => {
+            *program = found;
+            Ok(launch)
+        }
+        Err(missing) => Err(crate::program::missing_message(&missing)),
     }
 }
 

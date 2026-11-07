@@ -135,7 +135,7 @@ const STARTABLE: &[&str] = &[".com", ".exe", ".bat", ".cmd"];
 /// The standard library's own search reads such entries too, so a name in no absolute folder is
 /// `None`, not left to it. A name with a folder is the standard library's, as given.
 #[cfg(any(windows, test))]
-fn find_program(
+pub(crate) fn find_program(
     name: &OsStr,
     dirs: &[PathBuf],
     pathext: &str,

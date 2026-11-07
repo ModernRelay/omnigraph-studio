@@ -104,8 +104,22 @@ turn when the agent is ready (`AgentPanel::opening`); messages sent after it wai
 behind it. A start that has not answered in 20 s says "The agent has not answered yet" with
 Start again, and only then does the composer offer the restart button. A start that fails keeps
 the message ("Not sent yet: it goes when the agent starts again") under the agent's error, which
-reads as its reason without the protocol library's debugging fields. A message sent before an
-agent is chosen goes once one is.
+reads as its reason without the protocol library's debugging fields; what the agent printed
+shows under it only when the reason does not already say it. A message sent before an agent is
+chosen goes once one is, with "Choose an agent to send this to." said once however many wait.
+The same text sent again while it still waits is the person trying again: after a stop it starts
+the agent again, and it is held once, never shown both in the thread and in the queue.
+
+An agent runs with the PATH a terminal would give it (`program.rs`). Started from the Dock or
+Finder, Studio inherits launchd's `/usr/bin:/bin:/usr/sbin:/sbin`, where neither `npx`, `node`
+nor `codex` is. Studio reads the login shell's PATH once (`$SHELL -l -i -c`, stdin closed, the
+PATH between marks), on a thread of its own started with the panel and given 5 s, then appends
+its own PATH and the usual install folders (`~/.local/bin`, mise's shims, Volta's, Bun's,
+`/opt/homebrew/bin`, `/usr/local/bin`, the system's); relative entries are dropped. The agent
+gets that PATH unless `agent.env` sets one, which is then used as it is. A program named without
+a folder is looked for on it before the agent starts, and on Unix started by the path found; one
+that is nowhere says "Studio could not find `codex`. Install it, or set its path in Settings →
+Agent." instead of the system's "No such file or directory".
 
 `session/new` gets the conversation's own folder as `cwd`, `<agent dir>/graphs/<graph>/<branch>-<random>`
 (`sessions::working_dir`; a saved conversation keeps the folder it ran in), and no MCP server.
@@ -386,6 +400,7 @@ Effort, Fast mode and Agent; the test agent offers the same five.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-11-06 | Agents start in a Studio launched from Finder, a missing program is named, and a waiting message shows once | `agent_panel` `program::tests::the_agent_path_puts_the_shells_folders_first_and_lists_each_once`, `the_path_is_read_between_the_marks`, `the_login_shell_is_read_once_it_answers_and_given_up_on_when_it_hangs`, `a_program_is_found_on_the_path_or_named_as_missing`, `the_settings_path_wins_and_a_missing_program_is_named`, `panel::tests::a_message_sent_again_while_it_waits_is_held_once`; `cargo test -p agent_panel`, clippy `-D warnings`; a debug bundle (`script/bundle-mac --debug`) started with `open`, so with launchd's PATH, a new conversation with Codex | Pass. Before: launched from the Dock, Claude Agent stopped with "env: npx: No such file or directory" (exit 127, the line repeated in a code block) and Codex with "No such file or directory (os error 2)"; "Choose an agent to send this to." showed twice and a message sent again showed both in the thread and as "1 queued message". After: `npx` ran `@agentclientprotocol/codex-acp` under `node` and Codex reached its ready footer (Full access, High, its model); the missing-program message is checked by test, not in the app. A Claude conversation was not run |
 | 2026-10-29 | The model menu lists each agent's models, and a model of another agent runs that agent | `agent_panel` `sessions::tests::an_agents_models_are_kept_apart_from_its_options`; `cargo test -p agent_panel`, clippy `-D warnings` | Pass. The menu is not drawn by a test |
 | 2026-10-29 | A conversation runs the agent it was held with, starts it when shown, and joins the list on its first message | `agent_panel` `panel::tests::a_conversation_runs_the_agent_it_was_held_with` (held agent, default, a custom command offered beside the presets), `a_restored_conversation_starts_its_agent_when_shown`; `cargo test -p agent_panel`, clippy `-D warnings` | Pass. The menu and the in-place switch are not drawn by a test; checked by hand in the running app |
 | 2026-10-28 | The panel serves no MCP server, and each conversation has a folder of its own | `agent_panel` `sessions::tests::each_conversation_has_a_folder_of_its_own`, `cli_home::tests::agents_md_names_the_cli_the_branch_and_the_rules`, `a_conversation_home_holds_its_config_token_and_wrapper`, `panel::tests::a_run_of_steps_reads_as_one_sentence`, `streaming_into_the_last_turn_keeps_the_earlier_turns_blocks`; `cargo test -p agent_panel -p studio`, clippy `-D warnings` | See spec 013's log of the same date. `socket.rs`, `mcp.rs`, `tools.rs` and the `mcp-proxy` command are gone; every permission request is the person's; the thread shows each tool call by its title |

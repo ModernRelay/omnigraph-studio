@@ -673,6 +673,9 @@ struct Queued {
     text: String,
 }
 
+/// Said once under the messages sent before an agent is chosen.
+const CHOOSE_AN_AGENT: &str = "Choose an agent to send this to.";
+
 /// Messages sent while the agent works (spec 011), as Zed queues them on the client: ACP runs one
 /// turn at a time and has no queue of its own. The first goes out as each turn ends; Stop
 /// pauses the queue until the person sends again; "Send now" stops the turn and sends one at
@@ -1865,10 +1868,16 @@ impl AgentPanel {
             State::Starting => self.hold_until_ready(text, first),
             State::Setup => {
                 self.hold_until_ready(text, first);
-                self.entries.push(Entry::Notice {
-                    text: "Choose an agent to send this to.".into(),
-                    error: false,
-                });
+                let said = matches!(
+                    self.entries.last(),
+                    Some(Entry::Notice { text, .. }) if text == CHOOSE_AN_AGENT
+                );
+                if !said {
+                    self.entries.push(Entry::Notice {
+                        text: CHOOSE_AN_AGENT.into(),
+                        error: false,
+                    });
+                }
             }
             State::Idle | State::Exited { .. } => {
                 self.hold_until_ready(text, first);
@@ -1883,8 +1892,20 @@ impl AgentPanel {
     /// opening nor messages kept in the queue across a stop, it is the opening
     /// ([`Self::opening`]): shown in the thread at once and sent as soon as the agent is ready.
     /// Any other waits in the queue, behind it, so the messages go in the order they were sent.
+    ///
+    /// The same text sent again while it still waits is the person trying again, as after the
+    /// agent stopped: it is not held twice, so the thread and the queue never show one message
+    /// as two.
     fn hold_until_ready(&mut self, text: String, first: bool) {
-        if self.opening.is_none() && !self.queue.holds_messages() {
+        let waiting = self.opening.as_ref() == Some(&text)
+            || self
+                .queue
+                .entries
+                .last()
+                .is_some_and(|last| last.text == text);
+        if waiting {
+            self.thread.scroll_to_end();
+        } else if self.opening.is_none() && !self.queue.holds_messages() {
             self.opening = Some(text);
             self.thread.scroll_to_end();
         } else {
@@ -4323,6 +4344,54 @@ mod tests {
             assert_eq!(names, ["Claude Agent", "Codex", "my-agent"]);
         });
         std::fs::remove_file(&path).ok();
+    }
+
+    /// Messages sent before an agent is chosen wait for one, with "Choose an agent" said once.
+    /// The same message sent again while it waits (the person trying again) is held once, so
+    /// it does not show both in the thread and in the queue; a different one queues behind it.
+    #[gpui::test]
+    async fn a_message_sent_again_while_it_waits_is_held_once(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, _) = graph_store::test_server::followed_session(
+            "node Person {\n  slug: String @key\n}\n",
+            |_| serde_json::json!([]),
+            cx,
+        );
+        cx.run_until_parked();
+        let (_root, cx) = cx.add_window_view(|_, _| gpui::EmptyView);
+        let panel = cx.update(|window, cx| {
+            cx.new(|cx| AgentPanel::new(session, WeakEntity::new_invalid(), None, window, cx))
+        });
+        cx.update(|_, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.state = State::Setup;
+                for text in ["hi", "hi ", "hi", "and then"] {
+                    panel.send_or_queue(text.to_owned(), false, cx);
+                }
+            })
+        });
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.opening.as_deref(), Some("hi"));
+            let queued: Vec<&str> = panel
+                .queue
+                .entries
+                .iter()
+                .map(|queued| queued.text.as_str())
+                .collect();
+            assert_eq!(queued, ["and then"]);
+            let notices = panel
+                .entries
+                .iter()
+                .filter(
+                    |entry| matches!(entry, Entry::Notice { text, .. } if text == CHOOSE_AN_AGENT),
+                )
+                .count();
+            assert_eq!(notices, 1);
+        });
     }
 
     /// Starting a conversation nothing was sent in again (Restart, or Start again after a slow

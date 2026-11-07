@@ -18,6 +18,7 @@ mod host;
 mod json_schema;
 mod launch;
 mod panel;
+mod program;
 mod requester;
 mod sessions;
 mod sessions_panel;
@@ -36,6 +37,8 @@ use ui::IconName;
 pub const LAUNCH_COMMAND: &str = "launch-agent";
 
 pub fn init(cx: &mut App) {
+    // Agents run with the login shell's PATH (spec 011); read it before the first one starts.
+    program::warm();
     // A restored tab comes back with its conversation.
     studio_workspace::register_item_kind(cx, "agent", |data, workspace, window, cx| {
         match data.get("session").and_then(|id| id.as_str()) {
