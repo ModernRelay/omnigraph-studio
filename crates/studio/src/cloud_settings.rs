@@ -254,10 +254,16 @@ impl CloudPage {
             }
             _ => div().into_any_element(),
         };
+        // Every card on the page is a section gap from the next; a plane's name, when there are
+        // several, sits close over its account card.
         v_flex()
-            .gap(px(space::SM))
-            .when(many, |group| group.child(ds::text::meta(name)))
-            .child(account)
+            .gap(px(space::BETWEEN))
+            .child(
+                v_flex()
+                    .gap(px(space::SM))
+                    .when(many, |group| group.child(ds::text::meta(name)))
+                    .child(account),
+            )
             .child(body)
             .into_any_element()
     }
