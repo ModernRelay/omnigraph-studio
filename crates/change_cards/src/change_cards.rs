@@ -291,14 +291,13 @@ pub fn run_sentence(run: &GroupRun) -> (String, &'static str) {
     (parts.join(", "), joiner)
 }
 
-/// What a run's row says beside its type, past the counts: its properties that changed when
-/// they were read (`properties`), else how many relationships its entities carry. A run of
-/// one entity says nothing more, since that entity's own row says it.
-pub fn run_detail(run: &GroupRun, properties: &str) -> String {
-    if run.groups.len() < 2 {
+/// What a run's row says beside its type, past the counts: how many relationships its entities
+/// carry, when that is all that changed. The properties each change touched are said once, on
+/// its entity's row, and in full when it opens, never again on the type's row. A run of one
+/// entity says nothing more, since that entity's own row says it.
+pub fn run_detail(run: &GroupRun) -> String {
+    if run.groups.len() < 2 || run.changed + run.added + run.removed > 0 {
         String::new()
-    } else if !properties.is_empty() {
-        properties.to_owned()
     } else if run.relationships > 0 {
         format!(
             "with {}",
@@ -307,26 +306,6 @@ pub fn run_detail(run: &GroupRun, properties: &str) -> String {
     } else {
         String::new()
     }
-}
-
-/// The properties the entity changes of `run` touched, the first four and how many more.
-pub fn run_properties(run: &GroupRun, groups: &EntityGroups, folded: &FoldedChanges) -> String {
-    let mut names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-    for &g in &run.groups {
-        for change in groups.groups[g].changes() {
-            let change = &folded.changes[change];
-            if change.is_edge() {
-                continue;
-            }
-            names.extend(changed_properties(change));
-        }
-    }
-    let shown: Vec<&str> = names.iter().copied().take(4).collect();
-    let mut text = shown.join(", ");
-    if names.len() > 4 {
-        text.push_str(&format!(" and {} more", names.len() - 4));
-    }
-    text
 }
 
 /// The properties a change set or dropped, by name.
@@ -386,39 +365,49 @@ pub fn run_row(
         Color::Muted
     };
     let hover = studio_ui::ds::surface::hover(cx);
+    // The hover is a rounded row the feed's width, inset by `space::SM` so its text keeps the
+    // feed's edge, and kept `space::XS` clear of the table under it, whose open head is grey too.
+    let row = h_flex()
+        .id(id)
+        .w_full()
+        .h(px(studio_ui::ds::size::FEED_ROW))
+        .px(px(space::XL - space::SM))
+        .gap(px(space::MD))
+        .items_center()
+        .rounded(px(radii(cx).sm))
+        .cursor_pointer()
+        .hover(move |style| style.bg(hover))
+        .child(studio_ui::ds::dot(color))
+        .child(studio_ui::ds::icon::meta(if folded {
+            IconName::ChevronRight
+        } else {
+            IconName::ChevronDown
+        }))
+        .child(studio_ui::ds::text::body(counts))
+        .child(studio_ui::ds::text::muted(joiner))
+        .child(studio_ui::kind_swatch(&run.type_name, run.is_edge, cx))
+        .child(studio_ui::ds::text::body(run.type_name.clone()))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .child(studio_ui::ds::text::muted(detail).single_line().truncate()),
+        )
+        .children(when.map(studio_ui::ds::text::meta))
+        .on_click(on_click);
     v_flex()
+        .w_full()
         .children(section.map(section_title))
         .child(
-            h_flex()
-                .id(id)
-                .h(px(studio_ui::ds::size::FEED_ROW))
-                .px(px(space::XL))
-                .gap(px(space::MD))
-                .items_center()
-                .cursor_pointer()
-                .when(folded, |row| {
-                    row.border_b_1()
+            div()
+                .w_full()
+                .px(px(space::SM))
+                .when(folded, |wrap| {
+                    wrap.border_b_1()
                         .border_color(studio_ui::ds::surface::rule(cx))
                 })
-                .hover(move |style| style.bg(hover))
-                .child(studio_ui::ds::dot(color))
-                .child(studio_ui::ds::icon::meta(if folded {
-                    IconName::ChevronRight
-                } else {
-                    IconName::ChevronDown
-                }))
-                .child(studio_ui::ds::text::body(counts))
-                .child(studio_ui::ds::text::muted(joiner))
-                .child(studio_ui::kind_swatch(&run.type_name, run.is_edge, cx))
-                .child(studio_ui::ds::text::body(run.type_name.clone()))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .child(studio_ui::ds::text::muted(detail).single_line().truncate()),
-                )
-                .children(when.map(studio_ui::ds::text::meta))
-                .on_click(on_click),
+                .when(!folded, |wrap| wrap.pb(px(space::XS)))
+                .child(row),
         )
         .into_any_element()
 }
@@ -521,7 +510,8 @@ pub struct EntityRow {
 }
 
 /// An entity's row in the table under its run: a chevron, its name (struck through when
-/// removed), what changed in a few words, its status and its id; `body` under it when open.
+/// removed), what changed in a few words while it is folded, its status and its id; `body`
+/// under it when open, which says what changed in full, so the row does not say it again.
 /// The table is drawn row by row, inside the run's gutter.
 pub fn entity_row(
     row: EntityRow,
@@ -569,12 +559,9 @@ pub fn entity_row(
                 .single_line()
                 .truncate(),
         )
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .child(studio_ui::ds::text::muted(summary).single_line().truncate()),
-        )
+        .child(div().flex_1().min_w_0().when(!open, |slot| {
+            slot.child(studio_ui::ds::text::muted(summary).single_line().truncate())
+        }))
         .children(status.map(|(text, color)| studio_ui::ds::text::meta(text).color(color)))
         .children(entity_id.map(|id| {
             studio_ui::ds::text::meta(id)
@@ -673,6 +660,29 @@ fn property_rows(change: &FoldedChange, schema: Option<&SchemaModel>) -> Vec<Pro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A type's row names no properties: each entity's row says which of its changed, so a
+    /// type's row says only how many relationships a run of unchanged entities carries.
+    #[test]
+    fn a_types_row_leaves_the_properties_to_its_entities() {
+        let run = |changed, relationships| GroupRun {
+            section: None,
+            type_name: "Capability".into(),
+            is_edge: false,
+            groups: vec![0, 1],
+            added: 0,
+            changed,
+            removed: 0,
+            relationships,
+        };
+        assert_eq!(run_detail(&run(2, 3)), "");
+        assert_eq!(run_detail(&run(0, 3)), "with 3 relationships");
+        let one = GroupRun {
+            groups: vec![0],
+            ..run(0, 3)
+        };
+        assert_eq!(run_detail(&one), "", "its entity's row says it");
+    }
 
     /// A card of many relationships shows its first few, more each time they are asked for,
     /// and always every line through the one selected.

@@ -759,7 +759,6 @@ impl CommitView {
                 let run = &self.runs[ix];
                 let key = run_key(run, &self.groups);
                 let folded = self.folded_runs.contains(&key);
-                let properties = change_cards::run_properties(run, &self.groups, &self.folded);
                 change_cards::run_row(
                     ("commit-run", ix),
                     run,
@@ -771,7 +770,7 @@ impl CommitView {
                             }
                             .to_owned()
                         }),
-                        detail: change_cards::run_detail(run, &properties),
+                        detail: change_cards::run_detail(run),
                         when: None,
                     },
                     folded,

@@ -3181,8 +3181,9 @@ impl ReviewView {
         })
     }
 
-    /// The feed's row for a run of one type: a status dot, "1 changed in Task", the properties
-    /// its changes touched, and when; it folds the run's entities away and back.
+    /// The feed's row for a run of one type: a status dot, "1 changed in Task", and when; it
+    /// folds the run's entities away and back. Which properties changed is each entity's row's
+    /// to say.
     fn feed_section_row(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
         let Some(data) = &self.data else {
             return div().into_any_element();
@@ -3191,7 +3192,7 @@ impl ReviewView {
         let key = run_key(run, data);
         let folded = self.collapsed_runs.contains(&key);
         let facts = self.run_facts.get(ix).cloned().unwrap_or_default();
-        let detail = change_cards::run_detail(run, &facts.properties);
+        let detail = change_cards::run_detail(run);
         let when = facts.latest.map(|at| {
             let ago = studio_ui::relative_time(at, studio_ui::now_micros());
             if facts.commits > 1 {
@@ -3714,11 +3715,10 @@ fn notice(severity: Severity, text: String, action: Option<AnyElement>) -> AnyEl
     callout.into_any_element()
 }
 
-/// What a feed's row says of a run beyond its type: the properties its changes touched, how
-/// many commits made them, and the latest commit's time.
+/// What a feed's row says of a run beyond its type: how many commits made its changes, and the
+/// latest commit's time.
 #[derive(Debug, Clone, Default)]
 struct RunFacts {
-    properties: String,
     commits: usize,
     latest: Option<i64>,
 }
@@ -3741,7 +3741,6 @@ fn run_facts(data: &ReviewData, run: &GroupRun, created: &HashMap<&str, i64>) ->
         .copied()
         .max();
     RunFacts {
-        properties: change_cards::run_properties(run, &data.groups, &data.folded),
         commits: commits.len(),
         latest,
     }

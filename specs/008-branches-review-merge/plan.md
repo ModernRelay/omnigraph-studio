@@ -100,12 +100,15 @@ place), X (designed on 0.13; the better routes are deferred).
   - **Feed**: one row per run of one type (`graph_store::EntityGroups` runs, in two sections:
     changes to what the target has, then what the branch added), read as a sentence with a
     status dot of its kind: "1 changed in Task · 2 h ago", "2 added to Email · with 3
-    relationships", the right edge giving the commits and when; a run of two or more
-    entities names the properties they touched ("waiting_on, brief"), a run of one leaves
-    that to its entity's row. The row folds
+    relationships", the right edge giving the commits and when. Which properties changed is
+    said once, by each entity: the type's row names none, and an open entity's row drops its
+    few words, since its property rows say it in full (2026-11-06; before, the type's row and
+    the open row repeated what the diff under them showed). The row's hover is a rounded row
+    inset in the feed, a gap clear of the table under it. The row folds
     its entities away and back (`collapsed_runs`). Under an open row its entities sit in an
     inset table, hairline-framed and drawn row by row: a chevron, the name (a relationship's
-    ends), what changed in a few words ("brief, status changed · 2 relationships"), its state
+    ends), while folded what changed in a few words ("brief, status changed · 2
+    relationships"), its state
     (a fix's, "1 of 3 not reviewed", "Reviewed", dimmed) and its id. An entity unfolds in
     place (a click, Space; `expanded`; the selected one unfolds as J and K reach it, and the
     first opens with the review) to its property rows, its relationship lines and, last, its
