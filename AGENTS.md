@@ -61,8 +61,10 @@ python3 script/test_release_files.py   # a release's version-free copies and lat
   (`type_table/src/dialogs.rs` tests). Offscreen snapshots (`crates/studio/examples/snapshot.rs`)
   check what a view looks like.
 - A debug build run from `target/` is signed ad hoc, so each rebuild is a new app to the
-  Keychain and it asks for the login password again. Sign it after every build with
-  `script/sign-dev` (once: `script/sign-dev --make-identity`); `script/bundle-mac` uses the same
+  Keychain and it asks for the login password again. `cargo run` and `script/dev` sign it
+  before starting it (`script/run-signed`, Cargo's runner on macOS); a build started another
+  way needs `script/sign-dev` after it. Make the identity once with
+  `script/sign-dev --make-identity`; `script/bundle-mac` uses the same
   identity when no Developer ID is set. The `omnigraph` CLI keeps its sign-in session in the
   Keychain too and is signed ad hoc: after a CLI update, `script/sign-dev --cli`.
 - Write files with `studio_settings::write_atomic`, never by truncating in place.

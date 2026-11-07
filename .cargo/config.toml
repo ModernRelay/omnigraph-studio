@@ -1,0 +1,7 @@
+# `cargo run` signs Studio with the Mac's development identity before starting it, so the
+# Keychain asks once, not after every rebuild (script/run-signed, script/sign-dev).
+[target.aarch64-apple-darwin]
+runner = "script/run-signed"
+
+[target.x86_64-apple-darwin]
+runner = "script/run-signed"

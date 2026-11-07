@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Cargo's runner on macOS (.cargo/config.toml): `cargo run` and script/dev sign Studio with the
+# Mac's development identity before starting it, so the Keychain keeps trusting every rebuild
+# and asks once, not at every launch (script/sign-dev explains why). Every other binary, tests
+# and examples included, runs as built.
+#
+# Without the identity Studio runs ad hoc signed, as before, after one line saying how to make
+# it: script/sign-dev --make-identity.
+set -euo pipefail
+
+binary=$1
+if [[ "$(basename "$binary")" == omnigraph-studio ]]; then
+  identity=${STUDIO_DEV_SIGN_IDENTITY:-Omnigraph Studio Dev}
+  if security find-identity -v -p codesigning 2>/dev/null | grep -q "\"$identity\""; then
+    "$(dirname "$0")/sign-dev" "$binary" > /dev/null 2>&1 \
+      || echo "run-signed: signing failed; Studio runs ad hoc signed" >&2
+  else
+    echo "run-signed: no \"$identity\" identity, so the Keychain will ask at every launch;" \
+      "make it once with script/sign-dev --make-identity" >&2
+  fi
+fi
+exec "$@"
