@@ -433,7 +433,8 @@ Its action is not registered, so the palette and the keyboard button's list leav
     sizes, canvas node limit).
     With a graph open, the tab's scope switch ("All graphs" | the graph) shows only those,
     writes the graph's own value, and Reset removes it; an own value's description names the
-    shared one. Views read the values in effect through `GraphSession::options`.
+    shared one. The switch is drawn only where it changes something: on a section with such a
+    setting, in a search, and while the graph's scope is chosen (2026-11-06). Views read the values in effect through `GraphSession::options`.
   - **Node names** (since 2026-10-19). A node is named by one property of its type everywhere
     Studio shows it: a canvas chip, a tree row, the inspector's title, a table's relationship
     cell, the palette. By default that is `name`, `title`, `display_name` or `label`, else the

@@ -1021,6 +1021,7 @@ impl Render for SettingsView {
                 )
             })
             .filter(|(_, rows)| !rows.is_empty());
+        let scoped = scope_applies(chosen, searching, &scope);
         // The Omnigraph Cloud page holds its lists only while it shows.
         let cloud_shown = !searching && chosen == CLOUD;
         if cloud_shown != self.cloud_shown {
@@ -1139,7 +1140,7 @@ impl Render for SettingsView {
                                 SharedString::from(chosen)
                             }))
                             .child(div().flex_1())
-                            .children(self.render_scope(cx))
+                            .children(self.render_scope(cx).filter(|_| scoped))
                             .child(ds::search_field(self.search.clone(), cx).w(px(ds::size::FIELD)))
                             .child(
                                 studio_ui::ds::icon_button("reveal-settings", IconName::Folder)
@@ -1173,6 +1174,16 @@ impl Render for SettingsView {
                     .child(body),
             )
     }
+}
+
+/// Whether the scope switch shows: where it changes something, a section with a setting a graph
+/// may override, a search, or a graph's scope already chosen, to switch back from.
+fn scope_applies(section: &str, searching: bool, scope: &Scope) -> bool {
+    searching
+        || *scope != Scope::All
+        || studio_settings::fields()
+            .iter()
+            .any(|field| field.per_graph && field.section == section)
 }
 
 /// Shows `keymap.json`, written first with a starting point when the person has none, off the
@@ -1261,6 +1272,22 @@ mod tests {
     use gpui::{TestAppContext, VisualTestContext};
 
     use super::*;
+
+    /// The scope switch shows only where a graph's own value can be set.
+    #[test]
+    fn the_scope_switch_shows_where_a_graph_may_override() {
+        assert!(scope_applies("Browsing", false, &Scope::All));
+        assert!(!scope_applies(CLOUD, false, &Scope::All));
+        assert!(!scope_applies("Appearance", false, &Scope::All));
+        assert!(
+            scope_applies(CLOUD, true, &Scope::All),
+            "a search spans every section"
+        );
+        assert!(
+            scope_applies("Browsing", false, &Scope::Graph("k".into())),
+            "a graph's scope keeps the switch to leave it"
+        );
+    }
 
     fn cli_field(view: &SettingsView) -> usize {
         view.text_inputs
