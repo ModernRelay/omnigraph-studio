@@ -130,6 +130,20 @@ pub(crate) fn write_rows(
             (row.id.clone(), cells)
         })
         .collect();
+    let wrote = graph_store::Wrote {
+        type_name: type_name.to_owned(),
+        nodes: rows
+            .iter()
+            .map(|row| {
+                let values = row
+                    .cells
+                    .iter()
+                    .map(|(property, _, new)| (property.clone(), new.clone()))
+                    .collect();
+                (row.id.clone(), values)
+            })
+            .collect(),
+    };
     send_bound(
         session,
         branch,
@@ -139,6 +153,7 @@ pub(crate) fn write_rows(
         read_at,
         query,
         description,
+        wrote,
         cx,
     )
 }
@@ -164,6 +179,13 @@ pub(crate) fn write_cells(
         .iter()
         .map(|(id, old)| (id.clone(), vec![(property.to_owned(), old.clone())]))
         .collect();
+    let wrote = graph_store::Wrote {
+        type_name: type_name.to_owned(),
+        nodes: rows
+            .iter()
+            .map(|(id, _)| (id.clone(), vec![(property.to_owned(), new.clone())]))
+            .collect(),
+    };
     send_bound(
         session,
         branch,
@@ -173,6 +195,7 @@ pub(crate) fn write_cells(
         read_at,
         query,
         description,
+        wrote,
         cx,
     )
 }
@@ -183,7 +206,8 @@ pub(crate) fn write_cells(
 /// is `read_at` when the caller read every value there and it is the head the session holds;
 /// otherwise the nodes holding a list are read together at the branch's head, and the write is
 /// bound to the commit they were found at. A change made elsewhere since the values were read
-/// is found by the comparison, and one made after it by the head having moved.
+/// is found by the comparison, and one made after it by the head having moved. Once it commits,
+/// setting every node, the session tells views the values `wrote` names.
 #[expect(clippy::too_many_arguments)]
 fn send_bound(
     session: &Entity<GraphSession>,
@@ -194,6 +218,7 @@ fn send_bound(
     read_at: Option<String>,
     query: BuiltQuery,
     description: String,
+    wrote: graph_store::Wrote,
     cx: &mut App,
 ) -> Result<Task<Bound>, String> {
     let branch = branch.to_owned();
@@ -225,7 +250,7 @@ fn send_bound(
     };
     if let Some(bound_to) = bound_to {
         let write = session.update(cx, |session, cx| {
-            session.write_on(&branch, &query, bound_to, description, None, cx)
+            session.write_properties_on(&branch, &query, bound_to, description, wrote, cx)
         });
         return Ok(cx.spawn(async move |_| Bound::Sent(write.await)));
     }
@@ -264,7 +289,7 @@ fn send_bound(
             return Bound::Changed;
         }
         let write = session.update(cx, |session, cx| {
-            session.write_on(&branch, &query, Some(head), description, None, cx)
+            session.write_properties_on(&branch, &query, Some(head), description, wrote, cx)
         });
         Bound::Sent(write.await)
     }))

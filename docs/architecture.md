@@ -68,10 +68,18 @@ A view's first read returns `graph_commit_id`. Later reads in that view pass it 
 The `GraphSession` watches branch heads for every view: every 30 s while a Studio window is
 active and shows the graph, and at once when a window becomes active after a missed poll (or
 shows the graph again after parking it), it reads each watched branch's head with a query that
-returns no rows (`limit 0`; its answer names the head commit), and it reads the branch list. Studio's own commits set the head without asking. A view whose
-pin is not the head shows "Newer data · Refresh" and changes nothing until the person
-refreshes (constitution II, V). Writes use `POST /mutate/if-graph-commit` with the pinned id;
-a 412 reopens the draft.
+returns no rows (`limit 0`; its answer names the head commit), and it reads the branch list.
+Studio's own commits set the head without asking. Before one moves the head, a property write
+tells every view the values it set (`SessionEvent::PropertiesWritten`): a table, page or peek
+pinned to the commit it was made on that shows the nodes takes the values and moves to its
+commit, and a markdown editor with nothing unsaved shows the new value, wherever in Studio the
+write was made. A view whose pin is not the head, and that such a write did not move, shows
+"Newer data · Refresh" and changes nothing until the person refreshes (constitution II, V).
+Property writes are bound by value: their `where` names each value read, so a commit that
+changed nothing they set does not refuse them. A list cannot be compared in a `where`, so a
+write that sets one is bound to a commit holding the values read
+(`POST /mutate/if-graph-commit`), read again at the head when the view's pin is not it; a
+write that matched nothing, or a 412, reopens the draft.
 
 ## The window frame
 

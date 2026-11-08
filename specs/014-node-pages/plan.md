@@ -200,8 +200,11 @@ Four parts, built in this order; each lands on its own.
   it reads the value at the commit the field was edited at and shows what was typed, so its
   save stays bound to what the person read. ⌘S saves; the tab's dot says unsaved. A value
   changed elsewhere meanwhile is not overwritten: the text stays, and "Use theirs" or "Keep
-  mine" (the next save replaces the value as it is now) decides. Markdown highlighting in the
-  editor (`tree-sitter-md`) is not wired yet.
+  mine" (the next save replaces the value as it is now) decides. A save in the editor, a cell
+  or a page is told to every view before the head moves: a table, page or peek at the commit
+  it was made on takes the value and moves to the save's commit, and an editor with nothing
+  unsaved shows it, so opening the editor again from any of them never shows the old value.
+  Markdown highlighting in the editor (`tree-sitter-md`) is not wired yet.
 - Bounds: a value over 256 KB opens read-only with a notice, and every editor saves through the
   ordinary value-bound update.
 
@@ -289,6 +292,7 @@ Four parts, built in this order; each lands on its own.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-11-07 | A save made anywhere moves the views showing it | `type_table` `a_write_made_elsewhere_moves_the_table_with_it` (fails with the announcement off: the table stays at `c1`), `a_write_made_elsewhere_moves_the_page_with_it`, `an_open_editor_takes_a_value_written_elsewhere` (unsaved text stays bound to the value it was typed over) | A table and a page at `c1` move to the write's `c2` with the new name and no "Newer data"; an idle editor shows the new value. Before, a save in the editor left the table it was opened from at the old commit, so the editor opened again from it read the old value there |
 | 2026-10-29 | Views not drawn read nothing, a write out shows again on its branch, and ⌘S reaches a page with no field open | `type_table` `a_page_not_drawn_reads_nothing` (made, then the branch moved, with no window: no read, then drawn: read), `text_editor::tests::a_tab_not_drawn_reads_nothing` (an editor in a window that draws a blank root), `a_nodes_page_reads_it_and_names_its_tab` (extended: the saved label names a restored page before it reads), `a_write_out_shows_again_on_its_branch` (main → fix → main before the write lands), `a_page_with_no_field_open_saves_its_drafts_with_cmd_s`; the Blob tab's first read asked after its draw, and only when it can start | All pass. Before: every restored page and text editor read its node at start and at every branch move, shown or not; a write's markers went with a branch switch, so coming back before it landed let the property be written again; a page's own focus sat outside its view, so ⌘S saved nothing until a field was open. A first version of the Blob tab's deferral redrew itself in a loop while waiting for the schema, caught by its tests hanging |
 | 2026-10-28 | A save that finds its own value written closes the field, one write of a property is out at a time, and markdown is made once | `type_table` `a_conflict_with_the_value_typed_closes_the_field` (a write matching nothing at a head that holds what it would write), `a_second_write_of_a_property_waits_as_a_draft`, `a_texts_markdown_is_made_once_while_it_stands` (a text kept, changed, plain, then cleared) | All pass. Before: the field reopened saying the value had changed elsewhere to what the person typed; two writes of one property could both go; the markdown views were walked with an allocation per property each frame (texts were already parsed once) |
 | 2026-10-21 | A long text's controls sit in its head | `type_table` `a_long_texts_controls_and_folded_draft_sit_in_its_head` (a page's name made long: "Open in the editor" within the head's bounds; folded with a draft, its dot there), failing with the controls appended after the text as before, the button 32 px under the head | A regression review found the long text's "Open in the editor", saving dot and "Copied" stacked under the text, each a 32 px line, the hover-only button a blank strip, and a folded text's draft without its dot |

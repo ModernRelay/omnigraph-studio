@@ -65,7 +65,7 @@ pub mod cli {
 }
 pub use session::{
     BranchStart, DraftEntry, DraftKey, ExternalWrite, FollowUp, GraphSession, HeadWatch, HeldAs,
-    Loadable, MergeEntry, MergeSent, MergeSettled, OutcomeEntry, OutcomeKind, SessionEvent,
+    Loadable, MergeEntry, MergeSent, MergeSettled, OutcomeEntry, OutcomeKind, SessionEvent, Wrote,
     nothing_sent, open_session, open_session_behind,
 };
 

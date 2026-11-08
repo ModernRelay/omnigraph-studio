@@ -1369,6 +1369,14 @@ impl TypeTable {
             }
             SessionEvent::DraftsChanged => self.drafts_changed(cx),
             SessionEvent::CredentialChanged => self.credential_changed(cx),
+            SessionEvent::PropertiesWritten {
+                branch,
+                parent,
+                commit,
+                wrote,
+            } if *branch == self.branch => {
+                self.properties_written(parent.as_deref(), commit, wrote, cx)
+            }
             SessionEvent::HeadMoved { branch, .. } if *branch == self.branch => {
                 self.compare_head(cx)
             }
@@ -3452,6 +3460,67 @@ impl TypeTable {
     /// ([`Paging::advance_for_own_commit`]): the pin follows it when it was made on the pin, and
     /// every read out then is read again ([`Self::own_write_since`]). Whether the table is
     /// behind its branch now.
+    /// A property write Studio made, in this table or another view (a page, a peek, the markdown
+    /// editor): a table at the commit it was made on that shows every node it set takes the
+    /// values and moves to its commit, as after a cell edit of its own, so the change made in
+    /// Studio is not offered as newer data. The head move it makes is compared as any other
+    /// when the table cannot tell what it changed: a node it does not show (a filter may now
+    /// let it in), or one it may show among other rows' neighbours.
+    fn properties_written(
+        &mut self,
+        parent: Option<&str>,
+        commit: &str,
+        wrote: &graph_store::Wrote,
+        cx: &mut Context<Self>,
+    ) {
+        if self.at_commit.is_some()
+            || self.kind != TableKind::Node
+            || wrote.type_name != self.type_name
+            || self.paging.pinned.is_none()
+            || self.paging.pinned.as_deref() != parent
+        {
+            return;
+        }
+        let as_neighbours = self.columns.iter().any(|column| {
+            column
+                .relationship()
+                .is_some_and(|group| group.other_type == wrote.type_name)
+        }) || self
+            .grouping
+            .as_ref()
+            .is_some_and(|grouping| !grouping.by_own_property())
+            || self.filters.iter().any(|filter| {
+                matches!(
+                    builder::parse_group_key(&filter.property),
+                    builder::GroupKey::NeighbourProperty { .. }
+                )
+            });
+        if as_neighbours {
+            return;
+        }
+        // Where each node written shows, with the values written to it.
+        type Placed<'a> = (Vec<usize>, &'a [(String, Value)]);
+        let written: Vec<Placed> = wrote
+            .nodes
+            .iter()
+            .map(|(id, values)| (self.places_of_id(id), values.as_slice()))
+            .collect();
+        if written.iter().any(|(places, _)| places.is_empty()) {
+            return;
+        }
+        self.follow_own_commit(parent, commit);
+        let filters = self.resolved_filters();
+        for (places, values) in written {
+            for (property, value) in values {
+                self.set_cell_at(&places, property, value.clone());
+            }
+            let fits = self.row_fits_under(&filters, places[0]);
+            self.set_dimmed_at(&places, !fits);
+        }
+        cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
+    }
+
     fn follow_own_commit(&mut self, parent: Option<&str>, commit: &str) -> bool {
         let before = self.paging.pinned.clone();
         let behind = self.paging.advance_for_own_commit(parent, commit);
@@ -15270,6 +15339,47 @@ mod tests {
             .filter(|name| *name == "studio_value_counts")
             .count();
         assert_eq!(groups, 1, "{names:?}");
+    }
+
+    /// A property written elsewhere in Studio (the markdown editor, a node's page) over the
+    /// commit the table shows moves the table to its commit with the value, as its own cell
+    /// edit does: a change made in Studio is not offered as newer data.
+    #[gpui::test]
+    async fn a_write_made_elsewhere_moves_the_table_with_it(cx: &mut TestAppContext) {
+        let session = session(PEOPLE, cx);
+        let (table, cx) = people_table(&session, cx);
+        let pinned = table.read_with(cx, |table, _| table.paging.pinned.clone());
+        assert_eq!(pinned.as_deref(), Some("c1"));
+        let schema = session.read_with(cx, |session, _| session.schema_model().unwrap());
+        let write = cx.update(|_, cx| {
+            crate::write::write_properties(
+                &session,
+                "main",
+                &schema,
+                "Person",
+                "p1",
+                &[(
+                    "name".into(),
+                    serde_json::json!("Ada"),
+                    serde_json::json!("Ada Byron"),
+                )],
+                None,
+                cx,
+            )
+            .unwrap()
+        });
+        cx.run_until_parked();
+        assert!(matches!(write.await, SaveResult::Saved { .. }));
+        table.read_with(cx, |table, _| {
+            assert_eq!(
+                table.paging.pinned.as_deref(),
+                Some("c2"),
+                "moved with the write"
+            );
+            assert!(!table.newer, "nothing newer: the change was Studio's");
+            let row = table.rows.iter().find(|row| row.id == "p1").unwrap();
+            assert_eq!(row.value("name"), &serde_json::json!("Ada Byron"));
+        });
     }
 
     /// A restored tab keeps its filters, as it keeps its order and columns: it reads with them

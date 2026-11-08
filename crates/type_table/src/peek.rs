@@ -664,6 +664,44 @@ impl NodePeek {
                 cx.notify();
                 return;
             }
+            // A property write Studio made, here or in another view: at the commit it was made
+            // on, the view takes what it wrote and moves to its commit, as after a table's
+            // write, unless it shows a node written among its neighbours.
+            if let SessionEvent::PropertiesWritten {
+                branch,
+                parent,
+                commit,
+                wrote,
+            } = event
+            {
+                if *branch == this.branch
+                    && parent.is_some()
+                    && this.snapshot == *parent
+                    && let PeekSubject::Node { type_name, id } = &this.subject
+                {
+                    let values = (wrote.type_name == *type_name)
+                        .then(|| wrote.values_of(id))
+                        .flatten()
+                        .map(<[_]>::to_vec)
+                        .unwrap_or_default();
+                    let touched = wrote
+                        .nodes
+                        .iter()
+                        .map(|(written, _)| written.clone())
+                        .filter(|written| wrote.type_name != *type_name || written != id)
+                        .collect();
+                    let wrote = TableWrote {
+                        commit: commit.clone(),
+                        parent: parent.clone(),
+                        values,
+                        blob: None,
+                        type_name: wrote.type_name.clone(),
+                        touched,
+                    };
+                    this.table_wrote(wrote, cx);
+                }
+                return;
+            }
             // While its own writes are out the view compares when they end: the head may be its
             // own commit.
             let moved = match event {
@@ -1162,6 +1200,10 @@ impl NodePeek {
     /// commit the view shows, the view moves there; otherwise someone else committed in between,
     /// and the view is behind. Whether it moved.
     fn follow_own_commit(&mut self, parent: Option<&str>, commit: &str) -> bool {
+        // Moved there already: the session told the view of the write before it came back.
+        if self.snapshot.as_deref() == Some(commit) {
+            return true;
+        }
         let followed = parent.is_some() && parent == self.snapshot.as_deref();
         let pin = self.snapshot.clone();
         self.blobs_at
@@ -5634,6 +5676,58 @@ mod tests {
     /// A text longer than its box holds, with words to wrap at, is shown under its name at the
     /// full width; a short one, or one without words to wrap at (an email, an id), stays boxed
     /// and is cut at its box's end (spec 014).
+    /// A property written elsewhere in Studio (a table's cell, the markdown editor) over the
+    /// commit a node's page shows: the page takes the value and moves to its commit, offering
+    /// no newer data for a change made in Studio.
+    #[gpui::test]
+    async fn a_write_made_elsewhere_moves_the_page_with_it(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let session = crate::test_support::session(crate::test_support::PEOPLE, cx);
+        cx.run_until_parked();
+        let values: Map<String, Value> =
+            serde_json::from_value(json!({ "@id": "p1", "slug": "p1", "name": "Ada" })).unwrap();
+        let shown = session.clone();
+        let (view, cx) = cx.add_window_view(move |_, cx| {
+            NodePeek::new(
+                shown,
+                PeekSubject::Node {
+                    type_name: "Person".into(),
+                    id: "p1".into(),
+                },
+                Some(values),
+                Some("c1".into()),
+                HashMap::new(),
+                false,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let schema = session.read_with(cx, |session, _| session.schema_model().unwrap());
+        let write = cx.update(|_, cx| {
+            crate::write::write_properties(
+                &session,
+                "main",
+                &schema,
+                "Person",
+                "p1",
+                &[("name".into(), json!("Ada"), json!("Ada Byron"))],
+                None,
+                cx,
+            )
+            .unwrap()
+        });
+        cx.run_until_parked();
+        drop(write);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.snapshot.as_deref(), Some("c2"));
+            assert!(!view.newer);
+            assert_eq!(view.value_of("name"), json!("Ada Byron"));
+        });
+    }
+
     #[gpui::test]
     async fn a_long_text_leaves_its_box_and_a_short_one_stays(cx: &mut TestAppContext) {
         let (view, cx) = page(session(PEOPLE, cx), cx);

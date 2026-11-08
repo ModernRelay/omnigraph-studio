@@ -640,6 +640,10 @@ impl Paging {
     /// view holds exactly the new commit's state and the pin moves with it; otherwise someone
     /// else committed in between and the view is now behind. Returns whether it is behind.
     pub fn advance_for_own_commit(&mut self, parent: Option<&str>, commit: &str) -> bool {
+        // Moved there already: the session told the table of the write before it came back.
+        if self.pinned.as_deref() == Some(commit) {
+            return false;
+        }
         let followed = self.pinned.is_some() && self.pinned.as_deref() == parent;
         let pin = self.pinned.clone();
         self.blobs

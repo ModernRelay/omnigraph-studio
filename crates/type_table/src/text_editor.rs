@@ -157,7 +157,35 @@ impl TextEditor {
         });
         // On another branch, an editor with nothing unsaved reads the property there; one
         // with unsaved text keeps writing to the branch it was read on, and says so.
-        let follow = cx.subscribe_in(&session, window, |this, _, event, _, cx| {
+        let follow = cx.subscribe_in(&session, window, |this, _, event, window, cx| {
+            // The property set elsewhere in Studio (its cell, the node's page): an editor with
+            // nothing unsaved shows the value written, and binds its saves to it. Unsaved text
+            // stays, and its save finds the change, offering "Use theirs" or "Keep mine".
+            if let SessionEvent::PropertiesWritten { branch, wrote, .. } = event {
+                let value = (*branch == this.branch && wrote.type_name == this.type_name)
+                    .then(|| wrote.values_of(&this.id))
+                    .flatten()
+                    .and_then(|values| {
+                        values
+                            .iter()
+                            .find(|(property, _)| *property == this.property)
+                    })
+                    .map(|(_, value)| value.clone());
+                if let Some(value) = value
+                    && !this.unsaved
+                    && this.typed.is_none()
+                    && matches!(this.old, Loadable::Loaded(_))
+                    && !matches!(this.state, State::Saving)
+                {
+                    this.set_old(Loadable::Loaded(value));
+                    let text = this.old_text.clone().unwrap_or_default();
+                    this.set_text(text, window, cx);
+                    this.unsaved = false;
+                    cx.emit(ItemEvent::UpdateTab);
+                    cx.notify();
+                }
+                return;
+            }
             // The schema in at last (a tab restored as Studio starts): the node is read when the
             // tab is shown.
             if let SessionEvent::SchemaChanged = event {
@@ -755,6 +783,74 @@ mod tests {
     fn save(view: &Entity<TextEditor>, cx: &mut VisualTestContext) {
         view.update_in(cx, |view, window, cx| view.save(&SaveText, window, cx));
         cx.run_until_parked();
+    }
+
+    /// The property written elsewhere in Studio while the editor is open: with nothing unsaved
+    /// it shows the value written, so opening it again never shows the old one; unsaved text
+    /// stays, for its save to find the change.
+    #[gpui::test]
+    async fn an_open_editor_takes_a_value_written_elsewhere(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let session = crate::test_support::session(PEOPLE, cx);
+        cx.run_until_parked();
+        let shown = session.clone();
+        let (view, cx) = cx.add_window_view(move |window, cx| {
+            TextEditor::new(
+                shown,
+                "Person".into(),
+                "p1".into(),
+                "name".into(),
+                None,
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, cx| view.text(cx)), "Ada");
+        let schema = session.read_with(cx, |session, _| session.schema_model().unwrap());
+        let write_elsewhere = |old: &str, new: &str, cx: &mut VisualTestContext| {
+            let write = cx.update(|_, cx| {
+                crate::write::write_properties(
+                    &session,
+                    "main",
+                    &schema,
+                    "Person",
+                    "p1",
+                    &[("name".into(), Value::from(old), Value::from(new))],
+                    None,
+                    cx,
+                )
+                .unwrap()
+            });
+            cx.run_until_parked();
+            drop(write);
+        };
+        write_elsewhere("Ada", "Ada Byron", cx);
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.text(cx), "Ada Byron");
+            assert!(!view.unsaved);
+            assert_eq!(view.old, Loadable::Loaded(Value::from("Ada Byron")));
+        });
+
+        view.update_in(cx, |view, window, cx| {
+            view.editor
+                .update(cx, |editor, cx| editor.set_text("Mine", window, cx))
+        });
+        cx.run_until_parked();
+        write_elsewhere("Ada Byron", "Theirs", cx);
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.text(cx), "Mine", "unsaved text stays");
+            assert!(view.unsaved);
+            assert_eq!(
+                view.old,
+                Loadable::Loaded(Value::from("Ada Byron")),
+                "its save is bound to the value it was typed over, and finds the change"
+            );
+        });
     }
 
     /// Opened from a field being edited, the editor shows what was typed over the value read

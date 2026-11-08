@@ -210,6 +210,23 @@ pub enum MergeSettled {
     NotShown,
 }
 
+/// What a property write sets: of nodes of `type_name`, each `(id, [(property, new value)])`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Wrote {
+    pub type_name: String,
+    pub nodes: Vec<(String, Vec<(String, Value)>)>,
+}
+
+impl Wrote {
+    /// The values written to node `id`, if it is one written.
+    pub fn values_of(&self, id: &str) -> Option<&[(String, Value)]> {
+        self.nodes
+            .iter()
+            .find(|(written, _)| written == id)
+            .map(|(_, values)| values.as_slice())
+    }
+}
+
 /// A follow-up a write's outcome offers once it commits (spec 002, toasts).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FollowUp {
@@ -227,6 +244,16 @@ pub enum SessionEvent {
     /// watch saw. The branch's newest commit is read again.
     Committed {
         branch: String,
+    },
+    /// One of Studio's writes set `wrote`'s properties to the values it names, every node it
+    /// names, in `commit` over `parent`. Sent before the head moves to `commit`, so a view
+    /// pinned to `parent` that shows those nodes takes the values and moves to `commit` rather
+    /// than offering Refresh for a change made in Studio itself, wherever it was made.
+    PropertiesWritten {
+        branch: String,
+        parent: Option<String>,
+        commit: String,
+        wrote: Arc<Wrote>,
     },
     /// `branch`'s head is now `head` ([`GraphSession::head`]), seen for the first time or
     /// moved. A view pinned to another commit of the branch may offer Refresh.
@@ -3899,7 +3926,28 @@ impl GraphSession {
             params: query.params_value(),
             branch: Some(branch.to_owned()),
         };
-        self.send_write(request, if_commit, description, follow_up, cx)
+        self.send_write(request, if_commit, description, follow_up, None, cx)
+    }
+
+    /// [`Self::write_on`] for a write that sets the properties `wrote` names: once it commits,
+    /// setting every node it names, views are told the values
+    /// ([`SessionEvent::PropertiesWritten`]).
+    pub fn write_properties_on(
+        &mut self,
+        branch: &str,
+        query: &BuiltQuery,
+        if_commit: Option<String>,
+        description: String,
+        wrote: Wrote,
+        cx: &mut Context<Self>,
+    ) -> Task<WriteOutcome<ChangeOutput>> {
+        let request = ChangeRequest {
+            query: query.text.clone(),
+            name: Some(query.name.clone()),
+            params: query.params_value(),
+            branch: Some(branch.to_owned()),
+        };
+        self.send_write(request, if_commit, description, None, Some(wrote), cx)
     }
 
     pub fn write_request(
@@ -3909,7 +3957,7 @@ impl GraphSession {
         description: String,
         cx: &mut Context<Self>,
     ) -> Task<WriteOutcome<ChangeOutput>> {
-        self.send_write(request, if_commit, description, None, cx)
+        self.send_write(request, if_commit, description, None, None, cx)
     }
 
     fn send_write(
@@ -3918,6 +3966,7 @@ impl GraphSession {
         if_commit: Option<String>,
         description: String,
         follow_up: Option<FollowUp>,
+        wrote: Option<Wrote>,
         cx: &mut Context<Self>,
     ) -> Task<WriteOutcome<ChangeOutput>> {
         let client = self.client(cx);
@@ -3943,8 +3992,15 @@ impl GraphSession {
                     }
                     _ => asked,
                 };
+                // Told only of a write that set every node it names: one that set fewer left
+                // some as they were, and which is not said.
+                let wrote = wrote.filter(|wrote| {
+                    matches!(outcome, WriteOutcome::Committed(output)
+                        if output.affected_nodes == wrote.nodes.len() as i64)
+                });
                 WriteLog {
                     follow_up,
+                    wrote,
                     ..WriteLog::new(branch, description)
                 }
             },
@@ -4018,6 +4074,7 @@ impl GraphSession {
             description,
             follow_up,
             merge,
+            wrote: _,
         } = log;
         self.outcomes.push(OutcomeEntry {
             at: SystemTime::now(),
@@ -4100,9 +4157,10 @@ impl GraphSession {
             _ => None,
         };
         let branch = log.branch.clone();
+        let wrote = log.wrote.clone();
         self.log_outcome(log, outcome);
         if let Some(commit) = commit {
-            self.committed(branch, commit, parent, cx);
+            self.committed(branch, commit, parent, wrote, cx);
         }
         // A 403 since the access route last answered: the credential, or the policy, may have
         // changed, and the session's branch is read again.
@@ -4118,8 +4176,18 @@ impl GraphSession {
         branch: String,
         commit: String,
         parent: Option<String>,
+        wrote: Option<Wrote>,
         cx: &mut Context<Self>,
     ) {
+        // Before the head moves: a view this write leaves current follows it, not the head.
+        if let Some(wrote) = wrote {
+            cx.emit(SessionEvent::PropertiesWritten {
+                branch: branch.clone(),
+                parent: parent.clone(),
+                commit: commit.clone(),
+                wrote: Arc::new(wrote),
+            });
+        }
         // The counts are the session's branch's: a commit elsewhere (an agent's branch) leaves
         // them as they are.
         if branch == self.branch {
@@ -4344,6 +4412,8 @@ struct WriteLog {
     description: String,
     follow_up: Option<FollowUp>,
     merge: Option<MergeEntry>,
+    /// The properties a write set, which views are told of once it commits.
+    wrote: Option<Wrote>,
 }
 
 impl WriteLog {
@@ -4353,6 +4423,7 @@ impl WriteLog {
             description,
             follow_up: None,
             merge: None,
+            wrote: None,
         }
     }
 }
@@ -8479,7 +8550,7 @@ mod tests {
             })
         });
         session.update(cx, |session, cx| {
-            session.committed("main".into(), "m".into(), Some("c1".into()), cx)
+            session.committed("main".into(), "m".into(), Some("c1".into()), None, cx)
         });
         cx.run_until_parked();
         assert_eq!(
@@ -8649,7 +8720,7 @@ mod tests {
 
         served.lock().unwrap().commit("c2", Vec::new());
         session.update(cx, |session, cx| {
-            session.committed("main".into(), "c2".into(), Some("c1".into()), cx)
+            session.committed("main".into(), "c2".into(), Some("c1".into()), None, cx)
         });
         assert_eq!(reads(cx), 0);
         assert_eq!(
