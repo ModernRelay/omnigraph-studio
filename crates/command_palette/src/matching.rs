@@ -211,6 +211,8 @@ pub enum Group {
     Studio,
     /// Quick-open rows for node and edge types.
     Type,
+    /// The graph's saved views (spec 024).
+    View,
     /// Open query tabs.
     Query,
     /// Nodes found by id or label (⌘P).

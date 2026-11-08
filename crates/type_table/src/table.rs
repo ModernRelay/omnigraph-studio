@@ -36,8 +36,8 @@ use studio_actions::blob::{ChooseFile, ClearValue};
 use studio_actions::table::{
     AddFilter, Cancel, ClearFilters, ConfirmEdit, CopyCell, DeleteRow, EditCell, ExpandCell,
     FillColumn, FilterBySelection, FilterInWords, InsertRow, MoveDown, MoveLeft, MoveRight, MoveUp,
-    OpenRowPage, PeekRow, RefreshTable, SaveDrafts, SelectNextSuggestion, SelectPreviousSuggestion,
-    ShowRowOnCanvas, StageEdit,
+    OpenRowPage, PeekRow, RefreshTable, RevertView, SaveDrafts, SaveView, SaveViewAsNew,
+    SelectNextSuggestion, SelectPreviousSuggestion, ShowRowOnCanvas, StageEdit,
 };
 use studio_actions::{ViewKind, ViewLink};
 use studio_ui::ds::Tipped;
@@ -748,6 +748,8 @@ pub struct Opening {
     /// The grouping's key: a property, a relationship or a property of a neighbour.
     pub group_by: Option<String>,
     pub layout: ColumnLayout,
+    /// The saved view the tab is (spec 024), by id: what it saves to and is named by.
+    pub view: Option<String>,
 }
 
 /// A relationship's direction, as filters and the Group menu show it.
@@ -960,6 +962,8 @@ pub struct TypeTable {
     diff_owed: bool,
     diff_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
+    /// The saved view this tab is (spec 024), by id; `None` is the type's own table.
+    view_id: Option<String>,
     /// How often the table drew, for the test that moving through the offers draws it and
     /// leaves the grid alone.
     #[cfg(test)]
@@ -1032,15 +1036,14 @@ impl Item for TypeTable {
         true
     }
 
-    fn tab_title(&self, _cx: &App) -> SharedString {
+    fn tab_title(&self, cx: &App) -> SharedString {
+        let name = self
+            .saved_self(cx)
+            .map(|view| view.name)
+            .unwrap_or_else(|| self.type_name.clone());
         match &self.at_commit {
-            Some(commit) => format!(
-                "{} @ {}",
-                self.type_name,
-                studio_ui::short_commit_id(commit)
-            )
-            .into(),
-            None => self.type_name.clone().into(),
+            Some(commit) => format!("{name} @ {}", studio_ui::short_commit_id(commit)).into(),
+            None => name.into(),
         }
     }
 
@@ -1049,7 +1052,13 @@ impl Item for TypeTable {
     }
 
     fn dedupe_key(&self, _cx: &App) -> Option<SharedString> {
-        Some(crate::table_key(&self.type_name, self.at_commit.as_deref()).into())
+        Some(
+            match &self.view_id {
+                Some(view) => crate::view_key(view, self.at_commit.as_deref()),
+                None => crate::table_key(&self.type_name, self.at_commit.as_deref()),
+            }
+            .into(),
+        )
     }
 
     fn serialize(&self, _cx: &App) -> Option<SavedItem> {
@@ -1068,13 +1077,16 @@ impl Item for TypeTable {
                 "hidden": self.layout.hidden,
                 "order": self.layout.order,
                 "widths": self.layout.widths,
+                "view": self.view_id,
             }),
         })
     }
 
-    /// A save out, a draft, or an edit open that leaving its cell would keep as a draft.
+    /// A save out, a draft, an edit open that leaving its cell would keep as a draft, or a view
+    /// changed since it was saved.
     fn is_dirty(&self, cx: &App) -> bool {
-        self.saves_in_flight > 0
+        self.view_changed(cx)
+            || self.saves_in_flight > 0
             || self
                 .cells
                 .values()
@@ -1158,6 +1170,13 @@ impl TypeTable {
         });
         let grid = TableGrid::new(cx);
         let subscriptions = vec![
+            // A view renamed, saved or deleted elsewhere: the tab's name and dot follow it.
+            cx.observe_global::<studio_settings::StudioSettings>(|this, cx| {
+                if this.view_id.is_some() {
+                    cx.emit(ItemEvent::UpdateTab);
+                    cx.notify();
+                }
+            }),
             cx.subscribe_in(&session, window, Self::on_session_event),
             cx.subscribe(
                 &filter_editor,
@@ -1282,6 +1301,7 @@ impl TypeTable {
             diff_owed: true,
             diff_task: None,
             _subscriptions: subscriptions,
+            view_id: opening.view,
             #[cfg(test)]
             renders: 0,
             #[cfg(test)]
@@ -1757,6 +1777,7 @@ impl TypeTable {
             group_by: self.grouping.as_ref().map(|g| g.property.clone()),
             hidden: self.layout.hidden.clone(),
             order: self.layout.order.clone(),
+            ..studio_settings::SavedView::default()
         }
     }
 
@@ -1830,7 +1851,13 @@ impl TypeTable {
         self.reload(true, cx);
     }
 
-    fn open_save_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// The type this table shows.
+    pub(crate) fn type_name(&self) -> &str {
+        &self.type_name
+    }
+
+    /// Asks for a name and saves what the table shows as a view.
+    pub(crate) fn open_save_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
@@ -1841,11 +1868,115 @@ impl TypeTable {
             .into_iter()
             .map(|view| view.name)
             .collect();
+        // A view's tab saved as a new view becomes that view; the one it was stays as saved.
+        let table = self.view_id.is_some().then(|| cx.entity().downgrade());
         workspace.update(cx, |workspace, cx| {
             workspace.toggle_modal(window, cx, |window, cx| {
-                SaveViewModal::new(graph, view, taken, window, cx)
+                SaveViewModal::new(graph, view, taken, table, window, cx)
             });
         });
+    }
+
+    /// The saved view this tab is, as settings hold it now; `None` for a type's own table, or
+    /// a view deleted since.
+    pub(crate) fn saved_self(&self, cx: &App) -> Option<studio_settings::SavedView> {
+        let id = self.view_id.as_deref()?;
+        let graph = self.session.read(cx).overrides_key();
+        cx.try_global::<studio_settings::StudioSettings>()?
+            .view(&graph, id)
+            .cloned()
+    }
+
+    /// The saved view this tab is, by id.
+    pub(crate) fn view_id(&self) -> Option<&str> {
+        self.view_id.as_deref()
+    }
+
+    /// Whether this view's tab shows something other than the view as saved.
+    pub(crate) fn view_changed(&self, cx: &App) -> bool {
+        self.saved_self(cx)
+            .is_some_and(|saved| !saved.shows_as(&self.current_view()))
+    }
+
+    /// Makes this tab the saved view `id`: one saved from it as a new view.
+    pub(crate) fn become_view(&mut self, id: String, cx: &mut Context<Self>) {
+        self.view_id = Some(id);
+        cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
+    }
+
+    /// Saves what this view's tab shows into the view.
+    fn save_into_view(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.view_id.clone() else {
+            return;
+        };
+        if !self.view_changed(cx) {
+            return;
+        }
+        let graph = self.session.read(cx).overrides_key();
+        let shown = self.current_view();
+        studio_settings::update(cx, move |settings| {
+            settings.update_view(&graph, &id, &shown);
+        });
+        cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
+    }
+
+    /// Shows the view as it was saved, read again at the same commit.
+    fn revert_view(&mut self, cx: &mut Context<Self>) {
+        if let Some(saved) = self.saved_self(cx).filter(|_| self.view_changed(cx)) {
+            self.apply_view(&saved, cx);
+        }
+    }
+
+    /// Save, Save as new view and Revert, while a view's tab shows something other than the
+    /// view as saved.
+    fn render_view_changes(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !self.view_changed(cx) {
+            return None;
+        }
+        Some(
+            h_flex()
+                .gap(px(space::XS))
+                .child(
+                    studio_ui::ds::button("save-view", "Save")
+                        .style(ButtonStyle::Tinted(TintColor::Accent))
+                        .tip_fn(|_, cx| {
+                            studio_ui::ds::tooltip_for_action_view(
+                                "Save these filters, order, grouping and columns into the view",
+                                &SaveView,
+                                cx,
+                            )
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| this.save_into_view(cx))),
+                )
+                .child(
+                    studio_ui::ds::button("save-view-as", "Save as new view…")
+                        .style(ButtonStyle::Subtle)
+                        .tip_fn(|_, cx| {
+                            studio_ui::ds::tooltip_for_action_view(
+                                "Keep the view as it was and save this as another",
+                                &SaveViewAsNew,
+                                cx,
+                            )
+                        })
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.open_save_view(window, cx)),
+                        ),
+                )
+                .child(
+                    studio_ui::ds::button("revert-view", "Revert")
+                        .style(ButtonStyle::Subtle)
+                        .tip_fn(|_, cx| {
+                            studio_ui::ds::tooltip_for_action_view(
+                                "Show the view as it was saved",
+                                &RevertView,
+                                cx,
+                            )
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| this.revert_view(cx))),
+                ),
+        )
     }
 
     /// Adds the row at `row` to the selection, or takes it out; with `range`, picks every row
@@ -3264,6 +3395,10 @@ impl TypeTable {
     /// Reads the first page again. `keep_pin` re-reads the same commit (new filters);
     /// otherwise the table moves to the branch head (Refresh).
     fn reload(&mut self, keep_pin: bool, cx: &mut Context<Self>) {
+        // What a view's tab shows changed: its dot may come or go.
+        if self.view_id.is_some() {
+            cx.emit(ItemEvent::UpdateTab);
+        }
         if self.forget_rows(keep_pin, cx) {
             self.rows_owed = false;
             self.read_rows(cx);
@@ -8306,6 +8441,7 @@ impl TypeTable {
                         .on_click(cx.listener(|this, _, window, cx| this.refresh(window, cx))),
                 )
             })
+            .children(self.render_view_changes(cx))
             .child(div().flex_1())
             .child(self.render_words_field(cx))
             .child(
@@ -10910,6 +11046,15 @@ impl Render for TypeTable {
                 this.filter_by_selection(window, cx)
             }))
             .on_action(cx.listener(|this, _: &ClearFilters, _, cx| this.clear_filters(cx)))
+            .on_action(
+                cx.listener(|this, _: &SaveViewAsNew, window, cx| this.open_save_view(window, cx)),
+            )
+            // Only in a view's tab changed since it was saved, so the palette offers them there.
+            .when(self.view_changed(cx), |table| {
+                table
+                    .on_action(cx.listener(|this, _: &SaveView, _, cx| this.save_into_view(cx)))
+                    .on_action(cx.listener(|this, _: &RevertView, _, cx| this.revert_view(cx)))
+            })
             .when(
                 self.at_commit.is_none() && writable && self.blob_under_cursor().is_some(),
                 |table| {
@@ -15443,6 +15588,114 @@ mod tests {
         restored_cx.run_until_parked();
         restored.read_with(restored_cx, |table, _| {
             assert_eq!(table.filters, vec![ada]);
+        });
+    }
+
+    /// A saved view's tab (spec 024) is named by the view, keyed by its id, and marked while
+    /// it shows something other than the view as saved; Save keeps that, Revert goes back.
+    #[gpui::test]
+    async fn a_views_tab_saves_and_reverts_into_its_view(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+            studio_settings::init_test(cx);
+            studio_settings::keep_changes_in_memory(cx);
+        });
+        let (session, _names) = crate::test_support::session_routing(
+            PEOPLE,
+            |_| serde_json::json!([{"n": {"@id": "p1", "slug": "p1", "name": "Ada"}}]),
+            cx,
+        );
+        cx.run_until_parked();
+        let graph = session.read_with(cx, |session, _| session.overrides_key());
+        let saved = studio_settings::SavedView {
+            id: "v1".into(),
+            name: "Founders".into(),
+            type_name: "Person".into(),
+            filters: vec![studio_settings::SavedFilter {
+                property: "name".into(),
+                op: "eq".into(),
+                value: serde_json::json!("Ada"),
+            }],
+            ..Default::default()
+        };
+        cx.update(|cx| {
+            let (graph, saved) = (graph.clone(), saved.clone());
+            studio_settings::update(cx, move |settings| settings.save_view(&graph, saved));
+        });
+        let opening = crate::view_opening(&saved);
+        let (table, table_cx) = cx.add_window_view(|window, cx| {
+            TypeTable::opening(
+                WeakEntity::new_invalid(),
+                session.clone(),
+                "Person".into(),
+                None,
+                opening,
+                window,
+                cx,
+            )
+        });
+        table_cx.run_until_parked();
+        table.read_with(table_cx, |table, cx| {
+            assert_eq!(table.tab_title(cx), "Founders");
+            assert_eq!(table.dedupe_key(cx).as_deref(), Some("view:v1"));
+            assert!(!table.is_dirty(cx), "it shows the view as saved");
+            let data = table.serialize(cx).unwrap().data;
+            let (_, _, back) = crate::saved_table(&data).expect("the tab comes back");
+            assert_eq!(back.view.as_deref(), Some("v1"), "as the view's tab");
+        });
+
+        // Ordering it changes it from the view as saved.
+        let by_name = Some(Sort {
+            property: "name".into(),
+            descending: true,
+        });
+        table.update(table_cx, |table, cx| table.set_sort(by_name.clone(), cx));
+        table_cx.run_until_parked();
+        table.read_with(table_cx, |table, cx| {
+            assert!(table.view_changed(cx));
+            assert!(table.is_dirty(cx), "closing it asks first");
+        });
+        table.update(table_cx, |table, cx| table.save_into_view(cx));
+        table.read_with(table_cx, |table, cx| {
+            assert!(!table.is_dirty(cx));
+            let view = studio_settings::StudioSettings::get(cx)
+                .view(&graph, "v1")
+                .unwrap();
+            assert_eq!(view.sort.as_ref().map(|s| s.descending), Some(true));
+            assert_eq!(view.name, "Founders", "the name stays");
+            assert_eq!(view.filters.len(), 1, "and its filter");
+        });
+
+        // Revert shows it as saved again.
+        table.update(table_cx, |table, cx| table.set_sort(None, cx));
+        table_cx.run_until_parked();
+        table.update(table_cx, |table, cx| table.revert_view(cx));
+        table_cx.run_until_parked();
+        table.read_with(table_cx, |table, cx| {
+            assert_eq!(table.sort, by_name);
+            assert!(!table.is_dirty(cx));
+        });
+
+        // Renamed in the sidebar, the tab follows; deleted, it is the type's table again.
+        table_cx.update(|_, cx| {
+            let graph = graph.clone();
+            studio_settings::update(cx, move |settings| {
+                settings.rename_view(&graph, "v1", "Founders 2026");
+            });
+        });
+        table.read_with(table_cx, |table, cx| {
+            assert_eq!(table.tab_title(cx), "Founders 2026");
+        });
+        table_cx.update(|_, cx| {
+            let graph = graph.clone();
+            studio_settings::update(cx, move |settings| {
+                settings.remove_view(&graph, "v1");
+            });
+        });
+        table.read_with(table_cx, |table, cx| {
+            assert_eq!(table.tab_title(cx), "Person");
+            assert!(!table.is_dirty(cx), "nothing to save into");
         });
     }
 

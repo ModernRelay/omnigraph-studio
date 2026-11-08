@@ -9750,6 +9750,7 @@ name = "studio_settings"
 version = "0.4.0"
 dependencies = [
  "futures",
+ "getrandom 0.3.4",
  "gpui",
  "log",
  "schemars 1.0.4",

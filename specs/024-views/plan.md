@@ -1,6 +1,6 @@
 # 024: Views
 
-Status: draft · 2026-11-07
+Status: in progress · step 1 built 2026-11-07
 
 ## Problem
 
@@ -84,8 +84,9 @@ View {
 ```
 
 - Kept per graph in `settings.json`, `graphs."<target>/<graph>".views`, as today: personal, on
-  this Mac. Existing `SavedView` entries are read as Type views (an id is given on first read,
-  shape Table) and written back in the new form.
+  this Mac. Existing `SavedView` entries are read as Type views: shape Table, and an id made
+  from their type and name (`Person/Founders`, unique per graph) until they are next changed,
+  when it is written. Reading the file never writes it.
 - A view names a graph, not a branch: it opens on the window's branch. A filter, sort or column
   the branch's schema lacks is left out with the toolbar notice tables give today.
 
@@ -112,7 +113,8 @@ NODE TYPES
   query view…" (a `.gq` file or a stored query).
 - Context menu: Open as Table, Open as Tree, Open as Canvas; Rename (inline); Duplicate; Delete,
   with Undo in its toast (a view is a setting, so Undo puts it back).
-- ⌘K lists views as "Open view: Active customers".
+- ⌘K lists views under **Views**, in the All and Types scopes, each with its type ("view ·
+  Person"); running one opens it.
 - Spec 020's rule is amended: a sidebar row answers "what?", and a view does ("active
   customers"); its shapes (Table, Tree, Canvas) still have no row.
 
@@ -121,8 +123,10 @@ NODE TYPES
 - Key `view:<id>@<commit or head>`, title the view's name, the view strip the shapes it can take.
   Switching shape keeps the tab's read context and sets `shape`.
 - **Changed since saved.** Changing a view's filters, sort, grouping, columns or parameters in its
-  tab marks it: a dot on the tab and "Save · Save as new view · Revert" in the toolbar. Nothing
-  is saved by itself.
+  tab marks it: a dot on the tab and "Save · Save as new view… · Revert" in the toolbar (⌘⌥S,
+  ⌘⇧S, ⌘⌥Z), and closing the tab asks first. Nothing is saved by itself. Save as new view makes
+  the tab the new view; the one it was stays as saved. A view renamed elsewhere renames its tab;
+  one deleted leaves the tab as its type's table.
 - The table toolbar's Views menu stays, listing the views of that type, and "Save view…" makes a
   view that appears in the sidebar.
 
@@ -215,6 +219,7 @@ A result cell is editable when it shows one property of one node or edge of its 
 | Date | Claim | Check | Result |
 |---|---|---|---|
 | 2026-11-07 | Saved views, the Data panel, Queries, sets, the view strip and result columns are as described above | A read of `studio_settings`, `type_table`, `query_editor`, `relationship_tree`, `graph_canvas`, `studio_actions` and `gq_language` at `77ca3964`, citing file and line | As listed under "What exists today" |
+| 2026-11-07 | Step 1: a view has an id and a shape, views list first in the Data panel, a view opens in its own tab keyed by id, and its tab saves, saves as new and reverts | `studio_settings` `a_view_keeps_its_id_through_rename_duplicate_and_undo`; `type_table` `a_views_tab_saves_and_reverts_into_its_view`, `saved_views_list_before_the_types`; `command_palette` `saved_views_are_listed_with_the_types`; `studio` keymap tests | Pass. The context menu offers Open as Table until step 2 adds Tree and Canvas. Rename, Duplicate and Delete name a view by id, so they are in its context menu, not the keymap. Not yet checked in the running app |
 | 2026-11-07 | The compiler's AST names each projection's variable and property | `omnigraph-compiler` at `v0.14.0` (`60bfd19`), `src/query/ast.rs`: `Projection { expr, alias }`, `Expr::PropAccess { variable, property }`, the return's `distinct` | Present; a query's result descriptor (`descriptor.rs:21`) gives names and kinds but no sources |
 
 ## Corrections

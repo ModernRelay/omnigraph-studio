@@ -30,7 +30,8 @@ use gq_language::{Filter, FilterOp};
 use graph_store::GraphSession;
 use serde_json::Value;
 use studio_actions::graph::{
-    OpenBlob, OpenNode, OpenNodePage, OpenTextEditor, OpenType, PeekNode, UndoDelete,
+    OpenBlob, OpenNode, OpenNodePage, OpenSavedView, OpenTextEditor, OpenType, PeekNode,
+    RestoreSavedView, UndoDelete,
 };
 use studio_workspace::{PanelPosition, ToastKind, Workspace};
 use ui::IconName;
@@ -106,6 +107,12 @@ pub fn init(cx: &mut App) {
         workspace.set_panel_scrolls_itself(&types, cx);
         workspace.register_action(|workspace, action: &UndoDelete, _window, cx| {
             undo_delete(workspace, action, cx);
+        });
+        workspace.register_action(|workspace, action: &OpenSavedView, window, cx| {
+            open_saved_view(workspace, action, window, cx);
+        });
+        workspace.register_action(|workspace, action: &RestoreSavedView, _window, cx| {
+            restore_saved_view(workspace, action, cx);
         });
         workspace.register_action(|workspace, action: &OpenBlob, window, cx| {
             open_blob(workspace, action, None, window, cx);
@@ -203,13 +210,13 @@ fn open_type(
     }
     let handle = cx.entity().downgrade();
     let name = type_name.to_owned();
-    workspace.open_item_with::<TypeTable>(
-        table_key(type_name, at_commit.as_deref()),
-        preview,
-        window,
-        cx,
-        move |window, cx| TypeTable::opening(handle, session, name, at_commit, opening, window, cx),
-    )
+    let key = match &opening.view {
+        Some(view) => view_key(view, at_commit.as_deref()),
+        None => table_key(type_name, at_commit.as_deref()),
+    };
+    workspace.open_item_with::<TypeTable>(key, preview, window, cx, move |window, cx| {
+        TypeTable::opening(handle, session, name, at_commit, opening, window, cx)
+    })
 }
 
 /// What every type table's tab key starts with ([`table_key`]).
@@ -272,8 +279,115 @@ pub(crate) fn saved_table(data: &Value) -> Option<(String, Option<String>, Openi
         sort,
         group_by,
         layout,
+        view: data.get("view").and_then(Value::as_str).map(str::to_owned),
     };
     Some((type_name, at_commit, opening))
+}
+
+/// What a saved view's tab first shows: its filters, order, grouping and columns. Those the
+/// schema no longer has are left out when it is read, as a restored tab's are.
+pub(crate) fn view_opening(view: &studio_settings::SavedView) -> Opening {
+    Opening {
+        filters: view
+            .filters
+            .iter()
+            .filter_map(|filter| {
+                Some(Filter {
+                    property: filter.property.clone(),
+                    op: FilterOp::from_key(&filter.op)?,
+                    value: filter.value.clone(),
+                })
+            })
+            .collect(),
+        sort: view.sort.as_ref().map(|sort| gq_language::Sort {
+            property: sort.property.clone(),
+            descending: sort.descending,
+        }),
+        group_by: view.group_by.clone(),
+        layout: model::ColumnLayout::new(view.hidden.clone(), view.order.clone()),
+        view: Some(view.key()),
+    }
+}
+
+/// Opens a saved view's tab (spec 024), or shows the one it is in. Step 1 opens every view as
+/// a table.
+fn open_saved_view(
+    workspace: &mut Workspace,
+    action: &OpenSavedView,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Option<Entity<TypeTable>> {
+    let session = workspace.session().cloned()?;
+    let graph = session.read(cx).overrides_key();
+    let Some(view) = studio_settings::StudioSettings::get(cx)
+        .view(&graph, &action.id)
+        .cloned()
+    else {
+        workspace.show_toast(ToastKind::Error, "That view was deleted.", cx);
+        return None;
+    };
+    if let Some(schema) = session.read(cx).schema_model()
+        && schema.node(&view.type_name).is_none()
+        && schema.edge(&view.type_name).is_none()
+    {
+        workspace.show_toast(
+            ToastKind::Error,
+            format!(
+                "“{}” shows {}, which this branch's schema does not have.",
+                view.name, view.type_name
+            ),
+            cx,
+        );
+        return None;
+    }
+    let handle = cx.entity().downgrade();
+    let opening = view_opening(&view);
+    workspace.open_item_with::<TypeTable>(
+        view_key(&view.key(), None),
+        action.preview,
+        window,
+        cx,
+        move |window, cx| {
+            TypeTable::opening(handle, session, view.type_name, None, opening, window, cx)
+        },
+    )
+}
+
+/// Puts back a deleted view where it was (the Undo on its toast).
+fn restore_saved_view(
+    workspace: &mut Workspace,
+    action: &RestoreSavedView,
+    cx: &mut Context<Workspace>,
+) {
+    let Ok(view) = serde_json::from_value::<studio_settings::SavedView>(action.view.clone()) else {
+        return;
+    };
+    let name = view.name.clone();
+    let graph = action.graph.clone();
+    let at = action.at;
+    let taken = studio_settings::StudioSettings::get(cx).view_name_taken(&graph, &name, None);
+    if taken {
+        workspace.show_toast(
+            ToastKind::Error,
+            format!("“{name}” was not restored: another view has its name now."),
+            cx,
+        );
+        return;
+    }
+    studio_settings::update(cx, move |settings| {
+        settings.restore_view(&graph, at, view);
+    });
+}
+
+/// What a saved view's tab key starts with ([`view_key`]).
+pub(crate) const VIEW_KEY_PREFIX: &str = "view:";
+
+/// One tab per saved view at the head, and one per view and commit.
+pub(crate) fn view_key(id: &str, at_commit: Option<&str>) -> String {
+    match at_commit {
+        Some(commit) => format!("{VIEW_KEY_PREFIX}{id}@{commit}"),
+        None => format!("{VIEW_KEY_PREFIX}{id}"),
+    }
 }
 
 pub(crate) const TABLE_KEY_PREFIX: &str = "type:";

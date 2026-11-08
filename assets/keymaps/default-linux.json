@@ -271,7 +271,10 @@
       "ctrl-f": "studio_table::AddFilter",
       "ctrl-shift-f": "studio_table::FilterInWords",
       "ctrl-shift-l": "studio_table::FillColumn",
-      "ctrl-alt-backspace": "studio_table::ClearFilters"
+      "ctrl-alt-backspace": "studio_table::ClearFilters",
+      "ctrl-alt-s": "studio_table::SaveView",
+      "ctrl-shift-s": "studio_table::SaveViewAsNew",
+      "ctrl-alt-z": "studio_table::RevertView"
     }
   },
   {

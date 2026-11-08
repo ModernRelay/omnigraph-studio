@@ -451,6 +451,28 @@ pub mod graph {
         pub what: String,
     }
 
+    /// Open a saved view (spec 024) in its own tab, by its id, in the shape it was last shown.
+    #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = studio_graph)]
+    pub struct OpenSavedView {
+        pub id: String,
+        /// Open as the pane's preview tab, which the next preview replaces.
+        #[serde(default)]
+        pub preview: bool,
+    }
+
+    /// Put back a view that was deleted, where it was in its graph's list (spec 024). Offered
+    /// by the toast a delete leaves.
+    #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = studio_graph)]
+    pub struct RestoreSavedView {
+        /// The graph's settings key (`<target>/<graph>`).
+        pub graph: String,
+        pub at: usize,
+        /// The view as settings keep it.
+        pub view: serde_json::Value,
+    }
+
     /// Open one node as a page in its own tab, read at the branch head or at a commit.
     #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
     #[action(namespace = studio_graph)]
@@ -618,6 +640,12 @@ pub mod table {
             /// Fill the selected column's cells from other columns, with a model's suggestions
             /// to apply.
             FillColumn,
+            /// Save what a view's tab shows now into the view.
+            SaveView,
+            /// Save what the table shows as a new view, under a name.
+            SaveViewAsNew,
+            /// Show the view as it was saved, leaving what was changed in its tab.
+            RevertView,
         ]
     );
 }

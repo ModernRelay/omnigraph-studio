@@ -30,7 +30,7 @@ use gq_language::builder::{node_search, search_matches};
 use graph_store::{EntityKind, GraphSession, Loadable, SessionEvent};
 use serde_json::Value;
 use studio_actions::agent::Ask;
-use studio_actions::graph::{OpenNode, OpenQueryFile, OpenStoredQuery, OpenType};
+use studio_actions::graph::{OpenNode, OpenQueryFile, OpenSavedView, OpenStoredQuery, OpenType};
 use studio_actions::palette::{AskAgent, ShowScope};
 use studio_actions::workspace::{GoTo, ShowKeyBindings, SwitchBranch, ToggleCommandPalette};
 use studio_ui::ds::Tipped;
@@ -166,7 +166,7 @@ impl Scope {
     fn includes(self, group: Group) -> bool {
         match self {
             Scope::All => true,
-            Scope::Types => group == Group::Type,
+            Scope::Types => matches!(group, Group::Type | Group::View),
             Scope::Nodes => group == Group::Node,
             Scope::Queries => group == Group::Query,
             Scope::Branches => group == Group::Branch,
@@ -273,6 +273,11 @@ enum Row {
         id: EntityId,
         first_line: String,
     },
+    /// A saved view of this graph, and the type it shows.
+    View {
+        action: Box<dyn Action>,
+        type_name: String,
+    },
     /// A saved query file of this graph.
     Saved {
         action: Box<dyn Action>,
@@ -296,6 +301,7 @@ impl Row {
             | Row::Type { action, .. }
             | Row::Node { action, .. }
             | Row::Saved { action }
+            | Row::View { action, .. }
             | Row::Stored { action, .. } => Some(action.as_ref()),
             Row::Branch { .. } | Row::Tab { .. } | Row::MoreTypes { .. } => None,
         }
@@ -337,6 +343,7 @@ fn heading(group: Group) -> &'static str {
     match group {
         Group::Studio => "Commands",
         Group::Type => "Types",
+        Group::View => "Views",
         Group::Query => "Queries",
         Group::Node => "Nodes",
         Group::Branch => "Branches",
@@ -450,6 +457,7 @@ impl CommandPalette {
         let mut catalog = None;
         if let (Some(session), Mode::Picker(_)) = (&session, mode) {
             add_type_rows(session, window, cx, &mut rows, &mut candidates);
+            add_view_rows(session, window, cx, &mut rows, &mut candidates);
             add_branch_rows(session, cx, &mut rows, &mut candidates);
             add_stored_rows(session, window, cx, &mut rows, &mut candidates);
             if session.read(cx).stored_queries.loaded().is_none() {
@@ -1115,6 +1123,7 @@ impl CommandPalette {
             }),
             Row::Tab { .. } => muted("open tab".into()),
             Row::Saved { .. } => muted("saved".into()),
+            Row::View { type_name, .. } => muted(format!("view · {type_name}")),
             Row::Stored { mutation, .. } => muted(if *mutation {
                 "stored · writes".into()
             } else {
@@ -1137,6 +1146,7 @@ impl CommandPalette {
                 IconName::GitBranch
             }),
             Row::Tab { .. } | Row::Saved { .. } => icon_tile(IconName::Code),
+            Row::View { .. } => icon_tile(IconName::Table),
             Row::Stored { .. } => icon_tile(IconName::Server),
             Row::MoreTypes { .. } => icon_tile(IconName::MagnifyingGlass),
             Row::Action { .. } => icon_tile(command_icon(&candidate.key)),
@@ -1191,6 +1201,9 @@ impl CommandPalette {
             }
             Row::Tab { .. } => Some("Go to this tab.".into()),
             Row::Saved { .. } => Some("Open this saved query in a tab.".into()),
+            Row::View { type_name, .. } => {
+                Some(format!("Open view: its filters, order and columns of {type_name}.").into())
+            }
             Row::Stored {
                 description: Some(description),
                 ..
@@ -1359,6 +1372,35 @@ fn found_rows(rows: &Value) -> Option<Vec<Found>> {
 
 /// Quick-open rows for the session's node and edge types, when opening a type is available
 /// where the person is (constitution VIII).
+/// The graph's saved views, by name (spec 024).
+fn add_view_rows(
+    session: &Entity<GraphSession>,
+    window: &Window,
+    cx: &App,
+    rows: &mut Vec<Row>,
+    candidates: &mut Vec<Candidate>,
+) {
+    let open = |id: String| OpenSavedView { id, preview: false };
+    if !window.is_action_available(&open(String::new()), cx) {
+        return;
+    }
+    let graph = session.read(cx).overrides_key();
+    let Some(settings) = cx.try_global::<studio_settings::StudioSettings>() else {
+        return;
+    };
+    for view in settings.graph_views(&graph) {
+        candidates.push(Candidate {
+            label: view.name.clone(),
+            key: format!("view:{}", view.key()),
+            group: Group::View,
+        });
+        rows.push(Row::View {
+            action: Box::new(open(view.key())),
+            type_name: view.type_name.clone(),
+        });
+    }
+}
+
 fn add_type_rows(
     session: &Entity<GraphSession>,
     window: &mut Window,
@@ -1575,6 +1617,7 @@ mod tests {
                 .track_focus(&self.focus)
                 .on_action(|_: &OpenStoredQuery, _, _| {})
                 .on_action(|_: &OpenType, _, _| {})
+                .on_action(|_: &OpenSavedView, _, _| {})
                 .children(self.palette.clone())
         }
     }
@@ -1913,6 +1956,42 @@ mod tests {
             search_order(&schema, count),
             ["Note", "Person", "Code", "Empty"]
         );
+    }
+
+    /// The graph's saved views are listed in the Types scope, each opening its tab (spec 024).
+    #[gpui::test]
+    async fn saved_views_are_listed_with_the_types(cx: &mut TestAppContext) {
+        let session = session(cx);
+        cx.run_until_parked();
+        let graph = session.read_with(cx, |session, _| session.overrides_key());
+        cx.update(|cx| {
+            let mut settings = studio_settings::StudioSettings::default();
+            settings.save_view(
+                &graph,
+                studio_settings::SavedView {
+                    id: "v1".into(),
+                    name: "Founders".into(),
+                    type_name: "Person".into(),
+                    ..Default::default()
+                },
+            );
+            cx.set_global(settings);
+        });
+        let (palette, cx) = palette(Scope::Types, session, cx);
+        assert_eq!(listed(&palette, cx), ["type:Person", "view:v1"]);
+        palette.read_with(cx, |palette, _| {
+            let Row::View { action, type_name } = &palette.rows[palette.matches[1].index] else {
+                panic!("a view's row");
+            };
+            assert_eq!(type_name, "Person");
+            assert_eq!(
+                action.as_any().downcast_ref::<OpenSavedView>(),
+                Some(&OpenSavedView {
+                    id: "v1".into(),
+                    preview: false,
+                })
+            );
+        });
     }
 
     /// The Queries scope lists the graph's stored queries, each runnable from the keyboard. The

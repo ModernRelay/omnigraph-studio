@@ -1370,6 +1370,8 @@ pub struct SaveViewModal {
     graph: String,
     view: studio_settings::SavedView,
     taken: Vec<String>,
+    /// A view's tab, which becomes the view saved.
+    table: Option<WeakEntity<crate::table::TypeTable>>,
     name: Entity<Editor>,
     _subscription: Subscription,
 }
@@ -1390,6 +1392,7 @@ impl SaveViewModal {
         graph: String,
         view: studio_settings::SavedView,
         taken: Vec<String>,
+        table: Option<WeakEntity<crate::table::TypeTable>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -1407,6 +1410,7 @@ impl SaveViewModal {
             graph,
             view,
             taken,
+            table,
             name,
             _subscription: subscription,
         }
@@ -1421,20 +1425,42 @@ impl SaveViewModal {
         if name.is_empty() {
             return;
         }
+        // A name another type's view has is not taken over: views are named once per graph.
+        if self.held_by_another_type(&name, cx) {
+            return;
+        }
         let graph = self.graph.clone();
         let view = studio_settings::SavedView {
-            name,
+            name: name.clone(),
             ..self.view.clone()
         };
+        let type_name = view.type_name.clone();
         studio_settings::update(cx, move |settings| settings.save_view(&graph, view));
+        let saved = studio_settings::StudioSettings::get(cx)
+            .graph_views(&self.graph)
+            .iter()
+            .find(|view| view.type_name == type_name && view.name == name)
+            .map(studio_settings::SavedView::key);
+        if let (Some(table), Some(id)) = (self.table.as_ref(), saved) {
+            table.update(cx, |table, cx| table.become_view(id, cx)).ok();
+        }
         cx.emit(DismissEvent);
+    }
+
+    /// Whether a view of another type in this graph is named `name`.
+    fn held_by_another_type(&self, name: &str, cx: &App) -> bool {
+        studio_settings::StudioSettings::get(cx)
+            .graph_views(&self.graph)
+            .iter()
+            .any(|view| view.name == name && view.type_name != self.view.type_name)
     }
 }
 
 impl Render for SaveViewModal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let name = self.entered(cx);
-        let replaces = self.taken.contains(&name);
+        let elsewhere = self.held_by_another_type(&name, cx);
+        let replaces = !elsewhere && self.taken.contains(&name);
         let summary = {
             let filters = self.view.filters.len();
             let filters = match filters {
@@ -1486,6 +1512,14 @@ impl Render for SaveViewModal {
                             studio_ui::ds::text::body(format!("Replaces the view “{name}”."))
                                 .color(Color::Warning),
                         )
+                    })
+                    .when(elsewhere, |d| {
+                        d.child(
+                            studio_ui::ds::text::body(format!(
+                                "Another view is named “{name}”. Choose another name."
+                            ))
+                            .color(Color::Error),
+                        )
                     }),
             )
             .child(
@@ -1496,7 +1530,7 @@ impl Render for SaveViewModal {
                     )
                     .child(
                         action_button("save-view", if replaces { "Replace" } else { "Save" })
-                            .disabled(name.is_empty())
+                            .disabled(name.is_empty() || elsewhere)
                             .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
                     ),
             )

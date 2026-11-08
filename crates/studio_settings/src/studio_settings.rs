@@ -237,11 +237,19 @@ pub struct GraphOverrides {
     pub labels: BTreeMap<String, String>,
 }
 
-/// A named filter, order, grouping and set of columns for one type's table (spec 004).
+/// A named filter, order, grouping and set of columns for one type's table (spec 004), listed
+/// in the sidebar and opened in its own tab (spec 024).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct SavedView {
+    /// What names the view while its name changes: its tab and its row. Empty in a view saved
+    /// before views had ids, which goes by [`SavedView::key`] until it is next changed.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub id: String,
     pub name: String,
+    /// The shape it opens in: the one last shown.
+    #[serde(skip_serializing_if = "ViewShape::is_table")]
+    pub shape: ViewShape,
     #[serde(rename = "type")]
     pub type_name: String,
     pub filters: Vec<SavedFilter>,
@@ -256,6 +264,64 @@ pub struct SavedView {
     /// Column keys in the order the table shows them; empty is schema order.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub order: Vec<String>,
+}
+
+/// How a view shows its rows (spec 024).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewShape {
+    #[default]
+    Table,
+    Tree,
+    Canvas,
+}
+
+impl ViewShape {
+    fn is_table(&self) -> bool {
+        *self == ViewShape::Table
+    }
+}
+
+impl SavedView {
+    /// The view's id: its own, or for one saved before views had ids, one made from its type
+    /// and name, which stay unique per graph until it is changed and given its own.
+    pub fn key(&self) -> String {
+        if self.id.is_empty() {
+            format!("{}/{}", self.type_name, self.name)
+        } else {
+            self.id.clone()
+        }
+    }
+
+    /// Whether `other` shows the same rows the same way: the same filters, order, grouping and
+    /// columns, whatever it is named.
+    pub fn shows_as(&self, other: &SavedView) -> bool {
+        let hidden = |view: &SavedView| {
+            let mut hidden = view.hidden.clone();
+            hidden.sort();
+            hidden
+        };
+        self.type_name == other.type_name
+            && self.filters == other.filters
+            && self.sort == other.sort
+            && self.group_by == other.group_by
+            && hidden(self) == hidden(other)
+            && self.order == other.order
+    }
+}
+
+/// A new view's id: 16 random bytes in hex.
+pub fn new_view_id() -> String {
+    let mut bytes = [0u8; 16];
+    if getrandom::fill(&mut bytes).is_err() {
+        // A clock is unique enough for one person's views when the system has no randomness.
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        bytes = nanos.to_le_bytes();
+    }
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// A filter as the table holds it: a property or relationship key, an operator's key
@@ -515,6 +581,8 @@ struct SettingsFileState {
     keymap: Vec<String>,
     /// False for settings held in memory by a test: every change is refused.
     writable: bool,
+    /// A test's settings that take changes in memory, never written ([`keep_changes_in_memory`]).
+    in_memory: bool,
     /// Changes made so far: a write that comes back for an older one does not apply its
     /// reading over a newer change.
     edits: u64,
@@ -701,16 +769,136 @@ impl StudioSettings {
             .unwrap_or_default()
     }
 
-    /// Saves `view` for a graph, replacing one of the same type and name.
-    pub fn save_view(&mut self, graph: &str, view: SavedView) {
+    /// Saves `view` for a graph, replacing one of the same type and name, whose id it keeps;
+    /// a new one is given an id.
+    pub fn save_view(&mut self, graph: &str, mut view: SavedView) {
         let views = &mut self.graphs.entry(graph.to_owned()).or_default().views;
         match views
             .iter_mut()
             .find(|v| v.type_name == view.type_name && v.name == view.name)
         {
-            Some(existing) => *existing = view,
-            None => views.push(view),
+            Some(existing) => {
+                view.id = existing.key();
+                view.shape = existing.shape;
+                *existing = view;
+            }
+            None => {
+                if view.id.is_empty() {
+                    view.id = new_view_id();
+                }
+                views.push(view);
+            }
         }
+    }
+
+    /// Every view of a graph, in the order they were made.
+    pub fn graph_views(&self, graph: &str) -> &[SavedView] {
+        self.graphs
+            .get(graph)
+            .map(|overrides| overrides.views.as_slice())
+            .unwrap_or_default()
+    }
+
+    /// A graph's view by its id ([`SavedView::key`]).
+    pub fn view(&self, graph: &str, id: &str) -> Option<&SavedView> {
+        self.graph_views(graph).iter().find(|view| view.key() == id)
+    }
+
+    /// Whether a graph has a view named `name`, other than the one with id `except`.
+    pub fn view_name_taken(&self, graph: &str, name: &str, except: Option<&str>) -> bool {
+        self.graph_views(graph)
+            .iter()
+            .any(|view| view.name == name && except != Some(view.key().as_str()))
+    }
+
+    /// Changes what the view with `id` shows, keeping its id, name and shape. False when the
+    /// graph has no such view.
+    pub fn update_view(&mut self, graph: &str, id: &str, shown: &SavedView) -> bool {
+        let Some(view) = self.view_mut(graph, id) else {
+            return false;
+        };
+        *view = SavedView {
+            id: view.key(),
+            name: view.name.clone(),
+            shape: view.shape,
+            ..shown.clone()
+        };
+        true
+    }
+
+    /// Renames the view with `id`. A blank name, or one another view of the graph has, is
+    /// refused: false.
+    pub fn rename_view(&mut self, graph: &str, id: &str, name: &str) -> bool {
+        let name = name.trim();
+        if name.is_empty() || self.view_name_taken(graph, name, Some(id)) {
+            return false;
+        }
+        let Some(view) = self.view_mut(graph, id) else {
+            return false;
+        };
+        view.id = view.key();
+        view.name = name.to_owned();
+        true
+    }
+
+    /// A copy of the view with `id`, named "<name> copy" (then "copy 2", …), after it. Returns
+    /// the copy's id.
+    pub fn duplicate_view(&mut self, graph: &str, id: &str) -> Option<String> {
+        let views = self.graph_views(graph);
+        let at = views.iter().position(|view| view.key() == id)?;
+        let original = &views[at];
+        let name = (1..)
+            .map(|n| match n {
+                1 => format!("{} copy", original.name),
+                n => format!("{} copy {n}", original.name),
+            })
+            .find(|name| !self.view_name_taken(graph, name, None))?;
+        let copy = SavedView {
+            id: new_view_id(),
+            name,
+            ..original.clone()
+        };
+        let id = copy.id.clone();
+        self.graphs.get_mut(graph)?.views.insert(at + 1, copy);
+        Some(id)
+    }
+
+    /// Takes the view with `id` out of a graph: where it was and what it was, for Undo.
+    pub fn remove_view(&mut self, graph: &str, id: &str) -> Option<(usize, SavedView)> {
+        let views = &mut self.graphs.get_mut(graph)?.views;
+        let at = views.iter().position(|view| view.key() == id)?;
+        let removed = views.remove(at);
+        self.graphs.retain(|_, overrides| !overrides.is_empty());
+        Some((at, removed))
+    }
+
+    /// Puts a removed view back where it was, unless a view with its id or name is there now.
+    pub fn restore_view(&mut self, graph: &str, at: usize, view: SavedView) -> bool {
+        if self.view(graph, &view.key()).is_some() || self.view_name_taken(graph, &view.name, None)
+        {
+            return false;
+        }
+        let views = &mut self.graphs.entry(graph.to_owned()).or_default().views;
+        views.insert(at.min(views.len()), view);
+        true
+    }
+
+    /// Records the shape the view with `id` was last shown in.
+    pub fn set_view_shape(&mut self, graph: &str, id: &str, shape: ViewShape) {
+        if let Some(view) = self.view_mut(graph, id)
+            && view.shape != shape
+        {
+            view.id = view.key();
+            view.shape = shape;
+        }
+    }
+
+    fn view_mut(&mut self, graph: &str, id: &str) -> Option<&mut SavedView> {
+        self.graphs
+            .get_mut(graph)?
+            .views
+            .iter_mut()
+            .find(|view| view.key() == id)
     }
 
     /// The property chosen to name each type's nodes in a graph, by type.
@@ -811,6 +999,7 @@ pub fn init(cx: &mut App) {
         problems,
         keymap: Vec::new(),
         writable: true,
+        in_memory: false,
         edits: 0,
         writing: 0,
     });
@@ -828,10 +1017,17 @@ pub fn init_test(cx: &mut App) {
         problems: Vec::new(),
         keymap: Vec::new(),
         writable: false,
+        in_memory: false,
         edits: 0,
         writing: 0,
     });
     cx.set_global(StudioSettings::default());
+}
+
+/// Lets a test's settings ([`init_test`]) take changes, held in memory and never written.
+#[cfg(any(test, feature = "test-support"))]
+pub fn keep_changes_in_memory(cx: &mut App) {
+    cx.global_mut::<SettingsFileState>().in_memory = true;
 }
 
 /// What is wrong with `settings.json` and `keymap.json`, in a sentence or two for a toast, as
@@ -940,7 +1136,12 @@ pub fn update(cx: &mut App, f: impl FnOnce(&mut StudioSettings)) {
     let mut new = old.clone();
     f(&mut new);
     if !cx.global::<SettingsFileState>().writable {
-        notify(cx);
+        if cx.global::<SettingsFileState>().in_memory {
+            cx.set_global(new);
+            cx.refresh_windows();
+        } else {
+            notify(cx);
+        }
         return;
     }
     let state = cx.global_mut::<SettingsFileState>();
@@ -1371,6 +1572,78 @@ mod tests {
         assert_eq!(other.tree_page_size, 50, "a key names one target's graph");
     }
 
+    /// A view made before views had ids goes by its type and name until it changes, and keeps
+    /// that id when renamed; names are unique per graph; a removed view comes back where it was.
+    #[test]
+    fn a_view_keeps_its_id_through_rename_duplicate_and_undo() {
+        let old = r#"{"graphs":{"dev/k":{"views":[
+            {"name":"Founders","type":"Person","filters":[]},
+            {"name":"Big","type":"Company","filters":[]}]}}}"#;
+        let mut settings = read_clean(old);
+        let founders = "Person/Founders".to_owned();
+        assert_eq!(settings.view("dev/k", &founders).unwrap().name, "Founders");
+        assert!(
+            !settings.rename_view("dev/k", &founders, "Big"),
+            "a name another has"
+        );
+        assert!(
+            !settings.rename_view("dev/k", &founders, "  "),
+            "a blank name"
+        );
+        assert!(settings.rename_view("dev/k", &founders, "Founders 2026"));
+        assert_eq!(
+            settings.view("dev/k", &founders).unwrap().name,
+            "Founders 2026"
+        );
+        let text = serde_json::to_string(&settings).unwrap();
+        assert!(
+            text.contains(r#""id":"Person/Founders""#),
+            "the id is kept: {text}"
+        );
+        assert!(!text.contains("shape"), "a table is the default: {text}");
+        let copy = settings.duplicate_view("dev/k", &founders).unwrap();
+        assert_ne!(copy, founders);
+        let names: Vec<_> = settings
+            .graph_views("dev/k")
+            .iter()
+            .map(|v| v.name.clone())
+            .collect();
+        assert_eq!(names, ["Founders 2026", "Founders 2026 copy", "Big"]);
+        let again = settings.duplicate_view("dev/k", &founders).unwrap();
+        assert_eq!(
+            settings.view("dev/k", &again).unwrap().name,
+            "Founders 2026 copy 2"
+        );
+        settings.set_view_shape("dev/k", &copy, ViewShape::Canvas);
+        let (at, removed) = settings.remove_view("dev/k", &copy).unwrap();
+        assert_eq!((at, removed.shape), (2, ViewShape::Canvas));
+        assert!(settings.view("dev/k", &copy).is_none());
+        assert!(settings.restore_view("dev/k", at, removed.clone()));
+        assert!(
+            !settings.restore_view("dev/k", at, removed),
+            "it is there already"
+        );
+        assert_eq!(settings.graph_views("dev/k")[2].key(), copy);
+        // Saving over a view by type and name keeps its id and shape.
+        let shown = SavedView {
+            name: "Founders 2026 copy".into(),
+            type_name: "Person".into(),
+            group_by: Some("title".into()),
+            ..SavedView::default()
+        };
+        settings.save_view("dev/k", shown);
+        let saved = settings.view("dev/k", &copy).unwrap();
+        assert_eq!(
+            (saved.shape, saved.group_by.as_deref()),
+            (ViewShape::Canvas, Some("title"))
+        );
+        assert!(settings.update_view("dev/k", &founders, &SavedView::default()));
+        assert_eq!(
+            settings.view("dev/k", &founders).unwrap().name,
+            "Founders 2026"
+        );
+    }
+
     #[test]
     fn views_and_node_names_are_saved_per_graph_and_type() {
         let mut settings = StudioSettings::default();
@@ -1389,6 +1662,7 @@ mod tests {
             group_by: Some("title".into()),
             hidden: vec!["email".into()],
             order: Vec::new(),
+            ..SavedView::default()
         };
         settings.save_view("dev/knowledge", view("Founders", "eq"));
         settings.save_view("dev/knowledge", view("Founders", "ne"));

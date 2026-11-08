@@ -1143,7 +1143,8 @@ mod tests {
             "{out}"
         );
         assert!(
-            out.contains("\n        {\n          \"name\": \"New\",")
+            out.contains("\n        {\n          \"id\": \"")
+                && out.contains("\n          \"name\": \"New\",")
                 && out.contains("\n      ]\n"),
             "the new view at the list's indent: {out}"
         );
