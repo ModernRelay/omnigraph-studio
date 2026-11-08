@@ -1,6 +1,6 @@
 # 024: Views
 
-Status: in progress · step 1 built 2026-11-07
+Status: in progress · step 1 built 2026-11-07 · views on stored queries (of step 3) built 2026-11-08
 
 ## Problem
 
@@ -183,8 +183,9 @@ A stored query is the graph's shared definition of a question; a view is one per
 looking at its answer. A stored query is therefore a view's source, never a second kind of row
 in the Views section.
 
-- **What the view keeps:** the stored query's name, the parameter values, the shape, and how
-  its columns show (hidden, order). The parameters are its filters: Studio adds no filter or
+- **What the view keeps:** the stored query's name, the parameter values and the shape. Hiding
+  and ordering its columns wait for the results table of step 3; the tab keeps its column
+  widths, as a stored query's tab does. The parameters are its filters: Studio adds no filter or
   sort of its own, since the server could not answer it and a page sorted on this Mac breaks
   principle I.
 - **Where each lives.** Stored queries stay in the Queries panel under Stored, and are not
@@ -193,6 +194,9 @@ in the Views section.
   ⌘⇧S in its results tab does the same; both make a view with the parameters as set.
 - **Only reads.** A stored query that changes data (its catalog entry says so) cannot be a
   view's source; its "Save as view…" is disabled with that reason.
+- **Its tab** is the query editor's stored-query tab, keyed `view:<id>[@commit]` and titled by
+  the view. ⌘S saves the values into the view (in a stored query's own tab it asks for a name),
+  ⌘⇧S saves them as a new view, ⌘⌥Z reverts.
 - **Kept by name.** When the catalog no longer has the name, the view's row is dimmed with
   "Stored query <name> is gone" in its tooltip, as a view of a deleted type is, and opening it
   says so in a toast. When the parameters change, values of parameters that are gone are left
@@ -258,6 +262,7 @@ in the Views section.
 |---|---|---|---|
 | 2026-11-07 | Saved views, the Data panel, Queries, sets, the view strip and result columns are as described above | A read of `studio_settings`, `type_table`, `query_editor`, `relationship_tree`, `graph_canvas`, `studio_actions` and `gq_language` at `77ca3964`, citing file and line | As listed under "What exists today" |
 | 2026-11-07 | Step 1: a view has an id and a shape, views list first in the Data panel, a view opens in its own tab keyed by id, and its tab saves, saves as new and reverts | `studio_settings` `a_view_keeps_its_id_through_rename_duplicate_and_undo`; `type_table` `a_views_tab_saves_and_reverts_into_its_view`, `saved_views_list_before_the_types`; `command_palette` `saved_views_are_listed_with_the_types`; `studio` keymap tests | Pass. The context menu offers Open as Table until step 2 adds Tree and Canvas. Rename, Duplicate and Delete name a view by id, so they are in its context menu, not the keymap. Not yet checked in the running app |
+| 2026-11-08 | Views on stored queries: a view keeps a stored query and its values, opens in the stored query's tab keyed by the view, marks other values as changed, saves, saves as new and reverts; the Queries panel saves a stored query as a view; a view whose stored query is gone is dimmed; a node type's view copies as a stored query whose filter values are named parameters | `studio_settings` `a_query_view_keeps_its_stored_query_and_values`; `query_editor` `a_stored_query_views_tab_saves_and_reverts_its_values`; `gq_language` `a_view_as_a_stored_query_names_its_parameters_for_people` (type-checks); `type_table` `a_view_copies_as_a_stored_query_or_says_why_not`; `studio` keymap tests | Pass. Not built: query views from a `.gq` file, the Views "+" for a query view (the Queries panel's "Save as view…" does it), trees and canvases of a query view, hiding and ordering its columns. Copying refuses an edge type's view and a moving-date filter. Not yet checked in the running app |
 | 2026-11-08 | A stored query's catalog entry says whether it changes data | `graph_client` `api.rs:164-200`: `StoredQuery.mutation` and `params` (`:183-187`) | Present; a view's source is limited to reads by it |
 | 2026-11-07 | The compiler's AST names each projection's variable and property | `omnigraph-compiler` at `v0.14.0` (`60bfd19`), `src/query/ast.rs`: `Projection { expr, alias }`, `Expr::PropAccess { variable, property }`, the return's `distinct` | Present; a query's result descriptor (`descriptor.rs:21`) gives names and kinds but no sources |
 
