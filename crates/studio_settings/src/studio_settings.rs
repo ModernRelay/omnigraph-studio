@@ -250,8 +250,13 @@ pub struct SavedView {
     /// The shape it opens in: the one last shown.
     #[serde(skip_serializing_if = "ViewShape::is_table")]
     pub shape: ViewShape,
-    #[serde(rename = "type")]
+    /// The type a type view shows; empty in a query view.
+    #[serde(rename = "type", skip_serializing_if = "String::is_empty")]
     pub type_name: String,
+    /// The query a query view runs; `None` in a type view (spec 024).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query: Option<ViewQuery>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub filters: Vec<SavedFilter>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sort: Option<SavedSort>,
@@ -264,6 +269,18 @@ pub struct SavedView {
     /// Column keys in the order the table shows them; empty is schema order.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub order: Vec<String>,
+}
+
+/// The query a view runs (spec 024): a stored query the server serves by name, with the values
+/// of its parameters. The parameters are the view's filters.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct ViewQuery {
+    /// The stored query's name in the graph's catalog.
+    pub stored: String,
+    /// The parameters' values, as the parameter bar holds them.
+    #[serde(skip_serializing_if = "serde_json::Map::is_empty")]
+    pub params: serde_json::Map<String, serde_json::Value>,
 }
 
 /// How a view shows its rows (spec 024).
@@ -302,6 +319,7 @@ impl SavedView {
             hidden
         };
         self.type_name == other.type_name
+            && self.query == other.query
             && self.filters == other.filters
             && self.sort == other.sort
             && self.group_by == other.group_by
@@ -762,7 +780,7 @@ impl StudioSettings {
                 overrides
                     .views
                     .iter()
-                    .filter(|view| view.type_name == type_name)
+                    .filter(|view| view.query.is_none() && view.type_name == type_name)
                     .cloned()
                     .collect()
             })
@@ -775,7 +793,7 @@ impl StudioSettings {
         let views = &mut self.graphs.entry(graph.to_owned()).or_default().views;
         match views
             .iter_mut()
-            .find(|v| v.type_name == view.type_name && v.name == view.name)
+            .find(|v| v.query.is_none() && v.type_name == view.type_name && v.name == view.name)
         {
             Some(existing) => {
                 view.id = existing.key();
@@ -789,6 +807,28 @@ impl StudioSettings {
                 views.push(view);
             }
         }
+    }
+
+    /// Saves a new view of a stored query for a graph, named `name`, opening as a table.
+    /// Returns its id, or `None` when the name is blank or another view of the graph has it.
+    pub fn save_query_view(&mut self, graph: &str, name: &str, query: ViewQuery) -> Option<String> {
+        let name = name.trim();
+        if name.is_empty() || self.view_name_taken(graph, name, None) {
+            return None;
+        }
+        let view = SavedView {
+            id: new_view_id(),
+            name: name.to_owned(),
+            query: Some(query),
+            ..SavedView::default()
+        };
+        let id = view.id.clone();
+        self.graphs
+            .entry(graph.to_owned())
+            .or_default()
+            .views
+            .push(view);
+        Some(id)
     }
 
     /// Every view of a graph, in the order they were made.
@@ -1574,6 +1614,50 @@ mod tests {
 
     /// A view made before views had ids goes by its type and name until it changes, and keeps
     /// that id when renamed; names are unique per graph; a removed view comes back where it was.
+    #[test]
+    fn a_query_view_keeps_its_stored_query_and_values() {
+        let mut settings = read_clean(
+            r#"{"graphs":{"dev/k":{"views":[
+            {"name":"Founders","type":"Person","filters":[]}]}}}"#,
+        );
+        let mut params = serde_json::Map::new();
+        params.insert("city".into(), serde_json::json!("Berlin"));
+        let query = ViewQuery {
+            stored: "people_in".into(),
+            params,
+        };
+        assert_eq!(
+            settings.save_query_view("dev/k", "Founders", query.clone()),
+            None,
+            "a name a type view has"
+        );
+        let id = settings
+            .save_query_view("dev/k", "In Berlin", query.clone())
+            .unwrap();
+        let view = settings.view("dev/k", &id).unwrap();
+        assert_eq!(view.query.as_ref(), Some(&query));
+        assert!(settings.views_for("dev/k", "").is_empty(), "not a type's");
+        let text = serde_json::to_string(&settings.graphs["dev/k"].views[1]).unwrap();
+        assert_eq!(
+            text,
+            format!(
+                r#"{{"id":"{id}","name":"In Berlin","query":{{"stored":"people_in","params":{{"city":"Berlin"}}}}}}"#
+            )
+        );
+        // Other values are a change; saving them keeps the query view's id, name and query.
+        let mut shown = view.clone();
+        shown.query.as_mut().unwrap().params["city"] = serde_json::json!("Paris");
+        assert!(!view.shows_as(&shown));
+        assert!(settings.update_view("dev/k", &id, &shown));
+        assert!(settings.view("dev/k", &id).unwrap().shows_as(&shown));
+        let copy = settings.duplicate_view("dev/k", &id).unwrap();
+        assert_eq!(
+            settings.view("dev/k", &copy).unwrap().query,
+            shown.query,
+            "a copy runs the same query"
+        );
+    }
+
     #[test]
     fn a_view_keeps_its_id_through_rename_duplicate_and_undo() {
         let old = r#"{"graphs":{"dev/k":{"views":[

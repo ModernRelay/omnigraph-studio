@@ -1084,6 +1084,138 @@ fn node_page_reading(
     })
 }
 
+/// A node type's view as a stored query for a cluster's `queries/` folder (spec 024): every
+/// row its filters keep, in its order, with no page or limit. The filters' values become the
+/// query's parameters, each named after its property (`$city`), so whoever runs it passes their
+/// own; `params` holds the view's, under those names. `name` is the view's name, which names
+/// the query (`Active customers` is `active_customers`).
+pub fn stored_view_query(
+    schema: &SchemaModel,
+    type_name: &str,
+    filters: &[Filter],
+    sort: Option<&Sort>,
+    name: &str,
+) -> Result<BuiltQuery, BuildError> {
+    let node = node(schema, type_name)?;
+    let row = &NODE_VAR[1..];
+    let mut params = Params::new();
+    let mut clauses = vec![format!("{NODE_VAR}: {}", node.name)];
+    clauses.extend(filter_clauses(
+        schema,
+        &node.name,
+        &node.properties,
+        row,
+        filters,
+        &mut params,
+    )?);
+    let by_id = format!("{NODE_VAR}.@id asc");
+    let order = match sort {
+        Some(sort) => {
+            let property = node
+                .properties
+                .iter()
+                .find(|p| p.name == sort.property && Sort::allowed(p))
+                .ok_or_else(|| BuildError::UnknownProperty {
+                    type_name: node.name.clone(),
+                    property: sort.property.clone(),
+                })?;
+            format!(
+                "{NODE_VAR}.{} {}, {by_id}",
+                property.name,
+                if sort.descending { "desc" } else { "asc" }
+            )
+        }
+        None => by_id,
+    };
+    let query_name = identifier(name, "view");
+    let mut text = format!(
+        "query {query_name}({sig}) {{\n  match {{\n    {clauses}\n  }}\n  return {{ {NODE_VAR} }}\n  order {{ {order} }}\n}}\n",
+        sig = params.signature(),
+        clauses = clauses.join("\n    "),
+    );
+    // The builders name a filter's parameter by its place (`$f0`, `$f0_end`); a stored query's
+    // are named for people, by the property each tests. The longest are renamed first, so
+    // `$f1` is not taken for the start of `$f10` or `$f1_end`.
+    let mut generated: Vec<String> = params.values.keys().cloned().collect();
+    generated.sort_by_key(|name| std::cmp::Reverse(name.len()));
+    let mut taken: Vec<String> = Vec::new();
+    let mut values = Map::new();
+    for old in generated {
+        let filter = old
+            .strip_prefix('f')
+            .and_then(|rest| rest.split('_').next())
+            .and_then(|i| i.parse::<usize>().ok())
+            .and_then(|i| filters.get(i));
+        let base = filter.map_or("value".to_owned(), |filter| {
+            identifier(
+                filter.property.rsplit(['.', ':']).next().unwrap_or("value"),
+                "value",
+            )
+        });
+        let base = if old.ends_with("_end") {
+            format!("{base}_end")
+        } else {
+            base
+        };
+        let new = (1..)
+            .map(|n| match n {
+                1 => base.clone(),
+                n => format!("{base}_{n}"),
+            })
+            .find(|candidate| !taken.contains(candidate))
+            .unwrap_or_default();
+        text = rename_param(&text, &old, &new);
+        values.insert(new.clone(), params.values[&old].clone());
+        taken.push(new);
+    }
+    Ok(BuiltQuery {
+        name: query_name,
+        text,
+        params: values,
+        depends: Depends::rows_of(schema, &node.name, false, filters),
+        seeds: None,
+    })
+}
+
+/// `words` as a GQ identifier: lower case, `_` between words, never starting with a digit;
+/// `fallback` when nothing of it is left.
+fn identifier(words: &str, fallback: &str) -> String {
+    let mut out = String::new();
+    for c in words.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else if !out.is_empty() && !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    let out = out.trim_end_matches('_').to_owned();
+    match out.chars().next() {
+        None => fallback.to_owned(),
+        Some(c) if c.is_ascii_digit() => format!("{fallback}_{out}"),
+        Some(_) => out,
+    }
+}
+
+/// `text` with every `$old` that is the whole name (not the start of a longer one) as `$new`.
+fn rename_param(text: &str, old: &str, new: &str) -> String {
+    let needle = format!("${old}");
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(&needle) {
+        let after = &rest[at + needle.len()..];
+        let whole = !after
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+        out.push_str(&rest[..at]);
+        out.push_str(if whole { "$" } else { "" });
+        out.push_str(if whole { new } else { &needle });
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
 /// The count a query returning `count(…) as n` answers ([`node_count`], [`edge_count`]). The
 /// engine answers one row even when nothing matches (`{"n": 0}`), so an answer of no row, or a
 /// row without `n`, is no count, for the caller to say so rather than take it for none.
@@ -2916,6 +3048,63 @@ mod tests {
     use super::*;
     use crate::check::check;
     use crate::schema::tests::dev;
+
+    /// A view as a stored query (spec 024): its filters' values become parameters named after
+    /// their properties, it keeps its order, has no page or limit, and type-checks.
+    #[test]
+    fn a_view_as_a_stored_query_names_its_parameters_for_people() {
+        let filters = [
+            Filter {
+                property: "city".into(),
+                op: FilterOp::Eq,
+                value: json!("Berlin"),
+            },
+            Filter {
+                property: "city".into(),
+                op: FilterOp::Ne,
+                value: json!("Paris"),
+            },
+        ];
+        let sort = Sort {
+            property: "city".into(),
+            descending: false,
+        };
+        let query = stored_view_query(
+            &dev(),
+            "Company",
+            &filters,
+            Some(&sort),
+            "Big companies, 2026",
+        )
+        .unwrap();
+        assert_eq!(query.name, "big_companies_2026");
+        assert!(
+            query
+                .text
+                .starts_with("query big_companies_2026($city: String, $city_2: String)")
+                || query
+                    .text
+                    .starts_with("query big_companies_2026($city_2: String, $city: String)"),
+            "{}",
+            query.text
+        );
+        assert!(!query.text.contains("$f"), "{}", query.text);
+        assert!(!query.text.contains("limit"), "{}", query.text);
+        assert!(
+            query.text.contains("order { $n.city asc, $n.@id asc }"),
+            "{}",
+            query.text
+        );
+        let mut values: Vec<_> = query.params.values().cloned().collect();
+        values.sort_by_key(|v| v.to_string());
+        assert_eq!(values, [json!("Berlin"), json!("Paris")]);
+        assert_compiles(&query);
+        assert_eq!(
+            rename_param("$f1 $f10 $f1_end", "f1", "x"),
+            "$x $f10 $f1_end"
+        );
+        assert_eq!(identifier("2026 plan", "view"), "view_2026_plan");
+    }
 
     /// A relationship's neighbours ordered by a property of theirs (spec 005): the first page
     /// those with a value, by it then by id; a later page after the last value and id; then

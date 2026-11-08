@@ -353,6 +353,7 @@
       "cmd-shift-enter": "studio_query::Explain",
       "cmd-s": "studio_query::Save",
       "cmd-shift-s": "studio_query::SaveAs",
+      "cmd-alt-z": "studio_table::RevertView",
       "f8": "studio_query::NextProblem",
       "shift-f8": "studio_query::PreviousProblem",
       "cmd-.": "studio_query::ApplyFix"
@@ -365,6 +366,7 @@
       "cmd-shift-enter": "studio_query::Explain",
       "cmd-s": "studio_query::Save",
       "cmd-shift-s": "studio_query::SaveAs",
+      "cmd-alt-z": "studio_table::RevertView",
       "f8": "studio_query::NextProblem",
       "shift-f8": "studio_query::PreviousProblem",
       "cmd-.": "studio_query::ApplyFix",

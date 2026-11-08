@@ -6,6 +6,7 @@
 mod analysis;
 mod completion;
 mod hover;
+mod name_view;
 mod queries_panel;
 mod results;
 mod schema_view;
@@ -98,12 +99,16 @@ fn open_file(
 
 /// Opens the tab running the stored query `name`, or the one already open (spec 007). `values`,
 /// a remembered tab's, fill the parameters. A query the catalog has not been read for yet opens
-/// and takes its parameters when it is.
-fn open_stored(
+/// and takes its parameters when it is. With `view`, it is that saved view's tab (spec 024),
+/// and with `preview` the pane's preview tab.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn open_stored(
     workspace: &mut Workspace,
     name: String,
     values: Option<Map<String, Value>>,
     at_commit: Option<String>,
+    view: Option<String>,
+    preview: bool,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Option<Entity<QueryEditor>> {
@@ -128,15 +133,22 @@ fn open_stored(
             params: Vec::new(),
         });
     let number = view::next_number();
-    let opened = workspace.open_item(view::stored_key(&name), window, cx, |window, cx| {
-        let mut editor = QueryEditor::new_stored(number, session, entry, window, cx);
+    let key = match &view {
+        Some(id) => view::view_key(id, at_commit.as_deref()),
+        None => view::stored_key(&name),
+    };
+    let mut made = false;
+    let opened = workspace.open_item_with(key, preview, window, cx, |window, cx| {
+        made = true;
+        let mut editor = QueryEditor::new_stored(number, session, entry, view, window, cx);
         if let Some(commit) = at_commit {
             editor.pin_to(commit, cx);
         }
         editor
     });
     let editor = opened?;
-    if let Some(values) = values {
+    // A view's tab already open keeps the values it shows, saved or not.
+    if let Some(values) = values.filter(|_| made) {
         editor.update(cx, |editor, cx| editor.fill_params(&values, window, cx));
     }
     Some(editor)
@@ -243,6 +255,8 @@ pub fn init(cx: &mut App) {
             name.to_owned(),
             values,
             text("at_commit"),
+            text("view"),
+            false,
             window,
             cx,
         );
@@ -332,7 +346,25 @@ pub fn init(cx: &mut App) {
             });
         });
         workspace.register_action(|workspace, action: &OpenStoredQuery, window, cx| {
-            open_stored(workspace, action.name.clone(), None, None, window, cx);
+            // A saved view of the stored query opens with the values it keeps (spec 024).
+            let values = action.view.as_ref().and_then(|id| {
+                let graph = workspace.session()?.read(cx).overrides_key();
+                cx.try_global::<studio_settings::StudioSettings>()?
+                    .view(&graph, id)?
+                    .query
+                    .clone()
+                    .map(|query| query.params)
+            });
+            open_stored(
+                workspace,
+                action.name.clone(),
+                values,
+                None,
+                action.view.clone(),
+                action.preview,
+                window,
+                cx,
+            );
         });
         workspace.register_action(|workspace, action: &OpenSource, window, cx| {
             open_schema(

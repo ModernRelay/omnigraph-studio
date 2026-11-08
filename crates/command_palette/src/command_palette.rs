@@ -277,6 +277,8 @@ enum Row {
     View {
         action: Box<dyn Action>,
         type_name: String,
+        /// The stored query a query view runs (spec 024); `None` for a type view.
+        query: Option<String>,
     },
     /// A saved query file of this graph.
     Saved {
@@ -1123,6 +1125,9 @@ impl CommandPalette {
             }),
             Row::Tab { .. } => muted("open tab".into()),
             Row::Saved { .. } => muted("saved".into()),
+            Row::View {
+                query: Some(query), ..
+            } => muted(format!("view · {query}")),
             Row::View { type_name, .. } => muted(format!("view · {type_name}")),
             Row::Stored { mutation, .. } => muted(if *mutation {
                 "stored · writes".into()
@@ -1146,6 +1151,7 @@ impl CommandPalette {
                 IconName::GitBranch
             }),
             Row::Tab { .. } | Row::Saved { .. } => icon_tile(IconName::Code),
+            Row::View { query: Some(_), .. } => icon_tile(IconName::Server),
             Row::View { .. } => icon_tile(IconName::Table),
             Row::Stored { .. } => icon_tile(IconName::Server),
             Row::MoreTypes { .. } => icon_tile(IconName::MagnifyingGlass),
@@ -1201,6 +1207,9 @@ impl CommandPalette {
             }
             Row::Tab { .. } => Some("Go to this tab.".into()),
             Row::Saved { .. } => Some("Open this saved query in a tab.".into()),
+            Row::View {
+                query: Some(query), ..
+            } => Some(format!("Open view: the stored query {query} with its values.").into()),
             Row::View { type_name, .. } => {
                 Some(format!("Open view: its filters, order and columns of {type_name}.").into())
             }
@@ -1313,6 +1322,8 @@ fn add_stored_rows(
 ) {
     let open = |name: &str| OpenStoredQuery {
         name: name.to_owned(),
+        view: None,
+        preview: false,
     };
     if !window.is_action_available(&open(""), cx) {
         return;
@@ -1397,6 +1408,7 @@ fn add_view_rows(
         rows.push(Row::View {
             action: Box::new(open(view.key())),
             type_name: view.type_name.clone(),
+            query: view.query.as_ref().map(|query| query.stored.clone()),
         });
     }
 }
@@ -1980,7 +1992,10 @@ mod tests {
         let (palette, cx) = palette(Scope::Types, session, cx);
         assert_eq!(listed(&palette, cx), ["type:Person", "view:v1"]);
         palette.read_with(cx, |palette, _| {
-            let Row::View { action, type_name } = &palette.rows[palette.matches[1].index] else {
+            let Row::View {
+                action, type_name, ..
+            } = &palette.rows[palette.matches[1].index]
+            else {
                 panic!("a view's row");
             };
             assert_eq!(type_name, "Person");
@@ -2021,6 +2036,8 @@ mod tests {
                 action.as_any().downcast_ref::<OpenStoredQuery>(),
                 Some(&OpenStoredQuery {
                     name: "people_titled".into(),
+                    view: None,
+                    preview: false,
                 })
             );
             assert_eq!(

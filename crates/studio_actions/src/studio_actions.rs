@@ -511,6 +511,12 @@ pub mod graph {
     #[action(namespace = studio_graph)]
     pub struct OpenStoredQuery {
         pub name: String,
+        /// The saved view of it to open (spec 024), with the values it keeps.
+        #[serde(default)]
+        pub view: Option<String>,
+        /// Open as the pane's preview tab, which the next preview replaces.
+        #[serde(default)]
+        pub preview: bool,
     }
 
     /// Walk a node's relationships on a canvas of its own.
@@ -644,6 +650,9 @@ pub mod table {
             SaveView,
             /// Save what the table shows as a new view, under a name.
             SaveViewAsNew,
+            /// Copy what a node type's table shows as a stored query, for a cluster's queries
+            /// folder (spec 024).
+            CopyAsStoredQuery,
             /// Show the view as it was saved, leaving what was changed in its tab.
             RevertView,
         ]

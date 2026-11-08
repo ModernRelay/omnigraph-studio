@@ -34,6 +34,7 @@ use studio_actions::query::{
     ApplyFix, CopyCell, CopyRow, Explain, NextPage, NextProblem, PreviousProblem, Run, Save,
     SaveAs, SelectNextColumn, SelectPreviousColumn, ToggleResultsFocus,
 };
+use studio_actions::table::RevertView;
 use studio_actions::workspace::Refresh;
 use studio_ui::ds::Tipped;
 use studio_ui::ds::{Dotted as _, space};
@@ -126,6 +127,11 @@ struct Stored {
     /// Values for parameters the tab has no input for yet: it opened before the catalog was
     /// read. Each fills its input when the input is made.
     pending: Map<String, Value>,
+    /// The saved view (spec 024) this tab is, by id; `None` for the stored query's own tab.
+    view: Option<String>,
+    /// Whether the tab showed other values than the view as saved when it last said so, so a
+    /// keystroke in a parameter redraws the tab only when that changes.
+    view_changed: bool,
 }
 
 /// A write waiting for the person to confirm it (constitution III, VII).
@@ -780,7 +786,10 @@ impl Item for QueryEditor {
 
     fn tab_title(&self, _cx: &App) -> SharedString {
         let name = match (&self.stored, &self.path) {
-            (Some(stored), _) => stored.entry.name.clone(),
+            (Some(stored), _) => self
+                .saved_self(_cx)
+                .map(|view| view.name)
+                .unwrap_or_else(|| stored.entry.name.clone()),
             (None, path) => match path {
                 Some(path) => path
                     .file_stem()
@@ -796,8 +805,9 @@ impl Item for QueryEditor {
     }
 
     /// A file-backed query with changes since it was saved.
-    fn is_dirty(&self, _cx: &App) -> bool {
-        self.writing || self.stored.is_none() && self.unsaved
+    /// A view's tab whose parameters differ from the view as saved.
+    fn is_dirty(&self, cx: &App) -> bool {
+        self.writing || self.stored.is_none() && self.unsaved || self.view_changed(cx)
     }
 
     /// The rows shown were read at a commit their branch, the one shown, has moved past.
@@ -817,7 +827,13 @@ impl Item for QueryEditor {
 
     fn dedupe_key(&self, _cx: &App) -> Option<SharedString> {
         if let Some(stored) = &self.stored {
-            return Some(stored_key(&stored.entry.name).into());
+            return Some(
+                match &stored.view {
+                    Some(id) => view_key(id, self.at_commit.as_deref()),
+                    None => stored_key(&stored.entry.name),
+                }
+                .into(),
+            );
         }
         Some(match &self.path {
             Some(path) => file_key(path).into(),
@@ -849,6 +865,7 @@ impl Item for QueryEditor {
                 kind: "stored_query".into(),
                 data: serde_json::json!({
                     "name": stored.entry.name,
+                    "view": stored.view,
                     "at_commit": self.at_commit,
                     "values": values,
                     "widths": self.column_widths,
@@ -956,11 +973,13 @@ impl QueryEditor {
         this
     }
 
-    /// A tab for the stored query `entry` (spec 007), with an input for each parameter.
+    /// A tab for the stored query `entry` (spec 007), with an input for each parameter; with
+    /// `view`, the tab of that saved view of it (spec 024).
     pub fn new_stored(
         number: usize,
         session: Entity<GraphSession>,
         entry: QueryCatalogEntry,
+        view: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -968,6 +987,8 @@ impl QueryEditor {
             entry,
             gone: false,
             pending: Map::new(),
+            view,
+            view_changed: false,
         };
         // A restored tab is made before anything asked for the catalog it reads its query from.
         session.update(cx, |session, cx| session.want_stored_queries(cx));
@@ -1053,6 +1074,18 @@ impl QueryEditor {
                     _ => {}
                 },
             ),
+            // A view renamed, saved or deleted elsewhere: the tab's name and dot follow it.
+            cx.observe_global::<studio_settings::StudioSettings>(|this, cx| {
+                if this
+                    .stored
+                    .as_ref()
+                    .is_some_and(|stored| stored.view.is_some())
+                {
+                    this.note_view_changed(cx);
+                    cx.emit(ItemEvent::UpdateTab);
+                    cx.notify();
+                }
+            }),
         ];
         let mut this = Self {
             number,
@@ -1571,9 +1604,18 @@ impl QueryEditor {
     }
 
     fn save_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // A stored query lives on the server; there is no text here to save. A file still
-        // being read has none yet.
-        if self.stored.is_some() || self.loading.is_some() {
+        // A stored query lives on the server; there is no text here to save, so its values are
+        // saved into its view, or as a new one (spec 024).
+        if self.stored.is_some() {
+            if self.saved_self(cx).is_some() {
+                self.save_into_view(cx);
+            } else {
+                self.open_name_view(window, cx);
+            }
+            return;
+        }
+        // A file still being read has no text yet.
+        if self.loading.is_some() {
             return;
         }
         if self.saving {
@@ -1622,7 +1664,11 @@ impl QueryEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.stored.is_some() || self.loading.is_some() {
+        if self.stored.is_some() {
+            self.open_name_view(window, cx);
+            return;
+        }
+        if self.loading.is_some() {
             return;
         }
         let graph = self.session.read(cx).overrides_key();
@@ -2150,6 +2196,185 @@ impl QueryEditor {
     // ---- stored queries (spec 007) ----
 
     /// The stored query this tab runs, when it is a stored query's tab.
+    /// The saved view this tab is, as settings hold it now; `None` for a stored query's own
+    /// tab, a view deleted since, or any other query.
+    fn saved_self(&self, cx: &App) -> Option<studio_settings::SavedView> {
+        let id = self.stored.as_ref()?.view.as_deref()?;
+        let graph = self.session.read(cx).overrides_key();
+        cx.try_global::<studio_settings::StudioSettings>()?
+            .view(&graph, id)
+            .cloned()
+    }
+
+    /// The stored query and the parameters' values as a view keeps them: each as the run would
+    /// send it, an empty optional one left out, and one that does not read as its type as its
+    /// text, so the person's typing is kept as it is.
+    fn view_query(&self, cx: &App) -> Option<studio_settings::ViewQuery> {
+        let stored = self.stored.as_ref()?;
+        let mut params = stored.pending.clone();
+        for param in &stored.entry.params {
+            let Some(input) = self.params.get(&param.name) else {
+                continue;
+            };
+            let text = input.read(cx).text(cx);
+            match gq_language::param_value(&param.name, &param_type(param), param.nullable, &text) {
+                Ok(Some(value)) => {
+                    params.insert(param.name.clone(), value);
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    params.insert(param.name.clone(), Value::String(text));
+                }
+            }
+        }
+        Some(studio_settings::ViewQuery {
+            stored: stored.entry.name.clone(),
+            params,
+        })
+    }
+
+    /// Whether this view's tab shows other values than the view as saved.
+    fn view_changed(&self, cx: &App) -> bool {
+        self.saved_self(cx)
+            .is_some_and(|saved| saved.query != self.view_query(cx))
+    }
+
+    /// Redraws the tab when whether it differs from its view changed since it last said so.
+    fn note_view_changed(&mut self, cx: &mut Context<Self>) {
+        let changed = self.view_changed(cx);
+        if let Some(stored) = &mut self.stored
+            && stored.view_changed != changed
+        {
+            stored.view_changed = changed;
+            cx.emit(ItemEvent::UpdateTab);
+            cx.notify();
+        }
+    }
+
+    /// The tab becomes the saved view `id`: one just saved from it.
+    pub(crate) fn become_view(&mut self, id: String, cx: &mut Context<Self>) {
+        if let Some(stored) = &mut self.stored {
+            stored.view = Some(id);
+            stored.view_changed = false;
+        }
+        cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
+    }
+
+    /// Saves the values this view's tab shows into the view.
+    fn save_into_view(&mut self, cx: &mut Context<Self>) {
+        let (Some(saved), Some(query)) = (self.saved_self(cx), self.view_query(cx)) else {
+            return;
+        };
+        if saved.query.as_ref() == Some(&query) {
+            return;
+        }
+        let graph = self.session.read(cx).overrides_key();
+        let shown = studio_settings::SavedView {
+            query: Some(query),
+            ..saved.clone()
+        };
+        let id = saved.key();
+        studio_settings::update(cx, move |settings| {
+            settings.update_view(&graph, &id, &shown);
+        });
+        self.note_view_changed(cx);
+    }
+
+    /// Shows the view's values as they were saved.
+    fn revert_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(saved) = self.saved_self(cx).filter(|_| self.view_changed(cx)) else {
+            return;
+        };
+        let values = saved.query.map(|query| query.params).unwrap_or_default();
+        // A parameter the view keeps no value for is emptied.
+        for (name, input) in &self.params {
+            if !values.contains_key(name) {
+                input.update(cx, |input, cx| input.set_text("", window, cx));
+            }
+        }
+        self.fill_params(&values, window, cx);
+        self.note_view_changed(cx);
+    }
+
+    /// Asks for a name and saves the stored query with these values as a new view, which this
+    /// tab becomes. A stored query that changes data is no view's source.
+    pub(crate) fn open_name_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(stored) = &self.stored else {
+            return;
+        };
+        let Some(workspace) = studio_workspace::workspace_for(window) else {
+            return;
+        };
+        if stored.entry.mutation {
+            let name = stored.entry.name.clone();
+            workspace.update(cx, |workspace, cx| {
+                workspace.show_toast(
+                    studio_workspace::ToastKind::Info,
+                    format!("{name} changes data, so it cannot be a view; a view only reads."),
+                    cx,
+                )
+            });
+            return;
+        }
+        let Some(query) = self.view_query(cx) else {
+            return;
+        };
+        let graph = self.session.read(cx).overrides_key();
+        let editor = cx.entity().downgrade();
+        workspace.update(cx, |workspace, cx| {
+            workspace.toggle_modal(window, cx, |window, cx| {
+                crate::name_view::NameViewModal::new(graph, query, editor, window, cx)
+            });
+        });
+    }
+
+    /// Save, Save as new view and Revert, while a view's tab shows other values than the view
+    /// as saved.
+    fn render_view_changes(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.view_changed(cx) {
+            return None;
+        }
+        let focus = self.main_focus(cx);
+        let tip = move |text: &'static str, action: Box<dyn gpui::Action>| {
+            let focus = focus.clone();
+            move |_: &mut Window, cx: &mut App| {
+                studio_ui::ds::tooltip_for_action_in_view(text, action.as_ref(), &focus, cx)
+            }
+        };
+        Some(
+            h_flex()
+                .gap(px(space::XS))
+                .child(
+                    studio_ui::ds::button("save-view", "Save")
+                        .style(ButtonStyle::Tinted(ui::TintColor::Accent))
+                        .tip_fn(tip("Save these values into the view", Box::new(Save)))
+                        .on_click(cx.listener(|this, _, _, cx| this.save_into_view(cx))),
+                )
+                .child(
+                    studio_ui::ds::button("save-view-as", "Save as new view…")
+                        .style(ButtonStyle::Subtle)
+                        .tip_fn(tip(
+                            "Keep the view as it was and save these values as another",
+                            Box::new(SaveAs),
+                        ))
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.open_name_view(window, cx)),
+                        ),
+                )
+                .child(
+                    studio_ui::ds::button("revert-view", "Revert")
+                        .style(ButtonStyle::Subtle)
+                        .tip_fn(tip(
+                            "Show the view's values as they were saved",
+                            Box::new(RevertView),
+                        ))
+                        .on_click(cx.listener(|this, _, window, cx| this.revert_view(window, cx))),
+                )
+                .into_any_element(),
+        )
+    }
+
     pub fn stored_name(&self) -> Option<&str> {
         self.stored
             .as_ref()
@@ -2190,6 +2415,13 @@ impl QueryEditor {
                 .remove(&param.name)
                 .map(|value| gq_language::input::edit_text(&value));
             let input = param_input(placeholder, text, window, cx);
+            // A view's tab says when its values differ from the view's.
+            self._subscriptions
+                .push(cx.subscribe(&input, |this, _, event: &EditorEvent, cx| {
+                    if let EditorEvent::BufferEdited = event {
+                        this.note_view_changed(cx);
+                    }
+                }));
             self.params.insert(param.name, input);
         }
     }
@@ -3637,6 +3869,7 @@ impl QueryEditor {
                         .on_click(cx.listener(|this, _, _, cx| this.refresh_rows(cx))),
                 )
             })
+            .children(self.render_view_changes(cx))
             .child(div().flex_1())
             .child(self.render_snapshot_picker(cx))
             // A stored query's plan needs its text, which the server does not send.
@@ -4889,6 +5122,7 @@ impl Render for QueryEditor {
             .on_action(cx.listener(Self::previous_problem))
             .on_action(cx.listener(Self::apply_fix_action))
             .on_action(cx.listener(Self::refresh))
+            .on_action(cx.listener(|this, _: &RevertView, window, cx| this.revert_view(window, cx)))
             .size_full()
             .child(toolbar)
             .children(disk_change)
@@ -4948,6 +5182,15 @@ fn param_input(
         }
         editor
     })
+}
+
+/// The dedupe key of a saved view's tab (spec 024): one per view at the head, and one per view
+/// and commit, as a type view's tab is keyed.
+pub fn view_key(id: &str, at_commit: Option<&str>) -> String {
+    match at_commit {
+        Some(commit) => format!("view:{id}@{commit}"),
+        None => format!("view:{id}"),
+    }
 }
 
 /// The dedupe key of the tab running the stored query `name`, so it opens once.
@@ -6734,7 +6977,7 @@ mod tests {
                 params: Vec::new(),
             };
             let (editor, cx) = cx.add_window_view(|window, cx| {
-                QueryEditor::new_stored(1, session, entry, window, cx)
+                QueryEditor::new_stored(1, session, entry, None, window, cx)
             });
             editor.update_in(cx, |editor, window, cx| {
                 let values = json!({"title": "Founder", "limit": 5});
@@ -6755,6 +6998,80 @@ mod tests {
                 input.update(cx, |input, cx| input.set_text("CEO", window, cx));
                 let saved = editor.serialize(cx).unwrap();
                 assert_eq!(saved.data["values"], json!({"title": "CEO", "limit": 5}));
+            });
+        }
+
+        /// A saved view of a stored query (spec 024): its tab is named and keyed by the view,
+        /// other values mark it changed, Save puts them into the view, and Revert brings the
+        /// view's back.
+        #[gpui::test]
+        async fn a_stored_query_views_tab_saves_and_reverts_its_values(cx: &mut TestAppContext) {
+            init(cx);
+            cx.update(|cx| {
+                studio_settings::init_test(cx);
+                studio_settings::keep_changes_in_memory(cx);
+            });
+            let session = session(cx);
+            let graph = session.read_with(cx, |session, _| session.overrides_key());
+            let mut params = Map::new();
+            params.insert("title".into(), json!("Founder"));
+            let query = studio_settings::ViewQuery {
+                stored: "people_titled".into(),
+                params,
+            };
+            let id = cx.update(|cx| {
+                let mut id = None;
+                studio_settings::update(cx, |settings| {
+                    id = settings.save_query_view(&graph, "Founders", query.clone());
+                });
+                id.expect("the view is saved")
+            });
+            let entry = QueryCatalogEntry {
+                name: "people_titled".into(),
+                tool_name: None,
+                description: None,
+                instruction: None,
+                mutation: false,
+                params: vec![ParamDescriptor {
+                    name: "title".into(),
+                    ..param(ParamKind::String)
+                }],
+            };
+            let view_id = id.clone();
+            let (editor, cx) = cx.add_window_view(move |window, cx| {
+                let mut editor =
+                    QueryEditor::new_stored(1, session, entry, Some(view_id), window, cx);
+                editor.sync_stored_params(window, cx);
+                editor.fill_params(&query.params, window, cx);
+                editor
+            });
+            editor.update_in(cx, |editor, window, cx| {
+                assert_eq!(editor.tab_title(cx).as_ref(), "Founders");
+                assert_eq!(
+                    editor.dedupe_key(cx).as_deref(),
+                    Some(format!("view:{id}").as_str())
+                );
+                assert!(!editor.is_dirty(cx), "it shows the view as saved");
+                assert_eq!(editor.serialize(cx).unwrap().data["view"], json!(id));
+
+                let input = editor.params["title"].clone();
+                input.update(cx, |input, cx| input.set_text("CEO", window, cx));
+                assert!(editor.is_dirty(cx), "another value");
+                editor.revert_view(window, cx);
+                assert_eq!(input.read(cx).text(cx), "Founder");
+                assert!(!editor.is_dirty(cx));
+
+                input.update(cx, |input, cx| input.set_text("CEO", window, cx));
+                editor.save_now(window, cx);
+                assert!(!editor.is_dirty(cx), "saved into the view");
+            });
+            let graph = editor.read_with(cx, |editor, cx| editor.session.read(cx).overrides_key());
+            cx.update(|_, cx| {
+                let saved = studio_settings::StudioSettings::get(cx)
+                    .view(&graph, &id)
+                    .and_then(|view| view.query.clone())
+                    .expect("still a query view");
+                assert_eq!(saved.params["title"], json!("CEO"));
             });
         }
 

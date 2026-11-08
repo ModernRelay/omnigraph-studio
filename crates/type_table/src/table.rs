@@ -34,10 +34,10 @@ use graph_store::{
 use serde_json::Value;
 use studio_actions::blob::{ChooseFile, ClearValue};
 use studio_actions::table::{
-    AddFilter, Cancel, ClearFilters, ConfirmEdit, CopyCell, DeleteRow, EditCell, ExpandCell,
-    FillColumn, FilterBySelection, FilterInWords, InsertRow, MoveDown, MoveLeft, MoveRight, MoveUp,
-    OpenRowPage, PeekRow, RefreshTable, RevertView, SaveDrafts, SaveView, SaveViewAsNew,
-    SelectNextSuggestion, SelectPreviousSuggestion, ShowRowOnCanvas, StageEdit,
+    AddFilter, Cancel, ClearFilters, ConfirmEdit, CopyAsStoredQuery, CopyCell, DeleteRow, EditCell,
+    ExpandCell, FillColumn, FilterBySelection, FilterInWords, InsertRow, MoveDown, MoveLeft,
+    MoveRight, MoveUp, OpenRowPage, PeekRow, RefreshTable, RevertView, SaveDrafts, SaveView,
+    SaveViewAsNew, SelectNextSuggestion, SelectPreviousSuggestion, ShowRowOnCanvas, StageEdit,
 };
 use studio_actions::{ViewKind, ViewLink};
 use studio_ui::ds::Tipped;
@@ -1885,11 +1885,6 @@ impl TypeTable {
         cx.try_global::<studio_settings::StudioSettings>()?
             .view(&graph, id)
             .cloned()
-    }
-
-    /// The saved view this tab is, by id.
-    pub(crate) fn view_id(&self) -> Option<&str> {
-        self.view_id.as_deref()
     }
 
     /// Whether this view's tab shows something other than the view as saved.
@@ -11049,6 +11044,26 @@ impl Render for TypeTable {
             .on_action(
                 cx.listener(|this, _: &SaveViewAsNew, window, cx| this.open_save_view(window, cx)),
             )
+            .when(self.kind == TableKind::Node, |table| {
+                table.on_action(cx.listener(|this, _: &CopyAsStoredQuery, _, cx| {
+                    let view = studio_settings::SavedView {
+                        name: this
+                            .saved_self(cx)
+                            .map(|view| view.name)
+                            .unwrap_or_default(),
+                        ..this.current_view()
+                    };
+                    let filters = this.resolved_filters();
+                    let schema = this.session.read(cx).schema_model();
+                    crate::copy_as_stored_query(
+                        &this.workspace,
+                        schema.as_deref(),
+                        &view,
+                        &filters,
+                        cx,
+                    );
+                }))
+            })
             // Only in a view's tab changed since it was saved, so the palette offers them there.
             .when(self.view_changed(cx), |table| {
                 table

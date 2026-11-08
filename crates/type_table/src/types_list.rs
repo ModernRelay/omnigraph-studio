@@ -25,7 +25,18 @@ use ui::right_click_menu;
 use crate::table::TypeTable;
 
 /// What the rows were made from: the schema's text and the views' ids and names.
-type RowsFor = (Arc<str>, Vec<(String, String)>);
+type RowsFor = (Arc<str>, Vec<ViewEntry>);
+
+/// A saved view as its row shows it.
+#[derive(Debug, Clone, PartialEq)]
+struct ViewEntry {
+    id: String,
+    name: String,
+    /// The stored query a query view runs (spec 024); `None` for a type view.
+    query: Option<String>,
+    /// The graph's catalog, read, no longer has that stored query.
+    gone: bool,
+}
 
 /// One row of the sidebar's list.
 #[derive(Debug, PartialEq)]
@@ -34,11 +45,8 @@ enum Row {
     Section(&'static str),
     /// The Views section's label, with its "+".
     ViewsSection,
-    /// A saved view, by id and name.
-    View {
-        id: String,
-        name: String,
-    },
+    /// A saved view.
+    View(ViewEntry),
     Type {
         name: String,
         is_edge: bool,
@@ -96,7 +104,10 @@ impl TypesList {
             list: ListState::new(0, ListAlignment::Top, px(400.)),
             _workspace_subscription: workspace_subscription,
             _session_subscription: None,
-            _settings_subscription: cx.observe_global::<StudioSettings>(|_, cx| cx.notify()),
+            _settings_subscription: cx.observe_global::<StudioSettings>(|this, cx| {
+                this.want_catalog(cx);
+                cx.notify()
+            }),
         };
         this.watch(session, cx);
         this
@@ -108,17 +119,60 @@ impl TypesList {
                 SessionEvent::SchemaChanged
                 | SessionEvent::SchemaMoved
                 | SessionEvent::CountsChanged
-                | SessionEvent::BranchChanged => cx.notify(),
+                | SessionEvent::BranchChanged
+                | SessionEvent::StoredQueriesChanged => cx.notify(),
                 _ => {}
             })
         });
         self.session = session;
+        self.want_catalog(cx);
         cx.notify();
+    }
+
+    /// A view of a stored query says whether the graph still serves it, so the catalog is read
+    /// once any view runs one.
+    fn want_catalog(&self, cx: &mut Context<Self>) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        let graph = session.read(cx).overrides_key();
+        let runs_one = cx.try_global::<StudioSettings>().is_some_and(|settings| {
+            settings
+                .graph_views(&graph)
+                .iter()
+                .any(|view| view.query.is_some())
+        });
+        if runs_one {
+            session.update(cx, |session, cx| session.want_stored_queries(cx));
+        }
     }
 
     fn active_thing(&self, cx: &App) -> Option<Thing> {
         let workspace = self.workspace.upgrade()?;
         workspace.read(cx).active_item()?.thing(cx)
+    }
+
+    /// Copies the type view `id` as a stored query (spec 024).
+    fn copy_as_stored_query(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        let graph = session.read(cx).overrides_key();
+        let Some(view) = StudioSettings::get(cx).view(&graph, &id).cloned() else {
+            return;
+        };
+        let schema = session.read(cx).schema_model();
+        let filters = crate::view_opening(&view).filters;
+        crate::copy_as_stored_query(&self.workspace, schema.as_deref(), &view, &filters, cx);
+    }
+
+    /// The saved view the active tab is, a type's or a query's, from its tab's key
+    /// (`view:<id>`, `@<commit>` after it when pinned).
+    fn active_view(&self, cx: &App) -> Option<String> {
+        let workspace = self.workspace.upgrade()?;
+        let key = workspace.read(cx).active_item()?.dedupe_key(cx)?;
+        let id = key.strip_prefix(crate::VIEW_KEY_PREFIX)?;
+        Some(id.split_once('@').map_or(id, |(id, _)| id).to_owned())
     }
 
     /// The type table the active tab is, if it is one.
@@ -251,14 +305,11 @@ impl TypesList {
 
 /// The rows for a schema and the graph's views: the schema itself, the views by name, then the
 /// types.
-fn rows_of(schema: &SchemaModel, views: &[(String, String)]) -> Vec<Row> {
+fn rows_of(schema: &SchemaModel, views: &[ViewEntry]) -> Vec<Row> {
     let mut rows = vec![Row::Schema];
     if !views.is_empty() {
         rows.push(Row::ViewsSection);
-        rows.extend(views.iter().map(|(id, name)| Row::View {
-            id: id.clone(),
-            name: name.clone(),
-        }));
+        rows.extend(views.iter().cloned().map(Row::View));
     }
     rows.push(Row::Section("Node types"));
     rows.extend(schema.nodes.iter().map(|node| Row::Type {
@@ -317,10 +368,21 @@ impl Render for TypesList {
                 return studio_ui::ds::sidebar_note("Reading types…").into_any_element();
             }
         };
-        let views: Vec<(String, String)> = StudioSettings::get(cx)
+        let catalog = s.stored_queries.loaded();
+        let views: Vec<ViewEntry> = StudioSettings::get(cx)
             .graph_views(&s.overrides_key())
             .iter()
-            .map(|view| (view.key(), view.name.clone()))
+            .map(|view| {
+                let query = view.query.as_ref().map(|query| query.stored.clone());
+                ViewEntry {
+                    id: view.key(),
+                    name: view.name.clone(),
+                    gone: query.as_ref().is_some_and(|name| {
+                        catalog.is_some_and(|queries| !queries.iter().any(|q| &q.name == name))
+                    }),
+                    query,
+                }
+            })
             .collect();
         let made_for = (schema.source.clone(), views);
         if self.rows_for.as_ref() != Some(&made_for) {
@@ -330,9 +392,7 @@ impl Render for TypesList {
             self.rows_for = Some(made_for);
         }
         self.frame_active = self.active_thing(cx);
-        self.frame_view = self
-            .active_table(cx)
-            .and_then(|table| table.read(cx).view_id().map(str::to_owned));
+        self.frame_view = self.active_view(cx);
         list(
             self.list.clone(),
             // Each row in a column of the list's width, as the rows sat in one before.
@@ -400,7 +460,7 @@ impl TypesList {
                     )
                     .into_any_element()
             }
-            Row::View { id, name } => self.render_view_row(ix, id, name, cx),
+            Row::View(view) => self.render_view_row(ix, view, cx),
             Row::Type { name, is_edge } => {
                 let s = session.read(cx);
                 let entity = if *is_edge {
@@ -456,13 +516,8 @@ impl TypesList {
 impl TypesList {
     /// A saved view's row: its name, lit while the active tab is it; a click previews it, a
     /// double click keeps it, and a right click opens, renames, duplicates or deletes it.
-    fn render_view_row(
-        &self,
-        ix: usize,
-        id: &str,
-        name: &str,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_view_row(&self, ix: usize, view: &ViewEntry, cx: &mut Context<Self>) -> AnyElement {
+        let (id, name) = (view.id.as_str(), view.name.as_str());
         if let Some((_, editor, _)) = self.renaming.as_ref().filter(|(r, _, _)| r == id) {
             return h_flex()
                 .h(px(studio_ui::ds::size::SIDEBAR_ROW))
@@ -482,16 +537,34 @@ impl TypesList {
             id: id.to_owned(),
             preview: true,
         };
+        let (icon, tip) = match (&view.query, view.gone) {
+            (Some(query), true) => (
+                IconName::Warning,
+                format!("Stored query {query} is gone: this graph no longer serves it"),
+            ),
+            (Some(query), false) => (
+                IconName::Server,
+                format!(
+                    "A saved view of the stored query {query}: right-click to rename, duplicate \
+                     or delete it"
+                ),
+            ),
+            (None, _) => (
+                IconName::Table,
+                "A saved view: right-click to rename, duplicate or delete it".to_owned(),
+            ),
+        };
+        let gone = view.gone;
+        let is_query = view.query.is_some();
         let row = {
             let (name, open) = (name.to_owned(), open.clone());
             move |_: &mut Window, _: &mut App| {
                 let open = open.clone();
                 studio_ui::ds::SidebarRow::new(("view", ix), name.clone())
-                    .icon(IconName::Table)
+                    .icon(icon)
                     .selected(selected)
-                    .tip(studio_ui::ds::tooltip(
-                        "A saved view: right-click to rename, duplicate or delete it",
-                    ))
+                    .muted(gone)
+                    .tip(studio_ui::ds::tooltip(tip.clone()))
                     .on_click(move |event, window, cx| {
                         let mut action = open.clone();
                         action.preview = event.click_count() < 2;
@@ -532,6 +605,13 @@ impl TypesList {
                         None,
                         on(|this, id, _, cx| this.duplicate(id, cx)),
                     )
+                    .when(!is_query, |menu| {
+                        menu.entry(
+                            "Copy as stored query",
+                            None,
+                            on(|this, id, _, cx| this.copy_as_stored_query(id, cx)),
+                        )
+                    })
                     .separator()
                     .entry(
                         "Delete",
@@ -554,16 +634,18 @@ mod tests {
     fn saved_views_list_before_the_types() {
         let schema = SchemaModel::parse("node Person {\n  slug: String @key\n}\n")
             .expect("the schema parses");
-        let views = [("v1".to_owned(), "Founders".to_owned())];
+        let views = [ViewEntry {
+            id: "v1".into(),
+            name: "Founders".into(),
+            query: None,
+            gone: false,
+        }];
         assert_eq!(
             rows_of(&schema, &views),
             vec![
                 Row::Schema,
                 Row::ViewsSection,
-                Row::View {
-                    id: "v1".into(),
-                    name: "Founders".into()
-                },
+                Row::View(views[0].clone()),
                 Row::Section("Node types"),
                 Row::Type {
                     name: "Person".into(),

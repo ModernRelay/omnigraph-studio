@@ -3,6 +3,7 @@
 //! opens one, as ↵ opens the one ↑ and ↓ select; ⌘S in a new query saves it here.
 
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::{Duration, SystemTime};
 
 use gpui::{
@@ -13,8 +14,10 @@ use graph_store::{GraphSession, Loadable, SessionEvent};
 use studio_actions::graph::{NewQuery, OpenQueryFile, OpenStoredQuery};
 use studio_actions::queries::{OpenSelected, SelectNext, SelectPrevious};
 use studio_ui::ds::Tipped;
+use studio_ui::menu::{ContextMenu, ContextMenuEntry};
 use studio_workspace::{ToastKind, Workspace, WorkspaceEvent};
 use ui::prelude::*;
+use ui::right_click_menu;
 
 use crate::SavedQueriesChanged;
 
@@ -108,7 +111,11 @@ impl PanelRow {
             PanelRow::Saved { path, .. } => Some(Box::new(OpenQueryFile {
                 path: Some(path.to_string_lossy().into_owned()),
             })),
-            PanelRow::Stored { name, .. } => Some(Box::new(OpenStoredQuery { name: name.clone() })),
+            PanelRow::Stored { name, .. } => Some(Box::new(OpenStoredQuery {
+                name: name.clone(),
+                view: None,
+                preview: false,
+            })),
             _ => None,
         }
     }
@@ -369,12 +376,50 @@ impl QueriesPanel {
                 mutation,
             } => {
                 let tooltip = description.unwrap_or_else(|| format!("Run {name} on the server"));
-                ds::SidebarRow::new(("stored-query", ix), name)
-                    .icon(IconName::Server)
-                    .when(mutation, |row| row.end(ds::sidebar_count("writes")))
-                    .selected(selected)
-                    .tip(ds::tooltip(tooltip))
-                    .on_click(self.click(ix, cx))
+                let click = Rc::new(self.click(ix, cx));
+                let row = {
+                    let name = name.clone();
+                    move |_: &mut Window, _: &mut App| {
+                        let click = click.clone();
+                        ds::SidebarRow::new(("stored-query", ix), name.clone())
+                            .icon(IconName::Server)
+                            .when(mutation, |row| row.end(ds::sidebar_count("writes")))
+                            .selected(selected)
+                            .tip(ds::tooltip(tooltip.clone()))
+                            .on_click(move |event, window, cx| click(event, window, cx))
+                    }
+                };
+                right_click_menu(SharedString::from(format!("stored-menu-{name}")))
+                    .trigger(move |_, window, cx| row(window, cx))
+                    .menu(move |window, cx| {
+                        let name = name.clone();
+                        ContextMenu::build(window, cx, move |menu, _, _| {
+                            let open = OpenStoredQuery {
+                                name: name.clone(),
+                                view: None,
+                                preview: false,
+                            };
+                            let save = {
+                                let name = name.clone();
+                                move |window: &mut Window, cx: &mut App| {
+                                    save_as_view(name.clone(), window, cx)
+                                }
+                            };
+                            menu.entry("Open", None, move |window, cx| {
+                                window.dispatch_action(Box::new(open.clone()), cx)
+                            })
+                            .item(
+                                // A view only reads (spec 024).
+                                ContextMenuEntry::new(if mutation {
+                                    "Save as view (it changes data)"
+                                } else {
+                                    "Save as view…"
+                                })
+                                .disabled(mutation)
+                                .handler(save),
+                            )
+                        })
+                    })
                     .into_any_element()
             }
         }
@@ -525,6 +570,20 @@ impl Render for QueriesActions {
 
 /// Shows the graph's queries folder, made first off the main thread. One that cannot be made
 /// is said in a toast in `workspace`: shown, nothing would open.
+/// Opens the stored query `name` and asks for the name of a view of it, with the values its tab
+/// shows (spec 024).
+fn save_as_view(name: String, window: &mut Window, cx: &mut App) {
+    let Some(workspace) = studio_workspace::workspace_for(window) else {
+        return;
+    };
+    let editor = workspace.update(cx, |workspace, cx| {
+        crate::open_stored(workspace, name, None, None, None, false, window, cx)
+    });
+    if let Some(editor) = editor {
+        editor.update(cx, |editor, cx| editor.open_name_view(window, cx));
+    }
+}
+
 fn reveal_folder(folder: PathBuf, workspace: Option<WeakEntity<Workspace>>, cx: &mut App) {
     let made = {
         let folder = folder.clone();

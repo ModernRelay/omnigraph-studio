@@ -25,7 +25,7 @@ mod types_list;
 use filter_words as words;
 mod write;
 
-use gpui::{App, AppContext as _, Context, Entity, Window};
+use gpui::{App, AppContext as _, Context, Entity, WeakEntity, Window};
 use gq_language::{Filter, FilterOp};
 use graph_store::GraphSession;
 use serde_json::Value;
@@ -309,6 +309,98 @@ pub(crate) fn view_opening(view: &studio_settings::SavedView) -> Opening {
     }
 }
 
+/// A node type's view as a stored query (spec 024), ready to paste into a `.gq` file in the
+/// cluster's `queries/` folder: the query, then the values the view used for its parameters,
+/// in comments above it. `Err` says why it cannot be one.
+pub(crate) fn stored_query_text(
+    schema: &gq_language::SchemaModel,
+    view: &studio_settings::SavedView,
+    filters: &[Filter],
+) -> Result<(String, String), String> {
+    if schema.node(&view.type_name).is_none() {
+        return Err(format!(
+            "Only a view of a node type can be a stored query, and {} is not one.",
+            view.type_name
+        ));
+    }
+    if filters.iter().any(|filter| filter.op.is_date_preset()) {
+        return Err(
+            "A filter for today, this week or the last 30 days moves every day, and a stored \
+             query's parameter is a fixed date. Use an on-or-after filter, then copy it."
+                .to_owned(),
+        );
+    }
+    let sort = view.sort.as_ref().map(|sort| gq_language::Sort {
+        property: sort.property.clone(),
+        descending: sort.descending,
+    });
+    let name = if view.name.is_empty() {
+        &view.type_name
+    } else {
+        &view.name
+    };
+    let query = gq_language::builder::stored_view_query(
+        schema,
+        &view.type_name,
+        filters,
+        sort.as_ref(),
+        name,
+    )
+    .map_err(|error| format!("Studio could not write it as a query: {error:?}"))?;
+    let mut text = format!(
+        "// {} as a stored query. Save it in your cluster's queries/ folder, then run\n\
+         // `omnigraph cluster apply`.\n",
+        if view.name.is_empty() {
+            format!("The {} table", view.type_name)
+        } else {
+            format!("The view “{}” of {}", view.name, view.type_name)
+        }
+    );
+    if !query.params.is_empty() {
+        text.push_str(&format!(
+            "// The values the view used: {}\n",
+            Value::Object(query.params.clone())
+        ));
+    }
+    text.push_str(&query.text);
+    Ok((query.name, text))
+}
+
+/// Copies a node type's view as a stored query (spec 024) and says so, or why it could not.
+pub(crate) fn copy_as_stored_query(
+    workspace: &WeakEntity<Workspace>,
+    schema: Option<&gq_language::SchemaModel>,
+    view: &studio_settings::SavedView,
+    filters: &[Filter],
+    cx: &mut App,
+) {
+    let Some(workspace) = workspace.upgrade() else {
+        return;
+    };
+    let outcome = match schema {
+        Some(schema) => stored_query_text(schema, view, filters),
+        None => Err("The schema is still being read; try again in a moment.".to_owned()),
+    };
+    match outcome {
+        Ok((name, text)) => {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+            workspace.update(cx, |workspace, cx| {
+                workspace.show_toast(
+                    ToastKind::Info,
+                    format!(
+                        "Copied the stored query {name}. Save it in your cluster's queries/ \
+                         folder and apply the cluster."
+                    ),
+                    cx,
+                )
+            });
+        }
+        Err(why) => workspace.update(cx, |workspace, cx| {
+            workspace.show_toast(ToastKind::Error, why, cx)
+        }),
+    }
+}
+
 /// Opens a saved view's tab (spec 024), or shows the one it is in. Step 1 opens every view as
 /// a table.
 fn open_saved_view(
@@ -326,6 +418,34 @@ fn open_saved_view(
         workspace.show_toast(ToastKind::Error, "That view was deleted.", cx);
         return None;
     };
+    // A view of a stored query opens in the query editor's tab for it (spec 024).
+    if let Some(query) = &view.query {
+        let gone = session
+            .read(cx)
+            .stored_queries
+            .loaded()
+            .is_some_and(|queries| !queries.iter().any(|q| q.name == query.stored));
+        if gone {
+            workspace.show_toast(
+                ToastKind::Error,
+                format!(
+                    "“{}” runs the stored query {}, which this graph no longer serves.",
+                    view.name, query.stored
+                ),
+                cx,
+            );
+        } else {
+            window.dispatch_action(
+                Box::new(studio_actions::graph::OpenStoredQuery {
+                    name: query.stored.clone(),
+                    view: Some(view.key()),
+                    preview: action.preview,
+                }),
+                cx,
+            );
+        }
+        return None;
+    }
     if let Some(schema) = session.read(cx).schema_model()
         && schema.node(&view.type_name).is_none()
         && schema.edge(&view.type_name).is_none()
@@ -629,4 +749,62 @@ fn undo_delete(workspace: &mut Workspace, action: &UndoDelete, cx: &mut Context<
         write.await;
     })
     .detach();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A node type's view copies as a stored query with its values in a comment above it; an
+    /// edge type's, or one filtered by a moving date, says why it cannot (spec 024).
+    #[test]
+    fn a_view_copies_as_a_stored_query_or_says_why_not() {
+        let schema =
+            gq_language::SchemaModel::parse(include_str!("../../../dev/cluster/knowledge.pg"))
+                .unwrap();
+        let view = studio_settings::SavedView {
+            name: "Berlin companies".into(),
+            type_name: "Company".into(),
+            ..studio_settings::SavedView::default()
+        };
+        let filters = [Filter {
+            property: "city".into(),
+            op: FilterOp::Eq,
+            value: serde_json::json!("Berlin"),
+        }];
+        let (name, text) = stored_query_text(&schema, &view, &filters).unwrap();
+        assert_eq!(name, "berlin_companies");
+        assert!(
+            text.starts_with("// The view “Berlin companies” of Company as a stored query."),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"// The values the view used: {"city":"Berlin"}"#),
+            "{text}"
+        );
+        assert!(
+            text.contains("query berlin_companies($city: String)"),
+            "{text}"
+        );
+        assert!(
+            gq_language::check::check(&schema, &text)
+                .diagnostics
+                .is_empty(),
+            "it type-checks with its comments: {text}"
+        );
+
+        let edge = schema.edges.first().unwrap().name.clone();
+        let of_edge = studio_settings::SavedView {
+            type_name: edge,
+            ..view.clone()
+        };
+        assert!(stored_query_text(&schema, &of_edge, &[]).is_err());
+        let today = [Filter {
+            property: "created_at".into(),
+            op: FilterOp::Today,
+            value: Value::Null,
+        }];
+        let why = stored_query_text(&schema, &view, &today).unwrap_err();
+        assert!(why.contains("fixed date"), "{why}");
+    }
 }
