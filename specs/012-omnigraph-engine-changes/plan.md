@@ -391,6 +391,24 @@ the read still sees one snapshot. *Waits:* 004. *Today:* Studio reads a page in 
 row a page already read is answered from the session's memo (a node page opened from the table
 sends nothing).
 
+**E40. Arithmetic and string functions in expressions.**
+GQ at 0.14 has comparisons, boolean operators, aggregates and search calls, but no arithmetic
+(`+`, `-`, `*`, `/`) and no string functions (concatenation, lower, length): `return
+{ $n.hours * 2 as double }` does not parse (spec 023, Validation log). A computed column
+(`price * qty`, `first + " " + last`) would be the server's projection, filterable and sortable
+across the table, if `return`, `order` and filters took such expressions. Engine rule: values
+keep their declared types, a null operand gives null, and an expression is checked against the
+schema like any other. *Waits:* 023. *Today:* none; Studio computes nothing from the rows it holds.
+
+**E41. An optional traversal in `match`.**
+A traversal in `match` is inner: a node with no neighbour through it is not in the answer. A
+page sorted by a neighbour's value or an aggregate over a relationship therefore needs two
+runs, the nodes with neighbours ordered and bound by the aggregate, then the nodes with none
+(`not { … }`) by `@id`. An optional traversal, whose variable is null when there is no
+neighbour, would make it one keyset run, as a sort by the row's own property is. Engine rule:
+each node appears once per optional match, with nulls where nothing matched. *Waits:* 023.
+*Today:* sorting by a lookup or rollup is not offered.
+
 ### In 0.14, not in 0.13.0
 
 Studio's minimum server serves these, so it uses them without asking the server's OpenAPI
