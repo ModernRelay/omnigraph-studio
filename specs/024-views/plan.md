@@ -110,7 +110,7 @@ NODE TYPES
 - One click previews, a double click keeps, as types do. A view's row is lit while the active tab
   shows it, in any shape.
 - **+** offers "New view from this table" (when a table or tree of a type is active) and "New
-  query view…" (a `.gq` file or a stored query).
+  query view…" (a `.gq` file or a stored query that only reads).
 - Context menu: Open as Table, Open as Tree, Open as Canvas; Rename (inline); Duplicate; Delete,
   with Undo in its toast (a view is a setting, so Undo puts it back).
 - ⌘K lists views under **Views**, in the All and Types scopes, each with its type ("view ·
@@ -173,7 +173,35 @@ A result cell is editable when it shows one property of one node or edge of its 
   `SessionEvent::PropertiesWritten` (spec 014); the tab follows the write's commit when every
   node written is one it shows, and otherwise offers Newer data.
 - **Stored queries** stay read-only: their text never reaches Studio, so their columns' sources
-  are unknown (E43). Their header tooltip says so.
+  are unknown (E43). Their header tooltip says so. Studio does not match a stored query to a
+  local `.gq` file of the same name to learn them: the two can differ, and a cell would write
+  the wrong property.
+
+### Views on stored queries
+
+A stored query is the graph's shared definition of a question; a view is one person's way of
+looking at its answer. A stored query is therefore a view's source, never a second kind of row
+in the Views section.
+
+- **What the view keeps:** the stored query's name, the parameter values, the shape, and how
+  its columns show (hidden, order). The parameters are its filters: Studio adds no filter or
+  sort of its own, since the server could not answer it and a page sorted on this Mac breaks
+  principle I.
+- **Where each lives.** Stored queries stay in the Queries panel under Stored, and are not
+  listed as views by themselves: many need parameters before they run, and some are written
+  for agents, not people. A stored query's row has "Save as view…" in its context menu, and
+  ⌘⇧S in its results tab does the same; both make a view with the parameters as set.
+- **Only reads.** A stored query that changes data (its catalog entry says so) cannot be a
+  view's source; its "Save as view…" is disabled with that reason.
+- **Kept by name.** When the catalog no longer has the name, the view's row is dimmed with
+  "Stored query <name> is gone" in its tooltip, as a view of a deleted type is, and opening it
+  says so in a toast. When the parameters change, values of parameters that are gone are left
+  out, and a new parameter the query needs opens the parameter bar on that field rather than
+  running and failing.
+- **Sharing goes through stored queries.** Until E42, a type view offers "Copy as stored
+  query": the `.gq` text that asks what the view asks (its type, filters and sort) and the
+  `cluster.yaml` entry for it, on the clipboard. Someone commits them; every Studio then lists
+  the stored query, and anyone can make a view of it. Studio never writes `cluster.yaml`.
 
 ### Build order
 
@@ -182,7 +210,7 @@ A result cell is editable when it shows one property of one node or edge of its 
    views as tables.
 2. Type views as trees (with sort) and canvases (bounded, positions kept).
 3. Query views: tables, trees and canvases from a `.gq` file or a stored query, with
-   parameters.
+   parameters; "Save as view…" on stored queries, and "Copy as stored query" on type views.
 4. Editing a query view's cells.
 5. Lookup and rollup columns in type views (spec 023).
 
@@ -203,11 +231,21 @@ A result cell is editable when it shows one property of one node or edge of its 
   without being rewritten by hand. Rejected: requiring `@id` in every return, which most queries
   written to read do not have.
 - **No edits through `distinct` or aggregates.** A cell there is not one node's value.
+- **A stored query is a view's source, not a view** (Ragnor, 2026-11-08). Stored queries are
+  shared and declared by whoever runs the graph; views are personal and cheap. Listing every
+  stored query in Views would mix the two and show rows that cannot run without parameters.
+  Rejected: stored queries as read-only views in the Views section. Rejected: filters and sort
+  over a stored query's rows, which the server cannot answer.
+- **Shared views go through stored queries until E42**, and E42 is asked as views that name a
+  stored query or a type, never their own query text: one registry of questions per graph, not
+  two.
 
 ## Deferred
 
 - **E42** (spec 012): a writable view registry on the server, so a view can be shared with
-  everyone who opens the graph. *Today:* views are personal; a stored query is the shared form.
+  everyone who opens the graph. A shared view names a stored query or a type, never its own query
+  text. *Today:* views are personal; a stored query is the shared form ("Copy as stored
+  query").
 - **E43** (spec 012): a stored query's result columns with where each comes from (the variable,
   its type and the property), in its catalog entry. *Today:* stored-query views are read-only.
 - Following views (a canvas that tracks a table's filter, spec 020), folders of views, and a
@@ -220,6 +258,7 @@ A result cell is editable when it shows one property of one node or edge of its 
 |---|---|---|---|
 | 2026-11-07 | Saved views, the Data panel, Queries, sets, the view strip and result columns are as described above | A read of `studio_settings`, `type_table`, `query_editor`, `relationship_tree`, `graph_canvas`, `studio_actions` and `gq_language` at `77ca3964`, citing file and line | As listed under "What exists today" |
 | 2026-11-07 | Step 1: a view has an id and a shape, views list first in the Data panel, a view opens in its own tab keyed by id, and its tab saves, saves as new and reverts | `studio_settings` `a_view_keeps_its_id_through_rename_duplicate_and_undo`; `type_table` `a_views_tab_saves_and_reverts_into_its_view`, `saved_views_list_before_the_types`; `command_palette` `saved_views_are_listed_with_the_types`; `studio` keymap tests | Pass. The context menu offers Open as Table until step 2 adds Tree and Canvas. Rename, Duplicate and Delete name a view by id, so they are in its context menu, not the keymap. Not yet checked in the running app |
+| 2026-11-08 | A stored query's catalog entry says whether it changes data | `graph_client` `api.rs:164-200`: `StoredQuery.mutation` and `params` (`:183-187`) | Present; a view's source is limited to reads by it |
 | 2026-11-07 | The compiler's AST names each projection's variable and property | `omnigraph-compiler` at `v0.14.0` (`60bfd19`), `src/query/ast.rs`: `Projection { expr, alias }`, `Expr::PropAccess { variable, property }`, the return's `distinct` | Present; a query's result descriptor (`descriptor.rs:21`) gives names and kinds but no sources |
 
 ## Corrections

@@ -414,8 +414,11 @@ Studio's views (spec 024) are a name and how to ask: a type with filters, sort, 
 columns, or a query with parameters. They are kept in Studio's settings on one Mac, since the
 server's only registry, stored queries, is declared in `cluster.yaml` and read-only to clients.
 A per-graph registry clients may write, with each view's author and time, would let a view be
-shared with everyone who opens the graph. Engine rule: a view is data about asking, not graph
-data: writing one makes no graph commit, and reading one needs the graph's read permission.
+shared with everyone who opens the graph. A view's source is a stored query by name (with
+parameter values) or a type with filters and sort, never query text of its own, so the graph
+keeps one registry of questions: stored queries. Engine rule: a view is data about asking, not
+graph data: writing one makes no graph commit, and reading one needs the graph's read
+permission.
 *Waits:* 024. *Today:* views are personal; a stored query is the shared form.
 
 **E43. Where a stored query's result columns come from.**
