@@ -5006,6 +5006,7 @@ fn node_actions(type_name: &str, id: &str, at_commit: Option<String>) -> (PeekNo
             type_name: type_name.to_owned(),
             id: id.to_owned(),
             at_commit: at_commit.clone(),
+            snapshot: None,
         },
         OpenNodePage {
             type_name: type_name.to_owned(),

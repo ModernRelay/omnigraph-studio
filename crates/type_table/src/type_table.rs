@@ -193,6 +193,7 @@ pub fn init(cx: &mut App) {
                 &action.type_name,
                 &action.id,
                 action.at_commit.clone(),
+                action.snapshot.clone(),
                 cx,
             );
             // A peek asked for shows the inspector, even when its dock was hidden.
@@ -262,12 +263,14 @@ pub(crate) fn table_key(type_name: &str, at_commit: Option<&str>) -> String {
     }
 }
 
-/// Shows one node in the inspector, read at the branch head or held at `at_commit`.
+/// Shows one node in the inspector, held at `at_commit`, or else read at `snapshot`, the
+/// commit the view it comes from shows, or at the branch head.
 fn peek_node(
     workspace: &mut Workspace,
     type_name: &str,
     id: &str,
     at_commit: Option<String>,
+    snapshot: Option<String>,
     cx: &mut Context<Workspace>,
 ) {
     let Some(session) = workspace.session().cloned() else {
@@ -278,12 +281,13 @@ fn peek_node(
         id: id.to_owned(),
     };
     let holds = at_commit.is_some();
+    let snapshot = at_commit.or(snapshot);
     let peek = cx.new(|cx| {
         let mut peek = NodePeek::new(
             session,
             subject,
             None,
-            at_commit,
+            snapshot,
             Default::default(),
             false,
             cx,

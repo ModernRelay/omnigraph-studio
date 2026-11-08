@@ -1760,7 +1760,6 @@ impl Exploration {
     }
 
     /// The commit every read of this exploration is pinned to.
-    #[cfg(test)]
     pub fn pin(&self) -> Option<&str> {
         self.pin.as_deref()
     }

@@ -412,6 +412,10 @@ pub mod graph {
         pub id: String,
         #[serde(default)]
         pub at_commit: Option<String>,
+        /// The commit the view it comes from shows while that view follows the head: the peek
+        /// reads there, as the view does, and offers Refresh when the branch has moved past it.
+        #[serde(default)]
+        pub snapshot: Option<String>,
     }
 
     /// Open one node in the inspector and the Explore panel.

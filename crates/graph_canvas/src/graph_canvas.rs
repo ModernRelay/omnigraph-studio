@@ -1948,6 +1948,8 @@ impl GraphCanvas {
                 type_name: node.type_name,
                 id: node.id,
                 at_commit: self.held_at(),
+                // The commit the canvas shows, which may be behind the head ("Newer data").
+                snapshot: self.exploration.read(cx).pin().map(str::to_owned),
             }),
             cx,
         );

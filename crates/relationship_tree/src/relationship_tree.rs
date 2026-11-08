@@ -871,6 +871,8 @@ impl RelationshipTree {
                 type_name: node.type_name,
                 id: node.id,
                 at_commit: self.at_commit.clone(),
+                // The commit the tree shows, which may be behind the head ("Newer data").
+                snapshot: self.exploration.read(cx).pin().map(str::to_owned),
             }),
             cx,
         );
@@ -2253,6 +2255,64 @@ mod tests {
                 assert_eq!(back.total, kept, "{at_commit:?}");
             });
         }
+    }
+
+    /// A peek from a tree showing "Newer data" reads the commit the tree shows, not the head it
+    /// has not taken yet, and follows the branch as the tree does: it holds no commit.
+    #[gpui::test]
+    async fn a_peek_reads_the_commit_the_tree_shows(cx: &mut gpui::TestAppContext) {
+        cx.update(studio_theme::init_test);
+        let (session, served) = followed_session(
+            "node Person {\n  slug: String @key\n  name: String\n}\nedge Knows: Person -> Person\n",
+            |_| serde_json::json!([{ "id": "p1", "label": "Ada", "n": 0 }]),
+            cx,
+        );
+        cx.run_until_parked();
+        let peeked: std::rc::Rc<std::cell::RefCell<Vec<PeekNode>>> = Default::default();
+        cx.update(|cx| {
+            let heard = peeked.clone();
+            cx.on_action(move |action: &PeekNode, _| heard.borrow_mut().push(action.clone()));
+        });
+        let shown = session.clone();
+        let (dock, cx) = cx.add_window_view(move |_, cx| Dock {
+            tree: cx.new(|cx| {
+                RelationshipTree::new(
+                    shown.clone(),
+                    Subject::Node(NodeRef::new("Person", "p1")),
+                    None,
+                    cx,
+                )
+            }),
+        });
+        let settle = |cx: &mut gpui::VisualTestContext| {
+            for _ in 0..3 {
+                cx.run_until_parked();
+                cx.executor()
+                    .advance_clock(std::time::Duration::from_millis(10));
+            }
+            cx.run_until_parked();
+        };
+        settle(cx);
+        let tree = dock.read_with(cx, |dock, _| dock.tree.clone());
+        let pin = tree.read_with(cx, |tree, cx| {
+            tree.exploration.read(cx).pin().map(str::to_owned)
+        });
+        assert!(pin.is_some(), "the tree read at a commit");
+        served.lock().unwrap().commit(
+            "c2",
+            vec![graph_store::test_server::node_change("Person", "p1")],
+        );
+        session.update(cx, |session, cx| session.check_heads(cx));
+        settle(cx);
+        assert!(tree.read_with(cx, |tree, cx| tree.exploration.read(cx).newer_available()));
+        cx.update(|window, cx| window.focus(&tree.focus_handle(cx), cx));
+        tree.update(cx, |tree, cx| tree.select_row(0, cx));
+        cx.dispatch_action(PeekSelected);
+        cx.run_until_parked();
+        let peeked = peeked.borrow();
+        assert_eq!(peeked.len(), 1);
+        assert_eq!(peeked[0].at_commit, None);
+        assert_eq!(peeked[0].snapshot, pin, "not c2");
     }
 
     /// ⌘R where the tree has the keyboard reads it again at the branch head, as its "Newer
