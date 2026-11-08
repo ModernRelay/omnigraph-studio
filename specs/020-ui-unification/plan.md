@@ -164,6 +164,8 @@ not a change to the window's scope.
 | Bottom | Reports what ran (Activity) | Holds primary content |
 
 **Test for a sidebar row:** it must answer "what?". If it answers "how?", it's in the wrong place.
+A saved view (spec 024) passes: "active customers" is a what; its shapes, Table, Tree and Canvas,
+still have no row.
 
 ### What counts as the same thing
 

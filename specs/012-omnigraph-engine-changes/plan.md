@@ -409,6 +409,24 @@ neighbour, would make it one keyset run, as a sort by the row's own property is.
 each node appears once per optional match, with nulls where nothing matched. *Waits:* 023.
 *Today:* sorting by a lookup or rollup is not offered.
 
+**E42. A writable view registry.**
+Studio's views (spec 024) are a name and how to ask: a type with filters, sort, grouping and
+columns, or a query with parameters. They are kept in Studio's settings on one Mac, since the
+server's only registry, stored queries, is declared in `cluster.yaml` and read-only to clients.
+A per-graph registry clients may write, with each view's author and time, would let a view be
+shared with everyone who opens the graph. Engine rule: a view is data about asking, not graph
+data: writing one makes no graph commit, and reading one needs the graph's read permission.
+*Waits:* 024. *Today:* views are personal; a stored query is the shared form.
+
+**E43. Where a stored query's result columns come from.**
+A stored query's catalog entry gives its name, description and typed parameters, never its
+text (`GET /graphs/{id}/queries`). Studio therefore cannot tell that a result column is
+`$m.city` of a `Company`, nor add `$m.@id` to know which node a row shows, and a view built on a
+stored query is read-only. The entry's result columns, each with its variable, the variable's
+type, the property, and whether the query returns that variable's `@id`, would make its plain
+property cells editable as a `.gq` file's are. Engine rule: no query text is exposed; the
+descriptor is the compiler's. *Waits:* 024. *Today:* stored-query views are read-only.
+
 ### In 0.14, not in 0.13.0
 
 Studio's minimum server serves these, so it uses them without asking the server's OpenAPI

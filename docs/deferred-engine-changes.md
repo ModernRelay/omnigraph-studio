@@ -36,6 +36,8 @@ it goes through Omnigraph's own RFC process.
 | E39 | A page of a wide type that reads only what it returns: a sorted page sorts on its keys and then reads its rows, and a filter on `@id` or a key reads only the rows it keeps. On 100,000 rows of 95 columns a sorted first page takes 0.9 s and a point read 0.4 s | 004 | Reads a page in one query; a row a page read is answered from the session's memo |
 | E40 | Arithmetic and string functions in GQ expressions (`return`, `order`, filters), so a computed column is the server's projection | 023 | No computed columns |
 | E41 | An optional traversal in `match`, so a page sorted by a neighbour's value or an aggregate over a relationship is one keyset run that keeps the nodes with no neighbour | 023 | Sorting by a lookup or rollup is not offered |
+| E42 | A per-graph view registry clients may write, so a view is shared with everyone who opens the graph | 024 | Views are personal, in Studio's settings |
+| E43 | A stored query's result columns with the variable, type and property each comes from, in its catalog entry | 024 | Stored-query views are read-only |
 
 Every server Studio supports serves these (checked against `v0.14.0`'s OpenAPI document, 2026-10-24):
 
