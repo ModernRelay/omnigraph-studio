@@ -1058,6 +1058,8 @@ impl Item for TypeTable {
             data: serde_json::json!({
                 "type_name": self.type_name,
                 "at_commit": self.at_commit,
+                // As a saved view keeps them; `load_schema` drops any the schema no longer has.
+                "filters": self.current_view().filters,
                 "sort": self.sort.as_ref().map(|sort| serde_json::json!({
                     "property": sort.property,
                     "descending": sort.descending,
@@ -15268,6 +15270,70 @@ mod tests {
             .filter(|name| *name == "studio_value_counts")
             .count();
         assert_eq!(groups, 1, "{names:?}");
+    }
+
+    /// A restored tab keeps its filters, as it keeps its order and columns: it reads with them
+    /// again, and none the schema no longer has.
+    #[gpui::test]
+    async fn a_restored_table_keeps_its_filters(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, _names) = crate::test_support::session_routing(
+            PEOPLE,
+            |_| serde_json::json!([{"n": {"@id": "p1", "slug": "p1", "name": "Ada"}}]),
+            cx,
+        );
+        cx.run_until_parked();
+        let ada = Filter {
+            property: "name".into(),
+            op: FilterOp::Eq,
+            value: serde_json::json!("Ada"),
+        };
+        let opening = Opening {
+            filters: vec![ada.clone()],
+            ..Opening::default()
+        };
+        let (table, table_cx) = cx.add_window_view(|window, cx| {
+            TypeTable::opening(
+                WeakEntity::new_invalid(),
+                session.clone(),
+                "Person".into(),
+                None,
+                opening,
+                window,
+                cx,
+            )
+        });
+        table_cx.run_until_parked();
+        let mut saved = table.read_with(table_cx, |table, cx| table.serialize(cx).unwrap().data);
+        let (type_name, at_commit, back) = crate::saved_table(&saved).expect("the tab comes back");
+        assert_eq!((type_name.as_str(), at_commit), ("Person", None));
+        assert_eq!(back.filters, vec![ada.clone()]);
+
+        // A filter on a property the schema has lost is left out once the schema is read.
+        saved["filters"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"property": "gone", "op": "eq", "value": 1}));
+        let (_, _, back) = crate::saved_table(&saved).unwrap();
+        assert_eq!(back.filters.len(), 2);
+        let (restored, restored_cx) = cx.add_window_view(|window, cx| {
+            TypeTable::opening(
+                WeakEntity::new_invalid(),
+                session.clone(),
+                "Person".into(),
+                None,
+                back,
+                window,
+                cx,
+            )
+        });
+        restored_cx.run_until_parked();
+        restored.read_with(restored_cx, |table, _| {
+            assert_eq!(table.filters, vec![ada]);
+        });
     }
 
     /// The key of p1's name, the cell these tests edit.

@@ -84,48 +84,8 @@ pub fn init(cx: &mut App) {
         }
     });
     studio_workspace::register_item_kind(cx, "type_table", |data, workspace, window, cx| {
-        if let Some(type_name) = data.get("type_name").and_then(|name| name.as_str()) {
-            let at_commit = data
-                .get("at_commit")
-                .and_then(|commit| commit.as_str())
-                .map(str::to_owned);
-            let sort = data.get("sort").and_then(|sort| {
-                Some(gq_language::Sort {
-                    property: sort.get("property")?.as_str()?.to_owned(),
-                    descending: sort.get("descending")?.as_bool()?,
-                })
-            });
-            let group_by = data
-                .get("group_by")
-                .and_then(|property| property.as_str())
-                .map(str::to_owned);
-            let keys = |name: &str| -> Vec<String> {
-                data.get(name)
-                    .and_then(Value::as_array)
-                    .map(|keys| {
-                        keys.iter()
-                            .filter_map(Value::as_str)
-                            .map(str::to_owned)
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            };
-            let mut layout = model::ColumnLayout::new(keys("hidden"), keys("order"));
-            if let Some(widths) = data.get("widths").and_then(Value::as_object) {
-                for (key, width) in widths {
-                    if let Some(width) = width.as_f64() {
-                        layout.set_width(key, Some(width as f32));
-                    }
-                }
-            }
-            // Its first read is the one its order and grouping make.
-            let opening = Opening {
-                filters: Vec::new(),
-                sort,
-                group_by,
-                layout,
-            };
-            open_type(workspace, type_name, at_commit, opening, false, window, cx);
+        if let Some((type_name, at_commit, opening)) = saved_table(data) {
+            open_type(workspace, &type_name, at_commit, opening, false, window, cx);
         }
     });
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
@@ -253,6 +213,69 @@ fn open_type(
 }
 
 /// What every type table's tab key starts with ([`table_key`]).
+/// A type table tab as `TypeTable::serialize` saved it: its type, the commit it is held at, and
+/// how it opens again.
+pub(crate) fn saved_table(data: &Value) -> Option<(String, Option<String>, Opening)> {
+    let type_name = data.get("type_name")?.as_str()?.to_owned();
+    let at_commit = data
+        .get("at_commit")
+        .and_then(|commit| commit.as_str())
+        .map(str::to_owned);
+    let sort = data.get("sort").and_then(|sort| {
+        Some(gq_language::Sort {
+            property: sort.get("property")?.as_str()?.to_owned(),
+            descending: sort.get("descending")?.as_bool()?,
+        })
+    });
+    let group_by = data
+        .get("group_by")
+        .and_then(|property| property.as_str())
+        .map(str::to_owned);
+    let keys = |name: &str| -> Vec<String> {
+        data.get(name)
+            .and_then(Value::as_array)
+            .map(|keys| {
+                keys.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut layout = model::ColumnLayout::new(keys("hidden"), keys("order"));
+    if let Some(widths) = data.get("widths").and_then(Value::as_object) {
+        for (key, width) in widths {
+            if let Some(width) = width.as_f64() {
+                layout.set_width(key, Some(width as f32));
+            }
+        }
+    }
+    let filters = data
+        .get("filters")
+        .cloned()
+        .and_then(|filters| {
+            serde_json::from_value::<Vec<studio_settings::SavedFilter>>(filters).ok()
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|filter| {
+            Some(gq_language::Filter {
+                property: filter.property,
+                op: gq_language::FilterOp::from_key(&filter.op)?,
+                value: filter.value,
+            })
+        })
+        .collect();
+    // Its first read is the one its filters, order and grouping make.
+    let opening = Opening {
+        filters,
+        sort,
+        group_by,
+        layout,
+    };
+    Some((type_name, at_commit, opening))
+}
+
 pub(crate) const TABLE_KEY_PREFIX: &str = "type:";
 
 /// One tab per type at the head, and one per type and commit.
