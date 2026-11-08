@@ -100,7 +100,7 @@ pub(crate) fn missing_message(program: &str) -> String {
 
 /// `program` as a shell finds it: a name with a folder as it is, when it can run; a bare name
 /// in the first absolute folder of `dirs` that holds it, never in the working directory.
-#[cfg(any(not(windows), test))]
+#[cfg(not(windows))]
 fn find(program: &str, dirs: &[PathBuf], can_run: impl Fn(&Path) -> bool) -> Option<PathBuf> {
     if program.is_empty() {
         return None;
@@ -248,6 +248,7 @@ fn marked_path(output: &[u8]) -> Option<OsString> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     fn joined(folders: &[&str]) -> OsString {
         std::env::join_paths(folders).unwrap()
     }
