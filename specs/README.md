@@ -54,7 +54,7 @@ Add tasks, contracts or data-model files only for large features.
 | 021 | [Studio speaks to the managed control plane](021-control-plane/plan.md) | draft; waits on the control plane |
 | 022 | [Managing clusters from Studio](022-cluster-management/plan.md) | draft; waits on the control plane |
 | 023 | [Lookup and rollup columns](023-lookup-and-rollup-columns/plan.md) | draft |
-| 024 | [Views](024-views/plan.md) | draft |
+| 024 | [Views](024-views/plan.md) | steps 1, 3 (query views, but not their trees, canvases or columns) and 4 built |
 | 025 | [Filters through relationships](025-relation-filters/plan.md) | built; timings pending |
 
 Each plan's first line holds its full status. 012 is not scheduled: it records every Omnigraph change Studio would use, what Studio does

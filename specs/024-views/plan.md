@@ -1,6 +1,6 @@
 # 024: Views
 
-Status: in progress · step 1 built 2026-11-07 · views on stored queries (of step 3) built 2026-11-08
+Status: in progress · step 1 built 2026-11-07 · views on stored queries and on a `.gq` file's queries (of step 3) built 2026-11-08 · step 4, editing a query's cells, built 2026-11-08
 
 ## Problem
 
@@ -265,7 +265,21 @@ in the Views section.
 | 2026-11-08 | Views on stored queries: a view keeps a stored query and its values, opens in the stored query's tab keyed by the view, marks other values as changed, saves, saves as new and reverts; the Queries panel saves a stored query as a view; a view whose stored query is gone is dimmed; a node type's view copies as a stored query whose filter values are named parameters | `studio_settings` `a_query_view_keeps_its_stored_query_and_values`; `query_editor` `a_stored_query_views_tab_saves_and_reverts_its_values`; `gq_language` `a_view_as_a_stored_query_names_its_parameters_for_people` (type-checks); `type_table` `a_view_copies_as_a_stored_query_or_says_why_not`; `studio` keymap tests | Pass. Not built: query views from a `.gq` file, the Views "+" for a query view (the Queries panel's "Save as view…" does it), trees and canvases of a query view, hiding and ordering its columns. Copying refuses an edge type's view and a moving-date filter. Not yet checked in the running app |
 | 2026-11-08 | A stored query's catalog entry says whether it changes data | `graph_client` `api.rs:164-200`: `StoredQuery.mutation` and `params` (`:183-187`) | Present; a view's source is limited to reads by it |
 | 2026-11-07 | The compiler's AST names each projection's variable and property | `omnigraph-compiler` at `v0.14.0` (`60bfd19`), `src/query/ast.rs`: `Projection { expr, alias }`, `Expr::PropAccess { variable, property }`, the return's `distinct` | Present; a query's result descriptor (`descriptor.rs:21`) gives names and kinds but no sources |
+| 2026-11-08 | A result column knows the property its cells are, or why none: `$v.property` of a node variable is one; an edge's property, `@id`, a whole node, an aggregate, a literal, `now()`, a search score or a `distinct` query's column is not. The ids an editable column needs are the query's own `$v.@id` or added to the return, and the query sent still checks | `gq_language` `a_column_knows_the_property_its_cells_are` (`CellSource`, `RowId`, `with_row_ids`) | Pass |
+| 2026-11-08 | The results table reads each row's ids, hides the ones Studio added, says where each column's edit goes, and a node shown in two rows shows its new value in both | `query_editor` `an_added_id_column_names_each_rows_node_and_is_hidden` | Pass |
+| 2026-11-08 | A `.gq` file's cell is edited in place: the read sends the hidden id, ↵ (or a double click) opens the cell, ↵ writes it to its node bound to the value shown, and every row showing the node takes the value through `PropertiesWritten`, the rows following the write's commit | `query_editor` `a_result_cell_is_written_to_its_node_and_shown_in_every_row`; the `QueryResults && editing` bindings in `assets/keymaps/` | Pass. Not yet checked in the running app |
+| 2026-11-08 | A view keeps one query of a `.gq` file (its path and name) and its values; it opens in the file's tab, which runs that query with them, is titled by the view, and saves, saves as new and reverts its values; a file's results offer "Save as view…" | `query_editor` `a_files_query_is_a_view_that_runs_with_its_values` | Pass. Not yet checked in the running app |
 
 ## Corrections
 
-None yet.
+- **A file view opens in the file's own tab** (2026-11-08), keyed by the file, not
+  `view:<id>`: two tabs over one file would hold two drafts of it. The tab is titled by the view
+  while it shows it, and goes to its query. Its Save, Save as new view and Revert buttons name no
+  key there, since ⌘S saves the file.
+- **"Save as view…" for a file's query is a button by its results**, for the query under the
+  cursor, rather than an entry in the Queries panel: a file can declare several queries.
+- **Edits are one cell at a time**, written on ↵. A query view's cells have no drafts to save
+  together, unlike a table's (⇧↵); a list property is written only while the rows were read at
+  the branch's head.
+- **Edges' properties stay read-only** in a query's results: the table writes nodes, and an edge
+  bound in a query has no id Studio can add to its return yet.
