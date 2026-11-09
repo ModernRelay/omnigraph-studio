@@ -4,7 +4,7 @@
 
 use std::cmp::Ordering;
 
-use gq_language::builder::edge_property_column;
+use gq_language::builder::{Group, GroupTest, Quantifier, edge_property_column};
 use gq_language::input::{compare_values as compare, list_texts, parse_scalar, same_value, typed};
 pub use gq_language::input::{edit_text, parse_input};
 use gq_language::{
@@ -813,7 +813,11 @@ pub fn row_matches(filters: &[Filter], values: &Map<String, Value>) -> bool {
         match filter.op {
             _ if filter.property == gq_language::builder::ID_FILTER => true,
             // The engine judges a condition and a relationship; a row is kept as read.
-            FilterOp::HasAny | FilterOp::HasNone | FilterOp::RelatedTo | FilterOp::Expr => true,
+            FilterOp::HasAny
+            | FilterOp::HasNone
+            | FilterOp::RelatedTo
+            | FilterOp::Expr
+            | FilterOp::Where => true,
             // A neighbour's property is not in the row either.
             _ if filter.property.contains('.') => true,
             FilterOp::IsEmpty => value.is_null(),
@@ -872,6 +876,11 @@ pub fn row_matches(filters: &[Filter], values: &Map<String, Value>) -> bool {
 /// A filter as its pill's parts: the field, the test and the value it compares with, if any,
 /// as it reads: `title is Engineer`, `email is empty`, `has worksAt →`.
 pub fn filter_parts(filter: &Filter) -> (String, String, Option<String>) {
+    if filter.op == FilterOp::Where
+        && let Some((key, group)) = gq_language::builder::as_group(filter)
+    {
+        return group_parts(&key, &group);
+    }
     if filter.op == FilterOp::Expr {
         return (
             "Condition".into(),
@@ -902,6 +911,94 @@ pub fn filter_parts(filter: &Filter) -> (String, String, Option<String>) {
     }
     let value = filter.op.takes_value().then(|| edit_text(&filter.value));
     (filter.property.clone(), filter.op.label().to_owned(), value)
+}
+
+/// A group's pill (spec 025): the relationship, how many of its records must pass, and the
+/// tests one record passes: `worksAt · any where · city is Berlin · employees greater than 100`.
+pub fn group_parts(key: &str, group: &Group) -> (String, String, Option<String>) {
+    let relationship = traversal_of(key);
+    let tests: Vec<String> = group
+        .tests
+        .iter()
+        .map(|test| group_test_text(&relationship, test))
+        .collect();
+    let test = quantifier_text(&relationship, group, !tests.is_empty());
+    let value = (!tests.is_empty()).then(|| tests.join(" · "));
+    (relationship, test, value)
+}
+
+/// The whole sentence a filter reads as, for a pill's tooltip: a group's parts joined.
+pub fn filter_sentence(filter: &Filter) -> String {
+    let (field, test, value) = filter_parts(filter);
+    match value {
+        Some(value) => format!("{field} {test} {value}"),
+        None => format!("{field} {test}"),
+    }
+}
+
+fn traversal_of(key: &str) -> String {
+    gq_language::builder::parse_relationship_key(key)
+        .map(|(_, edge)| gq_language::traversal_name(edge))
+        .unwrap_or_else(|| key.to_owned())
+}
+
+/// How many of the related records must pass: `any where`, `at least 2 where`, `total hours
+/// greater than 100 where`; without tests, `has any`, `at least 2`.
+fn quantifier_text(relationship: &str, group: &Group, tested: bool) -> String {
+    let where_ = if tested { " where" } else { "" };
+    let count = group.count.unwrap_or_default();
+    match group.quantifier {
+        Quantifier::Any if tested => "any where".to_owned(),
+        Quantifier::Any => "has any".to_owned(),
+        Quantifier::None if tested => "none where".to_owned(),
+        Quantifier::None => "has none".to_owned(),
+        Quantifier::Every => format!("every one{where_}"),
+        Quantifier::AtLeast => format!("at least {count}{where_}"),
+        Quantifier::AtMost => format!("at most {count}{where_}"),
+        quantifier => {
+            let word = match quantifier {
+                Quantifier::Sum => "total",
+                Quantifier::Avg => "average",
+                Quantifier::Min => "smallest",
+                _ => "largest",
+            };
+            let of = group
+                .of
+                .as_deref()
+                .map(|of| match of.strip_prefix('@') {
+                    Some(name) => format!("{relationship} {name}"),
+                    None => of.to_owned(),
+                })
+                .unwrap_or_default();
+            let compare = group.compare.map(FilterOp::label).unwrap_or("is");
+            let than = group.than.as_ref().map(edit_text).unwrap_or_default();
+            format!("{word} {of} {compare} {than}{where_}")
+        }
+    }
+}
+
+/// One test of a group, as it reads in the pill: `city is Berlin`, `worksAt since greater than
+/// 2020-01-01` for the edge's own property, `locatedIn any where (name is Germany)` for a hop.
+fn group_test_text(relationship: &str, test: &GroupTest) -> String {
+    let filter = Filter::from(test.clone());
+    if let Some((key, inner)) = gq_language::builder::as_group(&filter) {
+        let (field, test, value) = group_parts(&key, &inner);
+        return match value {
+            Some(value) => format!("{field} {test} ({value})"),
+            None => format!("{field} {test}"),
+        };
+    }
+    let (field, op, value) = filter_parts(&filter);
+    let field = match test.property.strip_prefix('@') {
+        Some(name) if gq_language::builder::is_edge_property_key(&test.property) => {
+            format!("{relationship} {name}")
+        }
+        _ => field,
+    };
+    match value {
+        Some(value) => format!("{field} {op} {value}"),
+        None => format!("{field} {op}"),
+    }
 }
 
 // ---- write outcomes ----

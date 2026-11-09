@@ -121,6 +121,15 @@ impl Depends {
             nodes.push(type_name.to_owned());
         }
         for filter in filters {
+            if filter.op == FilterOp::Where {
+                for name in group_edges(filter) {
+                    if let Some(edge) = schema.edge(&name) {
+                        edges.push(edge.name.clone());
+                        nodes.extend([edge.from.clone(), edge.to.clone()]);
+                    }
+                }
+                continue;
+            }
             let edge = if filter.op.is_relationship() {
                 parse_relationship_key(&filter.property).map(|(_, edge)| edge)
             } else {
@@ -213,11 +222,14 @@ pub enum FilterOp {
     /// table), spliced into the match block in parentheses: `or`, `not`, a count, a further
     /// hop, anything the grammar has and the pills do not. Its key is [`WHERE_FILTER`].
     Expr,
+    /// A group (spec 025): the filter's property is a relationship key, its value a [`Group`],
+    /// the tests one related record passes and how many related records must pass them.
+    Where,
 }
 
 impl FilterOp {
     /// Every operator, for [`FilterOp::from_key`].
-    const ALL: [FilterOp; 19] = [
+    const ALL: [FilterOp; 20] = [
         FilterOp::Eq,
         FilterOp::Ne,
         FilterOp::Lt,
@@ -237,6 +249,7 @@ impl FilterOp {
         FilterOp::HasNone,
         FilterOp::RelatedTo,
         FilterOp::Expr,
+        FilterOp::Where,
     ];
 
     /// A stable name, for saved views.
@@ -261,6 +274,7 @@ impl FilterOp {
             FilterOp::HasNone => "has_none",
             FilterOp::RelatedTo => "related_to",
             FilterOp::Expr => "expr",
+            FilterOp::Where => "where_related",
         }
     }
 
@@ -289,6 +303,7 @@ impl FilterOp {
             FilterOp::HasNone => "has none",
             FilterOp::RelatedTo => "is related to",
             FilterOp::Expr => "where",
+            FilterOp::Where => "where",
         }
     }
 
@@ -304,6 +319,7 @@ impl FilterOp {
                 | FilterOp::Last30Days
                 | FilterOp::HasAny
                 | FilterOp::HasNone
+                | FilterOp::Where
         )
     }
 
@@ -626,6 +642,12 @@ pub enum BuildError {
     NoValues(String),
     /// A condition filter with no text.
     EmptyCondition,
+    /// A group's value is not a [`Group`], or its quantifier lacks what it needs.
+    BadGroup(String),
+    /// A group nested more than [`MAX_HOPS`] relationships away.
+    TooDeep,
+    /// A test a group cannot hold: a condition.
+    NotInGroup(String),
 }
 
 impl std::fmt::Display for BuildError {
@@ -647,6 +669,14 @@ impl std::fmt::Display for BuildError {
                 write!(f, "Enter at least one value for the new {type_name}")
             }
             BuildError::EmptyCondition => write!(f, "Enter a condition"),
+            BuildError::BadGroup(key) => write!(f, "The filter on {key} is incomplete"),
+            BuildError::TooDeep => write!(
+                f,
+                "A filter reaches at most {MAX_HOPS} relationships away; use a condition for more"
+            ),
+            BuildError::NotInGroup(key) => {
+                write!(f, "A condition cannot go inside the filter on {key}")
+            }
         }
     }
 }
@@ -706,7 +736,24 @@ fn filter_clauses(
             continue;
         }
         if filter.op.is_relationship() {
-            clauses.push(relationship_clause(schema, var, i, filter, params)?);
+            clauses.push(relationship_clause(
+                schema,
+                &format!("${var}"),
+                i,
+                filter,
+                params,
+            )?);
+            continue;
+        }
+        if filter.op == FilterOp::Where {
+            clauses.push(group_clause(
+                schema,
+                &format!("${var}"),
+                &i.to_string(),
+                1,
+                filter,
+                params,
+            )?);
             continue;
         }
         match parse_group_key(&filter.property) {
@@ -777,7 +824,7 @@ fn property_clause(
     target: &str,
     property: &Property,
     filter: &Filter,
-    i: usize,
+    i: impl std::fmt::Display,
     params: &mut Params,
 ) -> String {
     match filter.op {
@@ -845,7 +892,8 @@ fn property_clause(
                 | FilterOp::HasAny
                 | FilterOp::HasNone
                 | FilterOp::RelatedTo
-                | FilterOp::Expr => unreachable!(),
+                | FilterOp::Expr
+                | FilterOp::Where => unreachable!(),
             };
             format!("{target} {operator} {param}")
         }
@@ -875,8 +923,8 @@ fn expression_clause(filter: &Filter) -> Result<String, BuildError> {
 /// `not { … }` for "has none"; "related to" also binds the other node's id.
 fn relationship_clause(
     schema: &SchemaModel,
-    var: &str,
-    i: usize,
+    near: &str,
+    i: impl std::fmt::Display,
     filter: &Filter,
     params: &mut Params,
 ) -> Result<String, BuildError> {
@@ -885,7 +933,7 @@ fn relationship_clause(
     };
     let edge = edge(schema, edge_name)?;
     let other = format!("$r{i}");
-    let (_, other_type, hop) = hop(edge, direction, &format!("${var}"), &other);
+    let (_, other_type, hop) = hop(edge, direction, near, &other);
     let mut body = vec![format!("{other}: {other_type}"), hop];
     if filter.op == FilterOp::RelatedTo {
         let id = params.add(&format!("f{i}"), "String", filter.value.clone());
@@ -941,6 +989,652 @@ fn neighbour_property_clause(
     Ok(format!(
         "{block} {{\n      {}\n    }}",
         body.join("\n      ")
+    ))
+}
+
+/// How far a group reaches: a group inside a group inside a group (spec 025).
+pub const MAX_HOPS: usize = 3;
+
+/// How many of a row's related records must pass a group's tests (spec 025).
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Quantifier {
+    /// At least one: `exists { … }`.
+    #[default]
+    Any,
+    /// None: `not { … }`.
+    None,
+    /// Every one, of a row that has at least one.
+    Every,
+    /// At least [`Group::count`]: `count { … } >= n`.
+    AtLeast,
+    /// At most [`Group::count`], none included: `count { … } <= n`.
+    AtMost,
+    /// The total, average, smallest or largest of [`Group::of`] over the records that pass,
+    /// compared with [`Group::than`].
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+impl Quantifier {
+    pub const ALL: [Quantifier; 9] = [
+        Quantifier::Any,
+        Quantifier::None,
+        Quantifier::Every,
+        Quantifier::AtLeast,
+        Quantifier::AtMost,
+        Quantifier::Sum,
+        Quantifier::Avg,
+        Quantifier::Min,
+        Quantifier::Max,
+    ];
+
+    /// A stable name, as views and the sentence filter's answer write it.
+    pub fn key(self) -> &'static str {
+        match self {
+            Quantifier::Any => "any",
+            Quantifier::None => "none",
+            Quantifier::Every => "every",
+            Quantifier::AtLeast => "at_least",
+            Quantifier::AtMost => "at_most",
+            Quantifier::Sum => "sum",
+            Quantifier::Avg => "avg",
+            Quantifier::Min => "min",
+            Quantifier::Max => "max",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Quantifier> {
+        Self::ALL.into_iter().find(|q| q.key() == key)
+    }
+
+    pub fn counts(self) -> bool {
+        matches!(self, Quantifier::AtLeast | Quantifier::AtMost)
+    }
+
+    pub fn aggregates(self) -> bool {
+        matches!(
+            self,
+            Quantifier::Sum | Quantifier::Avg | Quantifier::Min | Quantifier::Max
+        )
+    }
+
+    /// Whether the aggregate takes `property`: totals and averages of numbers, the smallest and
+    /// largest of numbers, dates and text.
+    pub fn takes(self, property: &Property) -> bool {
+        if property.list || !property.projectable() {
+            return false;
+        }
+        match self {
+            Quantifier::Sum | Quantifier::Avg => {
+                matches!(property.kind, ScalarKind::Integer | ScalarKind::Float)
+            }
+            Quantifier::Min | Quantifier::Max => matches!(
+                property.kind,
+                ScalarKind::Integer
+                    | ScalarKind::Float
+                    | ScalarKind::Date
+                    | ScalarKind::DateTime
+                    | ScalarKind::Text
+            ),
+            _ => false,
+        }
+    }
+}
+
+/// A filter's operator by its [`FilterOp::key`], as a group's tests are kept, so a view holds
+/// the same names inside a group as outside one.
+mod op_by_key {
+    use super::FilterOp;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(op: &FilterOp, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(op.key())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<FilterOp, D::Error> {
+        let key = String::deserialize(d)?;
+        FilterOp::from_key(&key)
+            .ok_or_else(|| serde::de::Error::custom(format!("unknown operator {key}")))
+    }
+
+    pub mod option {
+        use super::super::FilterOp;
+        use serde::{Deserialize, Deserializer, Serializer};
+
+        pub fn serialize<S: Serializer>(op: &Option<FilterOp>, s: S) -> Result<S::Ok, S::Error> {
+            match op {
+                Some(op) => s.serialize_some(op.key()),
+                None => s.serialize_none(),
+            }
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<FilterOp>, D::Error> {
+            let key = Option::<String>::deserialize(d)?;
+            key.map(|key| {
+                FilterOp::from_key(&key)
+                    .ok_or_else(|| serde::de::Error::custom(format!("unknown operator {key}")))
+            })
+            .transpose()
+        }
+    }
+}
+
+/// One test of a group, relative to the related record: one of its properties (`city`), a
+/// property of the edge (`@since`), the record's id ([`ID_FILTER`]), one of its relationships
+/// (`has_any`, `has_none`, `related_to`), or another group one hop further.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+pub struct GroupTest {
+    pub property: String,
+    #[serde(with = "op_by_key")]
+    pub op: FilterOp,
+    #[serde(default)]
+    pub value: Value,
+}
+
+impl From<GroupTest> for Filter {
+    fn from(test: GroupTest) -> Self {
+        Filter {
+            property: test.property,
+            op: test.op,
+            value: test.value,
+        }
+    }
+}
+
+impl From<&Filter> for GroupTest {
+    fn from(filter: &Filter) -> Self {
+        GroupTest {
+            property: filter.property.clone(),
+            op: filter.op,
+            value: filter.value.clone(),
+        }
+    }
+}
+
+/// A [`FilterOp::Where`] filter's value (spec 025).
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Default)]
+pub struct Group {
+    #[serde(default)]
+    pub quantifier: Quantifier,
+    /// The `n` of `at_least` and `at_most`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u32>,
+    /// The property an aggregate is of: the related record's (`hours`) or the edge's (`@hours`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub of: Option<String>,
+    /// How the aggregate compares: `eq` to `ge`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "op_by_key::option"
+    )]
+    pub compare: Option<FilterOp>,
+    /// What the aggregate is compared with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub than: Option<Value>,
+    #[serde(default)]
+    pub tests: Vec<GroupTest>,
+}
+
+impl Group {
+    pub fn read(value: &Value) -> Option<Group> {
+        serde_json::from_value(value.clone()).ok()
+    }
+
+    pub fn to_value(&self) -> Value {
+        serde_json::to_value(self).unwrap_or(Value::Null)
+    }
+
+    pub fn filters(&self) -> Vec<Filter> {
+        self.tests.iter().cloned().map(Filter::from).collect()
+    }
+}
+
+/// A path key's relationships and what it ends on: `out:WorksAt.out:LocatedIn.name` is
+/// `[out:WorksAt, out:LocatedIn]` and `name`; `out:WorksAt.@since` ends on the edge's `since`.
+/// A key with no relationship, or with more than [`MAX_HOPS`], is no path.
+pub fn split_path(key: &str) -> Option<(Vec<&str>, &str)> {
+    let (relationships, end) = key.rsplit_once('.')?;
+    let relationships: Vec<&str> = relationships.split('.').collect();
+    if relationships.len() > MAX_HOPS
+        || relationships
+            .iter()
+            .any(|relationship| parse_relationship_key(relationship).is_none())
+        || end.is_empty()
+        || end.contains(':')
+    {
+        return None;
+    }
+    Some((relationships, end))
+}
+
+/// Whether `key` reaches further than a neighbour's own property: an edge's property, or a
+/// second or third hop. Such a key is only ever a draft's; it is kept as a group.
+pub fn is_deep_path(key: &str) -> bool {
+    split_path(key)
+        .is_some_and(|(relationships, end)| relationships.len() > 1 || is_edge_property_key(end))
+}
+
+/// The type a path of relationship keys from `type_name` ends at, with the last edge.
+pub fn path_end<'a>(
+    schema: &'a SchemaModel,
+    type_name: &str,
+    relationships: &[&str],
+) -> Option<(&'a NodeType, Option<&'a EdgeType>)> {
+    let mut at = schema.node(type_name)?;
+    let mut last = None;
+    for relationship in relationships {
+        let (direction, edge_name) = parse_relationship_key(relationship)?;
+        let edge = schema.edge(edge_name)?;
+        let (near, far) = match direction {
+            Direction::Outgoing => (&edge.from, &edge.to),
+            Direction::Incoming => (&edge.to, &edge.from),
+        };
+        if *near != at.name {
+            return None;
+        }
+        at = schema.node(far)?;
+        last = Some(edge);
+    }
+    Some((at, last))
+}
+
+/// The property a path key ends on, of the last record or its edge, when a filter can test it.
+pub fn path_property(schema: &SchemaModel, type_name: &str, key: &str) -> Option<Property> {
+    let (relationships, end) = split_path(key)?;
+    let (node, edge) = path_end(schema, type_name, &relationships)?;
+    let property = match end.strip_prefix('@') {
+        Some(name) if is_edge_property_key(end) => {
+            edge?.properties.iter().find(|p| p.name == name)?
+        }
+        _ => node.property(end)?,
+    };
+    (!FilterOp::for_property(property).is_empty()).then(|| property.clone())
+}
+
+/// A test on a path key as the filter it is kept as: a neighbour's own property as it always
+/// was (`out:WorksAt.city`), anything further as groups of one test inside each other.
+pub fn path_filter(key: &str, op: FilterOp, value: Value) -> Option<Filter> {
+    let (relationships, end) = split_path(key)?;
+    let (first, rest) = relationships.split_first()?;
+    let mut test = GroupTest {
+        property: end.to_owned(),
+        op,
+        value,
+    };
+    for relationship in rest.iter().rev() {
+        let inner = group_filter(
+            relationship,
+            &Group {
+                tests: vec![test],
+                ..Group::default()
+            },
+        );
+        test = GroupTest::from(&inner);
+    }
+    Some(group_filter(
+        first,
+        &Group {
+            tests: vec![test],
+            ..Group::default()
+        },
+    ))
+}
+
+/// A path key relative to a group on `group_key`: `out:WorksAt.city` inside the group on
+/// `out:WorksAt` is `city`, `out:WorksAt.out:LocatedIn.name` is `out:LocatedIn.name`.
+pub fn path_within<'a>(key: &'a str, group_key: &str) -> Option<&'a str> {
+    key.strip_prefix(group_key)?.strip_prefix('.')
+}
+
+/// A test inside a group, as the group keeps it, from a path key relative to the group's record
+/// (see [`path_within`]): its own or its edge's property as it is, a further hop as a group.
+pub fn group_test(relative: &str, op: FilterOp, value: Value) -> GroupTest {
+    match path_filter(relative, op, value.clone()) {
+        Some(filter) if relative.contains('.') => GroupTest::from(&filter),
+        _ => GroupTest {
+            property: relative.to_owned(),
+            op,
+            value,
+        },
+    }
+}
+
+/// A group's test as the path key relative to the group's record that names it, with its
+/// operator and value: `city`, `@since`, or `out:LocatedIn.name` for a hop of one test on any
+/// of them. A test a path cannot say (a relationship's own test, a hop under another
+/// quantifier or with several tests) is none.
+pub fn test_path(test: &GroupTest) -> Option<(String, FilterOp, Value)> {
+    if test.op.is_relationship() || test.op == FilterOp::Expr {
+        return None;
+    }
+    let filter = Filter::from(test.clone());
+    let Some((key, group)) = as_group(&filter) else {
+        return Some((test.property.clone(), test.op, test.value.clone()));
+    };
+    match group.tests.as_slice() {
+        [inner] if group.quantifier == Quantifier::Any => {
+            let (rest, op, value) = test_path(inner)?;
+            Some((format!("{key}.{rest}"), op, value))
+        }
+        // "Is empty" on a neighbour's property: none of them holds a value.
+        [inner] if group.quantifier == Quantifier::None && inner.op == FilterOp::IsNotEmpty => {
+            let (rest, _, value) = test_path(inner)?;
+            Some((format!("{key}.{rest}"), FilterOp::IsEmpty, value))
+        }
+        _ => None,
+    }
+}
+
+/// Every edge a group and the groups inside it traverse, and the edges their relationship
+/// tests and neighbour properties name.
+fn group_edges(filter: &Filter) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some((_, edge)) = parse_relationship_key(&filter.property) {
+        out.push(edge.to_owned());
+    }
+    if let Some(group) = Group::read(&filter.value) {
+        for test in group.filters() {
+            if test.op == FilterOp::Where {
+                out.extend(group_edges(&test));
+            } else if test.op.is_relationship() {
+                out.extend(parse_relationship_key(&test.property).map(|(_, e)| e.to_owned()));
+            } else if let GroupKey::NeighbourProperty { edge, .. } = parse_group_key(&test.property)
+            {
+                out.push(edge.to_owned());
+            }
+        }
+    }
+    out
+}
+
+/// Whether `key` inside a group names a property of the edge (`@since`), not of the record.
+pub fn is_edge_property_key(key: &str) -> bool {
+    key.starts_with('@') && key != ID_FILTER && key != WHERE_FILTER
+}
+
+/// The key of an edge property inside a group: `@since`.
+pub fn edge_property_key(property: &str) -> String {
+    format!("@{property}")
+}
+
+/// `filter` as a group: a [`FilterOp::Where`] as it is, and a neighbour's property
+/// (`out:WorksAt.city is Berlin`) as the group of one test it means. Anything else is no group.
+pub fn as_group(filter: &Filter) -> Option<(String, Group)> {
+    if filter.op == FilterOp::Where {
+        return Some((filter.property.clone(), Group::read(&filter.value)?));
+    }
+    let GroupKey::NeighbourProperty {
+        direction,
+        edge,
+        property,
+    } = parse_group_key(&filter.property)
+    else {
+        return None;
+    };
+    let key = match direction {
+        Direction::Outgoing => format!("out:{edge}"),
+        Direction::Incoming => format!("in:{edge}"),
+    };
+    // "Is empty" on a neighbour's property means no neighbour holds a value.
+    let (quantifier, op) = if filter.op == FilterOp::IsEmpty {
+        (Quantifier::None, FilterOp::IsNotEmpty)
+    } else {
+        (Quantifier::Any, filter.op)
+    };
+    Some((
+        key,
+        Group {
+            quantifier,
+            tests: vec![GroupTest {
+                property: property.to_owned(),
+                op,
+                value: filter.value.clone(),
+            }],
+            ..Group::default()
+        },
+    ))
+}
+
+/// The filter a group is kept as: the neighbour-property form when it says the same (one test
+/// on a property of the record, any or none of them), so views written before groups and after
+/// compare equal; a [`FilterOp::Where`] otherwise.
+pub fn group_filter(key: &str, group: &Group) -> Filter {
+    if let [test] = group.tests.as_slice()
+        && !is_edge_property_key(&test.property)
+        && test.property != ID_FILTER
+        && !matches!(test.op, FilterOp::Where | FilterOp::Expr)
+        && !test.op.is_relationship()
+        && !test.property.contains(['.', ':'])
+    {
+        let flat = match (group.quantifier, test.op) {
+            (Quantifier::Any, FilterOp::IsEmpty) => None,
+            (Quantifier::Any, op) => Some(op),
+            (Quantifier::None, FilterOp::IsNotEmpty) => Some(FilterOp::IsEmpty),
+            _ => None,
+        };
+        if let Some(op) = flat {
+            return Filter {
+                property: format!("{key}.{}", test.property),
+                op,
+                value: test.value.clone(),
+            };
+        }
+    }
+    Filter {
+        property: key.to_owned(),
+        op: FilterOp::Where,
+        value: group.to_value(),
+    }
+}
+
+/// A group as a correlated block on the record `near` (`$n`, or an outer group's `$r0`): the
+/// related record is `$r{tag}`, its edge `$w{tag}` when a test or the aggregate names an edge
+/// property, and each test's parameter `f{tag}_{j}`. `depth` is how many relationships from the
+/// row this group's records are.
+fn group_clause(
+    schema: &SchemaModel,
+    near: &str,
+    tag: &str,
+    depth: usize,
+    filter: &Filter,
+    params: &mut Params,
+) -> Result<String, BuildError> {
+    if depth > MAX_HOPS {
+        return Err(BuildError::TooDeep);
+    }
+    let group =
+        Group::read(&filter.value).ok_or_else(|| BuildError::BadGroup(filter.property.clone()))?;
+    let Some((direction, edge_name)) = parse_relationship_key(&filter.property) else {
+        return Err(BuildError::UnknownEdge(filter.property.clone()));
+    };
+    let edge = edge(schema, edge_name)?;
+    let far = format!("$r{tag}");
+    let edge_var = format!("$w{tag}");
+    let binds_edge = group
+        .tests
+        .iter()
+        .any(|test| is_edge_property_key(&test.property))
+        || group.of.as_deref().is_some_and(is_edge_property_key);
+    let word = if binds_edge {
+        format!("{edge_var}:{}", edge.traversal())
+    } else {
+        edge.traversal()
+    };
+    let far_type = match direction {
+        Direction::Outgoing => &edge.to,
+        Direction::Incoming => &edge.from,
+    };
+    let far_node = node(schema, far_type)?;
+    let head = vec![
+        format!("{far}: {far_type}"),
+        oriented(direction, near, &word, &far),
+    ];
+    let mut tests = Vec::new();
+    for (j, test) in group.tests.iter().enumerate() {
+        let test = Filter::from(test.clone());
+        tests.push(group_test_clause(
+            schema,
+            far_node,
+            edge,
+            &far,
+            &edge_var,
+            &format!("{tag}_{j}"),
+            depth,
+            &filter.property,
+            &test,
+            params,
+        )?);
+    }
+    let block = |keyword: &str, lines: &[String]| {
+        format!("{keyword} {{\n      {}\n    }}", lines.join("\n      "))
+    };
+    let all: Vec<String> = head.iter().chain(&tests).cloned().collect();
+    Ok(match group.quantifier {
+        Quantifier::Any => block("exists", &all),
+        Quantifier::None => block("not", &all),
+        Quantifier::Every if tests.is_empty() => block("exists", &head),
+        Quantifier::Every => {
+            let some = format!("$r{tag}_some");
+            let has = block(
+                "exists",
+                &[
+                    format!("{some}: {far_type}"),
+                    oriented(direction, near, &edge.traversal(), &some),
+                ],
+            );
+            let failing = format!("not {{\n        {}\n      }}", tests.join("\n        "));
+            let mut lines = head.clone();
+            lines.push(failing);
+            format!("{has}\n    {}", block("not", &lines))
+        }
+        quantifier @ (Quantifier::AtLeast | Quantifier::AtMost) => {
+            let count = group
+                .count
+                .ok_or_else(|| BuildError::BadGroup(filter.property.clone()))?;
+            let operator = if quantifier == Quantifier::AtLeast {
+                ">="
+            } else {
+                "<="
+            };
+            format!("{} {operator} {count}", block("count", &all))
+        }
+        quantifier => {
+            let bad = || BuildError::BadGroup(filter.property.clone());
+            let of = group.of.as_deref().ok_or_else(bad)?;
+            let (target, property) = match of.strip_prefix('@') {
+                Some(name) if is_edge_property_key(of) => (
+                    format!("{edge_var}.{name}"),
+                    edge.properties.iter().find(|p| p.name == name),
+                ),
+                _ => (format!("{far}.{of}"), far_node.property(of)),
+            };
+            let property = property.ok_or_else(|| BuildError::UnknownProperty {
+                type_name: far_node.name.clone(),
+                property: of.to_owned(),
+            })?;
+            if !quantifier.takes(property) {
+                return Err(bad());
+            }
+            let compare = group.compare.ok_or_else(bad)?;
+            let operator = match compare {
+                FilterOp::Eq => "=",
+                FilterOp::Ne => "!=",
+                FilterOp::Lt => "<",
+                FilterOp::Le => "<=",
+                FilterOp::Gt => ">",
+                FilterOp::Ge => ">=",
+                _ => return Err(bad()),
+            };
+            let than = group.than.clone().ok_or_else(bad)?;
+            // An average of whole numbers is a fraction.
+            let ty = if quantifier == Quantifier::Avg {
+                "F64".to_owned()
+            } else {
+                property.param_type(false)
+            };
+            let param = params.add(&format!("f{tag}"), &ty, than);
+            format!(
+                "{}({target}) {} {operator} {param}",
+                quantifier.key(),
+                block("", &all).trim_start()
+            )
+        }
+    })
+}
+
+/// One of a group's tests on its related record `far` (of type `far_node`, through `edge`,
+/// bound as `edge_var` where a test needs it).
+#[expect(clippy::too_many_arguments)]
+fn group_test_clause(
+    schema: &SchemaModel,
+    far_node: &NodeType,
+    edge: &EdgeType,
+    far: &str,
+    edge_var: &str,
+    tag: &str,
+    depth: usize,
+    key: &str,
+    test: &Filter,
+    params: &mut Params,
+) -> Result<String, BuildError> {
+    if test.op == FilterOp::Expr {
+        return Err(BuildError::NotInGroup(key.to_owned()));
+    }
+    if test.op == FilterOp::Where {
+        return group_clause(schema, far, tag, depth + 1, test, params);
+    }
+    if test.op.is_relationship() {
+        return relationship_clause(schema, far, tag, test, params);
+    }
+    // A neighbour's property of the related record: the group of one test it means.
+    if let Some((inner, group)) = as_group(test) {
+        let nested = Filter {
+            property: inner,
+            op: FilterOp::Where,
+            value: group.to_value(),
+        };
+        return group_clause(schema, far, tag, depth + 1, &nested, params);
+    }
+    if test.property == ID_FILTER {
+        let id = params.add(&format!("f{tag}"), "String", test.value.clone());
+        return Ok(format!("{far}.@id = {id}"));
+    }
+    if let Some(name) = test.property.strip_prefix('@')
+        && is_edge_property_key(&test.property)
+    {
+        let property = edge
+            .properties
+            .iter()
+            .find(|p| p.name == name)
+            .ok_or_else(|| BuildError::UnknownProperty {
+                type_name: edge.name.clone(),
+                property: name.to_owned(),
+            })?;
+        return Ok(property_clause(
+            &format!("{edge_var}.{name}"),
+            property,
+            test,
+            tag,
+            params,
+        ));
+    }
+    let property =
+        far_node
+            .property(&test.property)
+            .ok_or_else(|| BuildError::UnknownProperty {
+                type_name: far_node.name.clone(),
+                property: test.property.clone(),
+            })?;
+    Ok(property_clause(
+        &format!("{far}.{}", property.name),
+        property,
+        test,
+        tag,
+        params,
     ))
 }
 
@@ -1141,17 +1835,9 @@ pub fn stored_view_query(
     let mut taken: Vec<String> = Vec::new();
     let mut values = Map::new();
     for old in generated {
-        let filter = old
-            .strip_prefix('f')
-            .and_then(|rest| rest.split('_').next())
-            .and_then(|i| i.parse::<usize>().ok())
-            .and_then(|i| filters.get(i));
-        let base = filter.map_or("value".to_owned(), |filter| {
-            identifier(
-                filter.property.rsplit(['.', ':']).next().unwrap_or("value"),
-                "value",
-            )
-        });
+        let tag = old.strip_prefix('f').unwrap_or(&old);
+        let tag = tag.strip_suffix("_end").unwrap_or(tag);
+        let base = identifier(&param_words(filters, tag), "value");
         let base = if old.ends_with("_end") {
             format!("{base}_end")
         } else {
@@ -1175,6 +1861,55 @@ pub fn stored_view_query(
         depends: Depends::rows_of(schema, &node.name, false, filters),
         seeds: None,
     })
+}
+
+/// What the parameter at `tag` (`0`, `0_1`, `0_1_0`) tests, in words for its name: the
+/// property (`city`), after the relationships a group reaches it through (`works at city`).
+fn param_words(filters: &[Filter], tag: &str) -> String {
+    let mut words = Vec::new();
+    let mut indices = tag.split('_').map(|i| i.parse::<usize>().ok());
+    let mut filter = indices
+        .next()
+        .flatten()
+        .and_then(|i| filters.get(i))
+        .cloned();
+    while let Some(current) = filter.take() {
+        let last = |key: &str| {
+            key.rsplit(['.', ':', '@'])
+                .next()
+                .unwrap_or("value")
+                .to_owned()
+        };
+        if current.op == FilterOp::Where {
+            let group = Group::read(&current.value).unwrap_or_default();
+            words.push(split_camel(&last(&current.property)));
+            match indices.next() {
+                Some(Some(j)) => filter = group.tests.get(j).cloned().map(Filter::from),
+                // The aggregate's own value.
+                _ => words.push(group.of.as_deref().map(last).unwrap_or_default()),
+            }
+        } else {
+            words.push(last(&current.property));
+        }
+    }
+    let words = words.join(" ");
+    if words.trim().is_empty() {
+        "value".to_owned()
+    } else {
+        words
+    }
+}
+
+/// `WorksAt` as `Works At`, so an identifier made of it reads `works_at`.
+fn split_camel(word: &str) -> String {
+    let mut out = String::new();
+    for (i, c) in word.chars().enumerate() {
+        if i > 0 && c.is_ascii_uppercase() {
+            out.push(' ');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// `words` as a GQ identifier: lower case, `_` between words, never starting with a digit;
@@ -4561,6 +5296,346 @@ mod tests {
                 None => json!("Engineer"),
             },
         }
+    }
+
+    /// People, the companies they work at with the edge's own properties, and the cities and
+    /// countries the companies are in: three hops (spec 025).
+    const HOPS: &str = "node Person {\n  slug: String @key\n  name: String\n}\n\
+        node Company {\n  slug: String @key\n  city: String?\n  employees: I32?\n  revenue: F64?\n  founded: Date?\n}\n\
+        node City {\n  slug: String @key\n  name: String\n}\n\
+        node Country {\n  slug: String @key\n  name: String\n}\n\
+        edge WorksAt: Person -> Company {\n  since: Date?\n  role: String?\n  hours: I32?\n}\n\
+        edge LocatedIn: Company -> City\n\
+        edge InCountry: City -> Country\n";
+
+    fn test(property: &str, op: FilterOp, value: Value) -> GroupTest {
+        GroupTest {
+            property: property.into(),
+            op,
+            value,
+        }
+    }
+
+    fn group(key: &str, group: Group) -> Filter {
+        Filter {
+            property: key.into(),
+            op: FilterOp::Where,
+            value: group.to_value(),
+        }
+    }
+
+    #[test]
+    fn every_kind_of_group_compiles() {
+        let schema = SchemaModel::parse(HOPS).unwrap();
+        let berlin_and_big = Group {
+            tests: vec![
+                test("city", FilterOp::Eq, json!("Berlin")),
+                test("employees", FilterOp::Gt, json!(100)),
+            ],
+            ..Group::default()
+        };
+        let three_hops = Group {
+            tests: vec![test(
+                "out:LocatedIn",
+                FilterOp::Where,
+                Group {
+                    tests: vec![test(
+                        "out:InCountry",
+                        FilterOp::Where,
+                        Group {
+                            tests: vec![test("name", FilterOp::Eq, json!("Germany"))],
+                            ..Group::default()
+                        }
+                        .to_value(),
+                    )],
+                    ..Group::default()
+                }
+                .to_value(),
+            )],
+            ..Group::default()
+        };
+        let cases = [
+            ("two tests on one company", berlin_and_big.clone()),
+            (
+                "the edge's own properties",
+                Group {
+                    tests: vec![
+                        test("@since", FilterOp::Gt, json!("2020-01-01")),
+                        test("@role", FilterOp::Eq, json!("CTO")),
+                        test(
+                            "@since",
+                            FilterOp::Last30Days,
+                            json!(["2026-10-09", "2026-11-08"]),
+                        ),
+                    ],
+                    ..Group::default()
+                },
+            ),
+            ("three hops", three_hops),
+            (
+                "a hop as a neighbour's property, and a relationship test",
+                Group {
+                    tests: vec![
+                        test("out:LocatedIn.name", FilterOp::Eq, json!("Berlin")),
+                        test("out:LocatedIn", FilterOp::HasAny, Value::Null),
+                        test(ID_FILTER, FilterOp::Eq, json!("acme")),
+                    ],
+                    ..Group::default()
+                },
+            ),
+            (
+                "none of them",
+                Group {
+                    quantifier: Quantifier::None,
+                    ..berlin_and_big.clone()
+                },
+            ),
+            (
+                "every one",
+                Group {
+                    quantifier: Quantifier::Every,
+                    ..berlin_and_big.clone()
+                },
+            ),
+            (
+                "every one, no test",
+                Group {
+                    quantifier: Quantifier::Every,
+                    ..Group::default()
+                },
+            ),
+            (
+                "at least two",
+                Group {
+                    quantifier: Quantifier::AtLeast,
+                    count: Some(2),
+                    ..berlin_and_big.clone()
+                },
+            ),
+            (
+                "at most one",
+                Group {
+                    quantifier: Quantifier::AtMost,
+                    count: Some(1),
+                    ..berlin_and_big.clone()
+                },
+            ),
+            (
+                "the total of an edge property",
+                Group {
+                    quantifier: Quantifier::Sum,
+                    of: Some("@hours".into()),
+                    compare: Some(FilterOp::Gt),
+                    than: Some(json!(100)),
+                    ..Group::default()
+                },
+            ),
+            (
+                "the average of whole numbers",
+                Group {
+                    quantifier: Quantifier::Avg,
+                    of: Some("employees".into()),
+                    compare: Some(FilterOp::Ge),
+                    than: Some(json!(50.5)),
+                    ..berlin_and_big.clone()
+                },
+            ),
+            (
+                "the latest date",
+                Group {
+                    quantifier: Quantifier::Max,
+                    of: Some("founded".into()),
+                    compare: Some(FilterOp::Lt),
+                    than: Some(json!("2000-01-01")),
+                    ..Group::default()
+                },
+            ),
+            (
+                "the smallest fraction",
+                Group {
+                    quantifier: Quantifier::Min,
+                    of: Some("revenue".into()),
+                    compare: Some(FilterOp::Le),
+                    than: Some(json!(1.5)),
+                    ..Group::default()
+                },
+            ),
+        ];
+        for (what, case) in cases {
+            let filters = [
+                Filter {
+                    property: "name".into(),
+                    op: FilterOp::Contains,
+                    value: json!("a"),
+                },
+                group("out:WorksAt", case),
+            ];
+            let page = node_page(&schema, "Person", &filters, None, &PageStart::First, 50)
+                .unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert_compiles_in(&schema, &page);
+            assert_compiles_in(&schema, &node_count(&schema, "Person", &filters).unwrap());
+            let stored = stored_view_query(&schema, "Person", &filters, None, what).unwrap();
+            assert_compiles_in(&schema, &stored);
+        }
+        // Two tests on one company are one block with one record.
+        let page = node_page(
+            &schema,
+            "Person",
+            &[group("out:WorksAt", berlin_and_big.clone())],
+            None,
+            &PageStart::First,
+            50,
+        )
+        .unwrap();
+        assert_eq!(page.text.matches("exists {").count(), 1, "{}", page.text);
+        assert!(page.text.contains("$r0.city = $f0_0"), "{}", page.text);
+        assert!(page.text.contains("$r0.employees > $f0_1"), "{}", page.text);
+        assert!(
+            matches!(&page.depends, Depends::Types { edges, .. } if edges.contains(&"WorksAt".to_owned())),
+            "{:?}",
+            page.depends
+        );
+        // A stored query names the parameters by the path to them.
+        let stored = stored_view_query(
+            &schema,
+            "Person",
+            &[group("out:WorksAt", berlin_and_big)],
+            None,
+            "Berlin",
+        )
+        .unwrap();
+        assert!(
+            stored.params.contains_key("works_at_city"),
+            "{:?}",
+            stored.params
+        );
+        assert!(
+            stored.params.contains_key("works_at_employees"),
+            "{:?}",
+            stored.params
+        );
+    }
+
+    #[test]
+    fn a_group_refuses_what_it_cannot_say() {
+        let schema = SchemaModel::parse(HOPS).unwrap();
+        let build = |g: Group| {
+            node_page(
+                &schema,
+                "Person",
+                &[group("out:WorksAt", g)],
+                None,
+                &PageStart::First,
+                10,
+            )
+        };
+        // Four hops: WorksAt, LocatedIn, InCountry, then a group inside that.
+        let four = Group {
+            tests: vec![test(
+                "out:LocatedIn",
+                FilterOp::Where,
+                Group {
+                    tests: vec![test(
+                        "out:InCountry",
+                        FilterOp::Where,
+                        Group {
+                            tests: vec![test(
+                                "in:InCountry",
+                                FilterOp::Where,
+                                Group::default().to_value(),
+                            )],
+                            ..Group::default()
+                        }
+                        .to_value(),
+                    )],
+                    ..Group::default()
+                }
+                .to_value(),
+            )],
+            ..Group::default()
+        };
+        assert!(matches!(build(four), Err(BuildError::TooDeep)));
+        assert!(matches!(
+            build(Group {
+                quantifier: Quantifier::AtLeast,
+                ..Group::default()
+            }),
+            Err(BuildError::BadGroup(_))
+        ));
+        // A total of text is no total.
+        assert!(matches!(
+            build(Group {
+                quantifier: Quantifier::Sum,
+                of: Some("city".into()),
+                compare: Some(FilterOp::Gt),
+                than: Some(json!(1)),
+                ..Group::default()
+            }),
+            Err(BuildError::BadGroup(_))
+        ));
+        assert!(matches!(
+            build(Group {
+                tests: vec![test("@nope", FilterOp::Eq, json!(1))],
+                ..Group::default()
+            }),
+            Err(BuildError::UnknownProperty { .. })
+        ));
+        assert!(matches!(
+            build(Group {
+                tests: vec![test(WHERE_FILTER, FilterOp::Expr, json!("1 = 1"))],
+                ..Group::default()
+            }),
+            Err(BuildError::NotInGroup(_))
+        ));
+    }
+
+    #[test]
+    fn a_group_of_one_test_is_kept_as_the_neighbour_property_it_means() {
+        let one = Group {
+            tests: vec![test("city", FilterOp::Eq, json!("Berlin"))],
+            ..Group::default()
+        };
+        let flat = group_filter("out:WorksAt", &one);
+        assert_eq!(flat.property, "out:WorksAt.city");
+        assert_eq!(flat.op, FilterOp::Eq);
+        assert_eq!(
+            as_group(&flat),
+            Some(("out:WorksAt".to_owned(), one.clone()))
+        );
+        let none_hold = Filter {
+            property: "out:WorksAt.city".into(),
+            op: FilterOp::IsEmpty,
+            value: Value::Null,
+        };
+        let (key, as_one) = as_group(&none_hold).unwrap();
+        assert_eq!(as_one.quantifier, Quantifier::None);
+        assert_eq!(group_filter(&key, &as_one), none_hold);
+        // An edge property, two tests or another quantifier stay a group.
+        for kept in [
+            Group {
+                tests: vec![test("@role", FilterOp::Eq, json!("CTO"))],
+                ..Group::default()
+            },
+            Group {
+                quantifier: Quantifier::Every,
+                ..one.clone()
+            },
+            Group {
+                tests: vec![
+                    test("city", FilterOp::Eq, json!("Berlin")),
+                    test("employees", FilterOp::Gt, json!(1)),
+                ],
+                ..Group::default()
+            },
+        ] {
+            let filter = group_filter("out:WorksAt", &kept);
+            assert_eq!(filter.op, FilterOp::Where);
+            assert_eq!(Group::read(&filter.value), Some(kept));
+        }
+        // A view keeps a group's operators by their keys.
+        let value = one.to_value();
+        assert_eq!(value["tests"][0]["op"], json!("eq"));
+        assert_eq!(value["quantifier"], json!("any"));
     }
 
     #[test]

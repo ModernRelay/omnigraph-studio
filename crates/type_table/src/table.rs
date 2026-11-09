@@ -20,6 +20,7 @@ use gpui::{
     MouseMoveEvent, Pixels, Point, Render, ScrollStrategy, SharedString, StyleRefinement,
     Subscription, Task, WeakEntity, Window, anchored, deferred, point,
 };
+use gq_language::builder::{Group, Quantifier};
 use gq_language::input::same_value;
 use gq_language::{
     BuildError, BuiltQuery, Filter, FilterOp, PageStart, Property, RelationshipGroup, ScalarKind,
@@ -119,9 +120,35 @@ struct SelectEdit {
     _blur: Subscription,
 }
 
+/// Where a draft's filter goes when applied (spec 025): the bar, a test of a group in the bar
+/// (a new one, or the one at `test` it replaces), or a group's aggregate.
+#[derive(Debug, Clone, PartialEq)]
+enum DraftTarget {
+    Bar,
+    Test {
+        /// The group, as applied: found in the bar by equality, as `replacing` is.
+        group: Filter,
+        test: Option<usize>,
+    },
+    Aggregate {
+        group: Filter,
+        quantifier: Quantifier,
+    },
+}
+
+impl DraftTarget {
+    fn group(&self) -> Option<&Filter> {
+        match self {
+            DraftTarget::Bar => None,
+            DraftTarget::Test { group, .. } | DraftTarget::Aggregate { group, .. } => Some(group),
+        }
+    }
+}
+
 struct FilterDraft {
     property: String,
     op: FilterOp,
+    target: DraftTarget,
     error: Option<String>,
     /// The applied filter this draft edits: still applied, and so still filtering the rows and
     /// every page read, while its pill shows as this draft. Replaced where it stands when the
@@ -689,6 +716,181 @@ fn filter_key_entry(
         })
 }
 
+/// A change a group pill's menu makes to the table.
+type GroupEdit = dyn Fn(&mut TypeTable, &mut Window, &mut Context<TypeTable>);
+
+/// What a pick in a path menu does with the key it picked.
+type PickKey = Rc<dyn Fn(String, &mut Window, &mut App)>;
+
+/// A path menu's pick that sets the draft's key, as the Filter menu's own entries do.
+fn pick_for(table: &WeakEntity<TypeTable>) -> PickKey {
+    let table = table.clone();
+    Rc::new(move |key, window, cx| {
+        table
+            .update(cx, |this, cx| this.change_draft_key(key, window, cx))
+            .ok();
+    })
+}
+
+/// Where a draft into a group roots its key menu: the group's record.
+#[derive(Clone)]
+struct DraftRoot {
+    key: String,
+    type_name: String,
+    edge: String,
+    depth: usize,
+    icon: IconName,
+    offer: PathOffer,
+}
+
+/// What a path menu offers: every test, or (for a group's total, average, smallest or largest)
+/// the properties that aggregate takes, with no further hop.
+#[derive(Clone, Copy)]
+enum PathOffer {
+    Tests,
+    Aggregate(Quantifier),
+}
+
+/// A relationship's submenu beyond its own tests (spec 025): its edge's properties, the related
+/// type's properties, and its relationships, each opening the same menu one hop further, to
+/// [`builder::MAX_HOPS`]. `prefix` is the path key to here (`out:WorksAt`), `type_name` the
+/// record's type there and `edge` the edge that reached it.
+#[allow(clippy::too_many_arguments)]
+fn path_menu(
+    mut menu: ContextMenu,
+    pick: &PickKey,
+    schema: &Arc<SchemaModel>,
+    prefix: &str,
+    type_name: &str,
+    edge: &str,
+    depth: usize,
+    icon: IconName,
+    offer: PathOffer,
+) -> ContextMenu {
+    let entry = |key: String, label: String| {
+        let pick = pick.clone();
+        ContextMenuEntry::new(label)
+            .icon(icon)
+            .icon_color(Color::Muted)
+            .handler(move |window, cx| pick(key.clone(), window, cx))
+    };
+    let offered = |property: &gq_language::Property| match offer {
+        PathOffer::Tests => !FilterOp::for_property(property).is_empty(),
+        PathOffer::Aggregate(quantifier) => quantifier.takes(property),
+    };
+    if let Some(edge_type) = schema.edge(edge) {
+        let properties: Vec<_> = edge_type.properties.iter().filter(|p| offered(p)).collect();
+        if !properties.is_empty() {
+            menu = menu.header(format!("{} itself", gq_language::traversal_name(edge)));
+            for property in properties {
+                menu = menu.item(entry(
+                    format!("{prefix}.{}", builder::edge_property_key(&property.name)),
+                    property.name.clone(),
+                ));
+            }
+        }
+    }
+    if let Some(node) = schema.node(type_name) {
+        let properties: Vec<_> = node
+            .properties
+            .iter()
+            .filter(|p| !p.is_key && offered(p))
+            .collect();
+        if !properties.is_empty() {
+            menu = menu.header(format!("{type_name}'s property"));
+            for property in properties {
+                menu = menu.item(entry(
+                    format!("{prefix}.{}", property.name),
+                    property.name.clone(),
+                ));
+            }
+        }
+    }
+    if matches!(offer, PathOffer::Tests) && depth < builder::MAX_HOPS {
+        let groups = schema.relationships_of(type_name);
+        if !groups.is_empty() {
+            menu = menu.header(format!("{type_name}'s relationships"));
+        }
+        for group in groups {
+            let key = format!("{prefix}.{}", builder::relationship_key(group));
+            let label = format!(
+                "{} {}",
+                gq_language::traversal_name(&group.edge),
+                group.other_type
+            );
+            let (pick, schema) = (pick.clone(), schema.clone());
+            let (other, edge) = (group.other_type.clone(), group.edge.clone());
+            let icon = direction_icon(group.direction);
+            menu = menu.submenu_with_colored_icon(label, icon, Color::Muted, move |menu, _, _| {
+                path_menu(
+                    menu,
+                    &pick,
+                    &schema,
+                    &key,
+                    &other,
+                    &edge,
+                    depth + 1,
+                    icon,
+                    PathOffer::Tests,
+                )
+            });
+        }
+    }
+    menu
+}
+
+/// `group` with a draft applied into it (spec 025): a test added or put in place of the one it
+/// edits, or the aggregate set, from the draft's path key `key` (which starts at the group's
+/// relationship).
+fn into_group(
+    group: &Filter,
+    target: &DraftTarget,
+    key: &str,
+    op: FilterOp,
+    value: Value,
+) -> Result<Filter, String> {
+    let (group_key, mut kept) =
+        builder::as_group(group).ok_or_else(|| "That filter is no longer applied".to_owned())?;
+    let Some(relative) = builder::path_within(key, &group_key) else {
+        return Err(format!(
+            "Pick a test on {}",
+            path_label(&format!("{group_key}.x")).trim_end_matches(" · x")
+        ));
+    };
+    match target {
+        DraftTarget::Bar => unreachable!(),
+        DraftTarget::Test { test, .. } => {
+            let made = builder::group_test(relative, op, value);
+            match test.and_then(|at| kept.tests.get_mut(at)) {
+                Some(slot) => *slot = made,
+                None => kept.tests.push(made),
+            }
+        }
+        DraftTarget::Aggregate { quantifier, .. } => {
+            kept.quantifier = *quantifier;
+            kept.of = Some(relative.to_owned());
+            kept.compare = Some(op);
+            kept.than = Some(value);
+            kept.count = None;
+        }
+    }
+    Ok(builder::group_filter(&group_key, &kept))
+}
+
+/// How a path key reads where the Filter menu names it: `worksAt → locatedIn · name`, and an
+/// edge's own property `worksAt · since`.
+fn path_label(key: &str) -> String {
+    let Some((relationships, end)) = builder::split_path(key) else {
+        return key.to_owned();
+    };
+    let names: Vec<String> = relationships
+        .iter()
+        .filter_map(|relationship| builder::parse_relationship_key(relationship))
+        .map(|(_, edge)| gq_language::traversal_name(edge))
+        .collect();
+    format!("{} · {}", names.join(" → "), end.trim_start_matches('@'))
+}
+
 /// The Filter menu over `choices` (in [`TypeTable::filter_choices`]' order: each relationship
 /// followed by its neighbours' properties), each relationship naming its other end through
 /// `other_type`.
@@ -711,7 +913,7 @@ fn filter_menu(
             .position(|(nested, _, _)| !nested.starts_with(&prefix))
             .map_or(choices.len(), |offset| at + 1 + offset);
         entries.push(match other_type(key) {
-            Some(other_type) if end > at + 1 => FilterMenuEntry::Relationship {
+            Some(other_type) => FilterMenuEntry::Relationship {
                 key: at,
                 other_type,
                 properties: at + 1..end,
@@ -782,6 +984,8 @@ pub struct TypeTable {
     columns: Vec<ColumnSpec>,
     /// A column header's right-click menu, where it was opened.
     header_menu: Option<(Entity<ContextMenu>, gpui::Point<Pixels>, Subscription)>,
+    /// A group pill's menu (spec 025), where it was opened.
+    group_menu: Option<(Entity<ContextMenu>, gpui::Point<Pixels>, Subscription)>,
     rows: Vec<Row>,
     /// Rows made here and shown out of their read order (first in a sorted table, or in their
     /// section), by id: the page that reaches one leaves it out, so it shows once.
@@ -1212,6 +1416,7 @@ impl TypeTable {
             layout: opening.layout,
             columns: Vec::new(),
             header_menu: None,
+            group_menu: None,
             rows: Vec::new(),
             placed_here: HashSet::new(),
             paging: Paging::default(),
@@ -1494,6 +1699,18 @@ impl TypeTable {
         self.filters.retain(|f| {
             if f.op == FilterOp::Expr || f.property == builder::ID_FILTER {
                 return true;
+            }
+            // A group stays while it can still be built against this schema.
+            if f.op == FilterOp::Where {
+                return builder::node_page(
+                    &schema,
+                    &type_name,
+                    std::slice::from_ref(f),
+                    None,
+                    &PageStart::First,
+                    1,
+                )
+                .is_ok();
             }
             match builder::parse_group_key(&f.property) {
                 builder::GroupKey::Relationship(_, edge) => schema.edge(edge).is_some(),
@@ -7610,6 +7827,9 @@ impl TypeTable {
     /// The property a filter key tests: the table's own, or a neighbour's through a
     /// relationship key (`out:Attended.name`). None for a relationship itself.
     fn property_for_key(&self, key: &str) -> Option<Property> {
+        if builder::is_deep_path(key) {
+            return builder::path_property(self.schema.as_ref()?, &self.type_name, key);
+        }
         if let Some((relationship, property)) = key.split_once('.') {
             let (direction, edge) = builder::parse_relationship_key(relationship)?;
             let schema = self.schema.as_ref()?;
@@ -7725,6 +7945,55 @@ impl TypeTable {
             .unwrap_or_default()
     }
 
+    /// The tests a draft offers: its key's, and for a group's aggregate only the comparisons.
+    fn draft_ops(&self, draft: &FilterDraft) -> Vec<FilterOp> {
+        let ops = self.ops_for(&draft.property);
+        match draft.target {
+            DraftTarget::Aggregate { .. } => ops
+                .into_iter()
+                .filter(|op| {
+                    matches!(
+                        op,
+                        FilterOp::Eq
+                            | FilterOp::Ne
+                            | FilterOp::Lt
+                            | FilterOp::Le
+                            | FilterOp::Gt
+                            | FilterOp::Ge
+                    )
+                })
+                .collect(),
+            _ => ops,
+        }
+    }
+
+    /// Where a draft into a group roots its key menu: the record the group's relationship
+    /// reaches. `None` for a draft in the bar, whose menu is the whole Filter menu.
+    fn draft_root(&self, draft: &FilterDraft) -> Option<DraftRoot> {
+        let (key, _) = builder::as_group(draft.target.group()?)?;
+        self.group_root(
+            &key,
+            match draft.target {
+                DraftTarget::Aggregate { quantifier, .. } => PathOffer::Aggregate(quantifier),
+                _ => PathOffer::Tests,
+            },
+        )
+    }
+
+    fn group_root(&self, key: &str, offer: PathOffer) -> Option<DraftRoot> {
+        let schema = self.schema.as_ref()?;
+        let (direction, edge) = builder::parse_relationship_key(key)?;
+        let (node, _) = builder::path_end(schema, &self.type_name, &[key])?;
+        Some(DraftRoot {
+            key: key.to_owned(),
+            type_name: node.name.clone(),
+            edge: edge.to_owned(),
+            depth: 1,
+            icon: direction_icon(direction),
+            offer,
+        })
+    }
+
     fn open_filter_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let preferred = self
             .cursor
@@ -7748,11 +8017,22 @@ impl TypeTable {
             .filter_draft
             .as_ref()
             .and_then(|draft| draft.replacing.clone());
+        let target = self
+            .filter_draft
+            .as_ref()
+            .map_or(DraftTarget::Bar, |draft| draft.target.clone());
         self.set_draft_property(name, window, cx);
-        if let Some(draft) = &mut self.filter_draft
-            && draft.replacing.is_none()
-        {
-            draft.replacing = replacing;
+        if let Some(draft) = &mut self.filter_draft {
+            if draft.replacing.is_none() {
+                draft.replacing = replacing;
+            }
+            draft.target = target;
+        }
+        if let Some(draft) = &self.filter_draft {
+            let op = self.draft_ops(draft).first().copied().unwrap_or(draft.op);
+            if let Some(draft) = &mut self.filter_draft {
+                draft.op = op;
+            }
         }
     }
 
@@ -7763,6 +8043,7 @@ impl TypeTable {
         self.filter_draft = Some(FilterDraft {
             property: name,
             op,
+            target: DraftTarget::Bar,
             error: None,
             replacing: None,
             offers: Offers::default(),
@@ -7996,9 +8277,21 @@ impl TypeTable {
                 _ => Ok(Value::Null),
             }
         } else {
-            let Some(property) = self.property_for_key(&key) else {
+            let Some(mut property) = self.property_for_key(&key) else {
                 return;
             };
+            // An average of whole numbers is a fraction.
+            if let Some(FilterDraft {
+                target:
+                    DraftTarget::Aggregate {
+                        quantifier: Quantifier::Avg,
+                        ..
+                    },
+                ..
+            }) = &self.filter_draft
+            {
+                property.kind = ScalarKind::Float;
+            }
             if op == FilterOp::In {
                 parse_filter_list(&property, &text)
             } else if op.takes_value() {
@@ -8019,10 +8312,42 @@ impl TypeTable {
                 }
             }
         };
-        let filter = Filter {
-            property: key,
-            op,
-            value,
+        let target = self
+            .filter_draft
+            .as_ref()
+            .map_or(DraftTarget::Bar, |draft| draft.target.clone());
+        if let Some(group) = target.group() {
+            let Some(index) = self.filters.iter().position(|f| f == group) else {
+                self.filter_draft = None;
+                cx.notify();
+                return;
+            };
+            match into_group(group, &target, &key, op, value) {
+                Ok(filter) => self.filters[index] = filter,
+                Err(error) => {
+                    if let Some(draft) = &mut self.filter_draft {
+                        draft.error = Some(error);
+                    }
+                    cx.notify();
+                    return;
+                }
+            }
+            self.filter_draft = None;
+            window.focus(&self.focus_handle, cx);
+            self.reload(true, cx);
+            return;
+        }
+        let filter = if builder::is_deep_path(&key) {
+            match builder::path_filter(&key, op, value) {
+                Some(filter) => filter,
+                None => return,
+            }
+        } else {
+            Filter {
+                property: key,
+                op,
+                value,
+            }
         };
         let replacing = self.filter_draft.take().and_then(|draft| draft.replacing);
         match replacing.and_then(|old| self.filters.iter().position(|f| *f == old)) {
@@ -8144,11 +8469,26 @@ impl TypeTable {
         let choices = self.words_choices();
         let offered = self.view_choices();
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        // A node table's sentence may test one related record several ways, a relationship's
+        // own properties and further hops, as groups (spec 025).
+        let schema = self.schema.clone().filter(|_| self.kind == TableKind::Node);
+        let type_name = self.type_name.clone();
+        let reach = schema.as_deref().map(|schema| words::Reach {
+            schema,
+            type_name: &type_name,
+        });
         let request = ModelRequest {
             task: &words::TASK,
             instructions: words::INSTRUCTIONS,
-            input: words::input(&self.type_name, &choices, &offered, &today, &sentence),
-            schema: words::schema(&choices, &offered),
+            input: words::input_with(
+                &self.type_name,
+                &choices,
+                &offered,
+                &today,
+                &sentence,
+                reach,
+            ),
+            schema: words::schema_with(&choices, &offered, reach),
         };
         let call = models.read(cx).call::<words::Answer>(request, cx);
         let task = cx.spawn(async move |this, cx| {
@@ -8164,7 +8504,11 @@ impl TypeTable {
                 }
             };
             let (view, mut refused) = words::view(&answer.value, &offered);
-            let (mut filters, filters_refused) = words::filters(answer.value, &choices);
+            let reach = schema.as_deref().map(|schema| words::Reach {
+                schema,
+                type_name: &type_name,
+            });
+            let (mut filters, filters_refused) = words::filters_with(answer.value, &choices, reach);
             refused.extend(filters_refused);
             // A `related_to` names a record; the name becomes its id through the node search
             // the filter's own value field uses, the first match taken, and the pill shows it.
@@ -8324,6 +8668,367 @@ impl TypeTable {
             window.focus(&self.focus_handle, cx);
             self.reload(true, cx);
         }
+    }
+
+    /// A group pill's menu (spec 025): how many related records must pass, each test (edit,
+    /// separate, remove), a test to add, another pill on the same relationship to merge, and
+    /// the filter's removal. A neighbour's property pill opens it too, as the group of one test
+    /// it is.
+    fn open_group_menu(
+        &mut self,
+        index: usize,
+        position: gpui::Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(filter) = self.filters.get(index).cloned() else {
+            return;
+        };
+        let Some((key, group)) = builder::as_group(&filter) else {
+            return;
+        };
+        let Some(schema) = self.schema.clone() else {
+            return;
+        };
+        let Some(root) = self.group_root(&key, PathOffer::Tests) else {
+            return;
+        };
+        let table = cx.entity().downgrade();
+        let other_type = root.type_name.clone();
+        // Other pills on this relationship that any of its records passes: merged, their tests
+        // join this group's, one record passing all of them.
+        let merges: Vec<(Filter, String)> = self
+            .filters
+            .iter()
+            .enumerate()
+            .filter(|(at, _)| *at != index)
+            .filter_map(|(_, other)| {
+                let (other_key, other_group) = builder::as_group(other)?;
+                (other_key == key
+                    && other_group.quantifier == Quantifier::Any
+                    && !other_group.tests.is_empty())
+                .then(|| (other.clone(), crate::model::filter_sentence(other)))
+            })
+            .collect();
+        let can_merge = group.quantifier == Quantifier::Any;
+        let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+            let edit = |f: Rc<GroupEdit>| {
+                let table = table.clone();
+                move |window: &mut Window, cx: &mut App| {
+                    table.update(cx, |this, cx| f(this, window, cx)).ok();
+                }
+            };
+            let set = |made: Group| {
+                let (filter, key) = (filter.clone(), key.clone());
+                edit(Rc::new(move |this, _, cx| {
+                    this.replace_filter(&filter, Some(builder::group_filter(&key, &made)), cx)
+                }))
+            };
+            let with = |quantifier: Quantifier, count: Option<u32>| Group {
+                quantifier,
+                count,
+                of: None,
+                compare: None,
+                than: None,
+                ..group.clone()
+            };
+            menu = menu.header("Which of them");
+            for (quantifier, label) in [
+                (Quantifier::Any, "Any of them"),
+                (Quantifier::None, "None of them"),
+                (Quantifier::Every, "Every one"),
+            ] {
+                menu = menu.toggleable_entry(
+                    label,
+                    group.quantifier == quantifier,
+                    IconPosition::Start,
+                    None,
+                    set(with(quantifier, None)),
+                );
+            }
+            for (quantifier, label, counts) in [
+                (Quantifier::AtLeast, "At least", [1u32, 2, 3, 5, 10]),
+                (Quantifier::AtMost, "At most", [0u32, 1, 2, 3, 5]),
+            ] {
+                let current = (group.quantifier == quantifier)
+                    .then_some(group.count)
+                    .flatten();
+                let label = match current {
+                    Some(n) => format!("{label} {n}"),
+                    None => label.to_owned(),
+                };
+                let items: Vec<(u32, _)> = counts
+                    .into_iter()
+                    .map(|n| (n, set(with(quantifier, Some(n)))))
+                    .collect();
+                let items = Rc::new(std::cell::RefCell::new(Some(items)));
+                menu = menu.submenu(label, move |mut menu, _, _| {
+                    for (n, handler) in items.borrow_mut().take().into_iter().flatten() {
+                        menu = menu.toggleable_entry(
+                            n.to_string(),
+                            current == Some(n),
+                            IconPosition::Start,
+                            None,
+                            handler,
+                        );
+                    }
+                    menu
+                });
+            }
+            for (quantifier, label) in [
+                (Quantifier::Sum, "Total of"),
+                (Quantifier::Avg, "Average of"),
+                (Quantifier::Min, "Smallest"),
+                (Quantifier::Max, "Largest"),
+            ] {
+                let (table, schema, filter) = (table.clone(), schema.clone(), filter.clone());
+                let root = root.clone();
+                let pick: PickKey = Rc::new(move |key, window, cx| {
+                    let filter = filter.clone();
+                    table
+                        .update(cx, |this, cx| {
+                            this.start_group_draft(
+                                key,
+                                DraftTarget::Aggregate {
+                                    group: filter,
+                                    quantifier,
+                                },
+                                window,
+                                cx,
+                            )
+                        })
+                        .ok();
+                });
+                menu = menu.submenu(label, move |menu, _, _| {
+                    path_menu(
+                        menu,
+                        &pick,
+                        &schema,
+                        &root.key,
+                        &root.type_name,
+                        &root.edge,
+                        root.depth,
+                        root.icon,
+                        PathOffer::Aggregate(quantifier),
+                    )
+                });
+            }
+            menu = menu.separator().header(format!("Each {other_type} where"));
+            let relationship = crate::model::group_parts(&key, &group).0;
+            for (at, test) in group.tests.iter().enumerate() {
+                let label = crate::model::filter_sentence(&builder::group_filter(
+                    &key,
+                    &Group {
+                        tests: vec![test.clone()],
+                        ..Group::default()
+                    },
+                ))
+                .trim_start_matches(relationship.as_str())
+                .trim_start_matches(" any where ")
+                .to_owned();
+                let path = builder::test_path(test)
+                    .map(|(relative, op, value)| (format!("{key}.{relative}"), op, value));
+                let (edit_test, separate, remove) = {
+                    let (filter, key, group) = (filter.clone(), key.clone(), group.clone());
+                    let editing = path.clone().map(|(path, op, value)| {
+                        let filter = filter.clone();
+                        edit(Rc::new(move |this, window, cx| {
+                            this.start_group_draft(
+                                path.clone(),
+                                DraftTarget::Test {
+                                    group: filter.clone(),
+                                    test: Some(at),
+                                },
+                                window,
+                                cx,
+                            );
+                            this.fill_draft(op, &value, window, cx);
+                        }))
+                    });
+                    let separate = {
+                        let (filter, key, group) = (filter.clone(), key.clone(), group.clone());
+                        edit(Rc::new(move |this, _, cx| {
+                            let mut kept = group.clone();
+                            let moved = kept.tests.remove(at);
+                            let own = builder::group_filter(
+                                &key,
+                                &Group {
+                                    tests: vec![moved],
+                                    ..Group::default()
+                                },
+                            );
+                            let rest = (!kept.tests.is_empty())
+                                .then(|| builder::group_filter(&key, &kept));
+                            this.replace_filter(&filter, rest, cx);
+                            this.filters.push(own);
+                            this.reload(true, cx);
+                        }))
+                    };
+                    let remove = edit(Rc::new(move |this, _, cx| {
+                        let mut kept = group.clone();
+                        kept.tests.remove(at);
+                        // A group of none or every without a test still says something.
+                        let rest = (!kept.tests.is_empty()
+                            || !matches!(kept.quantifier, Quantifier::Any))
+                        .then(|| builder::group_filter(&key, &kept));
+                        this.replace_filter(&filter, rest, cx);
+                    }));
+                    (editing, separate, remove)
+                };
+                let several = group.tests.len() > 1;
+                let cell = Rc::new(std::cell::RefCell::new(Some((edit_test, separate, remove))));
+                menu = menu.submenu(label, move |mut menu, _, _| {
+                    if let Some((edit_test, separate, remove)) = cell.borrow_mut().take() {
+                        if let Some(edit_test) = edit_test {
+                            menu = menu.entry("Edit", None, edit_test);
+                        }
+                        if several {
+                            menu = menu.entry("Separate into its own filter", None, separate);
+                        }
+                        menu = menu.entry("Remove", None, remove);
+                    }
+                    menu
+                });
+            }
+            {
+                let (table, filter) = (table.clone(), filter.clone());
+                let pick: PickKey = Rc::new(move |key, window, cx| {
+                    let filter = filter.clone();
+                    table
+                        .update(cx, |this, cx| {
+                            this.start_group_draft(
+                                key,
+                                DraftTarget::Test {
+                                    group: filter,
+                                    test: None,
+                                },
+                                window,
+                                cx,
+                            )
+                        })
+                        .ok();
+                });
+                let (schema, root) = (schema.clone(), root.clone());
+                menu = menu.submenu("Add a test", move |menu, _, _| {
+                    path_menu(
+                        menu,
+                        &pick,
+                        &schema,
+                        &root.key,
+                        &root.type_name,
+                        &root.edge,
+                        root.depth,
+                        root.icon,
+                        PathOffer::Tests,
+                    )
+                });
+            }
+            if can_merge && !merges.is_empty() {
+                menu = menu.separator().header(format!("The same {other_type} as"));
+                for (other, sentence) in &merges {
+                    let (filter, other, key, group) =
+                        (filter.clone(), other.clone(), key.clone(), group.clone());
+                    menu = menu.entry(
+                        sentence.clone(),
+                        None,
+                        edit(Rc::new(move |this, _, cx| {
+                            let Some((_, theirs)) = builder::as_group(&other) else {
+                                return;
+                            };
+                            let mut merged = group.clone();
+                            merged.tests.extend(theirs.tests);
+                            this.filters.retain(|f| *f != other);
+                            this.replace_filter(
+                                &filter,
+                                Some(builder::group_filter(&key, &merged)),
+                                cx,
+                            );
+                        })),
+                    );
+                }
+            }
+            let filter = filter.clone();
+            menu.separator().entry(
+                "Remove filter",
+                None,
+                edit(Rc::new(move |this, _, cx| {
+                    this.replace_filter(&filter, None, cx)
+                })),
+            )
+        });
+        let subscription = cx.subscribe_in(
+            &menu,
+            window,
+            |this, _, _: &gpui::DismissEvent, window, cx| {
+                this.group_menu = None;
+                if this.filter_draft.is_none() {
+                    window.focus(&this.focus_handle, cx);
+                }
+                cx.notify();
+            },
+        );
+        window.focus(&menu.focus_handle(cx), cx);
+        self.group_menu = Some((menu, position, subscription));
+        cx.notify();
+    }
+
+    /// Puts `made` where `old` stands in the bar, or takes `old` out, and reads again.
+    fn replace_filter(&mut self, old: &Filter, made: Option<Filter>, cx: &mut Context<Self>) {
+        let Some(index) = self.filters.iter().position(|f| f == old) else {
+            return;
+        };
+        match made {
+            Some(made) => self.filters[index] = made,
+            None => {
+                self.filters.remove(index);
+            }
+        }
+        self.reload(true, cx);
+    }
+
+    /// A draft whose key is a path from a group's relationship, applied into the group.
+    fn start_group_draft(
+        &mut self,
+        key: String,
+        target: DraftTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_draft_property(key, window, cx);
+        if let Some(draft) = &mut self.filter_draft {
+            draft.target = target;
+        }
+        if let Some(draft) = &self.filter_draft {
+            let op = self.draft_ops(draft).first().copied();
+            if let Some(op) = op {
+                self.set_draft_op(op, window, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// The draft's test and value as `op` and `value` say, as a pill opened to edit shows them.
+    fn fill_draft(
+        &mut self,
+        op: FilterOp,
+        value: &Value,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_draft_op(op, window, cx);
+        let text = if op.takes_value() {
+            edit_text(value)
+        } else {
+            String::new()
+        };
+        self.filter_editor.update(cx, |editor, cx| {
+            editor.set_text(text, window, cx);
+            let end = editor.buffer().read(cx).read(cx).len();
+            editor.change_selections(Default::default(), window, cx, |s| {
+                s.select_ranges(vec![end..end])
+            });
+        });
+        self.refresh_suggestions(cx);
     }
 
     fn remove_filter(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -8543,22 +9248,47 @@ impl TypeTable {
             {
                 value = Some(label.clone());
             }
-            bar = bar.child(
-                studio_ui::ds::filter_pill(
-                    ("filter", index),
-                    self.key_icon(&filter.property),
-                    field,
-                    test,
-                    value.map(Into::into),
-                    cx.listener(move |this, _, _, cx| this.remove_filter(index, cx)),
-                    cx,
-                )
-                .cursor_pointer()
-                .tip(studio_ui::ds::tooltip("Edit this filter"))
+            let pill = studio_ui::ds::filter_pill(
+                ("filter", index),
+                self.key_icon(&filter.property),
+                field,
+                test,
+                value.map(Into::into),
+                cx.listener(move |this, _, _, cx| this.remove_filter(index, cx)),
+                cx,
+            )
+            .cursor_pointer();
+            // A group opens its menu (spec 025); a neighbour's property, the group of one test
+            // it is, opens it on a right click, and edits as any pill on a click.
+            let pill = if filter.op == FilterOp::Where {
+                pill.tip(studio_ui::ds::tooltip(crate::model::filter_sentence(
+                    filter,
+                )))
+                .on_click(cx.listener(
+                    move |this, event: &ClickEvent, window, cx| {
+                        this.open_group_menu(index, event.position(), window, cx)
+                    },
+                ))
+            } else {
+                let grouped = builder::as_group(filter).is_some();
+                pill.tip(studio_ui::ds::tooltip(if grouped {
+                    "Edit this filter · right-click to test the same record again"
+                } else {
+                    "Edit this filter"
+                }))
                 .on_click(
                     cx.listener(move |this, _, window, cx| this.edit_filter(index, window, cx)),
-                ),
-            );
+                )
+                .when(grouped, |pill| {
+                    pill.on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            this.open_group_menu(index, event.position, window, cx)
+                        }),
+                    )
+                })
+            };
+            bar = bar.child(pill);
         }
         if let Some(draft) = &self.filter_draft {
             let table = cx.entity().downgrade();
@@ -8568,9 +9298,11 @@ impl TypeTable {
                 .iter()
                 .find(|(key, _, _)| *key == draft.property)
                 .map(|(_, label, _)| label.clone())
-                .unwrap_or_else(|| draft.property.clone());
-            let ops = self.ops_for(&draft.property);
+                .unwrap_or_else(|| path_label(&draft.property));
+            let ops = self.draft_ops(draft);
             let property_table = table.clone();
+            let schema = self.schema.clone();
+            let rooted = self.draft_root(draft);
             let chosen_icon = self.key_icon(&draft.property);
             // The filter being written is the pill it will become, outlined while it is open:
             // a ring outside it as the pill's own edge is, so its buttons keep a button's height.
@@ -8587,7 +9319,21 @@ impl TypeTable {
                             let table = property_table.clone();
                             let choices = choices.clone();
                             let entries = entries.clone();
+                            let (schema, rooted) = (schema.clone(), rooted.clone());
                             Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                                if let Some((schema, root)) = schema.clone().zip(rooted.clone()) {
+                                    return path_menu(
+                                        menu,
+                                        &pick_for(&table),
+                                        &schema,
+                                        &root.key,
+                                        &root.type_name,
+                                        &root.edge,
+                                        root.depth,
+                                        root.icon,
+                                        root.offer,
+                                    );
+                                }
                                 let mut relationships = false;
                                 for entry in entries.iter() {
                                     let at = match entry {
@@ -8612,44 +9358,41 @@ impl TypeTable {
                                         }
                                         // The neighbours' properties open beside it, as the
                                         // Group menu's do; the relationship itself comes first.
-                                        FilterMenuEntry::Relationship {
-                                            other_type,
-                                            properties,
-                                            ..
-                                        } => {
-                                            let (table, choices) = (table.clone(), choices.clone());
+                                        FilterMenuEntry::Relationship { other_type, .. } => {
+                                            let Some(schema) = schema.clone() else {
+                                                continue;
+                                            };
+                                            let edge = builder::parse_relationship_key(key)
+                                                .map(|(_, edge)| edge.to_owned())
+                                                .unwrap_or_default();
+                                            let table = table.clone();
                                             let (key, label, icon) =
                                                 (key.clone(), label.clone(), *icon);
-                                            let (other_type, properties) =
-                                                (other_type.clone(), properties.clone());
+                                            let other_type = other_type.clone();
                                             menu = menu.submenu_with_colored_icon(
                                                 label.clone(),
                                                 icon,
                                                 Color::Muted,
-                                                move |mut menu, _, _| {
-                                                    menu = menu
+                                                move |menu, _, _| {
+                                                    let menu = menu
                                                         .item(filter_key_entry(
                                                             &table,
                                                             key.clone(),
                                                             label.clone(),
                                                             icon,
                                                         ))
-                                                        .separator()
-                                                        .header(format!("{other_type}'s property"));
-                                                    for (nested, _, _) in
-                                                        &choices[properties.clone()]
-                                                    {
-                                                        let name = nested
-                                                            .rsplit_once('.')
-                                                            .map_or(nested.as_str(), |(_, p)| p);
-                                                        menu = menu.item(filter_key_entry(
-                                                            &table,
-                                                            nested.clone(),
-                                                            name.to_owned(),
-                                                            icon,
-                                                        ));
-                                                    }
-                                                    menu
+                                                        .separator();
+                                                    path_menu(
+                                                        menu,
+                                                        &pick_for(&table),
+                                                        &schema,
+                                                        &key,
+                                                        &other_type,
+                                                        &edge,
+                                                        1,
+                                                        icon,
+                                                        PathOffer::Tests,
+                                                    )
                                                 },
                                             );
                                         }
@@ -11104,6 +11847,11 @@ impl Render for TypeTable {
                     .as_ref()
                     .map(|(menu, position, _)| studio_ui::ds::menu_at(menu.clone(), *position)),
             )
+            .children(
+                self.group_menu
+                    .as_ref()
+                    .map(|(menu, position, _)| studio_ui::ds::menu_at(menu.clone(), *position)),
+            )
     }
 }
 
@@ -11876,7 +12624,8 @@ mod tests {
     }
 
     /// The Filter menu lists each relationship once, with its neighbours' properties in a
-    /// submenu of it; a relationship without any is a plain entry. Before, every neighbour
+    /// submenu of it; since spec 025 a relationship without any is a submenu too, which holds
+    /// its edge's properties and further hops. Before, every neighbour
     /// property followed its relationship in the one menu: 1,122 entries for the personal
     /// graph's Person, every one drawn at each frame the menu was open.
     #[test]
@@ -11905,7 +12654,11 @@ mod tests {
                     other_type: "Person".into(),
                     properties: 2..4,
                 },
-                FilterMenuEntry::Key(4),
+                FilterMenuEntry::Relationship {
+                    key: 4,
+                    other_type: "Person".into(),
+                    properties: 5..5,
+                },
                 FilterMenuEntry::Relationship {
                     key: 5,
                     other_type: "Project".into(),
@@ -12030,14 +12783,19 @@ mod tests {
         table.read_with(cx, |table, _| {
             assert_eq!(&*table.schema.as_ref().unwrap().source, unnamed);
             assert_eq!(table.filters, [filters[1].clone(), filters[3].clone()]);
-            // The menus follow the schema: no name to offer, the relationship a plain entry.
+            // The menus follow the schema: no name to offer, the relationship a submenu with
+            // nothing of the neighbour's own under it.
             let choices = table.filter_choices();
             assert!(!choices.iter().any(|(key, _, _)| key.ends_with("name")));
             let knows = choices
                 .iter()
                 .position(|(key, _, _)| key == "out:Knows")
                 .unwrap();
-            assert!(table.filter_menu().contains(&FilterMenuEntry::Key(knows)));
+            assert!(table.filter_menu().iter().any(|entry| matches!(
+                entry,
+                FilterMenuEntry::Relationship { key, properties, .. }
+                    if *key == knows && properties.is_empty()
+            )));
         });
     }
 
@@ -12310,6 +13068,115 @@ mod tests {
                 }],
                 "one filter, on the other key"
             );
+        });
+    }
+
+    /// A draft on an edge's property or a further hop applies as a group, a test drafted into a
+    /// group joins it, and an aggregate sets the group's quantifier (spec 025); the old
+    /// neighbour-property form stays as it was.
+    #[gpui::test]
+    async fn drafts_through_relationships_apply_as_groups(cx: &mut TestAppContext) {
+        let schema = format!(
+            "{PEOPLE}node Company {{\n  slug: String @key\n  city: String?\n}}\n\
+             node City {{\n  slug: String @key\n  country: String?\n}}\n\
+             edge WorksAt: Person -> Company {{\n  role: String?\n  hours: I32?\n}}\n\
+             edge LocatedIn: Company -> City\n"
+        );
+        let session = session(&schema, cx);
+        let (table, cx) = people_table(&session, cx);
+        cx.run_until_parked();
+        let type_text = |table: &mut TypeTable,
+                         text: &str,
+                         window: &mut Window,
+                         cx: &mut Context<TypeTable>| {
+            table
+                .filter_editor
+                .update(cx, |editor, cx| editor.set_text(text, window, cx));
+        };
+        table.update_in(cx, |table, window, cx| {
+            // The edge's own property.
+            table.set_draft_property("out:WorksAt.@role".into(), window, cx);
+            assert!(table.filter_draft.is_some(), "the edge's role is a key");
+            type_text(table, "CTO", window, cx);
+            table.apply_filter_draft(window, cx);
+            let (key, group) = builder::as_group(&table.filters[0]).unwrap();
+            assert_eq!(key, "out:WorksAt");
+            assert_eq!(table.filters[0].op, FilterOp::Where);
+            assert_eq!(group.tests[0].property, "@role");
+
+            // A second test on the same company.
+            let first = table.filters[0].clone();
+            table.start_group_draft(
+                "out:WorksAt.city".into(),
+                DraftTarget::Test {
+                    group: first,
+                    test: None,
+                },
+                window,
+                cx,
+            );
+            type_text(table, "Berlin", window, cx);
+            table.apply_filter_draft(window, cx);
+            assert_eq!(table.filters.len(), 1, "joined the group");
+            let (_, group) = builder::as_group(&table.filters[0]).unwrap();
+            assert_eq!(group.tests.len(), 2);
+            assert_eq!(group.tests[1].property, "city");
+
+            // The total of the edge's hours.
+            let first = table.filters[0].clone();
+            table.start_group_draft(
+                "out:WorksAt.@hours".into(),
+                DraftTarget::Aggregate {
+                    group: first,
+                    quantifier: Quantifier::Sum,
+                },
+                window,
+                cx,
+            );
+            let ops = table.draft_ops(table.filter_draft.as_ref().unwrap());
+            assert!(!ops.contains(&FilterOp::In), "{ops:?}");
+            table.set_draft_op(FilterOp::Gt, window, cx);
+            type_text(table, "10", window, cx);
+            table.apply_filter_draft(window, cx);
+            let (_, group) = builder::as_group(&table.filters[0]).unwrap();
+            assert_eq!(group.quantifier, Quantifier::Sum);
+            assert_eq!(group.of.as_deref(), Some("@hours"));
+            assert_eq!(group.than, Some(serde_json::json!(10)));
+
+            // Two hops.
+            table.set_draft_property("out:WorksAt.out:LocatedIn.country".into(), window, cx);
+            type_text(table, "Germany", window, cx);
+            table.apply_filter_draft(window, cx);
+            let (_, hop) = builder::as_group(&table.filters[1]).unwrap();
+            assert_eq!(hop.tests[0].property, "out:LocatedIn.country");
+
+            // A neighbour's own property is kept as it always was.
+            table.set_draft_property("out:WorksAt.city".into(), window, cx);
+            type_text(table, "Paris", window, cx);
+            table.apply_filter_draft(window, cx);
+            assert_eq!(table.filters[2].property, "out:WorksAt.city");
+            assert_eq!(table.filters[2].op, FilterOp::Eq);
+        });
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert!(
+                !matches!(table.first_page, Loadable::Failed(_)),
+                "the groups were read"
+            );
+            let (_, test, value) = filter_parts(&table.filters[0]);
+            assert_eq!(test, "total worksAt hours greater than 10 where");
+            assert_eq!(
+                value.as_deref(),
+                Some("worksAt role is CTO · city is Berlin")
+            );
+        });
+        // A group's pill opens its menu.
+        table.update_in(cx, |table, window, cx| {
+            table.open_group_menu(0, gpui::point(px(10.), px(10.)), window, cx);
+            assert!(table.group_menu.is_some());
+            let group = table.filters[0].clone();
+            table.replace_filter(&group, None, cx);
+            assert_eq!(table.filters.len(), 2);
         });
     }
 

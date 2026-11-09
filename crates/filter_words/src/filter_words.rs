@@ -5,7 +5,10 @@
 //! back goes through the same keys, operators and value parsing a filter typed by hand does;
 //! one the type cannot take is dropped and named.
 
-use gq_language::builder::{Filter, FilterOp, NODE_VAR, Sort};
+use gq_language::SchemaModel;
+use gq_language::builder::{
+    self, Filter, FilterOp, Group, GroupTest, MAX_HOPS, NODE_VAR, PageStart, Quantifier, Sort,
+};
 use gq_language::input::parse_scalar;
 use gq_language::schema::Property;
 use model::{Limits, Task as ModelTask, Tier};
@@ -32,9 +35,10 @@ pub const INSTRUCTIONS: &str = "Turn the request into filters on a table of rows
 Use only the properties and operators listed. Answer with the JSON object only. A date is \
 ISO 8601. An operator that takes no value gets an empty list; `in` lists every member; every \
 other operator takes one value. Prefer an enum's exact value. Filters are joined with and. \
-When the request needs or, not, a count, two tests on one related record or more than one \
-hop, put that part in `predicate` as a GQ condition on the row variable $n and leave it out \
-of the filters; otherwise predicate is null. When the request names nothing the table has, \
+When `groups` is offered, put tests on one related record in one group; use a group's \
+quantifier for none, every, at least, at most and totals, and a group inside a group for a \
+further hop. Put only or, and anything groups cannot say, in `predicate` as a GQ condition on \
+the row variable $n and leave it out of the filters; otherwise predicate is null. When the request names nothing the table has, \
 answer with no filters and a null predicate. Set `sort`, `group_by` and `columns` only when \
 the request asks how the rows are ordered or grouped or which columns show; leave each empty \
 otherwise.";
@@ -78,7 +82,98 @@ pub struct View {
 /// keep the table's own. Each is a list, as a strict schema has no optional field; one whose
 /// choices are none is left out, as an enum of none is no schema.
 pub fn schema(choices: &[Choice], view: &ViewChoices) -> Value {
-    let keys: Vec<&str> = choices.iter().map(|choice| choice.key.as_str()).collect();
+    schema_with(choices, view, None)
+}
+
+/// What a sentence may reach through groups (spec 025): the schema and the row's type. Without
+/// it, an answer has no groups (the tree's relationship filter).
+#[derive(Clone, Copy)]
+pub struct Reach<'a> {
+    pub schema: &'a SchemaModel,
+    pub type_name: &'a str,
+}
+
+/// A type a group reaches: how many hops from the row, its name, and its relationships as
+/// (key, edge, other type).
+type Reached = (usize, String, Vec<(String, String, String)>);
+
+impl Reach<'_> {
+    /// The types a group can reach from the row, by how many hops: each with the edge that
+    /// reached it, after the first hop's.
+    fn types(&self) -> Vec<Reached> {
+        let mut seen: Vec<String> = vec![self.type_name.to_owned()];
+        let mut out = Vec::new();
+        let mut frontier = vec![self.type_name.to_owned()];
+        for hops in 1..=MAX_HOPS {
+            let mut next = Vec::new();
+            for type_name in &frontier {
+                for group in self.schema.relationships_of(type_name) {
+                    if seen.contains(&group.other_type) {
+                        continue;
+                    }
+                    seen.push(group.other_type.clone());
+                    next.push(group.other_type.clone());
+                }
+            }
+            for type_name in &next {
+                let relationships = self
+                    .schema
+                    .relationships_of(type_name)
+                    .iter()
+                    .map(|group| {
+                        (
+                            builder::relationship_key(group),
+                            group.edge.clone(),
+                            group.other_type.clone(),
+                        )
+                    })
+                    .collect();
+                out.push((hops, type_name.clone(), relationships));
+            }
+            frontier = next;
+        }
+        out
+    }
+
+    /// What a filter inside a group may name: every reachable type's filterable property and
+    /// every edge property, as `@name`, once each.
+    fn inside_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        let mut add = |name: String| {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        };
+        for (_, type_name, _) in self.types() {
+            if let Some(node) = self.schema.node(&type_name) {
+                for property in &node.properties {
+                    if !FilterOp::for_property(property).is_empty() {
+                        add(property.name.clone());
+                    }
+                }
+            }
+        }
+        for edge in &self.schema.edges {
+            for property in &edge.properties {
+                if !FilterOp::for_property(property).is_empty() {
+                    add(builder::edge_property_key(&property.name));
+                }
+            }
+        }
+        add(builder::ID_FILTER.to_owned());
+        names
+    }
+}
+
+/// [`schema`], with groups when `reach` is given.
+pub fn schema_with(choices: &[Choice], view: &ViewChoices, reach: Option<Reach>) -> Value {
+    let inside = reach.map(|reach| reach.inside_names()).unwrap_or_default();
+    let mut keys: Vec<&str> = choices.iter().map(|choice| choice.key.as_str()).collect();
+    for name in &inside {
+        if !keys.contains(&name.as_str()) {
+            keys.push(name);
+        }
+    }
     let mut ops: Vec<&str> = choices
         .iter()
         .flat_map(|choice| choice.ops.iter().map(|op| op.key()))
@@ -109,12 +204,47 @@ pub fn schema(choices: &[Choice], view: &ViewChoices) -> Value {
         "required": ["filters", "predicate"],
         "additionalProperties": false,
     });
+    if reach.is_some() {
+        let item = &mut shape["properties"]["filters"]["items"];
+        item["properties"]["group"] = json!({
+            "type": "string",
+            "description": "Empty for a test on the row; else the id of the group whose related record it tests, and the property is that record's own or its edge's (@name).",
+        });
+        if let Some(required) = item["required"].as_array_mut() {
+            required.push(json!("group"));
+        }
+    }
     let mut add = |name: &str, field: Value| {
         shape["properties"][name] = field;
         if let Some(required) = shape["required"].as_array_mut() {
             required.push(json!(name));
         }
     };
+    if reach.is_some() {
+        let quantifiers: Vec<&str> = Quantifier::ALL.iter().map(|q| q.key()).collect();
+        add(
+            "groups",
+            json!({
+                "type": "array",
+                "description": "Tests on one related record, joined: each group is one relationship from the row (parent empty) or from another group's record (parent its id), and how many of its records must pass its filters.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "parent": {"type": "string"},
+                        "relationship": {"type": "string", "description": "A relationship key of the parent's record type, or of the row's."},
+                        "quantifier": {"type": "string", "enum": quantifiers},
+                        "count": {"type": ["integer", "null"], "description": "The n of at_least and at_most; else null."},
+                        "of": {"type": "string", "description": "For sum, avg, min, max: the record's property or its edge's (@name); else empty."},
+                        "compare": {"type": "string", "description": "For sum, avg, min, max: eq, ne, lt, le, gt or ge; else empty."},
+                        "than": {"type": "string", "description": "For sum, avg, min, max: the value compared with; else empty."},
+                    },
+                    "required": ["id", "parent", "relationship", "quantifier", "count", "of", "compare", "than"],
+                    "additionalProperties": false,
+                },
+            }),
+        );
+    }
     if !view.sorts.is_empty() {
         add(
             "sort",
@@ -167,6 +297,20 @@ pub fn input(
     today: &str,
     sentence: &str,
 ) -> String {
+    input_with(type_name, choices, view, today, sentence, None)
+}
+
+/// [`input`], saying what groups can reach when `reach` is given: each relationship's own
+/// properties, and the types one, two and three hops away with their properties and
+/// relationships. The further hops go first when the input would pass the cap.
+pub fn input_with(
+    type_name: &str,
+    choices: &[Choice],
+    view: &ViewChoices,
+    today: &str,
+    sentence: &str,
+    reach: Option<Reach>,
+) -> String {
     let mut text = format!("Table: rows of type {type_name}. Today is {today}.\n\nKeys:\n");
     // The type's own properties, one line each; then each relationship on a line of its own,
     // their operators said once for all; then each related type's properties once, however
@@ -208,6 +352,20 @@ pub fn input(
         }
         if relationship.ops != common {
             text.push_str(&format!("; operators {}", op_keys(&relationship.ops)));
+        }
+        if let Some(reach) = reach
+            && let Some((_, edge)) = builder::parse_relationship_key(&relationship.key)
+            && let Some(edge) = reach.schema.edge(edge)
+        {
+            let own: Vec<String> = edge
+                .properties
+                .iter()
+                .filter(|p| !FilterOp::for_property(p).is_empty())
+                .map(|p| format!("@{} {}", p.name, kind_of(p)))
+                .collect();
+            if !own.is_empty() {
+                text.push_str(&format!("; its own properties: {}", own.join(", ")));
+            }
         }
         text.push('\n');
         let Some(other) = relationship.other_type.as_deref() else {
@@ -262,6 +420,61 @@ pub fn input(
             listed.push_str(&format!("- {other}: {}\n", nested.join(", ")));
         }
     }
+    // What groups reach past the relationships above, as far as fits: each type's
+    // relationships (but not at the last hop listed, which goes no further), and the
+    // properties of types two and three hops away (one hop away's are listed above).
+    let hops_to = |limit: usize| -> String {
+        let Some(reach) = reach else {
+            return String::new();
+        };
+        let mut out = String::from(
+            "\nGroups: a group is one relationship key from the row (parent \"\") or from a group's \
+             record (parent its id); its filters name that record's property, or its edge's as \
+             @name, with group set to its id. Quantifier any (default), none, every, at_least or \
+             at_most with count, or sum, avg, min, max of `of` compared by `compare` with \
+             `than`. Two tests on one related record go in one group.\n",
+        );
+        if limit < 2 {
+            return out;
+        }
+        out.push_str("\nFurther hops, by type:\n");
+        for (count, type_name, relationships) in reach.types() {
+            if count >= limit {
+                if count == limit {
+                    // The last hop: its properties only.
+                } else {
+                    continue;
+                }
+            }
+            let Some(node) = reach.schema.node(&type_name) else {
+                continue;
+            };
+            let mut parts = Vec::new();
+            if count > 1 {
+                let properties: Vec<String> = node
+                    .properties
+                    .iter()
+                    .filter(|p| !FilterOp::for_property(p).is_empty())
+                    .map(|p| format!("{} {}", p.name, kind_of(p)))
+                    .collect();
+                parts.push(properties.join(", "));
+            }
+            if count < limit && !relationships.is_empty() {
+                let relationships: Vec<String> = relationships
+                    .iter()
+                    .map(|(key, _, other)| format!("{key} {other}"))
+                    .collect();
+                parts.push(format!("relationships: {}", relationships.join(", ")));
+            }
+            if !parts.is_empty() {
+                out.push_str(&format!(
+                    "- {type_name} ({count} away): {}\n",
+                    parts.join("; ")
+                ));
+            }
+        }
+        out
+    };
     let rest = format!(
         "\nOperators: eq, ne, lt, le, gt, ge compare one value; contains matches text or a \
          list member; starts_with and search (the words, in any order) match text; in takes \
@@ -279,11 +492,35 @@ pub fn input(
     );
     // The related types' properties are what a wide type cannot always fit: left out, and said
     // to be, when they would pass the task's cap, so the request is still sent.
-    if text.len() + listed.len() + rest.len() > TASK.limits.input_bytes {
+    // The hops are a help, not the request: they take at most this much, so a well-connected
+    // type does not send the whole schema with every sentence.
+    const HOPS_BUDGET: usize = 12 * 1024;
+    let fits = |hops: &str, listed: &str| {
+        hops.len() <= HOPS_BUDGET
+            && text.len() + listed.len() + hops.len() + rest.len() <= TASK.limits.input_bytes
+    };
+    let mut hops = (2..=MAX_HOPS)
+        .rev()
+        .map(&hops_to)
+        .find(|hops| fits(hops, &listed))
+        .unwrap_or_else(|| {
+            let mut short = hops_to(1);
+            if reach.is_some() {
+                short.push_str(
+                    "Further hops: not listed for this type; groups go one relationship from the \
+                     row, and a further hop goes in `predicate`.\n",
+                );
+            }
+            short
+        });
+    if !fits(&hops, &listed) && reach.is_some() {
+        hops = hops_to(1);
+    }
+    if text.len() + listed.len() + hops.len() + rest.len() > TASK.limits.input_bytes {
         listed = "\nThe related types' properties are left out: there are too many to list.\n"
             .to_owned();
     }
-    text + &listed + &rest
+    text + &listed + &hops + &rest
 }
 
 /// Operators by their keys, as the answer names them: `eq, ne, contains`.
@@ -313,6 +550,9 @@ fn kind_of(property: &Property) -> String {
 #[derive(Debug, Deserialize)]
 pub struct Answer {
     pub filters: Vec<Item>,
+    /// Tests on one related record (spec 025), when the schema offered them.
+    #[serde(default)]
+    pub groups: Vec<GroupItem>,
     /// A GQ condition for what the filters cannot say; the table judges it with the compiler.
     #[serde(default)]
     pub predicate: Option<String>,
@@ -387,13 +627,65 @@ pub struct Item {
     pub op: String,
     #[serde(default)]
     pub value: Vec<String>,
+    /// The group whose related record this tests; empty for the row.
+    #[serde(default)]
+    pub group: String,
+}
+
+/// One group of an answer (spec 025), flat: its parent names the group it sits in.
+#[derive(Debug, Deserialize, Default)]
+pub struct GroupItem {
+    pub id: String,
+    #[serde(default)]
+    pub parent: String,
+    pub relationship: String,
+    #[serde(default)]
+    pub quantifier: String,
+    #[serde(default)]
+    pub count: Option<u32>,
+    #[serde(default)]
+    pub of: String,
+    #[serde(default)]
+    pub compare: String,
+    #[serde(default)]
+    pub than: String,
 }
 
 /// The answer as filters the table takes, and the keys it could not use, each with why.
 pub fn filters(answer: Answer, choices: &[Choice]) -> (Vec<Filter>, Vec<String>) {
+    filters_with(answer, choices, None)
+}
+
+/// [`filters`], with the answer's groups when `reach` is given: each built from its filters and
+/// the groups inside it, checked against the schema at every level, and dropped and named when
+/// the type cannot take it.
+pub fn filters_with(
+    answer: Answer,
+    choices: &[Choice],
+    reach: Option<Reach>,
+) -> (Vec<Filter>, Vec<String>) {
     let mut filters = Vec::new();
     let mut refused = Vec::new();
-    for item in answer.filters {
+    let (grouped, own): (Vec<Item>, Vec<Item>) = answer
+        .filters
+        .into_iter()
+        .partition(|item| !item.group.trim().is_empty());
+    match reach {
+        Some(reach) => {
+            let (made, why) = groups(&answer.groups, grouped, reach);
+            filters.extend(made);
+            refused.extend(why);
+        }
+        None => {
+            for item in grouped {
+                refused.push(format!(
+                    "{} is in a group, which this view cannot take",
+                    item.property
+                ));
+            }
+        }
+    }
+    for item in own {
         match filter(&item, choices) {
             Ok(filter) => filters.push(filter),
             Err(why) => refused.push(why),
@@ -445,6 +737,238 @@ fn filter(item: &Item, choices: &[Choice]) -> Result<Filter, String> {
         op,
         value,
     })
+}
+
+/// The answer's groups as filters: each top group (parent empty) a [`FilterOp::Where`] filter
+/// (or the neighbour-property form it equals), holding its filters and the groups whose parent
+/// it is. What the schema refuses is named; a group whose parent is missing, or that sits too
+/// deep, is dropped with its filters.
+fn groups(items: &[GroupItem], filters: Vec<Item>, reach: Reach) -> (Vec<Filter>, Vec<String>) {
+    let mut refused = Vec::new();
+    let mut by_group: Vec<(String, Vec<Item>)> = Vec::new();
+    for item in filters {
+        match by_group.iter_mut().find(|(id, _)| *id == item.group) {
+            Some((_, items)) => items.push(item),
+            None => by_group.push((item.group.clone(), vec![item])),
+        }
+    }
+    let known = |id: &str| items.iter().any(|g| g.id == id);
+    for (id, group_items) in &by_group {
+        if !known(id) {
+            for item in group_items {
+                refused.push(format!("{} names no group {id}", item.property));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for top in items.iter().filter(|g| g.parent.trim().is_empty()) {
+        if let Some(group) = build_group(
+            top,
+            items,
+            &by_group,
+            reach,
+            reach.type_name,
+            1,
+            &mut refused,
+        ) {
+            {
+                let filter = builder::group_filter(top.relationship.trim(), &group);
+                let built = builder::node_page(
+                    reach.schema,
+                    reach.type_name,
+                    std::slice::from_ref(&filter),
+                    None,
+                    &PageStart::First,
+                    1,
+                );
+                match built {
+                    Ok(_) => out.push(filter),
+                    Err(why) => refused.push(format!("{}: {why}", top.relationship)),
+                }
+            }
+        }
+    }
+    for orphan in items
+        .iter()
+        .filter(|g| !g.parent.trim().is_empty() && !items.iter().any(|p| p.id == g.parent))
+    {
+        refused.push(format!(
+            "{} sits in no group {}",
+            orphan.relationship, orphan.parent
+        ));
+    }
+    (out, refused)
+}
+
+/// One group of the answer on a record of `near_type`, `depth` hops from the row.
+fn build_group(
+    item: &GroupItem,
+    items: &[GroupItem],
+    by_group: &[(String, Vec<Item>)],
+    reach: Reach,
+    near_type: &str,
+    depth: usize,
+    refused: &mut Vec<String>,
+) -> Option<Group> {
+    let key = item.relationship.trim();
+    if depth > MAX_HOPS {
+        refused.push(format!("{key} is more than {MAX_HOPS} relationships away"));
+        return None;
+    }
+    let Some((node, edge)) = builder::path_end(reach.schema, near_type, &[key]) else {
+        refused.push(format!("{near_type} has no relationship {key}"));
+        return None;
+    };
+    let edge = edge?;
+    let property_of = |name: &str| -> Option<gq_language::Property> {
+        match name.strip_prefix('@') {
+            Some(own) if builder::is_edge_property_key(name) => {
+                edge.properties.iter().find(|p| p.name == own).cloned()
+            }
+            _ => node.property(name).cloned(),
+        }
+    };
+    let mut tests = Vec::new();
+    let mine = by_group
+        .iter()
+        .find(|(id, _)| *id == item.id)
+        .map(|(_, items)| items.as_slice())
+        .unwrap_or_default();
+    for filter in mine {
+        let name = filter.property.trim();
+        let op = FilterOp::from_key(&filter.op);
+        if name == builder::ID_FILTER {
+            match (op, filter.value.first()) {
+                (Some(FilterOp::Eq), Some(id)) => tests.push(GroupTest {
+                    property: name.to_owned(),
+                    op: FilterOp::Eq,
+                    value: Value::String(id.clone()),
+                }),
+                _ => refused.push(format!("{key} @id takes eq and one id")),
+            }
+            continue;
+        }
+        let Some(property) = property_of(name) else {
+            refused.push(format!("{} has no property {name}", node.name));
+            continue;
+        };
+        let Some(op) = op.filter(|op| FilterOp::for_property(&property).contains(op)) else {
+            refused.push(format!("{key} {name} cannot be tested with {}", filter.op));
+            continue;
+        };
+        let value = if !op.takes_value() {
+            Value::Null
+        } else if op == FilterOp::In {
+            match filter
+                .value
+                .iter()
+                .map(|text| parse_filter_value(&property, text))
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(values) => Value::Array(values),
+                Err(why) => {
+                    refused.push(format!("{key} {name}: {why}"));
+                    continue;
+                }
+            }
+        } else {
+            match filter
+                .value
+                .first()
+                .map(|text| parse_filter_value(&property, text))
+            {
+                Some(Ok(value)) => value,
+                Some(Err(why)) => {
+                    refused.push(format!("{key} {name}: {why}"));
+                    continue;
+                }
+                None => {
+                    refused.push(format!("{key} {name} {} needs a value", filter.op));
+                    continue;
+                }
+            }
+        };
+        tests.push(GroupTest {
+            property: name.to_owned(),
+            op,
+            value,
+        });
+    }
+    for inner in items
+        .iter()
+        .filter(|g| g.parent == item.id && !g.id.is_empty() && g.id != item.id)
+    {
+        if let Some(group) = build_group(
+            inner,
+            items,
+            by_group,
+            reach,
+            &node.name,
+            depth + 1,
+            refused,
+        ) {
+            let nested = builder::group_filter(inner.relationship.trim(), &group);
+            tests.push(GroupTest::from(&nested));
+        }
+    }
+    let quantifier = match item.quantifier.trim() {
+        "" => Quantifier::Any,
+        key => match Quantifier::from_key(key) {
+            Some(quantifier) => quantifier,
+            None => {
+                refused.push(format!("{key} is not a quantifier"));
+                return None;
+            }
+        },
+    };
+    let mut group = Group {
+        quantifier,
+        tests,
+        ..Group::default()
+    };
+    if quantifier.counts() {
+        let Some(count) = item.count else {
+            refused.push(format!("{key} {} needs a count", quantifier.key()));
+            return None;
+        };
+        group.count = Some(count);
+    }
+    if quantifier.aggregates() {
+        let of = item.of.trim();
+        let property = property_of(of).filter(|p| quantifier.takes(p));
+        let compare = FilterOp::from_key(item.compare.trim()).filter(|op| {
+            matches!(
+                op,
+                FilterOp::Eq
+                    | FilterOp::Ne
+                    | FilterOp::Lt
+                    | FilterOp::Le
+                    | FilterOp::Gt
+                    | FilterOp::Ge
+            )
+        });
+        let (Some(mut property), Some(compare)) = (property, compare) else {
+            refused.push(format!(
+                "{key}: the {} of {of} cannot be compared so",
+                quantifier.key()
+            ));
+            return None;
+        };
+        if quantifier == Quantifier::Avg {
+            property.kind = gq_language::schema::ScalarKind::Float;
+        }
+        let than = match parse_filter_value(&property, &item.than) {
+            Ok(than) => than,
+            Err(why) => {
+                refused.push(format!("{key} {of}: {why}"));
+                return None;
+            }
+        };
+        group.of = Some(of.to_owned());
+        group.compare = Some(compare);
+        group.than = Some(than);
+    }
+    Some(group)
 }
 
 /// A filter's value as typed for `property`: one element, parsed as its kind; an empty text is
@@ -509,6 +1033,149 @@ mod tests {
         out
     }
 
+    /// People, their companies with the edge's own properties, and the companies' cities.
+    const HOPS: &str = "node Person {\n  slug: String @key\n  name: String\n}\n\
+        node Company {\n  slug: String @key\n  city: String?\n  employees: I32?\n}\n\
+        node City {\n  slug: String @key\n  country: String?\n}\n\
+        edge WorksAt: Person -> Company {\n  role: String?\n  hours: I32?\n}\n\
+        edge LocatedIn: Company -> City\n";
+
+    fn group_item(id: &str, parent: &str, relationship: &str, quantifier: &str) -> GroupItem {
+        GroupItem {
+            id: id.into(),
+            parent: parent.into(),
+            relationship: relationship.into(),
+            quantifier: quantifier.into(),
+            ..GroupItem::default()
+        }
+    }
+
+    fn in_group(group: &str, property: &str, op: &str, value: &str) -> Item {
+        Item {
+            property: property.into(),
+            op: op.into(),
+            value: if value.is_empty() {
+                Vec::new()
+            } else {
+                vec![value.into()]
+            },
+            group: group.into(),
+        }
+    }
+
+    /// With the schema offered, an answer's groups become filters on one related record: two
+    /// tests on one company, the edge's own property, a further hop, a count and a total; what
+    /// the schema cannot take is named and left out (spec 025).
+    #[test]
+    fn an_answers_groups_test_one_related_record() {
+        let model = gq_language::SchemaModel::parse(HOPS).unwrap();
+        let reach = Reach {
+            schema: &model,
+            type_name: "Person",
+        };
+        let shape = schema_with(&[], &ViewChoices::default(), Some(reach));
+        let names = &shape["properties"]["filters"]["items"]["properties"]["property"]["enum"];
+        for name in ["city", "employees", "country", "@role", "@hours"] {
+            assert!(
+                names.as_array().unwrap().contains(&json!(name)),
+                "{name}: {names}"
+            );
+        }
+        assert!(
+            shape["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("groups"))
+        );
+        assert_eq!(
+            schema(&[], &ViewChoices::default())["properties"]["groups"],
+            Value::Null,
+            "no groups without the schema"
+        );
+        let input = input_with(
+            "Person",
+            &[],
+            &ViewChoices::default(),
+            "2026-11-08",
+            "x",
+            Some(reach),
+        );
+        assert!(input.contains("- Company (1 away)"), "{input}");
+        assert!(input.contains("- City (2 away)"), "{input}");
+        assert!(
+            input.contains("relationships: out:LocatedIn City"),
+            "{input}"
+        );
+
+        let mut total = group_item("g3", "", "out:WorksAt", "sum");
+        total.of = "@hours".into();
+        total.compare = "gt".into();
+        total.than = "100".into();
+        let mut two = group_item("g4", "", "out:WorksAt", "at_least");
+        two.count = Some(2);
+        let answer = Answer {
+            filters: vec![
+                in_group("g1", "city", "eq", "Berlin"),
+                in_group("g1", "employees", "gt", "100"),
+                in_group("g1", "@role", "eq", "CTO"),
+                in_group("g2", "country", "eq", "Germany"),
+                in_group("g4", "city", "eq", "Paris"),
+                in_group("g1", "mood", "eq", "good"),
+                in_group("g9", "city", "eq", "Rome"),
+            ],
+            groups: vec![
+                group_item("g1", "", "out:WorksAt", "any"),
+                group_item("g2", "g1", "out:LocatedIn", ""),
+                total,
+                two,
+                group_item("g5", "", "out:Likes", "any"),
+                group_item("g6", "", "out:WorksAt", "at_most"),
+            ],
+            predicate: None,
+            sort: Vec::new(),
+            group_by: Vec::new(),
+            columns: Vec::new(),
+        };
+        let (made, refused) = filters_with(answer, &[], Some(reach));
+        assert_eq!(made.len(), 3, "{made:?} {refused:?}");
+        let (key, first) = builder::as_group(&made[0]).unwrap();
+        assert_eq!(key, "out:WorksAt");
+        let tested: Vec<&str> = first.tests.iter().map(|t| t.property.as_str()).collect();
+        assert_eq!(
+            tested,
+            ["city", "employees", "@role", "out:LocatedIn.country"]
+        );
+        let (_, sum) = builder::as_group(&made[1]).unwrap();
+        assert_eq!(sum.quantifier, Quantifier::Sum);
+        assert_eq!(sum.than, Some(json!(100)));
+        let (_, at_least) = builder::as_group(&made[2]).unwrap();
+        assert_eq!(at_least.count, Some(2));
+        assert_eq!(
+            refused,
+            [
+                "city names no group g9",
+                "Company has no property mood",
+                "Person has no relationship out:Likes",
+                "out:WorksAt at_most needs a count",
+            ]
+        );
+        // Without the schema, a grouped filter is named, not kept.
+        let (made, refused) = filters_with(
+            Answer {
+                filters: vec![in_group("g1", "city", "eq", "Berlin")],
+                groups: vec![group_item("g1", "", "out:WorksAt", "any")],
+                predicate: None,
+                sort: Vec::new(),
+                group_by: Vec::new(),
+                columns: Vec::new(),
+            },
+            &[],
+            None,
+        );
+        assert!(made.is_empty());
+        assert_eq!(refused.len(), 1);
+    }
+
     /// The schema allows only the keys and operators offered, and the answer's filters are
     /// parsed as typed ones would be; one the type cannot take is named, not kept.
     #[test]
@@ -520,6 +1187,7 @@ mod tests {
             json!(["kind", "date", "out:Attended"])
         );
         let answer = Answer {
+            groups: Vec::new(),
             predicate: Some(" $n.kind = \"dinner\" or $n.kind = \"party\" ".into()),
             sort: Vec::new(),
             group_by: Vec::new(),
@@ -529,26 +1197,31 @@ mod tests {
                     property: "kind".into(),
                     op: "in".into(),
                     value: vec!["dinner".into(), "trip".into()],
+                    group: String::new(),
                 },
                 Item {
                     property: "date".into(),
                     op: "last_30_days".into(),
                     value: vec![],
+                    group: String::new(),
                 },
                 Item {
                     property: "out:Attended".into(),
                     op: "has_any".into(),
                     value: vec![],
+                    group: String::new(),
                 },
                 Item {
                     property: "mood".into(),
                     op: "eq".into(),
                     value: vec!["good".into()],
+                    group: String::new(),
                 },
                 Item {
                     property: "kind".into(),
                     op: "gt".into(),
                     value: vec!["dinner".into()],
+                    group: String::new(),
                 },
             ],
         };
