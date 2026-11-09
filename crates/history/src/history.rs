@@ -3,11 +3,12 @@
 //! Layer 5 (`docs/architecture.md`). Plan: `specs/009-history/plan.md`.
 
 mod commit_view;
+mod commits_panel;
 mod lanes;
 mod merged;
 mod view;
 
-use gpui::App;
+use gpui::{App, AppContext as _};
 use studio_actions::graph::{OpenBranchHistory, OpenCommit, OpenHistory};
 use studio_workspace::Workspace;
 
@@ -43,7 +44,22 @@ pub fn init(cx: &mut App) {
             |_, cx| commit_view::CommitView::when_shown(session, id, cx),
         );
     });
-    cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
+    cx.observe_new(|workspace: &mut Workspace, window, cx| {
+        // The newest commits of every branch, in the left dock (spec 026).
+        if let Some(window) = window {
+            let handle = cx.entity().downgrade();
+            let session = workspace.session().cloned();
+            let panel = cx.new(|cx| commits_panel::CommitsPanel::new(handle, session, window, cx));
+            workspace.add_panel(
+                studio_workspace::PanelPosition::Left,
+                commits_panel::COMMITS_PANEL,
+                "Commits",
+                ui::IconName::GitCommit,
+                panel.clone().into(),
+                cx,
+            );
+            workspace.set_panel_scrolls_itself(&panel.into(), cx);
+        }
         workspace.register_action(|workspace, _: &OpenHistory, window, cx| {
             let Some(session) = workspace.session().cloned() else {
                 return;
