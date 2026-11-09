@@ -430,6 +430,14 @@ type, the property, and whether the query returns that variable's `@id`, would m
 property cells editable as a `.gq` file's are. Engine rule: no query text is exposed; the
 descriptor is the compiler's. *Waits:* 024. *Today:* stored-query views are read-only.
 
+**E44. A commit's change counts in its listing.**
+A commit's change counts are read from its changes (`GET /graphs/{id}/commits/{id}/changes`), one
+page of up to 100 per listed commit, each change carrying its before and after images, only to
+count them; a commit with more shows a partial count. `CommitOutput` in `GET /commits` and
+`GET /commits/{id}` giving the entities the commit added, changed and removed, counted when the
+commit is made, would make the counts of History and the Commits panel one field each and exact.
+*Waits:* 009, 026. *Today:* one changes page per drawn row, kept per commit, partial past 100.
+
 ### In 0.14, not in 0.13.0
 
 Studio's minimum server serves these, so it uses them without asking the server's OpenAPI

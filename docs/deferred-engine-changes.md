@@ -38,6 +38,7 @@ it goes through Omnigraph's own RFC process.
 | E41 | An optional traversal in `match`, so a page sorted by a neighbour's value or an aggregate over a relationship is one keyset run that keeps the nodes with no neighbour | 023 | Sorting by a lookup or rollup is not offered |
 | E42 | A per-graph view registry clients may write, so a view is shared with everyone who opens the graph; a view names a stored query or a type, never its own query text | 024 | Views are personal, in Studio's settings |
 | E43 | A stored query's result columns with the variable, type and property each comes from, in its catalog entry | 024 | Stored-query views are read-only |
+| E44 | A commit's added, changed and removed counts in `CommitOutput` | 009, 026 | One changes page per drawn commit, partial past 100 |
 
 Every server Studio supports serves these (checked against `v0.14.0`'s OpenAPI document, 2026-10-24):
 

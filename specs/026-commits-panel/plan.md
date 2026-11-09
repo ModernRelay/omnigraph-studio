@@ -41,11 +41,15 @@ commit's tab, a double click keeps it.
 - **Live:** while the panel holds them, its watches keep every branch's head asked after; a
   commit landing on one reads that branch's newest page again, and a branch created or deleted
   is read or dropped. The time column is drawn again each minute while the panel shows.
+- **Change counts:** each drawn row shows what its commit added, changed and removed, read as
+  History reads them (`counts::RowCounts`, shared): one page of up to 100 changes per commit,
+  once scrolling pauses, kept for the panel's life; past 100 the count says "+". The graph's
+  first commit, and one that cannot be compared (a schema change) or is past cleanup, shows none.
 - **Open:** a click previews the commit's tab, a double click keeps it (spec 020).
 
 ### Build order
 
-1. The panel: rows across branches, live, click to open. *Built 2026-11-09.*
+1. The panel: rows across branches, live, click to open, with change counts. *Built 2026-11-09.*
 2. Keyboard (↑ ↓ ↵), a filter by branch or actor, and a mark on the commits that landed since
    the panel was last looked at.
 
@@ -58,6 +62,7 @@ commit's tab, a double click keeps it.
 
 ## Deferred
 
+- **E44** (spec 012): the counts in the commit listing, exact and with no read of the changes.
 - A stream of commits across branches from the server, so the panel learns of a commit when it
   lands rather than at the next poll.
 
@@ -66,5 +71,6 @@ commit's tab, a double click keeps it.
 | Date | Claim | Check | Result |
 |---|---|---|---|
 | 2026-11-09 | The panel lists the newest commits of every branch once each, newest first, and a branch that could not be read after them | `history` `commits_panel::tests::rows_are_every_branchs_newest_commits_once_each` | Pass. Not yet checked in the running app |
+| 2026-11-09 | History and the panel read change counts through one `RowCounts`: the drawn rows', once, never the first commit's | `history` `the_first_commits_changes_are_never_asked_for` (History's rows, through `RowCounts`) | Pass. The panel's counts not yet checked in the running app |
 
 ## Corrections
