@@ -23,6 +23,7 @@ ignore = [
     { id = "RUSTSEC-2026-0391", reason = "zstd 0.11 in Zed's rpc crate (the collaboration server's protocol, which Studio never speaks) and 0.13 through Zed's util, rust-embed and include-flate (decompresses Studio's own embedded assets); fixed in 0.14.3, which neither allows" },
     { id = "RUSTSEC-2026-0398", reason = "zstd-safe 7.3 through zstd 0.13, as RUSTSEC-2026-0391; Studio never seeks in a zstd frame; fixed in 8.2, which zstd 0.13 does not allow" },
     { id = "RUSTSEC-2026-0403", reason = "zstd-safe 5.0 and 7.3 through zstd 0.11 and 0.13, as RUSTSEC-2026-0391; the legacy-frame decoder reads only Zed's protocol, unused, and Studio's own assets; fixed in 8.2" },
+    { id = "RUSTSEC-2026-0459", reason = "SQLite before 3.54 bundled in libsqlite3-sys 0.30.1, through Zed's sqlez and db (editor and workspace state); Studio calls neither, and the only databases they open are Zed's own in the user's data folder, never a file another party wrote; fixed in 0.39, which Zed v1.26.2 and v1.27.0 do not allow (0.30.1)" },
 ]
 
 [licenses]
