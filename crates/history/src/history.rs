@@ -4,6 +4,7 @@
 
 mod commit_view;
 mod commits_panel;
+mod counts;
 mod lanes;
 mod merged;
 mod view;

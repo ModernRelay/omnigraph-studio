@@ -38,6 +38,10 @@ pub struct CommitsPanel {
     rows: Vec<Row>,
     /// The commit last clicked, by id.
     selected: Option<String>,
+    /// The drawn commits' change counts, as History reads them (spec 009).
+    counts: crate::counts::RowCounts,
+    /// The rows the frame being drawn laid out, asked for once it is out.
+    drawn: Vec<usize>,
     _session_subscription: Option<Subscription>,
     _tick: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -156,6 +160,8 @@ impl CommitsPanel {
             ),
             rows: Vec::new(),
             selected: None,
+            counts: Default::default(),
+            drawn: Vec::new(),
             _session_subscription: None,
             _tick: None,
             _subscriptions: subscriptions,
@@ -174,6 +180,7 @@ impl CommitsPanel {
         self.watches.clear();
         self.reads.clear();
         self.selected = None;
+        self.counts = Default::default();
         self._session_subscription = session.as_ref().map(|session| {
             cx.subscribe(session, |this, _, event: &SessionEvent, cx| match event {
                 SessionEvent::Committed { branch } if this.pages.contains_key(branch) => {
@@ -275,8 +282,32 @@ impl CommitsPanel {
         });
     }
 
+    /// After a frame: asks for the change counts of the commits it drew.
+    fn want_counts(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.session.clone() else {
+            return;
+        };
+        let drawn: Vec<&CommitOutput> = std::mem::take(&mut self.drawn)
+            .into_iter()
+            .filter_map(|ix| match self.rows.get(ix) {
+                Some(Row::Commit(commit)) => Some(commit.as_ref()),
+                _ => None,
+            })
+            .collect();
+        let mut counts = std::mem::take(&mut self.counts);
+        counts.want(&session, drawn, |this: &mut Self| &mut this.counts, cx);
+        self.counts = counts;
+    }
+
     fn render_row(&mut self, ix: usize, now: i64, cx: &mut Context<Self>) -> AnyElement {
         use studio_ui::ds;
+        if self.drawn.is_empty() {
+            let panel = cx.entity().downgrade();
+            cx.defer(move |cx| {
+                panel.update(cx, |this, cx| this.want_counts(cx)).ok();
+            });
+        }
+        self.drawn.push(ix);
         let Some(row) = self.rows.get(ix).cloned() else {
             return div().into_any_element();
         };
@@ -312,9 +343,23 @@ impl CommitsPanel {
                 );
                 let selected = self.selected.as_deref() == Some(commit.graph_commit_id.as_str());
                 let panel = cx.entity().downgrade();
+                // What it changed, as History counts it, before where and when.
+                let counts = self.counts.of(&commit.graph_commit_id).map(
+                    |((added, changed, removed), partial)| {
+                        h_flex()
+                            .gap(px(ds::space::XS))
+                            .child(studio_ui::change_counts(added, changed, removed))
+                            .when(partial, |d| d.child(ds::text::meta("+")))
+                    },
+                );
                 ds::SidebarRow::new(("commit", ix), label)
                     .icon(IconName::GitCommit)
-                    .end(ds::sidebar_count(format!("{branch} · {when}")))
+                    .end(
+                        h_flex()
+                            .gap(px(ds::space::SM))
+                            .children(counts)
+                            .child(ds::sidebar_count(format!("{branch} · {when}"))),
+                    )
                     .selected(selected)
                     .tip(ds::tooltip(tip))
                     .on_click(move |event, window, cx| {

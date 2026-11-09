@@ -15,7 +15,7 @@ use gpui::{
 };
 use graph_client::ReadError;
 use graph_client::api::{CommitListOutput, CommitOutput};
-use graph_store::{GraphSession, HeadWatch, NetChange, SessionEvent};
+use graph_store::{GraphSession, HeadWatch, SessionEvent};
 use studio_actions::history::{NewBranchHere, NextMatch, PreviousMatch};
 use studio_actions::workspace::Refresh;
 use studio_actions::{ViewKind, ViewLink};
@@ -52,8 +52,6 @@ const MERGED_RETRY_AFTER: Duration = Duration::from_secs(5);
 
 /// The search field in the toolbar.
 const SEARCH_WIDTH: f32 = 240.;
-/// How long scrolling must pause before the drawn rows' change counts are read.
-const COUNTS_AFTER: Duration = Duration::from_millis(120);
 /// How long typing in the search pauses before the commits are matched.
 const SEARCH_DELAY: Duration = Duration::from_millis(80);
 /// Other branches whose heads History reads for their tags, and whose listings it reads for
@@ -72,28 +70,6 @@ const WHEN_WIDTH: f32 = 64.;
 const CHANGES_WIDTH: f32 = 112.;
 const LANE_WIDTH: f32 = 14.;
 const GRAPH_PADDING: f32 = studio_ui::ds::space::MD;
-
-/// Changes read per commit for a row's counts: each comes with its before and after images, and a
-/// drawn row asks for its own. A commit with more shows its counts as partial.
-const ROW_COUNT_PAGE: u32 = 100;
-
-/// The entities a page of one commit's changes adds, changes and removes. A commit's changes name
-/// each entity once, so they are counted where the session's memo holds them, with nothing
-/// copied to fold them.
-fn tally(changes: &[graph_client::api::EntityChangeOutput]) -> (usize, usize, usize) {
-    changes.iter().fold(
-        (0, 0, 0),
-        |(added, changed, removed), change| match NetChange::of(
-            change.before.as_ref(),
-            change.after.as_ref(),
-        ) {
-            Some(NetChange::Added) => (added + 1, changed, removed),
-            Some(NetChange::Changed) => (added, changed + 1, removed),
-            Some(NetChange::Removed) => (added, changed, removed + 1),
-            None => (added, changed, removed),
-        },
-    )
-}
 
 /// The read of the listing's first page.
 enum State {
@@ -368,15 +344,8 @@ pub struct HistoryView {
     /// The commit list, drawn cached on its own: the commit beside it scrolls and reads
     /// without the list drawing again.
     rows: Entity<HistoryRows>,
-    counts: HashMap<String, (usize, usize, usize)>,
-    /// Commits whose counts come from a first page only, and those asked for already.
-    partial_counts: HashSet<String>,
-    asked_counts: HashSet<String>,
-    /// The count reads under way, by commit; and the drawn rows they were last asked for,
-    /// with the pause before they are read.
-    count_tasks: HashMap<String, Task<()>>,
-    count_rows: Option<Range<usize>>,
-    _count_wait: Option<Task<()>>,
+    /// The drawn commits' change counts.
+    counts: crate::counts::RowCounts,
     /// The rows the frame being drawn asked for last, taken once it is out ([`Self::drawn`]).
     drawn_rows: Option<Range<usize>>,
     drawn_due: bool,
@@ -583,12 +552,7 @@ impl HistoryView {
             graph: Graph::default(),
             selected: None,
             rows: HistoryRows::new(cx),
-            counts: HashMap::new(),
-            partial_counts: HashSet::new(),
-            asked_counts: HashSet::new(),
-            count_tasks: HashMap::new(),
-            count_rows: None,
-            _count_wait: None,
+            counts: Default::default(),
             drawn_rows: None,
             drawn_due: false,
             heads: HashMap::new(),
@@ -1164,7 +1128,7 @@ impl HistoryView {
         self.wanted = arranged.wanted;
         self.heads = self.branch_heads();
         // The drawn rows' counts were found in the list before.
-        self.count_rows = None;
+        self.counts.forget_drawn();
         self.keep_place(place);
         let keep =
             previous.and_then(|id| self.commits.iter().position(|c| c.graph_commit_id == id));
@@ -1450,40 +1414,22 @@ impl HistoryView {
     /// nothing for the rows it passes, and reads still out for rows no longer drawn are dropped
     /// (and asked again if they come back).
     fn want_row_counts(&mut self, rows: Range<usize>, cx: &mut Context<Self>) {
-        if self.count_rows.as_ref() == Some(&rows) {
-            return;
-        }
-        self.count_rows = Some(rows.clone());
-        self._count_wait = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(COUNTS_AFTER).await;
-            this.update(cx, |this, cx| {
-                let drawn: HashSet<&str> = this
-                    .commits
-                    .get(rows.start..rows.end.min(this.commits.len()))
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|commit| commit.graph_commit_id.as_str())
-                    .collect();
-                let gone: Vec<String> = this
-                    .count_tasks
-                    .keys()
-                    .filter(|id| !drawn.contains(id.as_str()))
-                    .cloned()
-                    .collect();
-                for id in gone {
-                    this.count_tasks.remove(&id);
-                    this.asked_counts.remove(&id);
-                }
-                this.load_row_counts(rows, cx);
-            })
-            .ok();
-        }));
+        let drawn: Vec<&CommitOutput> = self
+            .commits
+            .get(rows.start..rows.end.min(self.commits.len()))
+            .unwrap_or_default()
+            .iter()
+            .collect();
+        let session = self.session.clone();
+        // The commits are borrowed from the view, the counts beside them.
+        let mut counts = std::mem::take(&mut self.counts);
+        counts.want(&session, drawn, |this: &mut Self| &mut this.counts, cx);
+        self.counts = counts;
     }
 
-    /// Reads change counts for drawn commits that have none yet: one page each, netted as the
-    /// detail nets them. A commit with more changes than the page shows "N+". A commit's
-    /// changes never change, so an answer is kept for the life of the view. The graph's first
-    /// commit has no parent to compare with, so its changes are not asked for.
+    /// Reads change counts for the commits at `range` that have none yet
+    /// ([`crate::counts::RowCounts::read`]).
+    #[cfg(test)]
     fn load_row_counts(&mut self, range: Range<usize>, cx: &mut Context<Self>) {
         let ids: Vec<String> = self
             .commits
@@ -1492,51 +1438,11 @@ impl HistoryView {
             .iter()
             .filter(|commit| !crate::commit_view::is_first_commit(commit))
             .map(|commit| commit.graph_commit_id.clone())
-            .filter(|id| !self.counts.contains_key(id) && !self.asked_counts.contains(id))
             .collect();
-        for id in ids {
-            self.asked_counts.insert(id.clone());
-            let key = id.clone();
-            let read = self.session.update(cx, |session, cx| {
-                session.commit_changes(&id, None, ROW_COUNT_PAGE, cx)
-            });
-            let task = cx.spawn(async move |this, cx| {
-                let page = match read.await {
-                    Ok(page) => page,
-                    Err(error) => {
-                        // A commit that cannot be compared (a schema change: 409) or is past
-                        // cleanup (410) has no count, now or later: it stays asked, so a row
-                        // scrolled back to does not ask again. Another failure may pass.
-                        let lasting = matches!(
-                            &error,
-                            ReadError::Refused(refusal) if matches!(refusal.status, 409 | 410)
-                        );
-                        this.update(cx, |this, _| {
-                            this.count_tasks.remove(&id);
-                            if !lasting {
-                                this.asked_counts.remove(&id);
-                            }
-                        })
-                        .ok();
-                        return;
-                    }
-                };
-                let more = page.next_page_token.is_some();
-                let folded = cx
-                    .background_spawn(async move { tally(&page.changes) })
-                    .await;
-                this.update(cx, |this, cx| {
-                    this.count_tasks.remove(&id);
-                    this.counts.insert(id.clone(), folded);
-                    if more {
-                        this.partial_counts.insert(id);
-                    }
-                    cx.notify();
-                })
-                .ok();
-            });
-            self.count_tasks.insert(key, task);
-        }
+        let session = self.session.clone();
+        let mut counts = std::mem::take(&mut self.counts);
+        counts.read(&session, ids, |this: &mut Self| &mut this.counts, cx);
+        self.counts = counts;
     }
 
     fn render_rows(
@@ -1590,8 +1496,10 @@ impl HistoryView {
                     .clone()
                     .unwrap_or_else(|| "main".to_owned());
                 let id = commit.graph_commit_id.clone();
-                let counts = self.counts.get(&id).copied();
-                let partial = self.partial_counts.contains(&id);
+                let (counts, partial) = match self.counts.of(&id) {
+                    Some((counts, partial)) => (Some(counts), partial),
+                    None => (None, false),
+                };
                 let first = crate::commit_view::is_first_commit(commit);
                 let heads = self.heads.get(&id).cloned().unwrap_or_default();
                 let selected = self.selected == Some(ix);
@@ -2607,8 +2515,9 @@ mod tests {
         );
         assert!(changes("m1") > 0 && changes("m2") > 0);
         view.read_with(cx, |view, _| {
-            assert!(view.counts.contains_key("m1") && view.counts.contains_key("m2"));
-            assert!(!view.counts.contains_key("m0"));
+            let counts = &view.counts.counts;
+            assert!(counts.contains_key("m1") && counts.contains_key("m2"));
+            assert!(!counts.contains_key("m0"));
             assert!(crate::commit_view::is_first_commit(&view.commits[2]));
             assert!(!crate::commit_view::is_first_commit(&view.commits[1]));
         });
