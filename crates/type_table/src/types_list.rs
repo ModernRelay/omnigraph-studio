@@ -373,7 +373,7 @@ impl Render for TypesList {
             .graph_views(&s.overrides_key())
             .iter()
             .map(|view| {
-                let query = view.query.as_ref().map(|query| query.stored.clone());
+                let query = view.query.as_ref().map(|query| query.label());
                 ViewEntry {
                     id: view.key(),
                     name: view.name.clone(),

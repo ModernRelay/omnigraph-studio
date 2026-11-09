@@ -137,6 +137,12 @@ impl Analysis {
         self.queries.get(index).and_then(Option::as_ref)
     }
 
+    /// What the check says of the declaration named `name`.
+    pub fn query_named(&self, name: &str) -> Option<&QueryInfo> {
+        let declaration = self.outline.declarations.iter().find(|d| d.name == name)?;
+        self.query_of(declaration)
+    }
+
     /// Whether every declaration parsed, so the parameters the check lists are all the text
     /// declares.
     pub fn read_every_declaration(&self) -> bool {

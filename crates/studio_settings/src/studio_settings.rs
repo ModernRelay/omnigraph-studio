@@ -271,16 +271,43 @@ pub struct SavedView {
     pub order: Vec<String>,
 }
 
-/// The query a view runs (spec 024): a stored query the server serves by name, with the values
-/// of its parameters. The parameters are the view's filters.
+/// The query a view runs (spec 024): a stored query the server serves by name, or one query of
+/// a `.gq` file, with the values of its parameters. The parameters are the view's filters.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct ViewQuery {
-    /// The stored query's name in the graph's catalog.
+    /// The stored query's name in the graph's catalog; empty in a view of a file's query.
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub stored: String,
+    /// The `.gq` file whose query the view runs, by its path; empty in a view of a stored query.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub file: String,
+    /// The name of the query in `file` the view runs.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub name: String,
     /// The parameters' values, as the parameter bar holds them.
     #[serde(skip_serializing_if = "serde_json::Map::is_empty")]
     pub params: serde_json::Map<String, serde_json::Value>,
+}
+
+impl ViewQuery {
+    /// What the view runs, as a row's tooltip says it: the stored query's name, or the file's
+    /// query as `people in people.gq`.
+    pub fn label(&self) -> String {
+        if self.file.is_empty() {
+            return self.stored.clone();
+        }
+        let file = std::path::Path::new(&self.file)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.file.clone());
+        format!("{} in {file}", self.name)
+    }
+
+    /// The view runs a query of a `.gq` file, not a stored one.
+    pub fn is_file(&self) -> bool {
+        !self.file.is_empty()
+    }
 }
 
 /// How a view shows its rows (spec 024).
@@ -1625,6 +1652,7 @@ mod tests {
         let query = ViewQuery {
             stored: "people_in".into(),
             params,
+            ..Default::default()
         };
         assert_eq!(
             settings.save_query_view("dev/k", "Founders", query.clone()),

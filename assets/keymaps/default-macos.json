@@ -388,12 +388,20 @@
     }
   },
   {
-    "context": "QueryResults",
+    "context": "QueryResults && !editing",
     "bindings": {
       "cmd-c": "studio_query::CopyCell",
       "cmd-shift-c": "studio_query::CopyRow",
       "left": "studio_query::SelectPreviousColumn",
-      "right": "studio_query::SelectNextColumn"
+      "right": "studio_query::SelectNextColumn",
+      "enter": "studio_table::EditCell"
+    }
+  },
+  {
+    "context": "QueryResults && editing",
+    "bindings": {
+      "enter": "studio_table::ConfirmEdit",
+      "escape": "studio_table::Cancel"
     }
   },
   {

@@ -104,7 +104,7 @@ impl Render for NameViewModal {
             .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| this.submit(window, cx)))
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
             .child(
-                ModalHeader::new(format!("Save a view of {}", self.query.stored))
+                ModalHeader::new(format!("Save a view of {}", self.query.label()))
                     .description(SharedString::from(format!(
                         "The stored query and {values}, kept for this graph in your settings."
                     )))

@@ -110,6 +110,7 @@ impl PanelRow {
         match self {
             PanelRow::Saved { path, .. } => Some(Box::new(OpenQueryFile {
                 path: Some(path.to_string_lossy().into_owned()),
+                view: None,
             })),
             PanelRow::Stored { name, .. } => Some(Box::new(OpenStoredQuery {
                 name: name.clone(),

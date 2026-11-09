@@ -222,11 +222,22 @@ pub fn init(cx: &mut App) {
                     .map(str::to_owned),
                 saved: data.get("saved").and_then(Value::as_bool).unwrap_or(false),
             });
+            // The view it showed comes back with it, not run until asked (spec 024).
+            let view = data.get("view").and_then(Value::as_str).and_then(|id| {
+                let graph = workspace.session()?.read(cx).overrides_key();
+                let view = cx
+                    .try_global::<studio_settings::StudioSettings>()?
+                    .view(&graph, id)?;
+                Some((id.to_owned(), view.query.clone()?))
+            });
             if let Some(editor) = open_file(workspace, PathBuf::from(path), draft, window, cx) {
                 editor.update(cx, |editor, cx| {
                     editor.set_column_widths(widths);
                     if let Some(commit) = at_commit {
                         editor.pin_to(commit, cx);
+                    }
+                    if let Some((id, query)) = view {
+                        editor.show_view(id, query.name, query.params, false, window, cx);
                     }
                 });
             }
@@ -297,7 +308,28 @@ pub fn init(cx: &mut App) {
         workspace.register_action(|workspace, action: &OpenQueryFile, window, cx| {
             match &action.path {
                 Some(path) => {
-                    open_file(workspace, PathBuf::from(path), None, window, cx);
+                    let editor = open_file(workspace, PathBuf::from(path), None, window, cx);
+                    // A view of one of its queries (spec 024): shown and run with its values.
+                    if let (Some(editor), Some(id)) = (editor, &action.view) {
+                        let view = workspace.session().and_then(|session| {
+                            let graph = session.read(cx).overrides_key();
+                            cx.try_global::<studio_settings::StudioSettings>()?
+                                .view(&graph, id)
+                                .cloned()
+                        });
+                        if let Some(query) = view.and_then(|view| view.query) {
+                            editor.update(cx, |editor, cx| {
+                                editor.show_view(
+                                    id.clone(),
+                                    query.name,
+                                    query.params,
+                                    true,
+                                    window,
+                                    cx,
+                                )
+                            });
+                        }
+                    }
                 }
                 None => {
                     let chosen = cx.prompt_for_paths(PathPromptOptions {

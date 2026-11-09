@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use gq_language::{ResultColumn, SchemaModel, TokenKind};
+use gq_language::{CellSource, ResultColumn, RowId, SchemaModel, TokenKind};
 use graph_client::api::{BranchMergeOutcome, ChangeOutput, CommitKind};
 use serde_json::{Map, Value};
 use studio_actions::graph::ResultNode;
@@ -22,6 +22,19 @@ pub struct ResultTable {
     /// The node type of each column that returns whole nodes.
     pub node_types: Vec<Option<String>>,
     pub rows: Vec<Vec<Value>>,
+    /// Where an edit of each column's cells goes, or why none can (spec 024). Empty until
+    /// [`ResultTable::take_ids`].
+    pub edits: Vec<Result<CellTarget, &'static str>>,
+    /// Each row's node ids, one per id column the edits name (`CellTarget::slot`).
+    pub row_ids: Vec<Vec<Option<String>>>,
+}
+
+/// The property a column's cells are, of the node a row's id in `slot` names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CellTarget {
+    pub type_name: String,
+    pub property: String,
+    pub slot: usize,
 }
 
 impl ResultTable {
@@ -66,7 +79,141 @@ impl ResultTable {
             types,
             node_types,
             rows,
+            edits: Vec::new(),
+            row_ids: Vec::new(),
         }
+    }
+
+    /// Reads each row's node ids from the id columns `ids` names, drops those Studio added to
+    /// the query it sent, and says where an edit of each remaining column's cells goes.
+    pub fn take_ids(&mut self, expected: Option<&[ResultColumn]>, ids: &[RowId]) {
+        let slots: Vec<Option<usize>> = ids
+            .iter()
+            .map(|id| self.columns.iter().position(|column| *column == id.column))
+            .collect();
+        self.row_ids = self
+            .rows
+            .iter()
+            .map(|row| {
+                slots
+                    .iter()
+                    .map(|slot| {
+                        let value = row.get((*slot)?)?;
+                        value.as_str().map(str::to_owned)
+                    })
+                    .collect()
+            })
+            .collect();
+        let keep: Vec<bool> = self
+            .columns
+            .iter()
+            .map(|column| !column.starts_with(gq_language::check::ADDED_ID_PREFIX))
+            .collect();
+        if keep.iter().any(|keep| !keep) {
+            let mut i = 0;
+            self.columns.retain(|_| (keep[i], i += 1).0);
+            let mut i = 0;
+            self.types.retain(|_| (keep[i], i += 1).0);
+            let mut i = 0;
+            self.node_types.retain(|_| (keep[i], i += 1).0);
+            for row in &mut self.rows {
+                let mut i = 0;
+                row.retain(|_| (keep[i], i += 1).0);
+            }
+        }
+        self.edits = self
+            .columns
+            .iter()
+            .map(|column| {
+                let described = expected
+                    .unwrap_or_default()
+                    .iter()
+                    .find(|expected| expected.column == *column)
+                    .ok_or("its query was not checked")?;
+                match &described.source {
+                    CellSource::Property {
+                        variable,
+                        type_name,
+                        property,
+                    } => {
+                        let slot = ids
+                            .iter()
+                            .position(|id| id.variable == *variable)
+                            .filter(|slot| slots[*slot].is_some())
+                            .ok_or("its node's id was not read")?;
+                        Ok(CellTarget {
+                            type_name: type_name.clone(),
+                            property: property.clone(),
+                            slot,
+                        })
+                    }
+                    CellSource::ReadOnly(reason) => Err(*reason),
+                }
+            })
+            .collect();
+    }
+
+    /// Where an edit of cell (`row`, `column`) goes: its property, its node's type and id, or
+    /// why it cannot be edited.
+    pub fn cell_target(
+        &self,
+        row: usize,
+        column: usize,
+    ) -> Result<(&CellTarget, &str), &'static str> {
+        let target = self
+            .edits
+            .get(column)
+            .ok_or("its query was not checked")?
+            .as_ref()
+            .map_err(|reason| *reason)?;
+        let id = self
+            .row_ids
+            .get(row)
+            .and_then(|ids| ids.get(target.slot))
+            .and_then(Option::as_deref)
+            .ok_or("an absent node")?;
+        Ok((target, id))
+    }
+
+    /// Whether a row shows node `id` of `type_name` in an editable column.
+    pub fn shows_node(&self, type_name: &str, id: &str) -> bool {
+        self.edits.iter().flatten().any(|target| {
+            target.type_name == type_name
+                && self
+                    .row_ids
+                    .iter()
+                    .any(|ids| ids.get(target.slot).and_then(Option::as_deref) == Some(id))
+        })
+    }
+
+    /// Sets `property` of node `id` to `value` in every row that shows it.
+    pub fn set_property(
+        &mut self,
+        type_name: &str,
+        id: &str,
+        property: &str,
+        value: &Value,
+    ) -> Vec<usize> {
+        let mut changed = Vec::new();
+        for (column, edit) in self.edits.iter().enumerate() {
+            let Ok(target) = edit else { continue };
+            if target.type_name != type_name || target.property != property {
+                continue;
+            }
+            for (row, values) in self.rows.iter_mut().enumerate() {
+                if self.row_ids[row]
+                    .get(target.slot)
+                    .and_then(Option::as_deref)
+                    == Some(id)
+                {
+                    values[column] = value.clone();
+                    changed.push(row);
+                }
+            }
+        }
+        changed.sort_unstable();
+        changed.dedup();
+        changed
     }
 
     /// The result's nodes, each once, and which of them share a row, for drawing on a canvas
@@ -660,10 +807,20 @@ pub struct SourceMap {
     pub prefix_len: usize,
     pub inserted: usize,
     pub start: usize,
+    /// Where in the text sent Studio added columns to the `return` (`gq_language::with_row_ids`)
+    /// and how long they are; `(0, 0)` when it added none.
+    pub added: (usize, usize),
 }
 
 impl SourceMap {
     pub fn editor_offset(self, sent: usize) -> usize {
+        // Past the added columns, the text is the editor's again, that much earlier.
+        let (at, length) = self.added;
+        let sent = if length > 0 && sent > at {
+            at.max(sent - length)
+        } else {
+            sent
+        };
         if sent < self.prefix_len {
             sent
         } else {
@@ -887,7 +1044,52 @@ mod tests {
             kind: kind.into(),
             nullable,
             node_type: None,
+            source: CellSource::default(),
         }
+    }
+
+    /// A column of one node's property is edited through the row's id for its variable, which
+    /// an added id column carries and no one sees; another says why it is read-only, and an
+    /// absent node's cell has no id to write to.
+    #[test]
+    fn an_added_id_column_names_each_rows_node_and_is_hidden() {
+        let mut name = column("p.name", "String", false);
+        name.source = CellSource::Property {
+            variable: "p".into(),
+            type_name: "Person".into(),
+            property: "name".into(),
+        };
+        let mut n = column("n", "I64", false);
+        n.source = CellSource::ReadOnly("an aggregate");
+        let ids = [RowId {
+            variable: "p".into(),
+            column: "__studio_id_p".into(),
+            added: true,
+        }];
+        let rows = json!([
+            {"p.name": "Ada", "n": 2, "__studio_id_p": "p1"},
+            {"p.name": "Bob", "n": 1, "__studio_id_p": "p2"},
+            {"p.name": "Ada", "n": 3, "__studio_id_p": "p1"},
+            {"n": 0}
+        ]);
+        let mut table = ResultTable::new(
+            vec!["p.name".into(), "n".into(), "__studio_id_p".into()],
+            rows,
+            Some(&[name.clone(), n.clone()]),
+        );
+        table.take_ids(Some(&[name, n]), &ids);
+        assert_eq!(table.columns, ["p.name", "n"]);
+        assert_eq!(table.rows[0], [json!("Ada"), json!(2)]);
+        let (target, id) = table.cell_target(1, 0).unwrap();
+        assert_eq!((target.property.as_str(), id), ("name", "p2"));
+        assert_eq!(table.cell_target(0, 1).unwrap_err(), "an aggregate");
+        assert_eq!(table.cell_target(3, 0).unwrap_err(), "an absent node");
+        // A node shown in two rows shows its new value in both.
+        assert_eq!(
+            table.set_property("Person", "p1", "name", &json!("Ada L")),
+            [0, 2]
+        );
+        assert_eq!(table.rows[2][0], json!("Ada L"));
     }
 
     #[test]
@@ -1219,6 +1421,7 @@ mod tests {
             prefix_len: 11,
             inserted: 8,
             start: 41,
+            added: (0, 0),
         };
         assert_eq!(map.editor_offset(3), 3);
         assert_eq!(map.editor_offset(19), 41);
@@ -1274,6 +1477,7 @@ mod tests {
             prefix_len: 10,
             inserted: 0,
             start: 30,
+            added: (0, 0),
         };
         let sent = "// people\nquery people { match { $p: Person } return { $p.name } }";
         let at = sent.find(" {").unwrap();
@@ -1310,6 +1514,7 @@ mod tests {
             prefix_len: 11,
             inserted: 8,
             start: 40,
+            added: (0, 0),
         };
         let name = "set x = 1;\nexplain query q() { return { $p.nmae } }"
             .find("nmae")

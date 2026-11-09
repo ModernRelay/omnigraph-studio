@@ -49,6 +49,8 @@ pub struct GridColumn {
     pub detail: Option<SharedString>,
     pub width: Pixels,
     pub align_right: bool,
+    /// What the header says when pointed at, such as why the column's cells cannot be edited.
+    pub tooltip: Option<SharedString>,
 }
 
 impl GridColumn {
@@ -59,7 +61,13 @@ impl GridColumn {
             detail: None,
             width: px(180.),
             align_right: false,
+            tooltip: None,
         }
+    }
+
+    pub fn tooltip(mut self, tooltip: impl Into<SharedString>) -> Self {
+        self.tooltip = Some(tooltip.into());
+        self
     }
 
     pub fn detail(mut self, detail: impl Into<SharedString>) -> Self {
@@ -116,7 +124,9 @@ pub fn resizable_grid_header(
                 GridPlace::Gap(width) => return div().w(width).flex_none().into_any_element(),
             };
             let column = &columns[index];
+            let tooltip = column.tooltip.clone();
             h_flex()
+                .id(("grid-header", index))
                 .relative()
                 .w(column.width)
                 .flex_none()
@@ -131,6 +141,7 @@ pub fn resizable_grid_header(
                         .single_line()
                 }))
                 .children(handle(index))
+                .when_some(tooltip, |d, tooltip| d.tooltip(ui::Tooltip::text(tooltip)))
                 .into_any_element()
         }))
 }

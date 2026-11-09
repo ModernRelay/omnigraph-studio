@@ -589,7 +589,10 @@ impl CommandPalette {
                     group: Group::Query,
                 };
                 let row = Row::Saved {
-                    action: Box::new(OpenQueryFile { path: Some(path) }),
+                    action: Box::new(OpenQueryFile {
+                        path: Some(path),
+                        ..Default::default()
+                    }),
                 };
                 (row, candidate)
             })
@@ -1408,7 +1411,7 @@ fn add_view_rows(
         rows.push(Row::View {
             action: Box::new(open(view.key())),
             type_name: view.type_name.clone(),
-            query: view.query.as_ref().map(|query| query.stored.clone()),
+            query: view.query.as_ref().map(|query| query.label()),
         });
     }
 }

@@ -418,6 +418,17 @@ fn open_saved_view(
         workspace.show_toast(ToastKind::Error, "That view was deleted.", cx);
         return None;
     };
+    // A view of a file's query opens in the file's tab, which runs it (spec 024).
+    if let Some(query) = view.query.as_ref().filter(|query| query.is_file()) {
+        window.dispatch_action(
+            Box::new(studio_actions::graph::OpenQueryFile {
+                path: Some(query.file.clone()),
+                view: Some(view.key()),
+            }),
+            cx,
+        );
+        return None;
+    }
     // A view of a stored query opens in the query editor's tab for it (spec 024).
     if let Some(query) = &view.query {
         let gone = session

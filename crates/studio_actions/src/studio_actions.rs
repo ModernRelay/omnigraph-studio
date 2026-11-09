@@ -496,6 +496,9 @@ pub mod graph {
     pub struct OpenQueryFile {
         #[serde(default)]
         pub path: Option<String>,
+        /// The saved view (spec 024) of one of the file's queries to show and run, by its id.
+        #[serde(default)]
+        pub view: Option<String>,
     }
 
     /// Open a query editor that reads one commit, read-only.

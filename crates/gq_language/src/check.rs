@@ -74,6 +74,121 @@ pub struct ResultColumn {
     /// The node type of a column that returns a whole node (`return { $p }`), from the
     /// variable's binding.
     pub node_type: Option<String>,
+    /// Where its cells' values live, so a cell can be edited, or why they cannot be (spec 024).
+    pub source: CellSource,
+}
+
+/// Where a result column's values come from (spec 024, "Editing a query view").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CellSource {
+    /// `$variable.property`, of the node type `variable` is bound to: each cell is that
+    /// property of the row's node, which the row's id for `variable` names.
+    Property {
+        variable: String,
+        type_name: String,
+        property: String,
+    },
+    /// No one node's property: the reason, as a header's tooltip says it after "Read-only: ".
+    ReadOnly(&'static str),
+}
+
+impl Default for CellSource {
+    fn default() -> Self {
+        CellSource::ReadOnly("not checked yet")
+    }
+}
+
+/// The answer column that holds a variable's node id in each row: one the query returns
+/// (`$p.@id`), or one Studio adds to what it sends ([`with_row_ids`]) and hides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowId {
+    pub variable: String,
+    pub column: String,
+    /// Studio adds it to the query it sends; the person's text does not return it.
+    pub added: bool,
+}
+
+/// The prefix of an id column Studio adds to a query it sends; the results never show it.
+pub const ADDED_ID_PREFIX: &str = "__studio_id_";
+
+/// Where the values of the projection `expr` come from, with the variables' bindings.
+fn cell_source(
+    expr: &Expr,
+    bindings: &std::collections::HashMap<String, BoundVariable>,
+) -> CellSource {
+    match expr {
+        Expr::PropAccess { property, .. } if property.starts_with('@') => {
+            CellSource::ReadOnly("the system's own field")
+        }
+        Expr::PropAccess { variable, property } => match bindings.get(variable) {
+            Some(BoundVariable::Node { type_name }) => CellSource::Property {
+                variable: variable.clone(),
+                type_name: type_name.clone(),
+                property: property.clone(),
+            },
+            Some(BoundVariable::Edge { .. }) => CellSource::ReadOnly("a relationship's property"),
+            None => CellSource::ReadOnly("not one node's property"),
+        },
+        Expr::Variable(_) => CellSource::ReadOnly("a whole node"),
+        Expr::Aggregate { .. } => CellSource::ReadOnly("an aggregate"),
+        Expr::Literal(_) => CellSource::ReadOnly("a literal"),
+        Expr::Now => CellSource::ReadOnly("the time it ran"),
+        Expr::Nearest { .. }
+        | Expr::Search { .. }
+        | Expr::Fuzzy { .. }
+        | Expr::MatchText { .. }
+        | Expr::Bm25 { .. }
+        | Expr::Rrf { .. } => CellSource::ReadOnly("a search score"),
+        _ => CellSource::ReadOnly("a computed value"),
+    }
+}
+
+/// `text`, a read's runnable text, with a column for each id of `ids` Studio adds, at the end
+/// of its `return`, and where they went in it: `(text, offset, length)`. `None` when nothing is
+/// added or the `return` is not found.
+pub fn with_row_ids(text: &str, ids: &[RowId]) -> Option<(String, usize, usize)> {
+    let added: Vec<&RowId> = ids.iter().filter(|id| id.added).collect();
+    if added.is_empty() {
+        return None;
+    }
+    let tokens = tokenize(text);
+    let mut tokens = tokens
+        .iter()
+        .filter(|token| !matches!(token.kind, TokenKind::Comment));
+    tokens
+        .find(|token| token.kind == TokenKind::Keyword && &text[token.range.clone()] == "return")?;
+    let open = tokens.find(|token| &text[token.range.clone()] == "{")?;
+    let mut depth = 1usize;
+    let mut close = None;
+    let mut before = open.range.clone();
+    for token in tokens {
+        match &text[token.range.clone()] {
+            "{" => depth += 1,
+            "}" => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(token.range.start);
+                    break;
+                }
+            }
+            _ => {}
+        }
+        before = token.range.clone();
+    }
+    let close = close?;
+    let comma = !matches!(&text[before], "," | "{");
+    let mut insert = String::new();
+    for (i, id) in added.iter().enumerate() {
+        if comma || i > 0 {
+            insert.push(',');
+        }
+        insert.push_str(&format!(" ${}.@id as {}", id.variable, id.column));
+    }
+    insert.push(' ');
+    let mut sent = text[..close].to_owned();
+    sent.push_str(&insert);
+    sent.push_str(&text[close..]);
+    Some((sent, close, insert.len()))
 }
 
 /// A result column's kind as a type reads: `String`, `[Date]`, `Vector(3)`, a whole node's
@@ -112,6 +227,8 @@ pub struct QueryInfo {
     pub destroys: Option<Destroys>,
     /// Where a write's result goes: the branch it is sent to, or held off every branch.
     pub publication: Publication,
+    /// The answer column of each node variable's id that an editable column needs (spec 024).
+    pub ids: Vec<RowId>,
 }
 
 /// Where a write's result goes, by how it is declared (`as commit`, `as unattached branch`).
@@ -307,6 +424,7 @@ pub fn check(schema: &SchemaModel, source: &str) -> QueryCheck {
             columns: Vec::new(),
             destroys: deletes(decl),
             publication: Publication::of(&decl.write_mode),
+            ids: Vec::new(),
         };
         match typecheck_query_decl(&schema.catalog, decl) {
             Ok(checked) => {
@@ -349,15 +467,28 @@ pub fn check(schema: &SchemaModel, source: &str) -> QueryCheck {
                                         .iter()
                                         .find(|(name, _)| *name == column)
                                         .map(|(_, ty)| ty.clone());
+                                    // A distinct row is not one node's: an added id would
+                                    // change which rows it keeps.
+                                    let source = match &checked {
+                                        CheckedQuery::Read(_) if decl.distinct => {
+                                            CellSource::ReadOnly("a distinct query's cell")
+                                        }
+                                        CheckedQuery::Read(context) => {
+                                            cell_source(&projection.expr, context.bindings())
+                                        }
+                                        CheckedQuery::Mutation(_) => CellSource::default(),
+                                    };
                                     ResultColumn {
                                         name: field.name.clone(),
                                         kind: kind_label(field, node_type.as_deref()),
                                         nullable: field.nullable,
                                         node_type,
                                         column,
+                                        source,
                                     }
                                 })
                                 .collect();
+                            info.ids = row_ids(decl, &info.columns);
                         }
                         // Checked, but the compiler cannot describe what it returns (a traversal
                         // no binding starts, a list nested in a list): it would fail when run.
@@ -373,6 +504,46 @@ pub fn check(schema: &SchemaModel, source: &str) -> QueryCheck {
         }
     }
     result
+}
+
+/// The id column of each variable an editable column of `columns` reads: the query's own
+/// `$v.@id`, else one Studio adds.
+fn row_ids(decl: &QueryDecl, columns: &[ResultColumn]) -> Vec<RowId> {
+    let mut ids: Vec<RowId> = Vec::new();
+    for column in columns {
+        let CellSource::Property { variable, .. } = &column.source else {
+            continue;
+        };
+        if ids.iter().any(|id| id.variable == *variable) {
+            continue;
+        }
+        let returned = decl
+            .return_clause
+            .iter()
+            .find_map(|projection| match &projection.expr {
+                Expr::PropAccess {
+                    variable: of,
+                    property,
+                } if of == variable && property == "@id" => Some(executed_column_name(
+                    &projection.expr,
+                    projection.alias.as_deref(),
+                )),
+                _ => None,
+            });
+        ids.push(match returned {
+            Some(column) => RowId {
+                variable: variable.clone(),
+                column,
+                added: false,
+            },
+            None => RowId {
+                variable: variable.clone(),
+                column: format!("{ADDED_ID_PREFIX}{variable}"),
+                added: true,
+            },
+        });
+    }
+    ids
 }
 
 /// The code of a declaration named like one before it in the same source.
@@ -448,6 +619,87 @@ mod tests {
         assert_eq!(found[0].query.as_deref(), Some("people"));
         let unnamed = "query a() { match { $p: Person } return { $p } }\nquery (\nquery (";
         assert!(duplicate_names(unnamed, &crate::lex::outline(unnamed)).is_empty());
+    }
+
+    /// Each column says which node's property its cells are, or why they are none; a column
+    /// that is one gets its node's id, the query's own or one added to what is sent, which
+    /// still checks.
+    #[test]
+    fn a_column_knows_the_property_its_cells_are() {
+        let source = "query q() { match { $p: Person  $p $w: worksAt $c } \
+                      return { $p.name, $c.city as town, $w.role, count($c) as n, $p.@id, $p } }";
+        let result = check(&dev(), source);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let query = &result.queries[0];
+        let sources: Vec<&CellSource> = query.columns.iter().map(|c| &c.source).collect();
+        assert_eq!(
+            sources[0],
+            &CellSource::Property {
+                variable: "p".into(),
+                type_name: "Person".into(),
+                property: "name".into(),
+            }
+        );
+        assert!(
+            matches!(sources[1], CellSource::Property { type_name, property, .. }
+            if type_name == "Company" && property == "city")
+        );
+        assert_eq!(
+            sources[2],
+            &CellSource::ReadOnly("a relationship's property")
+        );
+        assert_eq!(sources[3], &CellSource::ReadOnly("an aggregate"));
+        assert_eq!(sources[4], &CellSource::ReadOnly("the system's own field"));
+        assert_eq!(sources[5], &CellSource::ReadOnly("a whole node"));
+        // `$p`'s id is returned; `$c`'s is added.
+        assert_eq!(
+            query.ids,
+            [
+                RowId {
+                    variable: "p".into(),
+                    column: "p.@id".into(),
+                    added: false
+                },
+                RowId {
+                    variable: "c".into(),
+                    column: "__studio_id_c".into(),
+                    added: true
+                },
+            ]
+        );
+        let (sent, at, len) = with_row_ids(source, &query.ids).unwrap();
+        assert_eq!(&sent[at..at + len], ", $c.@id as __studio_id_c ");
+        let sent_check = check(&dev(), &sent);
+        assert!(
+            sent_check.diagnostics.is_empty(),
+            "{sent}: {:?}",
+            sent_check.diagnostics
+        );
+        assert!(
+            sent_check.queries[0]
+                .columns
+                .iter()
+                .any(|c| c.column == "__studio_id_c")
+        );
+        // A trailing comma takes no second one, and a distinct read is never rewritten.
+        let trailing = "query q() { match { $p: Person } return { $p.name, } order { $p.name } }";
+        let info = &check(&dev(), trailing).queries[0];
+        let (sent, ..) = with_row_ids(trailing, &info.ids).unwrap();
+        assert!(
+            sent.contains("$p.@id as __studio_id_p }") && !sent.contains(",,"),
+            "{sent}"
+        );
+        assert!(check(&dev(), &sent).diagnostics.is_empty());
+        let distinct = check(
+            &dev(),
+            "query q() { match { $p: Person } return distinct { $p.name } }",
+        );
+        let info = &distinct.queries[0];
+        assert_eq!(
+            info.columns[0].source,
+            CellSource::ReadOnly("a distinct query's cell")
+        );
+        assert!(info.ids.is_empty());
     }
 
     #[test]
