@@ -5,6 +5,7 @@ use gq_language::builder::GroupOn;
 use gq_language::{Direction, SchemaModel};
 use graph_store::{BucketValue, Entry, EntryKind, ExplorePath, ExploreState, GroupKey, NodeRef};
 use serde_json::Value;
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RowTag {
@@ -79,34 +80,59 @@ pub fn row_text(entry: &Entry, state: &ExploreState, schema: Option<&SchemaModel
     }
 }
 
-/// Whether an entry is a relationship group known to have no relationships, or lies under one.
-fn under_empty_group(entries: &[Entry], index: usize) -> bool {
+/// Whether an entry is a relationship group that hides with the relationships with none, or
+/// lies under one: known to have none, or not counted yet and not one of `had` (the groups seen
+/// with relationships), so a group shows only once it is known to have some rather than show
+/// and then go.
+fn under_empty_group(entries: &[Entry], index: usize, had: &HashSet<ExplorePath>) -> bool {
+    use graph_store::Loadable;
     let mut current = Some(index);
     while let Some(ix) = current {
-        if let EntryKind::Group {
-            count: graph_store::Loadable::Loaded(0),
-            ..
-        } = entries[ix].kind
-        {
-            return true;
+        if let EntryKind::Group { count, .. } = &entries[ix].kind {
+            match count {
+                Loadable::Loaded(0) => return true,
+                Loadable::NotLoaded | Loadable::Loading if !had.contains(&entries[ix].path) => {
+                    return true;
+                }
+                _ => {}
+            }
         }
         current = entries[ix].parent;
     }
     false
 }
 
+/// The groups among `entries` known to have relationships, or whose count failed (which says
+/// why): those [`filter`] keeps while their count is read again.
+pub fn groups_with_relationships(entries: &[Entry]) -> impl Iterator<Item = &ExplorePath> {
+    entries.iter().filter_map(|entry| match &entry.kind {
+        EntryKind::Group { count, .. }
+            if !matches!(
+                count,
+                graph_store::Loadable::Loaded(0)
+                    | graph_store::Loadable::NotLoaded
+                    | graph_store::Loadable::Loading
+            ) =>
+        {
+            Some(&entry.path)
+        }
+        _ => None,
+    })
+}
+
 /// The entries to show for `query`: every match with its ancestors, in tree order. An empty
 /// query shows everything. Loading and error rows hide while filtering; a "Show more" row
 /// stays under a group that shows, so a group not read in full can be searched on the server.
-/// `hide_empty` leaves out groups with no relationships.
+/// `hide_empty` leaves out groups with no relationships, and those not counted yet unless they
+/// are among the groups it holds, which were seen with some.
 pub fn filter(
     entries: &[Entry],
     state: &ExploreState,
     schema: Option<&SchemaModel>,
     query: &str,
-    hide_empty: bool,
+    hide_empty: Option<&HashSet<ExplorePath>>,
 ) -> Vec<usize> {
-    let shown = |ix: &usize| !hide_empty || !under_empty_group(entries, *ix);
+    let shown = |ix: &usize| hide_empty.is_none_or(|had| !under_empty_group(entries, *ix, had));
     let query = query.trim().to_lowercase();
     if query.is_empty() {
         return (0..entries.len()).filter(shown).collect();
@@ -366,7 +392,7 @@ mod tests {
     #[test]
     fn the_tree_flattens_with_cycles_and_paging_rows() {
         let (_, state, entries) = fixture();
-        let all = filter(&entries, &state, None, "", false);
+        let all = filter(&entries, &state, None, "", None);
         let shown = texts(&entries, &state, &all);
         assert_eq!(shown[0], "Ada Lovelace ada");
         assert!(
@@ -382,7 +408,7 @@ mod tests {
     #[test]
     fn filtering_keeps_matches_and_their_ancestors() {
         let (_, state, entries) = fixture();
-        let visible = filter(&entries, &state, None, "young", false);
+        let visible = filter(&entries, &state, None, "young", None);
         // The group's "Show more" row stays, to search the rest of the group on the server.
         assert_eq!(
             texts(&entries, &state, &visible),
@@ -394,7 +420,7 @@ mod tests {
             ]
         );
         // The root always stays, so the filter never empties the tree.
-        assert_eq!(filter(&entries, &state, None, "zzz", false), vec![0]);
+        assert_eq!(filter(&entries, &state, None, "zzz", None), vec![0]);
     }
 
     #[test]
@@ -403,8 +429,9 @@ mod tests {
         let bob_knows = GroupKey::new(person("bob"), knows());
         state.counts.insert(bob_knows, Loadable::Loaded(0));
         let entries = state.entries(&schema);
-        let all = filter(&entries, &state, None, "", false);
-        let without = filter(&entries, &state, None, "", true);
+        let all = filter(&entries, &state, None, "", None);
+        let had = HashSet::new();
+        let without = filter(&entries, &state, None, "", Some(&had));
         assert!(without.len() < all.len());
         assert!(without.iter().all(|ix| !matches!(
             &entries[*ix].kind,
@@ -413,12 +440,32 @@ mod tests {
                 ..
             }
         )));
+        // A group not counted yet waits to show until it is known to have some, unless it was
+        // seen with some before (its count read again).
+        let uncounted = |entry: &Entry| {
+            matches!(
+                entry.kind,
+                EntryKind::Group {
+                    count: Loadable::NotLoaded | Loadable::Loading,
+                    ..
+                }
+            )
+        };
+        let pending = all
+            .iter()
+            .copied()
+            .find(|ix| uncounted(&entries[*ix]))
+            .expect("a group not counted yet");
+        assert!(!without.contains(&pending), "it waits for its count");
+        let had: HashSet<_> = [entries[pending].path.clone()].into();
+        let kept = filter(&entries, &state, None, "", Some(&had));
+        assert!(kept.contains(&pending), "seen with some, it stays");
     }
 
     #[test]
     fn moves_follow_parents_and_children() {
         let (_, state, entries) = fixture();
-        let visible = filter(&entries, &state, None, "", false);
+        let visible = filter(&entries, &state, None, "", None);
         let group_row = visible
             .iter()
             .position(|ix| matches!(&entries[*ix].kind, EntryKind::Group { key, .. } if key.node.id == "ada" && key.group.edge == "Knows"))

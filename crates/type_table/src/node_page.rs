@@ -24,6 +24,9 @@ pub struct NodePage {
     saved_label: Option<String>,
     /// The tab as it was last told: its title, and whether it says newer data.
     tab: (String, bool),
+    /// The toolbar as it was last drawn: whether the relationships with none are hidden, and
+    /// whether there are any.
+    toolbar: (bool, bool),
     _subscription: Subscription,
 }
 
@@ -54,6 +57,11 @@ impl NodePage {
                 this.tab = tab;
                 cx.emit(ItemEvent::UpdateTab);
             }
+            let toolbar = this.toolbar_state(cx);
+            if toolbar != this.toolbar {
+                this.toolbar = toolbar;
+                cx.notify();
+            }
         });
         let mut page = Self {
             view,
@@ -62,9 +70,11 @@ impl NodePage {
             at_commit,
             saved_label,
             tab: (String::new(), false),
+            toolbar: (true, false),
             _subscription: subscription,
         };
         page.tab = (page.title(cx), page.view.read(cx).is_newer());
+        page.toolbar = page.toolbar_state(cx);
         page
     }
 
@@ -76,6 +86,11 @@ impl NodePage {
             .label()
             .or_else(|| self.saved_label.clone())
             .unwrap_or_else(|| self.id.clone())
+    }
+
+    fn toolbar_state(&self, cx: &App) -> (bool, bool) {
+        let view = self.view.read(cx);
+        (view.hides_empty(), view.any_empty())
     }
 
     /// One page per node at the head, and one per node and commit.
@@ -170,6 +185,35 @@ impl Item for NodePage {
     }
 }
 
+impl NodePage {
+    /// The tab's toolbar: its views, then the tree's eye over the relationships with none and
+    /// Collapse all.
+    fn render_toolbar(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let (hide_empty, any_empty) = self.toolbar;
+        studio_ui::ds::toolbar(cx)
+            .children(studio_workspace::view_strip(Item::views(self, cx), cx))
+            .child(div().flex_1())
+            .child(
+                studio_ui::ds::toolbar_actions()
+                    // The eye shows only when it changes something, as on a tree.
+                    .when(hide_empty || any_empty, |row| {
+                        row.child(
+                            studio_workspace::empty_groups_toggle(hide_empty, false).on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.view.update(cx, |view, cx| view.toggle_empty(cx))
+                                }),
+                            ),
+                        )
+                    })
+                    .child(
+                        studio_workspace::collapse_all_button().on_click(cx.listener(
+                            |this, _, _, cx| this.view.update(cx, |view, cx| view.collapse_all(cx)),
+                        )),
+                    ),
+            )
+    }
+}
+
 impl Render for NodePage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
@@ -177,10 +221,7 @@ impl Render for NodePage {
             .key_context("NodePage")
             .size_full()
             .bg(studio_ui::ds::surface::document(cx))
-            .child(
-                studio_ui::ds::toolbar(cx)
-                    .children(studio_workspace::view_strip(Item::views(self, cx), cx)),
-            )
+            .child(self.render_toolbar(cx))
             // The page scrolls as a list of its own, drawing only what is in view.
             .child(div().flex_1().min_h_0().child(self.view.clone()))
     }

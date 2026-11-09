@@ -448,8 +448,9 @@ pub struct NodePeek {
     edge_writes: HashSet<usize>,
     /// Why a group's last write did not land.
     group_notices: HashMap<usize, Notice>,
-    /// The relationship groups with no neighbours are listed too; by default they fold into
-    /// one row at the end.
+    /// The relationship groups with no neighbours are listed too. By default the peek folds
+    /// them into one row at the end, and a page hides them, its toolbar's eye showing them
+    /// again, as a tree's does.
     show_empty: bool,
     /// The long texts folded under their names, by property.
     folded: HashSet<String>,
@@ -4648,6 +4649,44 @@ impl NodePeek {
         place_of(group, working)
     }
 
+    /// Whether a group known to have none shows on a page: the groups with none are shown, or
+    /// the person is working in it.
+    fn shows_empty_group(&self, index: usize) -> bool {
+        let Some(group) = self.groups.get(index) else {
+            return false;
+        };
+        !matches!(group.count, Loadable::Loaded(0))
+            || self.edge_writes.contains(&index)
+            || self.group_notices.contains_key(&index)
+            || self.folded_shown(index)
+    }
+
+    /// Whether the relationships with none are hidden (on a page, by its toolbar's eye).
+    pub fn hides_empty(&self) -> bool {
+        !self.show_empty
+    }
+
+    /// Whether any relationship group is known to have none: the eye changes something.
+    pub fn any_empty(&self) -> bool {
+        self.groups
+            .iter()
+            .any(|group| matches!(group.count, Loadable::Loaded(0)))
+    }
+
+    /// Shows the relationships with none, or hides them again.
+    pub fn toggle_empty(&mut self, cx: &mut Context<Self>) {
+        self.show_empty = !self.show_empty;
+        cx.notify();
+    }
+
+    /// Closes every relationship group.
+    pub fn collapse_all(&mut self, cx: &mut Context<Self>) {
+        for group in &mut self.groups {
+            group.expanded = false;
+        }
+        cx.notify();
+    }
+
     /// Whether a group under the empty row shows: the row is open, or the person is adding to
     /// that group.
     fn folded_shown(&self, index: usize) -> bool {
@@ -4670,10 +4709,7 @@ impl NodePeek {
             } else {
                 "Show the relationships with none, to add one"
             }))
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.show_empty = !this.show_empty;
-                cx.notify();
-            }))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_empty(cx)))
             .child(studio_ui::ds::text::meta(studio_ui::group_count(
                 folded as i64,
             )))
@@ -5309,6 +5345,8 @@ impl NodePeek {
         for index in 0..self.groups.len() {
             match self.place(index) {
                 Place::Listed => listed.push(Item::Group(index)),
+                // A page hides a group once it is counted empty, as a tree does.
+                Place::AsDrawn if self.page && !self.shows_empty_group(index) => {}
                 Place::AsDrawn => as_drawn.push(Item::Group(index)),
                 Place::Folded => folded.push(index),
             }
@@ -5316,7 +5354,10 @@ impl NodePeek {
         items.extend(listed);
         items.extend(as_drawn);
         if !folded.is_empty() {
-            items.push(Item::Empty);
+            // A page has no Empty row: its toolbar's eye shows or hides the groups.
+            if !self.page {
+                items.push(Item::Empty);
+            }
             items.extend(
                 folded
                     .into_iter()
@@ -6251,8 +6292,10 @@ mod tests {
     }
 
     /// A type with many relationships reads only the groups whose rows are drawn, and a few
-    /// rows past them; scrolling reads the rest, each once. A group read as having none keeps
-    /// its row, so its count arriving pulls no further group into view.
+    /// rows past them; scrolling reads the rest, each once. With the relationships with none
+    /// shown, a group read as having none keeps its row, so its count arriving pulls no further
+    /// group into view. (Hidden, as a page has them at first, each empty group read makes room
+    /// for the next, as on a tree.)
     #[gpui::test]
     async fn only_the_groups_drawn_are_read_and_scrolling_reads_the_rest_once(
         cx: &mut TestAppContext,
@@ -6283,7 +6326,9 @@ mod tests {
             editor::init(cx);
         });
         let window = cx.open_window(gpui::size(px(480.), px(360.)), move |_, cx| {
-            NodePeek::page(session, "Person".into(), "p1".into(), None, cx)
+            let mut view = NodePeek::page(session, "Person".into(), "p1".into(), None, cx);
+            view.show_empty = true;
+            view
         });
         let view = window.root(cx).unwrap();
         let cx = VisualTestContext::from_window(window.into(), cx).into_mut();
@@ -7008,9 +7053,10 @@ mod tests {
     }
 
     /// A node lists first the relationships it is known to have; the ones known to have none
-    /// fold into one row, which lists them when opened. One the person is adding to stays
-    /// listed while empty. A group laid out before it was counted keeps its place whatever its
-    /// count says, so a count arriving moves no row.
+    /// fold into one row in the peek, which lists them when opened, and a page hides them
+    /// until its toolbar's eye shows them, as a tree does. One the person is adding to stays
+    /// listed while empty. In the peek, a group laid out before it was counted keeps its place
+    /// whatever its count says, so a count arriving moves no row.
     #[gpui::test]
     async fn relationships_with_none_fold_away_until_asked_for(cx: &mut TestAppContext) {
         let (view, cx) = page(session(KNOWS, cx), cx);
@@ -7018,6 +7064,19 @@ mod tests {
             assert!(view.groups.len() >= 2, "knows, out and in");
             assert_eq!(view.groups[1].count, Loadable::Loaded(0), "read as drawn");
             assert_eq!(view.place(1), Place::AsDrawn, "it has none, in its place");
+            assert!(
+                view.hides_empty() && view.any_empty(),
+                "a page hides it at first"
+            );
+            assert!(
+                !view.list_items().contains(&Item::Group(1)),
+                "a page hides it once it is counted"
+            );
+            view.page = false;
+            assert!(
+                view.list_items().contains(&Item::Group(1)),
+                "the peek keeps it"
+            );
             // As if the table had counted them before the page laid them out.
             for group in &mut view.groups {
                 group.as_drawn = false;
@@ -7031,6 +7090,25 @@ mod tests {
                 [Item::Group(0), Item::Empty],
                 "listed, then the empty row"
             );
+            view.page = true;
+            assert_eq!(
+                view.list_items()[1..],
+                [Item::Group(0)],
+                "a page has no empty row"
+            );
+            view.toggle_empty(cx);
+            assert_eq!(
+                view.list_items()[1..],
+                [Item::Group(0), Item::Group(1)],
+                "the eye shows it after the others"
+            );
+            view.collapse_all(cx);
+            assert!(
+                view.groups.iter().all(|group| !group.expanded),
+                "all closed"
+            );
+            view.toggle_empty(cx);
+            view.page = false;
             view.groups[1].count = Loadable::Failed("unreachable".into());
             assert_eq!(view.place(1), Place::Listed, "a failed count says why");
             view.groups[1].count = Loadable::Loading;

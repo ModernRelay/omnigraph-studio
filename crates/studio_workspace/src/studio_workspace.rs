@@ -487,6 +487,47 @@ pub fn view_strip(views: Vec<ViewLink>, cx: &App) -> Option<AnyElement> {
     )
 }
 
+/// A toolbar's eye over a node's relationships, as a tree and a node's page show it: hides the
+/// relationships with none (`hide`), or shows them again. With `key`, its tooltip names
+/// [`studio_actions::tree::ToggleEmptyGroups`]'s key, which only a tree binds.
+pub fn empty_groups_toggle(hide: bool, key: bool) -> studio_ui::ds::IconButton {
+    use studio_ui::ds::Tipped as _;
+    studio_ui::ds::row_icon_button(
+        "toggle-empty-groups",
+        if hide {
+            IconName::EyeOff
+        } else {
+            IconName::Eye
+        },
+    )
+    .icon_color(Color::Muted)
+    .toggle_state(hide)
+    .tip_fn(move |_, cx| {
+        let text = if hide {
+            "Show relationships with none"
+        } else {
+            "Hide relationships with none"
+        };
+        if key {
+            studio_ui::ds::tooltip_for_action_view(
+                text,
+                &studio_actions::tree::ToggleEmptyGroups,
+                cx,
+            )
+        } else {
+            studio_ui::ds::tooltip_view(text, cx)
+        }
+    })
+}
+
+/// A toolbar's Collapse all, beside [`empty_groups_toggle`]: closes every open relationship.
+pub fn collapse_all_button() -> studio_ui::ds::IconButton {
+    use studio_ui::ds::Tipped as _;
+    studio_ui::ds::row_icon_button("collapse-to-root", IconName::ListCollapse)
+        .icon_color(Color::Muted)
+        .tip(studio_ui::ds::tooltip("Collapse all"))
+}
+
 /// The inspector while the active tab has nothing selected.
 struct NothingSelected;
 

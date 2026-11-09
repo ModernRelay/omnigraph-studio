@@ -7,6 +7,7 @@
 mod neighbour_controls;
 mod rows;
 
+use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -271,6 +272,9 @@ pub(crate) struct RelationshipTree {
     filter: String,
     /// Leave out relationship groups with no relationships.
     hide_empty: bool,
+    /// The groups shown seen with relationships: one keeps its row while its count is read
+    /// again, and the others wait for theirs before they show.
+    had_relationships: HashSet<graph_store::ExplorePath>,
     focus_handle: FocusHandle,
     scroll_handle: UniformListScrollHandle,
     _subscriptions: Vec<Subscription>,
@@ -493,6 +497,7 @@ impl RelationshipTree {
             // Relationships with none are left out until asked for: what a node has is the
             // tree, not what its type allows.
             hide_empty: true,
+            had_relationships: HashSet::new(),
             focus_handle: cx.focus_handle(),
             scroll_handle: UniformListScrollHandle::new(),
             _subscriptions: subscriptions,
@@ -514,6 +519,12 @@ impl RelationshipTree {
     fn rebuild(&mut self, cx: &mut Context<Self>) {
         self.rebuild_owed = false;
         self.entries = self.exploration.read(cx).entries();
+        // Only the groups still in the tree are remembered.
+        let shown: HashSet<&graph_store::ExplorePath> =
+            self.entries.iter().map(|entry| &entry.path).collect();
+        self.had_relationships.retain(|path| shown.contains(path));
+        self.had_relationships
+            .extend(rows::groups_with_relationships(&self.entries).cloned());
         self.any_empty = self.entries.iter().any(|entry| {
             matches!(
                 entry.kind,
@@ -559,7 +570,7 @@ impl RelationshipTree {
                     exploration.state(),
                     exploration.schema().as_deref(),
                     &self.filter,
-                    self.hide_empty,
+                    self.hide_empty.then_some(&self.had_relationships),
                 )
             }
         };
@@ -1415,38 +1426,15 @@ impl RelationshipTree {
                     // hiding on.
                     .when(hide_empty || self.any_empty, |row| {
                         row.child(
-                            studio_ui::ds::row_icon_button(
-                                "toggle-empty-groups",
-                                if hide_empty {
-                                    IconName::EyeOff
-                                } else {
-                                    IconName::Eye
-                                },
-                            )
-                            .icon_color(Color::Muted)
-                            .toggle_state(hide_empty)
-                            .tip_fn(move |_, cx| {
-                                studio_ui::ds::tooltip_for_action_view(
-                                    if hide_empty {
-                                        "Show relationships with none"
-                                    } else {
-                                        "Hide relationships with none"
-                                    },
-                                    &ToggleEmptyGroups,
-                                    cx,
-                                )
-                            })
-                            .on_click(cx.listener(
-                                |this, _, window, cx| {
+                            studio_workspace::empty_groups_toggle(hide_empty, true).on_click(
+                                cx.listener(|this, _, window, cx| {
                                     this.toggle_empty_groups(&ToggleEmptyGroups, window, cx)
-                                },
-                            )),
+                                }),
+                            ),
                         )
                     })
                     .child(
-                        studio_ui::ds::row_icon_button("collapse-to-root", IconName::ListCollapse)
-                            .icon_color(Color::Muted)
-                            .tip(studio_ui::ds::tooltip("Collapse all"))
+                        studio_workspace::collapse_all_button()
                             .on_click(cx.listener(|this, _, _, cx| this.collapse_to_root(cx))),
                     ),
             )
