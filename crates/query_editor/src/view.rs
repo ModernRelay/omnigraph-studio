@@ -34,7 +34,7 @@ use studio_actions::query::{
     ApplyFix, CopyCell, CopyRow, Explain, NextPage, NextProblem, PreviousProblem, Run, Save,
     SaveAs, SelectNextColumn, SelectPreviousColumn, ToggleResultsFocus,
 };
-use studio_actions::table::{Cancel as CancelEdit, ConfirmEdit, EditCell, RevertView};
+use studio_actions::table::RevertView;
 use studio_actions::workspace::Refresh;
 use studio_ui::ds::Tipped;
 use studio_ui::ds::{Dotted as _, space};
@@ -95,8 +95,6 @@ struct Prepared {
     /// It asks for a plan (`explain`): only its answer is shown as one, whatever another
     /// read's columns are called.
     explain: bool,
-    /// The answer columns of the nodes' ids that the editable columns need (spec 024).
-    ids: Vec<gq_language::RowId>,
 }
 
 /// Where a read's rows came from, as its answer says.
@@ -145,20 +143,6 @@ struct FileView {
     changed: bool,
     /// Run the query once its parameters are in: the view was just opened.
     run: bool,
-}
-
-/// A result cell being edited (spec 024): its place, the property and node it is, the value it
-/// showed, which the write is bound to, and its field.
-struct CellEditing {
-    row: usize,
-    column: usize,
-    type_name: String,
-    property: String,
-    id: String,
-    old: Value,
-    input: Entity<Editor>,
-    /// Its write is out: a second ↵ sends nothing.
-    saving: bool,
 }
 
 /// A write waiting for the person to confirm it (constitution III, VII).
@@ -296,7 +280,7 @@ struct BuiltRows {
 /// table, or the refusal.
 enum Answer {
     Plan(ReadOutput),
-    Rows(ReadOutput, Box<BuiltRows>),
+    Rows(ReadOutput, BuiltRows),
     Refused(ReadError),
 }
 
@@ -304,15 +288,14 @@ impl Answer {
     fn of(
         result: Result<ReadOutput, ReadError>,
         columns: Option<&[ResultColumn]>,
-        ids: &[gq_language::RowId],
         schema: Option<Arc<SchemaModel>>,
         explain: bool,
     ) -> Self {
         match result {
             Ok(output) if explain && is_plan(&output.columns) => Answer::Plan(output),
             Ok(mut output) => {
-                let built = BuiltRows::new(&mut output, columns, ids, schema);
-                Answer::Rows(output, Box::new(built))
+                let built = BuiltRows::new(&mut output, columns, schema);
+                Answer::Rows(output, built)
             }
             Err(error) => Answer::Refused(error),
         }
@@ -324,12 +307,10 @@ impl BuiltRows {
     fn new(
         output: &mut ReadOutput,
         columns: Option<&[ResultColumn]>,
-        ids: &[gq_language::RowId],
         schema: Option<Arc<SchemaModel>>,
     ) -> Self {
         let rows = Arc::unwrap_or_clone(std::mem::take(&mut output.rows));
-        let mut table = ResultTable::new(output.columns.clone(), rows, columns);
-        table.take_ids(columns, ids);
+        let table = ResultTable::new(output.columns.clone(), rows, columns);
         let widths = (0..table.columns.len())
             .map(|i| table.column_width(i))
             .collect();
@@ -718,8 +699,6 @@ pub struct QueryEditor {
     check_task: Option<Task<()>>,
     /// A stored query's tab (spec 007); `None` for a query written in the editor.
     stored: Option<Stored>,
-    /// The result cell being edited.
-    cell_edit: Option<CellEditing>,
     /// The saved view of one of the file's queries this tab shows (spec 024).
     file_view: Option<FileView>,
     /// Values for parameters the query has no input for yet, which fill their inputs when they
@@ -1113,12 +1092,6 @@ impl QueryEditor {
                     }
                     SessionEvent::HeadMoved { branch, head } => this.head_moved(branch, head, cx),
                     SessionEvent::StoredQueriesChanged => this.catalog_changed(window, cx),
-                    SessionEvent::PropertiesWritten {
-                        branch,
-                        parent,
-                        commit,
-                        wrote,
-                    } => this.properties_written(branch, parent.as_deref(), commit, wrote, cx),
                     _ => {}
                 },
             ),
@@ -1186,7 +1159,6 @@ impl QueryEditor {
             run_task: None,
             check_task: None,
             stored,
-            cell_edit: None,
             file_view: None,
             view_values: Map::new(),
             results: QueryResults::new(cx),
@@ -2749,7 +2721,6 @@ impl QueryEditor {
             publication: Publication::Branch,
             page: 0,
             explain: false,
-            ids: Vec::new(),
         })
     }
 
@@ -3028,7 +2999,6 @@ impl QueryEditor {
                 },
                 sent: Some(self.snapshot(cx)),
                 stored: None,
-                ids: Vec::new(),
             });
         }
         let declaration = outline
@@ -3073,28 +3043,14 @@ impl QueryEditor {
         } else {
             declaration.name.clone()
         };
-        let (columns, destroys, publication, ids) = match info {
-            Some(info) => (
-                Some(info.columns),
-                info.destroys,
-                info.publication,
-                if mutation || explained {
-                    Vec::new()
-                } else {
-                    info.ids
-                },
-            ),
+        let (columns, destroys, publication) = match info {
+            Some(info) => (Some(info.columns), info.destroys, info.publication),
             // Unchecked (no schema yet): where it publishes and what it destroys are in its
             // parse alone, so a destructive write still waits for its name typed.
             None => {
                 let declared = gq_language::check::declared_write(&text, &declaration.name);
-                (None, declared.destroys, declared.publication, Vec::new())
+                (None, declared.destroys, declared.publication)
             }
-        };
-        // The ids an edit needs that the query does not return go with it, hidden (spec 024).
-        let (text, added) = match gq_language::with_row_ids(&text, &ids) {
-            Some((sent, at, length)) => (sent, (at, length)),
-            None => (text, (0, 0)),
         };
         Ok(Prepared {
             text,
@@ -3108,7 +3064,6 @@ impl QueryEditor {
                 prefix_len: outline.prefix.end,
                 inserted: if explained { "explain ".len() } else { 0 },
                 start: declaration.range.start,
-                added,
             },
             sent: Some(self.snapshot(cx)),
             stored: None,
@@ -3116,7 +3071,6 @@ impl QueryEditor {
             publication,
             page: 0,
             explain: explained,
-            ids,
         })
     }
 
@@ -3337,12 +3291,11 @@ impl QueryEditor {
             let elapsed = started.elapsed();
             // The rows are built off the main thread: a large answer would hold up frames.
             let columns = prepared.columns.clone();
-            let ids = prepared.ids.clone();
             let explain = prepared.explain;
             let answer = cx
-                .background_spawn(async move {
-                    Answer::of(result, columns.as_deref(), &ids, schema, explain)
-                })
+                .background_spawn(
+                    async move { Answer::of(result, columns.as_deref(), schema, explain) },
+                )
                 .await;
             this.update(cx, |this, cx| {
                 // A new output replaces the plan whose operator lit the text.
@@ -3373,7 +3326,6 @@ impl QueryEditor {
         let answer = Answer::of(
             result,
             prepared.columns.as_deref(),
-            &prepared.ids,
             schema,
             prepared.explain,
         );
@@ -3382,8 +3334,6 @@ impl QueryEditor {
 
     /// Shows a read's answer, its rows already built ([`BuiltRows`]).
     fn show_read(&mut self, prepared: Prepared, sent: ReadAt, answer: Answer, elapsed: Duration) {
-        // The cell being edited was one of the rows replaced.
-        self.cell_edit = None;
         let note = match &answer {
             Answer::Plan(output) | Answer::Rows(output, _) => RunNote {
                 text: format!(
@@ -3418,7 +3368,7 @@ impl QueryEditor {
                     right_aligned,
                     graph,
                     shown,
-                } = *built;
+                } = built;
                 // A width the person dragged a column to wins over the one from its content.
                 let widths = widths
                     .into_iter()
@@ -3755,10 +3705,6 @@ impl QueryEditor {
     /// Moves the selected cell `rows` rows down and `columns` columns right, within the
     /// result; with nothing selected yet, the first step lands on the first cell.
     fn move_selection(&mut self, rows: isize, columns: isize, cx: &mut Context<Self>) {
-        // The keys move within the cell being edited.
-        if self.cell_edit.is_some() {
-            return;
-        }
         let Output::Rows(output) = &self.output else {
             return;
         };
@@ -3845,334 +3791,10 @@ impl QueryEditor {
         }
     }
 
-    // ---- editing cells (spec 024) ----
-
-    /// Where an edit of cell (`row`, `column`) goes, `(type, property, id, the value shown)`, or
-    /// why it cannot be edited, as a sentence.
-    fn cell_edit_target(
-        &self,
-        row: usize,
-        column: usize,
-        cx: &App,
-    ) -> Result<(String, String, String, Value), String> {
-        let Output::Rows(rows) = &self.output else {
-            return Err("There is no result to edit.".into());
-        };
-        if self.stored.is_some() {
-            return Err(STORED_READ_ONLY.into());
-        }
-        let (target, id) = rows
-            .table
-            .cell_target(row, column)
-            .map_err(|reason| format!("This cell is read-only: {reason}."))?;
-        let session = self.session.read(cx);
-        let branch = match &rows.read_at {
-            ReadAt::Branch(branch) if *branch == session.branch => branch.clone(),
-            ReadAt::Branch(branch) => {
-                return Err(format!(
-                    "These rows were read on {branch}. Run the query again on {} to edit them.",
-                    session.branch
-                ));
-            }
-            ReadAt::Commit(commit) => {
-                return Err(format!(
-                    "These rows were read at commit {}, which is never written. Unpin the tab \
-                     and run the query again to edit them.",
-                    short_commit_id(commit)
-                ));
-            }
-            ReadAt::Statement => return Err("A statement's rows are not edited.".into()),
-        };
-        let schema = session
-            .schema_model()
-            .ok_or("The schema is not read yet.")?;
-        let property = schema
-            .node(&target.type_name)
-            .and_then(|node| node.property(&target.property))
-            .ok_or_else(|| {
-                format!(
-                    "{} has no property {} on {branch}.",
-                    target.type_name, target.property
-                )
-            })?;
-        if !property.editable_in_cell() {
-            return Err(format!(
-                "{} is not edited in a cell: it is a key, a vector or a blob.",
-                target.property
-            ));
-        }
-        // A list cannot be compared in a write's `where`: the write is bound to the commit the
-        // rows were read at, which must be the head.
-        if property.list && rows.commit.as_deref() != session.head(&branch) {
-            return Err(format!(
-                "{} is a list, and the branch has moved since these rows were read. Refresh, \
-                 then edit it.",
-                target.property
-            ));
-        }
-        if let Some(refusal) = session.refusal(
-            graph_store::AccessAction::Change,
-            &graph_store::AccessScope::branch(&branch),
-        ) {
-            return Err(refusal);
-        }
-        let old = rows.table.rows[row][column].clone();
-        Ok((
-            target.type_name.clone(),
-            target.property.clone(),
-            id.to_owned(),
-            old,
-        ))
-    }
-
-    /// Says `text` in a toast: why a cell is not edited, or how its write ended.
+    /// Says `text` in a toast.
     fn say(&self, kind: studio_workspace::ToastKind, text: String, window: &Window, cx: &mut App) {
         if let Some(workspace) = studio_workspace::workspace_for(window) {
             workspace.update(cx, |workspace, cx| workspace.show_toast(kind, text, cx));
-        }
-    }
-
-    /// ↵ or a double click: edits the selected cell in place, or says why it cannot be.
-    fn edit_cell(&mut self, _: &EditCell, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((row, column)) = self.selected else {
-            return;
-        };
-        if self.cell_edit.is_some() {
-            return;
-        }
-        match self.cell_edit_target(row, column, cx) {
-            Ok((type_name, property, id, old)) => {
-                let text = gq_language::input::edit_text(&old);
-                let input = param_input("", Some(text), window, cx);
-                input.update(cx, |input, cx| {
-                    input.select_all(&Default::default(), window, cx)
-                });
-                window.focus(&input.focus_handle(cx), cx);
-                self.cell_edit = Some(CellEditing {
-                    row,
-                    column,
-                    type_name,
-                    property,
-                    id,
-                    old,
-                    input,
-                    saving: false,
-                });
-                cx.emit(ItemEvent::UpdateTab);
-                self.redraw_results(cx);
-                cx.notify();
-            }
-            Err(reason) => self.say(studio_workspace::ToastKind::Info, reason, window, cx),
-        }
-    }
-
-    /// Esc: leaves the cell as it was.
-    fn cancel_cell(&mut self, _: &CancelEdit, window: &mut Window, cx: &mut Context<Self>) {
-        if self
-            .cell_edit
-            .as_ref()
-            .is_some_and(|editing| !editing.saving)
-        {
-            self.end_cell_edit(window, cx);
-        }
-    }
-
-    fn end_cell_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.cell_edit = None;
-        window.focus(&self.results_focus, cx);
-        cx.emit(ItemEvent::UpdateTab);
-        self.redraw_results(cx);
-        cx.notify();
-    }
-
-    /// ↵ in the cell: writes the value typed to its node's property, bound to the value the
-    /// cell showed, as a table's cell is written. A value left as it was writes nothing.
-    fn confirm_cell(&mut self, _: &ConfirmEdit, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(editing) = &self.cell_edit else {
-            return;
-        };
-        if editing.saving {
-            return;
-        }
-        let Some(schema) = self.schema(cx) else {
-            return;
-        };
-        let Some(property) = schema
-            .node(&editing.type_name)
-            .and_then(|node| node.property(&editing.property))
-            .cloned()
-        else {
-            return;
-        };
-        let text = editing.input.read(cx).text(cx);
-        let new = match gq_language::input::typed(&property, &editing.old, &text) {
-            None => return self.end_cell_edit(window, cx),
-            Some(Err(error)) => {
-                return self.say(studio_workspace::ToastKind::Error, error, window, cx);
-            }
-            Some(Ok(new)) => new,
-        };
-        let (type_name, name, id) = (
-            editing.type_name.clone(),
-            editing.property.clone(),
-            editing.id.clone(),
-        );
-        let row = gq_language::builder::RowEdit {
-            id: id.clone(),
-            cells: vec![(name.clone(), editing.old.clone(), new.clone())],
-        };
-        let query = match gq_language::builder::update_rows(&schema, &type_name, &[row]) {
-            Ok(query) => query,
-            Err(error) => {
-                return self.say(
-                    studio_workspace::ToastKind::Error,
-                    error.to_string(),
-                    window,
-                    cx,
-                );
-            }
-        };
-        let Output::Rows(rows) = &self.output else {
-            return;
-        };
-        let if_commit = if property.list {
-            rows.commit.clone()
-        } else {
-            None
-        };
-        let branch = self.branch(cx);
-        let wrote = graph_store::Wrote {
-            type_name,
-            nodes: vec![(id.clone(), vec![(name.clone(), new)])],
-        };
-        let description = format!("Set {name} of {id}");
-        let write = self.session.update(cx, |session, cx| {
-            session.write_properties_on(&branch, &query, if_commit, description, wrote, cx)
-        });
-        if let Some(editing) = &mut self.cell_edit {
-            editing.saving = true;
-        }
-        cx.spawn_in(window, async move |this, cx| {
-            let outcome = write.await;
-            this.update_in(cx, |this, window, cx| {
-                this.cell_written(outcome, &name, &id, &branch, window, cx)
-            })
-            .ok();
-        })
-        .detach();
-        cx.notify();
-    }
-
-    /// How a cell's write ended. A value written comes into every row that shows it with
-    /// [`SessionEvent::PropertiesWritten`]; a refusal keeps the cell open with what was typed.
-    fn cell_written(
-        &mut self,
-        outcome: WriteOutcome<graph_client::api::ChangeOutput>,
-        property: &str,
-        id: &str,
-        branch: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        use studio_workspace::ToastKind;
-        match outcome {
-            WriteOutcome::Committed(output) if output.affected_nodes == 1 => {
-                self.end_cell_edit(window, cx);
-            }
-            WriteOutcome::Committed(_) => {
-                self.end_cell_edit(window, cx);
-                self.say(
-                    ToastKind::Info,
-                    format!(
-                        "Nothing was written: {property} of {id} changed on {branch} since it \
-                         was read, or the node is gone. Refresh to see it."
-                    ),
-                    window,
-                    cx,
-                );
-            }
-            WriteOutcome::Refused(error) => {
-                if let Some(editing) = &mut self.cell_edit {
-                    editing.saving = false;
-                }
-                let reason = studio_ui::clause(error.reason()).to_owned();
-                self.say(
-                    ToastKind::Error,
-                    format!("Nothing was written. {reason}."),
-                    window,
-                    cx,
-                );
-                cx.notify();
-            }
-            WriteOutcome::NotSent { reason } => {
-                if let Some(editing) = &mut self.cell_edit {
-                    editing.saving = false;
-                }
-                let reason = studio_ui::clause(&reason).to_owned();
-                self.say(
-                    ToastKind::Error,
-                    format!("Nothing was written. {reason}."),
-                    window,
-                    cx,
-                );
-                cx.notify();
-            }
-            WriteOutcome::Unknown { reason } => {
-                self.end_cell_edit(window, cx);
-                let reason = studio_ui::clause(&reason).to_owned();
-                self.say(
-                    ToastKind::Error,
-                    format!(
-                        "{reason}. The write may have been made: look at the branch's history \
-                         before setting {property} of {id} again."
-                    ),
-                    window,
-                    cx,
-                );
-            }
-        }
-    }
-
-    /// Values written by any view of this graph: each row that shows one of the nodes takes
-    /// it. When every node written is one the rows show and they were read at the commit the
-    /// write was made over, the rows follow the write's commit rather than offer Newer data.
-    fn properties_written(
-        &mut self,
-        branch: &str,
-        parent: Option<&str>,
-        commit: &str,
-        wrote: &graph_store::Wrote,
-        cx: &mut Context<Self>,
-    ) {
-        let Output::Rows(rows) = &mut self.output else {
-            return;
-        };
-        if !matches!(&rows.read_at, ReadAt::Branch(read) if read == branch) {
-            return;
-        }
-        let mut changed = Vec::new();
-        let mut every_shown = true;
-        for (id, values) in &wrote.nodes {
-            every_shown &= rows.table.shows_node(&wrote.type_name, id);
-            for (property, value) in values {
-                changed.extend(
-                    rows.table
-                        .set_property(&wrote.type_name, id, property, value),
-                );
-            }
-        }
-        for row in &changed {
-            if let Some(shown) = rows.shown.get_mut(*row) {
-                *shown = Default::default();
-            }
-        }
-        if every_shown && parent.is_some() && rows.commit.as_deref() == parent {
-            rows.commit = Some(commit.to_owned());
-            rows.head_seen = Some(commit.to_owned());
-        }
-        if !changed.is_empty() {
-            self.redraw_results(cx);
-            cx.notify();
         }
     }
 
@@ -4335,19 +3957,8 @@ impl QueryEditor {
                         );
                     }
                 }
-                if let Some(editing) = &self.cell_edit {
-                    let focus = editing.input.focus_handle(cx);
-                    keys.push(KeyHint::new(
-                        format!("Save to {}", editing.id),
-                        &ConfirmEdit,
-                        &focus,
-                    ));
-                    keys.push(KeyHint::new("Cancel", &CancelEdit, &focus));
-                } else if let Some((row, column)) = self.selected {
+                if self.selected.is_some() {
                     let focus = &self.results_focus;
-                    if self.cell_edit_target(row, column, cx).is_ok() {
-                        keys.push(KeyHint::new("Edit the cell", &EditCell, focus));
-                    }
                     keys.push(KeyHint::new("Copy cell", &CopyCell, focus));
                     keys.push(KeyHint::new("Copy row", &CopyRow, focus));
                     keys.push(KeyHint::new(
@@ -5081,12 +4692,6 @@ impl QueryEditor {
                 if let Some(Some(ty)) = table.types.get(i) {
                     column = column.detail(ty.clone());
                 }
-                // A column whose cells cannot be edited says why (spec 024).
-                if self.stored.is_some() {
-                    column = column.tooltip(STORED_READ_ONLY.trim_start_matches("This cell is "));
-                } else if let Some(Err(reason)) = table.edits.get(i) {
-                    column = column.tooltip(format!("Read-only: {reason}"));
-                }
                 column
             })
             .collect();
@@ -5129,17 +4734,9 @@ impl QueryEditor {
                 )
                 .into_any_element()
         };
-        let mut context = gpui::KeyContext::default();
-        context.add("QueryResults");
-        if self.cell_edit.is_some() {
-            context.add("editing");
-        }
         v_flex()
-            .key_context(context)
+            .key_context("QueryResults")
             .track_focus(&self.results_focus)
-            .on_action(cx.listener(Self::edit_cell))
-            .on_action(cx.listener(Self::confirm_cell))
-            .on_action(cx.listener(Self::cancel_cell))
             .on_action(cx.listener(Self::copy_cell))
             .on_action(cx.listener(Self::copy_row))
             .on_action(
@@ -5275,10 +4872,6 @@ impl QueryEditor {
             Color::Default.color(cx),
         );
         let selected = self.selected;
-        let editing = self
-            .cell_edit
-            .as_ref()
-            .map(|editing| (editing.row, editing.column, editing.input.clone()));
         range
             .filter_map(|ix| {
                 let values = rows.table.rows.get(ix)?;
@@ -5309,15 +4902,6 @@ impl QueryEditor {
                                 }
                             };
                             let cell_selected = selected == Some((ix, column));
-                            if let Some((_, _, input)) = editing
-                                .as_ref()
-                                .filter(|(row, at, _)| *row == ix && *at == column)
-                            {
-                                return grid_cell(px(rows.widths[column]), false)
-                                    .bg(selected_bg)
-                                    .child(input.clone())
-                                    .into_any_element();
-                            }
                             let right = rows.right_aligned[column];
                             let text = studio_ui::cell_text(shown[column].clone(), cx).color(
                                 if values[column].is_null() {
@@ -5331,12 +4915,8 @@ impl QueryEditor {
                                 .child(if right { text.align_end() } else { text })
                                 .on_mouse_down(
                                     MouseButton::Left,
-                                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                                        this.select_cell(ix, column, window, cx);
-                                        // A double click edits the cell, as ↵ does.
-                                        if event.click_count == 2 {
-                                            this.edit_cell(&EditCell, window, cx);
-                                        }
+                                    cx.listener(move |this, _, window, cx| {
+                                        this.select_cell(ix, column, window, cx)
                                     }),
                                 )
                                 .into_any_element()
@@ -5833,11 +5413,6 @@ fn param_input(
         editor
     })
 }
-
-/// Why a stored query's cells are read-only (spec 024, E43).
-const STORED_READ_ONLY: &str = "This cell is read-only: the server keeps a stored query's text, \
-     so Studio cannot tell which property each column is. Run the query from a .gq file to edit \
-     its cells.";
 
 /// The dedupe key of a saved view's tab (spec 024): one per view at the head, and one per view
 /// and commit, as a type view's tab is keyed.
@@ -7728,99 +7303,6 @@ mod tests {
                     .and_then(|view| view.query.clone())
                     .expect("still a query view");
                 assert_eq!(saved.params["title"], json!("CEO"));
-            });
-        }
-
-        /// A cell of one node's property is edited in place: the read sends the node's id as a
-        /// hidden column, ↵ writes the value typed to that node bound to the one shown, and every
-        /// row showing the node takes it, the rows following the write's commit.
-        #[gpui::test]
-        async fn a_result_cell_is_written_to_its_node_and_shown_in_every_row(
-            cx: &mut TestAppContext,
-        ) {
-            init(cx);
-            let written = json!({
-                "branch": "main", "query_name": "update_rows", "affected_nodes": 1,
-                "affected_edges": 0,
-                "commit": {"graph_commit_id": "c2", "graph_manifest_version": 3,
-                           "graph_branch": "main", "parent_commit_id": "c1", "published": true,
-                           "created_at": 0, "kind": "published"},
-            });
-            let (session, asked) = served(
-                cx,
-                vec![schema_route(PEOPLE), ("/mutate", written.to_string())],
-            );
-            cx.run_until_parked();
-            let schema = session.read_with(cx, |session, _| session.schema_model().unwrap());
-            let (editor, cx) =
-                cx.add_window_view(|window, cx| QueryEditor::new(1, session, window, cx));
-            let text = "query people() { match { $p: Person } return { $p.name, count($p) as n } }";
-            editor.update_in(cx, |editor, window, cx| {
-                editor.set_text(text, window, cx);
-                editor.cursor = 0;
-                editor.apply_analysis(Arc::new(Analysis::new(&schema, text.into())), window, cx);
-                let prepared = editor.prepare(false, cx).unwrap();
-                assert!(
-                    prepared.text.contains("$p.@id as __studio_id_p"),
-                    "{}",
-                    prepared.text
-                );
-                let output: ReadOutput = serde_json::from_value(json!({
-                    "query_name": "people",
-                    "target": {"branch": "main"},
-                    "graph_commit_id": "c1",
-                    "row_count": 2,
-                    "columns": ["p.name", "n", "__studio_id_p"],
-                    "rows": [
-                        {"p.name": "Ada", "n": 1, "__studio_id_p": "p1"},
-                        {"p.name": "Ada", "n": 1, "__studio_id_p": "p1"},
-                    ],
-                }))
-                .unwrap();
-                let at = ReadAt::Branch("main".into());
-                editor.finish_read(prepared, at, Ok(output), Duration::ZERO, None);
-                let Output::Rows(rows) = &editor.output else {
-                    panic!("no rows");
-                };
-                assert_eq!(rows.table.columns, ["p.name", "n"], "the id is hidden");
-                assert!(
-                    editor
-                        .cell_edit_target(0, 1, cx)
-                        .unwrap_err()
-                        .contains("an aggregate")
-                );
-                editor.selected = Some((0, 0));
-                editor.edit_cell(&EditCell, window, cx);
-                let input = editor.cell_edit.as_ref().expect("editing").input.clone();
-                assert_eq!(input.read(cx).text(cx), "Ada");
-                input.update(cx, |input, cx| input.set_text("Ada Lovelace", window, cx));
-                editor.confirm_cell(&ConfirmEdit, window, cx);
-            });
-            cx.run_until_parked();
-            let sent = asked
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|line| line.ends_with("/mutate"))
-                .count();
-            assert_eq!(sent, 1, "written once");
-            editor.read_with(cx, |editor, _| {
-                assert!(editor.cell_edit.is_none(), "the edit ended");
-                let Output::Rows(rows) = &editor.output else {
-                    panic!("no rows");
-                };
-                assert_eq!(rows.table.rows[0][0], json!("Ada Lovelace"));
-                assert_eq!(
-                    rows.table.rows[1][0],
-                    json!("Ada Lovelace"),
-                    "the same node"
-                );
-                assert_eq!(
-                    rows.commit.as_deref(),
-                    Some("c2"),
-                    "the rows follow the write"
-                );
-                assert!(!rows.newer);
             });
         }
 
