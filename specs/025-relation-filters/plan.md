@@ -1,6 +1,6 @@
 # 025: Filters through relationships
 
-Status: draft · 2026-11-08
+Status: built 2026-11-08 (steps 1–3; step 4's timings pending) · draft 2026-11-08
 
 ## Problem
 
@@ -159,8 +159,6 @@ A group is one filter. Its op is the new `FilterOp::Where` (key `where_related`,
   meaning they have today. Each pill's menu has "**Same Company as …**", which merges it into
   the other pill's group, and a group's test menu has "**Separate**", which moves the test back
   to the bar.
-- **Actions.** `studio_table::FilterWhere` opens the relationship submenu for the focused
-  relationship column's key. It is palette-only, so it goes on `PALETTE_ONLY`.
 
 ### The sentence filter (spec 019)
 
@@ -245,10 +243,29 @@ anything else the pills can't express.
 |---|---|---|---|
 | 2026-11-08 | GQ at 0.14 takes every shape the design builds | `omnigraph lint --schema s.pg --query q.gq` (CLI `0.14.1-edge+269299b`) on Person, Company, City with `WorksAt { since: Date?, role: String? }` and `LocatedIn`: two tests on one `$r0` in an `exists`; a bound edge `$n $w0:worksAt $r0` with `$w0.since > $d` and `$w0.role = "CTO"`; a second hop as a nested `exists` and as two traversals in one block; `count { … } >= 2`; `not { … }` with a test; `every` as `exists { $n worksAt $_ }` plus `not { $r0 … not { $r0.city = $c } }`; `sum($r0.employees) { … } > 100` | All eight: OK, read queries, no warnings |
 | 2026-11-08 | The filter, menu, row-matching and sentence-filter paths are as described | A read of `gq_language::builder`, `type_table::{table, model}` and `filter_words` at `43176b80`, citing file and line | As listed under "What exists today" |
+| 2026-11-08 | Every group the builder writes type-checks, and refuses what it cannot say | `gq_language` `every_kind_of_group_compiles` (two tests on one company, the edge's `@since` and `@role` with a date preset, three hops, a hop as a neighbour's property beside a relationship test and `@id`, none, every with and without tests, at least 2, at most 1, the total of an edge property, the average of whole numbers against `50.5`, the latest date, the smallest fraction; each as a page, a count and a stored query, all checked by the compiler), `a_group_refuses_what_it_cannot_say` (four hops, a count without its n, a total of text, an unknown edge property, a condition inside), `a_group_of_one_test_is_kept_as_the_neighbour_property_it_means` | Pass. Two tests on one company are one `exists` with `$r0.city = $f0_0` and `$r0.employees > $f0_1`; the copy as a stored query names them `$works_at_city` and `$works_at_employees`; a group of one plain test reads back as `out:WorksAt.city`, and "is empty" as `none` of `is not empty` |
+| 2026-11-08 | Drafts through relationships apply as groups in the table | `type_table` `drafts_through_relationships_apply_as_groups`: the edge's `@role`, a second test drafted into that group, its total of `@hours` (the op menu offering comparisons only), two hops, and a neighbour's own property kept flat; the page read with all of them; the pill reads "worksAt · total worksAt hours greater than 10 where · worksAt role is CTO · city is Berlin"; the group's menu opens | Pass. `the_filter_menu_nests_each_relationships_neighbour_properties` and `a_schema_changed_elsewhere_waits_for_refresh` updated: every relationship is now a submenu, since it holds its edge's properties and further hops |
+| 2026-11-08 | A sentence's groups become filters on one related record | `filter_words` `an_answers_groups_test_one_related_record`: the schema offers `groups` and the names inside them (`city`, `country`, `@role`, `@hours`) only with the schema; an answer with three tests and a hop in one group, a total, at least 2, and five mistakes | Pass: three filters; refused, by name, a filter in no group, a property the company lacks, a relationship Person lacks, and at most with no count. Without the schema a grouped filter is refused |
+| 2026-11-08 | The sentence input with groups fits the cap on the personal graph's 100 types | An uncommitted instrument over `omnigraph schema show --target personal --graph personal` (212 KB), building each type's choices as the table does | Listing every type three hops away filled 48 KiB on most types and still left 99 without it: the graph is connected enough that three hops reach nearly every type. With a 12 KiB budget for the hops, the widest input is Artifact's 36,018 B (32,709 before), Person's 30,093 B, and 7 of 100 types list further hops; the other 93 say groups go one relationship from the row and a further hop goes in the predicate |
 | pending | `count { } <= n` keeps rows with no match | Run on the dev server: people with at most one company, compared with `not { }` plus `count = 1` | — |
 | pending | A three-hop group and `every` page in about the time of a one-hop filter on a large type | Time the first page on the personal graph's Person, as "has none" was measured | — |
-| pending | The sentence input with edge properties and related relationships fits 48 KiB on the widest types | The uncommitted instrument over the personal graph's schema (spec 019) | — |
+| pending | The live sentence filter answers in groups | A sentence on the personal graph's Event ("events at a company in Berlin I worked at since 2020") with a key stored | — |
 
 ## Corrections
 
-None yet.
+- 2026-11-08, building it: the group's editor is the pill's menu, not a popover of the bar's
+  parts. A click on a group pill (or a right-click on a neighbour's property pill) opens a menu:
+  "Which of them" (any, none, every; "At least" 1, 2, 3, 5, 10 and "At most" 0, 1, 2, 3, 5;
+  "Total of", "Average of", "Smallest", "Largest" by property), then each test as a submenu
+  (Edit, "Separate into its own filter", Remove), "Add a test" (the relationship's submenu rooted
+  at its record), "The same Company as" listing other pills on the relationship that any of its
+  records passes, and "Remove filter". Editing a test, adding one or setting an aggregate opens
+  the bar's draft, its key menu rooted at the group's record, applied into the group. A count
+  is picked from the list, not typed.
+- A nested group is edited through its path: a hop of one test on any of them edits as
+  `out:LocatedIn.name`; a nested group with several tests or another quantifier (which only the
+  sentence filter makes) is removed and added again.
+- No `studio_table::FilterWhere` action: the Filter menu's relationship submenus and the pill's
+  menu reach everything, so no key was needed.
+- The sentence input lists further hops only within a 12 KiB budget (Validation log); past it,
+  groups go one relationship from the row.

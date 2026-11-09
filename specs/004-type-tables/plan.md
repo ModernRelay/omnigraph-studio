@@ -286,7 +286,7 @@ stay put), IX (paged, virtualized).
   attended" filters when several records are called Aaron: all of them, where "related to"
   binds one record (since 2026-10-31).
 - Several tests on one related record, edge properties, further hops and how many related
-  records match: spec 025 makes a relationship filter a group (draft, 2026-11-08).
+  records match: spec 025 makes a relationship filter a group (built 2026-11-08).
 - The value field offers what it can take: an enum's values (or `true` and `false`), narrowed
   as text is typed with matches at the start first, and for "related to" the other type's
   nodes, searched on the server by id or label (`builder::node_search`, 8 at a time, at the

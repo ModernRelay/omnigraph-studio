@@ -249,7 +249,7 @@ exact record, whose name goes through the node search the filter's own value fie
 gets its id; a name no record matches is dropped and named. What the pills cannot say (`or`,
 `not`, a further hop, two tests on one related record) the model puts in `predicate`, a GQ
 condition on `$n` the answer's schema has beside `filters` (spec 025 moves all but `or` into
-groups; draft): the input gives each
+groups, built 2026-11-08): the input gives each
 relationship as GQ in the edge's own direction from the row `$n` to the related record `$r`
 (`$n attended $r`, `$r knows $n` for an incoming key; `builder::relationship_traversal`) and a
 short grammar; the table makes it a condition filter (spec
