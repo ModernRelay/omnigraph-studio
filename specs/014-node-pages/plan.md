@@ -229,6 +229,11 @@ Four parts, built in this order; each lands on its own.
   row after the rest, with their number; opening it lists them beneath it, each with its "+",
   so the rows above do not move. A listed group whose last neighbour is removed moves under the
   empty row; one added to from there moves up once it has a neighbour.
+- **A page hides the relationships with none** (Ragnor, 2026-11-09), as a tree does: no
+  "Empty" row, and a group leaves the page once it is counted empty. Its toolbar has the tree's
+  eye, which shows them again after the others, and Collapse all; both are the tree's own
+  buttons (`studio_workspace::empty_groups_toggle`, `collapse_all_button`). The peek in the
+  inspector keeps its Empty row.
 - **Built so far**: a group's "+" (§1 says where it sits) opens a
   search over the other type, eight matches by name or id; ↑↓ choose and ↵ adds, written at
   once as one commit with this node at the end its group points from. On an outgoing
@@ -314,5 +319,11 @@ Four parts, built in this order; each lands on its own.
 | 2026-10-16 | 0.13 keeps a property annotation it does not know, but only from the start | `omnigraph` 0.13.0 on a scratch graph: `init` with `body: String? @format("markdown")`, `schema show`; `schema plan` adding the annotation to an existing property, then a new property and a new type carrying it | `init` and `schema show` keep it verbatim; adding it to `Note.body`: "supported: no … changing annotations beyond @description/@instruction is not supported in schema migration v1"; a new property or type with it: "supported: yes" |
 | 2026-10-16 | Plain text keeps its lines when rendered as markdown | `crates/markdown/src/markdown.rs:3292-3295` at Zed `v1.23.2` | `MarkdownStyle::soft_break_as_hard_break` renders a soft break as a line break |
 | 2026-10-16 | `markdown_preview` cannot be used as it is | `crates/markdown_preview/Cargo.toml` at Zed `v1.23.2` | Depends on `workspace` and `project` |
+| 2026-11-09 | A page hides the relationships with none until its eye shows them, and Collapse all closes every group; the peek keeps its Empty row | `type_table` `relationships_with_none_fold_away_until_asked_for`; `only_the_groups_drawn_are_read_and_scrolling_reads_the_rest_once` with them shown | Pass. Not yet checked in the running app |
 
 ## Corrections
+
+- **A page hides groups found empty** (Ragnor, 2026-11-09). This design kept a group read as
+  empty in its row, since hiding it pulls the next groups into view and reads them. A page now
+  hides them as a tree does, so a node whose groups are mostly empty reads every count, one per
+  group, until the page is full or none is left. The peek keeps the rows in place.

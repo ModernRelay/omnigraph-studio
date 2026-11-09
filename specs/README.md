@@ -56,6 +56,7 @@ Add tasks, contracts or data-model files only for large features.
 | 023 | [Lookup and rollup columns](023-lookup-and-rollup-columns/plan.md) | draft |
 | 024 | [Views](024-views/plan.md) | steps 1 and 3 (query views, but not their trees, canvases or columns) built; step 4 dropped |
 | 025 | [Filters through relationships](025-relation-filters/plan.md) | built; timings pending |
+| 026 | [Commits panel](026-commits-panel/plan.md) | step 1 built |
 
 Each plan's first line holds its full status. 012 is not scheduled: it records every Omnigraph change Studio would use, what Studio does
 without it, and which plan waits on it. Each feature plan's Deferred section names its IDs.

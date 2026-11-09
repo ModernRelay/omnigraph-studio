@@ -43,6 +43,10 @@ mark: each relationship already names the type it leads to, so its nodes carry a
 the type's colour. Rows are the sidebar row height (`ds::size::SIDEBAR_ROW`, 26 px). The
 panel's title row holds its actions: show relationships with none (they are left out until
 asked for, since what a node has is the tree, not what its type allows) and Collapse all.
+While they are left out, a relationship not counted yet waits for its count and shows only once
+it is known to have some, so no row shows and then goes; one seen with some keeps its row while
+it is counted again. A node's page has the same two buttons (spec 014), drawn by the same
+`studio_workspace` functions.
 Typed filter text shows as a field above the rows on the toolbar's edge, with `esc` to clear.
 
 ### Keys (context `Tree`)
@@ -184,6 +188,7 @@ on the canvas. Typing filters the visible rows.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-11-09 | With relationships with none left out, one not counted yet does not show until it is known to have some, and one seen with some keeps its row while counted again | `relationship_tree` `rows::tests::empty_groups_hide_with_their_rows_when_asked` | Pass. Not yet checked in the running app |
 | 2026-11-01 | Relationships with none are hidden until asked for; the filter field sits on the toolbar's edge | `relationship_tree` `the_rows_fit_the_dock_and_the_selected_row_shows` (now shows the empty groups first); offscreen snapshot of the Source tree with a node expanded and "tit" typed | An expanded Source shows ChangeEvidence and DesignationEvidence only, the eye toggle slashed; the field's left edge is the view strip's |
 | 2026-11-01 | A relationship's neighbours are filtered by a property wherever it appears, in counts, pages and values | `gq_language` `neighbour_reads_take_filters_on_the_neighbours`; `graph_store` `filters_on_a_relationship_read_its_count_and_page_again`; `relationship_tree` `the_filter_popover_sets_and_removes_a_relationships_filters` | Pass. Offscreen snapshot of a Tree on the dev graph with a filter set on one relationship |
 | 2026-11-01 | A tree holds a set of nodes as well as one | `relationship_tree` `a_set_opens_closed_and_canvas_takes_the_selected_node`; `graph_store` `a_set_is_paged_and_its_rows_open_on_their_own`; an offscreen snapshot | Spec 020. A table's rows open as closed rows, read a page at a time; a closed row reads nothing |
@@ -259,3 +264,6 @@ on the canvas. Typing filters the visible rows.
 - **Fields seen:** the dev schema has no at-most-one edge, so fields were checked on a scratch
   copy of it with `edge ReportsTo: Person -> Person @card(0..1)` (validation log). A field with
   no target reads "—", muted, with no type mark.
+- **A relationship waits for its count** (Ragnor, 2026-11-09). With relationships with none
+  left out, a node's relationships showed as they were read and the empty ones then went. Now
+  one not counted yet is left out too until its count says it has some.
