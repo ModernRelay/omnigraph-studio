@@ -16,14 +16,18 @@ GPU, through Metal on macOS and Vulkan (wgpu) on Linux; there is no web view or 
 
 [Releases](https://github.com/ModernRelay/omnigraph-studio/releases) have a macOS DMG (Apple
 silicon), Linux tarballs (x86_64, arm64) and a Windows zip (x86_64, Windows 10 1809 or later).
-macOS builds are not notarized and the Windows build is not signed yet; the release notes say
-how to open them. To build from source instead, see below.
+From 0.4.1 the macOS app is signed with a Developer ID of team `6XQX9HAB25` (EQTR INC) and
+notarized; the Windows build is not signed yet, and its release notes say how to open it. The
+newest release's files are also at version-free names,
+`https://github.com/ModernRelay/omnigraph-studio/releases/latest/download/Omnigraph-Studio-arm64.dmg`
+for macOS. To build from source instead, see below.
 
 Studio checks for a newer version half a minute after launch and every hour (Settings →
 Updates, or Check for Updates in the app menu). On macOS it downloads the update, checks its
 signature and installs it, ready at the next restart; on Linux and Windows it says a newer
 version is out and links to it ([spec 017](specs/017-auto-update/plan.md)). Installing needs
-releases signed with the Developer ID and the update key, which 0.2.1 and earlier are not.
+releases signed with the Developer ID and the update key; until the update key is published
+(below), Studio says a newer version is out on macOS too.
 
 ## Quick start
 

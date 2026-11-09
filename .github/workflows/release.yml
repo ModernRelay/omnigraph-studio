@@ -205,17 +205,21 @@ jobs:
         shell: bash
         run: script/bundle-${{ runner.os == 'macOS' && 'mac' || runner.os == 'Windows' && 'windows' || 'linux' }}
 
-      # The requirement `omnigraph studio` checks before it opens or installs Studio (RFC #1017).
+      # The requirement `omnigraph studio` checks before it opens or installs Studio (RFC #1017),
+      # with the team it pins: EQTR INC's, recorded in the README and spec 017. A certificate of
+      # any other team fails here rather than being refused by every launcher.
       - name: The app passes the Developer ID requirement
         if: runner.os == 'macOS' && env.SIGNED == 'true'
         env:
           APPLE_SIGN_IDENTITY: ${{ secrets.APPLE_SIGN_IDENTITY }}
+          TEAM_ID: 6XQX9HAB25
         run: |
           team=$(sed -nE 's/.*\(([A-Z0-9]{10})\)$/\1/p' <<< "$APPLE_SIGN_IDENTITY")
-          if [[ -z "$team" ]]; then
-            echo "APPLE_SIGN_IDENTITY names no team: \"Developer ID Application: Name (TEAMID)\"" >&2
+          if [[ "$team" != "$TEAM_ID" ]]; then
+            echo "APPLE_SIGN_IDENTITY names team \"$team\", not Studio's team $TEAM_ID" >&2
             exit 1
           fi
+          team=$TEAM_ID
           codesign --verify --deep --strict --verbose=2 \
             -R="identifier \"com.modernrelay.omnigraph-studio\" and anchor apple generic and certificate leaf[subject.OU] = \"$team\"" \
             "target/bundle/Omnigraph Studio.app"
