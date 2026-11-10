@@ -353,6 +353,16 @@ mod tests {
         assert!(error.to_string().contains("404"), "{error}");
     }
 
+    /// The release key Studio is built with decodes as a minisign public key: one that did not
+    /// would refuse every update, found only when the first signed release is offered.
+    #[test]
+    fn the_published_update_key_is_a_minisign_public_key() {
+        let key = include_str!("../update-key.pub");
+        assert!(!key.trim().is_empty(), "the update key is published");
+        let text = decoded(key).expect("base64");
+        assert!(PublicKey::decode(&text).is_ok(), "a minisign public key");
+    }
+
     #[test]
     fn only_the_file_the_key_signed_verifies() {
         let (signature, key) = (base64(SIGNATURE), base64(PUBLIC_KEY));
