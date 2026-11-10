@@ -100,7 +100,7 @@ schema, the agent skill's `upstream/`).
 - Windows: `script/bundle-windows`, run in Git Bash, builds a zip (`omnigraph-studio.exe`,
   `LICENSE`, `THIRD-PARTY-NOTICES.md`) for Windows 10 1809 and later, the first Windows with Unix
   sockets, which the agent's tool socket used (`uds_windows`) until 2026-10-28. A release build opens no console
-  window. The executable is not signed, has no icon yet, and there is no installer. Settings live
+  window. The executable is not signed and has no icon yet; an Inno Setup installer is built beside the zip ([spec 027](../027-windows-installer/plan.md)). Settings live
   in `%APPDATA%\Omnigraph Studio`. `.gitattributes` checks text out with LF everywhere, so the
   files Studio embeds are the same bytes on every system. The agent panel says it is not
   available on Windows: its `omnigraph` wrapper is a shell script (spec 013).
@@ -145,7 +145,7 @@ schema, the agent skill's `upstream/`).
 
 ## Deferred
 
-- A Windows installer, a signed executable and its icon.
+- A signed Windows executable and its icon (the installer: [spec 027](../027-windows-installer/plan.md)).
 - Auto-update, until there is a first signed release ([spec 017](../017-auto-update/plan.md)).
 - Engine change E19 (publish `omnigraph-compiler` to crates.io again), [spec 012](../012-omnigraph-engine-changes/plan.md). Until then the
   compiler is a git dependency on the tag of Studio's oldest supported server,
