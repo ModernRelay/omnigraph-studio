@@ -175,7 +175,7 @@ names it reads.
 | Date | Claim | Check | Result |
 |---|---|---|---|
 | 2026-11-09 | Inno Setup is on `windows-2025`, NSIS is not | `actions/runner-images` `images/windows/Windows2025-Readme.md` and `Windows2022-Readme.md` | 2025: InnoSetup 6.7.1, WiX 3.14.1.8722, no NSIS. 2022: InnoSetup 6.7.1, NSIS 3.10, WiX 3.14.1.8722 |
-| 2026-11-09 | Release files carry the installer under both names | `python3 script/test_release_files.py` | See the PR |
-| 2026-11-09 | The installer builds, installs per user, writes the keys the CLI reads, and uninstalls | Release workflow run by hand (`gh workflow run release.yml --ref <branch>`), job Build (windows-x86_64), step "The installer installs and registers" | See the PR |
+| 2026-11-09 | Release files carry the installer under both names | `python3 script/test_release_files.py`; `cargo test -p studio_update --lib manifest` | 8 passed (a missing installer stops the release); 11 passed (Download opens the installer) |
+| 2026-11-10 | The installer builds, installs per user, writes the keys the CLI reads, and uninstalls | Release workflow run by hand on this branch (run 42761573400, nothing published), job Build (windows-x86_64), step "The installer installs and registers" | Passed: `omnigraph-studio-0.4.1-windows-x86_64-setup.exe` built by Inno Setup 6.7.1 on `windows-2025`; silent install without admin; HKCU uninstall key with DisplayName `Omnigraph Studio`, DisplayVersion `0.4.1`, Publisher `ModernRelay`, InstallLocation under `%LOCALAPPDATA%\Programs\Omnigraph Studio`; App Paths key; no HKLM key; silent uninstall removed the files and both keys. The `windows-x86_64` artifact (installer and zip) is 91 MB |
 
 ## Corrections
