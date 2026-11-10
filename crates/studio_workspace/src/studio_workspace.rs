@@ -5019,7 +5019,7 @@ impl Render for Workspace {
             (!p.others(p.active).is_empty(), !p.all_unpinned().is_empty())
         });
         // Escape leaves focus mode once what has the keyboard has nothing of its own to cancel.
-        let mut key_context = KeyContext::new_with_defaults();
+        let mut key_context = KeyContext::new_with_defaults(cx.platform_info().os);
         key_context.add("Workspace");
         if self.focus_mode.is_some() {
             key_context.add("focus_mode");

@@ -384,8 +384,9 @@ fn main() {
         }
         if let Some(keys) = spec.strip_prefix("key:") {
             for key in keys.split(' ') {
-                let keystroke = gpui::Keystroke::parse(key).expect("a keystroke");
                 cx.update_window(handle, |_, window, cx| {
+                    let keystroke = gpui::Keystroke::parse_with_os(key, cx.platform_info().os)
+                        .expect("a keystroke");
                     window.dispatch_keystroke(keystroke, cx);
                 })
                 .expect("press a key");

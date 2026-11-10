@@ -1851,8 +1851,9 @@ pub fn search_key_context(
     name: &'static str,
     search: &gpui::FocusHandle,
     window: &Window,
+    cx: &App,
 ) -> gpui::KeyContext {
-    let mut context = gpui::KeyContext::new_with_defaults();
+    let mut context = gpui::KeyContext::new_with_defaults(cx.platform_info().os);
     context.add(name);
     if search.is_focused(window) {
         context.add("searching");

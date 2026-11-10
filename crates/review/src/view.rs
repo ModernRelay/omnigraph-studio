@@ -4714,7 +4714,7 @@ impl Render for ReviewView {
         };
         // Typing in the search box must not move between cards.
         let context =
-            studio_ui::ds::search_key_context("Review", &self.search.focus_handle(cx), window);
+            studio_ui::ds::search_key_context("Review", &self.search.focus_handle(cx), window, cx);
         v_flex()
             .key_context(context)
             .track_focus(&self.focus_handle)

@@ -5,3 +5,9 @@ runner = "script/run-signed"
 
 [target.x86_64-apple-darwin]
 runner = "script/run-signed"
+
+# GPUI requires macOS 12 from Zed v1.27.0: its Metal shaders are built for 12.0 and its window code
+# calls 11.0-and-later AppKit. Studio links for the same minimum, as Zed does
+# (`script/bundle-mac` declares it as LSMinimumSystemVersion).
+[env]
+MACOSX_DEPLOYMENT_TARGET = "12.0"

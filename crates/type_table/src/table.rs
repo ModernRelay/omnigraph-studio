@@ -1,7 +1,7 @@
 //! One type's table (spec 004): keyset pages pinned to one commit, engine-side filters and
 //! counts, a cell cursor, value-bound cell edits with their three outcomes, and a peek.
 //!
-//! The grid is Zed's `ui::Table` (`crates/ui/src/components/data_table.rs` at v1.26.2) in the
+//! The grid is Zed's `ui::Table` (`crates/ui/src/components/data_table.rs` at v1.27.0) in the
 //! configuration Zed's `tabular_data_preview` uses: resizable columns, the first column pinned,
 //! rows virtualized by `uniform_list`.
 
@@ -5638,7 +5638,7 @@ impl TypeTable {
             return;
         }
         // ⌘-click picks a row for a bulk set; ⇧-click picks the rows from the last one picked.
-        if modifiers.secondary() || modifiers.shift {
+        if modifiers.secondary(cx) || modifiers.shift {
             self.pick_rows(row, modifiers.shift, cx);
             self.set_cursor(cursor, cx);
             return;
@@ -11711,7 +11711,7 @@ impl Render for TypeTable {
             || self.bulk_editor.focus_handle(cx).is_focused(window)
             || self.words_editor.focus_handle(cx).is_focused(window)
             || self.fill_editor.focus_handle(cx).is_focused(window);
-        let mut context = KeyContext::new_with_defaults();
+        let mut context = KeyContext::new_with_defaults(cx.platform_info().os);
         context.add("TypeTable");
         if typing {
             context.add("editing");
