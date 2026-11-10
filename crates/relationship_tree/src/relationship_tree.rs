@@ -1619,7 +1619,7 @@ impl Render for RelationshipTree {
         if std::mem::take(&mut self.selection_owed) {
             self.follow_selection(cx);
         }
-        let mut context = KeyContext::new_with_defaults();
+        let mut context = KeyContext::new_with_defaults(cx.platform_info().os);
         context.add("Tree");
         if !self.filter.is_empty() {
             context.add("filtering");

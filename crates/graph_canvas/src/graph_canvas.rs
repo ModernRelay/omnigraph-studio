@@ -1877,7 +1877,7 @@ impl GraphCanvas {
         }
         let hit = self.hit(event.position);
         // ⌘-click marks a chip, or unmarks it, as ⌘-click picks rows in a table.
-        if event.modifiers.secondary() {
+        if event.modifiers.secondary(cx) {
             if let Some(index) = hit {
                 let id = self.scene.nodes[index].id.clone();
                 if !self.marked.remove(&id) {

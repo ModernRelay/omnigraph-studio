@@ -2111,7 +2111,7 @@ impl Render for HistoryView {
         };
         // Typing in the search box must not move the selection.
         let context =
-            studio_ui::ds::search_key_context("History", &self.search.focus_handle(cx), window);
+            studio_ui::ds::search_key_context("History", &self.search.focus_handle(cx), window, cx);
         v_flex()
             .key_context(context)
             .track_focus(&self.focus_handle)
