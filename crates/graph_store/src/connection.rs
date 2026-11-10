@@ -25,8 +25,9 @@ pub enum ServerSource {
     /// `OMNIGRAPH_STUDIO_SERVER` in the environment, for development and tests; its token,
     /// `OMNIGRAPH_STUDIO_TOKEN`, lasts the run.
     Environment,
-    /// A cluster of a profile's organization that no CLI target names, opened from the control
-    /// plane's list for this run (spec 021); its data token is the control plane's.
+    /// A managed cluster that no CLI target names, opened from its control plane: from the
+    /// plane's list, from a link that names it, or again at a start by the window that had it
+    /// open (spec 021); its data token is the control plane's.
     ControlPlane,
 }
 

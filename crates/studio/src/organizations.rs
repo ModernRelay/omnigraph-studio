@@ -35,7 +35,7 @@ pub(crate) fn nav_places(planes: &[Entity<ControlPlane>], cx: &App) -> Vec<Place
 }
 
 /// The clusters of `organization` on `plane` the keyboard reaches in its pane: those that open
-/// for this run, and those a CLI target names, which choose that server.
+/// from the control plane, and those a CLI target names, which choose that server.
 pub(crate) fn pane_places(
     plane: &Entity<ControlPlane>,
     organization: &str,
@@ -94,14 +94,15 @@ pub(crate) struct ClusterRow {
     pub meta: String,
     /// Shown dimmed: it has no data endpoint, so there is nothing to open.
     pub dimmed: bool,
-    /// Clicking it opens the cluster for this run: no CLI target names it, and it has a data
-    /// endpoint.
+    /// Clicking it opens the cluster from its control plane: no CLI target names it, and it has
+    /// a data endpoint.
     pub opens: bool,
     /// The CLI target that names it, which clicking it chooses.
     pub target: Option<String>,
 }
 
-/// The CLI command that keeps `cluster` as a target of `profile` (constitution VI).
+/// The CLI command that makes `cluster` a target of `profile`, for using it from the CLI too
+/// (constitution VI). Studio needs none to open it or to reopen it.
 pub(crate) fn add_command(cluster: &ClusterView, profile: Option<&str>) -> String {
     let command = format!(
         "omnigraph target add {} --cluster {}",
@@ -130,7 +131,8 @@ pub(crate) fn cluster_row(cluster: &ClusterView, managed: &[ManagedTarget]) -> C
         },
         (None, Some(_)) => ClusterRow {
             name: cluster.name.clone(),
-            meta: format!("Not a CLI target · {state}"),
+            // A CLI target is a label a cluster may have; one without it needs no remark.
+            meta: state.to_owned(),
             dimmed: false,
             opens: true,
             target: None,
@@ -528,7 +530,7 @@ fn organization_pane(
                         item = item
                             .toggle_state(cursor == Some(&place))
                             .aria_label(format!(
-                                "Open {} for this run. To keep it, add it as a CLI target: {command}",
+                                "Open {}. To use it from the CLI too, add it as a target: {command}",
                                 cluster.name
                             ))
                             .on_click(cx.listener(move |this, _, window, cx| {
@@ -682,7 +684,7 @@ mod tests {
         );
         // Another incarnation of the same cluster is not the target's.
         let other = [target("prod", "work", "01C", "01OLD")];
-        assert_eq!(cluster_row(&ready, &other).meta, "Not a CLI target · Ready");
+        assert_eq!(cluster_row(&ready, &other).meta, "Ready");
         assert!(cluster_row(&ready, &other).opens);
         assert_eq!(
             add_command(&ready, Some("work")),

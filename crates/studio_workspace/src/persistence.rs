@@ -225,10 +225,12 @@ pub struct SavedSession {
     pub shown: usize,
 }
 
-/// A graph a window had open, by its CLI target's name and address and its id (spec 002), as
+/// A graph a window had open, by its server's name and address and its id (spec 002), as
 /// its saved state is filed (`GraphSession::overrides_key`): a window whose target the CLI no
 /// longer lists at that address is not reopened, so a name given to another server does not
-/// reopen the graphs of the server that had it.
+/// reopen the graphs of the server that had it. A managed cluster is named by its control plane
+/// too, so its window reopens whether or not a CLI target names the cluster (spec 021,
+/// Reopening a cluster).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SavedGraph {
     pub target: String,
@@ -236,6 +238,10 @@ pub struct SavedGraph {
     pub url: String,
     pub graph: String,
     pub branch: String,
+    /// The managed cluster the server was, as its control plane names it; none for a server
+    /// that is no managed cluster, and in a file an earlier Studio wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster: Option<graph_store::ClusterIdentity>,
 }
 
 /// A window to reopen at the next start: its graphs and where it was.
@@ -609,6 +615,7 @@ mod tests {
             url: "https://example.test".into(),
             graph: name.into(),
             branch: "main".into(),
+            cluster: None,
         }
     }
 
@@ -649,6 +656,32 @@ mod tests {
         assert_eq!(parse_session(&text), Some(windows));
         assert_eq!(parse_session("{}"), Some(Vec::new()));
         assert_eq!(parse_session("not json"), None);
+        // A graph of a managed cluster names the cluster as its control plane does, so its
+        // window reopens with no CLI target naming it (spec 021); a graph without one, as every
+        // graph in a file an earlier Studio wrote, reads as before and writes no `cluster`.
+        let cluster = graph_store::ClusterIdentity {
+            route: "https://control.test".into(),
+            organization: "org_1".into(),
+            cluster_id: "01C".into(),
+            incarnation: "01I".into(),
+        };
+        let on_cluster = SavedGraph {
+            cluster: Some(cluster),
+            ..graph("crm")
+        };
+        let text = serde_json::to_string(&on_cluster).unwrap();
+        assert!(text.contains(r#""cluster":{"route":"https://control.test","organization":"org_1","cluster_id":"01C","incarnation":"01I"}"#), "{text}");
+        assert_eq!(
+            serde_json::from_str::<SavedGraph>(&text).unwrap(),
+            on_cluster
+        );
+        let before =
+            r#"{"target":"example","url":"https://example.test","graph":"crm","branch":"main"}"#;
+        assert_eq!(
+            serde_json::from_str::<SavedGraph>(before).unwrap(),
+            graph("crm")
+        );
+        assert_eq!(serde_json::to_string(&graph("crm")).unwrap(), before);
         // An earlier build's file names its graphs by their server's address alone, or by
         // their target's name alone: it is set aside.
         for graph in [

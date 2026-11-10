@@ -24,7 +24,7 @@ use crate::cli_config::{
 };
 use crate::cli_tokens::{self, CliTokenSource, TargetDigests, Token, TokenSource};
 use crate::connection::{Connection, ServerEntry, ServerSource};
-use crate::control_plane::ControlPlane;
+use crate::control_plane::{ClusterIdentity, ControlPlane, same_route};
 use crate::control_token::ControlTokenSource;
 use crate::sign_in::{self, PlatformKeychain, SignInContext};
 
@@ -79,6 +79,16 @@ struct KnownGraphs {
     targets: BTreeMap<String, Vec<String>>,
 }
 
+/// A cluster opened from its control plane, from the plane's list or from what a saved window or a
+/// link names: its connection, its plane, and what the plane names it.
+struct OpenedCluster {
+    connection: gpui::EntityId,
+    plane: Entity<ControlPlane>,
+    organization: String,
+    cluster_id: String,
+    incarnation: String,
+}
+
 /// What a CLI server was when the CLI's targets were last listed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CliKept {
@@ -95,9 +105,8 @@ pub struct ConnectionRegistry {
     pub control_planes: Vec<Entity<ControlPlane>>,
     /// The managed targets as the CLI last listed them, landed or not: which cluster each names.
     pub managed_targets: Vec<ManagedTarget>,
-    /// The clusters opened from a control plane's list for this run: each connection, its
-    /// control plane, organization and `cluster_id`.
-    opened: Vec<(gpui::EntityId, Entity<ControlPlane>, String, String)>,
+    /// The clusters opened from a control plane, which no CLI target need name.
+    opened: Vec<OpenedCluster>,
     /// Why the environment's server could not be added at start, which stays one of the
     /// [`Self::notices`] for the run.
     environment_notice: Option<String>,
@@ -369,6 +378,29 @@ impl ConnectionRegistry {
         let registry = cx.new(|_| Self::empty(http, None));
         cx.set_global(GlobalRegistry(registry.clone()));
         (registry, asked)
+    }
+
+    /// Holds Omnigraph Cloud's control plane at `route`, able to sign in, with nothing kept in
+    /// its keychain and so nothing sent to it: what a window reopening one of its clusters, or a
+    /// link naming one, is tested with.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn hold_cloud_for_tests(
+        &mut self,
+        route: &str,
+        cx: &mut Context<Self>,
+    ) -> Entity<ControlPlane> {
+        self.sign_in = Some(SignInContext {
+            elsewhere: self.http.clone(),
+            keychain: Arc::new(sign_in::MemoryKeychain::default()),
+            turns: sign_in::KeychainTurns::default(),
+            identities: oauth_client::ClientIdentities {
+                metadata_document: Some("https://studio.test/client.json".into()),
+                registered: Vec::new(),
+                development: None,
+            },
+        });
+        self.set_cloud(route.to_owned(), cx);
+        self.plane_at(route, cx).expect("the plane just held")
     }
 
     /// Adds a server named `name` at `url`, given `token`, as the environment's server is.
@@ -848,11 +880,12 @@ impl ConnectionRegistry {
         made
     }
 
-    /// The connection to `cluster`, a cluster of `organization` on `plane` no CLI target names,
-    /// opened for this run (spec 021, Listing clusters): one already reaching its data endpoint
-    /// is it. Its data token is the control plane's, and its own sign-in is still preferred where
-    /// its 401 offers one. `None` without a data endpoint, or a control plane Studio cannot sign
-    /// in to here.
+    /// The connection to `cluster`, a cluster of `organization` on `plane` no CLI target names
+    /// (spec 021, Listing clusters): one already reaching its data endpoint is it. Its data token
+    /// is the control plane's, and its own sign-in is still preferred where its 401 offers one.
+    /// A window that has one of its graphs open reopens it at the next start
+    /// ([`Self::connection_for_saved`]). `None` without a data endpoint, or a control plane
+    /// Studio cannot sign in to here.
     pub fn open_cluster(
         &mut self,
         plane: &Entity<ControlPlane>,
@@ -861,6 +894,32 @@ impl ConnectionRegistry {
         cx: &mut Context<Self>,
     ) -> Option<Entity<Connection>> {
         let endpoint = cluster.data_endpoint.clone()?;
+        self.open_cluster_at(
+            plane,
+            organization,
+            &cluster.cluster_id,
+            &cluster.incarnation,
+            &cluster.name,
+            endpoint,
+            cx,
+        )
+    }
+
+    /// [`Self::open_cluster`] for the incarnation `incarnation` of the cluster `cluster_id`,
+    /// named `name` and reached at `endpoint`: as the plane's list answered it, or as a saved
+    /// window kept it. The control plane decides either way: every data token is asked for in
+    /// `organization`, and one for another endpoint or another incarnation is dropped.
+    #[allow(clippy::too_many_arguments)]
+    fn open_cluster_at(
+        &mut self,
+        plane: &Entity<ControlPlane>,
+        organization: &str,
+        cluster_id: &str,
+        incarnation: &str,
+        name: &str,
+        endpoint: String,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<Connection>> {
         let same = |url: &str| url.trim_end_matches('/') == endpoint.trim_end_matches('/');
         if let Some(open) = self
             .connections
@@ -882,11 +941,12 @@ impl ConnectionRegistry {
             profile,
             organization.to_owned(),
             handle,
-            cluster.cluster_id.clone(),
+            cluster_id.to_owned(),
+            incarnation.to_owned(),
             endpoint.clone(),
         ));
         let entry = ServerEntry {
-            name: cluster.name.clone(),
+            name: name.to_owned(),
             url: endpoint,
             source: ServerSource::ControlPlane,
             known_graphs: Vec::new(),
@@ -897,12 +957,13 @@ impl ConnectionRegistry {
             .with_sign_in(self.sign_in.clone());
         let connection = cx.new(|_| connection);
         self.connections.push(connection.clone());
-        self.opened.push((
-            connection.entity_id(),
-            plane.clone(),
-            organization.to_owned(),
-            cluster.cluster_id.clone(),
-        ));
+        self.opened.push(OpenedCluster {
+            connection: connection.entity_id(),
+            plane: plane.clone(),
+            organization: organization.to_owned(),
+            cluster_id: cluster_id.to_owned(),
+            incarnation: incarnation.to_owned(),
+        });
         cx.notify();
         Some(connection)
     }
@@ -915,10 +976,12 @@ impl ConnectionRegistry {
         cx: &App,
     ) -> Option<(Entity<ControlPlane>, Option<String>, String)> {
         let id = connection.entity_id();
-        if let Some((_, plane, organization, cluster)) =
-            self.opened.iter().find(|(opened, ..)| *opened == id)
-        {
-            return Some((plane.clone(), Some(organization.clone()), cluster.clone()));
+        if let Some(opened) = self.opened.iter().find(|opened| opened.connection == id) {
+            return Some((
+                opened.plane.clone(),
+                Some(opened.organization.clone()),
+                opened.cluster_id.clone(),
+            ));
         }
         let server = &connection.read(cx).server;
         if server.source != ServerSource::Cli {
@@ -931,6 +994,104 @@ impl ConnectionRegistry {
         let plane = self.plane_of(&target.profile, cx)?;
         let organization = plane.read(cx).organization_of(&target.profile);
         Some((plane.clone(), organization, target.cluster_id.clone()))
+    }
+
+    /// What the control plane names `connection`'s cluster, when it is a managed cluster whose
+    /// organization is known: one opened from a control plane, or a CLI target's, by the
+    /// target's profile. A saved window keeps it with the graph ([`Self::connection_for_saved`]).
+    pub fn cluster_identity(
+        &self,
+        connection: &Entity<Connection>,
+        cx: &App,
+    ) -> Option<ClusterIdentity> {
+        let id = connection.entity_id();
+        if let Some(opened) = self.opened.iter().find(|opened| opened.connection == id) {
+            return Some(ClusterIdentity {
+                route: opened.plane.read(cx).route.clone(),
+                organization: opened.organization.clone(),
+                cluster_id: opened.cluster_id.clone(),
+                incarnation: opened.incarnation.clone(),
+            });
+        }
+        let server = &connection.read(cx).server;
+        if server.source != ServerSource::Cli {
+            return None;
+        }
+        let target = self
+            .managed_targets
+            .iter()
+            .find(|target| target.name == server.name)?;
+        let plane = self.plane_of(&target.profile, cx)?.read(cx);
+        Some(ClusterIdentity {
+            route: plane.route.clone(),
+            organization: plane.organization_of(&target.profile)?,
+            cluster_id: target.cluster_id.clone(),
+            incarnation: target.cluster_incarnation.clone(),
+        })
+    }
+
+    /// The control plane at `route`, when Studio holds one there: Omnigraph Cloud's, or one a
+    /// CLI profile names.
+    pub fn plane_at(&self, route: &str, cx: &App) -> Option<Entity<ControlPlane>> {
+        self.control_planes
+            .iter()
+            .find(|plane| same_route(&plane.read(cx).route, route))
+            .cloned()
+    }
+
+    /// The server that reaches the cluster `cluster` names now: a CLI target naming it, or one
+    /// opened from its control plane.
+    pub fn connection_of_cluster(
+        &self,
+        cluster: &ClusterIdentity,
+        cx: &App,
+    ) -> Option<Entity<Connection>> {
+        self.connections
+            .iter()
+            .find(|connection| {
+                self.cluster_identity(connection, cx)
+                    .is_some_and(|held| held.is(cluster))
+            })
+            .cloned()
+    }
+
+    /// The server a saved window's graph was on (spec 021, Reopening a cluster): the one named
+    /// `target` at `url`, as the CLI lists it or as a control plane opened it. Failing that, and
+    /// when the graph was on a managed cluster, the server that reaches that cluster now, under
+    /// whatever name; or the cluster opened again from what was saved, when Studio holds the
+    /// control plane it names. Studio keeps no list for this: the window names one cluster, and
+    /// the control plane still decides, since every data token is asked for in the cluster's
+    /// organization and one for another address or another incarnation is dropped. `None` for a
+    /// server target the CLI no longer lists at that address, as before, and for a cluster of a
+    /// control plane Studio no longer holds.
+    pub fn connection_for_saved(
+        &mut self,
+        target: &str,
+        url: &str,
+        cluster: Option<&ClusterIdentity>,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<Connection>> {
+        let named = self.connections.iter().find(|connection| {
+            let server = &connection.read(cx).server;
+            server.name == target && server.url == url
+        });
+        if let Some(named) = named {
+            return Some(named.clone());
+        }
+        let cluster = cluster?;
+        if let Some(reaching) = self.connection_of_cluster(cluster, cx) {
+            return Some(reaching);
+        }
+        let plane = self.plane_at(&cluster.route, cx)?;
+        self.open_cluster_at(
+            &plane,
+            &cluster.organization,
+            &cluster.cluster_id,
+            &cluster.incarnation,
+            target,
+            url.to_owned(),
+            cx,
+        )
     }
 
     /// The control plane the CLI profile `profile` names.
@@ -978,6 +1139,7 @@ impl ConnectionRegistry {
             handle,
             organization,
             target.cluster_id.clone(),
+            target.cluster_incarnation.clone(),
             endpoint,
         )))
     }
@@ -1711,11 +1873,11 @@ mod tests {
         );
     }
 
-    /// A cluster no CLI target names opens for this run, once, reached at its data endpoint
-    /// with the control plane's token; one without a data endpoint, or a control plane Studio
-    /// cannot sign in to, opens nothing (spec 021).
+    /// A cluster no CLI target names opens from its control plane's list, once, reached at its
+    /// data endpoint with the control plane's token; one without a data endpoint, or a control
+    /// plane Studio cannot sign in to, opens nothing (spec 021).
     #[gpui::test]
-    async fn a_cluster_no_target_names_opens_for_this_run(cx: &mut TestAppContext) {
+    async fn a_cluster_no_target_names_opens_from_its_control_plane(cx: &mut TestAppContext) {
         let (registry, _) = cx.update(ConnectionRegistry::init_for_tests);
         let context = crate::sign_in::SignInContext {
             elsewhere: http_client::FakeHttpClient::with_404_response(),
@@ -1759,6 +1921,11 @@ mod tests {
             (organization.as_deref(), cluster_id.as_str()),
             (Some("org_2"), "01C")
         );
+        // What a saved window keeps of it.
+        assert_eq!(
+            registry.read_with(cx, |registry, cx| registry.cluster_identity(&first, cx)),
+            Some(identity("https://control.test", "org_2", "01C", "01I"))
+        );
         let again = open(&signed, &cluster, cx).expect("the same");
         assert_eq!(again.entity_id(), first.entity_id());
         assert_eq!(registry.read_with(cx, |r, _| r.connections.len()), 1);
@@ -1770,6 +1937,119 @@ mod tests {
         let mut other = cluster.clone();
         other.data_endpoint = Some("https://other.graphs.test".into());
         assert!(open(&unsigned, &other, cx).is_none());
+    }
+
+    fn identity(
+        route: &str,
+        organization: &str,
+        cluster: &str,
+        incarnation: &str,
+    ) -> ClusterIdentity {
+        ClusterIdentity {
+            route: route.into(),
+            organization: organization.into(),
+            cluster_id: cluster.into(),
+            incarnation: incarnation.into(),
+        }
+    }
+
+    /// A registry whose control planes can sign in, with Omnigraph Cloud at `route`.
+    fn registry_with_cloud(route: &str, cx: &mut TestAppContext) -> Entity<ConnectionRegistry> {
+        let (registry, _) = cx.update(ConnectionRegistry::init_for_tests);
+        registry.update(cx, |registry, cx| {
+            registry.hold_cloud_for_tests(route, cx);
+        });
+        registry
+    }
+
+    /// A window that had a graph of a managed cluster open reopens it at the next start with no
+    /// CLI target naming the cluster: the cluster is opened again from what the window kept,
+    /// under the name and at the address it had, with the control plane's token. A server
+    /// target the CLI no longer lists is still not reopened, nor a cluster of a control plane
+    /// Studio no longer holds (spec 021, Reopening a cluster).
+    #[gpui::test]
+    async fn a_saved_cluster_reopens_without_a_cli_target(cx: &mut TestAppContext) {
+        let registry = registry_with_cloud("https://control.test", cx);
+        let saved = identity("https://control.test/", "org_2", "01C", "01I");
+        let reopen = |target: &str,
+                      url: &str,
+                      cluster: Option<&ClusterIdentity>,
+                      cx: &mut TestAppContext| {
+            registry.update(cx, |registry, cx| {
+                registry.connection_for_saved(target, url, cluster, cx)
+            })
+        };
+        // A server target the CLI does not list has no cluster to go by.
+        assert!(reopen("prod", "https://prod.test", None, cx).is_none());
+        // Nor is a cluster reopened whose control plane Studio does not hold.
+        let elsewhere = identity("https://other.test", "org_2", "01C", "01I");
+        assert!(reopen("acme", "https://acme.graphs.test", Some(&elsewhere), cx).is_none());
+        assert_eq!(registry.read_with(cx, |r, _| r.connections.len()), 0);
+
+        let first = reopen("acme", "https://acme.graphs.test", Some(&saved), cx).expect("reopened");
+        first.read_with(cx, |connection, _| {
+            assert_eq!(connection.server.name, "acme");
+            assert_eq!(connection.server.url, "https://acme.graphs.test");
+            assert_eq!(connection.server.source, ServerSource::ControlPlane);
+        });
+        // It is the cluster the window named, so the next save names it again.
+        let kept = registry
+            .read_with(cx, |registry, cx| registry.cluster_identity(&first, cx))
+            .unwrap();
+        assert!(kept.is(&saved), "{kept:?}");
+        // A second graph of the window, or a second window, finds the same server: by its
+        // name and address, and by the cluster under a name it no longer has.
+        let again = reopen("acme", "https://acme.graphs.test", Some(&saved), cx).unwrap();
+        assert_eq!(again.entity_id(), first.entity_id());
+        let renamed = reopen("acme-old", "https://moved.graphs.test", Some(&saved), cx).unwrap();
+        assert_eq!(renamed.entity_id(), first.entity_id());
+        assert_eq!(registry.read_with(cx, |r, _| r.connections.len()), 1);
+        // Another incarnation under the same id is another cluster, opened on its own address.
+        let remade = identity("https://control.test", "org_2", "01C", "02I");
+        let other = reopen("acme", "https://remade.graphs.test", Some(&remade), cx).unwrap();
+        assert_ne!(other.entity_id(), first.entity_id());
+    }
+
+    /// A window saved on a CLI target of a managed cluster names the cluster too, and finds it
+    /// again under the name the CLI lists it by now (spec 021, Reopening a cluster).
+    #[gpui::test]
+    async fn a_saved_cluster_finds_the_cli_target_naming_it(cx: &mut TestAppContext) {
+        let (http, _) = answering();
+        let registry = cx.new(|_| ConnectionRegistry::empty(http, None));
+        let targets = |name: &str| CliTargets {
+            servers: Some(vec![server(name, "https://acme.graphs.test", "1")]),
+            managed: vec![ManagedTarget {
+                name: name.into(),
+                profile: "work".into(),
+                cluster_id: "01C".into(),
+                cluster_incarnation: "01I".into(),
+                endpoint: Some("https://acme.graphs.test".into()),
+                default_graph: None,
+            }],
+            profiles: vec![owner("work", Some("https://control.test"), Some("org_1"))],
+            ..CliTargets::default()
+        };
+        apply(&registry, targets("mr"), cx);
+        let listed = find(&registry, "mr", cx).expect("listed");
+        let saved = registry
+            .read_with(cx, |registry, cx| registry.cluster_identity(&listed, cx))
+            .expect("a managed target's cluster");
+        assert_eq!(
+            saved,
+            identity("https://control.test", "org_1", "01C", "01I")
+        );
+
+        // Renamed in the CLI's file: the window saved under the old name finds the cluster.
+        apply(&registry, targets("modernrelay"), cx);
+        let found = registry.update(cx, |registry, cx| {
+            registry.connection_for_saved("mr", "https://acme.graphs.test/", Some(&saved), cx)
+        });
+        assert_eq!(found.map(|c| c.entity_id()), Some(listed.entity_id()));
+        // Without the cluster the old name finds nothing, as before.
+        let unnamed = registry.update(cx, |registry, cx| {
+            registry.connection_for_saved("mr", "https://acme.graphs.test/", None, cx)
+        });
+        assert!(unnamed.is_none());
     }
 
     /// Two targets naming one transport whose client could not be made off the main thread
