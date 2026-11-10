@@ -385,9 +385,12 @@ next launch is the new version.
 1. ~~The Apple team identifier, who holds the Developer ID certificate, and when the secrets are
    set.~~ Team `6XQX9HAB25` (EQTR INC); the secrets are set (2026-11-07), and the release
    workflow refuses a certificate of any other team (2026-11-09).
-2. Who holds the update key and its password. The workflow reads them from the
-   `update-signing` environment (2026-10-26); the environment needs required reviewers set in
-   the repository's settings, so that a workflow change alone cannot sign a release.
+2. ~~Who holds the update key and its password.~~ Made 2026-11-09 with cargo-packager 0.11.8:
+   the public half is `crates/studio_update/update-key.pub`, the private half and its password
+   the `update-signing` environment's secrets and a 1Password item ("Omnigraph Studio Update
+   Signing Key"). The environment requires Ragnor's approval and takes only `v*` tags, so a
+   workflow change alone cannot sign a release. Studio carries the key from 0.4.2; 0.4.1 and
+   earlier offer the download.
 3. Whether a beta channel is wanted, which would bring pre-releases back alongside `latest`.
 4. ~~The default bindings for the four actions.~~ None: they are palette-only, as Zed's are
    (2026-10-22).
@@ -401,6 +404,7 @@ next launch is the new version.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-11-09 | The update key signs and verifies, and Studio decodes the committed public half | a probe file signed with `cargo packager signer sign` and verified with `minisign -V`; `studio_update` `bundle::tests::the_published_update_key_is_a_minisign_public_key`; `python3 script/test_release_files.py` | Pass. The first release signed with it is 0.4.2 |
 | 2026-11-09 | The Developer ID's team is `6XQX9HAB25`, and a release build is signed, notarized and stapled | `APPLE_SIGN_IDENTITY` ("Developer ID Application: EQTR INC (6XQX9HAB25)"); Release run 42563307688, the edge build of 2026-11-09: `notarytool` "status: Accepted", "The staple and validate action worked!" | Pass |
 | 2026-10-26 | Studio downloads, verifies and installs an update itself, bounded and in one rename | `studio_update` `bundle::tests` (the whole file with each whole percent; a file said to be too large refused before its body, one that grows past the limit unsaid stopped; an error answer; only the file the key signed verifies), `install::tests` (the update takes the bundle's place and the old one is deleted; one that does not unpack, or holds other than one bundle, leaves the bundle; an entry outside the update is not written; only Studio's own leftovers go), `manifest::tests` (another platform's entry of any shape is not read; a file from anywhere but its release is refused; build metadata is not newer), `tests::turning_updates_off_stops_a_download_in_the_background`, `a_download_the_person_asked_for_goes_on_with_updates_off`, `a_failed_check_leaves_the_newer_version_offered`, `tests/installer.rs` through Studio's HTTP client (the codesign check of an installed bundle included); `studio_settings` `only_an_installed_build_is_a_release_build` (a bundle under `target/` or a `CACHEDIR.TAG` folder is not); CI on PR #11 (run 40281608899), Check on macOS, Linux and Windows: `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`; `python3 script/test_release_files.py`; `minisign -V` on the test fixtures | All pass: 1014 passed on macOS, 1009 on Linux, 979 on Windows; 0 failed; 6 release-file tests; the fixture signature verifies |
 | 2026-10-22 | No release is `latest`, and every file name carries the version | `gh api repos/ModernRelay/omnigraph-studio/releases/latest`; `curl -L …/releases/latest/download/SHA256SUMS`; `gh release view <tag> --json assets,isPrerelease` for 0.1.0, 0.2.0, 0.2.1 | 404 and 404; every release a pre-release. macOS disk image 49,870,872, 50,315,597 and 50,318,066 bytes; Linux arm64 177,883,752 to 179,434,982; Linux x86_64 209,439,435 to 211,172,133; Windows zip (0.2.1 only) 46,235,407 |
