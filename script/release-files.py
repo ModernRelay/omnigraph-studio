@@ -28,6 +28,7 @@ FIRST_INSTALL = [
     ("Omnigraph-Studio-arm64.dmg", "Omnigraph-Studio-{v}-arm64.dmg"),
     ("omnigraph-studio-linux-x86_64.tar.gz", "omnigraph-studio-{v}-linux-x86_64.tar.gz"),
     ("omnigraph-studio-linux-aarch64.tar.gz", "omnigraph-studio-{v}-linux-aarch64.tar.gz"),
+    ("omnigraph-studio-windows-x86_64-setup.exe", "omnigraph-studio-{v}-windows-x86_64-setup.exe"),
     ("omnigraph-studio-windows-x86_64.zip", "omnigraph-studio-{v}-windows-x86_64.zip"),
 ]
 

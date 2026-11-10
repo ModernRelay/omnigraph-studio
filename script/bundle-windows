@@ -1,17 +1,24 @@
 #!/usr/bin/env bash
-# Build a Windows zip of Omnigraph Studio in target/bundle (spec 001, "Shipping"):
+# Build Omnigraph Studio's Windows installer and zip in target/bundle (spec 001, "Shipping";
+# spec 027):
 #
-#   omnigraph-studio-<version>-windows-<arch>/
-#     omnigraph-studio.exe
-#     LICENSE
-#     THIRD-PARTY-NOTICES.md
+#   omnigraph-studio-<version>-windows-<arch>-setup.exe   the installer (Inno Setup)
+#   omnigraph-studio-<version>-windows-<arch>.zip         the same files, to unzip anywhere:
+#     omnigraph-studio-<version>-windows-<arch>/
+#       omnigraph-studio.exe
+#       LICENSE
+#       THIRD-PARTY-NOTICES.md
 #
 #   script/bundle-windows            # release build
 #   script/bundle-windows --debug    # the debug build, to check the layout quickly
 #
-# Runs in Git Bash on Windows, as GitHub's Windows runners provide it. Unzip anywhere and run
-# omnigraph-studio.exe; Studio keeps its settings in %APPDATA%\Omnigraph Studio. An installer is
-# not built yet, and the executable is not signed.
+# Runs in Git Bash on Windows, as GitHub's Windows runners provide it. The installer needs Inno
+# Setup 6 (on GitHub's Windows runners; elsewhere `winget install JRSoftware.InnoSetup`), found
+# on PATH as ISCC, at $ISCC, or where Inno installs it; a release build stops without it, a
+# debug build skips the installer. It installs for the current user, without administrator
+# rights, into %LOCALAPPDATA%\Programs\Omnigraph Studio, under the AppId
+# com.modernrelay.omnigraph-studio (resources/windows/omnigraph-studio.iss). Studio keeps its
+# settings in %APPDATA%\Omnigraph Studio either way. Neither file is signed.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -67,3 +74,33 @@ rm -f "$out/$name.zip"
 python3 -c 'import shutil, sys; shutil.make_archive(sys.argv[1], "zip", sys.argv[2], sys.argv[3])' \
   "$out/$name" "$staging" "$name"
 echo "$out/$name.zip"
+
+# The installer. ISCC is a Windows program: paths go to it in Windows form, and Git Bash must
+# not rewrite its arguments.
+iscc=${ISCC:-}
+if [[ -z "$iscc" ]]; then
+  for candidate in "$(command -v iscc 2>/dev/null || true)" \
+    "C:/Program Files (x86)/Inno Setup 6/ISCC.exe" \
+    "${LOCALAPPDATA:-}/Programs/Inno Setup 6/ISCC.exe"; do
+    if [[ -n "$candidate" && -f "$candidate" ]]; then
+      iscc=$candidate
+      break
+    fi
+  done
+fi
+if [[ -z "$iscc" ]]; then
+  if [[ "$profile" == release ]]; then
+    echo "bundle-windows: Inno Setup 6 (ISCC.exe) is not installed; set ISCC to its path" >&2
+    exit 1
+  fi
+  echo "bundle-windows: no Inno Setup, so no installer" >&2
+  exit 0
+fi
+# Windows's file version is numeric: a pre-release's suffix stays in the product version alone.
+numeric=${version%%[-+]*}
+setup="$name-setup"
+rm -f "$out/$setup.exe"
+MSYS2_ARG_CONV_EXCL='*' "$iscc" -Q \
+  "-DVersion=$version" "-DNumericVersion=$numeric" "-DSourceDir=$(cygpath -w "$dir")" \
+  "-O$(cygpath -w "$out")" "-F$setup" "$(cygpath -w "$ROOT/resources/windows/omnigraph-studio.iss")"
+echo "$out/$setup.exe"

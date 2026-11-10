@@ -17,6 +17,7 @@ FILES = [
     "Omnigraph-Studio-0.3.0-arm64.app.tar.gz",
     "omnigraph-studio-0.3.0-linux-x86_64.tar.gz",
     "omnigraph-studio-0.3.0-linux-aarch64.tar.gz",
+    "omnigraph-studio-0.3.0-windows-x86_64-setup.exe",
     "omnigraph-studio-0.3.0-windows-x86_64.zip",
 ]
 
@@ -37,6 +38,8 @@ class ReleaseFiles(unittest.TestCase):
             ("Omnigraph-Studio-arm64.dmg", "Omnigraph-Studio-0.3.0-arm64.dmg"),
             ("omnigraph-studio-linux-x86_64.tar.gz", "omnigraph-studio-0.3.0-linux-x86_64.tar.gz"),
             ("omnigraph-studio-linux-aarch64.tar.gz", "omnigraph-studio-0.3.0-linux-aarch64.tar.gz"),
+            ("omnigraph-studio-windows-x86_64-setup.exe",
+             "omnigraph-studio-0.3.0-windows-x86_64-setup.exe"),
             ("omnigraph-studio-windows-x86_64.zip", "omnigraph-studio-0.3.0-windows-x86_64.zip"),
         ]:
             self.assertEqual((self.dist / stable).read_bytes(), versioned.encode(), stable)
@@ -53,6 +56,11 @@ class ReleaseFiles(unittest.TestCase):
 
     def test_a_missing_first_install_file_stops_the_release(self):
         (self.dist / "omnigraph-studio-0.3.0-windows-x86_64.zip").unlink()
+        with self.assertRaises(SystemExit):
+            release_files.stable_copies(self.dist, "0.3.0")
+
+    def test_a_missing_windows_installer_stops_the_release(self):
+        (self.dist / "omnigraph-studio-0.3.0-windows-x86_64-setup.exe").unlink()
         with self.assertRaises(SystemExit):
             release_files.stable_copies(self.dist, "0.3.0")
 
