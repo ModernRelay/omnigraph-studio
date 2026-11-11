@@ -5,7 +5,9 @@
 //! it fills the room its parent gives it (a cell's box, fixed by its column), or asks for the
 //! width of its line and gives way when there is less ([`CellText::hug`]). It shapes its line
 //! once a frame (GPUI keeps shaped lines from the frame before) and cuts it only when it is
-//! wider than its room.
+//! wider than its room. It works out its text style once a frame: GPUI makes a style from
+//! every refinement on its stack each time it is asked (`Window::text_style`), and allocates as
+//! it does, so the line is shaped as it is laid out and kept for the steps after.
 //!
 //! It looks as a small `Label` does: the UI font at the small size and weight, in the colour
 //! given, or the buffer font.
@@ -13,7 +15,7 @@
 use gpui::{
     App, Bounds, DefiniteLength, Element, ElementId, FontWeight, GlobalElementId, Hsla,
     InspectorElementId, IntoElement, LayoutId, Length, Pixels, ShapedLine, SharedString, Style,
-    TextAlign, TextStyleRefinement, TruncateFrom, Window, px,
+    TextAlign, TextStyle, TextStyleRefinement, TruncateFrom, Window, px,
 };
 
 /// See the module documentation.
@@ -111,9 +113,16 @@ pub struct Fitted {
     line_height: Pixels,
 }
 
+/// What laying the text out found, kept for its prepaint: the whole line (for a hugging one,
+/// also its width), and the height it is drawn in. Shaped as it is laid out, so a frame works
+/// out the text style once, not again to shape it and again for its height.
+pub struct Shaped {
+    whole: Option<Box<ShapedLine>>,
+    line_height: Pixels,
+}
+
 impl Element for CellText {
-    /// A hugging line, shaped to ask for its width.
-    type RequestLayoutState = Option<Box<ShapedLine>>;
+    type RequestLayoutState = Shaped;
     type PrepaintState = Option<Fitted>;
 
     fn id(&self) -> Option<ElementId> {
@@ -132,13 +141,21 @@ impl Element for CellText {
         _inspector_id: Option<&InspectorElementId>,
         window: &mut Window,
         cx: &mut App,
-    ) -> (LayoutId, Option<Box<ShapedLine>>) {
-        let (line_height, whole) = window.with_text_style(Some(self.style.clone()), |window| {
-            let whole = self.hug.then(|| Box::new(self.shape(window)));
-            (line_height(window), whole)
+    ) -> (LayoutId, Shaped) {
+        let shaped = window.with_text_style(Some(self.style.clone()), |window| {
+            let text_style = window.text_style();
+            let font_size = text_style.font_size.to_pixels(window.rem_size());
+            // A hugging line asks for its width, even an empty one's; an empty line in a cell
+            // draws nothing.
+            let whole = (self.hug || !self.text.is_empty())
+                .then(|| Box::new(self.shape(&text_style, font_size, window)));
+            Shaped {
+                whole,
+                line_height: line_height(&text_style, font_size, window),
+            }
         });
         let none = Length::Definite(DefiniteLength::Absolute(px(0.).into()));
-        let mut style = match &whole {
+        let mut style = match shaped.whole.as_ref().filter(|_| self.hug) {
             Some(whole) => {
                 let mut style = Style {
                     flex_shrink: 1.,
@@ -159,8 +176,8 @@ impl Element for CellText {
             },
         };
         style.min_size.width = none;
-        style.size.height = Length::Definite(DefiniteLength::Absolute(line_height.into()));
-        (window.request_layout(style, [], cx), whole)
+        style.size.height = Length::Definite(DefiniteLength::Absolute(shaped.line_height.into()));
+        (window.request_layout(style, [], cx), shaped)
     }
 
     fn prepaint(
@@ -168,16 +185,26 @@ impl Element for CellText {
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
-        whole: &mut Option<Box<ShapedLine>>,
+        shaped: &mut Shaped,
         window: &mut Window,
         cx: &mut App,
     ) -> Option<Fitted> {
         if self.text.is_empty() {
             return None;
         }
-        window.with_text_style(Some(self.style.clone()), |window| {
-            let whole = whole.take().unwrap_or_else(|| Box::new(self.shape(window)));
-            self.fit(whole, bounds.size.width, window, cx)
+        let whole = shaped.whole.take()?;
+        let line = if whole.width <= bounds.size.width {
+            whole
+        } else {
+            // Wider than its room, as few are: cut at the end, "…" taking the place of what
+            // does not show.
+            window.with_text_style(Some(self.style.clone()), |window| {
+                self.cut(bounds.size.width, window, cx)
+            })
+        };
+        Some(Fitted {
+            line,
+            line_height: shaped.line_height,
         })
     }
 
@@ -186,7 +213,7 @@ impl Element for CellText {
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
-        _whole: &mut Option<Box<ShapedLine>>,
+        _shaped: &mut Shaped,
         fitted: &mut Option<Fitted>,
         window: &mut Window,
         cx: &mut App,
@@ -208,10 +235,8 @@ impl Element for CellText {
 }
 
 impl CellText {
-    /// The whole line, shaped in the text style in effect.
-    fn shape(&self, window: &mut Window) -> ShapedLine {
-        let text_style = window.text_style();
-        let font_size = text_style.font_size.to_pixels(window.rem_size());
+    /// The whole line, shaped in `text_style`.
+    fn shape(&self, text_style: &TextStyle, font_size: Pixels, window: &Window) -> ShapedLine {
         window.text_system().shape_line(
             self.text.clone(),
             font_size,
@@ -220,36 +245,20 @@ impl CellText {
         )
     }
 
-    /// `whole`, or cut to `width` when it is wider.
-    fn fit(
-        &self,
-        whole: Box<ShapedLine>,
-        width: Pixels,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Option<Fitted> {
-        let line = if whole.width <= width {
-            whole
-        } else {
-            // Wider than its room, as few are: cut at the end, "…" taking the place of what
-            // does not show.
-            let text_style = window.text_style();
-            let font_size = text_style.font_size.to_pixels(window.rem_size());
-            let runs = [text_style.to_run(self.text.len())];
-            let (text, runs) = cx
+    /// The line cut to `width` at its end, in the text style in effect.
+    fn cut(&self, width: Pixels, window: &mut Window, cx: &mut App) -> Box<ShapedLine> {
+        let text_style = window.text_style();
+        let font_size = text_style.font_size.to_pixels(window.rem_size());
+        let runs = [text_style.to_run(self.text.len())];
+        let (text, runs) = cx
+            .text_system()
+            .line_wrapper(text_style.font(), font_size)
+            .truncate_line(self.text.clone(), width, "…", &runs, TruncateFrom::End);
+        Box::new(
+            window
                 .text_system()
-                .line_wrapper(text_style.font(), font_size)
-                .truncate_line(self.text.clone(), width, "…", &runs, TruncateFrom::End);
-            Box::new(
-                window
-                    .text_system()
-                    .shape_line(text, font_size, &runs, None),
-            )
-        };
-        Some(Fitted {
-            line,
-            line_height: line_height(window),
-        })
+                .shape_line(text, font_size, &runs, None),
+        )
     }
 }
 
@@ -270,10 +279,8 @@ fn one_line(text: SharedString) -> SharedString {
     }
 }
 
-/// The height of a line of the text style in effect, on whole pixels as GPUI's text is.
-fn line_height(window: &Window) -> Pixels {
-    let text_style = window.text_style();
-    let font_size = text_style.font_size.to_pixels(window.rem_size());
+/// The height of a line of `text_style`, on whole pixels as GPUI's text is.
+fn line_height(text_style: &TextStyle, font_size: Pixels, window: &Window) -> Pixels {
     window.pixel_snap(
         text_style
             .line_height
@@ -313,7 +320,7 @@ mod tests {
             std::mem::size_of::<gpui::ShapedLine>() > 1024,
             "a line is large"
         );
-        assert!(std::mem::size_of::<Option<Box<gpui::ShapedLine>>>() <= 8);
+        assert!(std::mem::size_of::<Shaped>() <= 16);
         assert!(std::mem::size_of::<Option<Fitted>>() <= 16);
         assert!(std::mem::size_of::<CellText>() <= 256);
     }
