@@ -2564,6 +2564,32 @@ impl Workspace {
             }
         }
         let view = cx.new(|cx| build(window, cx));
+        self.install_modal(view, previous_focus, window, cx);
+    }
+
+    /// Shows a modal made before, as one closed while its write was out comes back with that
+    /// write's outcome (spec 004), when no other modal is open; whether it is shown.
+    pub fn show_modal_again<V: ModalView>(
+        &mut self,
+        view: Entity<V>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.modal.is_some() {
+            return false;
+        }
+        let previous_focus = window.focused(cx);
+        self.install_modal(view, previous_focus, window, cx);
+        true
+    }
+
+    fn install_modal<V: ModalView>(
+        &mut self,
+        view: Entity<V>,
+        previous_focus: Option<FocusHandle>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let subscription =
             cx.subscribe_in(&view, window, |this, _, _: &DismissEvent, window, cx| {
                 this.hide_modal(window, cx);
@@ -2607,6 +2633,11 @@ impl Workspace {
             cx.notify();
         }
         true
+    }
+
+    /// The modal open, when it is a `V`.
+    pub fn active_modal<V: 'static>(&self) -> Option<Entity<V>> {
+        self.modal.as_ref()?.view.clone().downcast::<V>().ok()
     }
 
     /// Whether a modal is open: a window waiting to ask for a graph does not ask over one.

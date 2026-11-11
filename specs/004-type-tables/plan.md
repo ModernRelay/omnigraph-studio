@@ -460,6 +460,15 @@ its open section.
   save settles it (since 2026-10-21; before, a refused save then lost its text). Each edit has
   an editor of its own, so ⌘Z never brings back the text of the cell edited before.
 - Insert: a form generated from the node shape (required properties, key, enums, ranges).
+  **↵ closes the dialog as the insert goes (since 2026-11-10):** the person goes on while the
+  write is out, and the row shows where it sorts once it commits. Refused, not sent, matching
+  nothing, or of unknown outcome, the same dialog comes back with what was typed and why, as
+  soon as no other dialog is open (one opened meanwhile is the person's, and is never
+  replaced), so nothing typed is lost (constitution III). After an unknown outcome Insert stays
+  off until the form changes, and "Open history" says whether the row landed. A row is not
+  shown before it commits: a type without a key has no id until the server gives it one, and a
+  row that may never exist would take edits, peeks and deletes meant for a real one
+  (`dialogs::send_insert`, `Workspace::show_modal_again`). The relationship dialog does the same.
 - Delete (⌘⌫, or Delete… on the bulk bar): the picked rows (checkboxes, ⌘-click, ⇧-click), or
   else the cursor's, in one commit bound
   to the table's pin (`/mutate/if-graph-commit`). Before it is offered, the dialog reads what
@@ -680,6 +689,7 @@ kept answers.
 | 2026-10-20 | The Blob write contract | `openapi/omnigraph-0.14.0-edge.json` (`cluster_putBlob`, `cluster_clearBlob`, `BlobWriteOutput`, `ErrorOutput.blob_precondition_failure`); Omnigraph `crates/omnigraph-server/src/handlers.rs` (`server_blob_put`, `server_blob_delete`) and `crates/omnigraph/src/blob.rs` (`managed_blob_etag`) at `cf2b20e9` | `If-Match` is `*` (a value is there) or strong tags; a null cell satisfies neither, and a put takes no `If-None-Match`, so a write into a null cell cannot be bound. The ETag hashes the table version with the row: any write to the type moves every ETag of it. A put needs `Content-Type: application/octet-stream`, at most 32 MiB; a receipt's `commit` is null only for a clear of a cell already null |
 | 2026-10-20 | A Blob write is bound to the value read and has three outcomes | `graph_client` `a_blob_put_sends_raw_bytes_bound_to_the_etag_read`, `a_blob_clear_of_a_null_cell_commits_nothing`, `a_changed_blob_refuses_the_write_with_its_current_etag`, `a_blob_put_without_the_servers_answer_is_unknown`; `type_table` `blob_write` tests, the peek's `a_file_stored_in_a_slot_is_bound_to_the_value_read`, `a_value_changed_elsewhere_is_offered_again_over_the_new_one`, `uploads_the_view_cannot_send_say_why_and_send_nothing`, `a_page_held_at_a_commit_stores_no_file`, the table's `a_file_dropped_on_a_blob_cell_is_stored_bound_to_the_value_read`, the tab's `a_file_stored_from_the_tab_shows_at_its_own_commit` and `a_tab_at_a_commit_writes_nothing`, against the fake server's Blob cells | One `PUT` with one content type, the bytes and the ETag read; the view, the table and the tab move to the write's commit and show its value; a value changed elsewhere sends one write, keeps the other writer's bytes and offers "Replace anyway" bound to the new ETag, which lands; a 32 MiB + 1 file and a held view send nothing; a lost answer is unknown and not sent again. The native picker and a drop from Finder were not driven: no test reaches the system's open panel or its file drags, so the paths after them (`upload_blob`, `upload`) are what the tests call |
 | 2026-11-10 | A delete's rows leave at once and come back where they were, picked, the cursor on its row, when it is refused or its outcome is unknown (which also offers Refresh); committed, they stay out and the table follows the commit | `type_table` `a_deletes_rows_leave_at_once_and_come_back_if_it_is_not_made`; the `type_table` suite | Pass. Not yet checked in the running app |
+| 2026-11-10 | ↵ in the insert dialog closes it as the insert goes; refused, the same dialog comes back with what was typed and why, after a dialog opened meanwhile closes | `type_table` `dialogs::tests::a_refused_insert_brings_its_dialog_back_with_what_was_typed`; the `type_table` and `studio_workspace` suites | Pass. Not yet checked in the running app |
 
 ## Corrections
 

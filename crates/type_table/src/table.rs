@@ -5651,6 +5651,11 @@ impl TypeTable {
         cx.notify();
     }
 
+    /// The workspace the table is in, for a dialog's outcome that comes after it closed.
+    pub(crate) fn workspace(&self) -> WeakEntity<Workspace> {
+        self.workspace.clone()
+    }
+
     fn take_pending_delete(&mut self, ids: &[String]) -> Option<PendingDelete> {
         let at = self
             .deleting
