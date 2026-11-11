@@ -3137,7 +3137,12 @@ impl Workspace {
             ServerEnvironment::Staging => Color::Warning,
             ServerEnvironment::Development | ServerEnvironment::Unset => Color::Muted,
         };
+        // A server on this machine is a development one until the person says otherwise: shown,
+        // not saved, so the menu still sets one.
         let label = match environment {
+            ServerEnvironment::Unset if graph_client::is_loopback(&url) => {
+                ServerEnvironment::Development.label()
+            }
             ServerEnvironment::Unset => "Environment not set",
             known => known.label(),
         };
@@ -3573,8 +3578,9 @@ impl Workspace {
                 let state = match (&connection.state, connection.latency) {
                     (ConnectionState::Ready, Some(latency)) => {
                         format!(
-                            "{} · {}",
+                            "{} · contract {} · {}",
                             connection.label(),
+                            graph_client::CONTRACT,
                             studio_ui::format_elapsed(latency)
                         )
                     }

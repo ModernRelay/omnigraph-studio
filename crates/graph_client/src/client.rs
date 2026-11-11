@@ -466,6 +466,17 @@ const QUERY_ANSWER_MAX: usize = 32 * 1024 * 1024;
 /// decode, which for a write is an unknown outcome.
 const READ_ANSWER_MAX: usize = QUERY_ANSWER_MAX;
 
+/// Whether the server at `url` is on this machine: `localhost`, `127.0.0.0/8` or `[::1]`. A
+/// text that is not an address is not.
+pub fn is_loopback(url: &str) -> bool {
+    Url::parse(url).is_ok_and(|url| match url.host() {
+        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    })
+}
+
 /// A server address as typed, made into the root URL a client is built on: trimmed, without a
 /// trailing slash, and with `http://` (loopback hosts) or `https://` (any other host) when no
 /// scheme was given. Refused unless it is an `http` or `https` URL with a host.
@@ -2502,6 +2513,24 @@ mod tests {
 
     /// A blank token is none, given at the start or later: sent, a server would read `Bearer `
     /// as no credential, and say it got none.
+    #[test]
+    fn a_loopback_address_is_this_machine() {
+        for url in [
+            "http://127.0.0.1:8787",
+            "http://localhost:80",
+            "http://[::1]:8080/",
+        ] {
+            assert!(is_loopback(url), "{url}");
+        }
+        for url in [
+            "https://graph.example.com",
+            "http://127.example.com",
+            "not an address",
+        ] {
+            assert!(!is_loopback(url), "{url}");
+        }
+    }
+
     #[test]
     fn a_blank_token_is_none() {
         let http = FakeHttpClient::create(|_| async { unreachable!() });

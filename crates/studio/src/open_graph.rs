@@ -43,6 +43,21 @@ pub(crate) enum Place {
     GraphId,
 }
 
+/// Where a line the dialog says is shown: beside what it is about (constitution VII).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Said {
+    /// Under the pane: about the server or cluster chosen.
+    Pane,
+    /// Under the graph id field and Open.
+    GraphId,
+    /// Under the field for a new token and Update token.
+    Token,
+    /// Under the add form's buttons: the add's refusal.
+    Add,
+    /// Under the add form's buttons, as progress rather than an error.
+    Adding,
+}
+
 pub struct OpenGraphModal {
     workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
@@ -70,6 +85,8 @@ pub struct OpenGraphModal {
     /// A replacement for a token the selected server refused.
     replacement_token: Entity<Editor>,
     error: Option<SharedString>,
+    /// Where [`Self::error`] shows: beside the field or button it is about.
+    error_at: Said,
     /// The server and graph lists, which scroll within the dialog: the keyboard's row is
     /// scrolled into view ([`Self::move_to`]).
     servers_scroll: ScrollHandle,
@@ -205,6 +222,7 @@ impl OpenGraphModal {
             replacement_token,
             _adding: None,
             error: None,
+            error_at: Said::Pane,
             servers_scroll: ScrollHandle::new(),
             graphs_scroll: ScrollHandle::new(),
             planes: Vec::new(),
@@ -571,6 +589,21 @@ impl OpenGraphModal {
         }
     }
 
+    /// Shows `text` at `at`, in place of anything said before.
+    pub(crate) fn say(&mut self, at: Said, text: impl Into<SharedString>) {
+        self.error = Some(text.into());
+        self.error_at = at;
+    }
+
+    /// What is said at `at`, if anything, drawn there.
+    fn said_at(&self, at: Said) -> Option<AnyElement> {
+        let text = self.error.clone().filter(|_| self.error_at == at)?;
+        Some(match at {
+            Said::Adding => ds::text::muted(text).into_any_element(),
+            _ => ds::text::error(text).into_any_element(),
+        })
+    }
+
     fn show_add(&mut self, adding: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.adding = adding;
         if adding {
@@ -603,13 +636,13 @@ impl OpenGraphModal {
                 self.select(connection, window, cx);
             }
             None => {
-                self.error = Some(
+                self.say(
+                    Said::Pane,
                     format!(
                         "Studio could not open {}: sign in to its organization's control plane \
                          first.",
                         cluster.name
-                    )
-                    .into(),
+                    ),
                 );
                 cx.notify();
             }
@@ -634,7 +667,10 @@ impl OpenGraphModal {
                 self.select(connection, window, cx);
             }
             None => {
-                self.error = Some(format!("Studio lists no CLI target named {name}.").into());
+                self.say(
+                    Said::Pane,
+                    format!("Studio lists no CLI target named {name}."),
+                );
                 cx.notify();
             }
         }
@@ -687,7 +723,7 @@ impl OpenGraphModal {
             return;
         };
         if graph_id.trim().is_empty() {
-            self.error = Some("Enter a graph id.".into());
+            self.say(Said::GraphId, "Enter a graph id.");
             cx.notify();
             return;
         }
@@ -756,7 +792,7 @@ impl OpenGraphModal {
             .map(|connection| connection.entity_id())
             .collect();
         let adding = registry.update(cx, |registry, cx| registry.add_target(name, url, token, cx));
-        self.error = Some("Adding the target through the Omnigraph CLI…".into());
+        self.say(Said::Adding, "Adding the target through the Omnigraph CLI…");
         cx.notify();
         self._adding = Some(cx.spawn_in(window, async move |this, cx| {
             let added = adding.await;
@@ -769,7 +805,7 @@ impl OpenGraphModal {
                     Ok(connection) if listed.contains(&connection.entity_id()) => {
                         let name = connection.read(cx).server.name.clone();
                         this.select(connection, window, cx);
-                        this.error = Some(format!("{name} has that address already.").into());
+                        this.say(Said::Pane, format!("{name} has that address already."));
                     }
                     Ok(connection) => {
                         // Followed now, before the registry's notice reaches the dialog.
@@ -781,7 +817,7 @@ impl OpenGraphModal {
                         window.focus(&this.graph_id.focus_handle(cx), cx);
                     }
                     Err(error) => {
-                        this.error = Some(format!("The server was not added: {error}").into());
+                        this.say(Said::Add, format!("The server was not added: {error}"));
                     }
                 }
                 cx.notify();
@@ -810,7 +846,7 @@ impl OpenGraphModal {
         };
         let token = self.replacement_token.read(cx).text(cx);
         if token.trim().is_empty() {
-            self.error = Some("Enter the new token.".into());
+            self.say(Said::Token, "Enter the new token.");
             cx.notify();
             return;
         }
@@ -890,18 +926,16 @@ impl OpenGraphModal {
         let token_tooltip = token_tooltip(c, self.platform);
         let selected = connection.clone();
         let listing_note = match &c.graphs {
-            GraphListing::NotAllowed => Some("This token may not list graphs. Enter a graph id."),
+            GraphListing::NotAllowed => {
+                Some("This server does not list its graphs to this token. Enter a graph id.")
+            }
             GraphListing::Failed(_) => Some("The graph list could not be read. Enter a graph id."),
             _ => None,
         };
         let graphs = c.graph_ids();
         // An empty list says why, rather than leaving a blank pane.
-        let listing_note = listing_note.or_else(|| {
-            graphs.is_empty().then_some(match c.state {
-                ConnectionState::Ready => "This server lists no graphs. Enter a graph id.",
-                _ => "Its graphs show once Studio connects to it.",
-            })
-        });
+        let listing_note =
+            listing_note.or_else(|| graphs.is_empty().then_some(empty_list_note(&c.state)));
         // What each id's row says: a listed graph's state, nothing more for one the server
         // named by discovery, and "remembered" for one only typed in before.
         let discovered =
@@ -969,6 +1003,7 @@ impl OpenGraphModal {
                                 ),
                         ),
                 )
+                .children(self.said_at(Said::Token))
             })
             .child(
                 v_flex()
@@ -1036,6 +1071,7 @@ impl OpenGraphModal {
                             })),
                     ),
             )
+            .children(self.said_at(Said::GraphId))
     }
 
     fn render_add(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1087,6 +1123,24 @@ impl OpenGraphModal {
                         ),
                     ),
             )
+            .children(self.said_at(Said::Add))
+            .children(self.said_at(Said::Adding))
+    }
+}
+
+/// Why a server's graph list is empty, by its state: what would show them, never a connect
+/// that will not.
+fn empty_list_note(state: &ConnectionState) -> &'static str {
+    match state {
+        ConnectionState::Ready => "This server lists no graphs. Enter a graph id.",
+        ConnectionState::Unauthorized => "Its graphs show once the server accepts a token.",
+        ConnectionState::Unreachable(_) => "Its graphs show once Studio reaches it.",
+        ConnectionState::ContractMismatch { .. } => {
+            "Studio cannot read this server's graphs: it speaks another contract."
+        }
+        ConnectionState::Idle | ConnectionState::Connecting => {
+            "Its graphs show once Studio connects."
+        }
     }
 }
 
@@ -1540,7 +1594,7 @@ impl Render for OpenGraphModal {
                             .pb(px(space::LG))
                             .gap(px(space::MD))
                             .child(div().flex_1().min_h_0().child(body))
-                            .children(self.error.clone().map(ds::text::error)),
+                            .children(self.said_at(Said::Pane)),
                     ),
             )
     }
@@ -1606,6 +1660,45 @@ mod tests {
 
     /// ↓ and Tab move through the servers, choosing each, then the chosen one's graphs and the
     /// id field, wrapping around; ↵ on a server goes to its graphs, and on a graph opens it.
+    /// An empty graph list says what would show its graphs: a connect while connecting, a token
+    /// while refused, reaching it while unreachable; never a connect that will not.
+    #[test]
+    fn an_empty_list_says_what_would_show_it() {
+        assert_eq!(
+            empty_list_note(&ConnectionState::Unauthorized),
+            "Its graphs show once the server accepts a token."
+        );
+        assert_eq!(
+            empty_list_note(&ConnectionState::Unreachable("refused".into())),
+            "Its graphs show once Studio reaches it."
+        );
+        assert_eq!(
+            empty_list_note(&ConnectionState::Connecting),
+            "Its graphs show once Studio connects."
+        );
+    }
+
+    /// What the dialog says shows beside what it is about: an id not entered under the id field,
+    /// a token not entered under Update token.
+    #[gpui::test]
+    fn an_error_shows_beside_its_field(cx: &mut TestAppContext) {
+        let alpha = server(&["one"], cx);
+        alpha.update(cx, |connection, _| {
+            connection.state = ConnectionState::Unauthorized;
+            connection.refusal = Some(Unauthorized::TokenRefused);
+        });
+        let (modal, cx) = dialog(vec![alpha], cx);
+        let said = |cx: &mut VisualTestContext| {
+            modal.read_with(cx, |modal, _| (modal.error_at, modal.error.clone()))
+        };
+        modal.update_in(cx, |modal, window, cx| {
+            modal.open(String::new(), window, cx)
+        });
+        assert_eq!(said(cx), (Said::GraphId, Some("Enter a graph id.".into())));
+        modal.update_in(cx, |modal, window, cx| modal.update_token(window, cx));
+        assert_eq!(said(cx), (Said::Token, Some("Enter the new token.".into())));
+    }
+
     #[gpui::test]
     fn the_keyboard_chooses_a_server_and_opens_its_graph(cx: &mut TestAppContext) {
         let alpha = server(&["one"], cx);
