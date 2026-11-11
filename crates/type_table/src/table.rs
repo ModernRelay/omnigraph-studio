@@ -11333,7 +11333,7 @@ impl TypeTable {
                                 .bg(change_color(net).color(cx)),
                         )
                     })
-                    .when(!self.is_removed(&row.id), |cell| {
+                    .when(self.builds_row_check(ix, &row.id), |cell| {
                         cell.child(self.render_row_check(ix, &row.id, cx))
                     })
                     .into_any_element(),
@@ -11341,6 +11341,16 @@ impl TypeTable {
                 GridPlace::Gap(_) => div().into_any_element(),
             })
             .collect()
+    }
+
+    /// Whether row `ix` builds its checkbox: every row the branch keeps while any row is checked,
+    /// and otherwise only the pointer's row, the one row that can show it. A checkbox is a
+    /// control with an id, its listeners and its icon, and hidden in every row it was a thirtieth
+    /// of a table scroll frame; a move to another row draws the grid again anyway
+    /// ([`Self::pointer_moved`]), as for the row's Peek.
+    fn builds_row_check(&self, ix: usize, id: &str) -> bool {
+        !self.is_removed(id)
+            && (!self.selection.is_empty() || self.frame_pointer.is_some_and(|(row, _)| row == ix))
     }
 
     /// A row's checkbox, on the page's gutter in its key cell: shown under the pointer, and on
@@ -18211,6 +18221,39 @@ mod tests {
         });
     }
 
+    /// While no row is checked, only the pointer's row builds its checkbox, the one row that can
+    /// show it; with a row checked, every row shows and builds its own.
+    #[gpui::test]
+    async fn only_the_pointers_row_builds_its_checkbox_until_a_row_is_checked(
+        cx: &mut TestAppContext,
+    ) {
+        let session = session(PEOPLE, cx);
+        let (table, cx) = people_table(&session, cx);
+        cx.run_until_parked();
+        let built = |cx: &mut VisualTestContext| -> Vec<usize> {
+            (0..2)
+                .filter(|row| cx.debug_bounds(format!("row-check-{row}").leak()).is_some())
+                .collect()
+        };
+        assert_eq!(built(cx), Vec::<usize>::new(), "the pointer is away");
+        let second = cell_bounds(1, 1, cx);
+        cx.simulate_mouse_move(second.center(), None, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(built(cx), [1]);
+        let check = cx.debug_bounds("row-check-1").unwrap();
+        cx.simulate_click(check.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        let picked = table.read_with(cx, |table, _| {
+            table.selection.iter().cloned().collect::<Vec<String>>()
+        });
+        assert_eq!(picked, ["p2"]);
+        assert_eq!(
+            built(cx),
+            [0, 1],
+            "with a row checked, every row shows its box"
+        );
+    }
+
     /// A grid line is as tall as a row is drawn: the list's own height is not a line's. What is
     /// first in view, and how far a read that puts rows in above the view moves the scroll so the
     /// lines in view stay where they are, are counted in lines (constitution V).
@@ -18218,8 +18261,8 @@ mod tests {
     async fn a_grid_line_is_as_tall_as_a_drawn_row(cx: &mut TestAppContext) {
         let session = session(PEOPLE, cx);
         let (table, cx) = people_table(&session, cx);
-        let first = cx.debug_bounds("row-check-0").expect("row 0 is drawn");
-        let second = cx.debug_bounds("row-check-1").expect("row 1 is drawn");
+        let first = cx.debug_bounds("cell-0-1").expect("row 0 is drawn");
+        let second = cx.debug_bounds("cell-1-1").expect("row 1 is drawn");
         let drawn = second.top() - first.top();
         assert!(drawn > px(0.));
         let height = table.read_with(cx, |table, cx| table.line_height(cx));
