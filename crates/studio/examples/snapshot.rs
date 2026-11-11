@@ -18,7 +18,7 @@
 //! `measure:<n>,scroll=<dy>` first scrolls at the window's centre each frame (a zoom on the
 //! canvas; `scroll=<dx>:<dy>` scrolls sideways too), and `measure:<n>,drag=<dx>:<dy>` drags from the centre by that much a frame (a pan),
 //! both back and forth every 30 frames (`,at=<x>:<y>` puts the pointer there instead, as on the
-//! inspector); `measure:<n>,type` types a letter into the focused
+//! inspector; `,live` lets reads and timers land before each frame, timed with it); `measure:<n>,type` types a letter into the focused
 //! field and takes it back, alternately. Each also prints the main thread's CPU time per
 //! frame, which a busy machine does not inflate. `SNAPSHOT_WAIT_MS` (default 1500) is how
 //! long to let each step's network work finish; `SNAPSHOT_SIZE` is `WIDTHxHEIGHT` (default
@@ -224,8 +224,11 @@ fn main() {
             let mut scroll: Option<(f32, f32)> = None;
             let mut drag: Option<(f32, f32)> = None;
             let mut at: Option<(f32, f32)> = None;
+            let mut live = false;
             for part in parts {
-                if part == "refresh" {
+                if part == "live" {
+                    live = true;
+                } else if part == "refresh" {
                     refresh = true;
                 } else if part == "type" {
                     typing = true;
@@ -272,9 +275,20 @@ fn main() {
             for frame in 0..frames {
                 // Back and forth every 30 frames, so the view stays where it can be measured.
                 let sign = if (frame / 30) % 2 == 0 { 1. } else { -1. };
+                // `live`: a frame's worth of real time passes before each frame, and what landed
+                // meanwhile (reads, timers) is handled inside the frame's time, as the app does
+                // between two frames.
+                let (mut landed, mut landed_cpu) = (Duration::ZERO, Duration::ZERO);
+                if live {
+                    std::thread::sleep(Duration::from_millis(8));
+                    cx.advance_clock(Duration::from_millis(8));
+                    let (start, cpu_start) = (Instant::now(), thread_cpu_time());
+                    cx.run_until_parked();
+                    (landed, landed_cpu) = (start.elapsed(), thread_cpu_time() - cpu_start);
+                }
                 cx.update_window(handle, |root, window, cx| {
-                    let start = Instant::now();
-                    let cpu_start = thread_cpu_time();
+                    let start = Instant::now() - landed;
+                    let cpu_start = thread_cpu_time() - landed_cpu;
                     if typing {
                         // Typing into the focused field: a letter, then taking it back.
                         let key = if frame % 2 == 0 { "a" } else { "backspace" };
