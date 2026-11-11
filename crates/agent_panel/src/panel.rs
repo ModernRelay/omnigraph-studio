@@ -51,6 +51,29 @@ pub const PRESETS: &[(&str, &[&str])] = &[
     ),
 ];
 
+/// An agent's ask for a sign-in (spec 029).
+struct SignInNeed {
+    /// The methods it signs in with itself.
+    methods: Vec<crate::host::AuthChoice>,
+    /// Why the last method tried did not sign in.
+    error: Option<String>,
+    /// A sign-in under way.
+    _signing: Option<Task<()>>,
+}
+
+/// The agent `command` runs, named, and the command that signs in to its account, for the
+/// presets: Claude Code's `claude /login`, Codex's `codex login`.
+fn sign_in_hint(command: &[String]) -> (&'static str, Option<&'static str>) {
+    let runs = |package: &str| command.iter().any(|word| word.contains(package));
+    if runs("claude-agent-acp") || runs("claude-code-acp") {
+        ("Claude", Some("claude /login"))
+    } else if runs("codex-acp") {
+        ("Codex", Some("codex login"))
+    } else {
+        ("The agent", None)
+    }
+}
+
 const UNKNOWN_OUTCOME: &str = "The server did not confirm this change. It was not retried; \
 check the branch history before the agent tries it again.";
 
@@ -858,6 +881,11 @@ pub struct AgentPanel {
     start_owed: bool,
     /// The agent stopped with an error.
     failed: bool,
+    /// The agent the conversation runs, as it was last started: what a sign-in it asks for is
+    /// made with.
+    launched: Option<AgentLaunch>,
+    /// The agent asked for a sign-in before it would go on (spec 029).
+    sign_in: Option<SignInNeed>,
     /// The directory the agent works in for this conversation.
     cwd: Option<PathBuf>,
     _focus: Option<gpui::Subscription>,
@@ -1067,6 +1095,8 @@ impl AgentPanel {
             agent,
             start_owed: false,
             failed: false,
+            launched: None,
+            sign_in: None,
             cwd: None,
             _focus: Some(focus),
             config_options: Vec::new(),
@@ -1222,8 +1252,10 @@ impl AgentPanel {
         let (events_tx, mut events_rx) = mpsc::unbounded();
         let (commands_tx, commands_rx) = mpsc::unbounded();
         // One process per agent, shared with the graph's other conversations.
-        let connection =
-            crate::connection::connection(AgentLaunch::new(settings.command, settings.env), cx);
+        let agent_launch = AgentLaunch::new(settings.command, settings.env);
+        self.launched = Some(agent_launch.clone());
+        self.sign_in = None;
+        let connection = crate::connection::connection(agent_launch, cx);
         if !connection.open(launch, events_tx.clone(), commands_rx) {
             self.fail_start("The agent is not running.".into(), cx);
             return;
@@ -1352,6 +1384,11 @@ impl AgentPanel {
     /// Starts the agent again on this conversation, after it stopped: it replays the
     /// conversation when it can load it, else a new one begins in this tab.
     fn restart(&mut self, _: &Restart, _window: &mut Window, cx: &mut Context<Self>) {
+        self.restart_now(cx);
+    }
+
+    /// [`Self::restart`], without a window.
+    fn restart_now(&mut self, cx: &mut Context<Self>) {
         self.stop_host();
         self._slow_start = None;
         self.clear_thread();
@@ -1647,6 +1684,21 @@ impl AgentPanel {
                     }),
                 }
                 self.send_queued(cx);
+            }
+            HostEvent::AuthRequired { methods, message } => {
+                self.stop_host();
+                self.settle_open_tools(ToolCallStatus::Failed);
+                self.show_held();
+                self.failed = true;
+                self.sign_in = Some(SignInNeed {
+                    methods,
+                    error: None,
+                    _signing: None,
+                });
+                self.state = State::Exited {
+                    message,
+                    stderr: String::new(),
+                };
             }
             HostEvent::Exited {
                 message,
@@ -3342,6 +3394,11 @@ impl AgentPanel {
                     message.hash(&mut hasher);
                     stderr.hash(&mut hasher);
                 }
+                if let Some(need) = &self.sign_in {
+                    need.error.hash(&mut hasher);
+                    need._signing.is_some().hash(&mut hasher);
+                    need.methods.len().hash(&mut hasher);
+                }
                 0..0
             }
         };
@@ -3451,6 +3508,9 @@ impl AgentPanel {
             }
             Block::Waiting => self.render_waiting(cx),
             Block::Exited => match &self.state {
+                State::Exited { .. } if self.sign_in.is_some() => {
+                    gutter_row(None, self.render_sign_in(cx)).into_any_element()
+                }
                 State::Exited { message, stderr } => {
                     let mut callout = studio_ui::ds::callout(Severity::Error, message.clone());
                     if !stderr.is_empty() {
@@ -3469,6 +3529,95 @@ impl AgentPanel {
             .when(ix == 0, |block| block.pt(px(ds::space::XL)))
             .child(body)
             .into_any_element()
+    }
+
+    /// The agent's ask for a sign-in: a button for each method it signs in with itself, and the
+    /// command that signs in to its account for the presets, then Restart (spec 029).
+    fn render_sign_in(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(need) = &self.sign_in else {
+            return div().into_any_element();
+        };
+        let command = self
+            .launched
+            .as_ref()
+            .map(|launch| launch.command.clone())
+            .unwrap_or_default();
+        let (agent, login) = sign_in_hint(&command);
+        let signing = need._signing.is_some();
+        let buttons = need.methods.iter().enumerate().map(|(index, method)| {
+            let id = method.id.clone();
+            ds::row_button(("agent-sign-in", index), method.name.clone())
+                .disabled(signing)
+                .when_some(method.description.clone(), |button, description| {
+                    button.tip(studio_ui::ds::tooltip(description))
+                })
+                .on_click(cx.listener(move |this, _, _, cx| this.authenticate(id.clone(), cx)))
+        });
+        let says = match login {
+            Some(login) => {
+                format!("{agent} needs you to sign in. Run `{login}` in a terminal, then Restart.")
+            }
+            None => {
+                format!("{agent} asks you to sign in. Sign in with its own command, then Restart.")
+            }
+        };
+        let detail = v_flex()
+            .gap(px(ds::space::SM))
+            .child(ds::text::muted(says))
+            .children(login.map(|login| studio_ui::ds::command_block("agent-login", login, cx)))
+            .children(need.error.clone().map(ds::text::error))
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .gap(px(ds::space::SM))
+                    .children(buttons)
+                    .child(
+                        ds::row_button("agent-sign-in-restart", "Restart")
+                            .start_icon(Icon::new(IconName::RotateCw))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.restart(&Restart, window, cx)
+                            })),
+                    ),
+            );
+        studio_ui::ds::callout(Severity::Warning, format!("Sign in to {agent}"))
+            .description_slot(detail)
+            .into_any_element()
+    }
+
+    /// Signs in with the agent's own method `method`, on the agent's running process (or a new
+    /// one), then starts the conversation again; a refusal is said under the buttons.
+    fn authenticate(&mut self, method: String, cx: &mut Context<Self>) {
+        let Some(launch) = self.launched.clone() else {
+            return;
+        };
+        let Some(need) = &mut self.sign_in else {
+            return;
+        };
+        need.error = None;
+        let connection = crate::connection::connection(launch, cx);
+        let answer = connection.authenticate(method);
+        need._signing = Some(cx.spawn(async move |this, cx| {
+            let result = answer
+                .await
+                .unwrap_or_else(|_| Err("The agent stopped before it answered.".to_owned()));
+            // Held until the answer: the process signed in is the one the restart uses.
+            let _connection = connection;
+            this.update(cx, |this, cx| match result {
+                Ok(()) => {
+                    this.sign_in = None;
+                    this.restart_now(cx);
+                }
+                Err(error) => {
+                    if let Some(need) = &mut this.sign_in {
+                        need._signing = None;
+                        need.error = Some(format!("The agent did not sign in: {error}"));
+                    }
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+        cx.notify();
     }
 
     /// Edit for the message waiting for the agent ([`Self::edit_opening`]), offered once the
@@ -4293,6 +4442,21 @@ impl AgentPanel {
 mod tests {
     use super::*;
 
+    /// The presets name the command that signs in to their account; another agent is asked to
+    /// sign in its own way (spec 029).
+    #[test]
+    fn a_preset_names_its_sign_in_command() {
+        let command = |preset: usize| -> Vec<String> {
+            PRESETS[preset]
+                .1
+                .iter()
+                .map(|word| word.to_string())
+                .collect()
+        };
+        assert_eq!(sign_in_hint(&command(0)), ("Claude", Some("claude /login")));
+        assert_eq!(sign_in_hint(&command(1)), ("Codex", Some("codex login")));
+        assert_eq!(sign_in_hint(&["my-agent".to_owned()]), ("The agent", None));
+    }
     /// A conversation runs the agent it was held with, whatever the default is now; a new one
     /// runs the default. A configured agent that is no preset is offered beside the presets.
     #[gpui::test]

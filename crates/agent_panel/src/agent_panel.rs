@@ -62,9 +62,17 @@ pub fn init(cx: &mut App) {
             workspace.set_panel_actions(sessions_panel::PANEL_ID, actions.into(), cx);
         }
         workspace.register_action(|workspace, _: &OpenAgent, window, cx| {
+            if workspace.session().is_none() {
+                no_graph(workspace, cx);
+                return;
+            }
             panel::open(workspace, window, cx);
         });
         workspace.register_action(|workspace, _: &NewConversation, window, cx| {
+            if workspace.session().is_none() {
+                no_graph(workspace, cx);
+                return;
+            }
             panel::new_conversation(workspace, window, cx);
         });
         workspace.register_action(|workspace, action: &OpenConversation, window, cx| {
@@ -81,4 +89,16 @@ pub fn init(cx: &mut App) {
         });
     })
     .detach();
+}
+
+/// The agent works on the graph in front: with none open, the Agent action says so and offers
+/// to open one, rather than doing nothing (spec 029).
+fn no_graph(workspace: &mut Workspace, cx: &mut gpui::Context<Workspace>) {
+    workspace.show_toast_with_action(
+        studio_workspace::ToastKind::Info,
+        "Open a graph first: the agent works on the graph in front.",
+        "Open a graph…",
+        Box::new(studio_actions::workspace::OpenGraph),
+        cx,
+    );
 }

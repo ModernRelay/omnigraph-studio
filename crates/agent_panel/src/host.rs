@@ -15,13 +15,14 @@ use std::time::Duration;
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    BooleanConfigOptionCapabilities, CancelNotification, ClientCapabilities,
-    ClientSessionCapabilities, CloseSessionRequest, ContentBlock, DeleteSessionRequest,
-    Implementation, InitializeRequest, ListSessionsRequest, LoadSessionRequest, NewSessionRequest,
-    PromptRequest, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    ResumeSessionRequest, SessionConfigId, SessionConfigOption, SessionConfigOptionValue,
-    SessionConfigOptionsCapabilities, SessionId, SessionInfo, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, StopReason, TextContent,
+    AuthMethod, AuthenticateRequest, BooleanConfigOptionCapabilities, CancelNotification,
+    ClientCapabilities, ClientSessionCapabilities, CloseSessionRequest, ContentBlock,
+    DeleteSessionRequest, Implementation, InitializeRequest, ListSessionsRequest,
+    LoadSessionRequest, NewSessionRequest, PromptRequest, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, ResumeSessionRequest, SessionConfigId,
+    SessionConfigOption, SessionConfigOptionValue, SessionConfigOptionsCapabilities, SessionId,
+    SessionInfo, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, StopReason,
+    TextContent,
 };
 use agent_client_protocol::{
     AcpAgent, AcpAgentConfig, Agent, ConnectionTo, LineDirection, SentRequest,
@@ -123,12 +124,46 @@ pub enum HostEvent {
     TurnEnded {
         stop: Result<StopReason, String>,
     },
+    /// The agent asks for a sign-in before it opens a conversation or runs a turn, offering
+    /// `methods` it signs in with itself (spec 029); `message` is what it said.
+    AuthRequired {
+        methods: Vec<AuthChoice>,
+        message: String,
+    },
     /// The agent stopped or could not start; `failed` unless the session simply ended.
     Exited {
         message: String,
         stderr: String,
         failed: bool,
     },
+}
+
+/// A way the agent signs in by itself (ACP's `agent` auth method), which Studio offers as a
+/// button. A `terminal` method, which the client must run in a terminal it has, is not offered:
+/// Studio advertises no terminal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthChoice {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+}
+
+/// The `agent` methods of `methods`, as Studio offers them.
+fn auth_choices(methods: &[AuthMethod]) -> Vec<AuthChoice> {
+    methods
+        .iter()
+        .filter(|method| matches!(method, AuthMethod::Agent(_)))
+        .map(|method| AuthChoice {
+            id: method.id().0.to_string(),
+            name: method.name().to_owned(),
+            description: method.description().map(str::to_owned),
+        })
+        .collect()
+}
+
+/// Whether `error` is the agent asking for a sign-in.
+fn asks_sign_in(error: &agent_client_protocol::Error) -> bool {
+    error.code == agent_client_protocol::ErrorCode::AuthRequired
 }
 
 pub enum HostCommand {
@@ -160,6 +195,11 @@ pub enum ConnectionCommand {
     /// Deletes a session at the agent, when it can.
     Delete {
         session: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// Signs in with one of the agent's own methods ([`AuthChoice`]).
+    Authenticate {
+        method: String,
         reply: oneshot::Sender<Result<(), String>>,
     },
 }
@@ -427,6 +467,14 @@ fn located(mut launch: AgentLaunch) -> Result<AgentLaunch, String> {
         return Ok(launch);
     };
     match crate::program::resolve(program, &mut launch.env) {
+        // `npx` runs nothing where `node` is missing: said before the agent is started, rather
+        // than as the failed start's own words (spec 029).
+        Ok(_)
+            if crate::program::runs_on_node(program)
+                && crate::program::resolve("node", &mut launch.env.clone()).is_err() =>
+        {
+            Err(crate::program::NODE_MISSING.to_owned())
+        }
         Ok(found) => {
             *program = found;
             Ok(launch)
@@ -549,6 +597,7 @@ async fn connect(
                 resume: sessions.resume.is_some(),
                 close: sessions.close.is_some(),
             };
+            let methods = auth_choices(&initialized.auth_methods);
 
             // An agent that exits cleanly ends the transport, not this loop: its end is watched
             // for too, so every conversation hears that the agent stopped.
@@ -573,8 +622,7 @@ async fn connect(
                             events,
                             commands,
                             (routes.clone(), opening.clone()),
-                            agent.name.clone(),
-                            can,
+                            (agent.name.clone(), can, methods.clone()),
                         );
                         connection.spawn(session)?;
                     }
@@ -587,6 +635,19 @@ async fn connect(
                             } else {
                                 Err("The agent cannot list its conversations.".to_owned())
                             };
+                            reply.send(result).ok();
+                            Ok(())
+                        })?;
+                    }
+                    ConnectionCommand::Authenticate { method, reply } => {
+                        let connection_for_auth = connection.clone();
+                        connection.spawn(async move {
+                            let result = connection_for_auth
+                                .send_request(AuthenticateRequest::new(method))
+                                .block_task()
+                                .await
+                                .map(|_| ())
+                                .map_err(|error| error_words(&error));
                             reply.send(result).ok();
                             Ok(())
                         })?;
@@ -644,8 +705,7 @@ async fn open_session(
     events: mpsc::UnboundedSender<HostEvent>,
     mut commands: mpsc::UnboundedReceiver<HostCommand>,
     (routes, opening): (SharedRoutes, Opening),
-    agent_name: String,
-    can: Can,
+    (agent_name, can, methods): (String, Can, Vec<AuthChoice>),
 ) -> Result<(), agent_client_protocol::Error> {
     let opened_or_failed = |opening: &Opening| {
         if let Ok(mut opening) = opening.lock() {
@@ -719,6 +779,16 @@ async fn open_session(
                     config_options = created.config_options.unwrap_or_default();
                     (created.session_id, Opened::New)
                 }
+                Err(error) if asks_sign_in(&error) => {
+                    opened_or_failed(&opening);
+                    events
+                        .unbounded_send(HostEvent::AuthRequired {
+                            methods,
+                            message: error_words(&error),
+                        })
+                        .ok();
+                    return Ok(());
+                }
                 Err(error) => {
                     opened_or_failed(&opening);
                     events
@@ -776,6 +846,7 @@ async fn open_session(
                 let session_id = session_id.clone();
                 let events = events.clone();
                 let turns = turns.clone();
+                let methods = methods.clone();
                 turns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 connection.spawn(async move {
                     let response = connection_for_turn
@@ -785,6 +856,16 @@ async fn open_session(
                         ))
                         .block_task()
                         .await;
+                    if let Err(error) = &response
+                        && asks_sign_in(error)
+                    {
+                        events
+                            .unbounded_send(HostEvent::AuthRequired {
+                                methods,
+                                message: error_words(error),
+                            })
+                            .ok();
+                    }
                     let stop = response
                         .map(|response| response.stop_reason)
                         .map_err(|error| error.to_string());
@@ -1104,6 +1185,29 @@ mod tests {
     use super::*;
     use agent_client_protocol::schema::v1::{ContentChunk, TextContent};
 
+    /// The methods an agent signs in with itself are offered; one the client would have to run
+    /// in a terminal is not, and the refusal asking for a sign-in is told apart (spec 029).
+    #[test]
+    fn only_the_agents_own_sign_ins_are_offered() {
+        use agent_client_protocol::schema::v1::AuthMethod;
+        let methods: Vec<AuthMethod> = serde_json::from_value(serde_json::json!([
+            {"id": "chatgpt", "name": "Log in with ChatGPT", "description": "Opens a browser"},
+            {"id": "login", "name": "Log in", "type": "terminal", "args": ["--login"]},
+        ]))
+        .unwrap();
+        assert_eq!(
+            auth_choices(&methods),
+            [AuthChoice {
+                id: "chatgpt".into(),
+                name: "Log in with ChatGPT".into(),
+                description: Some("Opens a browser".into()),
+            }]
+        );
+        assert!(asks_sign_in(&agent_client_protocol::Error::auth_required()));
+        assert!(!asks_sign_in(
+            &agent_client_protocol::Error::internal_error()
+        ));
+    }
     /// An agent's error reads as its message and its reason, without the protocol library's
     /// debugging fields: an agent whose program exited before it answered says that, not where
     /// in the library it was noticed.
