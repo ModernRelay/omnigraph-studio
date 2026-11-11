@@ -408,7 +408,9 @@ impl OpenGraphModal {
                 );
                 return places;
             }
-            Some(Start::Local) => return places,
+            // The recipe is one pane with one action (Connect, ↵): the keyboard stays on it, as
+            // it does on the form to add a server.
+            Some(Start::Local) => return Vec::new(),
             None => {}
         }
         match self.shown_plane() {
@@ -495,6 +497,7 @@ impl OpenGraphModal {
         match &place {
             Place::Server(id) => {
                 self.plane_shown = None;
+                self.leave_recipe();
                 self.start = None;
                 if let Some(connection) = self
                     .connections
@@ -559,6 +562,7 @@ impl OpenGraphModal {
     /// Shows the control plane `id` in the pane, with `organization`'s clusters when it names
     /// one, in place of a server's graphs or the form to add one.
     fn show_plane(&mut self, id: EntityId, organization: Option<String>) {
+        self.leave_recipe();
         self.plane_shown = Some((id, organization));
         self.adding = false;
         self.start = None;
@@ -679,6 +683,9 @@ impl OpenGraphModal {
     }
 
     fn show_add(&mut self, adding: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if adding {
+            self.leave_recipe();
+        }
         self.adding = adding;
         if adding {
             self.plane_shown = None;
@@ -701,8 +708,19 @@ impl OpenGraphModal {
             .is_some_and(|registry| registry.read(cx).no_cli().is_some())
     }
 
+    /// Leaves the recipe's pane, if it shows: its wait for the server stops with it, so an
+    /// answer that comes later does not take the dialog from what the person went to.
+    fn leave_recipe(&mut self) {
+        if self.start == Some(Start::Local) {
+            self.waiting = None;
+        }
+    }
+
     /// Shows the start screen at `start`, its first choice under the keyboard.
     pub(crate) fn show_start(&mut self, start: Start, window: &mut Window, cx: &mut Context<Self>) {
+        if start != Start::Local {
+            self.leave_recipe();
+        }
         self.start = Some(start);
         self.adding = false;
         self.plane_shown = None;
@@ -949,6 +967,7 @@ impl OpenGraphModal {
         self.cursor = Some(Place::Server(connection.entity_id()));
         self.choose(Some(connection), window, cx);
         self.adding = false;
+        self.leave_recipe();
         self.start = None;
         self.error = None;
         cx.notify();
@@ -2279,6 +2298,30 @@ mod tests {
         assert_eq!(at(cx).2, Some(Place::Choice(Choice::Local)));
         cx.dispatch_action(menu::Confirm);
         assert_eq!(at(cx).0, Some(Start::Local));
+    }
+
+    /// The keyboard stays on the recipe, and leaving it for anything else stops its wait, so the
+    /// server answering later takes nothing from where the person went.
+    #[gpui::test]
+    fn leaving_the_recipe_stops_its_wait(cx: &mut TestAppContext) {
+        let local = server(&[], cx);
+        let (modal, cx) = dialog(vec![local.clone()], cx);
+        modal.update_in(cx, |modal, window, cx| {
+            modal.show_start(Start::Local, window, cx);
+            modal.waiting = Some(Waiting {
+                connection: local.clone(),
+                gave_up: false,
+                _task: None,
+            });
+        });
+        cx.dispatch_action(menu::SelectNext);
+        assert_eq!(
+            modal.read_with(cx, |modal, _| modal.start),
+            Some(Start::Local),
+            "↓ stays on the recipe"
+        );
+        modal.update_in(cx, |modal, window, cx| modal.show_add(true, window, cx));
+        assert!(modal.read_with(cx, |modal, _| modal.waiting.is_none()));
     }
 
     /// The recipe's wait opens its graph once the server answers, shows the server once it
