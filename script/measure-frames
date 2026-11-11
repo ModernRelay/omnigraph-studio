@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Measure the frames that matter most against the development graph, on the release-fast
 # profile: a key in each kind of field and a table scroll (docs/drawing.md). Prints the main
-# thread's CPU time per frame, median and p95, which a busy machine moves far less than wall
-# time. An instrument, not a gate: compare runs made in the same session.
+# thread's CPU time per frame, median, p95 and mean (the mean still reads where the thread clock
+# ticks coarsely, as gVisor's does in 10 ms), which a busy machine moves far less than wall
+# time, and its allocations per frame, median, which are exact: the same count for the same
+# frame on any machine. Compare times only between runs made in the same session.
 #
 #   script/dev-server &        # once, in another shell
 #   script/measure-frames      # prints one line per case
@@ -51,7 +53,7 @@ cases=(
   "history scroll|studio_graph::OpenHistory|measure:$FRAMES,scroll=40"
 )
 
-printf '%-24s %10s %10s\n' "case" "cpu median" "cpu p95"
+printf '%-24s %10s %10s %10s %13s\n' "case" "cpu median" "cpu p95" "cpu mean" "allocs/frame"
 for ((round = 1; round <= ROUNDS; round++)); do
   for case in "${cases[@]}"; do
     IFS='|' read -r -a parts <<<"$case"
@@ -59,7 +61,9 @@ for ((round = 1; round <= ROUNDS; round++)); do
     line=$("$SNAPSHOT" "$OUT/frame.png" "${parts[@]:1}" 2>&1 | grep '^measure' || true)
     median=$(sed -n 's/.*cpu median \([^,]*\),.*/\1/p' <<<"$line")
     p95=$(sed -n 's/.*cpu median [^,]*, p95 \([^,]*\),.*/\1/p' <<<"$line")
-    printf '%-24s %10s %10s\n' "$name" "${median:-failed}" "${p95:-}"
+    mean=$(sed -n 's/.*cpu median [^|]*, mean \([^ ]*\) |.*/\1/p' <<<"$line")
+    allocs=$(sed -n 's/.*allocs median \([0-9]*\),.*/\1/p' <<<"$line")
+    printf '%-24s %10s %10s %10s %13s\n' "$name" "${median:-failed}" "${p95:-}" "${mean:-}" "${allocs:-}"
   done
 done
 uptime

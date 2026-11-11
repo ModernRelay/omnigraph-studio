@@ -19,12 +19,15 @@
 //! canvas; `scroll=<dx>:<dy>` scrolls sideways too), and `measure:<n>,drag=<dx>:<dy>` drags from the centre by that much a frame (a pan),
 //! both back and forth every 30 frames; `measure:<n>,type` types a letter into the focused
 //! field and takes it back, alternately. Each also prints the main thread's CPU time per
-//! frame, which a busy machine does not inflate. `SNAPSHOT_WAIT_MS` (default 1500) is how
+//! frame, which a busy machine does not inflate, and its allocations per frame, which are
+//! exact on any machine. `SNAPSHOT_WAIT_MS` (default 1500) is how
 //! long to let each step's network work finish; `SNAPSHOT_SIZE` is `WIDTHxHEIGHT` (default
 //! 1440x900). Remembered tabs are not restored unless `OMNIGRAPH_STUDIO_NO_RESTORE=0`. The run
 //! keeps its state in a fresh temporary directory unless `OMNIGRAPH_STUDIO_DATA` names one, so
 //! it neither reads nor writes the app's settings, tabs or conversations.
 
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -33,6 +36,74 @@ use gpui::{
     MouseMoveEvent, MouseUpEvent, PlatformInput, ScrollDelta, ScrollEvent, ScrollSource,
     TouchPhase, point, px, size,
 };
+
+/// The system allocator, counting what each thread asks of it: a frame's allocations are exact
+/// on any machine and in any session, where its CPU time is not. Counted as Zed's
+/// `bench_metrics::CountingAllocator` counts (`crates/bench_metrics/src/bench_metrics.rs` at
+/// v1.27.0): a reallocation is a new allocation, and the counts are `const` thread-locals with
+/// no `Drop`, so counting never allocates and still works while a thread exits.
+// Forked from zed-industries/zed crates/bench_metrics/src/bench_metrics.rs @ c84af5b99cbc
+struct CountingAllocator;
+
+thread_local! {
+    static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
+    static ALLOCATED_BYTES: Cell<u64> = const { Cell::new(0) };
+}
+
+fn count_allocation(size: usize) {
+    // Fails only while the thread exits, when nothing reads its counts.
+    ALLOCATIONS.try_with(|n| n.set(n.get() + 1)).ok();
+    ALLOCATED_BYTES
+        .try_with(|n| n.set(n.get() + size as u64))
+        .ok();
+}
+
+// SAFETY: every method forwards to `System` with the caller's arguments and returns its result;
+// counting never touches the memory.
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: the caller upholds `GlobalAlloc::alloc`'s contract.
+        let pointer = unsafe { System.alloc(layout) };
+        if !pointer.is_null() {
+            count_allocation(layout.size());
+        }
+        pointer
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: the caller upholds `GlobalAlloc::alloc_zeroed`'s contract.
+        let pointer = unsafe { System.alloc_zeroed(layout) };
+        if !pointer.is_null() {
+            count_allocation(layout.size());
+        }
+        pointer
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        // SAFETY: the caller upholds `GlobalAlloc::dealloc`'s contract.
+        unsafe { System.dealloc(pointer, layout) }
+    }
+
+    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // SAFETY: the caller upholds `GlobalAlloc::realloc`'s contract.
+        let pointer = unsafe { System.realloc(pointer, layout, new_size) };
+        if !pointer.is_null() {
+            count_allocation(new_size);
+        }
+        pointer
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+/// The calling thread's allocations and allocated bytes so far.
+fn thread_allocations() -> (u64, u64) {
+    (
+        ALLOCATIONS.try_with(Cell::get).unwrap_or(0),
+        ALLOCATED_BYTES.try_with(Cell::get).unwrap_or(0),
+    )
+}
 
 /// The calling thread's CPU time so far.
 #[cfg(unix)]
@@ -260,12 +331,15 @@ fn main() {
             }
             let mut times = Vec::with_capacity(frames);
             let mut cpu_times = Vec::with_capacity(frames);
+            let mut allocations = Vec::with_capacity(frames);
+            let mut allocated = Vec::with_capacity(frames);
             for frame in 0..frames {
                 // Back and forth every 30 frames, so the view stays where it can be measured.
                 let sign = if (frame / 30) % 2 == 0 { 1. } else { -1. };
                 cx.update_window(handle, |root, window, cx| {
                     let start = Instant::now();
                     let cpu_start = thread_cpu_time();
+                    let (count_start, bytes_start) = thread_allocations();
                     if typing {
                         // Typing into the focused field: a letter, then taking it back.
                         let key = if frame % 2 == 0 { "a" } else { "backspace" };
@@ -304,8 +378,11 @@ fn main() {
                         cx.notify(root.entity_id());
                     }
                     window.draw(cx).clear(cx);
+                    let (count_end, bytes_end) = thread_allocations();
                     times.push(start.elapsed());
                     cpu_times.push(thread_cpu_time() - cpu_start);
+                    allocations.push(count_end - count_start);
+                    allocated.push(bytes_end - bytes_start);
                 })
                 .expect("draw a frame");
             }
@@ -325,7 +402,14 @@ fn main() {
             }
             times.sort();
             cpu_times.sort();
+            allocations.sort();
+            allocated.sort();
             let at = |times: &[Duration], q: f32| times[((times.len() - 1) as f32 * q) as usize];
+            let count_at =
+                |counts: &[u64], q: f32| counts[((counts.len() - 1) as f32 * q) as usize];
+            // A clock that ticks coarsely (10 ms under gVisor) reads most frames as 0 or one
+            // tick, so the median says little there; the mean over many frames still does.
+            let cpu_mean = cpu_times.iter().sum::<Duration>() / frames.max(1) as u32;
             let kind = match (typing, scroll, drag, refresh) {
                 (true, _, _, _) => " (type)",
                 (_, Some(_), _, _) => " (scroll)",
@@ -334,9 +418,10 @@ fn main() {
                 _ => "",
             };
             // Wall time is what a frame took; the main thread's CPU time is the work in it,
-            // which other processes on a busy machine do not inflate.
+            // which other processes on a busy machine do not inflate; its allocations are
+            // exact, the same on any machine for the same frame.
             eprintln!(
-                "measure{kind}: {frames} frames, median {:.2?}, p90 {:.2?}, p95 {:.2?}, p99 {:.2?}, max {:.2?} | cpu median {:.2?}, p95 {:.2?}, p99 {:.2?}",
+                "measure{kind}: {frames} frames, median {:.2?}, p90 {:.2?}, p95 {:.2?}, p99 {:.2?}, max {:.2?} | cpu median {:.2?}, p95 {:.2?}, p99 {:.2?}, mean {:.2?} | allocs median {}, p95 {}, max {}, bytes median {}",
                 at(&times, 0.5),
                 at(&times, 0.9),
                 at(&times, 0.95),
@@ -345,6 +430,11 @@ fn main() {
                 at(&cpu_times, 0.5),
                 at(&cpu_times, 0.95),
                 at(&cpu_times, 0.99),
+                cpu_mean,
+                count_at(&allocations, 0.5),
+                count_at(&allocations, 0.95),
+                count_at(&allocations, 1.),
+                count_at(&allocated, 0.5),
             );
             continue;
         }

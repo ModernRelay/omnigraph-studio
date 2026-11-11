@@ -99,8 +99,12 @@ footer, and a build with `--features perf` (GPUI's `profiler`) has GPUI's frame-
 
 `crates/studio/examples/snapshot.rs` draws Studio offscreen against a server and measures frames:
 `measure:<n>` with `,type` (a key into the focused field), `,scroll=<dy>` (`,scroll=<dx>:<dy>` sideways) or `,drag=<dx>:<dy>`.
-It prints wall time and the main thread's CPU time per frame; compare CPU times, in the same
-session, on the `release-fast` profile:
+It prints wall time, the main thread's CPU time and the main thread's allocations per frame.
+Compare CPU times only in the same session, on the `release-fast` profile. Allocations are
+counted, not timed (the example's global allocator counts each thread's, as Zed's
+`bench_metrics::CountingAllocator` does), so they are the same for the same frame on any
+machine: the number to compare across sessions and machines, and the one that shows what a
+change to a frame's elements saved where a time cannot.
 
 ```bash
 cargo build --profile release-fast -p studio --example snapshot
