@@ -961,8 +961,19 @@ than styling one-off elements.
 
 ### Motion
 
-Palette, J/K, cell cursor and tab switches never animate. Dialogs and peeks enter with a
+Palette, J/K, cell cursor and tab switches never animate. Dialogs and toasts come up with a
 120–180 ms ease-out and leave faster. Reduced motion keeps fades only.
+
+- **A dialog** (`ModalPlacement::Dialog`): its dim and card fade in over `motion::ENTER`
+  (150 ms, out-cubic) as the card settles 6 px down into place. Focus is in it from the first
+  frame, so typing never waits. It goes in one frame. The palette opens and closes in one.
+- **A toast**: slides 8 px in from the right edge it sits on as it fades in, over `ENTER`.
+  Dismissed or run out, it is off the stack at once but fades where it was, drifting 4 px
+  right, over `motion::LEAVE` (100 ms); then the toasts below close up. One taken to make room
+  or folded goes at once, since another takes its place.
+- **Not the peek.** It follows the selection, so it would move on every row the cursor reaches.
+- A fade is drawn whole each frame: a cached view inside one whose place does not change would
+  keep the opacity of its first frame. Neither a dialog nor a toast holds one.
 
 ## Decisions
 
@@ -1124,6 +1135,7 @@ opens a link from inside Studio.
 | 2026-10-21 | Property rows and control chips are design-system parts | `studio_ui` `property_and_control_parts_draw_at_their_sizes` (a property row 32 px, its boxed value 22, a switch and a wrapping list's first line level with the label, a chip 26 with its button centred, the "+" a value's height); clippy `-D warnings`; design tokens; offscreen snapshots of the Design system tab (1440 px wide at 2×, light and dark) | The gallery's inspector card shows boxed values, a long email cut at its box's end, a switch, a list of tags wrapping under its first line with its "+", a relationship's neighbours with their type marks, and a fold; its chips row reads Views, "Columns 3 hidden ×", "Sort name ×", "Filters 2 ×" and Row beside a filter pill, the value in the accent in both themes. The switch first sat 7 px high, outside a property value |
 | 2026-10-21 | The palette, the agent's composer and the type table follow the three reference frames on the design system | Offscreen snapshots (1440×900 at 2×) against a scratch dev server, light, dark and glass, before and after, cropped at 2× beside the references; `studio_ui` `key_caps_are_one_box_per_key`, `a_row_knows_its_place_in_its_panel`, `controls_draw_at_their_sizes` (a tile, a segment and the grid's cells at their tokens), `values_pick_their_kind_icon`; `command_palette` `rows_are_grouped_by_kind_until_text_is_typed`; `agent_panel` `a_querys_rows_are_read_from_what_its_call_returned`, `a_tool_call_keeps_the_result_its_agent_reported`, `a_turn_ends_at_its_last_reply` | The palette is a tray of inset panels, its groups named while nothing is typed and counted once text is, rows led by tiles with their keys as caps; the inset panels' corners stayed square until each end was drawn as tall as its corner (GPUI clamps a corner to half its box). The type table's header was 42 px under Zed's padding; Studio's own header row is 30. In a dark theme a darker header fill did not show, so the header takes the well's ink |
 | 2026-10-22 | About shows Studio's icon, name, version and licence, once, and closes as a Mac panel does | `studio` `about::tests` (the version line, one window however often asked, the four parts drawn, `menu::Cancel` and `CloseActiveItem` closing it) and the keymap test; the debug build opened from its app menu with System Events, captured with `screencapture -l`, then Escape, Cmd-W and File → Close Tab sent, and its windows listed through Accessibility | 5 passed. The window showed the icon, "Omnigraph Studio", "Version 0.2.1" and the two notice lines, minimize and zoom greyed; each of Escape, Cmd-W and Close Tab left only the main window. A first check counted the closed window still open: `CGWindowListCopyWindowInfo` with `optionAll` lists windows off screen too |
+| 2026-11-10 | Dialogs and toasts come up and toasts go as Motion says; the palette never moves | `studio_workspace` `a_toast_that_goes_fades_where_it_was_then_is_gone` (off the stack at once, drawn in its place while it fades, then gone; one run out the same), `motion` `what_comes_up_arrives_within_spec_002s_window_and_goes_faster`; the workspace and `studio_ui` suites | Pass. The motion itself is checked by eye in the running app, not by a test |
 
 ## Corrections
 

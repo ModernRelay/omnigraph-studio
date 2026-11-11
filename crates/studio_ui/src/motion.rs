@@ -16,6 +16,20 @@ use gpui::{App, Window};
 /// How long a change of place takes: long enough to follow, short enough not to wait for.
 pub const GLIDE: Duration = Duration::from_millis(220);
 
+/// How long something that comes up over the work (a dialog, a toast) takes to arrive: inside
+/// the 120–180 ms of spec 002, so the eye catches where it lands and nothing waits on it.
+pub const ENTER: Duration = Duration::from_millis(150);
+
+/// How long a toast takes to go: faster than it came, since the person is done with it.
+pub const LEAVE: Duration = Duration::from_millis(100);
+
+/// An entrance or exit over `duration`, eased as things arriving. For an element that is
+/// drawn whole each frame: a cached view inside one whose place does not change is drawn
+/// again only when it notifies, so it would keep the opacity of its first frame.
+pub fn arrival(duration: Duration) -> gpui::Animation {
+    gpui::Animation::new(duration).with_easing(|t| Ease::OutCubic.apply(t))
+}
+
 /// How far apart a live dot's beats are ([`crate::ds::live_dot`]): each sends one ring out
 /// from the dot, and between rings nothing is drawn.
 pub const PULSE: Duration = Duration::from_millis(3000);
@@ -161,6 +175,13 @@ mod tests {
         assert!(reach > 0.8 && (seen - 0.5).abs() < 1e-6);
         // A beat's ring is over well before the next beat.
         assert!(PULSE_RING * 3 <= PULSE);
+    }
+
+    #[test]
+    fn what_comes_up_arrives_within_spec_002s_window_and_goes_faster() {
+        let ms = |d: Duration| d.as_millis();
+        assert!((120..=180).contains(&ms(ENTER)));
+        assert!(LEAVE < ENTER);
     }
 
     #[test]
