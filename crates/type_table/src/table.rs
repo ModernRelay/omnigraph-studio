@@ -313,12 +313,17 @@ struct BlobSent {
     bound_at: Option<String>,
 }
 
-/// A grouped section's read under way: how many rows it asks for, which a read dropped away
-/// from the view asks for again when its line is drawn, and the read itself.
+/// A grouped section's read under way. It is never dropped while the sections stand: one that
+/// reached the server would be read again for nothing when its line came back.
 struct SectionRead {
-    rows: u32,
     _task: Task<()>,
 }
+
+/// How many section reads a grouped table has out at once. Below the connection's eight
+/// (`graph_client::READ_CONCURRENCY`), so the counts, relationship cells and Blob values of the
+/// lines in view never wait behind sections the view scrolled past; a read asked for past it
+/// waits for its line to be drawn again with a read back ([`TypeTable::owed_sections`]).
+const SECTION_READS_OUT: usize = 3;
 
 /// A bulk set: the property, what came of the last try, and the rows picked when the one out
 /// was sent. Clearing the pick leaves a set out as it is: its outcome is shown, and a set that
@@ -1162,10 +1167,13 @@ pub struct TypeTable {
     page_task: Option<Task<()>>,
     /// Each grouped section's read under way, by the section's index: a reload drops them.
     section_tasks: HashMap<usize, SectionRead>,
-    /// Section reads dropped away from the view ([`Self::drop_section_reads_away_from`]), by
-    /// the section's index, with how many rows each asked for: asked for again when the
-    /// section's read line is drawn, a first read and a "Show more" alike.
-    dropped_sections: HashMap<usize, u32>,
+    /// Section reads asked for while [`SECTION_READS_OUT`] were out, by the section's index,
+    /// with how many rows each asks for: sent when the section's read line is next drawn with a
+    /// read back, a first read and a "Show more" alike, so one whose line went by is never sent.
+    owed_sections: HashMap<usize, u32>,
+    /// The most section reads out at once so far.
+    #[cfg(test)]
+    most_section_reads_out: usize,
     /// How many of the table's own writes moved its pin ([`Self::follow_own_commit`]). A read
     /// out when one landed answers for the commit before it and is read again; the pin carried
     /// forward to a head that changed nothing the table reads ([`ScopeSince::Unchanged`])
@@ -1531,7 +1539,9 @@ impl TypeTable {
             table_state,
             page_task: None,
             section_tasks: HashMap::new(),
-            dropped_sections: HashMap::new(),
+            owed_sections: HashMap::new(),
+            #[cfg(test)]
+            most_section_reads_out: 0,
             own_writes: 0,
             count_task: None,
             total_task: None,
@@ -3745,7 +3755,7 @@ impl TypeTable {
         // path and a query that cannot be built start none of their own.
         self.page_task = None;
         self.section_tasks.clear();
-        self.dropped_sections.clear();
+        self.owed_sections.clear();
         self.count_task = None;
         self.total_task = None;
         if !swap {
@@ -4164,7 +4174,7 @@ impl TypeTable {
         let generation = grouping.restart();
         let property = grouping.property.clone();
         // The sections are read again, and with them which reads are owed.
-        self.dropped_sections.clear();
+        self.owed_sections.clear();
         // At a commit made before a property was added or renamed, the groups are counted
         // without filters on it, as the rows are read; one asking for a value matches no row.
         let without: Vec<String> = self.absent.keys().cloned().collect();
@@ -4330,9 +4340,15 @@ impl TypeTable {
     }
 
     /// Reads the next rows of one section: its first few when it shows, a page on "Show more".
-    /// A read of it dropped away from the view is owed no more once another is asked for.
+    /// With [`SECTION_READS_OUT`] out, the read is owed to its line instead, and sent when the
+    /// line is drawn with a read back.
     fn load_section(&mut self, index: usize, size: u32, cx: &mut Context<Self>) {
-        self.dropped_sections.remove(&index);
+        if self.section_tasks.len() >= SECTION_READS_OUT && !self.section_tasks.contains_key(&index)
+        {
+            self.owed_sections.insert(index, size);
+            return;
+        }
+        self.owed_sections.remove(&index);
         let Some(grouping) = &self.grouping else {
             return;
         };
@@ -4387,13 +4403,12 @@ impl TypeTable {
             })
             .ok();
         });
-        self.section_tasks.insert(
-            index,
-            SectionRead {
-                rows: size,
-                _task: task,
-            },
-        );
+        self.section_tasks
+            .insert(index, SectionRead { _task: task });
+        #[cfg(test)]
+        {
+            self.most_section_reads_out = self.most_section_reads_out.max(self.section_tasks.len());
+        }
         cx.notify();
     }
 
@@ -4819,8 +4834,8 @@ impl TypeTable {
     }
 
     /// Once the frame being drawn is out, asks for what its last lines drawn need: their rows'
-    /// relationships and Blob cells, and of the section reads out, only those near them. Else
-    /// the line the list measures, asked for in between, would make every frame ask again.
+    /// relationships and Blob cells. Else the line the list measures, asked for in between,
+    /// would make every frame ask again.
     fn drawn(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if std::mem::replace(&mut self.frame_due, true) {
             return;
@@ -4832,8 +4847,7 @@ impl TypeTable {
             }
             if let Some(lines) = this.frame_line_range.take() {
                 this.want_row_relations(lines.clone(), window, cx);
-                this.want_blob_metas(lines.clone(), cx);
-                this.drop_section_reads_away_from(lines);
+                this.want_blob_metas(lines, cx);
             }
         });
     }
@@ -10163,7 +10177,7 @@ impl TypeTable {
                     };
                     let shown: Vec<Line> = lines.slice(range).collect();
                     // An open section reads its first rows when its read line comes into view,
-                    // and a read dropped while its line was away reads again as it returns.
+                    // and a read owed while the section reads were full goes once one is back.
                     for line in &shown {
                         if let Line::More(index) = *line
                             && let Some(rows) = this.section_read_owed(index)
@@ -10395,7 +10409,9 @@ impl TypeTable {
             return Vec::new();
         };
         let page = self.page_size(cx);
-        let content: AnyElement = if section.loading {
+        // A read owed while the section reads are full reads as one under way: it goes as soon
+        // as one is back, and a second click would ask for nothing more.
+        let content: AnyElement = if section.loading || self.owed_sections.contains_key(&index) {
             studio_ui::ds::text::meta("Reading…").into_any_element()
         } else if let Some(error) = &section.error {
             h_flex()
@@ -10596,53 +10612,15 @@ impl TypeTable {
         }
     }
 
-    /// Drops the section reads whose read line is more than a screen from the lines drawn
-    /// (`lines`): reads share a connection's few slots, so one scrolled past would keep those of
-    /// the sections in view waiting. Its section reads as many rows again when its line comes
-    /// back ([`Self::dropped_sections`]), a "Show more" as a first read does.
-    fn drop_section_reads_away_from(&mut self, lines: Range<usize>) {
-        if self.section_tasks.is_empty() {
-            return;
-        }
-        let Some(grouping) = self.grouping.as_mut() else {
-            return;
-        };
-        let screen = lines.len().max(1);
-        let near = lines.start.saturating_sub(screen)..lines.end + screen;
-        let kept: HashSet<usize> = grouping
-            .line_map()
-            .slice(near)
-            .filter_map(|line| match line {
-                Line::More(index) => Some(index),
-                _ => None,
-            })
-            .collect();
-        let away: Vec<usize> = self
-            .section_tasks
-            .keys()
-            .filter(|index| !kept.contains(index))
-            .copied()
-            .collect();
-        for index in away {
-            if let Some(read) = self.section_tasks.remove(&index) {
-                self.dropped_sections.insert(index, read.rows);
-            }
-            if let Some(section) = grouping.section_mut(index) {
-                section.loading = false;
-            }
-        }
-    }
-
-    /// How many rows section `index`'s read line asks for as it is drawn: a read dropped away
-    /// from the view asks for as many as it did, and an open section with no rows read its
-    /// first few. `None` while a read is out, after one failed (Retry asks), and for a section
+    /// How many rows section `index`'s read line asks for as it is drawn: a read owed asks for
+    /// as many as it was asked for, and an open section with no rows reads its first few. `None` while a read is out, after one failed (Retry asks), and for a section
     /// whose next rows are asked for by "Show more".
     fn section_read_owed(&self, index: usize) -> Option<u32> {
         let section = self.grouping.as_ref()?.sections().get(index)?;
         if section.loading || section.error.is_some() {
             return None;
         }
-        match self.dropped_sections.get(&index) {
+        match self.owed_sections.get(&index) {
             Some(&rows) => Some(rows),
             None if section.range.is_empty() => Some(SECTION_FIRST_PAGE),
             None => None,
@@ -18226,13 +18204,10 @@ mod tests {
         assert_eq!(height, drawn);
     }
 
-    /// Grouped, a section's read whose line is more than a screen away is dropped, freeing
-    /// its slot for the lines in view, and reads again when its line comes back; rows a read
-    /// puts in above the lines in view leave those lines where they are (constitution V).
+    /// Grouped, rows a section's read puts in above the lines in view leave those lines where
+    /// they are (constitution V).
     #[gpui::test]
-    async fn section_reads_away_from_the_view_are_dropped_and_rows_above_it_move_nothing(
-        cx: &mut TestAppContext,
-    ) {
+    async fn rows_a_section_read_puts_above_the_view_move_nothing(cx: &mut TestAppContext) {
         let session = session(PEOPLE, cx);
         let (table, cx) = people_table(&session, cx);
         let page = |rows: Value| -> Result<ReadOutput, ReadError> {
@@ -18273,28 +18248,6 @@ mod tests {
                 table.first_line_in_view(cx).map(|(line, _)| line),
                 Some(Line::Header(20))
             );
-
-            // Section 0's read is far above the lines drawn; section 21's is in view.
-            for index in [0, 21] {
-                let read = SectionRead {
-                    rows: SECTION_FIRST_PAGE,
-                    _task: Task::ready(()),
-                };
-                table.section_tasks.insert(index, read);
-                table
-                    .grouping
-                    .as_mut()
-                    .unwrap()
-                    .section_mut(index)
-                    .unwrap()
-                    .loading = true;
-            }
-            table.drop_section_reads_away_from(40..60);
-            let loading = |table: &TypeTable, index: usize| {
-                table.grouping.as_ref().unwrap().sections()[index].loading
-            };
-            assert!(!table.section_tasks.contains_key(&0) && !loading(table, 0));
-            assert!(table.section_tasks.contains_key(&21) && loading(table, 21));
 
             // Section 0's rows land above the view: the scroll moves with them.
             let rows = serde_json::json!([
@@ -18533,12 +18486,13 @@ mod tests {
         });
     }
 
-    /// A section's "Show more" read dropped while its line was a screen away is asked for again
-    /// when its line is drawn, for as many rows as it asked for, as a section's first read is.
-    /// Before, only a section with no rows read again, and the dropped page never came. The
-    /// read is the one Show more sends, and the view moves away before it is answered.
+    /// A section's read out when its line goes by is not dropped: it lands, its rows stay,
+    /// and the line coming back asks for nothing more. Before (2026-11-11), the read was dropped
+    /// a screen away and sent again as the line returned, so scrolling a grouped table back and
+    /// forth sent each section's read again every pass (63 reads for one pass on the people by
+    /// company table). The read is the one Show more sends.
     #[gpui::test]
-    async fn a_show_more_dropped_away_from_the_view_reads_again_when_its_line_returns(
+    async fn a_section_read_out_as_its_line_goes_by_lands_and_is_not_sent_again(
         cx: &mut TestAppContext,
     ) {
         let pages = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
@@ -18598,12 +18552,10 @@ mod tests {
         };
 
         // Show more asks for a page, as its button does; before it is answered the view
-        // scrolls to the end, where the read line (line 3) is far above the lines drawn. The
-        // frame drawn as the update ends drops the read.
+        // scrolls to the end, where the read line (line 3) is far above the lines drawn.
         table.update(cx, |table, cx| {
             table.load_section(0, page, cx);
             assert!(table.section_tasks.contains_key(&0), "the read is out");
-            assert!(table.grouping.as_ref().unwrap().sections()[0].loading);
             scroll(150., table, cx);
         });
         table.read_with(cx, |table, _| {
@@ -18612,31 +18564,76 @@ mod tests {
                 drawn.start > 3 + drawn.len(),
                 "a screen from line 3: {drawn:?}"
             );
-            assert!(!table.section_tasks.contains_key(&0));
-            assert_eq!(table.dropped_sections.get(&0), Some(&page));
-            assert!(!table.grouping.as_ref().unwrap().sections()[0].loading);
+            assert!(table.section_tasks.contains_key(&0), "still out");
         });
-        // The dropped read may have reached the server before it stopped; a frame away from
-        // the line asks for nothing more.
         cx.run_until_parked();
-        pages.lock().unwrap().clear();
-        table.update(cx, |table, cx| scroll(149., table, cx));
-        cx.run_until_parked();
-        assert!(pages.lock().unwrap().is_empty());
-        table.read_with(cx, |table, _| {
-            assert_eq!(table.dropped_sections.get(&0), Some(&page))
-        });
-
-        // Scrolled back, its line is drawn and the page is asked for again.
-        table.update(cx, |table, cx| scroll(0., table, cx));
-        cx.run_until_parked();
+        // Back and forth: the read went once, and no pass sends it again.
+        for line in [0., 150., 0.] {
+            table.update(cx, |table, cx| scroll(line, table, cx));
+            cx.run_until_parked();
+        }
         let pages = pages.lock().unwrap().clone();
         assert_eq!(pages.len(), 1, "{pages:?}");
         let query = pages[0]["query"].as_str().unwrap_or_default();
         assert!(query.contains(&format!("limit {page}")), "{query}");
-        assert!(pages[0]["params"].to_string().contains("v000"), "{pages:?}");
         table.read_with(cx, |table, _| {
-            assert!(table.dropped_sections.is_empty());
+            assert!(table.section_tasks.is_empty() && table.owed_sections.is_empty());
         });
+    }
+
+    /// A grouped table has at most [`SECTION_READS_OUT`] section reads out, and the sections
+    /// in view past them read as reads come back, each once.
+    #[gpui::test]
+    async fn a_grouped_table_reads_a_few_sections_at_a_time_each_once(cx: &mut TestAppContext) {
+        let pages = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let seen = pages.clone();
+        let (session, _) = crate::test_support::session_routing(
+            PEOPLE,
+            move |request| {
+                if request["name"] == "studio_page" {
+                    seen.lock().unwrap().push(request.clone());
+                }
+                serde_json::json!([])
+            },
+            cx,
+        );
+        let (table, cx) = people_table(&session, cx);
+        table.update(cx, |table, cx| {
+            table.rows.clear();
+            let mut grouping = Grouping::new("name");
+            grouping.restart();
+            let values: Vec<Value> = (0..40)
+                .map(|i| serde_json::json!({"value": format!("v{i:02}"), "n": 3}))
+                .collect();
+            let counts: ReadOutput = serde_json::from_value(serde_json::json!({
+                "query_name": "studio_value_counts",
+                "target": {"branch": "main"},
+                "row_count": values.len(),
+                "columns": ["value", "n"],
+                "rows": values,
+            }))
+            .unwrap();
+            grouping.accept_counts(&counts, GROUP_LIMIT);
+            table.grouping = Some(grouping);
+            table.lines_moved();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert_eq!(table.most_section_reads_out, SECTION_READS_OUT);
+            assert!(table.section_tasks.is_empty() && table.owed_sections.is_empty());
+        });
+        let mut values: Vec<String> = pages
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|page| page["params"].to_string())
+            .collect();
+        let sent = values.len();
+        values.sort();
+        values.dedup();
+        assert_eq!(values.len(), sent, "each section read once");
+        // More sections came into view than may read at once, and every one of them read.
+        assert!(sent > SECTION_READS_OUT, "{sent}");
     }
 }
