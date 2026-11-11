@@ -233,6 +233,11 @@ struct RowLook {
 }
 
 /// How long scrolling must pause before the drawn rows' Blob cells are read.
+/// The most rows a table reads again on its own when its branch moves (spec 028), as a multiple
+/// of the graph's page size: past it, a long scroll would cost a large read every head poll, so
+/// the table offers Refresh instead.
+const LIVE_PAGES: u32 = 4;
+
 const BLOB_READ_AFTER: Duration = Duration::from_millis(120);
 /// How many Blob cells a table reads at once: the reads share the connection's few slots with
 /// the table's pages, relationships and counts, and with every other view's reads.
@@ -1159,6 +1164,10 @@ pub struct TypeTable {
     /// The rows are read when the table is next drawn ([`Self::owe_reload`]): a table behind
     /// another tab reads nothing when it is restored, nor when the branch or the schema moves.
     rows_owed: bool,
+    /// The table in front follows its branch (spec 028): the head it last read again for on its
+    /// own, so a read that failed is not sent again until the head moves; and that read.
+    live_tried: Option<String>,
+    live_task: Option<Task<()>>,
     /// What the branch changed in this type's rows against its target, once read
     /// ([`Self::read_diff`]); `None` on the target, at a commit, and until the read lands.
     diff: Option<Arc<BranchDiff>>,
@@ -1382,6 +1391,13 @@ impl TypeTable {
                 }
             }),
             cx.subscribe_in(&session, window, Self::on_session_event),
+            // A table behind its branch in a window that was not active follows it once the
+            // window is (spec 028): it is drawn again to ask.
+            cx.observe_window_activation(window, |this, window, cx| {
+                if this.newer && window.is_window_active() {
+                    cx.notify();
+                }
+            }),
             cx.subscribe(
                 &filter_editor,
                 |this, _, event: &EditorEvent, cx| match event {
@@ -1502,6 +1518,8 @@ impl TypeTable {
             total_task: None,
             count_shift: None,
             rows_owed: false,
+            live_tried: None,
+            live_task: None,
             diff: None,
             diff_owed: true,
             diff_task: None,
@@ -3630,6 +3648,14 @@ impl TypeTable {
     /// ([`Self::reload`]); `false` when there is nothing to read (no schema yet, or the type is
     /// gone).
     fn forget_rows(&mut self, keep_pin: bool, cx: &mut Context<Self>) -> bool {
+        self.clear_rows(keep_pin, false, cx)
+    }
+
+    /// [`Self::forget_rows`]; with `swap`, for rows read at the head that land in this frame
+    /// ([`Self::take_head`]): the place, the counts and what the branch changed stay shown
+    /// until their own reads replace them, and what the old rows were read for stays in the
+    /// scope beside what the new ones were (more than the view shows, never less).
+    fn clear_rows(&mut self, keep_pin: bool, swap: bool, cx: &mut Context<Self>) -> bool {
         if self.schema.is_none() || self.missing {
             return false;
         }
@@ -3639,7 +3665,7 @@ impl TypeTable {
             // Another commit, or another schema: what it holds is found out again, and what it
             // shows is read again.
             self.absent.clear();
-            if let Some(scope) = &self.scope {
+            if let Some(scope) = self.scope.as_ref().filter(|_| !swap) {
                 let branch = self.branch.clone();
                 self.session
                     .update(cx, |session, _| session.reset_scope(scope, &branch));
@@ -3649,10 +3675,12 @@ impl TypeTable {
             self.paging.pinned = self.at_commit.clone();
             self.count_shift = None;
             self.newer = false;
-            // What the branch changed is read again with the rows.
-            self.diff = None;
+            // What the branch changed is read again with the rows; a swap brings its own.
+            if !swap {
+                self.diff = None;
+                self.diff_owed = true;
+            }
             self.diff_task = None;
-            self.diff_owed = true;
             cx.emit(ItemEvent::UpdateTab);
         }
         // An edit open over the rows read before is kept as its cell's draft, as leaving the
@@ -3672,21 +3700,25 @@ impl TypeTable {
         self.lines_moved();
         // The view scrolls back to its first line (below): until a frame draws it, the rows
         // near the lines drawn, and how far the next page is ahead of them, are judged there.
-        self.lines_drawn = 0..0;
+        if !swap {
+            self.lines_drawn = 0..0;
+            self.cursor = None;
+        }
         self._blob_wait = None;
-        self.cursor = None;
         // Picked rows stay picked by id; the row a range starts from is a place in the old
         // order.
         self.selection_anchor = None;
         self.loading_more = false;
         self.more_error = None;
         self.first_page = Loadable::Loading;
-        self.count = Loadable::Loading;
-        self.total = if self.filters.is_empty() {
-            Loadable::NotLoaded
-        } else {
-            Loadable::Loading
-        };
+        if !swap {
+            self.count = Loadable::Loading;
+            self.total = if self.filters.is_empty() {
+                Loadable::NotLoaded
+            } else {
+                Loadable::Loading
+            };
+        }
         // A page or section read for what the table showed before must not land: the grouped
         // path and a query that cannot be built start none of their own.
         self.page_task = None;
@@ -3694,10 +3726,12 @@ impl TypeTable {
         self.dropped_sections.clear();
         self.count_task = None;
         self.total_task = None;
-        self.table_state
-            .read(cx)
-            .scroll_handle
-            .scroll_to_item(0, ScrollStrategy::Top);
+        if !swap {
+            self.table_state
+                .read(cx)
+                .scroll_handle
+                .scroll_to_item(0, ScrollStrategy::Top);
+        }
         true
     }
 
@@ -5216,6 +5250,148 @@ impl TypeTable {
                 cx.notify();
             }
         }
+    }
+
+    /// Whether the table may take its branch's head itself (spec 028, constitution II): it
+    /// follows the branch, shows its rows ungrouped, and holds nothing of the person's: no
+    /// edit, fill, draft or write out, no file being stored. A table whose schema moved, or
+    /// that has read more than [`LIVE_PAGES`], offers Refresh instead.
+    fn follows_live(&self, cx: &App) -> bool {
+        let schema_moved = match (&self.schema, self.session.read(cx).schema_model()) {
+            (Some(shown), Some(held)) => shown.source != held.source,
+            _ => true,
+        };
+        self.at_commit.is_none()
+            && self.grouping.is_none()
+            && self.editing.is_none()
+            && self.fill.is_none()
+            && self.saves_in_flight == 0
+            && self.cells.is_empty()
+            && !self.blob_edits.values().any(|edit| edit.is_saving())
+            && !self.loading_more
+            && !self.missing
+            && !schema_moved
+            && matches!(self.first_page, Loadable::Loaded(()))
+            && self.rows.len() <= (LIVE_PAGES * self.page_size(cx)) as usize
+    }
+
+    /// Reads, at the branch head, as many rows as the table shows, with what the branch
+    /// changed, while the rows it shows stay; they are taken in one frame when both are in
+    /// ([`Self::take_head`]). A read that fails leaves the table offering Refresh, and is not
+    /// sent again until the head moves.
+    fn follow_head(&mut self, cx: &mut Context<Self>) {
+        if !self.newer || self.live_task.is_some() || !self.follows_live(cx) {
+            return;
+        }
+        let Some(head) = self.session.read(cx).head(&self.branch).map(str::to_owned) else {
+            return;
+        };
+        if self.live_tried.as_ref() == Some(&head) || self.paging.pinned.as_ref() == Some(&head) {
+            return;
+        }
+        self.live_tried = Some(head.clone());
+        let base = self.page_size(cx);
+        let size = (self.rows.len() as u32).max(base.saturating_mul(2));
+        let Ok(query) = self.page_query(&PageStart::First, size, None) else {
+            return;
+        };
+        let read = self.read_shown(&query, Some(head), cx);
+        let diff = (self.branch != TARGET).then(|| {
+            let (session, branch) = (self.session.clone(), self.branch.clone());
+            let (kind, type_name) = (self.entity_kind(), self.type_name.clone());
+            (session, branch, kind, type_name)
+        });
+        let (sent, pin, branch) = (
+            self.own_writes,
+            self.paging.pinned.clone(),
+            self.branch.clone(),
+        );
+        self.live_task = Some(cx.spawn(async move |this, cx| {
+            let page = read.await;
+            let diff = match diff {
+                Some((session, branch, kind, type_name)) => {
+                    let folded = read_branch_diff(&session, &branch, cx).await;
+                    let diff = cx
+                        .background_executor()
+                        .spawn(async move {
+                            folded.map(|folded| BranchDiff::of(&folded, kind, &type_name))
+                        })
+                        .await;
+                    Some(diff)
+                }
+                None => None,
+            };
+            this.update(cx, |this, cx| {
+                this.live_task = None;
+                // Anything the person did meanwhile, a Refresh, a write or a move to another
+                // branch, keeps what it made: this read answers for the table as it was.
+                let unchanged = this.newer
+                    && this.own_writes == sent
+                    && this.paging.pinned == pin
+                    && this.branch == branch
+                    && this.follows_live(cx);
+                if let (Ok(output), true) = (page, unchanged) {
+                    this.take_head(output, diff, size, cx);
+                }
+            })
+            .ok();
+        }));
+    }
+
+    /// Takes rows read at the head in one frame, keeping the person's place (constitution V):
+    /// the cursor stays on its row, or on the row now in its place, and the first row in view
+    /// stays first while it is still there. Rows another writer removed go, as on Refresh.
+    fn take_head(
+        &mut self,
+        output: ReadOutput,
+        diff: Option<Option<BranchDiff>>,
+        size: u32,
+        cx: &mut Context<Self>,
+    ) {
+        let on = self
+            .cursor
+            .and_then(|cursor| Some((self.rows.get(cursor.row)?.id.clone(), cursor)));
+        let scroll = self.table_state.read(cx).scroll_handle.clone();
+        let (offset, row_height) = {
+            let state = scroll.0.borrow();
+            let height = state.last_item_size.map(|size| size.item.height);
+            (state.base_handle.offset(), height)
+        };
+        let first_shown = row_height
+            .filter(|height| *height > px(0.))
+            .map(|height| ((-offset.y) / height).floor().max(0.) as usize);
+        let first = first_shown.and_then(|ix| Some((ix, self.rows.get(ix)?.id.clone())));
+        if !self.clear_rows(false, true, cx) {
+            return;
+        }
+        if let Some(diff) = diff {
+            self.diff = diff.map(Arc::new);
+        }
+        self.apply_page(Ok(output), Some(false), size, cx);
+        if let Some((id, cursor)) = on {
+            let row = self
+                .rows
+                .iter()
+                .position(|row| row.id == id)
+                .unwrap_or(cursor.row);
+            self.cursor = (!self.rows.is_empty()).then(|| Cursor {
+                row: row.min(self.rows.len() - 1),
+                col: cursor.col,
+            });
+        }
+        if let (Some((was, id)), Some(height)) = (first, row_height)
+            && let Some(now) = self.rows.iter().position(|row| row.id == id)
+        {
+            let moved = now as f32 - was as f32;
+            scroll
+                .0
+                .borrow()
+                .base_handle
+                .set_offset(point(offset.x, offset.y - height * moved));
+        }
+        // The head may have moved again while the rows were read.
+        self.compare_head(cx);
+        cx.notify();
     }
 
     /// A write on the table's behalf is going out (a dialog's insert or delete).
@@ -11696,6 +11872,10 @@ impl Render for TypeTable {
         if std::mem::take(&mut self.rows_owed) {
             cx.defer_in(window, |this, _, cx| this.read_rows(cx));
         }
+        // Drawn behind its branch with its window active: the table reads the head itself.
+        if self.newer && self.live_task.is_none() && window.is_window_active() {
+            cx.defer_in(window, |this, _, cx| this.follow_head(cx));
+        }
         // An edit taken from the cell (a reload kept it as a draft) leaves the cell editor
         // focused but no longer drawn: the keys come back to the table.
         if self.editing.is_none()
@@ -12543,6 +12723,99 @@ mod tests {
         table.read_with(cx, |table, _| {
             assert_eq!(table.paging.pinned.as_deref(), Some("c2"));
             assert!(table.newer, "a person changed");
+        });
+    }
+
+    /// The table in front takes its branch's head itself when a commit changes what it shows
+    /// (spec 028), keeping the cursor on its row; behind another window it waits, offering
+    /// Refresh, and follows once its window is active. One holding the person's edit does not.
+    #[gpui::test]
+    async fn the_table_in_front_takes_its_branchs_head_keeping_its_place(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let newer = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let serves_newer = newer.clone();
+        let (session, writer) = session_followed(
+            PEOPLE,
+            move |request| {
+                if request["name"].as_str() == Some("studio_head") {
+                    return serde_json::json!([]);
+                }
+                let mut rows = vec![
+                    serde_json::json!({"n": {"@id": "p1", "slug": "p1", "name": "Ada"}}),
+                    serde_json::json!({"n": {"@id": "p2", "slug": "p2", "name": "Grace"}}),
+                ];
+                if serves_newer.load(std::sync::atomic::Ordering::SeqCst) {
+                    rows.insert(
+                        0,
+                        serde_json::json!({"n": {"@id": "p0", "slug": "p0", "name": "Alan"}}),
+                    );
+                }
+                serde_json::Value::Array(rows)
+            },
+            cx,
+        );
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session.clone(),
+                "Person".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        table.update(cx, |table, _| {
+            table.cursor = Some(Cursor { row: 1, col: 0 })
+        });
+        let draw = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+        };
+
+        // Behind another window: the chip, and nothing read.
+        cx.deactivate_window();
+        newer.store(true, std::sync::atomic::Ordering::SeqCst);
+        writer.commit("c2", vec![changed("node", "Person", "p0", None)]);
+        session.update(cx, |session, cx| session.check_heads(cx));
+        cx.run_until_parked();
+        draw(cx);
+        table.read_with(cx, |table, _| {
+            assert!(table.newer, "Refresh is offered");
+            assert_eq!(table.paging.pinned.as_deref(), Some("c1"));
+        });
+        assert_eq!(row_names(&table, cx), ["Ada", "Grace"]);
+
+        // In front: the head, taken in one frame, the cursor still on Grace.
+        cx.update(|window, _| window.activate_window());
+        draw(cx);
+        table.read_with(cx, |table, _| {
+            assert!(!table.newer, "nothing to refresh");
+            assert_eq!(table.paging.pinned.as_deref(), Some("c2"));
+            assert_eq!(
+                table.cursor,
+                Some(Cursor { row: 2, col: 0 }),
+                "still on Grace"
+            );
+            assert!(table.live_task.is_none());
+        });
+        assert_eq!(row_names(&table, cx), ["Alan", "Ada", "Grace"]);
+
+        // An edit open: the chip, and the edit stays.
+        table.update_in(cx, |table, window, cx| {
+            table.start_edit(Cursor { row: 1, col: 1 }, window, cx)
+        });
+        writer.commit("c3", vec![changed("node", "Person", "p1", None)]);
+        session.update(cx, |session, cx| session.check_heads(cx));
+        cx.run_until_parked();
+        draw(cx);
+        table.read_with(cx, |table, _| {
+            assert!(table.newer, "Refresh is offered");
+            assert_eq!(table.paging.pinned.as_deref(), Some("c2"));
+            assert!(table.editing.is_some(), "the edit stays");
         });
     }
 

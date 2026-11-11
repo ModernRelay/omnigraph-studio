@@ -74,7 +74,9 @@ tells every view the values it set (`SessionEvent::PropertiesWritten`): a table,
 pinned to the commit it was made on that shows the nodes takes the values and moves to its
 commit, and a markdown editor with nothing unsaved shows the new value, wherever in Studio the
 write was made. A view whose pin is not the head, and that such a write did not move, shows
-"Newer data · Refresh" and changes nothing until the person refreshes (constitution II, V).
+"Newer data · Refresh" and changes nothing until the person refreshes (constitution II, V),
+except an ungrouped type table in front with nothing of the person's in it, which reads the
+head itself and takes it in one frame, keeping the cursor and the first row in view (spec 028).
 Property writes are bound by value: their `where` names each value read, so a commit that
 changed nothing they set does not refuse them. A list cannot be compared in a `where`, so a
 write that sets one is bound to a commit holding the values read

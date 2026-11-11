@@ -1,8 +1,8 @@
 # Omnigraph Studio constitution
 
-Version 1.4.0 · ratified 2026-10-11 · amended 2026-10-17 (IV: ↵ and Undo for what Studio can
+Version 1.5.0 · ratified 2026-10-11 · amended 2026-10-17 (IV: ↵ and Undo for what Studio can
 put back) · amended 2026-10-18 (IV: ↵ for what loses no data) · amended 2026-10-22 (I: the
-updater's requests) · amended 2026-10-24 (X: Omnigraph `v0.14.0` and later) · amended 2026-10-30 (I: model calls) · amended 2026-11-01 (XIII: one rule for what a pick does) · amended 2026-11-05 (I: control-plane calls)
+updater's requests) · amended 2026-10-24 (X: Omnigraph `v0.14.0` and later) · amended 2026-10-30 (I: model calls) · amended 2026-11-01 (XIII: one rule for what a pick does) · amended 2026-11-05 (I: control-plane calls) · amended 2026-11-10 (II, V: a view in front may take new data itself)
 
 Omnigraph Studio is a native desktop app for exploring and changing Omnigraph graphs: type
 tables, a relationship tree, a graph canvas, a `.gq` query editor, branches, review, merge and
@@ -27,8 +27,10 @@ an unknown effect.
 ## II. One snapshot per view
 
 Every view reads one commit. It records the `graph_commit_id` its first read returned and pins
-later reads to it. When the branch moves, the view offers Refresh; it does not change under the
-reader. A write carries the commit it was read at (`Omnigraph-If-Graph-Commit`).
+later reads to it. When the branch moves, the view offers Refresh. A view that follows its
+branch, is in front and holds no draft of the person's may instead read the new commit in the
+background and take it in one frame, keeping the person's place (spec 028). A view pinned to a
+commit never moves. A write carries the commit it was read at (`Omnigraph-If-Graph-Commit`).
 
 ## III. A write has three outcomes
 
@@ -51,7 +53,8 @@ stays.
 
 Layout is stable. A row that stops matching a filter after an edit stays in place, dimmed,
 until the list is read again. Columns only grow while results stream. Tabs, buttons and modal
-positions keep their size and place. New data announces itself as a chip, never as a jump.
+positions keep their size and place. New data announces itself as a chip, never as a jump. Where a view takes new data itself (II), the row
+under the cursor and the first row in view stay where they are.
 
 ## VI. Every control explains itself
 
