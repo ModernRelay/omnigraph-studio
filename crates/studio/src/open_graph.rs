@@ -176,8 +176,17 @@ impl OpenGraphModal {
                 registry.managed_targets.clone(),
             )
         };
+        // The window's own server is the one chosen: the page for a graph it would not open sends
+        // the person here for a new token or another graph (spec 029).
+        let shown = workspace.upgrade().and_then(|workspace| {
+            let session = workspace.read(cx).session()?;
+            Some(session.read(cx).connection.clone())
+        });
         let mut this = Self::build(workspace, connections, vec![observe], platform, window, cx);
         this.follow_planes(planes, managed, cx);
+        if let Some(connection) = shown.filter(|c| this.connections.contains(c)) {
+            this.select(connection, window, cx);
+        }
         this
     }
 

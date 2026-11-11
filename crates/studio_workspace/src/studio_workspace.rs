@@ -9,6 +9,7 @@
 
 mod item;
 pub mod models;
+mod open_failure;
 mod pane;
 mod panels;
 mod persistence;
@@ -52,6 +53,7 @@ use ui::{ButtonLike, PopoverMenu, right_click_menu};
 
 use item::ItemHandle;
 pub use item::{Item, ItemEvent, ItemStatus, KeyHint};
+pub use open_failure::open_failure;
 use pane::{Member, Pane, PaneId, SplitAxis, SplitDirection, Tab};
 pub use panels::PanelPosition;
 use panels::{Dock, PanelEntry};
@@ -4109,8 +4111,16 @@ impl Workspace {
         let prompt = active
             .filter(|item| item.reads_graph(cx))
             .and_then(|_| sign_in_prompt(&self.session.as_ref()?.read(cx).connection, cx));
+        // A graph that would not open says why, in place of a tab that reads it or of an empty
+        // centre (spec 029).
+        let prompt = prompt.or_else(|| {
+            active
+                .is_none_or(|item| item.reads_graph(cx))
+                .then(|| open_failure(self.session.as_ref()?, cx))
+                .flatten()
+        });
         let body = match active {
-            Some(_) if prompt.is_some() => div()
+            _ if prompt.is_some() => div()
                 .flex_1()
                 .min_h_0()
                 .overflow_hidden()

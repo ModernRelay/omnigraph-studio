@@ -345,6 +345,14 @@ impl Render for TypesList {
         }
         let schema = match &s.schema {
             Loadable::Loaded(schema) => schema.clone(),
+            // The centre says why the graph would not open, and offers what helps (spec 029).
+            Loadable::Failed(_)
+                if s.schema_failure
+                    .is_some_and(|failure| failure != graph_store::SchemaFailure::Other) =>
+            {
+                return studio_ui::ds::sidebar_note("The graph did not open. See the page beside.")
+                    .into_any_element();
+            }
             Loadable::Failed(error) => {
                 let error = error.clone();
                 return v_flex()

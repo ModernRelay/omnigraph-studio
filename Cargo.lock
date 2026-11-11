@@ -9640,6 +9640,7 @@ dependencies = [
  "studio_ui",
  "theme_settings",
  "ui",
+ "url",
 ]
 
 [[package]]
