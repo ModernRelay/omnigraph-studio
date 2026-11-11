@@ -176,17 +176,8 @@ impl OpenGraphModal {
                 registry.managed_targets.clone(),
             )
         };
-        // The window's own server is the one chosen: the page for a graph it would not open sends
-        // the person here for a new token or another graph (spec 029).
-        let shown = workspace.upgrade().and_then(|workspace| {
-            let session = workspace.read(cx).session()?;
-            Some(session.read(cx).connection.clone())
-        });
         let mut this = Self::build(workspace, connections, vec![observe], platform, window, cx);
         this.follow_planes(planes, managed, cx);
-        if let Some(connection) = shown.filter(|c| this.connections.contains(c)) {
-            this.select(connection, window, cx);
-        }
         this
     }
 
@@ -940,6 +931,11 @@ impl OpenGraphModal {
         }
     }
 
+    /// Whether the dialog lists `connection`'s server.
+    pub(crate) fn lists(&self, connection: &Entity<Connection>) -> bool {
+        self.connections.contains(connection)
+    }
+
     pub(crate) fn select(
         &mut self,
         connection: Entity<Connection>,
@@ -1359,7 +1355,7 @@ impl OpenGraphModal {
         let selected = connection.clone();
         let listing_note = match &c.graphs {
             GraphListing::NotAllowed => {
-                Some("This server does not list its graphs to this token. Enter a graph id.")
+                Some("This server does not list its graphs. Enter a graph id.")
             }
             GraphListing::Failed(_) => Some("The graph list could not be read. Enter a graph id."),
             _ => None,
@@ -1898,6 +1894,12 @@ fn state_status(c: &Connection) -> String {
     match (&c.state, &c.token_unread) {
         (ConnectionState::Unreachable(error), _) => {
             format!("Could not reach the server: {error}")
+        }
+        // A cluster opened from its control plane asks the control plane, not the CLI.
+        (ConnectionState::Unauthorized, Some(reason))
+            if c.server.source == ServerSource::ControlPlane =>
+        {
+            format!("The control plane gave no token for this cluster: {reason}")
         }
         (ConnectionState::Unauthorized, Some(reason)) => {
             format!("The Omnigraph CLI gave no token for this server: {reason}")
@@ -3188,6 +3190,30 @@ mod tests {
             plane.sign_in_state(),
             SignIn::Offered { .. }
         )));
+    }
+
+    /// A sign-in that no organization has as a member keeps the plane's row, which the
+    /// keyboard reaches and which says so, rather than an empty section (spec 029).
+    #[gpui::test]
+    fn a_sign_in_in_no_organization_keeps_its_row(cx: &mut TestAppContext) {
+        let alpha = server(&["one"], cx);
+        let (modal, cx) = dialog(vec![alpha.clone()], cx);
+        let plane = cx.new(|cx| {
+            let mut plane = ControlPlane::new("https://control.test".into(), None, cx);
+            plane.signed_in_for_test(Vec::new(), Vec::new(), cx);
+            plane
+        });
+        modal.update(cx, |modal, cx| {
+            modal.follow_planes(vec![plane.clone()], Vec::new(), cx)
+        });
+        let places = modal.read_with(cx, |modal, cx| modal.places(cx));
+        assert_eq!(
+            places[..2],
+            [
+                Place::Server(alpha.entity_id()),
+                Place::Plane(plane.entity_id())
+            ]
+        );
     }
 
     /// A control plane signed in to, listing `org_1` (Acme) with two clusters: `acme` (`01C`),
