@@ -28,19 +28,27 @@ if ! curl -sf -o /dev/null "$OMNIGRAPH_STUDIO_SERVER/healthz"; then
 fi
 
 cargo build --quiet --profile release-fast -p studio --example snapshot --manifest-path "$ROOT/Cargo.toml"
-SNAPSHOT="$ROOT/target/release-fast/examples/snapshot"
+SNAPSHOT="${CARGO_TARGET_DIR:-$ROOT/target}/release-fast/examples/snapshot"
 
 PERSON='studio_graph::OpenType={"type_name":"Person"}'
 QUERY='query people() { match { $p: Person } return { $p.slug, $p.name, $p.title, $p.email, $p.born, $p.tags } }'
 NEW_QUERY="studio_graph::NewQueryWithText={\"text\":\"$QUERY\"}"
+PAGE='studio_graph::OpenNodePage={"type_name":"Person","id":"person-000001"}'
 
-# name, then the snapshot steps.
+# name, then the snapshot steps. "window redraw" draws every view again, as a frame of an
+# animation (a dialog coming up, a toast, the connection dot) does: the cost of motion.
 cases=(
   "table filter key|$PERSON|studio_table::AddFilter|measure:$FRAMES,type"
   "table cell key|$PERSON|studio_table::EditCell|key:right|studio_table::EditCell|measure:$FRAMES,type"
   "table scroll|$PERSON|measure:$FRAMES,scroll=40"
   "query key (6 columns)|$NEW_QUERY|studio_query::Run|measure:$FRAMES,type"
   "palette key|$PERSON|studio::GoTo|measure:$FRAMES,type"
+  "window redraw|$PERSON|measure:$FRAMES,refresh"
+  "node page scroll|$PAGE|measure:$FRAMES,scroll=40"
+  "tree scroll|$PAGE|studio_graph::OpenAsTree|measure:$FRAMES,scroll=40"
+  "canvas pan|$PAGE|studio_graph::OpenAsCanvas|measure:$FRAMES,drag=4:2"
+  "canvas zoom|$PAGE|studio_graph::OpenAsCanvas|measure:$FRAMES,scroll=40"
+  "history scroll|studio_graph::OpenHistory|measure:$FRAMES,scroll=40"
 )
 
 printf '%-24s %10s %10s\n' "case" "cpu median" "cpu p95"
