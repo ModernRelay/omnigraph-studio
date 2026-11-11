@@ -18,6 +18,11 @@ ROUNDS=${1:-1}
 FRAMES=${STUDIO_MEASURE_FRAMES:-200}
 OUT=$(mktemp -d)
 trap 'rm -rf "$OUT"' EXIT
+# Studio lists the person's CLI targets beside the server it is given, and a toast for each one it
+# cannot reach is drawn in every frame measured (180 allocations a frame on one machine). Each case
+# runs with an empty operator home instead, so it measures the development graph alone.
+export OMNIGRAPH_HOME="$OUT/omnigraph-home"
+mkdir -p "$OMNIGRAPH_HOME"
 
 export OMNIGRAPH_STUDIO_SERVER=${OMNIGRAPH_STUDIO_SERVER:-http://127.0.0.1:8787}
 export OMNIGRAPH_STUDIO_TOKEN=${OMNIGRAPH_STUDIO_TOKEN:-dev-token}
