@@ -100,6 +100,8 @@ pub struct OpenGraphModal {
     new_name: Entity<Editor>,
     new_url: Entity<Editor>,
     new_token: Entity<Editor>,
+    /// The graph to open on the server added, for one that does not list its graphs (spec 029).
+    new_graph: Entity<Editor>,
     /// Whether the CLI gives Studio a token here, as the registry holds it: where it gives none
     /// (Windows), the new server's token field is disabled and says why.
     platform: Platform,
@@ -198,6 +200,11 @@ impl OpenGraphModal {
         );
         let new_token = input("Token (kept by the Omnigraph CLI)", window, cx);
         new_token.update(cx, |editor, cx| editor.set_masked(true, cx));
+        let new_graph = input(
+            "Graph id, if the server does not list its graphs",
+            window,
+            cx,
+        );
         let replacement_token = input("New token", window, cx);
         replacement_token.update(cx, |editor, cx| editor.set_masked(true, cx));
         // An error is about what was typed: typing again clears it. Typing in a field puts the
@@ -207,6 +214,7 @@ impl OpenGraphModal {
             (&graph_id, Some(Place::GraphId)),
             (&new_url, None),
             (&new_token, None),
+            (&new_graph, None),
             (&replacement_token, Some(Place::Token)),
         ] {
             subscriptions.push(cx.subscribe_in(
@@ -250,6 +258,7 @@ impl OpenGraphModal {
             new_name,
             new_url,
             new_token,
+            new_graph,
             platform,
             replacement_token,
             _adding: None,
@@ -452,6 +461,7 @@ impl OpenGraphModal {
             if self.token_refusal().is_none() {
                 fields.push(&self.new_token);
             }
+            fields.push(&self.new_graph);
             let at = fields
                 .iter()
                 .position(|field| field.focus_handle(cx).is_focused(window));
@@ -974,6 +984,13 @@ impl OpenGraphModal {
             return;
         }
         let graph_id = graph_id.trim().to_owned();
+        // A server that says which graphs the token reaches does not have one it leaves out: the
+        // dialog says so beside the field, rather than closing on a window that cannot open it.
+        if let Some(missing) = missing_graph(connection.read(cx), &graph_id) {
+            self.say(Said::GraphId, missing);
+            cx.notify();
+            return;
+        }
         // A graph id typed in is kept with its server, for a token that cannot list graphs. Where
         // the server says which graphs the token reaches, none is kept: one it lists needs no
         // keeping, and kept would be offered after its deletion; one it does not is a mistyped
@@ -1027,6 +1044,7 @@ impl OpenGraphModal {
         let name = self.new_name.read(cx).text(cx);
         let url = self.new_url.read(cx).text(cx);
         let token = self.new_token.read(cx).text(cx);
+        let graph = self.new_graph.read(cx).text(cx).trim().to_owned();
         // What the fields held as the add began, to clear them once it lands.
         let fields = [name.clone(), url.clone(), token.clone()];
         let token = (!token.trim().is_empty()).then(|| token.trim().to_owned());
@@ -1060,6 +1078,14 @@ impl OpenGraphModal {
                         connection.update(cx, |c, cx| c.connect(cx));
                         this.select(connection, window, cx);
                         this.clear_added(&fields, window, cx);
+                        // A graph named with it is opened now: a server that lists none (one run
+                        // without a cluster policy, spec 012 E47) shows its graph this way.
+                        if !graph.is_empty() {
+                            this.new_graph
+                                .update(cx, |editor, cx| editor.set_text("", window, cx));
+                            this.open(graph.clone(), window, cx);
+                            return;
+                        }
                         window.focus(&this.graph_id.focus_handle(cx), cx);
                     }
                     Err(error) => {
@@ -1510,6 +1536,7 @@ impl OpenGraphModal {
             .child(field("Address", &self.new_url))
             .child(field("Name", &self.new_name))
             .child(token)
+            .child(field("Graph (optional)", &self.new_graph))
             .child(
                 h_flex()
                     .gap(px(space::MD))
@@ -1577,6 +1604,28 @@ fn sentence(text: &str) -> String {
     } else {
         format!("{text}.")
     }
+}
+
+/// What the dialog says of `graph_id` on `c`'s server when the server says which graphs the
+/// token reaches and it is not one: the graphs it has instead. `None` for a server that lists
+/// none, whose 404 the window's page explains.
+fn missing_graph(c: &Connection, graph_id: &str) -> Option<String> {
+    let listed = match &c.graphs {
+        GraphListing::Listed(infos) => infos.iter().map(|info| info.graph_id.clone()).collect(),
+        GraphListing::Discovered(ids) => ids.clone(),
+        _ => return None,
+    };
+    if listed.iter().any(|id: &String| id == graph_id) {
+        return None;
+    }
+    let name = &c.server.name;
+    Some(match listed.as_slice() {
+        [] => format!("{name} has no graph “{graph_id}”, and lists none."),
+        listed => format!(
+            "{name} has no graph “{graph_id}”. It has: {}.",
+            listed.join(", ")
+        ),
+    })
 }
 
 /// Why a server's graph list is empty, by its state: what would show them, never a connect
@@ -2153,6 +2202,40 @@ mod tests {
             empty_list_note(&ConnectionState::Connecting),
             "Its graphs show once Studio connects."
         );
+    }
+
+    /// An id the server does not list is said beside the field, naming the graphs it has, and
+    /// the dialog stays open; one it lists opens (spec 029).
+    #[gpui::test]
+    fn an_id_the_server_does_not_list_is_said_before_the_dialog_closes(cx: &mut TestAppContext) {
+        let connection = server(&[], cx);
+        connection.update(cx, |connection, _| {
+            connection.graphs = GraphListing::Discovered(vec!["knowledge".into(), "notes".into()])
+        });
+        let name = connection.read_with(cx, |c, _| c.server.name.clone());
+        let (modal, cx) = dialog(vec![connection], cx);
+        let dismissed = Rc::new(Cell::new(false));
+        let _dismissed = cx.update(|_, cx| {
+            let dismissed = dismissed.clone();
+            cx.subscribe(&modal, move |_, _: &DismissEvent, _| dismissed.set(true))
+        });
+        modal.update_in(cx, |modal, window, cx| {
+            modal.open("knowlege".into(), window, cx)
+        });
+        assert_eq!(
+            modal.read_with(cx, |modal, _| (modal.error_at, modal.error.clone())),
+            (
+                Said::GraphId,
+                Some(format!("{name} has no graph “knowlege”. It has: knowledge, notes.").into())
+            )
+        );
+        cx.run_until_parked();
+        assert!(!dismissed.get());
+        modal.update_in(cx, |modal, window, cx| {
+            modal.open("notes".into(), window, cx)
+        });
+        cx.run_until_parked();
+        assert!(dismissed.get());
     }
 
     /// An empty dialog starts on its choices: ↓ moves through them, ↵ on Connect to a server
@@ -2967,6 +3050,7 @@ mod tests {
                 ("address", &modal.new_url),
                 ("name", &modal.new_name),
                 ("token", &modal.new_token),
+                ("graph", &modal.new_graph),
             ];
             fields
                 .into_iter()
@@ -2982,7 +3066,7 @@ mod tests {
     ) -> Vec<&'static str> {
         modal.update_in(cx, |modal, window, cx| modal.show_add(true, window, cx));
         let mut visited = vec![add_field_focused(modal, cx)];
-        for _ in 0..3 {
+        for _ in 0..4 {
             cx.dispatch_action(menu::SelectNext);
             visited.push(add_field_focused(modal, cx));
         }
@@ -3011,7 +3095,7 @@ mod tests {
         );
         assert_eq!(
             add_tab_order(&modal, cx),
-            ["address", "name", "address", "name"]
+            ["address", "name", "graph", "address", "name"]
         );
         cx.run_until_parked();
         assert!(
@@ -3241,7 +3325,7 @@ mod tests {
         assert_eq!(modal.read_with(cx, |modal, _| modal.token_refusal()), None);
         assert_eq!(
             add_tab_order(&modal, cx),
-            ["address", "name", "token", "address"]
+            ["address", "name", "token", "graph", "address"]
         );
         cx.run_until_parked();
         assert!(cx.debug_bounds("new-token-disabled").is_none());
