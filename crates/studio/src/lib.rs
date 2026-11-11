@@ -7,6 +7,7 @@ mod cloud_settings;
 pub mod deep_link;
 #[cfg(debug_assertions)]
 mod design_gallery;
+mod first_run;
 mod keymaps;
 pub mod logging;
 mod menus;

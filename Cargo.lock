@@ -9523,6 +9523,7 @@ dependencies = [
  "schemars 1.0.4",
  "semver",
  "serde_json",
+ "serde_norway",
  "settings",
  "smol",
  "studio_actions",
