@@ -4111,11 +4111,11 @@ impl Workspace {
         let prompt = active
             .filter(|item| item.reads_graph(cx))
             .and_then(|_| sign_in_prompt(&self.session.as_ref()?.read(cx).connection, cx));
-        // A graph that would not open says why, in place of a tab that reads it or of an empty
-        // centre (spec 029).
+        // A graph that would not open says why where the centre would be empty (spec 029); a
+        // tab open there stays, showing what it can.
         let prompt = prompt.or_else(|| {
             active
-                .is_none_or(|item| item.reads_graph(cx))
+                .is_none()
                 .then(|| open_failure(self.session.as_ref()?, cx))
                 .flatten()
         });

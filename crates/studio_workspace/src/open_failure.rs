@@ -126,7 +126,7 @@ fn says(
             format!("Could not reach {server}"),
             if loopback {
                 format!(
-                    "Is `omnigraph-server` running at {}? Start it, then Try again.",
+                    "Is omnigraph-server running at {}? Start it, then Try again.",
                     connection.server.url
                 )
             } else {

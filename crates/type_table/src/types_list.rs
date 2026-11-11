@@ -345,23 +345,14 @@ impl Render for TypesList {
         }
         let schema = match &s.schema {
             Loadable::Loaded(schema) => schema.clone(),
-            // The centre says why the graph would not open, and offers what helps (spec 029).
-            Loadable::Failed(_)
-                if s.schema_failure
-                    .is_some_and(|failure| failure != graph_store::SchemaFailure::Other) =>
-            {
-                return studio_ui::ds::sidebar_note("The graph did not open. See the page beside.")
-                    .into_any_element();
-            }
             Loadable::Failed(error) => {
                 let error = error.clone();
                 return v_flex()
                     .px(px(studio_ui::ds::space::LG))
                     .py(px(studio_ui::ds::space::XS))
                     .gap(px(studio_ui::ds::space::XS))
-                    .child(studio_ui::ds::text::error(
-                        "Studio could not read the schema.",
-                    ))
+                    // What the server answered is said in full on the centre's page (spec 029).
+                    .child(studio_ui::ds::text::error("The graph did not open."))
                     .child(studio_ui::ds::text::meta(error))
                     .child(
                         studio_ui::ds::button("reload-schema", "Try again")
