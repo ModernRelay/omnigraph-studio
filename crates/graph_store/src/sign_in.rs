@@ -562,6 +562,12 @@ impl Access {
 }
 
 impl OAuthSource {
+    /// Whether the sign-in ended: signed out, or its grant ended by the service, so it gives no
+    /// token again (spec 029: the plane holding it offers a sign-in).
+    pub(crate) fn has_ended(&self) -> bool {
+        self.inner.ended.load(Ordering::SeqCst)
+    }
+
     /// A sign-in just made, its tokens and what the keychain holds for its target, with the
     /// token of an earlier item there the keychain would not let go of (`left`).
     #[cfg(test)]

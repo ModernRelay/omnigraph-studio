@@ -456,6 +456,21 @@ impl ControlPlane {
         self.end(End::Dropped, cx);
     }
 
+    /// The sign-in held ended at the service, which forgot it already: its lists go, and a
+    /// sign-in is offered, saying why.
+    fn sign_in_ended(&mut self, cx: &mut Context<Self>) {
+        self.reading = None;
+        self.organizations = None;
+        self.listings.clear();
+        self.hold(None);
+        let service = oauth_client::host_of(&self.route);
+        self.sign_in = SignIn::Offered {
+            why: Some(format!("Your sign-in at {service} ended. Sign in again.")),
+            service,
+        };
+        cx.notify();
+    }
+
     fn end(&mut self, how: End, cx: &mut Context<Self>) {
         self.signing_in = None;
         self.kept_was_read();
@@ -508,6 +523,12 @@ impl ControlPlane {
                         }]
                     })
                     .unwrap_or_default(),
+                // The service ended the grant (a kept sign-in it no longer honours): the plane
+                // is signed out, and offers a sign-in, rather than saying "Signed in" (spec 029).
+                Err(ControlError::Unauthenticated(_)) if source.has_ended() => {
+                    this.update(cx, |this, cx| this.sign_in_ended(cx)).ok();
+                    return;
+                }
                 Err(error) => {
                     this.update(cx, |this, cx| {
                         this.reading = None;
@@ -1303,6 +1324,35 @@ mod tests {
         // The kept token was rotated, and the keychain holds the new one.
         let item = keychain.items.lock().unwrap().get(&key(ROUTE)).cloned();
         assert_eq!(item, Some(("user_1".into(), b"r1".to_vec())));
+    }
+
+    /// A kept sign-in the service no longer honours (its refresh refused) signs the plane out,
+    /// offering a sign-in that says why, rather than keeping "Signed in" over a list that cannot
+    /// be read (spec 029).
+    #[gpui::test]
+    fn a_kept_sign_in_the_service_ended_offers_a_sign_in(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let served = Arc::new(Mutex::new(Served::default()));
+        let (plane, _) = kept(&served, cx);
+        // The service forgot the grant.
+        served.lock().unwrap().refresh.clear();
+        plane.update(cx, |p, cx| p.read_clusters(cx));
+        until(cx, "the sign-in to end", |cx| {
+            plane.read_with(cx, |p, _| {
+                matches!(p.sign_in_state(), SignIn::Offered { .. })
+            })
+        });
+        plane.read_with(cx, |p, _| {
+            assert!(!p.holds_sign_in());
+            assert_eq!(p.organizations(), None);
+            let SignIn::Offered { why, .. } = p.sign_in_state() else {
+                unreachable!()
+            };
+            assert!(
+                why.as_deref()
+                    .is_some_and(|why| why.ends_with("ended. Sign in again."))
+            );
+        });
     }
 
     /// The CLI's export, as a managed target's login.
