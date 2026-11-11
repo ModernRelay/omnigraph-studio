@@ -11028,17 +11028,22 @@ impl TypeTable {
         cx.notify();
     }
 
-    /// Column `col`'s relationship cell of `row`: the first neighbours as chips, then "+N"; "—"
-    /// for none. Drawn for every row in view at every draw, so its id is the cell's place (`id`,
-    /// as [`Self::render_cell`] names the cell) and its tooltip is made only when it shows.
+    /// Column `col`'s relationship cell of row `ix`: the first neighbours as chips, then "+N";
+    /// "—" for none. Drawn for every row in view at every draw, so only the cell under the
+    /// pointer carries the tooltip that says what the count is of ([`Self::pointer_moved`]):
+    /// a tooltip takes an element id, and with it an element state, a hitbox and its mouse
+    /// listeners each frame, which in every relationship cell were a twelfth of a table scroll
+    /// frame. Its id is the cell's place, as [`Self::render_cell`] names the cell, and its
+    /// tooltip is made only when it shows.
     fn render_relation_cell(
         &self,
-        id: u64,
+        ix: usize,
         col: usize,
         row: &Row,
         available: f32,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let id = (ix * self.columns.len() + col) as u64;
         let key = self.columns[col].key.as_str();
         let Some(relation) = self.relations.get(&row.id, key) else {
             return studio_ui::cell_text("…", cx)
@@ -11078,28 +11083,11 @@ impl TypeTable {
             .collect();
         let fit = chips_that_fit(&labels, count, available);
         let more = count - fit as i64;
-        // The other type is the column's, looked up when the tooltip shows.
-        let table = cx.weak_entity();
         // The count stays in view; the tags give way, whole.
-        h_flex()
-            .id(ElementId::NamedInteger("relation".into(), id))
+        let cell = h_flex()
             .w_full()
             .min_w_0()
             .gap(px(space::XS))
-            .tip_fn(move |_, cx| {
-                let other = table.upgrade().and_then(|table| {
-                    let group = table.read(cx).columns.get(col)?.relationship()?;
-                    Some(group.other_type.clone())
-                });
-                studio_ui::ds::tooltip_view(
-                    format!(
-                        "{} {} · click to open them",
-                        studio_ui::group_count(count),
-                        other.unwrap_or_default()
-                    ),
-                    cx,
-                )
-            })
             .child(
                 h_flex()
                     .min_w_0()
@@ -11125,6 +11113,27 @@ impl TypeTable {
                         .color(Color::Muted.color(cx))
                         .hug(),
                     ),
+                )
+            });
+        if self.frame_pointer != Some((ix, col)) {
+            return cell.into_any_element();
+        }
+        // The other type is the column's, looked up when the tooltip shows.
+        let table = cx.weak_entity();
+        cell.id(ElementId::NamedInteger("relation".into(), id))
+            .debug_selector(move || format!("relation-tip-{ix}-{col}"))
+            .tip_fn(move |_, cx| {
+                let other = table.upgrade().and_then(|table| {
+                    let group = table.read(cx).columns.get(col)?.relationship()?;
+                    Some(group.other_type.clone())
+                });
+                studio_ui::ds::tooltip_view(
+                    format!(
+                        "{} {} · click to open them",
+                        studio_ui::group_count(count),
+                        other.unwrap_or_default()
+                    ),
+                    cx,
                 )
             })
             .into_any_element()
@@ -11262,6 +11271,16 @@ impl TypeTable {
         })
     }
 
+    /// Whether the cell at `at` is a relationship cell, which carries its tooltip only under the
+    /// pointer ([`Self::render_relation_cell`]).
+    fn relation_at(&self, at: Option<(usize, usize)>) -> bool {
+        at.is_some_and(|(_, col)| {
+            self.columns
+                .get(col)
+                .is_some_and(|column| column.relationship().is_some())
+        })
+    }
+
     /// The pointer moved over the rows: the grid draws again when that moves what only the
     /// pointer's row or cell builds (`docs/drawing.md`). GPUI shows them only while the pointer
     /// is over them; this decides which row and cell build them at all.
@@ -11274,6 +11293,8 @@ impl TypeTable {
         if row(at) != row(self.frame_pointer)
             || self.expands_at(at)
             || self.expands_at(self.frame_pointer)
+            || self.relation_at(at)
+            || self.relation_at(self.frame_pointer)
         {
             // Once per change: the next frame draws with this one.
             self.frame_pointer = at;
@@ -11579,7 +11600,8 @@ impl TypeTable {
             // The cell's padding on both sides.
             let available = self.layout.width(column) - 2. * space::LG;
             return cell
-                .child(self.render_relation_cell(place, col, row, available, cx))
+                .debug_selector(move || format!("cell-{ix}-{col}"))
+                .child(self.render_relation_cell(ix, col, row, available, cx))
                 .when(is_cursor, |cell| cell.child(studio_ui::ds::cell_cursor(cx)))
                 .into_any_element();
         }
@@ -15474,6 +15496,70 @@ mod tests {
             1,
             "none read again"
         );
+    }
+
+    /// A relationship cell carries its tooltip, with the element state, hitbox and listeners a
+    /// tooltip takes, only under the pointer: no cell while the pointer is away from them, then
+    /// the one under it, whether the pointer came from another row or along its own row.
+    #[gpui::test]
+    async fn only_the_relationship_cell_under_the_pointer_carries_its_tooltip(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let answer = workers(&[("p1", 2), ("p2", 1)], None);
+        let (session, _, _served) = crate::test_support::session_served(WORKERS, answer, cx);
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session,
+                "Person".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let key = relationship_column(&table, cx);
+        let col = table.read_with(cx, |table, _| table.column_index(&key).unwrap());
+        let tipped = |cx: &mut VisualTestContext| -> Vec<usize> {
+            (0..2)
+                .filter(|row| {
+                    cx.debug_bounds(format!("relation-tip-{row}-{col}").leak())
+                        .is_some()
+                })
+                .collect()
+        };
+        assert_eq!(tipped(cx), Vec::<usize>::new(), "the pointer is away");
+
+        // From the key of another row onto the first row's relationship cell.
+        let key_cell = cell_bounds(1, 0, cx);
+        cx.simulate_mouse_move(key_cell.center(), None, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(
+            tipped(cx),
+            Vec::<usize>::new(),
+            "over a key, not a relationship"
+        );
+        let ada = cell_bounds(0, col, cx);
+        cx.simulate_mouse_move(ada.center(), None, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(tipped(cx), [0]);
+
+        // Along the second row, from its key onto its relationship cell, and off it again.
+        let key_cell = cell_bounds(1, 0, cx);
+        cx.simulate_mouse_move(key_cell.center(), None, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(tipped(cx), Vec::<usize>::new());
+        let grace = cell_bounds(1, col, cx);
+        cx.simulate_mouse_move(grace.center(), None, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(tipped(cx), [1], "a move along the row draws the grid once");
+        cx.simulate_mouse_move(key_cell.center(), None, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(tipped(cx), Vec::<usize>::new());
     }
 
     /// A row the first neighbour read cut short, after a hub that spent its limit, is read
