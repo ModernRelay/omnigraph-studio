@@ -58,7 +58,7 @@ Add tasks, contracts or data-model files only for large features.
 | 025 | [Filters through relationships](025-relation-filters/plan.md) | built; timings pending |
 | 026 | [Commits panel](026-commits-panel/plan.md) | step 1 built |
 | 028 | [The table in front follows its branch](028-live-tables/plan.md) | step 1 built |
-| 029 | [The first run](029-first-run/plan.md) | draft |
+| 029 | [The first run](029-first-run/plan.md) | implemented |
 
 Each plan's first line holds its full status. 012 is not scheduled: it records every Omnigraph change Studio would use, what Studio does
 without it, and which plan waits on it. Each feature plan's Deferred section names its IDs.

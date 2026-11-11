@@ -1,6 +1,6 @@
 # 029: The first run
 
-Status: draft · 2026-11-11
+Status: implemented · 2026-11-11 (approved the same day). Built: every part below, with the changes in Corrections.
 
 ## Problem
 
@@ -295,7 +295,7 @@ the centre page catches a 404.
 The add form gets an optional **Graph** field after Name ("Graph id, if the server does not list
 its graphs"). When given, it is remembered with the server (`remember_graph`) and opened once the
 server connects. For `GraphListing::NotAllowed` and a 403 the note becomes "This server does not
-list its graphs to this token. Enter a graph id." in place of "could not be read"; `Failed`
+list its graphs. Enter a graph id." in place of "could not be read"; `Failed`
 keeps its text only for other failures.
 
 ### 7. Cloud sign-in states
@@ -315,7 +315,7 @@ keeps its text only for other failures.
   **Sign out**. The sidebar keeps a row for such a plane ("No organizations"), so the keyboard
   reaches it.
 - **Data-token words name their source.** For a `ServerSource::ControlPlane` connection the line
-  reads "Omnigraph Cloud gave no token for this cluster: REASON"; the CLI wording stays for CLI
+  reads "The control plane gave no token for this cluster: REASON"; the CLI wording stays for CLI
   targets.
 
 ### 8. Copy
@@ -364,7 +364,27 @@ E1 (`omnigraph studio`) would replace the local recipe.
 | 2026-11-11 | An `Agent` auth method may be passed to `authenticate`; a `Terminal` one may not | `agent-client-protocol-schema-1.9.1/src/v1/agent.rs:581-709` | as stated; `Terminal` needs `AuthCapabilities.terminal` (`client.rs:2508`) |
 | 2026-11-11 | Settings → Agent has no path field | `studio/src/settings_view.rs:766-805`, `studio_settings.rs:441-453` | segments None / presets / Custom; `agent.command` and a hidden `agent.env` |
 | 2026-11-11 | A refused kept Cloud sign-in leaves the plane `SignedIn` | `control_plane.rs:283`, `:511`, `:727-736`; `sign_in.rs:1199-1211` | the source ends, the plane's `sign_in` is never changed |
+| 2026-11-11 | The recipe's commands, as Studio shows them, make a graph a server serves | `steps(false)`'s first three commands run in a shell with `HOME` set to a scratch folder, CLI 0.15.0 | `cluster.yaml` and `schema.pg` written, `knowledge` created, the lock released |
+| 2026-11-11 | An anonymous server's discovery read is a 401, not a 403 | `curl -H 'Omnigraph-Http-Api: 0.14' http://127.0.0.1:8792/graphs/discovery` on a server run `--unauthenticated` | 401 `unauthorized` "missing bearer token"; Studio said "could not be read" until it took 401 as `NotAllowed` too |
+| 2026-11-11 | Each screen draws as designed | `crates/studio/examples/snapshot.rs` at 1280×800: no CLI (`PATH` without it), no targets (a scratch `HOME`), the recipe (↓ ↓ ↵), a seeded and an empty `--unauthenticated` server (`OMNIGRAPH_STUDIO_SERVER`), a missing graph id, a closed port, and Open a graph over the anonymous server | the band with the install command over the choices, Connect and Local disabled; the recipe's steps with Copy; Connected and Development in the top bar; the 404 and unreachable pages in the centre with the Data panel pointing at them; "This server does not list its graphs." |
 
 ## Corrections
 
-None yet.
+- **Omnigraph Cloud needs no CLI.** Studio holds its own sign-in to the control plane the
+  `omnigraph_cloud` setting names (spec 021), so the Cloud choice goes to that plane's sign-in
+  and is offered with or without a CLI. Without that setting it says to set it in Settings.
+- **Get started is one sidebar row**, after Add server…, whether or not servers are listed: one
+  place, so it never moves (constitution V).
+- **The 401 page sends the person to the dialog** for a new token rather than holding a token
+  field of its own: the workspace crate holds no editor, and Open a graph now opens on the
+  window's own server, where Update token is.
+- **A cluster's missing data token names the control plane**, not Omnigraph Cloud: a CLI profile
+  may name a control plane that is not Omnigraph Cloud. "No token from the control plane" and
+  "The control plane gave no token for this cluster: …".
+- **The page fills an empty centre only.** A tab open over a graph that would not open stays as it
+  is (a restored tab, a query being written); the page shows where the centre would be empty, and
+  the Data panel says "The graph did not open." with the server's words and Try again.
+- **Dialog rows are one line**, title and meta side by side as the graph rows are, rather than a
+  new two-line row size.
+- **The agent's sign-in restarts the agent's conversation** once the agent accepts it, on the same
+  agent process, which the panel holds while the sign-in runs.
