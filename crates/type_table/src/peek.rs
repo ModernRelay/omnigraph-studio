@@ -8,12 +8,13 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use editor::{Editor, EditorEvent};
 use gpui::{
     App, AsyncApp, ClipboardItem, Context, Entity, ExternalPaths, FocusHandle, Focusable,
-    ListAlignment, ListState, Render, SharedString, Subscription, Task, WeakEntity, Window, list,
+    ListAlignment, ListOffset, ListState, Render, SharedString, Subscription, Task, WeakEntity,
+    Window, list,
 };
 use gq_language::builder::Depends;
 use gq_language::input::edit_text;
@@ -81,6 +82,11 @@ const NODE_GONE: &str =
 /// How far past the rows in view the view's list lays rows out. A group is read once its row
 /// is laid out, so this is how far ahead of a scroll the groups are read: a few rows.
 const DRAW_AHEAD: f32 = 160.;
+
+/// How long after the list last moved the person counts as scrolling. A small group that is
+/// counted meanwhile shows its count and stays closed: opened, it would push every row under
+/// it down while the list moves (constitution V).
+const SCROLL_SETTLE: Duration = Duration::from_millis(500);
 
 /// One item of the view's list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -469,6 +475,10 @@ pub struct NodePeek {
     list_items: Vec<Item>,
     /// The list's items the last frame laid out, first to last: those in view and just past it.
     items_drawn: Option<Range<usize>>,
+    /// Where the list was scrolled to when last drawn, and when it last moved
+    /// ([`SCROLL_SETTLE`]).
+    scroll_top: ListOffset,
+    scrolled_at: Option<Instant>,
     /// Properties the commit shown does not hold under their current name, and what they were
     /// then. The node is read without them.
     absent: HashMap<String, PropertyThen>,
@@ -753,6 +763,8 @@ impl NodePeek {
             list: ListState::new(0, ListAlignment::Top, px(DRAW_AHEAD)),
             list_items: Vec::new(),
             items_drawn: None,
+            scroll_top: ListOffset::default(),
+            scrolled_at: None,
             absent: HashMap::new(),
             groups_absent: Vec::new(),
             awaiting_changes: false,
@@ -835,6 +847,15 @@ impl NodePeek {
     /// one that has any on a page.
     fn opens_by_itself(&self, count: i64) -> bool {
         count > 0 && (self.page || count <= i64::from(NEIGHBOUR_LIMIT))
+    }
+
+    /// Whether a group counted now opens by itself: when small, and not while the person
+    /// scrolls ([`SCROLL_SETTLE`]).
+    fn opens_now(&self, count: i64, cx: &App) -> bool {
+        let scrolling = self.scrolled_at.is_some_and(|at| {
+            cx.background_executor().now().saturating_duration_since(at) < SCROLL_SETTLE
+        });
+        !scrolling && self.opens_by_itself(count)
     }
 
     pub(crate) fn label(&self) -> Option<String> {
@@ -2159,7 +2180,7 @@ impl NodePeek {
                 Loadable::Loaded(n)
                     if !group.expanded
                         && matches!(group.neighbours, Loadable::NotLoaded)
-                        && this.opens_by_itself(n) =>
+                        && this.opens_now(n, cx) =>
                 {
                     if let Some(group) = this.groups.get_mut(index) {
                         group.expanded = true;
@@ -2251,7 +2272,7 @@ impl NodePeek {
                         let opens = match (read, &count) {
                             (GroupRead::Whole { open: true }, Loadable::Loaded(n)) => Some(*n > 0),
                             (GroupRead::Whole { .. }, Loadable::Loaded(n)) => {
-                                Some(this.opens_by_itself(*n))
+                                Some(this.opens_now(*n, cx))
                             }
                             (GroupRead::Whole { .. }, _) => Some(false),
                             (GroupRead::Neighbours, _) => None,
@@ -5394,6 +5415,10 @@ impl NodePeek {
         // those the last frame laid out are measured again, the others keep the height they
         // had. This frame's are noted as they are laid out.
         let count = self.list_items.len();
+        let top = self.list.logical_scroll_top();
+        if top != std::mem::replace(&mut self.scroll_top, top) {
+            self.scrolled_at = Some(cx.background_executor().now());
+        }
         if let Some(drawn) = self.items_drawn.take() {
             let drawn = drawn.start.min(count)..drawn.end.min(count);
             if !drawn.is_empty() {
@@ -6374,6 +6399,94 @@ mod tests {
         let once: HashSet<&String> = read.iter().collect();
         assert_eq!(read.len(), groups, "every group read: {read:?}");
         assert_eq!(once.len(), groups, "each once");
+    }
+
+    /// A small group counted while the person scrolls shows its count and stays closed, so
+    /// the rows under it do not move while the list does; one counted before any scroll, or
+    /// once the list has been still for [`SCROLL_SETTLE`], opens by itself.
+    #[gpui::test]
+    async fn a_group_counted_while_scrolling_stays_closed(cx: &mut TestAppContext) {
+        let mut schema = PEOPLE.to_owned();
+        for n in 0..30 {
+            schema.push_str(&format!("edge Rel{n:02}: Person -> Person\n"));
+        }
+        let (session, _) = session_routing(
+            &schema,
+            move |request| match request["name"].as_str() {
+                Some("studio_node") => {
+                    json!([{ "n": { "@id": "p1", "slug": "p1", "name": "Ada" } }])
+                }
+                // Every group has one neighbour: small enough to open by itself.
+                Some("studio_neighbours") => json!([{ "id": "p2", "edge_id": "e1" }]),
+                _ => json!([]),
+            },
+            cx,
+        );
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let window = cx.open_window(gpui::size(px(480.), px(360.)), move |_, cx| {
+            let subject = PeekSubject::Node {
+                type_name: "Person".into(),
+                id: "p1".into(),
+            };
+            NodePeek::new(session, subject, None, None, HashMap::new(), false, cx)
+        });
+        let view = window.root(cx).unwrap();
+        let cx = VisualTestContext::from_window(window.into(), cx).into_mut();
+        cx.run_until_parked();
+
+        let states = |cx: &mut VisualTestContext| {
+            view.read_with(cx, |view, _| {
+                view.groups
+                    .iter()
+                    .filter(|group| matches!(group.count, Loadable::Loaded(1)))
+                    .map(|group| group.expanded)
+                    .collect::<Vec<bool>>()
+            })
+        };
+        let before = states(cx);
+        assert!(!before.is_empty(), "the groups in view are counted");
+        assert!(
+            before.iter().all(|&open| open),
+            "counted before any scroll, each opens"
+        );
+
+        // Scrolled: the groups that come into view are counted while the list moves.
+        for _ in 0..4 {
+            view.update(cx, |view, cx| {
+                view.list.scroll_by(px(120.));
+                cx.notify();
+            });
+            cx.run_until_parked();
+        }
+        let during = states(cx);
+        assert!(
+            during.len() > before.len(),
+            "more groups counted: {during:?}"
+        );
+        assert!(
+            during[before.len()..].iter().all(|&open| !open),
+            "counted mid-scroll, each stays closed: {during:?}"
+        );
+
+        // Still for longer than the settle, the next group counted opens again.
+        cx.executor().advance_clock(SCROLL_SETTLE);
+        let index = view.update(cx, |view, cx| {
+            let index = view
+                .groups
+                .iter()
+                .position(|group| matches!(group.count, Loadable::NotLoaded))
+                .expect("a group left to count");
+            view.load_group(index, false, cx);
+            index
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(matches!(view.groups[index].count, Loadable::Loaded(1)));
+            assert!(view.groups[index].expanded, "counted once still, it opens");
+        });
     }
 
     /// A peek of a table's row shows what the table counted without reading it again, and
