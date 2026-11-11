@@ -2852,6 +2852,26 @@ pub fn code_block(code: impl Into<SharedString>, cx: &App) -> Div {
         .child(code.into())
 }
 
+/// A command to run, in a [`code_block`] with Copy at its end: what Studio shows where an
+/// `omnigraph` or other command does what is asked (constitution VI). A copy is silent.
+pub fn command_block(id: impl Into<ElementId>, command: impl Into<SharedString>, cx: &App) -> Div {
+    let command: SharedString = command.into();
+    let copied = command.clone();
+    h_flex()
+        .w_full()
+        .gap(px(space::SM))
+        .items_start()
+        .child(div().flex_1().min_w_0().child(code_block(command, cx)))
+        .child(
+            row_icon_button(id, IconName::Copy)
+                .icon_color(Color::Muted)
+                .tip(tooltip("Copy"))
+                .on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(copied.to_string()))
+                }),
+        )
+}
+
 /// A group of [`field`]s: rows close together, so the group reads as one block.
 pub fn fields() -> Div {
     v_flex().w_full().gap(px(space::WITHIN))

@@ -9,7 +9,7 @@ use gpui::{
     ScrollHandle, SharedString, Subscription, Task, WeakEntity, Window,
 };
 use graph_client::Unauthorized;
-use graph_store::cli_config::{self, ManagedTarget, Platform};
+use graph_store::cli_config::{self, ManagedTarget, NoCli, Platform};
 use graph_store::sign_in::{Kept, SignIn, left_in_keychain};
 use graph_store::{
     Connection, ConnectionEvent, ConnectionRegistry, ConnectionState, ConnectionWatch,
@@ -916,6 +916,18 @@ impl OpenGraphModal {
             ))
     }
 
+    /// While Studio finds no Omnigraph CLI it can drive, a band over the pane says so, with the
+    /// CLI's reason, how to install one, and Check again; it stays until one is found (spec 029),
+    /// where a toast would have gone by behind the dialog.
+    fn render_cli_band(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let registry = ConnectionRegistry::try_global(cx)?;
+        let (no_cli, checking) = {
+            let registry = registry.read(cx);
+            (registry.no_cli()?.clone(), registry.checking_cli())
+        };
+        Some(cli_band(&no_cli, checking, registry, cx))
+    }
+
     fn render_graphs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(connection) = &self.selected else {
             return v_flex().child(studio_ui::ds::text::state("Add a server to start."));
@@ -1132,6 +1144,57 @@ impl OpenGraphModal {
             )
             .children(self.said_at(Said::Add))
             .children(self.said_at(Said::Adding))
+    }
+}
+
+/// The band [`OpenGraphModal::render_cli_band`] draws for `no_cli`, its Check again acting on
+/// `registry`; "Looking for the CLI…" while a look it asked is under way.
+fn cli_band(
+    no_cli: &NoCli,
+    checking: bool,
+    registry: Entity<ConnectionRegistry>,
+    cx: &mut Context<OpenGraphModal>,
+) -> AnyElement {
+    let title = if no_cli.unfit {
+        "Studio needs a newer Omnigraph CLI"
+    } else {
+        "Studio needs the Omnigraph CLI"
+    };
+    let check = studio_ui::ds::button("check-cli", "Check again")
+        .style(ButtonStyle::Subtle)
+        .disabled(checking)
+        .tip(studio_ui::ds::tooltip(
+            "Looks for the Omnigraph CLI again and lists its targets",
+        ))
+        .on_click(cx.listener(move |_, _, _, cx| {
+            registry.update(cx, |registry, cx| registry.check_cli_again(cx))
+        }));
+    studio_ui::ds::callout(ui::Severity::Warning, title)
+        .description_slot(
+            v_flex()
+                .gap(px(space::SM))
+                .child(ds::text::muted(if checking {
+                    "Looking for the CLI…".to_owned()
+                } else {
+                    format!("{} Install it, then Check again:", sentence(&no_cli.why))
+                }))
+                .child(studio_ui::ds::command_block(
+                    "copy-install",
+                    graph_store::cli::INSTALL,
+                    cx,
+                )),
+        )
+        .actions_slot(check)
+        .into_any_element()
+}
+
+/// `text` ending in a full stop.
+fn sentence(text: &str) -> String {
+    let text = text.trim_end();
+    if text.ends_with('.') {
+        text.to_owned()
+    } else {
+        format!("{text}.")
     }
 }
 
@@ -1560,6 +1623,7 @@ fn first_choice(connections: &[Entity<Connection>], cx: &App) -> Option<Entity<C
 impl Render for OpenGraphModal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let nav = self.render_nav(cx).into_any_element();
+        let cli_band = self.render_cli_band(cx);
         let body = match (self.adding, self.shown_plane()) {
             (true, _) => self.render_add(cx).into_any_element(),
             (false, Some((plane, organization))) => organizations::pane(
@@ -1622,6 +1686,7 @@ impl Render for OpenGraphModal {
                             .pt(px(space::XL))
                             .pb(px(space::LG))
                             .gap(px(space::MD))
+                            .children(cli_band)
                             .child(div().flex_1().min_h_0().child(body))
                             .children(self.said_at(Said::Pane)),
                     ),

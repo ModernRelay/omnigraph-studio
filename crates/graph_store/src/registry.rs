@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cli_config::{
     self, CliAuth, CliCredential, CliServer, CliTargets, CliTransport, FileStamp, ManagedTarget,
-    Platform, ProfileOwner,
+    NoCli, Platform, ProfileOwner,
 };
 use crate::cli_tokens::{self, CliTokenSource, TargetDigests, Token, TokenSource};
 use crate::connection::{Connection, ServerEntry, ServerSource};
@@ -114,6 +114,10 @@ pub struct ConnectionRegistry {
     /// what the CLI's targets could not give when last listed. One list, each said as it
     /// happened.
     notices: Vec<String>,
+    /// Why no CLI Studio can drive was found, until one is ([`Self::no_cli`]).
+    no_cli: Option<NoCli>,
+    /// A look for the CLI asked by the person is under way ([`Self::check_cli_again`]).
+    check_again: bool,
     http: Arc<dyn HttpClient>,
     transported: TransportHttp,
     /// The client made for each transport a CLI connection uses, which every target naming it
@@ -644,6 +648,8 @@ impl ConnectionRegistry {
             connections: Vec::new(),
             environment_notice: None,
             notices: Vec::new(),
+            no_cli: None,
+            check_again: false,
             http,
             transported: Arc::new(move |_| Ok(same.clone())),
             transport_clients: Vec::new(),
@@ -682,6 +688,27 @@ impl ConnectionRegistry {
     /// CLI Studio can drive, a configuration the CLI refuses, a target Studio does not connect
     /// to, the other targets on an address). Each says what happened, and the workspace shows
     /// each new one in a toast.
+    /// Why Studio found no Omnigraph CLI it can drive, until it finds one (spec 029).
+    pub fn no_cli(&self) -> Option<&NoCli> {
+        self.no_cli.as_ref()
+    }
+
+    /// Whether a look for the CLI asked by [`Self::check_cli_again`] is under way.
+    pub fn checking_cli(&self) -> bool {
+        self.check_again
+    }
+
+    /// Looks for the CLI and lists its targets again now, rather than at the next change where
+    /// Studio looks for it: the dialog's Check again, after the person installed one.
+    pub fn check_cli_again(&mut self, cx: &mut Context<Self>) {
+        if self._watch.is_none() {
+            return;
+        }
+        self.check_again = true;
+        cx.notify();
+        self.watch_cli_targets(cx);
+    }
+
     pub fn notices(&self) -> &[String] {
         &self.notices
     }
@@ -759,14 +786,17 @@ impl ConnectionRegistry {
                 if !std::mem::take(&mut first) {
                     cx.background_executor().timer(OPERATOR_POLL).await;
                 }
-                let Ok((watched, places, listing, platform)) = this.update(cx, |this, _| {
-                    (
-                        this.watched.clone(),
-                        this.cli_places.clone(),
-                        !this.listed,
-                        this.platform,
-                    )
-                }) else {
+                let Ok((watched, places, listing, platform, forced)) =
+                    this.update(cx, |this, _| {
+                        (
+                            this.watched.clone(),
+                            this.cli_places.clone(),
+                            !this.listed,
+                            this.platform,
+                            this.check_again,
+                        )
+                    })
+                else {
                     break;
                 };
                 let (stamp, cli_stamp, places) = cx
@@ -784,7 +814,7 @@ impl ConnectionRegistry {
                 }) else {
                     break;
                 };
-                if !listing && !listed_files && !cli_moved {
+                if !listing && !listed_files && !cli_moved && !forced {
                     continue;
                 }
                 let Ok(prepare) = this.update(cx, |this, _| this.transport_preparer()) else {
@@ -815,7 +845,8 @@ impl ConnectionRegistry {
                         let held_back = listing && targets.lists_again() && patient;
                         this.cli_stamp = cli_stamp;
                         this.keep_stamp(&targets);
-                        let changed = this.apply_cli_targets(targets, prepared, cx);
+                        let mut changed = this.apply_cli_targets(targets, prepared, cx);
+                        changed |= std::mem::take(&mut this.check_again);
                         if asks_again {
                             this.ask_cli_tokens_again(cx);
                         }
@@ -1263,11 +1294,19 @@ impl ConnectionRegistry {
             watched: _,
             managed,
             profiles,
+            no_cli,
         } = targets;
         let Some(servers) = servers else {
-            return self.keep_notices(errors);
+            // A CLI that cannot be driven is kept until one is found; a listing that failed for
+            // another reason says nothing of it.
+            let cli_changed = no_cli.is_some() && self.no_cli != no_cli;
+            if cli_changed {
+                self.no_cli = no_cli;
+            }
+            return self.keep_notices(errors) | cli_changed;
         };
-        let mut changed = self.apply_control_planes(profiles, cx);
+        let cli_found = self.no_cli.take().is_some();
+        let mut changed = self.apply_control_planes(profiles, cx) | cli_found;
         if self.managed_targets != managed {
             self.managed_targets = managed;
             changed = true;
@@ -2878,6 +2917,47 @@ mod tests {
                 "listed again after the add"
             );
         });
+    }
+
+    /// A listing that found no CLI Studio can drive keeps why, for the Open dialog, and says it
+    /// in no notice; a later listing that finds one lets it go. A listing that failed for another
+    /// reason says nothing of the CLI (spec 029).
+    #[gpui::test]
+    async fn a_missing_cli_is_kept_until_one_is_found(cx: &mut TestAppContext) {
+        let (http, _) = answering();
+        let cli = Arc::new(FakeCli::default());
+        let registry = registry_with(http, &cli, cx);
+        let missing = cli_config::NoCli {
+            unfit: false,
+            why: "Studio found no Omnigraph CLI it can drive".into(),
+        };
+        assert!(apply(
+            &registry,
+            CliTargets {
+                no_cli: Some(missing.clone()),
+                ..CliTargets::default()
+            },
+            cx
+        ));
+        registry.read_with(cx, |registry, _| {
+            assert_eq!(registry.no_cli(), Some(&missing));
+            assert!(registry.notices().is_empty(), "{:?}", registry.notices());
+        });
+        apply(
+            &registry,
+            CliTargets {
+                errors: vec!["the CLI refuses its configuration".into()],
+                ..CliTargets::default()
+            },
+            cx,
+        );
+        registry.read_with(cx, |registry, _| assert!(registry.no_cli().is_some()));
+        assert!(apply(
+            &registry,
+            files(vec![server("a", "http://a.test", "1")]),
+            cx
+        ));
+        registry.read_with(cx, |registry, _| assert_eq!(registry.no_cli(), None));
     }
 
     /// A token for an `http://` server on this machine, which the CLI keeps for no `http://`
