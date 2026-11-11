@@ -856,15 +856,19 @@ async fn open_session(
                         ))
                         .block_task()
                         .await;
+                    // A turn the agent will not run without a sign-in is that ask alone, not
+                    // a failed turn as well: the panel shows the sign-in, nothing else.
                     if let Err(error) = &response
                         && asks_sign_in(error)
                     {
+                        turns.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                         events
                             .unbounded_send(HostEvent::AuthRequired {
                                 methods,
                                 message: error_words(error),
                             })
                             .ok();
+                        return Ok(());
                     }
                     let stop = response
                         .map(|response| response.stop_reason)
