@@ -902,10 +902,12 @@ impl Workspace {
         }
     }
 
-    /// The open graphs as Studio reopens them at its next start.
-    fn session_snapshot(&self, cx: &App) -> SavedSession {
+    /// The open graphs as Studio reopens them at its next start: each by its server's name and
+    /// address, and a managed cluster's by what its control plane names it too.
+    pub fn session_snapshot(&self, cx: &App) -> SavedSession {
         let open = self.open_graphs();
         let shown = open.iter().position(|(_, shown)| *shown).unwrap_or(0);
+        let registry = graph_store::ConnectionRegistry::try_global(cx);
         SavedSession {
             graphs: open
                 .iter()
@@ -917,6 +919,9 @@ impl Workspace {
                         url: server.url.clone(),
                         graph: session.graph_id.clone(),
                         branch: session.branch.clone(),
+                        cluster: registry.as_ref().and_then(|registry| {
+                            registry.read(cx).cluster_identity(&session.connection, cx)
+                        }),
                     }
                 })
                 .collect(),

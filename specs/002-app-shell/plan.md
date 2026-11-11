@@ -91,7 +91,9 @@ by name, graph, branch, and the one shown) and bounds are written to the owner-o
 kept by its target's name and its id too (since 2026-10-22; before, by its server's address,
 which a window saved then names instead, so it is not reopened). The next start reopens every
 window that has a graph on a target the CLI still lists, where it was, showing the graph it
-showed; with none it opens one window asking for a graph. Closing a window forgets it, unless it was the last one open: that
+showed; with none it opens one window asking for a graph. A graph on a managed cluster names
+the cluster as its control plane does too, and reopens whether or not a CLI target names it
+(since 2026-11-10, [spec 021's amendment](../021-control-plane/reopening.md)). Closing a window forgets it, unless it was the last one open: that
 one comes back at the next start, or when the Dock icon is clicked with no window open, until
 another window opens. Quitting keeps every window. A new window (⌘⇧N) asks for a graph; it
 opens where the last moved window was. A `session.json` from before held one window's graphs

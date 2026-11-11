@@ -3,9 +3,10 @@
 Status: in progress; the control plane accepts Studio's sign-in (CP1, live 2026-11-05).
 Built: `control_client`; a profile's control-plane sign-in and its cluster list in the Open
 dialog, on the keyboard's path; data tokens from the control plane; a cluster no CLI target
-names opened for this run; a cluster's state and latest deployment in the connection chip's
+names opened from the list; a cluster's state and latest deployment in the connection chip's
 card; Omnigraph Cloud as a default control plane, which reaches clusters without the CLI and
-so on Windows · 2026-11-05
+so on Windows · 2026-11-05. A cluster reopened at the next start by the window that had it
+open, and opened from `omnigraph studio`'s link: [the amendment](reopening.md) · 2026-11-10
 
 ## Problem
 
@@ -126,11 +127,14 @@ With a sign-in held, opening the Open dialog reads `GET /v1/clusters` for each c
 | Cluster | Row |
 |---|---|
 | A CLI target names it (same `cluster_id` and `incarnation`) | The target's row, as today, with the cluster's `state` |
-| No CLI target names it, and it has a `data_endpoint` | The cluster's `name`, "Not a CLI target"; opening it connects for this run only and shows `omnigraph target add` for it (VI) |
+| No CLI target names it, and it has a `data_endpoint` | The cluster's `name` and `state`; opening it connects, a window that has one of its graphs open reopens it at the next start ([the amendment](reopening.md)), and its `omnigraph target add` is shown for using it from the CLI too (VI) |
 | No `data_endpoint` (provisioning, or data access off) | Dimmed, with its `state`: "Provisioning", or "No data endpoint" |
 | A CLI target names a cluster the list does not have | The target's row, marked "Not in org_… on the control plane" |
 
-Studio keeps no list: the answer is held while the dialog is open and dropped after.
+Studio keeps no list: the answer is held while the dialog is open and dropped after. A window
+that has a cluster's graph open names that one cluster when it is saved
+([the amendment](reopening.md)); that is the window's state, as a server's name and address
+are, and the control plane still decides when the cluster is reached again.
 
 ### A cluster's state
 
@@ -231,8 +235,9 @@ managed target, sees none. Studio has one control plane of its own:
 - **It is the plane at that route.** A CLI profile on the same route shares it; another route a
   profile names is its own plane. One sign-in each, and it lists every organization the person
   is a member of (One sign-in, every organization, below).
-- **Without the CLI.** Every cluster it lists opens for this run, with the control plane's data
-  token. Its command to keep it is
+- **Without the CLI.** Every cluster it lists opens with the control plane's data token, and
+  the window that has it open reopens it at the next start ([the amendment](reopening.md)).
+  Its command to use it from the CLI too is
   `omnigraph target add <name> --cluster <id>`, with a profile when one names the organization.
   This needs no CLI, so managed clusters work on Windows through it.
 - **Tests.** The setting's lifecycle, a profile on the same route sharing the plane, every
@@ -273,7 +278,7 @@ of the client, cluster sign-ins included.
 | Call the API from Studio | Run `omnigraph cluster list --json` and its siblings | The CLI holds its operator lock for each command, needs a login it can renew without a terminal (it answered `refresh_outcome_unknown` here), and exports no token on Windows |
 | The control plane found through `credentials status`'s `route` | Parse `~/.omnigraph/config.yaml` | Spec 003: Studio reads no operator file. The profile already names its route and organization, without a secret |
 | Omnigraph Cloud as a default control plane, besides the profiles' | Only the profiles' routes, as at first | Without the CLI, or on Windows, nobody could reach Omnigraph Cloud from Studio. One shipped address is a setting, not a server list, and the token names the organization |
-| A cluster without a CLI target opens for this run only | Register it as a target from Studio | Studio keeps no server list (spec 003); registering is the CLI's, and Studio shows its command |
+| A cluster without a CLI target opens from the control plane, and the window that has it open reopens it (amended 2026-11-10, [the amendment](reopening.md); at first it opened for the run only) | Register it as a target from Studio | Studio keeps no server list (spec 003); registering is the CLI's, and Studio shows its command. A window naming the cluster it had open is not a list |
 | Data tokens of 900 s | The 3600 s default, or 86400 s like a cached `cluster token` | Removing admission does not retract a data token; the shorter it lives, the sooner a removal holds |
 | Read only, plus the data token, in the first slice | Deployments, members and cluster lifecycle | Each is a write with its own outcome rules, and the CLI already does them; reading first shows whether people want them here |
 
@@ -375,3 +380,9 @@ of the client, cluster sign-ins included.
   organization's clusters asked for a sign-in on the web of their own, and each moved the one
   consent. The control plane's token now comes first while the plane holds a sign-in (The data
   token).
+- **2026-11-10, a cluster was open for the run only.** The plan had a cluster no CLI target
+  names opened for the run, so a CLI target stayed the only way to keep one, and the next start
+  showed whatever a target named: in an account with several organizations, another
+  organization's graph. A window now saves the cluster it had open and reopens it through the
+  control plane, and `omnigraph studio` opens a managed target by the cluster's identity
+  ([the amendment](reopening.md)).

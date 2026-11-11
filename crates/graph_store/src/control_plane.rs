@@ -16,13 +16,45 @@ use control_client::{
     ClusterDetail, ClusterList, ClusterStatus, ControlClient, ControlError, Envelope,
     OrganizationSummary,
 };
+use futures::channel::oneshot;
 use gpui::{App, AppContext as _, Context, Entity, Task};
 use http_client::HttpClient;
 use oauth_client::{Clients, Refusal};
+use serde::{Deserialize, Serialize};
 
 use crate::cli_tokens::TokenSource as _;
 use crate::control_token::PlaneHandle;
 use crate::sign_in::{self, End, Kept, OAuthSource, Service, SignIn, SignInContext};
+
+/// A managed cluster as its control plane names it: the plane's route, the organization the
+/// cluster is in, and the cluster's id and incarnation. It is what a saved window keeps of a
+/// cluster's server besides its name and address (spec 021, Reopening a cluster), and what an
+/// `omnigraph-studio://open` link from `omnigraph studio` names for a managed target: a CLI
+/// target's name is the CLI's, and a cluster needs none to be opened.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ClusterIdentity {
+    /// The control plane's origin ([`ControlPlane::route`]).
+    pub route: String,
+    pub organization: String,
+    pub cluster_id: String,
+    pub incarnation: String,
+}
+
+impl ClusterIdentity {
+    /// Whether `other` names the same incarnation of the same cluster, in the same organization
+    /// of the same control plane: a route with and without its last `/` is one route.
+    pub fn is(&self, other: &ClusterIdentity) -> bool {
+        same_route(&self.route, &other.route)
+            && self.organization == other.organization
+            && self.cluster_id == other.cluster_id
+            && self.incarnation == other.incarnation
+    }
+}
+
+/// Whether two control-plane routes are one: a last `/` does not tell them apart.
+pub(crate) fn same_route(a: &str, b: &str) -> bool {
+    a.trim_end_matches('/') == b.trim_end_matches('/')
+}
 
 /// What the control plane last answered for an organization's clusters.
 #[derive(Debug, Clone, PartialEq)]
@@ -54,6 +86,10 @@ pub struct ControlPlane {
     oauth: Option<OAuthSource>,
     /// The sign-in, or a launch's read of its keychain item, under way.
     signing_in: Option<Task<()>>,
+    /// Whether the launch's read of its keychain item is over ([`Self::when_kept_read`]), and
+    /// what waits for that.
+    kept_read: bool,
+    kept_waiters: Vec<oneshot::Sender<()>>,
     organizations: Option<Organizations>,
     /// Each organization's clusters, by its id.
     listings: BTreeMap<String, Listing>,
@@ -78,6 +114,8 @@ impl ControlPlane {
             service: None,
             oauth: None,
             signing_in: None,
+            kept_read: false,
+            kept_waiters: Vec::new(),
             organizations: None,
             listings: BTreeMap::new(),
             reading: None,
@@ -175,29 +213,63 @@ impl ControlPlane {
             .map_or(Kept::Nothing, OAuthSource::kept_in_keychain)
     }
 
+    /// Resolves once the launch's read of the keychain item is over, at once when it is: the
+    /// sign-in it kept is held by then, or there is none to take up. A window reopened on one of
+    /// its clusters waits for this, so the cluster is asked for the plane's token first and
+    /// never for a sign-in of its own while the item is still being read.
+    pub fn when_kept_read(&mut self) -> impl Future<Output = ()> + use<> {
+        let waiting = (!self.kept_read).then(|| {
+            let (read, waiting) = oneshot::channel();
+            self.kept_waiters.push(read);
+            waiting
+        });
+        async move {
+            if let Some(waiting) = waiting {
+                waiting.await.ok();
+            }
+        }
+    }
+
+    /// Whether the launch's read of the keychain item is over ([`Self::when_kept_read`]).
+    pub fn kept_read(&self) -> bool {
+        self.kept_read
+    }
+
+    /// The launch's read of the keychain item is over, or a sign-in or sign-out took its place.
+    fn kept_was_read(&mut self) {
+        self.kept_read = true;
+        for read in self.kept_waiters.drain(..) {
+            read.send(()).ok();
+        }
+    }
+
     /// Reads the item a sign-in left at launch, in its keychain turn, and holds it: the details
     /// it needs are read only once there is one.
     fn take_up_kept(&mut self, cx: &mut Context<Self>) {
         let Some(context) = self.context.clone() else {
+            self.kept_was_read();
             return;
         };
         let key = self.key();
         let route = self.route.clone();
         self.signing_in = Some(cx.spawn(async move |this, cx| {
-            let (before, done) = context.turns.next(&key);
-            if let Some(before) = before {
-                before.await;
+            let kept = async {
+                let (before, done) = context.turns.next(&key);
+                if let Some(before) = before {
+                    before.await;
+                }
+                let item = context.keychain.read(key.clone()).await.ok().flatten();
+                done.send(()).ok();
+                let (subject, secret) = item?;
+                let refresh = String::from_utf8(secret).ok()?;
+                Some((subject, refresh, discover(&context, &route).await))
             }
-            let item = context.keychain.read(key.clone()).await.ok().flatten();
-            done.send(()).ok();
-            let Some((subject, secret)) = item else {
-                return;
-            };
-            let Ok(refresh) = String::from_utf8(secret) else {
-                return;
-            };
-            let found = discover(&context, &route).await;
+            .await;
             this.update(cx, |this, cx| {
+                this.kept_was_read();
+                let Some((subject, refresh, found)) = kept else {
+                    return;
+                };
                 this.signing_in = None;
                 match found {
                     Ok(service) => {
@@ -240,6 +312,8 @@ impl ControlPlane {
         let Some(context) = self.context.clone() else {
             return;
         };
+        // A sign-in the person asked for takes the place of the launch's read of the item.
+        self.kept_was_read();
         let Some(service) = self.service.clone() else {
             self.sign_in = SignIn::Reading;
             cx.notify();
@@ -384,6 +458,7 @@ impl ControlPlane {
 
     fn end(&mut self, how: End, cx: &mut Context<Self>) {
         self.signing_in = None;
+        self.kept_was_read();
         self.reading = None;
         self.organizations = None;
         self.listings.clear();
@@ -603,6 +678,32 @@ impl ControlPlane {
                 status: None,
                 _reading: reading,
             }
+        }))
+    }
+}
+
+impl ControlPlane {
+    /// Reads the cluster `cluster_id` of `organization`, for a link that names it (spec 021,
+    /// Reopening a cluster): one request, with one silent refresh of the access token after a
+    /// 401, and nothing kept of the answer here. `None` without a sign-in held, so nothing is
+    /// sent.
+    pub fn read_cluster(
+        &self,
+        organization: &str,
+        cluster_id: &str,
+        cx: &App,
+    ) -> Option<Task<Result<Envelope<ClusterDetail>, ControlError>>> {
+        let source = self.oauth.clone()?;
+        let http = self.context.as_ref()?.elsewhere.clone();
+        let route = self.route.clone();
+        let organization = organization.to_owned();
+        let id = cluster_id.to_owned();
+        Some(cx.background_executor().spawn(async move {
+            with_access(&http, &route, &source, Some(&organization), |client| {
+                let id = id.clone();
+                async move { client.cluster(&id).await }
+            })
+            .await
         }))
     }
 }
@@ -878,13 +979,17 @@ mod tests {
                     .log
                     .push(format!("data token in {organization} {body}"));
                 let expires = (chrono::Utc::now() + chrono::Duration::seconds(900)).to_rfc3339();
-                let endpoint = cluster(&organization)["data_endpoint"].clone();
+                let cluster = cluster(&organization);
+                // As the control plane answers: the token's cluster and incarnation in `meta`.
+                let mut meta = meta();
+                meta["cluster_id"] = cluster["cluster_id"].clone();
+                meta["incarnation"] = cluster["incarnation"].clone();
                 (
                     200,
                     json!({
-                        "data": {"version": 2, "token": "data-token", "endpoint": endpoint,
+                        "data": {"version": 2, "token": "data-token", "endpoint": cluster["data_endpoint"],
                                  "expires_at": expires, "kid": "k", "actor": "user_1"},
-                        "meta": meta(),
+                        "meta": meta,
                     }),
                 )
             }
@@ -1139,6 +1244,55 @@ mod tests {
         assert!(cx.opened_url().is_none());
     }
 
+    /// What reopens a window on one of its clusters waits for the launch's read of the keychain
+    /// item, so the cluster is asked for the plane's token and not for a sign-in of its own:
+    /// the wait ends with the sign-in held when one was kept, and at once when the read is over,
+    /// when nothing was kept, and for a plane that cannot sign in here.
+    #[gpui::test]
+    fn the_read_of_a_kept_sign_in_can_be_waited_for(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let served = Arc::new(Mutex::new(Served::default()));
+        // Whether a wait for `plane`'s read, begun now, has ended.
+        let waited = |plane: &Entity<ControlPlane>, cx: &mut TestAppContext| {
+            let ended = Arc::new(AtomicBool::new(false));
+            let read = plane.update(cx, |p, _| p.when_kept_read());
+            let flag = ended.clone();
+            cx.foreground_executor()
+                .spawn(async move {
+                    read.await;
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                })
+                .detach();
+            ended
+        };
+        let over = |ended: &Arc<AtomicBool>| ended.load(std::sync::atomic::Ordering::SeqCst);
+
+        let keychain = Arc::new(MemoryKeychain::default());
+        keychain
+            .items
+            .lock()
+            .unwrap()
+            .insert(key(ROUTE), ("user_1".into(), b"kept".to_vec()));
+        let held = plane(context(&served, keychain), cx);
+        assert!(!held.read_with(cx, |p, _| p.kept_read()));
+        let ended = waited(&held, cx);
+        until(cx, "the read of the kept item", |_| over(&ended));
+        assert!(held.read_with(cx, |p, _| p.kept_read() && p.holds_sign_in()));
+        // Over: a later wait does not wait.
+        let again = waited(&held, cx);
+        cx.run_until_parked();
+        assert!(over(&again));
+
+        // Nothing kept: the wait ends with no sign-in held.
+        let empty = plane(context(&served, Arc::new(MemoryKeychain::default())), cx);
+        let ended = waited(&empty, cx);
+        until(cx, "the read of no item", |_| over(&ended));
+        assert!(empty.read_with(cx, |p, _| p.kept_read() && !p.holds_sign_in()));
+        // A plane that cannot sign in here reads nothing.
+        let unable = cx.new(|cx| ControlPlane::new(ROUTE.into(), None, cx));
+        assert!(unable.read_with(cx, |p, _| p.kept_read()));
+    }
+
     #[gpui::test]
     fn a_kept_sign_in_lists_after_a_silent_refresh(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
@@ -1182,6 +1336,7 @@ mod tests {
             handle.clone(),
             Some(OTHER.into()),
             "02C".into(),
+            "01I".into(),
             "https://beta.graphs.test".into(),
         );
         // Signed in, the plane's token is not held back for the cluster's own sign-in.
@@ -1199,10 +1354,26 @@ mod tests {
             handle.clone(),
             Some(OTHER.into()),
             "02C".into(),
+            "01I".into(),
             "https://other.graphs.test".into(),
         );
         let refused = smol::block_on(elsewhere.token(Arc::default())).unwrap_err();
         assert!(refused.why.contains("another address"), "{}", refused.why);
+
+        // So is a token for another incarnation: the cluster deleted and made again under its
+        // id is not the one a saved window or a CLI target named. Without the check the
+        // source hands out its token.
+        let remade = ControlTokenSource::of_plane(
+            None,
+            OTHER.into(),
+            handle.clone(),
+            "02C".into(),
+            "00I".into(),
+            "https://beta.graphs.test".into(),
+        );
+        let refused = smol::block_on(remade.token(Arc::default())).unwrap_err();
+        assert!(refused.why.contains("made again"), "{}", refused.why);
+        assert!(!refused.passing);
 
         // Refused by the cluster, the next is not asked for within the minute.
         source.note_refused();

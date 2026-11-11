@@ -33,8 +33,8 @@ pub(crate) enum Place {
     /// An organization in the sidebar, under its control plane: moving to it shows its
     /// clusters, and ↵ goes to the first.
     Organization(EntityId, String),
-    /// A cluster of an organization's pane that opens for this run, or that chooses the CLI
-    /// target naming it: its organization and `cluster_id`.
+    /// A cluster of an organization's pane that opens from its control plane, or that chooses
+    /// the CLI target naming it: its organization and `cluster_id`.
     Cluster(EntityId, String, String),
     Graph(String),
     /// The field for a new token, shown when the server refused the token.
@@ -583,7 +583,8 @@ impl OpenGraphModal {
         cx.notify();
     }
 
-    /// Opens `cluster`, which no CLI target names, for this run, and chooses it (spec 021).
+    /// Opens `cluster`, which no CLI target names, from its control plane, and chooses it
+    /// (spec 021). A window that opens one of its graphs reopens it at the next start.
     pub(crate) fn open_cluster(
         &mut self,
         plane: &Entity<ControlPlane>,
@@ -1394,8 +1395,8 @@ fn tooltip_for(
             .unwrap_or_default();
         return format!(
             "Studio asks the organization's control plane for this cluster's token, keeps it in \
-             memory and asks again before it ends. Opened for this run: to keep it, add it as a \
-             CLI target with `omnigraph target add {name} --cluster <id>{profile}`."
+             memory and asks again before it ends. To use this cluster from the CLI too, add it \
+             as a target with `omnigraph target add {name} --cluster <id>{profile}`."
         );
     }
     if let Some(profile) = profile {
@@ -1430,7 +1431,7 @@ fn source_label(source: &ServerSource, profile: Option<&str>) -> String {
         (ServerSource::Cli, Some(profile)) => format!("CLI target, CLI profile {profile}"),
         (ServerSource::Cli, None) => "CLI target".to_owned(),
         (ServerSource::Environment, _) => "environment".to_owned(),
-        (ServerSource::ControlPlane, _) => "from the control plane, for this run".to_owned(),
+        (ServerSource::ControlPlane, _) => "from the control plane".to_owned(),
     }
 }
 
@@ -2417,7 +2418,7 @@ mod tests {
     }
 
     /// A control plane signed in to, listing `org_1` (Acme) with two clusters: `acme` (`01C`),
-    /// which [`managed`]'s target names, and `beta`, which opens for this run.
+    /// which [`managed`]'s target names, and `beta`, which opens from the control plane.
     fn signed_in_plane(cx: &mut VisualTestContext) -> Entity<ControlPlane> {
         let cluster = |id: &str, name: &str| {
             serde_json::json!({
@@ -2485,7 +2486,7 @@ mod tests {
         );
         assert!(cx.debug_bounds("control-plane-clusters").is_some());
         assert!(cx.debug_bounds("open-graph").is_none());
-        // Both clusters are reached: one a target names, one that opens for this run.
+        // Both clusters are reached: one a target names, one that opens from the control plane.
         let places = modal.read_with(cx, |modal, cx| modal.places(cx));
         let acme = Place::Cluster(plane.entity_id(), "org_1".into(), "01C".into());
         let beta = Place::Cluster(plane.entity_id(), "org_1".into(), "02C".into());

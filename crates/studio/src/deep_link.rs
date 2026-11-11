@@ -9,6 +9,10 @@
 //!   is what `omnigraph studio` sends (Omnigraph 0.14.1, `protocols.studio` 1): a CLI target
 //!   by name, with digests of what it resolves to and of the operator file it was read from,
 //!   which Studio checks against its own `target inspect` before it opens the target's server.
+//! - `omnigraph-studio://open?api=<control plane>&organization=<org>&cluster=<id>&incarnation=<id>[&graph=<id>]`
+//!   is what `omnigraph studio` sends for a managed target: the cluster as its control plane
+//!   names it, with no target name, so no CLI target need name the cluster here (spec 021,
+//!   Reopening a cluster). The control plane must be one Studio holds and is signed in to.
 //! - `omnigraph-studio://connect?code=<code>` was reserved for that launcher before it existed,
 //!   and is still refused with a note.
 
@@ -43,6 +47,18 @@ pub struct CliLink {
     pub graph: Option<String>,
 }
 
+/// What `omnigraph studio` sends for a managed target: the cluster as its control plane names
+/// it, and the graph asked for, else the target's default graph, when there is either.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterLink {
+    pub cluster: graph_store::ClusterIdentity,
+    pub graph: Option<String>,
+}
+
+/// The longest id a cluster link names (an organization's, a cluster's, an incarnation's), as
+/// the CLI bounds an organization's.
+const ID_MAX: usize = 128;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeepLink {
     Graph(Target),
@@ -57,6 +73,9 @@ pub enum DeepLink {
     },
     /// A link from `omnigraph studio`, opened once its digests match this Mac's.
     Open(CliLink),
+    /// A link from `omnigraph studio` for a managed target: a cluster by what its control plane
+    /// names it, opened once that control plane answers for it.
+    OpenCluster(ClusterLink),
     /// The launcher's first shape, from before it existed; refused with a note.
     Connect,
 }
@@ -67,7 +86,7 @@ impl DeepLink {
             DeepLink::Graph(target)
             | DeepLink::Node { target, .. }
             | DeepLink::Query { target, .. } => Some(target),
-            DeepLink::Open(_) | DeepLink::Connect => None,
+            DeepLink::Open(_) | DeepLink::OpenCluster(_) | DeepLink::Connect => None,
         }
     }
 }
@@ -120,6 +139,40 @@ pub fn parse(link: &str) -> Result<DeepLink, String> {
     let need = |key: &str| get(key).ok_or_else(|| format!("The link has no {key}."));
     if route == "connect" {
         return Ok(DeepLink::Connect);
+    }
+    if route == "open" && get("target").is_none() && get("cluster").is_some() {
+        // An id goes into a request's path or a header: letters, digits, `_` and `-` only.
+        let id = |key: &str| -> Result<String, String> {
+            let value = need(key)?;
+            let plain = value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+            if !plain || value.len() > ID_MAX {
+                return Err(format!("The link's {key} is not an id."));
+            }
+            Ok(value)
+        };
+        let api = need("api")?;
+        let at = Url::parse(&api).ok().filter(|at| {
+            matches!(at.scheme(), "https" | "http")
+                && at.host_str().is_some()
+                && at.username().is_empty()
+                && at.password().is_none()
+                && at.query().is_none()
+                && at.fragment().is_none()
+        });
+        if at.is_none() {
+            return Err("The link's api is not a control plane's address.".into());
+        }
+        return Ok(DeepLink::OpenCluster(ClusterLink {
+            cluster: graph_store::ClusterIdentity {
+                route: api,
+                organization: id("organization")?,
+                cluster_id: id("cluster")?,
+                incarnation: id("incarnation")?,
+            },
+            graph: get("graph"),
+        }));
     }
     if route == "open" {
         let digest = |key: &str| -> Result<String, String> {
@@ -256,6 +309,87 @@ mod tests {
                 "omnigraph-studio://open?target=law&binding=md5:abc&home=sha256:{hex}"
             )),
             Err("The link's binding is not a sha256 digest.".into())
+        );
+    }
+
+    /// `omnigraph studio`'s link for a managed target names the cluster as its control plane
+    /// does, and no target; a part missing, or one that is no id or no address, is refused with
+    /// the reason. A link that names a target is the CLI target's, whatever else it names.
+    #[test]
+    fn an_open_link_names_a_managed_cluster() {
+        let link = "omnigraph-studio://open?api=https://platform.omnigraph.dev\
+                    &organization=org_01M1&cluster=01M5C&incarnation=01M5I";
+        let cluster = graph_store::ClusterIdentity {
+            route: "https://platform.omnigraph.dev".into(),
+            organization: "org_01M1".into(),
+            cluster_id: "01M5C".into(),
+            incarnation: "01M5I".into(),
+        };
+        assert_eq!(
+            parse(link),
+            Ok(DeepLink::OpenCluster(ClusterLink {
+                cluster: cluster.clone(),
+                graph: None,
+            }))
+        );
+        assert_eq!(
+            parse(&format!("{link}&graph=knowledge")),
+            Ok(DeepLink::OpenCluster(ClusterLink {
+                cluster,
+                graph: Some("knowledge".into()),
+            }))
+        );
+        // As the CLI writes it, the address percent-encoded, with the control plane's path.
+        assert_eq!(
+            parse(
+                "omnigraph-studio://open?api=https:%2F%2Fcontrol.example.com%2Fprefix\
+                 &organization=org_work&cluster=01CLUSTER&incarnation=01INCARNATION&graph=knowledge"
+            ),
+            Ok(DeepLink::OpenCluster(ClusterLink {
+                cluster: graph_store::ClusterIdentity {
+                    route: "https://control.example.com/prefix".into(),
+                    organization: "org_work".into(),
+                    cluster_id: "01CLUSTER".into(),
+                    incarnation: "01INCARNATION".into(),
+                },
+                graph: Some("knowledge".into()),
+            }))
+        );
+        assert_eq!(
+            parse("omnigraph-studio://open?api=https://c.test&organization=org_1&cluster=01C"),
+            Err("The link has no incarnation.".into())
+        );
+        assert_eq!(
+            parse("omnigraph-studio://open?organization=org_1&cluster=01C&incarnation=01I"),
+            Err("The link has no api.".into())
+        );
+        // An id that could add to a path or a header is no id.
+        for (organization, cluster) in [("org_1%0D%0Ax:1", "01C"), ("org_1", "01C%2F..%2Fx")] {
+            let refused = parse(&format!(
+                "omnigraph-studio://open?api=https://c.test&organization={organization}\
+                 &cluster={cluster}&incarnation=01I"
+            ))
+            .unwrap_err();
+            assert!(refused.ends_with("is not an id."), "{refused}");
+        }
+        for api in [
+            "ftp://c.test",
+            "https://user:pw@c.test",
+            "https://c.test/?x=1",
+            "c.test",
+        ] {
+            assert_eq!(
+                parse(&format!(
+                    "omnigraph-studio://open?api={api}&organization=org_1&cluster=01C&incarnation=01I"
+                )),
+                Err("The link's api is not a control plane's address.".into()),
+                "{api}"
+            );
+        }
+        // With a target it is a CLI target's link, and needs that link's digests.
+        assert_eq!(
+            parse(&format!("{link}&target=law")),
+            Err("The link has no binding.".into())
         );
     }
 
