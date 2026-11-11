@@ -80,7 +80,7 @@ times over.
 on `release-fast`: a key in the table's filter field, in a cell, in the query editor with six
 result columns, and in the Go To palette; a table scroll; the whole window drawn again, as each
 frame of an animation draws it (a dialog or a toast coming up, the connection dot); and a
-scroll of a node page, its tree and History, and a pan of its canvas. On 2026-10-18 (Apple M5 Pro, load
+scroll of a node page, the inspector, its tree and History, and a pan of its canvas. On 2026-10-18 (Apple M5 Pro, load
 average 8) each key cost 1.2 to 2.0 ms of main-thread CPU and a table scroll 4.3 ms. On the
 personal graph's 92-column Person type a table scroll costs 4.0 ms, and a 63-column query
 result 2.2 ms.
@@ -92,6 +92,11 @@ is most of the window. What is left of a table frame is GPUI's own work per elem
 each cell's rule (about a tenth of the frame), Taffy's layout and each element's style. Drawing
 the column rules once per column, over the rows, would take the quads; it is not done, since the
 rules would then draw over the cursor's ring and the edit field.
+
+On 2026-11-11 (load average 35 to 47) the inspector's scroll cost 4.3 ms on a company of the
+development graph and 1.4 to 6.5 ms on a person of the personal graph, with its 60 relationship
+groups, and read nothing as it scrolled. Turning off the re-measure of the items each draw
+changed nothing beyond the machine's noise.
 
 In the running app, `studio.show_performance` puts Studio's memory and CPU at the end of the
 footer, and a build with `--features perf` (GPUI's `profiler`) has GPUI's frame-time overlay on
