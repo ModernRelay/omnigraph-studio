@@ -465,7 +465,8 @@ pub struct ModelSettings {
     /// tried, in about 10 s.
     #[schemars(title = "Careful model", extend("x-control" = "model"))]
     pub careful: String,
-    /// Studio sends a task's input to OpenRouter and the model named above, with your key,
+    /// For Studio's own model features, not the agent panel, which uses your Claude or Codex
+    /// sign-in. Studio sends a task's input to OpenRouter and the model named above, with your key,
     /// which the system keychain holds: a table filter sends the type's property names and
     /// your sentence, a branch summary the changed records' titles and property names, a
     /// column fill the row's values in the columns you pick. Nothing is sent without a key.
