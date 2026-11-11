@@ -98,7 +98,7 @@ node Company {
         let mut matches = cursor.matches(&outline, tree.root_node(), EVERY_CONSTRUCT.as_bytes());
         let mut names = Vec::new();
         while let Some(found) = matches.next() {
-            for capture in found.captures.iter().filter(|c| c.index == name) {
+            for capture in found.captures().iter().filter(|c| c.index == name) {
                 names.push(
                     capture
                         .node

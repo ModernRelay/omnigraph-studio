@@ -65,6 +65,9 @@ pub(crate) struct ControlTokenSource {
     /// The control plane that gives its token.
     plane: PlaneHandle,
     cluster_id: String,
+    /// The incarnation of the cluster Studio opened: a token the control plane says is for
+    /// another, the cluster made again under its id, is dropped.
+    incarnation: String,
     /// The cluster's data endpoint: a token for any other is dropped.
     endpoint: String,
     /// When a data token was last asked for.
@@ -81,9 +84,18 @@ impl ControlTokenSource {
         plane: PlaneHandle,
         organization: Option<String>,
         cluster_id: String,
+        incarnation: String,
         endpoint: String,
     ) -> Self {
-        Self::with(Some(cli), None, organization, plane, cluster_id, endpoint)
+        Self::with(
+            Some(cli),
+            None,
+            organization,
+            plane,
+            cluster_id,
+            incarnation,
+            endpoint,
+        )
     }
 
     /// The source of a cluster no CLI target names, in `organization`: only the control plane
@@ -93,6 +105,7 @@ impl ControlTokenSource {
         organization: String,
         plane: PlaneHandle,
         cluster_id: String,
+        incarnation: String,
         endpoint: String,
     ) -> Self {
         Self::with(
@@ -101,6 +114,7 @@ impl ControlTokenSource {
             Some(organization),
             plane,
             cluster_id,
+            incarnation,
             endpoint,
         )
     }
@@ -111,6 +125,7 @@ impl ControlTokenSource {
         organization: Option<String>,
         plane: PlaneHandle,
         cluster_id: String,
+        incarnation: String,
         endpoint: String,
     ) -> Self {
         Self {
@@ -119,6 +134,7 @@ impl ControlTokenSource {
             organization,
             plane,
             cluster_id,
+            incarnation,
             endpoint,
             asked: Mutex::new(None),
             refused: AtomicBool::new(false),
@@ -155,6 +171,7 @@ impl TokenSource for ControlTokenSource {
         let plane = self.plane.clone();
         let organization = self.organization.clone();
         let cluster_id = self.cluster_id.clone();
+        let incarnation = self.incarnation.clone();
         let endpoint = self.endpoint.clone();
         async move {
             let organization = organization.as_deref();
@@ -168,6 +185,14 @@ impl TokenSource for ControlTokenSource {
                 why: format!("The control plane gave no data token: {error}"),
                 passing: error.is_passing(),
             })?;
+            // The answer names the incarnation its token is for. Another one is the cluster made
+            // again under its id: not the one opened, so its token is dropped, as one for
+            // another endpoint is.
+            if let Some(answered) = &answer.meta.incarnation
+                && *answered != incarnation
+            {
+                return Err(another_incarnation());
+            }
             leased(answer.data)
         }
         .boxed()
@@ -211,6 +236,15 @@ impl TokenSource for ControlTokenSource {
 fn no_sign_in() -> NoToken {
     NoToken {
         why: "Sign in to the organization's control plane to reach this cluster".into(),
+        passing: false,
+    }
+}
+
+fn another_incarnation() -> NoToken {
+    NoToken {
+        why: "The control plane's token is for a newer cluster with this id: the one opened here \
+              was deleted and made again. Open it again from its organization's clusters"
+            .into(),
         passing: false,
     }
 }
@@ -326,6 +360,7 @@ mod tests {
             plane,
             Some("org_1".into()),
             "01C".into(),
+            "01I".into(),
             "https://acme.test".into(),
         );
         let token = smol::block_on(source.token(Arc::default())).unwrap();

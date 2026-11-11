@@ -1877,7 +1877,7 @@ impl GraphCanvas {
         }
         let hit = self.hit(event.position);
         // ⌘-click marks a chip, or unmarks it, as ⌘-click picks rows in a table.
-        if event.modifiers.secondary() {
+        if event.modifiers.secondary(cx) {
             if let Some(index) = hit {
                 let id = self.scene.nodes[index].id.clone();
                 if !self.marked.remove(&id) {
@@ -2819,8 +2819,11 @@ impl GraphCanvas {
         v_flex()
             .absolute()
             // The canvas's controls stand in from its edges as a toolbar's do from its column's,
-            // apart as controls are.
-            .top(px(space::EDGE))
+            // apart as controls are: their first row where a toolbar centres its controls, so the
+            // view strip is where the page's and the tree's are.
+            .top(px((studio_ui::ds::size::TOOLBAR
+                - studio_ui::ds::size::CONTROL)
+                / 2.))
             .left(px(space::EDGE))
             .right(px(space::EDGE))
             .gap(px(space::CONTROLS))
@@ -2828,6 +2831,10 @@ impl GraphCanvas {
                 h_flex()
                     .w_full()
                     .gap(px(space::CONTROLS))
+                    // The view strip first, at the top left as every tab has it, so switching
+                    // views leaves it where it is; what is drawn follows it, its width changing
+                    // as nodes open.
+                    .children(studio_workspace::view_strip(Item::views(self, cx), cx))
                     // What is drawn, in a floating pill: the walk's root and its nodes, or the
                     // query.
                     .child(
@@ -2851,10 +2858,6 @@ impl GraphCanvas {
                             ),
                         )
                     })
-                    .children(
-                        studio_workspace::view_strip(Item::views(self, cx), cx)
-                            .map(|strip| panel("canvas-views").child(strip)),
-                    )
                     .child(div().flex_1())
                     .child(
                         panel("canvas-zoom")

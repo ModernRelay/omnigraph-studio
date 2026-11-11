@@ -339,10 +339,12 @@ date; not the key, a list or a vector). One read counts the rows per value under
 200 values, rows without a value last); each value is a section with a header (value, count,
 disclosure). An open section reads its first 10 rows when its line comes into view, then "Show
 N more of M" (or "Show N more" when the page holds the rest) reads a page, all keyset pages narrowed with `title = $value` (or `is null`) and
-pinned to the table's commit, in the table's sort. A closed section reads nothing. A section's
-read whose line is more than a screen from the lines drawn is dropped, freeing its slot (a
-connection has 8), and reads as many rows again when its line returns, a "Show more" page as a
-first read (before 2026-10-21 a dropped "Show more" never read again); rows a read puts in
+pinned to the table's commit, in the table's sort. A closed section reads nothing. A table has
+at most 3 section reads out (a connection has 8, so the counts and cells in view never wait
+behind them); a read asked for past them, a "Show more" page as a first read, goes when its line
+is next drawn with one back, and one whose line went by is never sent. A read out is never
+dropped: it lands though its line went by, and is not sent again when the line returns (before
+2026-11-11 one was dropped a screen away and sent again on the way back); rows a read puts in
 above the lines in view move the scroll with them, so those lines stay where they are (since
 2026-10-21). Every read is engine-side, so the counts are right at any size. Edge tables group
 by their own properties the same way.
@@ -460,6 +462,15 @@ its open section.
   save settles it (since 2026-10-21; before, a refused save then lost its text). Each edit has
   an editor of its own, so ⌘Z never brings back the text of the cell edited before.
 - Insert: a form generated from the node shape (required properties, key, enums, ranges).
+  **↵ closes the dialog as the insert goes (since 2026-11-10):** the person goes on while the
+  write is out, and the row shows where it sorts once it commits. Refused, not sent, matching
+  nothing, or of unknown outcome, the same dialog comes back with what was typed and why, as
+  soon as no other dialog is open (one opened meanwhile is the person's, and is never
+  replaced), so nothing typed is lost (constitution III). After an unknown outcome Insert stays
+  off until the form changes, and "Open history" says whether the row landed. A row is not
+  shown before it commits: a type without a key has no id until the server gives it one, and a
+  row that may never exist would take edits, peeks and deletes meant for a real one
+  (`dialogs::send_insert`, `Workspace::show_modal_again`). The relationship dialog does the same.
 - Delete (⌘⌫, or Delete… on the bulk bar): the picked rows (checkboxes, ⌘-click, ⇧-click), or
   else the cursor's, in one commit bound
   to the table's pin (`/mutate/if-graph-commit`). Before it is offered, the dialog reads what
@@ -471,7 +482,16 @@ its open section.
   more refuses, saying which (a chain whose every round finds more goes "at least 32 steps
   deep"; before 2026-10-21 such a chain was refused as more than 1,000 nodes), and points to
   the query editor. The dialog lists them by type and name with the relationship each
-  needs ("Also deletes 1 Person, 1 Badge that cannot exist without it"), and ↵ deletes. The
+  needs ("Also deletes 1 Person, 1 Badge that cannot exist without it"), and ↵ deletes.
+  **The rows leave at once (since 2026-11-10):** ↵ sends the delete, closes the dialog and
+  takes the table's own rows out, the cursor on the row now in their place, while the write is
+  out. Their drafts stay until it commits (constitution III), and the counts follow the commit.
+  Refused, not sent, or of unknown outcome, the rows come back where they were, picked as they
+  were (grouped, the rows are read again at the pin); the session's toast says why, and an
+  unknown outcome also marks the table behind its branch, since the head may hold the delete. A
+  delete that found none of its rows at the head leaves them out and says so in a toast. A
+  Refresh or a new filter while the delete is out reads what the server holds, and nothing is
+  put back over it (`TypeTable::rows_deleting`, `delete_not_made`, `delete_found_nothing`). The
   outcome's toast offers Undo (`studio_graph::UndoDelete`): it reads the delete commit's changes,
   inserts every node and then every relationship again in one commit bound to the delete's
   commit, so it applies only while the branch is still there; unkeyed relationships come back
@@ -558,6 +578,7 @@ kept answers.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-11-11 | A grouped table sends each section's read once, at most 3 at a time | `type_table` `a_section_read_out_as_its_line_goes_by_lands_and_is_not_sent_again` (Show more out, scrolled to the end and back twice: one read), `a_grouped_table_reads_a_few_sections_at_a_time_each_once` (40 open sections: at most 3 out, every one read, none twice); `snapshot` on the development graph, people grouped by company, 300 frames scrolling | Fixed. The scroll sent 30 reads where it sent 63 (the same run, 2026-11-11 morning): reads dropped a screen away were sent again as their lines came back |
 | 2026-11-02 | An enum's cell and a boolean's are chosen from their values | `type_table` `an_enum_cell_is_chosen_from_its_values_not_typed` (↵ on a nullable enum: the select has the keys and the editor none, None highlighted; ↓ ↑ around the ends; `m` to member, `a` straight after moves nothing, `g` after a pause to guest; ↵ saves guest and gives the keys back; opened again, guest is highlighted), `a_select_takes_only_the_value_picked` (Esc, and a click on another row's name in an active window, end the edit with no write and no draft; a click on member saves it), `a_boolean_cell_is_chosen_and_kept_as_a_draft` (true and false, no None on `Bool`; `f` ⌥↵ keeps the draft `false`, which opens highlighted), `typing_in_a_field_leaves_the_grid_as_it_was` extended (moving a select's highlight draws no grid). Offscreen snapshots on the dev graph's Project (1100×640 at 2×): ↵ on `status`, then ↓ | Pass. The cell keeps its chip with a chevron inside the ring; the list hangs under the cell's edge, the value held checked, then the keys. The first snapshot stretched the chip to the chevron (a block child), now a flex row |
 | 2026-11-02 | A click puts the cursor on a cell and a second edits it; a text cell's ⤢ or ⌘⇧↵ opens it in the editor | `type_table` `one_click_puts_the_cursor_on_a_value_and_a_second_edits_it` (a click on Person's name: the cursor there, nothing edited, ↓ moves it; a double click edits), `a_text_cells_expand_opens_it_in_the_editor_with_what_was_typed` (no ⤢ on the key; the name's ⤢, hovered and clicked, opens `OpenTextEditor` at the table's commit; ⌘⇧↵ in an open edit sends what was typed, kept as the draft; a read-only credential draws no ⤢ and has no key). Both fail on main, where one click edited and no cell had a ⤢. `a_branch_shows_what_it_changed_in_the_rows` also opens removed p3's Knows cell, as ↵ would: no `OpenType` (red without `open_cell`'s removed-row check). Offscreen snapshots on the dev graph (1440×900 at 2×): the cursor on a name, another row's title hovered, the cursor's row hovered, the cursor's cell edited | Pass. A 2 px ring with 6 px corners at the default radius, the ⤢ at the cell's end; the first render put the hovered ⤢ on the resting row's white fill inside the grey hovered row, so the grid draws the design system's hovered row itself and the ⤢ takes that fill |
 | 2026-11-01 | On a branch the rows the branch removed show first, struck and not for picking or editing, and the rows it added or changed are marked, a changed row by its changed cells | `type_table` `a_branch_shows_what_it_changed_in_the_rows` (a table on main, then on fix with p1 added, p2's name changed and p3 removed, then back on main), `branch_diff` `marks_the_types_rows_by_what_the_branch_did`, `a_removed_edge_keeps_its_ends`, `a_row_that_ends_where_it_began_is_not_marked` | Pass. On main nothing is read for it; on fix the rows read p3, p1, p2, select-all picked p1 and p2, Enter on p3 opened nothing; back on main p3 went. Not drawn by a test: the wash, the gutter bar and the strikethrough |
@@ -670,6 +691,8 @@ kept answers.
 | 2026-10-14 | Grouping by a neighbour's property and by an end's property | `gq_language` `rows_group_by_a_neighbours_or_an_ends_property` (for every relationship of every dev node type and every groupable property of the other type: the counts, and pages and counts narrowed to a value and to "no value", compile; for both ends of every dev edge the same), `group_keys_name_one_kind_each`; `type_table` `a_neighbours_property_narrows_by_its_value_and_an_end_has_no_value_in_the_row`, `rows_group_by_a_neighbours_or_an_ends_property` (the menu's keys and labels on Person and WorksAt); offscreen snapshots on the dev server: Person, Group, the `worksAt Company` submenu, city; scrolled to the end; WorksAt, Group, `to Company`, city; and the same counts read with curl | Submenus for `contributes Project`, `knows Person`, `worksAt Company` and `← knows Person`, each with its arrow; Berlin 9, Lisbon 9, London 46, San Francisco 46, Tokyo 58, Toronto 35, "No city" 38 of 200 people, as curl counted; WorksAt by `to Company.city`: Berlin 9, Lisbon 9, London 49, and 7 edges to companies with no city |
 | 2026-10-20 | The Blob write contract | `openapi/omnigraph-0.14.0-edge.json` (`cluster_putBlob`, `cluster_clearBlob`, `BlobWriteOutput`, `ErrorOutput.blob_precondition_failure`); Omnigraph `crates/omnigraph-server/src/handlers.rs` (`server_blob_put`, `server_blob_delete`) and `crates/omnigraph/src/blob.rs` (`managed_blob_etag`) at `cf2b20e9` | `If-Match` is `*` (a value is there) or strong tags; a null cell satisfies neither, and a put takes no `If-None-Match`, so a write into a null cell cannot be bound. The ETag hashes the table version with the row: any write to the type moves every ETag of it. A put needs `Content-Type: application/octet-stream`, at most 32 MiB; a receipt's `commit` is null only for a clear of a cell already null |
 | 2026-10-20 | A Blob write is bound to the value read and has three outcomes | `graph_client` `a_blob_put_sends_raw_bytes_bound_to_the_etag_read`, `a_blob_clear_of_a_null_cell_commits_nothing`, `a_changed_blob_refuses_the_write_with_its_current_etag`, `a_blob_put_without_the_servers_answer_is_unknown`; `type_table` `blob_write` tests, the peek's `a_file_stored_in_a_slot_is_bound_to_the_value_read`, `a_value_changed_elsewhere_is_offered_again_over_the_new_one`, `uploads_the_view_cannot_send_say_why_and_send_nothing`, `a_page_held_at_a_commit_stores_no_file`, the table's `a_file_dropped_on_a_blob_cell_is_stored_bound_to_the_value_read`, the tab's `a_file_stored_from_the_tab_shows_at_its_own_commit` and `a_tab_at_a_commit_writes_nothing`, against the fake server's Blob cells | One `PUT` with one content type, the bytes and the ETag read; the view, the table and the tab move to the write's commit and show its value; a value changed elsewhere sends one write, keeps the other writer's bytes and offers "Replace anyway" bound to the new ETag, which lands; a 32 MiB + 1 file and a held view send nothing; a lost answer is unknown and not sent again. The native picker and a drop from Finder were not driven: no test reaches the system's open panel or its file drags, so the paths after them (`upload_blob`, `upload`) are what the tests call |
+| 2026-11-10 | A delete's rows leave at once and come back where they were, picked, the cursor on its row, when it is refused or its outcome is unknown (which also offers Refresh); committed, they stay out and the table follows the commit | `type_table` `a_deletes_rows_leave_at_once_and_come_back_if_it_is_not_made`; the `type_table` suite | Pass. Not yet checked in the running app |
+| 2026-11-10 | ↵ in the insert dialog closes it as the insert goes; refused, the same dialog comes back with what was typed and why, after a dialog opened meanwhile closes | `type_table` `dialogs::tests::a_refused_insert_brings_its_dialog_back_with_what_was_typed`; the `type_table` and `studio_workspace` suites | Pass. Not yet checked in the running app |
 
 ## Corrections
 

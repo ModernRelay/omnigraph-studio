@@ -74,7 +74,9 @@ tells every view the values it set (`SessionEvent::PropertiesWritten`): a table,
 pinned to the commit it was made on that shows the nodes takes the values and moves to its
 commit, and a markdown editor with nothing unsaved shows the new value, wherever in Studio the
 write was made. A view whose pin is not the head, and that such a write did not move, shows
-"Newer data · Refresh" and changes nothing until the person refreshes (constitution II, V).
+"Newer data · Refresh" and changes nothing until the person refreshes (constitution II, V),
+except an ungrouped type table in front with nothing of the person's in it, which reads the
+head itself and takes it in one frame, keeping the cursor and the first row in view (spec 028).
 Property writes are bound by value: their `where` names each value read, so a commit that
 changed nothing they set does not refuse them. A list cannot be compared in a `where`, so a
 write that sets one is bound to a commit holding the values read
@@ -152,3 +154,9 @@ Studio connects to running servers:
    target add`, and `omnigraph credentials set` for its token); Studio keeps no server list.
 3. A local graph is opened by serving it first (`omnigraph-server --cluster <dir>`); Studio
    does not open storage itself.
+4. A managed cluster is opened from its control plane: from the plane's list in the Open
+   dialog, or from the link `omnigraph studio` sends for a managed target, with the control
+   plane's data token (spec 021). No CLI target need name it. The window that has one of its
+   graphs open saves the cluster as the control plane names it (`ClusterIdentity`: route,
+   organization, id, incarnation) and reopens it at the next start; Studio still keeps no list
+   of clusters (`specs/021-control-plane/reopening.md`).

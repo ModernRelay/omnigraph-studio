@@ -30,7 +30,7 @@ members = [
 default-members = ["crates/studio"]
 
 [workspace.package]
-version = "0.4.1"
+version = "0.4.3"
 edition = "2024"
 license = "GPL-3.0-or-later"
 publish = false
@@ -71,26 +71,26 @@ history = { path = "crates/history" }
 agent_panel = { path = "crates/agent_panel" }
 
 # Zed, one release tag for every crate (docs/zed-pin.md). GPL-3.0-or-later and Apache-2.0.
-gpui = { git = "https://github.com/zed-industries/zed", tag = "v1.26.2" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", tag = "v1.26.2" }
-ui = { git = "https://github.com/zed-industries/zed", tag = "v1.26.2" }
-theme = { git = "https://github.com/zed-industries/zed", tag = "v1.26.2" }
-menu = { git = "https://github.com/zed-industries/zed", tag = "v1.26.2" }
-collections = { git = "https://github.com/zed-industries/zed", tag = "v1.26.2" }
-util = { git = "https://github.com/zed-industries/zed", tag = "v1.26.2" }
-http_client = { git = "https://github.com/zed-industries/zed", tag = "v1.26.2" }
-reqwest_client = { git = "https://github.com/zed-industries/zed", tag = "v1.26.2" }
+gpui = { git = "https://github.com/zed-industries/zed", tag = "v1.27.0" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", tag = "v1.27.0" }
+ui = { git = "https://github.com/zed-industries/zed", tag = "v1.27.0" }
+theme = { git = "https://github.com/zed-industries/zed", tag = "v1.27.0" }
+menu = { git = "https://github.com/zed-industries/zed", tag = "v1.27.0" }
+collections = { git = "https://github.com/zed-industries/zed", tag = "v1.27.0" }
+util = { git = "https://github.com/zed-industries/zed", tag = "v1.27.0" }
+http_client = { git = "https://github.com/zed-industries/zed", tag = "v1.27.0" }
+reqwest_client = { git = "https://github.com/zed-industries/zed", tag = "v1.27.0" }
 # The reqwest fork Zed v1.23.2 pins, with its features, for a CLI target that trusts its own
 # certificate authority (spec 003): `reqwest_client` takes a `reqwest::Client` built with roots.
 reqwest = { package = "zed-reqwest", git = "https://github.com/zed-industries/reqwest.git", rev = "33bc764aa15ff7b200bf7c93bd96e24878d53e14", default-features = false, features = ["charset", "http2", "macos-system-configuration", "multipart", "rustls-tls-native-roots", "socks", "stream"] }
-editor = { git = "https://github.com/zed-industries/zed", tag = "v1.26.2" }
-markdown = { git = "https://github.com/zed-industries/zed", tag = "v1.26.2" }
-language = { git = "https://github.com/zed-industries/zed", tag = "v1.26.2" }
-settings = { git = "https://github.com/zed-industries/zed", tag = "v1.26.2" }
-release_channel = { git = "https://github.com/zed-industries/zed", tag = "v1.26.2" }
-zlog = { git = "https://github.com/zed-industries/zed", tag = "v1.26.2" }
-theme_settings = { git = "https://github.com/zed-industries/zed", tag = "v1.26.2" }
-assets = { git = "https://github.com/zed-industries/zed", tag = "v1.26.2" }
+editor = { git = "https://github.com/zed-industries/zed", tag = "v1.27.0" }
+markdown = { git = "https://github.com/zed-industries/zed", tag = "v1.27.0" }
+language = { git = "https://github.com/zed-industries/zed", tag = "v1.27.0" }
+settings = { git = "https://github.com/zed-industries/zed", tag = "v1.27.0" }
+release_channel = { git = "https://github.com/zed-industries/zed", tag = "v1.27.0" }
+zlog = { git = "https://github.com/zed-industries/zed", tag = "v1.27.0" }
+theme_settings = { git = "https://github.com/zed-industries/zed", tag = "v1.27.0" }
+assets = { git = "https://github.com/zed-industries/zed", tag = "v1.27.0" }
 
 # Omnigraph's parser and type checker. MIT; no Lance dependency.
 omnigraph-compiler = { git = "https://github.com/ModernRelay/omnigraph", tag = "v0.14.0" }
@@ -143,9 +143,10 @@ windows-sys = "0.61"
 
 # Zed patches crates.io crates in its own workspace. Patches do not carry over to a crate that
 # depends on Zed, so Studio repeats the ones its graph reaches. Copied from Zed v1.23.2
-# Cargo.toml; recheck on every bump (docs/zed-pin.md).
+# Cargo.toml and rechecked at v1.27.0 (tree-sitter-language at Zed's new tree-sitter revision);
+# recheck on every bump (docs/zed-pin.md).
 [patch.crates-io]
-tree-sitter-language = { git = "https://github.com/tree-sitter/tree-sitter", rev = "43623ec9bf0eaaf7113285c46e8a09018f181b18" }
+tree-sitter-language = { git = "https://github.com/tree-sitter/tree-sitter", rev = "803c6ebaac27d69e1808b45058482e868d073ceb" }
 notify = { git = "https://github.com/zed-industries/notify", rev = "d842f16b2716bd60f09caf3ae3a894237ab38f54" }
 notify-types = { git = "https://github.com/zed-industries/notify", rev = "d842f16b2716bd60f09caf3ae3a894237ab38f54" }
 async-process = { git = "https://github.com/zed-industries/async-process.git", rev = "0b6d6713570af61806e1e5cb40e0f757cb93fd9d" }

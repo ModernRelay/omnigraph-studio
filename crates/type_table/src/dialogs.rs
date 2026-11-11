@@ -5,6 +5,7 @@
 
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use editor::{Editor, EditorEvent};
 use gpui::{
@@ -83,17 +84,6 @@ trait InsertForm: EventEmitter<DismissEvent> + Sized + 'static {
         {
             *shown = None;
         }
-    }
-
-    /// The write is in: with no notice the dialog closes, else it says why.
-    fn finish_insert(&mut self, notice: Option<Notice>, cx: &mut Context<Self>) {
-        let (saving, shown) = self.outcome_mut();
-        *saving = false;
-        match notice {
-            None => cx.emit(DismissEvent),
-            Some(notice) => *shown = Some(notice),
-        }
-        cx.notify();
     }
 }
 
@@ -177,11 +167,13 @@ fn field_values(fields: &mut [Field], cx: &App) -> Option<Vec<(String, Value)>> 
 }
 
 /// Sends an insert on `branch`, the branch the dialog was opened on, which its checks read,
-/// and shows its outcome; `no_match` says why one that matched nothing inserted nothing. The
-/// write is never cancelled with the dialog: the table hears the outcome even when the dialog
-/// was closed meanwhile, and keeps the row (`key`, `values`) it inserted.
+/// and closes the dialog: the person goes on while the write is out (spec 004). Committed, the
+/// table shows the row (`key`, `values`) where it sorts. Not made, or of unknown outcome, the
+/// same dialog comes back with what was typed and why, as soon as no other dialog is open, so
+/// nothing typed is lost (constitution III); `no_match` says why one that matched nothing
+/// inserted nothing.
 #[expect(clippy::too_many_arguments)]
-fn send_insert<T: InsertForm>(
+fn send_insert<T: InsertForm + ModalView>(
     session: &Entity<GraphSession>,
     table: WeakEntity<TypeTable>,
     branch: String,
@@ -196,7 +188,14 @@ fn send_insert<T: InsertForm>(
         session.write_on(&branch, query, None, description, None, cx)
     });
     table.update(cx, |table, _| table.save_started()).ok();
-    cx.spawn_in(window, async move |this, cx| {
+    let workspace = table
+        .upgrade()
+        .map(|table| table.read(cx).workspace())
+        .unwrap_or_else(WeakEntity::new_invalid);
+    // The dialog is kept while its write is out, to come back if it is not made.
+    let dialog = cx.entity();
+    cx.emit(DismissEvent);
+    cx.spawn_in(window, async move |_, cx| {
         let outcome = write.await;
         let result = save_result(&outcome, &branch);
         table
@@ -208,15 +207,31 @@ fn send_insert<T: InsertForm>(
             })
             .ok();
         let notice = match result {
-            SaveResult::Saved { .. } => None,
-            SaveResult::NoMatch => Some(Notice::new(Tone::Refused, no_match)),
-            SaveResult::Refused(notice) | SaveResult::Unknown(notice) => Some(notice),
+            SaveResult::Saved { .. } => return,
+            SaveResult::NoMatch => Notice::new(Tone::Refused, no_match),
+            SaveResult::Refused(notice) | SaveResult::Unknown(notice) => notice,
         };
-        this.update(cx, |this, cx| this.finish_insert(notice, cx))
-            .ok();
+        dialog.update(cx, |dialog, cx| {
+            *dialog.outcome_mut().1 = Some(notice);
+            cx.notify();
+        });
+        // Back once no other dialog is open: one the person opened meanwhile is theirs.
+        loop {
+            let shown = workspace.update_in(cx, |workspace, window, cx| {
+                workspace.show_modal_again(dialog.clone(), window, cx)
+            });
+            if !matches!(shown, Ok(false)) {
+                break;
+            }
+            cx.background_executor().timer(DIALOG_BACK_AFTER).await;
+        }
     })
     .detach();
 }
+
+/// How often a dialog whose insert was not made looks again for its turn to come back, while
+/// another dialog is open.
+const DIALOG_BACK_AFTER: Duration = Duration::from_millis(250);
 
 /// "Open history", after an unknown outcome: where whether the write landed is read
 /// (constitution III). The dialog stays, its values with it.
@@ -299,9 +314,8 @@ impl InsertForm for InsertRowModal {
             Some(key) => format!("Insert {} {key}", self.type_name),
             None => format!("Insert {}", self.type_name),
         };
-        self.saving = true;
+        // Not `saving`: the dialog closes as the write goes ([`send_insert`]).
         self.notice = None;
-        cx.notify();
         let values: Map<String, Value> = values.into_iter().collect();
         send_insert(
             &self.session,
@@ -331,12 +345,7 @@ impl InsertForm for InsertRowModal {
     }
 }
 
-impl ModalView for InsertRowModal {
-    /// A write still running keeps the dialog open: its outcome shows here.
-    fn on_before_dismiss(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
-        !self.saving
-    }
-}
+impl ModalView for InsertRowModal {}
 
 impl Focusable for InsertRowModal {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
@@ -611,9 +620,8 @@ impl InsertForm for InsertEdgeModal {
                 return;
             }
         };
-        self.saving = true;
+        // Not `saving`: the dialog closes as the write goes ([`send_insert`]).
         self.notice = None;
-        cx.notify();
         let description = format!("Insert {} {from} → {to}", self.edge_name);
         send_insert(
             &self.session,
@@ -644,12 +652,7 @@ impl InsertForm for InsertEdgeModal {
     }
 }
 
-impl ModalView for InsertEdgeModal {
-    /// A write still running keeps the dialog open: its outcome shows here.
-    fn on_before_dismiss(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
-        !self.saving
-    }
-}
+impl ModalView for InsertEdgeModal {}
 
 impl Focusable for InsertEdgeModal {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
@@ -1150,61 +1153,59 @@ impl DeleteRowModal {
             session.write_on(&branch, &query, if_commit, description, follow_up, cx)
         });
         let table = self.table.clone();
-        table.update(cx, |table, _| table.save_started()).ok();
+        // The rows leave the table now and the dialog closes: the person goes on while the
+        // write is out, and the rows come back if it is refused (spec 004, constitution III).
+        table
+            .update(cx, |table, cx| {
+                table.save_started();
+                table.rows_deleting(&branch, &own, cx);
+            })
+            .ok();
         let several = self.targets.len() > 1 || dependents > 0;
-        cx.spawn_in(window, async move |this, cx| {
+        cx.emit(DismissEvent);
+        cx.spawn_in(window, async move |_, cx| {
             let outcome = write.await;
             let result = save_result(&outcome, &branch);
             let moved = matches!(&outcome, graph_client::WriteOutcome::Refused(error)
                 if error.status == 412 || error.body.precondition_failure.is_some());
             if let SaveResult::Saved { .. } = &result {
-                session
-                    .update(cx, |session, cx| {
-                        // The deleted rows' drafts on the branch they were deleted from, though
-                        // the window moved to another branch meanwhile.
-                        let keys: Vec<DraftKey> = session
-                            .drafts_on(&branch)
-                            .filter(|(key, _)| {
-                                removed.iter().any(|(t, id)| key.type_name == *t && key.id == *id)
-                            })
-                            .map(|(key, _)| key.clone())
-                            .collect();
-                        for key in &keys {
-                            session.remove_draft_on(&branch, key, cx);
-                        }
-                    });
+                session.update(cx, |session, cx| {
+                    // The deleted rows' drafts on the branch they were deleted from, though
+                    // the window moved to another branch meanwhile.
+                    let keys: Vec<DraftKey> = session
+                        .drafts_on(&branch)
+                        .filter(|(key, _)| {
+                            removed
+                                .iter()
+                                .any(|(t, id)| key.type_name == *t && key.id == *id)
+                        })
+                        .map(|(key, _)| key.clone())
+                        .collect();
+                    for key in &keys {
+                        session.remove_draft_on(&branch, key, cx);
+                    }
+                });
             }
+            // A refused or unknown outcome has its toast from the session's log; a delete that
+            // found nothing has the table's.
             table
                 .update(cx, |table, cx| {
-                    if let SaveResult::Saved { commit, parent } = &result {
-                        table.rows_deleted(&branch, &own, commit, parent.as_deref(), cx);
-                    } else if moved {
-                        table.branch_moved(cx);
+                    match &result {
+                        SaveResult::Saved { commit, parent } => {
+                            table.rows_deleted(&branch, &own, commit, parent.as_deref(), cx)
+                        }
+                        SaveResult::NoMatch => table.delete_found_nothing(&own, several, cx),
+                        SaveResult::Refused(_) => {
+                            table.delete_not_made(&own, false, cx);
+                            if moved {
+                                table.branch_moved(cx);
+                            }
+                        }
+                        SaveResult::Unknown(_) => table.delete_not_made(&own, true, cx),
                     }
                     table.save_finished(cx);
                 })
                 .ok();
-            this.update(cx, |this, cx| {
-                this.saving = false;
-                match result {
-                    SaveResult::Saved { .. } => cx.emit(DismissEvent),
-                    SaveResult::NoMatch => {
-                        this.notice = Some(Notice::new(
-                            Tone::Conflict,
-                            if several {
-                                "Nothing was deleted: they no longer exist at the head of the branch."
-                            } else {
-                                "Nothing was deleted: it no longer exists at the head of the branch."
-                            },
-                        ));
-                    }
-                    SaveResult::Refused(notice) | SaveResult::Unknown(notice) => {
-                        this.notice = Some(notice)
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
         })
         .detach();
     }
@@ -1721,5 +1722,97 @@ mod tests {
                 }
             });
         }
+    }
+
+    /// ↵ in the insert dialog sends the insert and closes the dialog; refused, the same dialog
+    /// comes back with what was typed and why, though only once no other dialog is open
+    /// (spec 004, constitution III).
+    #[gpui::test]
+    async fn a_refused_insert_brings_its_dialog_back_with_what_was_typed(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+            editor::init(cx);
+        });
+        let refused = serde_json::json!({ "error": "policy denied", "code": "forbidden", "disposition": { "action": "refresh", "effects": "none" } });
+        let session =
+            crate::test_support::session_answering(crate::test_support::PEOPLE, 403, refused, cx);
+        let (workspace, cx) = cx.add_window_view(studio_workspace::Workspace::new);
+        let table = workspace.update_in(cx, |_, window, cx| {
+            let workspace = cx.entity().downgrade();
+            cx.new(|cx| {
+                TypeTable::new(
+                    workspace,
+                    session.clone(),
+                    "Person".into(),
+                    None,
+                    window,
+                    cx,
+                )
+            })
+        });
+        cx.run_until_parked();
+        let schema = Arc::new(SchemaModel::parse(crate::test_support::PEOPLE).unwrap());
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_modal(window, cx, |window, cx| {
+                InsertRowModal::new(
+                    table.downgrade(),
+                    session.clone(),
+                    schema.clone(),
+                    "Person".into(),
+                    window,
+                    cx,
+                )
+            })
+        });
+        let dialog = || {
+            let workspace = workspace.clone();
+            move |cx: &mut gpui::VisualTestContext| {
+                workspace.read_with(cx, |workspace, _| {
+                    workspace.active_modal::<InsertRowModal>()
+                })
+            }
+        };
+        let modal = dialog()(cx).expect("open");
+        modal.update_in(cx, |modal, window, cx| {
+            for (field, text) in modal.fields.iter().zip(["p9", "Hedy"]) {
+                field
+                    .editor
+                    .update(cx, |editor, cx| editor.set_text(text, window, cx));
+            }
+            modal.submit(window, cx);
+        });
+        assert!(dialog()(cx).is_none(), "closed as the insert goes");
+
+        // Another dialog opened meanwhile is the person's: the refused one waits for it.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_modal(window, cx, |window, cx| {
+                InsertRowModal::new(
+                    table.downgrade(),
+                    session.clone(),
+                    schema.clone(),
+                    "Person".into(),
+                    window,
+                    cx,
+                )
+            })
+        });
+        cx.run_until_parked();
+        let other = dialog()(cx).expect("the other dialog");
+        assert_ne!(other.entity_id(), modal.entity_id(), "not replaced");
+        workspace.update_in(cx, |workspace, window, cx| workspace.hide_modal(window, cx));
+        cx.executor().advance_clock(DIALOG_BACK_AFTER * 2);
+        cx.run_until_parked();
+        let back = dialog()(cx).expect("back");
+        assert_eq!(back.entity_id(), modal.entity_id(), "the same dialog");
+        back.read_with(cx, |modal, cx| {
+            let typed: Vec<String> = modal
+                .fields
+                .iter()
+                .map(|field| field.editor.read(cx).text(cx))
+                .collect();
+            assert_eq!(typed, ["p9", "Hedy"], "what was typed");
+            assert!(modal.notice.is_some(), "and why");
+        });
     }
 }

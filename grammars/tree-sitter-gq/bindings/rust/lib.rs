@@ -133,7 +133,7 @@ explain query q() { match { $p: Person } return { $p.name } }
             let mut cursor = QueryCursor::new();
             let mut matches = cursor.matches(&highlights, tree.root_node(), source.as_bytes());
             while let Some(found) = matches.next() {
-                for capture in found.captures.iter().filter(|c| c.index == keyword) {
+                for capture in found.captures().iter().filter(|c| c.index == keyword) {
                     words.push(
                         capture
                             .node
@@ -195,7 +195,7 @@ explain query q() { match { $p: Person } return { $p.name } }
         let mut matches = cursor.matches(&outline, tree.root_node(), EVERY_CLAUSE.as_bytes());
         let mut names = Vec::new();
         while let Some(found) = matches.next() {
-            for capture in found.captures.iter().filter(|c| c.index == name) {
+            for capture in found.captures().iter().filter(|c| c.index == name) {
                 names.push(
                     capture
                         .node

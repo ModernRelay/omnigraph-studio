@@ -17,7 +17,8 @@
 //! after notifying the workspace (or redrawing everything) and prints their times;
 //! `measure:<n>,scroll=<dy>` first scrolls at the window's centre each frame (a zoom on the
 //! canvas; `scroll=<dx>:<dy>` scrolls sideways too), and `measure:<n>,drag=<dx>:<dy>` drags from the centre by that much a frame (a pan),
-//! both back and forth every 30 frames; `measure:<n>,type` types a letter into the focused
+//! both back and forth every 30 frames (`,at=<x>:<y>` puts the pointer there instead, as on the
+//! inspector; `,live` lets reads and timers land before each frame, timed with it); `measure:<n>,type` types a letter into the focused
 //! field and takes it back, alternately. Each also prints the main thread's CPU time per
 //! frame, which a busy machine does not inflate. `SNAPSHOT_WAIT_MS` (default 1500) is how
 //! long to let each step's network work finish; `SNAPSHOT_SIZE` is `WIDTHxHEIGHT` (default
@@ -222,8 +223,12 @@ fn main() {
             let mut typing = false;
             let mut scroll: Option<(f32, f32)> = None;
             let mut drag: Option<(f32, f32)> = None;
+            let mut at: Option<(f32, f32)> = None;
+            let mut live = false;
             for part in parts {
-                if part == "refresh" {
+                if part == "live" {
+                    live = true;
+                } else if part == "refresh" {
                     refresh = true;
                 } else if part == "type" {
                     typing = true;
@@ -238,11 +243,18 @@ fn main() {
                 } else if let Some(delta) = part.strip_prefix("drag=") {
                     let (dx, dy) = delta.split_once(':').expect("drag=<dx>:<dy>");
                     drag = Some((dx.parse().expect("drag dx"), dy.parse().expect("drag dy")));
+                } else if let Some(point) = part.strip_prefix("at=") {
+                    let (x, y) = point.split_once(':').expect("at=<x>:<y>");
+                    at = Some((x.parse().expect("at x"), y.parse().expect("at y")));
                 }
             }
-            // Input goes to the window's centre: each frame first handles one scroll or one move
-            // of a held button, as a frame of a real zoom or pan does, then draws.
-            let center = point(px(width / 2.), px(height / 2.));
+            // Input goes to the window's centre, or where `at` puts it: each frame first handles
+            // one scroll or one move of a held button, as a frame of a real zoom or pan does,
+            // then draws.
+            let center = match at {
+                Some((x, y)) => point(px(x), px(y)),
+                None => point(px(width / 2.), px(height / 2.)),
+            };
             if drag.is_some() {
                 cx.update_window(handle, |_, window, cx| {
                     window.dispatch_event(
@@ -263,9 +275,20 @@ fn main() {
             for frame in 0..frames {
                 // Back and forth every 30 frames, so the view stays where it can be measured.
                 let sign = if (frame / 30) % 2 == 0 { 1. } else { -1. };
+                // `live`: a frame's worth of real time passes before each frame, and what landed
+                // meanwhile (reads, timers) is handled inside the frame's time, as the app does
+                // between two frames.
+                let (mut landed, mut landed_cpu) = (Duration::ZERO, Duration::ZERO);
+                if live {
+                    std::thread::sleep(Duration::from_millis(8));
+                    cx.advance_clock(Duration::from_millis(8));
+                    let (start, cpu_start) = (Instant::now(), thread_cpu_time());
+                    cx.run_until_parked();
+                    (landed, landed_cpu) = (start.elapsed(), thread_cpu_time() - cpu_start);
+                }
                 cx.update_window(handle, |root, window, cx| {
-                    let start = Instant::now();
-                    let cpu_start = thread_cpu_time();
+                    let start = Instant::now() - landed;
+                    let cpu_start = thread_cpu_time() - landed_cpu;
                     if typing {
                         // Typing into the focused field: a letter, then taking it back.
                         let key = if frame % 2 == 0 { "a" } else { "backspace" };
@@ -384,8 +407,9 @@ fn main() {
         }
         if let Some(keys) = spec.strip_prefix("key:") {
             for key in keys.split(' ') {
-                let keystroke = gpui::Keystroke::parse(key).expect("a keystroke");
                 cx.update_window(handle, |_, window, cx| {
+                    let keystroke = gpui::Keystroke::parse_with_os(key, cx.platform_info().os)
+                        .expect("a keystroke");
                     window.dispatch_keystroke(keystroke, cx);
                 })
                 .expect("press a key");

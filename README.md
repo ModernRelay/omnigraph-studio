@@ -40,8 +40,8 @@ Studio checks for a newer version half a minute after launch and every hour (Set
 Updates, or Check for Updates in the app menu). On macOS it downloads the update, checks its
 signature and installs it, ready at the next restart; on Linux and Windows it says a newer
 version is out and links to it ([spec 017](specs/017-auto-update/plan.md)). Installing needs
-releases signed with the Developer ID and the update key; until the update key is published
-(below), Studio says a newer version is out on macOS too.
+releases signed with the Developer ID and the update key. The key is in Studio from 0.4.2, so
+0.4.1 and earlier say a newer version is out and link to it; 0.4.2 and later install it.
 
 ## Quick start
 
@@ -209,9 +209,11 @@ A release's updates are signed with an update key (spec 017). Make it once with 
 signer generate` (cargo-packager 0.11.8): its public half goes in
 `crates/studio_update/update-key.pub`, the private half and its password in the
 `STUDIO_UPDATER_KEY` and `STUDIO_UPDATER_KEY_PASSWORD` secrets of the repository's
-`update-signing` environment. Give that environment required reviewers: the release workflow
-signs a tag's update there, so no workflow change alone can sign one. Once `update-key.pub`
-holds the key, a release whose macOS update is not signed with it is refused.
+`update-signing` environment. That environment needs a reviewer's approval and takes only `v*`
+tags: the release workflow signs a tag's update there, so no workflow change alone can sign
+one, and each release waits for the approval. `update-key.pub` holds the key (2026-11-09), so a
+release whose macOS update is not signed with it is refused. The key and its password are also
+kept in 1Password ("Omnigraph Studio Update Signing Key"), since a secret cannot be read back.
 
 CI runs these checks on macOS, Linux and Windows for each pull request that changes more than
 documentation, and not again on merge. `crates/studio/examples/snapshot.rs` renders Studio

@@ -21,10 +21,10 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    Action, AnyView, App, Bounds, ClickEvent, Context, DismissEvent, Div, DragMoveEvent, ElementId,
-    Entity, EntityId, EventEmitter, FocusHandle, Focusable, KeyContext, MouseButton, Pixels, Point,
-    Render, ScrollHandle, SharedString, Stateful, Subscription, Task, WeakEntity, Window,
-    WindowControlArea, WindowHandle, deferred, div, point,
+    Action, AnimationExt as _, AnyView, App, Bounds, ClickEvent, Context, DismissEvent, Div,
+    DragMoveEvent, ElementId, Entity, EntityId, EventEmitter, FocusHandle, Focusable, KeyContext,
+    MouseButton, Pixels, Point, Render, ScrollHandle, SharedString, Stateful, Subscription, Task,
+    WeakEntity, Window, WindowControlArea, WindowHandle, deferred, div, point,
 };
 use graph_store::{
     AccessAction, AccessScope, ConnectionRegistry, ConnectionState, ControlPlane, GraphSession,
@@ -256,6 +256,13 @@ const TOAST_TICK: Duration = Duration::from_millis(250);
 /// Toasts shown at once.
 const TOASTS_SHOWN: usize = 4;
 
+/// How far above its place a dialog starts as it comes up.
+const DIALOG_SETTLE: f32 = 6.;
+
+/// How far a toast slides in from the right as it comes, and drifts right as it goes.
+const TOAST_SLIDE: f32 = 8.;
+const TOAST_DRIFT: f32 = 4.;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceEvent {
     SessionChanged,
@@ -364,6 +371,9 @@ pub struct Workspace {
     _follow_subscription: Subscription,
     toasts: Vec<Toast>,
     next_toast: usize,
+    /// Toasts going: each with the place it had in the stack, drawn there as it fades out
+    /// ([`Self::let_toast_go`]). They are no longer toasts shown: nothing counts or folds them.
+    leaving_toasts: Vec<(usize, Toast)>,
     actions: Vec<ActionRegistration>,
     /// The views the active tab offers, as the frame drawn asked them once ([`Self::offers_view`]):
     /// each view action's condition reads them, rather than asking the tab again.
@@ -694,6 +704,7 @@ impl Workspace {
             _follow_subscription: cx.observe_self(|this, cx| this.follow_active_item(cx)),
             toasts: Vec::new(),
             next_toast: 0,
+            leaving_toasts: Vec::new(),
             actions: Vec::new(),
             offered_views: Vec::new(),
             focus_handle: cx.focus_handle(),
@@ -891,10 +902,12 @@ impl Workspace {
         }
     }
 
-    /// The open graphs as Studio reopens them at its next start.
-    fn session_snapshot(&self, cx: &App) -> SavedSession {
+    /// The open graphs as Studio reopens them at its next start: each by its server's name and
+    /// address, and a managed cluster's by what its control plane names it too.
+    pub fn session_snapshot(&self, cx: &App) -> SavedSession {
         let open = self.open_graphs();
         let shown = open.iter().position(|(_, shown)| *shown).unwrap_or(0);
+        let registry = graph_store::ConnectionRegistry::try_global(cx);
         SavedSession {
             graphs: open
                 .iter()
@@ -906,6 +919,9 @@ impl Workspace {
                         url: server.url.clone(),
                         graph: session.graph_id.clone(),
                         branch: session.branch.clone(),
+                        cluster: registry.as_ref().and_then(|registry| {
+                            registry.read(cx).cluster_identity(&session.connection, cx)
+                        }),
                     }
                 })
                 .collect(),
@@ -2548,6 +2564,32 @@ impl Workspace {
             }
         }
         let view = cx.new(|cx| build(window, cx));
+        self.install_modal(view, previous_focus, window, cx);
+    }
+
+    /// Shows a modal made before, as one closed while its write was out comes back with that
+    /// write's outcome (spec 004), when no other modal is open; whether it is shown.
+    pub fn show_modal_again<V: ModalView>(
+        &mut self,
+        view: Entity<V>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.modal.is_some() {
+            return false;
+        }
+        let previous_focus = window.focused(cx);
+        self.install_modal(view, previous_focus, window, cx);
+        true
+    }
+
+    fn install_modal<V: ModalView>(
+        &mut self,
+        view: Entity<V>,
+        previous_focus: Option<FocusHandle>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let subscription =
             cx.subscribe_in(&view, window, |this, _, _: &DismissEvent, window, cx| {
                 this.hide_modal(window, cx);
@@ -2591,6 +2633,11 @@ impl Workspace {
             cx.notify();
         }
         true
+    }
+
+    /// The modal open, when it is a `V`.
+    pub fn active_modal<V: 'static>(&self) -> Option<Entity<V>> {
+        self.modal.as_ref()?.view.clone().downcast::<V>().ok()
     }
 
     /// Whether a modal is open: a window waiting to ask for a graph does not ask over one.
@@ -2707,8 +2754,7 @@ impl Workspace {
                                 .saturating_sub(TOAST_TICK);
                             toast.remaining = Some(left);
                             if left.is_zero() {
-                                this.toasts.retain(|t| t.id != id);
-                                cx.notify();
+                                this.let_toast_go(id, cx);
                                 return true;
                             }
                         }
@@ -2839,8 +2885,30 @@ impl Workspace {
     }
 
     pub fn dismiss_toast(&mut self, id: usize, cx: &mut Context<Self>) {
-        self.toasts.retain(|t| t.id != id);
+        self.let_toast_go(id, cx);
+    }
+
+    /// Takes a toast off the stack, dismissed or run out, and lets it fade where it was for
+    /// [`studio_ui::motion::LEAVE`] (spec 002, Motion); then the toasts below close up. A toast
+    /// taken to make room, or folded, goes at once: another takes its place.
+    fn let_toast_go(&mut self, id: usize, cx: &mut Context<Self>) {
+        let Some(at) = self.toasts.iter().position(|t| t.id == id) else {
+            return;
+        };
+        let toast = self.toasts.remove(at);
+        self.leaving_toasts.push((at, toast));
         cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(studio_ui::motion::LEAVE)
+                .await;
+            this.update(cx, |this, cx| {
+                this.leaving_toasts.retain(|(_, t)| t.id != id);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// The text of each toast shown, oldest first: for the tests of crates that show toasts.
@@ -4801,20 +4869,21 @@ impl Workspace {
     }
 
     fn render_toasts(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let moves = studio_ui::motion::enabled(cx);
         // Under the top bar and a pane's tabs, so a toast never covers the scope or a tab.
         v_flex()
             .absolute()
             .top(px(HEADER_HEIGHT * 2. + studio_ui::ds::space::MD))
             .right(px(studio_ui::ds::space::LG))
             .gap(px(studio_ui::ds::space::MD))
-            .children(self.toasts.iter().map(|toast| {
+            .children(self.toasts_drawn().into_iter().map(|(toast, leaving)| {
                 let color = match toast.kind {
                     ToastKind::Info => Color::Muted,
                     ToastKind::Success => Color::Success,
                     ToastKind::Error => Color::Error,
                 };
                 let id = toast.id;
-                h_flex()
+                let toast = h_flex()
                     .id(("toast", id))
                     .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                         if let Some(toast) = this.toasts.iter_mut().find(|t| t.id == id) {
@@ -4848,8 +4917,47 @@ impl Workspace {
                             .on_click(
                                 cx.listener(move |this, _, _, cx| this.dismiss_toast(id, cx)),
                             ),
-                    )
+                    );
+                // A toast slides in from the edge it sits on and drifts back out that way as it
+                // fades, keyed by the toast so each comes once (spec 002, Motion). Reduced
+                // motion keeps the fades.
+                let id = id as u64;
+                if leaving {
+                    toast
+                        .with_animation(
+                            ElementId::NamedInteger("toast-goes".into(), id),
+                            studio_ui::motion::arrival(studio_ui::motion::LEAVE),
+                            move |toast, t| {
+                                toast
+                                    .opacity(1. - t)
+                                    .when(moves, |toast| toast.relative().left(px(TOAST_DRIFT * t)))
+                            },
+                        )
+                        .into_any_element()
+                } else {
+                    toast
+                        .with_animation(
+                            ElementId::NamedInteger("toast-comes".into(), id),
+                            studio_ui::motion::arrival(studio_ui::motion::ENTER),
+                            move |toast, t| {
+                                toast.opacity(t).when(moves, |toast| {
+                                    toast.relative().left(px(TOAST_SLIDE * (1. - t)))
+                                })
+                            },
+                        )
+                        .into_any_element()
+                }
             }))
+    }
+
+    /// The toasts to draw, oldest first, each with whether it is going: the stack, with each
+    /// toast going back in the place it had.
+    fn toasts_drawn(&self) -> Vec<(&Toast, bool)> {
+        let mut drawn: Vec<(&Toast, bool)> = self.toasts.iter().map(|t| (t, false)).collect();
+        for (at, toast) in &self.leaving_toasts {
+            drawn.insert((*at).min(drawn.len()), (toast, true));
+        }
+        drawn
     }
 }
 
@@ -5019,7 +5127,7 @@ impl Render for Workspace {
             (!p.others(p.active).is_empty(), !p.all_unpinned().is_empty())
         });
         // Escape leaves focus mode once what has the keyboard has nothing of its own to cancel.
-        let mut key_context = KeyContext::new_with_defaults();
+        let mut key_context = KeyContext::new_with_defaults(cx.platform_info().os);
         key_context.add("Workspace");
         if self.focus_mode.is_some() {
             key_context.add("focus_mode");
@@ -5183,46 +5291,72 @@ impl Render for Workspace {
         // closes it. A dialog sits a quarter of the way down the space it leaves free, as
         // Tower's `1fr auto 3fr` rows place it; the palette a tenth of the window down.
         let viewport = window.viewport_size();
+        let moves = studio_ui::motion::enabled(cx);
         let modal = self.modal.as_ref().map(|modal| {
             let palette = modal.placement == ModalPlacement::Palette;
+            // A dialog comes up (spec 002, Motion): its dim and card fade in as the card settles
+            // a few pixels down into place, keyed by the modal so each one arrives once. The
+            // palette opens in one frame, and every modal goes in one.
+            let key = modal.view.entity_id().as_u64();
+            let arrives = !palette;
             let card = div()
                 .flex_none()
                 .min_h_0()
                 .max_w_full()
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .child(modal.view.clone());
-            deferred(
-                v_flex()
-                    .absolute()
-                    .size_full()
-                    .top_0()
-                    .left_0()
-                    .items_center()
-                    .px(px(studio_ui::ds::space::EDGE))
-                    .py(px(studio_ui::ds::space::EDGE))
-                    .bg(if palette {
-                        studio_ui::ds::surface::veil(cx)
-                    } else {
-                        studio_ui::ds::surface::backdrop(cx)
-                    })
-                    .occlude()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, window, cx| {
-                            this.hide_modal(window, cx);
-                        }),
-                    )
-                    .map(|layer| {
-                        if palette {
-                            layer.pt(viewport.height * 0.1).child(card)
-                        } else {
-                            let mut below = div().flex_1();
-                            below.style().flex_grow = Some(3.);
-                            layer.child(div().flex_1()).child(card).child(below)
-                        }
+            let card = if arrives && moves {
+                card.with_animation(
+                    ElementId::NamedInteger("dialog-settles".into(), key),
+                    studio_ui::motion::arrival(studio_ui::motion::ENTER),
+                    |card, t| card.relative().top(px(DIALOG_SETTLE * (1. - t))),
+                )
+                .into_any_element()
+            } else {
+                card.into_any_element()
+            };
+            let layer = v_flex()
+                .absolute()
+                .size_full()
+                .top_0()
+                .left_0()
+                .items_center()
+                .px(px(studio_ui::ds::space::EDGE))
+                .py(px(studio_ui::ds::space::EDGE))
+                .bg(if palette {
+                    studio_ui::ds::surface::veil(cx)
+                } else {
+                    studio_ui::ds::surface::backdrop(cx)
+                })
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        this.hide_modal(window, cx);
                     }),
-            )
-            .with_priority(1)
+                )
+                .map(|layer| {
+                    if palette {
+                        layer.pt(viewport.height * 0.1).child(card)
+                    } else {
+                        let mut below = div().flex_1();
+                        below.style().flex_grow = Some(3.);
+                        layer.child(div().flex_1()).child(card).child(below)
+                    }
+                });
+            // Reduced motion keeps the fade (constitution VII).
+            let layer = if arrives {
+                layer
+                    .with_animation(
+                        ElementId::NamedInteger("dialog-fades-in".into(), key),
+                        studio_ui::motion::arrival(studio_ui::motion::ENTER),
+                        |layer, t| layer.opacity(t),
+                    )
+                    .into_any_element()
+            } else {
+                layer.into_any_element()
+            };
+            deferred(layer).with_priority(1)
         });
         // Focus mode: the active tab alone over the whole window, with no docks, tab strip or
         // status bar. A window not (yet) full screen keeps a strip it moves by, under the
@@ -8313,6 +8447,69 @@ mod tests {
     /// A full stack takes away a toast with no follow-up first, then the oldest with one, but
     /// never an Undo or an error: an agent's four commits after a delete leave the delete's
     /// Undo up. A stack of nothing but those makes room by folding its two oldest errors into
+    /// A toast dismissed, or run out, is off the stack at once (nothing counts or folds it) but
+    /// is drawn where it was while it fades, then gone; the toasts below keep their order.
+    #[gpui::test]
+    fn a_toast_that_goes_fades_where_it_was_then_is_gone(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+        });
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        let drawn = |cx: &mut gpui::VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                workspace
+                    .toasts_drawn()
+                    .into_iter()
+                    .map(|(toast, going)| (toast.message.to_string(), going))
+                    .collect::<Vec<_>>()
+            })
+        };
+        workspace.update(cx, |workspace, cx| {
+            for text in ["one", "two", "three"] {
+                workspace.show_toast(ToastKind::Error, text.to_owned(), cx);
+            }
+        });
+        let two = workspace.read_with(cx, |workspace, _| workspace.toasts[1].id);
+        workspace.update(cx, |workspace, cx| workspace.dismiss_toast(two, cx));
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(
+                workspace.toast_messages(),
+                ["one", "three"],
+                "off the stack at once"
+            );
+        });
+        assert_eq!(
+            drawn(cx),
+            [
+                ("one".into(), false),
+                ("two".into(), true),
+                ("three".into(), false)
+            ],
+            "drawn in its place while it fades"
+        );
+        cx.run_until_parked();
+        cx.executor().advance_clock(studio_ui::motion::LEAVE);
+        cx.run_until_parked();
+        assert_eq!(
+            drawn(cx),
+            [("one".into(), false), ("three".into(), false)],
+            "then gone"
+        );
+
+        // One that runs out goes the same way.
+        workspace.update(cx, |workspace, cx| {
+            workspace.show_toast(ToastKind::Info, "saved".to_owned(), cx)
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(TOAST_DURATION);
+        cx.run_until_parked();
+        assert!(drawn(cx).contains(&("saved".into(), true)), "fading");
+        cx.executor().advance_clock(studio_ui::motion::LEAVE);
+        cx.run_until_parked();
+        assert_eq!(drawn(cx).len(), 2, "gone");
+    }
+
     /// one toast that counts them.
     #[gpui::test]
     fn an_undo_and_an_error_stay_when_toasts_overflow(cx: &mut gpui::TestAppContext) {
