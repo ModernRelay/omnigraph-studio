@@ -2488,19 +2488,20 @@ impl ReviewView {
                 let view = view.clone();
                 Some(cx.new(|cx| ScopeMenu::new(view, commits, scope, cx)))
             });
-        let search =
-            studio_ui::ds::search_field(self.search.clone(), cx).w(px(studio_ui::ds::size::FIELD));
+        // The search and the layout switch are pills too, so the row is one height and shape.
+        let search = studio_ui::ds::pill_search("review-search", self.search.clone(), cx)
+            .w(px(studio_ui::ds::size::FIELD));
         let layout = self.layout;
         let segment =
             |id: &'static str, label: &'static str, this: ReviewLayout, tip: &'static str| {
                 let focus = focus.clone();
-                studio_ui::ds::segment(id, label, layout == this, cx)
+                studio_ui::ds::pill_segment(id, label, layout == this, cx)
                     .tip_fn(move |_, cx| {
                         studio_ui::ds::tooltip_for_action_in_view(tip, &SwitchLayout, &focus, cx)
                     })
                     .on_click(cx.listener(move |view, _, _, cx| view.set_layout(this, cx)))
             };
-        let layouts = studio_ui::ds::segmented_track(cx)
+        let layouts = studio_ui::ds::pill_segments("review-layout", cx)
             .child(segment(
                 "layout-feed",
                 "Feed",

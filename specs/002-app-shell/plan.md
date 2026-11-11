@@ -794,10 +794,16 @@ than styling one-off elements.
   `shadow-custom` (below; its border clear), the error border with the drops alone when
   invalid)
   around `ds::field_input`, and every search box is `ds::search_field`, so fields line up
-  with the buttons beside them: the settings search and text fields, the history and review
-  searches, the dialogs' fields, the review editor's fields and the query's parameters. A
+  with the buttons beside them: the settings search and text fields, the history
+  search, the dialogs' fields, the review editor's fields and the query's parameters. A
   filter among a sidebar's rows (the conversations') is `ds::sidebar_search` instead: a
   sunken row as tall as the rows, its text on their edge, with no border.
+- **A toolbar of chips is one height and shape** (since 2026-11-11). Where a toolbar holds
+  control chips, its search is `ds::pill_search` and a choice of layouts is `ds::pill_segments`
+  of round `ds::pill_segment`s, so the search, the chips and the switch are all a pill's 22 px
+  with round ends (the review's toolbar; the table's words filter is a `ds::pill_field`). A
+  28 px field with the scale's corner beside 22 px pills, and a 28 px track, read as three
+  sizes in one row.
 - **Tabs** fill the 32 px strip (an explicit height: the right-click wrapper lays a tab out at
   its content's height, so `h_full` would shrink it to its label); the active tab joins the
   document, inactive ones sit on the strip's rule. A tab is laid out after Zed's `Tab`: its

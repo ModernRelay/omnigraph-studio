@@ -1948,6 +1948,60 @@ pub fn pill_field(id: impl Into<ElementId>, invalid: bool, cx: &App) -> Stateful
         })
 }
 
+/// A search in a toolbar of [`control_chip`]s: a [`pill_field`] led by a magnifying glass, so
+/// it is the chips' height and shape. A search in a form or a list is [`search_field`].
+pub fn pill_search(id: impl Into<ElementId>, editor: impl IntoElement, cx: &App) -> Stateful<Div> {
+    pill_field(id, false, cx)
+        .child(
+            Icon::new(IconName::MagnifyingGlass)
+                .size(IconSize::XSmall)
+                .color(Color::Muted),
+        )
+        .child(field_input(editor))
+}
+
+/// A choice of two or three in a toolbar of [`control_chip`]s (a view's layout): a raised pill,
+/// as a chip is, holding round [`pill_segment`]s [`PILL_BUTTON_GAP`] inside its edge, so it is
+/// the chips' height and shape. A switch beside fields and tracks is [`segmented_track`].
+pub fn pill_segments(id: impl Into<ElementId>, cx: &App) -> Stateful<Div> {
+    pill_frame(id, cx)
+        .px(px(PILL_BUTTON_GAP))
+        .gap(px(space::XXS))
+}
+
+/// One option of [`pill_segments`]: round, a [`pill_button`]'s height; the selected one is
+/// filled and in ink, the others their muted label until hovered.
+pub fn pill_segment(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    selected: bool,
+    cx: &App,
+) -> Stateful<Div> {
+    let hover = surface::highlight(cx);
+    h_flex()
+        .id(id.into())
+        .h(px(size::PILL - 2. * PILL_BUTTON_GAP))
+        .px(px(space::MD - PILL_BUTTON_GAP))
+        .items_center()
+        .rounded_full()
+        .cursor_pointer()
+        .when(selected, |segment| segment.bg(surface::pressed(cx)))
+        .when(!selected, |segment| {
+            segment.hover(move |style| style.bg(hover))
+        })
+        .child(
+            Label::new(label.into())
+                .size(LabelSize::Small)
+                .weight(text::weight::BODY)
+                .color(if selected {
+                    Color::Default
+                } else {
+                    Color::Muted
+                })
+                .single_line(),
+        )
+}
+
 /// The filter being written, as the [`filter_pill`] it will become: its segments on the
 /// document's fill, ringed in the focus colour while it is open (red when its value is
 /// refused). The ring is outside it, as a pill's edge is, so its buttons keep a button's
