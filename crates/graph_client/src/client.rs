@@ -2511,8 +2511,8 @@ mod tests {
         GraphClient::new("http://127.0.0.1:8787", Some("t".into()), http).unwrap()
     }
 
-    /// A blank token is none, given at the start or later: sent, a server would read `Bearer `
-    /// as no credential, and say it got none.
+    /// A loopback address is this machine's, by its host; a name that only begins like one is
+    /// another host (spec 029).
     #[test]
     fn a_loopback_address_is_this_machine() {
         for url in [
@@ -2531,6 +2531,8 @@ mod tests {
         }
     }
 
+    /// A blank token is none, given at the start or later: sent, a server would read `Bearer `
+    /// as no credential, and say it got none.
     #[test]
     fn a_blank_token_is_none() {
         let http = FakeHttpClient::create(|_| async { unreachable!() });
