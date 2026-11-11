@@ -233,6 +233,21 @@ struct RowLook {
 }
 
 /// How long scrolling must pause before the drawn rows' Blob cells are read.
+/// Rows the table's own delete took out before its outcome is known (constitution III): what
+/// puts them back if the write is refused, or its outcome is unknown.
+struct PendingDelete {
+    ids: Vec<String>,
+    /// Each row with the place it had, ungrouped, in the order they were placed.
+    rows: Vec<(usize, Row)>,
+    /// The rows of these that were picked.
+    picked: Vec<String>,
+    /// How many rows went, and of those how many matched the filters, for the counts.
+    counts: (i64, i64),
+    /// The rows read when the delete was sent ([`TypeTable::generation`]): read again since,
+    /// they are what the table shows, and nothing is put back.
+    generation: u64,
+}
+
 /// The most rows a table reads again on its own when its branch moves (spec 028), as a multiple
 /// of the graph's page size: past it, a long scroll would cost a large read every head poll, so
 /// the table offers Refresh instead.
@@ -1168,6 +1183,10 @@ pub struct TypeTable {
     /// own, so a read that failed is not sent again until the head moves; and that read.
     live_tried: Option<String>,
     live_task: Option<Task<()>>,
+    /// Deletes sent and not yet answered, their rows taken out already.
+    deleting: Vec<PendingDelete>,
+    /// Counts each time the rows are let go to be read again ([`Self::clear_rows`]).
+    generation: u64,
     /// What the branch changed in this type's rows against its target, once read
     /// ([`Self::read_diff`]); `None` on the target, at a commit, and until the read lands.
     diff: Option<Arc<BranchDiff>>,
@@ -1520,6 +1539,8 @@ impl TypeTable {
             rows_owed: false,
             live_tried: None,
             live_task: None,
+            deleting: Vec::new(),
+            generation: 0,
             diff: None,
             diff_owed: true,
             diff_task: None,
@@ -3659,6 +3680,7 @@ impl TypeTable {
         if self.schema.is_none() || self.missing {
             return false;
         }
+        self.generation += 1;
         if keep_pin {
             self.paging.restart();
         } else {
@@ -5585,6 +5607,121 @@ impl TypeTable {
         self.count_shift = Some(shift);
     }
 
+    /// The table's own delete was sent (spec 004): its rows leave the list now, as if it had
+    /// committed, and come back where they were if it is refused or its outcome is unknown
+    /// ([`Self::delete_not_made`]). Their drafts stay until the commit (constitution III).
+    pub fn rows_deleting(&mut self, branch: &str, ids: &[String], cx: &mut Context<Self>) {
+        if branch != self.branch {
+            return;
+        }
+        let going: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        let filters = self.resolved_filters();
+        let mut counted = HashSet::new();
+        let counts = self
+            .rows
+            .iter()
+            .filter(|row| going.contains(row.id.as_str()) && counted.insert(row.id.as_str()))
+            .fold((0, 0), |(rows, matching), row| {
+                let shown = row_matches(&filters, &row.values);
+                (rows + 1, matching + i64::from(shown))
+            });
+        let rows: Vec<(usize, Row)> = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| going.contains(row.id.as_str()))
+            .map(|(index, row)| (index, row.clone()))
+            .collect();
+        let picked: Vec<String> = self
+            .selection
+            .iter()
+            .filter(|id| going.contains(id.as_str()))
+            .cloned()
+            .collect();
+        self.selection.retain(|id| !going.contains(id.as_str()));
+        let gone: Vec<usize> = rows.iter().rev().map(|(index, _)| *index).collect();
+        self.take_out(&gone, &going, cx);
+        self.deleting.push(PendingDelete {
+            ids: ids.to_vec(),
+            rows,
+            picked,
+            counts,
+            generation: self.generation,
+        });
+        cx.notify();
+    }
+
+    fn take_pending_delete(&mut self, ids: &[String]) -> Option<PendingDelete> {
+        let at = self
+            .deleting
+            .iter()
+            .position(|pending| pending.ids == ids)?;
+        Some(self.deleting.remove(at))
+    }
+
+    /// The table's own delete was not made, or may not have been: its rows come back where
+    /// they were, picked as they were. Grouped, the rows are read again at the pin instead.
+    /// With the outcome `unknown`, the head may hold the delete: the table is behind its
+    /// branch, and offers Refresh or follows it (spec 028).
+    pub fn delete_not_made(&mut self, ids: &[String], unknown: bool, cx: &mut Context<Self>) {
+        if let Some(pending) = self
+            .take_pending_delete(ids)
+            .filter(|pending| pending.generation == self.generation)
+        {
+            if self.grouping.is_some() {
+                self.reload(true, cx);
+            } else {
+                let shown: HashSet<String> = self.rows.iter().map(|row| row.id.clone()).collect();
+                for (index, row) in pending.rows {
+                    if shown.contains(&row.id) {
+                        continue;
+                    }
+                    let index = index.min(self.rows.len());
+                    self.row_put_back(index);
+                    self.rows.insert(index, row);
+                }
+                self.selection.extend(pending.picked);
+                self.lines_moved();
+            }
+        }
+        if unknown && !self.newer {
+            self.newer = true;
+            cx.emit(ItemEvent::UpdateTab);
+        }
+        cx.notify();
+    }
+
+    /// The table's own delete found none of its rows at the head of the branch: someone
+    /// deleted them first. They stay out, and the table, behind its branch, says so.
+    pub fn delete_found_nothing(&mut self, ids: &[String], several: bool, cx: &mut Context<Self>) {
+        self.take_pending_delete(ids);
+        if !self.newer {
+            self.newer = true;
+            cx.emit(ItemEvent::UpdateTab);
+        }
+        let reason = if several {
+            "Nothing was deleted: they no longer exist at the head of the branch."
+        } else {
+            "Nothing was deleted: it no longer exists at the head of the branch."
+        };
+        self.toast(ToastKind::Info, reason, cx);
+        cx.notify();
+    }
+
+    /// Keeps the cursor and the selection anchor on their rows as a row comes back at `index`.
+    fn row_put_back(&mut self, index: usize) {
+        if let Some(anchor) = &mut self.selection_anchor
+            && *anchor >= index
+        {
+            *anchor += 1;
+        }
+        if let Some(cursor) = &mut self.cursor
+            && cursor.row >= index
+        {
+            cursor.row += 1;
+        }
+    }
+
     /// Rows the table's own delete removed in `commit`: they leave the list, with their drafts
     /// and the pick. The table follows the commit, which moves its pin once, and its counts
     /// follow it ([`Self::recount`]).
@@ -5605,9 +5742,21 @@ impl TypeTable {
             self.newer = true;
             cx.emit(ItemEvent::UpdateTab);
         }
+        // Taken out when the delete was sent: counted then, and their drafts go now.
+        let pending = self
+            .take_pending_delete(ids)
+            .filter(|pending| pending.generation == self.generation);
+        if pending.is_some() {
+            let going: HashSet<&str> = ids.iter().map(String::as_str).collect();
+            self.cells
+                .retain(|(row_id, _), _| !going.contains(row_id.as_str()));
+            self.drop_rows_drafts(&going, cx);
+        }
         // Counted before they go, for counts adjusted here: each row once, however many places
         // it shows in.
-        let (rows, matching) = {
+        let (rows, matching) = if let Some(pending) = pending {
+            pending.counts
+        } else {
             let going: HashSet<&str> = ids.iter().map(String::as_str).collect();
             let mut counted = HashSet::new();
             let filters = self.resolved_filters();
@@ -5657,16 +5806,22 @@ impl TypeTable {
         if gone.is_empty() {
             return;
         }
-        for &index in &gone {
+        self.take_out(&gone, &going, cx);
+        self.cells
+            .retain(|(row_id, _), _| !going.contains(row_id.as_str()));
+        self.drop_rows_drafts(&going, cx);
+    }
+
+    /// Takes the rows at `gone` (from the last up) out of the list, the cursor and the anchor
+    /// kept on their rows, and the peek closed on one of them. Their drafts stay.
+    fn take_out(&mut self, gone: &[usize], going: &HashSet<&str>, cx: &mut Context<Self>) {
+        for &index in gone {
             if let Some(grouping) = &mut self.grouping {
                 grouping.removed(index);
             }
             self.row_removed(index);
         }
         self.rows.retain(|row| !going.contains(row.id.as_str()));
-        self.cells
-            .retain(|(row_id, _), _| !going.contains(row_id.as_str()));
-        self.drop_rows_drafts(&going, cx);
         // Moved up past each row that went (`row_removed`); on the last row, the one above.
         if self.rows.is_empty() {
             self.cursor = None;
@@ -12723,6 +12878,83 @@ mod tests {
         table.read_with(cx, |table, _| {
             assert_eq!(table.paging.pinned.as_deref(), Some("c2"));
             assert!(table.newer, "a person changed");
+        });
+    }
+
+    /// A delete's rows leave at once; refused, or of unknown outcome, they come back where
+    /// they were, picked as they were, the cursor on its row; committed, they stay out and
+    /// their drafts go (spec 004, constitution III).
+    #[gpui::test]
+    async fn a_deletes_rows_leave_at_once_and_come_back_if_it_is_not_made(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let session = session(PEOPLE, cx);
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session.clone(),
+                "Person".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert_eq!(row_names(&table, cx), ["Ada", "Grace"]);
+        let first = table.read_with(cx, |table, _| table.rows[0].id.clone());
+        let ids = vec![first.clone()];
+        table.update(cx, |table, cx| {
+            table.cursor = Some(Cursor { row: 1, col: 0 });
+            table.selection.insert(first.clone());
+            table.rows_deleting("main", &ids, cx);
+        });
+        assert_eq!(row_names(&table, cx), ["Grace"], "gone at once");
+        table.read_with(cx, |table, _| {
+            assert_eq!(
+                table.cursor,
+                Some(Cursor { row: 0, col: 0 }),
+                "still on Grace"
+            );
+            assert!(table.selection.is_empty());
+        });
+
+        table.update(cx, |table, cx| table.delete_not_made(&ids, false, cx));
+        assert_eq!(row_names(&table, cx), ["Ada", "Grace"], "back where it was");
+        table.read_with(cx, |table, _| {
+            assert_eq!(
+                table.cursor,
+                Some(Cursor { row: 1, col: 0 }),
+                "still on Grace"
+            );
+            assert!(table.selection.contains(&first), "picked again");
+            assert!(!table.newer, "refused: nothing changed");
+            assert!(table.deleting.is_empty());
+        });
+
+        // Unknown: back, and the head may hold it.
+        table.update(cx, |table, cx| {
+            table.rows_deleting("main", &ids, cx);
+            table.delete_not_made(&ids, true, cx);
+        });
+        assert_eq!(row_names(&table, cx), ["Ada", "Grace"]);
+        table.read_with(cx, |table, _| assert!(table.newer, "Refresh is offered"));
+
+        // Committed: out for good.
+        table.update(cx, |table, cx| {
+            table.newer = false;
+            table.rows_deleting("main", &ids, cx);
+            table.rows_deleted("main", &ids, "c2", Some("c1"), cx);
+        });
+        assert_eq!(row_names(&table, cx), ["Grace"]);
+        table.read_with(cx, |table, _| {
+            assert!(table.deleting.is_empty());
+            assert_eq!(
+                table.paging.pinned.as_deref(),
+                Some("c2"),
+                "follows its commit"
+            );
         });
     }
 

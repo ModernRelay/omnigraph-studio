@@ -1150,61 +1150,59 @@ impl DeleteRowModal {
             session.write_on(&branch, &query, if_commit, description, follow_up, cx)
         });
         let table = self.table.clone();
-        table.update(cx, |table, _| table.save_started()).ok();
+        // The rows leave the table now and the dialog closes: the person goes on while the
+        // write is out, and the rows come back if it is refused (spec 004, constitution III).
+        table
+            .update(cx, |table, cx| {
+                table.save_started();
+                table.rows_deleting(&branch, &own, cx);
+            })
+            .ok();
         let several = self.targets.len() > 1 || dependents > 0;
-        cx.spawn_in(window, async move |this, cx| {
+        cx.emit(DismissEvent);
+        cx.spawn_in(window, async move |_, cx| {
             let outcome = write.await;
             let result = save_result(&outcome, &branch);
             let moved = matches!(&outcome, graph_client::WriteOutcome::Refused(error)
                 if error.status == 412 || error.body.precondition_failure.is_some());
             if let SaveResult::Saved { .. } = &result {
-                session
-                    .update(cx, |session, cx| {
-                        // The deleted rows' drafts on the branch they were deleted from, though
-                        // the window moved to another branch meanwhile.
-                        let keys: Vec<DraftKey> = session
-                            .drafts_on(&branch)
-                            .filter(|(key, _)| {
-                                removed.iter().any(|(t, id)| key.type_name == *t && key.id == *id)
-                            })
-                            .map(|(key, _)| key.clone())
-                            .collect();
-                        for key in &keys {
-                            session.remove_draft_on(&branch, key, cx);
-                        }
-                    });
+                session.update(cx, |session, cx| {
+                    // The deleted rows' drafts on the branch they were deleted from, though
+                    // the window moved to another branch meanwhile.
+                    let keys: Vec<DraftKey> = session
+                        .drafts_on(&branch)
+                        .filter(|(key, _)| {
+                            removed
+                                .iter()
+                                .any(|(t, id)| key.type_name == *t && key.id == *id)
+                        })
+                        .map(|(key, _)| key.clone())
+                        .collect();
+                    for key in &keys {
+                        session.remove_draft_on(&branch, key, cx);
+                    }
+                });
             }
+            // A refused or unknown outcome has its toast from the session's log; a delete that
+            // found nothing has the table's.
             table
                 .update(cx, |table, cx| {
-                    if let SaveResult::Saved { commit, parent } = &result {
-                        table.rows_deleted(&branch, &own, commit, parent.as_deref(), cx);
-                    } else if moved {
-                        table.branch_moved(cx);
+                    match &result {
+                        SaveResult::Saved { commit, parent } => {
+                            table.rows_deleted(&branch, &own, commit, parent.as_deref(), cx)
+                        }
+                        SaveResult::NoMatch => table.delete_found_nothing(&own, several, cx),
+                        SaveResult::Refused(_) => {
+                            table.delete_not_made(&own, false, cx);
+                            if moved {
+                                table.branch_moved(cx);
+                            }
+                        }
+                        SaveResult::Unknown(_) => table.delete_not_made(&own, true, cx),
                     }
                     table.save_finished(cx);
                 })
                 .ok();
-            this.update(cx, |this, cx| {
-                this.saving = false;
-                match result {
-                    SaveResult::Saved { .. } => cx.emit(DismissEvent),
-                    SaveResult::NoMatch => {
-                        this.notice = Some(Notice::new(
-                            Tone::Conflict,
-                            if several {
-                                "Nothing was deleted: they no longer exist at the head of the branch."
-                            } else {
-                                "Nothing was deleted: it no longer exists at the head of the branch."
-                            },
-                        ));
-                    }
-                    SaveResult::Refused(notice) | SaveResult::Unknown(notice) => {
-                        this.notice = Some(notice)
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
         })
         .detach();
     }
