@@ -10204,6 +10204,22 @@ impl TypeTable {
                     .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                         this.pointer_moved(event.position, cx)
                     }))
+                    // One click handler for every cell: the cell under the pointer, as the
+                    // pointer's row and cell are found (`row_cell_at`). A control in a cell (the
+                    // row's check, Peek, ⤢, a chip) takes its own click and stops it here.
+                    .id("type-table-lines")
+                    .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
+                        if let Some((row, col)) = this.row_cell_at(event.position(), cx) {
+                            this.click_cell(
+                                row,
+                                col,
+                                event.modifiers(),
+                                event.click_count(),
+                                window,
+                                cx,
+                            )
+                        }
+                    }))
                     .child(table)
                     .child(wheel),
             )
@@ -11517,11 +11533,11 @@ impl TypeTable {
         // A text opens in the editor with its preview from the ⤢ at its cell's end (spec 014),
         // shown under the pointer, on the cursor's cell and in the cell's open field.
         let expands = self.frame_writable && self.cell_expands(row, column, state);
+        // No id, and no click handler of its own: a cell needs an element state only for a
+        // tooltip, and the grid takes the click for the cell under it (`render_grid`). An id
+        // and a handler on each of a frame's hundreds of cells cost the frame its state
+        // lookups and hitboxes (`docs/drawing.md`).
         let mut cell = div()
-            .id(ElementId::NamedInteger(
-                "cell".into(),
-                (ix * self.columns.len() + col) as u64,
-            ))
             .relative()
             .h(px(ROW_HEIGHT))
             .w_full()
@@ -11550,6 +11566,10 @@ impl TypeTable {
                 self.render_edit_callout(editing.notice.clone(), hint, window, cx)
             });
             return cell
+                .id(ElementId::NamedInteger(
+                    "cell".into(),
+                    (ix * self.columns.len() + col) as u64,
+                ))
                 .child(studio_ui::ds::cell_cursor(cx).bg(editor_bg))
                 .child(
                     div()
@@ -11583,9 +11603,6 @@ impl TypeTable {
             return cell
                 .child(self.render_relation_cell(place, col, row, available, cx))
                 .when(is_cursor, |cell| cell.child(studio_ui::ds::cell_cursor(cx)))
-                .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                    this.click_cell(ix, col, event.modifiers(), event.click_count(), window, cx)
-                }))
                 .into_any_element();
         }
         // A draft shows what was typed, so a row of drafts reads as it will once saved.
@@ -11745,13 +11762,14 @@ impl TypeTable {
                     this.drop_blob_files(&row_id, &property, paths.paths(), cx)
                 }));
         }
-        if row.dimmed && col == 0 {
-            cell = cell.tip(studio_ui::ds::tooltip(
-                "No longer matches the filters or its group. It leaves when the list is read again.",
-            ));
-        } else if let Some(tooltip) = tooltip {
-            cell = cell.tip(studio_ui::ds::tooltip(tooltip));
-        }
+        let tooltip: Option<SharedString> = if row.dimmed && col == 0 {
+            Some(
+                "No longer matches the filters or its group. It leaves when the list is read again."
+                    .into(),
+            )
+        } else {
+            tooltip
+        };
         // The key's cell ends in the row's Peek while the row is hovered, as the reference
         // table's cells end in their action.
         // Peek and ⤢ show only under the pointer, so they are built only in the pointer's row
@@ -11785,18 +11803,22 @@ impl TypeTable {
             };
             slot.debug_selector(move || format!("expand-cell-{ix}-{col}"))
         });
-        cell.when(expand.is_some(), |cell| cell.group(CELL_GROUP))
+        let cell = cell
+            .when(expand.is_some(), |cell| cell.group(CELL_GROUP))
             .debug_selector(move || format!("cell-{ix}-{col}"))
             .children(dot.map(studio_ui::ds::dot))
             .child(content)
             .children(peek)
             .children(expand)
             // The cursor rings what the cell holds, its action too.
-            .when(is_cursor, |cell| cell.child(studio_ui::ds::cell_cursor(cx)))
-            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                this.click_cell(ix, col, event.modifiers(), event.click_count(), window, cx)
-            }))
-            .into_any_element()
+            .when(is_cursor, |cell| cell.child(studio_ui::ds::cell_cursor(cx)));
+        match tooltip {
+            Some(tooltip) => cell
+                .id(ElementId::NamedInteger("cell".into(), place))
+                .tip(studio_ui::ds::tooltip(tooltip))
+                .into_any_element(),
+            None => cell.into_any_element(),
+        }
     }
 
     /// A text cell's ⤢: the cell in the editor with its preview, from the cursor's cell.

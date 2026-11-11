@@ -46,6 +46,16 @@ Measured against Zed v1.23.2 (`crates/gpui/src/window.rs`, `view.rs`):
   truncated label is measured on every layout pass of every frame, with a line wrapper taken
   from GPUI's pool each time (`TextLayout::layout`); in a table that was a fifth of a scroll
   frame.
+- A cell has no element id and no click handler of its own. GPUI keeps an element state and a
+  hitbox for every element with an id, each frame, for each of a frame's hundreds of cells; the
+  grid takes the click and finds the cell under it (`TypeTable::row_cell_at`), and a control in
+  a cell stops the click. A cell takes an id only for a tooltip. On 2026-11-10 this took a
+  table scroll from 4.7 to 4.4 ms.
+- An element's request-layout and prepaint states are small: GPUI moves them, with the element,
+  from step to step of every frame. A `ShapedLine` is about 3 KB, its runs held inline, so a
+  cell keeps its line boxed (`studio_ui::CellText`, guarded by
+  `a_cell_moves_a_pointer_not_its_line`). Unboxed, the copies were a tenth of a table scroll
+  frame; boxing took it from 5.1 to 4.7 ms.
 
 ## Guards
 
@@ -68,10 +78,20 @@ times over.
 
 `script/measure-frames` runs the common cases against the development graph (`script/dev-server`)
 on `release-fast`: a key in the table's filter field, in a cell, in the query editor with six
-result columns, and in the Go To palette, and a table scroll. On 2026-10-18 (Apple M5 Pro, load
+result columns, and in the Go To palette; a table scroll; the whole window drawn again, as each
+frame of an animation draws it (a dialog or a toast coming up, the connection dot); and a
+scroll of a node page, its tree and History, and a pan of its canvas. On 2026-10-18 (Apple M5 Pro, load
 average 8) each key cost 1.2 to 2.0 ms of main-thread CPU and a table scroll 4.3 ms. On the
 personal graph's 92-column Person type a table scroll costs 4.0 ms, and a 63-column query
 result 2.2 ms.
+
+On 2026-11-10 (Apple M5 Pro, load average 6 to 20), the median of eight alternating runs of the
+same two builds: a table scroll 5.1 ms before the two rules above and 4.4 ms after; every other
+case 1 to 2.5 ms, and the whole window redrawn about what a table scroll costs, since the table
+is most of the window. What is left of a table frame is GPUI's own work per element: a quad for
+each cell's rule (about a tenth of the frame), Taffy's layout and each element's style. Drawing
+the column rules once per column, over the rows, would take the quads; it is not done, since the
+rules would then draw over the cursor's ring and the edit field.
 
 In the running app, `studio.show_performance` puts Studio's memory and CPU at the end of the
 footer, and a build with `--features perf` (GPUI's `profiler`) has GPUI's frame-time overlay on

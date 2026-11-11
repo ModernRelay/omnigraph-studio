@@ -102,15 +102,18 @@ impl IntoElement for CellText {
     }
 }
 
-/// The line as it fits, and the height it is drawn in.
+/// The line as it fits, and the height it is drawn in. A shaped line is about 3 KB (its runs
+/// are held inline), and GPUI moves an element's states from step to step of every frame: boxed,
+/// a cell moves a pointer, not the line, which in a table was a tenth of a scroll frame
+/// (`docs/drawing.md`).
 pub struct Fitted {
-    line: ShapedLine,
+    line: Box<ShapedLine>,
     line_height: Pixels,
 }
 
 impl Element for CellText {
     /// A hugging line, shaped to ask for its width.
-    type RequestLayoutState = Option<ShapedLine>;
+    type RequestLayoutState = Option<Box<ShapedLine>>;
     type PrepaintState = Option<Fitted>;
 
     fn id(&self) -> Option<ElementId> {
@@ -129,9 +132,9 @@ impl Element for CellText {
         _inspector_id: Option<&InspectorElementId>,
         window: &mut Window,
         cx: &mut App,
-    ) -> (LayoutId, Option<ShapedLine>) {
+    ) -> (LayoutId, Option<Box<ShapedLine>>) {
         let (line_height, whole) = window.with_text_style(Some(self.style.clone()), |window| {
-            let whole = self.hug.then(|| self.shape(window));
+            let whole = self.hug.then(|| Box::new(self.shape(window)));
             (line_height(window), whole)
         });
         let none = Length::Definite(DefiniteLength::Absolute(px(0.).into()));
@@ -165,7 +168,7 @@ impl Element for CellText {
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
-        whole: &mut Option<ShapedLine>,
+        whole: &mut Option<Box<ShapedLine>>,
         window: &mut Window,
         cx: &mut App,
     ) -> Option<Fitted> {
@@ -173,7 +176,7 @@ impl Element for CellText {
             return None;
         }
         window.with_text_style(Some(self.style.clone()), |window| {
-            let whole = whole.take().unwrap_or_else(|| self.shape(window));
+            let whole = whole.take().unwrap_or_else(|| Box::new(self.shape(window)));
             self.fit(whole, bounds.size.width, window, cx)
         })
     }
@@ -183,7 +186,7 @@ impl Element for CellText {
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
-        _whole: &mut Option<ShapedLine>,
+        _whole: &mut Option<Box<ShapedLine>>,
         fitted: &mut Option<Fitted>,
         window: &mut Window,
         cx: &mut App,
@@ -220,7 +223,7 @@ impl CellText {
     /// `whole`, or cut to `width` when it is wider.
     fn fit(
         &self,
-        whole: ShapedLine,
+        whole: Box<ShapedLine>,
         width: Pixels,
         window: &mut Window,
         cx: &mut App,
@@ -237,9 +240,11 @@ impl CellText {
                 .text_system()
                 .line_wrapper(text_style.font(), font_size)
                 .truncate_line(self.text.clone(), width, "…", &runs, TruncateFrom::End);
-            window
-                .text_system()
-                .shape_line(text, font_size, &runs, None)
+            Box::new(
+                window
+                    .text_system()
+                    .shape_line(text, font_size, &runs, None),
+            )
         };
         Some(Fitted {
             line,
@@ -298,5 +303,18 @@ mod tests {
             shown.starts_with("first") && shown.ends_with("third"),
             "{shown}"
         );
+    }
+
+    /// GPUI moves an element and its states from step to step of every frame, for each of a
+    /// table's hundreds of cells: they stay small, the shaped line behind a pointer.
+    #[test]
+    fn a_cell_moves_a_pointer_not_its_line() {
+        assert!(
+            std::mem::size_of::<gpui::ShapedLine>() > 1024,
+            "a line is large"
+        );
+        assert!(std::mem::size_of::<Option<Box<gpui::ShapedLine>>>() <= 8);
+        assert!(std::mem::size_of::<Option<Fitted>>() <= 16);
+        assert!(std::mem::size_of::<CellText>() <= 256);
     }
 }
