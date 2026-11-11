@@ -1453,6 +1453,9 @@ impl ConnectionRegistry {
     /// secure store. Studio writes neither the CLI's file nor the token. The targets are listed
     /// again at once, and the new target's connection is the answer. An address Studio connects
     /// to already is that connection, and nothing is added. A refusal is the CLI's own words.
+    /// A token for an `http://` server on this machine, which the CLI keeps for no `http://`
+    /// server, goes to the new connection in memory instead, and the target is added anonymous
+    /// (spec 029); for another `http://` server it is refused before the CLI is asked.
     /// Where the CLI gives Studio no token (Windows), a token is refused before the CLI is asked:
     /// Studio could not use the target it would add. The Open dialog disables its token field
     /// there, so this refusal is what stands behind it.
@@ -1485,10 +1488,22 @@ impl ConnectionRegistry {
                  letters, digits, `.`, `_` and `-`"
             )));
         }
-        let token = token
+        let mut token = token
             .map(|token| token.trim().to_owned())
             .filter(|token| !token.is_empty())
             .map(Token::typed);
+        // The CLI keeps a token only for an `https://` server (spec 012 E46): one at `http://` on
+        // this machine is added anonymous, and its token kept in memory, as Update token keeps
+        // one. Another `http://` server is refused here, in the CLI's words.
+        let held = match &token {
+            Some(_) if url.starts_with("http://") && !graph_client::is_loopback(&url) => {
+                return Task::ready(Err(
+                    "endpoint requires HTTPS; HTTP is only allowed for loopback servers".into(),
+                ));
+            }
+            Some(_) if url.starts_with("http://") => token.take(),
+            _ => None,
+        };
         let platform = self.platform;
         if token.is_some() && !platform.exports_tokens() {
             return Task::ready(Err(format!(
@@ -1526,9 +1541,15 @@ impl ConnectionRegistry {
                         cx.notify();
                     }
                     added?;
-                    this.find(&name, cx).ok_or_else(|| {
+                    let found = this.find(&name, cx).ok_or_else(|| {
                         format!("The CLI added the target '{name}', but does not list it")
-                    })
+                    })?;
+                    if let Some(held) = held {
+                        found.update(cx, |connection, cx| {
+                            connection.set_token(Some(held.into_string()), cx)
+                        });
+                    }
+                    Ok(found)
                 })
                 .map_err(|error| error.to_string())
                 .and_then(|found| found);
@@ -2856,6 +2877,48 @@ mod tests {
                 registry.find("new", cx).is_some(),
                 "listed again after the add"
             );
+        });
+    }
+
+    /// A token for an `http://` server on this machine, which the CLI keeps for no `http://`
+    /// server, is not handed to the CLI: the target is added anonymous and the connection holds
+    /// the token for the run. One for an `http://` server elsewhere is refused before the CLI is
+    /// asked (spec 029).
+    #[gpui::test]
+    async fn a_loopback_servers_token_is_kept_in_memory(cx: &mut TestAppContext) {
+        let (http, _) = answering();
+        let listing = HeldListing::default();
+        let answer = listing.next();
+        let handed = Arc::new(Mutex::new(Vec::new()));
+        let registry = cx.new(|_| {
+            let mut registry = ConnectionRegistry::empty(http, None);
+            registry.lister = listing.lister();
+            let handed = handed.clone();
+            registry.adder = Arc::new(move |_, name, _, token: Option<Token>| {
+                handed.lock().unwrap().push((name, token.is_some()));
+                async move { Ok(()) }.boxed()
+            });
+            registry
+        });
+        let refused = registry.update(cx, |registry, cx| {
+            let token = Some("secret".to_owned());
+            registry.add_target("far".into(), "http://far.test".into(), token, cx)
+        });
+        assert!(refused.await.unwrap_err().contains("requires HTTPS"));
+        assert!(handed.lock().unwrap().is_empty(), "the CLI was not asked");
+
+        let adding = registry.update(cx, |registry, cx| {
+            let token = Some(" secret ".to_owned());
+            registry.add_target("local".into(), "http://127.0.0.1:8787".into(), token, cx)
+        });
+        cx.run_until_parked();
+        answer
+            .send(files(vec![server("local", "http://127.0.0.1:8787", "1")]))
+            .ok();
+        let local = adding.await.unwrap();
+        assert_eq!(*handed.lock().unwrap(), [("local".to_owned(), false)]);
+        local.read_with(cx, |connection, _| {
+            assert!(connection.token_given(), "the connection holds the token");
         });
     }
 

@@ -168,7 +168,11 @@ impl OpenGraphModal {
     ) -> Self {
         let graph_id = input("Graph id, for example knowledge", window, cx);
         let new_name = input("Name, for example dev", window, cx);
-        let new_url = input("http://127.0.0.1:8787", window, cx);
+        let new_url = input(
+            "https://omnigraph.example.com or http://127.0.0.1:8787",
+            window,
+            cx,
+        );
         let new_token = input("Token (kept by the Omnigraph CLI)", window, cx);
         new_token.update(cx, |editor, cx| editor.set_masked(true, cx));
         let replacement_token = input("New token", window, cx);
@@ -1086,8 +1090,11 @@ impl OpenGraphModal {
         };
         // Disabled where Studio could not use a token (Windows): it takes no text, Tab passes it
         // by, and it says why.
+        let token_note = new_token_note(&self.new_url.read(cx).text(cx));
         let token = match self.token_refusal() {
-            None => field("Bearer token", &self.new_token).into_any_element(),
+            None => field("Bearer token", &self.new_token)
+                .children(token_note.map(studio_ui::ds::text::meta))
+                .into_any_element(),
             Some(reason) => v_flex()
                 .gap(px(space::XS))
                 .child(studio_ui::ds::text::meta("Bearer token"))
@@ -1278,7 +1285,11 @@ fn retry_button(selected: &Entity<Connection>, cx: &mut Context<OpenGraphModal>)
 /// CLI server the CLI gave no token is asked nothing, and says why. A server that offers a
 /// sign-in says where, and who is signed in (spec 016).
 fn server_status(c: &Connection) -> String {
-    let status = state_status(c);
+    let mut status = state_status(c);
+    // A token typed for a target the CLI keeps none for is Studio's alone, for this run.
+    if c.token_given() && c.server.source == ServerSource::Cli && !c.has_token_source() {
+        status.push_str(" Token kept until Studio quits.");
+    }
     // An item the keychain would not delete, which Studio may read again later, is said
     // whatever the state.
     match c.keychain_left() {
@@ -1427,11 +1438,29 @@ fn retries_on_select(c: &Connection) -> bool {
 /// the CLI's login, which offers no sign-in of its own, it first says where that cluster's token
 /// comes from.
 fn token_tooltip(c: &Connection, platform: Platform) -> String {
+    // A CLI target added anonymous has no credential the CLI could keep a token in.
+    if c.server.source == ServerSource::Cli && !c.has_token_source() {
+        return ANONYMOUS_TOKEN.to_owned();
+    }
     tooltip_for(
         &c.server.source,
         &c.server.name,
         c.login_profile().as_deref(),
         platform,
+    )
+}
+
+/// What a token typed for a CLI target that takes none does: the CLI keeps none for it.
+const ANONYMOUS_TOKEN: &str = "Used until Studio quits. The Omnigraph CLI keeps no token for a \
+                               server it reaches without one.";
+
+/// What the new server's token field says of a token for `url`: one at `http://` on this
+/// machine lasts until Studio quits, since the CLI keeps tokens only for `https://` servers.
+fn new_token_note(url: &str) -> Option<&'static str> {
+    let url = graph_client::server_root(url).ok()?;
+    (url.starts_with("http://") && graph_client::is_loopback(&url)).then_some(
+        "The Omnigraph CLI keeps tokens only for https:// servers. Studio keeps this one until \
+         it quits.",
     )
 }
 
@@ -1676,6 +1705,16 @@ mod tests {
             empty_list_note(&ConnectionState::Connecting),
             "Its graphs show once Studio connects."
         );
+    }
+
+    /// A token for a server on this machine at `http://` is said to last until Studio quits,
+    /// before it is added; one for an `https://` server is the CLI's to keep.
+    #[test]
+    fn a_loopback_token_is_said_to_last_until_studio_quits() {
+        assert!(new_token_note("127.0.0.1:8787").is_some());
+        assert!(new_token_note("http://localhost:8080").is_some());
+        assert!(new_token_note("https://graph.example.com").is_none());
+        assert!(new_token_note("").is_none());
     }
 
     /// What the dialog says shows beside what it is about: an id not entered under the id field,

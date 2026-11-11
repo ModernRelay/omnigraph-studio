@@ -1317,6 +1317,18 @@ impl Connection {
         self.token_source.as_ref()?.login_profile()
     }
 
+    /// Whether the token held was given to Studio (typed in), so it lasts until Studio quits or
+    /// asks the source again (spec 029).
+    pub fn token_given(&self) -> bool {
+        self.token_given
+    }
+
+    /// Whether the server's token comes from a source Studio asks (the CLI's `credentials
+    /// export`, a control plane): a CLI target added anonymous has none.
+    pub fn has_token_source(&self) -> bool {
+        self.token_source.is_some()
+    }
+
     /// Whether a connect asks its token source first: it has one, and no token was given.
     fn asks_token_source(&self) -> bool {
         self.token_source.is_some() && !self.token_given
