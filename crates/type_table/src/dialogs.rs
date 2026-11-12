@@ -929,6 +929,10 @@ pub struct DeleteRowModal {
     saving: bool,
     focus_handle: FocusHandle,
     _plan: Option<Task<()>>,
+    /// How far the plan has got: the reads it sent and those answered, shown while it reads.
+    progress: deletes::PlanProgress,
+    /// Draws the progress again while the plan reads.
+    _progress: Option<Task<()>>,
     _subscription: Subscription,
 }
 
@@ -1002,6 +1006,8 @@ impl DeleteRowModal {
             saving: false,
             focus_handle: cx.focus_handle(),
             _plan: None,
+            progress: deletes::PlanProgress::default(),
+            _progress: None,
             _subscription: subscription,
         };
         if edges {
@@ -1033,6 +1039,7 @@ impl DeleteRowModal {
     /// Reads what deleting the nodes takes with them.
     fn start_plan(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.plan = Loadable::Loading;
+        self.progress = deletes::PlanProgress::default();
         let ids = self.targets.iter().map(|t| t.id.clone()).collect();
         let plan = deletes::plan_node_delete(
             self.session.clone(),
@@ -1040,8 +1047,27 @@ impl DeleteRowModal {
             self.type_name.clone(),
             ids,
             self.if_commit.clone(),
+            self.progress.clone(),
             cx,
         );
+        // The count of reads answered, drawn again twice a second while the plan reads: a plan
+        // on a large graph takes a while, and a line that moves says it is not stuck.
+        self._progress = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(500))
+                    .await;
+                let reading = this
+                    .update(cx, |this, cx| {
+                        cx.notify();
+                        this.plan.is_loading()
+                    })
+                    .unwrap_or(false);
+                if !reading {
+                    break;
+                }
+            }
+        }));
         self._plan = Some(cx.spawn_in(window, async move |this, cx| {
             let plan = plan.await;
             this.update_in(cx, |this, window, cx| {
@@ -1216,6 +1242,17 @@ impl DeleteRowModal {
         }
     }
 
+    /// The waiting line: what the plan does, then how many of its reads have come back.
+    fn progress_text(&self) -> String {
+        match self.progress.reads() {
+            (0, _) => "Finding what depends on it…".to_owned(),
+            (sent, answered) => format!(
+                "Finding what depends on it and what Undo would restore… {answered} of {sent} \
+                 reads"
+            ),
+        }
+    }
+
     /// What else goes: "Also deletes 2 nodes that need it:", then their names and the
     /// relationship each needs.
     fn render_plan(&self, cx: &App) -> Option<AnyElement> {
@@ -1225,7 +1262,7 @@ impl DeleteRowModal {
                 h_flex()
                     .gap(px(studio_ui::ds::space::MD))
                     .child(studio_ui::ds::spinner())
-                    .child(studio_ui::ds::text::muted("Finding what depends on it…"))
+                    .child(studio_ui::ds::text::muted(self.progress_text()))
                     .into_any_element(),
             ),
             // The plan's own sentence: a read that failed, or a delete too large or too deep.

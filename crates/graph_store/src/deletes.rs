@@ -11,6 +11,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use gpui::{App, Entity, Task};
 use gq_language::builder::{
@@ -18,6 +19,7 @@ use gq_language::builder::{
 };
 use gq_language::{BuiltQuery, Filter, FilterOp, SchemaModel};
 use graph_client::ReadError;
+use graph_client::api::EntityKind;
 use serde_json::Value;
 
 use crate::changes::{ChangeFold, NetChange, REVIEW_CHANGE_CAP};
@@ -36,6 +38,32 @@ const UNDO_PAGE: u32 = 8_192;
 /// (constitution IX): a delete that removed more is refused before it is all held, and a delete
 /// that would remove more is confirmed by typing.
 pub const UNDO_CAP: usize = REVIEW_CHANGE_CAP;
+/// Relationship types counted at once for Undo: as many reads as a connection sends together,
+/// so a batch is answered before the next one decides whether it is needed.
+const COUNT_BATCH: usize = 8;
+
+/// How far a delete's plan has got, for its dialog: reads sent and reads answered. Shared
+/// with the plan's task, read while it runs.
+#[derive(Debug, Clone, Default)]
+pub struct PlanProgress(Arc<(AtomicUsize, AtomicUsize)>);
+
+impl PlanProgress {
+    /// Reads sent, and reads answered, so far.
+    pub fn reads(&self) -> (usize, usize) {
+        (
+            self.0.0.load(Ordering::Relaxed),
+            self.0.1.load(Ordering::Relaxed),
+        )
+    }
+
+    fn sent(&self, n: usize) {
+        self.0.0.fetch_add(n, Ordering::Relaxed);
+    }
+
+    fn answered(&self, n: usize) {
+        self.0.1.fetch_add(n, Ordering::Relaxed);
+    }
+}
 
 /// A node deleted because it needs one that is.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,6 +158,7 @@ pub fn plan_node_delete(
     type_name: String,
     ids: Vec<String>,
     at_commit: Option<String>,
+    progress: PlanProgress,
     cx: &mut App,
 ) -> Task<Result<DeletePlan, PlanError>> {
     cx.spawn(async move |cx| {
@@ -165,7 +194,16 @@ pub fn plan_node_delete(
                 reads.push((edge, read));
             }
             let (edges, reads): (Vec<&gq_language::EdgeType>, Vec<_>) = reads.into_iter().unzip();
-            let outputs = futures::future::join_all(reads).await;
+            progress.sent(reads.len());
+            let outputs = futures::future::join_all(reads.into_iter().map(|read| {
+                let progress = progress.clone();
+                async move {
+                    let output = read.await;
+                    progress.answered(1);
+                    output
+                }
+            }))
+            .await;
             for (edge, output) in edges.into_iter().zip(outputs) {
                 let output = output?;
                 let rows = output.rows.as_array().cloned().unwrap_or_default();
@@ -200,7 +238,8 @@ pub fn plan_node_delete(
                 // that removes more is found so here, at the pin, so its dialog asks for the
                 // key to be typed rather than offering an Undo that would restore nothing.
                 if unavailable.is_none() {
-                    let removed = removed_changes(&session, &schema, &nodes, &at_commit, cx).await;
+                    let removed =
+                        removed_changes(&session, &schema, &nodes, &at_commit, &progress, cx).await;
                     unavailable = undo_past_cap(removed);
                 }
                 return Ok(DeletePlan {
@@ -236,30 +275,105 @@ fn undo_past_cap(removed: Result<usize, String>) -> Option<String> {
 /// How many changes deleting `nodes` makes, counted at `at_commit`: one per node, and one per
 /// relationship any of them has. The rows asked for are counted as they were asked for, so one
 /// gone already counts too: the count is never short.
+///
+/// Only what decides Undo is read. Where the session holds each relationship type's total at
+/// the commit the delete is bound to, a type's total bounds what it can remove: types are
+/// counted largest first, and counting stops once what is counted and the totals of the rest
+/// cannot pass [`UNDO_CAP`], which on most graphs is before the first read. The number returned
+/// is then that bound, which is at most the cap. A delete past the cap is counted whole, so its
+/// dialog says exactly what it removes.
 async fn removed_changes(
     session: &Entity<GraphSession>,
     schema: &SchemaModel,
     nodes: &[(String, Vec<String>)],
     at_commit: &Option<String>,
+    progress: &PlanProgress,
     cx: &mut gpui::AsyncApp,
 ) -> Result<usize, String> {
     let counts = removal_counts(schema, nodes)?;
-    let reads: Vec<_> = counts
-        .iter()
-        .map(|(_, query)| {
-            session.update(cx, |session, cx| session.read(query, at_commit.clone(), cx))
-        })
-        .collect();
-    let outputs = futures::future::join_all(reads).await;
+    let totals = session.read_with(cx, |session, _| {
+        let at_counts = at_commit.is_none() || at_commit.as_deref() == session.counts_commit();
+        at_counts
+            .then(|| session.counts.loaded().cloned())
+            .flatten()
+            .unwrap_or_default()
+    });
     let mut removed: i64 = nodes.iter().map(|(_, ids)| ids.len() as i64).sum();
-    for ((sign, _), output) in counts.iter().zip(outputs) {
-        let output = output.map_err(|error| error.to_string())?;
-        let n = gq_language::builder::count_of(&output.rows)
-            .ok_or_else(|| "the server's count could not be read".to_owned())?;
-        removed += sign * n;
+    // Each relationship type's reads, and what its total says it can remove at most.
+    let mut edges: Vec<TypeCount> = Vec::new();
+    let mut last: Option<String> = None;
+    for (edge, sign, query) in counts {
+        if last.as_ref() == Some(&edge)
+            && let Some((_, reads)) = edges.last_mut()
+        {
+            reads.push((sign, query));
+            continue;
+        }
+        let bound = totals
+            .get(&(EntityKind::Edge, edge.clone()))
+            .map(|total| (*total).max(0));
+        edges.push((bound, vec![(sign, query)]));
+        last = Some(edge);
+    }
+    // Unknown totals first, then the largest: the reads most likely to settle it.
+    edges.sort_by_key(|(bound, _)| std::cmp::Reverse(bound.unwrap_or(i64::MAX)));
+    let cap = UNDO_CAP as i64;
+    let mut at = 0;
+    while at < edges.len() {
+        // How many of the largest types not yet counted must be, for the totals of the rest to
+        // prove the delete under the cap; none, and it is settled.
+        let unread = &edges[at..];
+        let mut tail = 0i64;
+        let mut needed = unread.len();
+        for (i, (bound, _)) in unread.iter().enumerate().rev() {
+            let Some(bound) = bound else {
+                break;
+            };
+            if removed.saturating_add(tail).saturating_add(*bound) > cap {
+                break;
+            }
+            tail = tail.saturating_add(*bound);
+            needed = i;
+        }
+        if needed == 0 {
+            return Ok(removed.saturating_add(tail).max(0) as usize);
+        }
+        // At most a connection's worth of types at once.
+        let batch = &edges[at..at + needed.min(COUNT_BATCH)];
+        let reads: Vec<_> = batch
+            .iter()
+            .flat_map(|(_, reads)| reads)
+            .map(|(sign, query)| {
+                let read =
+                    session.update(cx, |session, cx| session.read(query, at_commit.clone(), cx));
+                (*sign, read)
+            })
+            .collect();
+        progress.sent(reads.len());
+        let (signs, reads): (Vec<i64>, Vec<_>) = reads.into_iter().unzip();
+        let outputs = futures::future::join_all(reads.into_iter().map(|read| {
+            let progress = progress.clone();
+            async move {
+                let output = read.await;
+                progress.answered(1);
+                output
+            }
+        }))
+        .await;
+        for (sign, output) in signs.into_iter().zip(outputs) {
+            let output = output.map_err(|error| error.to_string())?;
+            let n = gq_language::builder::count_of(&output.rows)
+                .ok_or_else(|| "the server's count could not be read".to_owned())?;
+            removed += sign * n;
+        }
+        at += batch.len();
     }
     Ok(removed.max(0) as usize)
 }
+
+/// One relationship type's count reads, each with its sign, and the most its total says it can
+/// remove (`None` when the session holds no total for it).
+type TypeCount = (Option<i64>, Vec<(i64, BuiltQuery)>);
 
 /// The reads that count the relationships deleting `nodes` removes, each with the sign it is
 /// summed with. A relationship type with a deleted end is counted by its ends' keys, which are
@@ -269,7 +383,7 @@ async fn removed_changes(
 fn removal_counts(
     schema: &SchemaModel,
     nodes: &[(String, Vec<String>)],
-) -> Result<Vec<(i64, BuiltQuery)>, String> {
+) -> Result<Vec<(String, i64, BuiltQuery)>, String> {
     // The filter on one end: its key among the deleted ids of its type; none when no node of
     // its type goes. A node without a key has no value to match its id by.
     let end = |end: EdgeEnd, type_name: &str| -> Result<Option<Filter>, String> {
@@ -297,10 +411,14 @@ fn removal_counts(
         let from = end(EdgeEnd::From, &edge.from)?;
         let to = end(EdgeEnd::To, &edge.to)?;
         for filter in [&from, &to].into_iter().flatten() {
-            counts.push((1, count(&edge.name, std::slice::from_ref(filter))?));
+            counts.push((
+                edge.name.clone(),
+                1,
+                count(&edge.name, std::slice::from_ref(filter))?,
+            ));
         }
         if let (Some(from), Some(to)) = (from, to) {
-            counts.push((-1, count(&edge.name, &[from, to])?));
+            counts.push((edge.name.clone(), -1, count(&edge.name, &[from, to])?));
         }
     }
     Ok(counts)
@@ -568,6 +686,7 @@ mod tests {
                 "Company".into(),
                 vec!["acme".into()],
                 Some("c1".into()),
+                PlanProgress::default(),
                 cx,
             )
         });
@@ -697,6 +816,7 @@ mod tests {
                     "Link".into(),
                     vec!["l0".into()],
                     Some("c1".into()),
+                    PlanProgress::default(),
                     cx,
                 )
             });
@@ -791,7 +911,7 @@ mod tests {
         let counts = removal_counts(&schema, &tags).unwrap();
         let shape: Vec<(i64, bool, bool)> = counts
             .iter()
-            .map(|(sign, query)| {
+            .map(|(_, sign, query)| {
                 assert!(!query.text.contains("$e:cites"), "{}", query.text);
                 let check = gq_language::check(&schema, &query.text);
                 assert!(check.diagnostics.is_empty(), "{:?}", check.diagnostics);
@@ -812,11 +932,11 @@ mod tests {
                 (1, false, true)
             ]
         );
-        assert!(counts[3].1.text.contains("$e:tagged"));
+        assert!(counts[3].2.text.contains("$e:tagged"));
         // Docs too: Tagged and Cites are read from their sources as well.
         let both = [tags[0].clone(), ("Doc".to_owned(), vec!["d1".to_owned()])];
         let counts = removal_counts(&schema, &both).unwrap();
-        let signs: Vec<i64> = counts.iter().map(|(sign, _)| *sign).collect();
+        let signs: Vec<i64> = counts.iter().map(|(_, sign, _)| *sign).collect();
         assert_eq!(signs, [1, 1, -1, 1, 1, -1, 1, 1, -1]);
         // A node type without a key has nothing to count its relationships by.
         let unkeyed = SchemaModel::parse(
@@ -896,20 +1016,22 @@ mod tests {
             cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
         cx.run_until_parked();
         let schema = Arc::new(SchemaModel::parse(TAGS).unwrap());
-        let plan = |type_name: &str, id: &str| {
+        let plan_at = |at: Option<&str>, type_name: &str, id: &str, cx: &mut TestAppContext| {
             let plan = cx.update(|cx| {
                 plan_node_delete(
                     session.clone(),
                     schema.clone(),
                     type_name.into(),
                     vec![id.into()],
-                    Some("c1".into()),
+                    at.map(str::to_owned),
+                    PlanProgress::default(),
                     cx,
                 )
             });
             cx.run_until_parked();
             futures::executor::block_on(plan).unwrap()
         };
+        let mut plan = |type_name: &str, id: &str| plan_at(Some("c1"), type_name, id, cx);
         let counts = |seen: &Mutex<Vec<Value>>| -> Vec<Value> {
             let counts = seen
                 .lock()
@@ -944,5 +1066,37 @@ mod tests {
         let note = plan("Note", "n1");
         assert!(note.undo_unavailable.unwrap().contains("no key"));
         assert!(counts(&seen).is_empty(), "nothing counted");
+
+        // With each relationship type's total held for the commit the delete reads, a type
+        // too small to pass the cap is not counted: here none is, so nothing is read.
+        let totals = |tagged: i64| {
+            HashMap::from([
+                ((EntityKind::Edge, "Tagged".to_owned()), tagged),
+                ((EntityKind::Edge, "Broader".to_owned()), 40),
+                ((EntityKind::Edge, "Cites".to_owned()), 7),
+            ])
+        };
+        session.update(cx, |session, _| {
+            session.counts = crate::session::Loadable::Loaded(totals(500));
+        });
+        let small = plan_at(None, "Tag", "rare", cx);
+        assert_eq!(small.undo_unavailable, None);
+        assert!(counts(&seen).is_empty(), "the totals settle it");
+
+        // A type that could pass the cap is counted first, and once it leaves the rest unable
+        // to pass it, they are not: Tagged's 10 leaves Broader's 40 under.
+        session.update(cx, |session, _| {
+            session.counts = crate::session::Loadable::Loaded(totals(30_000));
+        });
+        let rare = plan_at(None, "Tag", "rare", cx);
+        assert_eq!(rare.undo_unavailable, None);
+        let reads = counts(&seen);
+        assert_eq!(reads.len(), 1, "{reads:#?}");
+        assert!(reads[0]["query"].as_str().unwrap().contains("$e:tagged"));
+        // A delete past the cap is counted whole, so its dialog says exactly what it removes.
+        let hub = plan_at(None, "Tag", "hub", cx);
+        let reason = hub.undo_unavailable.unwrap();
+        assert!(reason.contains("25,005"), "{reason}");
+        assert_eq!(counts(&seen).len(), 4);
     }
 }
