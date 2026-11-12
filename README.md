@@ -1,269 +1,74 @@
 # Omnigraph Studio
 
-A native, GPU-rendered desktop client for
-[Omnigraph](https://github.com/ModernRelay/omnigraph) graphs, written in Rust. It connects to
-an Omnigraph server over HTTP and provides a table per node and edge type, a relationship
-explorer, a GQ query editor with stored queries, branch review and merge, commit history and an
-agent panel.
-
-The UI is built on [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui), the
-Rust UI framework from Zed, with its editor, UI and theme crates. GPUI draws every frame on the
-GPU, through Metal on macOS and Vulkan (wgpu) on Linux; there is no web view or browser engine.
+The Knowledge IDE for [Omnigraph](https://github.com/ModernRelay/omnigraph): a fast,
+GPU-rendered desktop app to visualize your ontology and graph, inspect knowledge, and review
+what agents change before it merges.
 
 ![Studio switching the Person table to a branch, whose rows show what it adds, changes and removes inline, then opening a person as a page, exploring their relationships on the canvas and in the tree, catching a typo in a query before it runs, and reviewing the branch's changes before the merge](docs/images/demo.gif)
 
 ## Download
 
-[Releases](https://github.com/ModernRelay/omnigraph-studio/releases) have a macOS DMG (Apple
-silicon), Linux tarballs (x86_64, arm64), and for Windows (x86_64, Windows 10 1809 or later) an
-installer and a zip. From 0.4.1 the macOS app is signed with a Developer ID of team `6XQX9HAB25`
-(EQTR INC) and notarized. The newest release's files are also at version-free names under
-`https://github.com/ModernRelay/omnigraph-studio/releases/latest/download/`:
+| Platform | File | Needs |
+|---|---|---|
+| macOS, Apple silicon | [Omnigraph-Studio-arm64.dmg](https://github.com/ModernRelay/omnigraph-studio/releases/latest/download/Omnigraph-Studio-arm64.dmg) | macOS 11 or later |
+| Windows, x86_64 | [omnigraph-studio-windows-x86_64-setup.exe](https://github.com/ModernRelay/omnigraph-studio/releases/latest/download/omnigraph-studio-windows-x86_64-setup.exe) (installer) or [.zip](https://github.com/ModernRelay/omnigraph-studio/releases/latest/download/omnigraph-studio-windows-x86_64.zip) | Windows 10 1809 or later |
+| Linux, x86_64 | [omnigraph-studio-linux-x86_64.tar.gz](https://github.com/ModernRelay/omnigraph-studio/releases/latest/download/omnigraph-studio-linux-x86_64.tar.gz) | glibc 2.35 or later |
+| Linux, arm64 | [omnigraph-studio-linux-aarch64.tar.gz](https://github.com/ModernRelay/omnigraph-studio/releases/latest/download/omnigraph-studio-linux-aarch64.tar.gz) | glibc 2.35 or later |
 
-| File | Platform |
-|---|---|
-| `Omnigraph-Studio-arm64.dmg` | macOS 11 or later, Apple silicon |
-| `omnigraph-studio-linux-x86_64.tar.gz` | Linux x86_64, glibc 2.35 or later |
-| `omnigraph-studio-linux-aarch64.tar.gz` | Linux arm64, glibc 2.35 or later |
-| `omnigraph-studio-windows-x86_64-setup.exe` | Windows installer |
-| `omnigraph-studio-windows-x86_64.zip` | Windows, to unzip anywhere |
+The macOS app is signed and notarized, and installs its own updates. The Windows installer
+needs no administrator rights. Neither Windows file is signed yet, so SmartScreen may ask
+first: choose More info, then Run anyway. Every version is on the
+[releases page](https://github.com/ModernRelay/omnigraph-studio/releases).
 
-The Windows installer puts Studio in `%LOCALAPPDATA%\Programs\Omnigraph Studio` for you alone,
-with no administrator rights, and adds it to the Start menu and Installed apps; uninstalling
-keeps your settings in `%APPDATA%\Omnigraph Studio`. It registers as
-`com.modernrelay.omnigraph-studio`, the name `omnigraph studio` looks up
-([spec 027](specs/027-windows-installer/plan.md)). Neither Windows file is signed yet, so
-SmartScreen may ask first: choose More info, then Run anyway. To build from source instead, see
-below.
+## Open a graph
 
-Studio checks for a newer version half a minute after launch and every hour (Settings →
-Updates, or Check for Updates in the app menu). On macOS it downloads the update, checks its
-signature and installs it, ready at the next restart; on Linux and Windows it says a newer
-version is out and links to it ([spec 017](specs/017-auto-update/plan.md)). Installing needs
-releases signed with the Developer ID and the update key. The key is in Studio from 0.4.2, so
-0.4.1 and earlier say a newer version is out and link to it; 0.4.2 and later install it.
-
-## Quick start
-
-Requirements:
-
-- Rust 1.98.1, installed by `rust-toolchain.toml`. With Homebrew's `rustup`, put
-  `$(brew --prefix rustup)/bin` first on `PATH`: its `cargo` otherwise runs the first `rustc` on
-  `PATH`, such as Homebrew's `rust`, whatever its version.
-- CMake, which builds wasmtime's C API for Zed's tree-sitter (`brew install cmake` on macOS).
-- macOS: the Command Line Tools (GPUI compiles its Metal shaders when Studio starts); full
-  Xcode to compile them into a release build (`script/bundle-mac`). Linux: the Wayland, X11 and
-  Vulkan development packages listed in `.github/workflows/ci.yml`.
-- An Omnigraph server of `v0.14.0` or later (HTTP contract 0.14). Studio refuses a server
-  that speaks another contract, such as Omnigraph 0.13, and its query checks follow `v0.14.0`.
-- For the servers of the CLI's targets, the agent panel and the sample graph, the `omnigraph`
-  CLI of `v0.14.0` or later, which Omnigraph's installer puts in `~/.local/bin`:
-
-  ```bash
-  curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install.sh | bash
-  ```
-
-  Studio looks for it on `PATH`, then in `~/.local/bin`, `/opt/homebrew/bin` and
-  `/usr/local/bin`, and drives the first that reports target, credential and access protocol 2.
-
-Run against the sample graph (200 people, 25 companies, 40 projects), with that release's
-`omnigraph` and `omnigraph-server` on `PATH` or named by `OMNIGRAPH_BIN` and
-`OMNIGRAPH_SERVER_BIN`:
+Studio reaches your graphs through the `omnigraph` CLI, so install it first:
 
 ```bash
-script/dev-server    # serves knowledge and notes on 127.0.0.1:8787, token dev-token
+curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install.sh | bash
 ```
 
-The first run applies `dev/cluster/` and loads the seeds through a direct target in an operator
-home of the script's own, before the server starts; your `~/.omnigraph` takes no part. It stops,
-saying which, when a binary is one Studio cannot use: the CLI by its `version --json`, the
-started server by the contract header its `/healthz` answers with. `STUDIO_DEV_DATA` and `STUDIO_DEV_BIND` move its data (default `dev/.data`) and
-address, and `--reset` starts again from empty graphs.
+Studio lists every server you have as a CLI target (`omnigraph target list`) and uses the
+CLI's credentials. To add a server, choose File → Open Graph… in Studio. It needs Omnigraph
+0.14 or later.
 
-```bash
-OMNIGRAPH_STUDIO_SERVER=http://127.0.0.1:8787 OMNIGRAPH_STUDIO_TOKEN=dev-token \
-  OMNIGRAPH_STUDIO_GRAPH=knowledge cargo run
-```
+## What you can do
 
-Or both in one step: `script/dev` starts `script/dev-server` unless a server already answers at
-its address, runs Studio on `knowledge` once the graphs are seeded, and stops the server it
-started when Studio quits. Its arguments go to `cargo run` (`script/dev --release`).
+- **Browse.** A table for each node and edge type, with sorting, filters, grouping and saved
+  views, read page by page on the server. Edit cells, or stage edits across rows and save them
+  as one change.
+- **Explore.** Open any node as a page, then follow its relationships in a tree or on a canvas.
+  The ontology view draws the schema's types and how they relate.
+- **Query.** Write `.gq` queries with highlighting, completion and errors as you type. ⌘↵ runs
+  the query under the cursor, and a mutation asks first, naming the branch it writes to.
+- **Review and merge.** See what a branch adds, changes and removes, revert single changes,
+  and merge into main. Conflicts are listed when the server refuses a merge.
+- **Go back in time.** Open any table, query or node as it was at an older commit.
+- **Work with an agent.** Claude or Codex in a side panel. The agent writes only to a branch
+  Studio makes for it, and never sees your token.
 
-To try signing in (spec 016), `script/dev-sign-in` serves the same graphs on
-`https://127.0.0.1:8791` behind a sign-in: an `omnigraph-server` that trusts a stand-in sign-in
-service, through TLS from a certificate authority of the script's own. It writes an operator
-home with one anonymous target, `oauth-bed`, that trusts that authority:
+⌘K opens the command palette, ⌘P goes to any type or node, and `?` lists every shortcut.
 
-```bash
-OMNIGRAPH_HOME=dev/.sign-in/studio-home OMNIGRAPH_STUDIO_OAUTH_CLIENT=https://studio.test/client.json cargo run
-```
+## How it's built
 
-A clean debug build takes about 2.5 minutes on an Apple M5 Pro and about 8 GB of `target/`; a
-release build (`cargo run --release`) about 10 minutes.
+Studio is a Rust app built on [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui),
+the framework the Zed editor is made with, and it reuses Zed's editor, UI and theme crates.
+Every frame is drawn on the GPU (Metal on macOS, Vulkan on Linux, DirectX on Windows), with no
+web view in between. On an M5 Pro a table frame takes about 4.4 ms
+([perf reports](docs/perf/)).
 
-Without the environment variables, Studio takes its servers from the `omnigraph` CLI's targets
-(`omnigraph target list`) and each server's token from `omnigraph credentials export`; it reads
-no operator configuration or credential itself. File → Open Graph… adds a server through the
-CLI too (`omnigraph target add`, and `credentials set` for its token).
+If you use Zed, a lot will feel familiar: `keymap.json` takes Zed's keymap format, and
+`settings.json` reloads when you save it. The query editor links `omnigraph-compiler`, the same
+parser and type checker the server runs, so you get the server's errors before you run
+anything. The agent panel runs Claude or Codex over the Agent Client Protocol, the protocol Zed
+uses for its agents.
 
-| Variable | Effect |
-|---|---|
-| `OMNIGRAPH_STUDIO_SERVER` | Adds a server named `environment` |
-| `OMNIGRAPH_STUDIO_TOKEN` | Its bearer token |
-| `OMNIGRAPH_STUDIO_GRAPH` | Opens this graph on that server at launch |
-| `OMNIGRAPH_STUDIO_BRANCH` | The branch to open (default `main`) |
-| `OMNIGRAPH_STUDIO_OAUTH_CLIENT` | The client ID Studio signs in with at any sign-in service, for development (spec 016) |
-| `OMNIGRAPH_STUDIO_DATA` | Directory of `settings.json`, `keymap.json` and the session (default `~/Library/Application Support/Omnigraph Studio`, `%APPDATA%\Omnigraph Studio` on Windows, or `$XDG_CONFIG_HOME/omnigraph-studio`) |
-
-Packaging: `script/bundle-mac` builds an app bundle and a DMG, ad hoc signed unless a signing
-identity is configured (`--fast` bundles the optimized `release-fast` build, which rebuilds in
-seconds, to run day to day); `script/bundle-linux` builds a tarball with a `.desktop` entry.
-
-## Features
-
-- **Type tables.** One table per node and edge type, read in keyset pages with filters and
-  counts evaluated on the server. Sort, filter (including "related to" and "has none" on
-  relationships), group by a property or a relationship, hide and reorder columns, saved views,
-  Blob metadata and previews. Cell edits, inserts, deletes and bulk set; edits can be staged
-  across rows and saved as one mutation.
-- **Explorer.** A relationship tree and a canvas that render the same exploration: expand a
-  node's relationships, page and group neighbours, show at-most-one edges as fields. The
-  ontology view draws the schema's types and relationships.
-- **Query editor.** `.gq` files with tree-sitter highlighting, and diagnostics, completion and
-  hover from `omnigraph-compiler`. ⌘↵ runs the declaration under the cursor, mutations need a
-  confirmation naming the branch, and `explain` plans map each operator back to the query text.
-  Saved queries per graph.
-- **Branches, review and merge.** Create, switch and delete branches; review a branch's changes
-  against its base row by row and revert single changes; merge, with conflicts listed when the
-  server refuses.
-- **History.** Commit lane graph; open any table, query or node at an older commit, read-only.
-- **Agent panel.** Claude or Codex over the Agent Client Protocol, each started as its own
-  `npx` process. Each conversation has a folder of its own with an `omnigraph` CLI that reaches
-  the graph through Studio; the agent writes only to a branch Studio creates for it, and never
-  receives the token.
-- **Shell.** Command palette (⌘K), go to type or node (⌘P), split panes, several windows
-  restored on launch, the schema's `.pg` source, and `omnigraph-studio://`
-  links that open a graph, node or query without running anything. `?` lists every binding.
-- **Settings and shortcuts.** A settings tab (⌘,) generated from the settings schema, with
-  per-graph values. `settings.json` and `keymap.json` (Zed's keymap format, over Studio's
-  defaults) may hold comments, are read again when saved, and list every problem by line; a
-  change from the tab rewrites only the setting it touches.
-
-## How Studio uses Omnigraph
-
-Studio is a client of the Omnigraph HTTP API and nothing else. These rules are in
-`.specify/memory/constitution.md` and each feature plan records how it follows them.
-
-- **HTTP only.** No access to graph storage and no engine crate except `omnigraph-compiler`,
-  which is linked for parsing and type checking. Every request sends `omnigraph-http-api: 0.14`,
-  a server that answers with another contract is refused, and a response without the header is
-  treated as having an unknown effect.
-- **One commit per view.** A view records the `graph_commit_id` of its first read and passes it
-  as `snapshot` on every later read. When the branch head moves, the view shows "Newer data ·
-  Refresh" and keeps its data until refreshed.
-- **Bound writes.** A cell edit or bulk set is `update T set { p: $new } where @id = $id and
-  p = $old`, so a row changed by someone else is left alone and reported. Row deletes and
-  reverts from a review use `POST /mutate/if-graph-commit` with the commit the view read.
-- **Three outcomes, no retries.** A write is committed, refused, or unknown (the response was
-  lost). Studio never resends a write; an unknown outcome is settled by reading history, and the
-  draft is kept until then.
-- **Server policy.** Authorization is the server's Cedar policy; Studio enforces no rules of its
-  own. A 403 is shown as a refusal and the draft stays.
-- **Newer routes on demand.** Routes beyond 0.14 are used only when the server's OpenAPI
-  document advertises them. Engine changes Studio would use, and what it does without them, are
-  listed in `docs/deferred-engine-changes.md` and [spec 012](specs/012-omnigraph-engine-changes/plan.md).
-
-## Architecture
-
-Studio is a Cargo workspace (Rust 2024 edition) of 20 crates: 18 for the app and 2 for the
-tree-sitter grammars. A crate depends only on crates in lower layers, and feature crates never
-depend on each other.
-`script/check-layers.py` enforces this in CI.
-
-| Layer | Crates |
-|---|---|
-| 6 | `studio`: the binary, menus, windows, deep links |
-| 5 | `type_table`, `relationship_tree`, `graph_canvas`, `query_editor`, `review`, `history`, `agent_panel`, `command_palette` |
-| 4 | `studio_workspace`: panes, tabs, docks, modals, toasts |
-| 3 | `graph_store`: connections, graph sessions, snapshot pins, exploration |
-| 2 | `graph_client` (HTTP, no GPUI), `gq_language` (compiler wrapper, no GPUI), `studio_ui` |
-| 1 | `studio_settings`, `studio_theme` |
-| 0 | `studio_actions`: every action type |
-
-GPUI and its crates come from git at one release tag (`docs/zed-pin.md`). The tree-sitter grammars for
-`.gq` and `.pg` are in `grammars/`. `docs/architecture.md` describes the data flow and the state
-model.
-
-## Development
-
-```bash
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-python3 script/check-layers.py
-python3 script/check-brand.py
-python3 script/test_release_files.py
-```
-
-A release's updates are signed with an update key (spec 017). Make it once with `cargo packager
-signer generate` (cargo-packager 0.11.8): its public half goes in
-`crates/studio_update/update-key.pub`, the private half and its password in the
-`STUDIO_UPDATER_KEY` and `STUDIO_UPDATER_KEY_PASSWORD` secrets of the repository's
-`update-signing` environment. That environment needs a reviewer's approval and takes only `v*`
-tags: the release workflow signs a tag's update there, so no workflow change alone can sign
-one, and each release waits for the approval. `update-key.pub` holds the key (2026-11-09), so a
-release whose macOS update is not signed with it is refused. The key and its password are also
-kept in 1Password ("Omnigraph Studio Update Signing Key"), since a secret cannot be read back.
-
-CI runs these checks on macOS, Linux and Windows for each pull request that changes more than
-documentation, and not again on merge. `crates/studio/examples/snapshot.rs` renders Studio
-offscreen to a PNG while dispatching actions, clicks and keystrokes. It is how UI changes are
-checked against the sample graph:
-
-```bash
-OMNIGRAPH_STUDIO_SERVER=http://127.0.0.1:8787 OMNIGRAPH_STUDIO_TOKEN=dev-token \
-  OMNIGRAPH_STUDIO_GRAPH=knowledge cargo run -p studio --example snapshot -- out.png \
-  'studio_graph::OpenType={"type_name":"Person"}'
-```
-
-The same tool records the demo above: `script/dev-server`, then `script/demo-video`, which
-records the story in `demo/story.steps` and frames it with Remotion. See
-[`docs/demo-video.md`](docs/demo-video.md) for what to install, how to change the story, and how
-to put a new video in this README.
-
-Each feature has a plan in [`specs/`](specs/README.md): the design, the alternatives rejected,
-what is deferred, and a dated validation log of the checks behind each claim.
-
-| Path | Contents |
-|---|---|
-| `.specify/memory/constitution.md` | Principles every change follows |
-| `specs/` | One plan per feature |
-| `docs/` | Architecture, the GPUI pin, deferred engine changes |
-| `crates/` | The workspace; `crates/studio` is the binary |
-| `grammars/` | Tree-sitter grammars for `.gq` and `.pg` |
-| `assets/` | Default keymaps and settings |
-| `script/` | Dev server, sample data, demo video, bundling, release files, layer and spelling checks |
-| `demo/` | The demo video's Remotion project and story |
-
-## Status
-
-Built against Omnigraph `v0.14.0` (HTTP contract 0.14); macOS is the primary platform, and Linux and Windows build and
-test in CI. Not implemented:
-
-- Signed and notarized releases, which installing updates waits on; a Windows installer;
-  updates installed in place on Linux and Windows.
-- OIDC sign-in; Studio authenticates with bearer tokens.
-- Approvals and comments on reviews.
-- Features that depend on deferred engine changes ([spec 012](specs/012-omnigraph-engine-changes/plan.md)).
+To build it and run it against a sample graph, see [docs/development.md](docs/development.md).
 
 ## License
 
-GPL-3.0-or-later, because Studio links Zed's GPL-3.0 UI crates (`LICENSE`). Omnigraph is MIT
-and is not affected: Studio talks to it over HTTP and links only the MIT-licensed
-`omnigraph-compiler`.
-
-The interface font, Inter (`assets/fonts/inter/`), is under the SIL Open Font License 1.1
-(`assets/fonts/inter/OFL.txt`). The icons in `assets/icons/nucleo/` are not under the GPL: they are [Nucleo](https://nucleoapp.com)
-icons, used under Nucleo's licence (`assets/icons/nucleo/NOTICE`), which allows an open-source
-project up to 100 of them and only within the product they ship with. `script/vendor-icons.py`
-copies them from a licensed bundle; a test keeps the count under the limit.
+GPL-3.0-or-later, because Studio links Zed's GPL-3.0 crates ([LICENSE](LICENSE)). Omnigraph
+itself is MIT and is not affected: Studio talks to it over HTTP and links only the MIT-licensed
+`omnigraph-compiler`. The Inter font is under the SIL Open Font License 1.1, and the
+[Nucleo](https://nucleoapp.com) icons in `assets/icons/nucleo/` are used under Nucleo's own
+licence, not the GPL ([NOTICE](assets/icons/nucleo/NOTICE)).
