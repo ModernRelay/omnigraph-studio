@@ -76,7 +76,8 @@ pub enum Answered {
     Held(Origin),
     /// An answer at an earlier commit that nothing since changed, itself of this origin.
     Carried(Origin),
-    /// A page's row answered it at this commit.
+    /// Another answer at this commit gave it: a page's row, or a count of 0 for a group's
+    /// first neighbours (`builder::EmptyWithout`).
     Seeded,
     /// It shared a read already under way.
     Joined,

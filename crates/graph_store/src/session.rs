@@ -3169,6 +3169,34 @@ impl GraphSession {
         Some(output)
     }
 
+    /// The answer to `query` at `commit` when it has no rows there without being read
+    /// (`builder::EmptyWithout`): the count of the node's neighbours through the group, held or
+    /// carried to `commit` under the session's schema, is 0. Rows the count's read matched
+    /// would be rows of this query's too, so none means none.
+    fn empty_at(&mut self, query: &BuiltQuery, commit: &str) -> Option<ReadOutput> {
+        let empty = query.empty_without.as_ref()?;
+        let at = DegreeAt {
+            type_name: empty.type_name.clone(),
+            group: empty.group.clone(),
+            id: empty.id.clone(),
+            commit: commit.to_owned(),
+            schema: self.schema_epoch,
+        };
+        let (count, _) = self.degree_kept(&at)?;
+        (count == 0).then(|| ReadOutput {
+            query_name: query.name.clone(),
+            target: ReadTargetOutput {
+                branch: None,
+                snapshot: Some(commit.to_owned()),
+            },
+            row_count: 0,
+            columns: empty.columns.clone(),
+            rows: Arc::new(Value::Array(Vec::new())),
+            graph_commit_id: Some(commit.to_owned()),
+            page: None,
+        })
+    }
+
     /// The memo key of `query` read at `commit`, under the session's schema.
     fn pinned_key(&self, query: &BuiltQuery, commit: &str) -> PinnedRead {
         PinnedRead::of(query, commit, self.schema_epoch)
@@ -3222,6 +3250,13 @@ impl GraphSession {
         {
             self.answered_here(&query.name, Answered::Seeded);
             return self.seeding(query.seeds.clone(), Task::ready(Ok(output)), cx);
+        }
+        // A count the session holds at this commit says the node has no neighbours there.
+        if !self.pinned_reads.holds(&key)
+            && let Some(output) = self.empty_at(query, &commit)
+        {
+            self.answered_here(&query.name, Answered::Seeded);
+            return Task::ready(Ok(output));
         }
         // Neither an answer nor a read someone still waits for: carried from an earlier
         // commit when nothing it depends on changed since.
@@ -7472,6 +7507,7 @@ mod tests {
             params: serde_json::Map::new(),
             depends: Depends::Unknown,
             seeds: None,
+            empty_without: None,
         };
         let asked = queries.load(Ordering::SeqCst);
         let read = session.update(cx, |session, cx| {
@@ -9472,6 +9508,79 @@ mod tests {
             assert!(
                 session.pinned_reads.peek(&c10).is_some(),
                 "nothing was forgotten"
+            );
+        });
+    }
+
+    /// A node the session counted with no neighbours through a group, at a commit and under the
+    /// schema the count was read with, has none on the first page of that group's neighbours:
+    /// the page is answered with no rows and no request (spec 030, part 5). A count of one, a
+    /// narrowed page and a node not counted are read.
+    #[gpui::test]
+    async fn a_group_counted_empty_lists_no_neighbours_without_a_read(cx: &mut TestAppContext) {
+        use crate::ledger::Answered;
+        use crate::test_server::followed_session;
+        use serde_json::json;
+
+        const SCHEMA: &str =
+            "node Person {\n  slug: String @key\n  name: String\n}\nedge Knows: Person -> Person\n";
+        let (session, _served) = followed_session(
+            SCHEMA,
+            |request| match request["name"].as_str() {
+                // p1 knows nobody, p2 one person.
+                Some("studio_page_degrees") => json!([{ "id": "p2", "n": 1 }]),
+                _ => json!([{ "id": "p3", "edge_id": "e1", "label": "Edsger" }]),
+            },
+            cx,
+        );
+        cx.run_until_parked();
+        let schema = session.read_with(cx, |session, _| session.schema_model().unwrap());
+        let group = schema.relationships_of("Person")[0].clone();
+        let head = session.read_with(cx, |session, _| session.heads.get("main").cloned().unwrap());
+        let counts = session.update(cx, |session, cx| {
+            ["p1", "p2"].map(|id| session.degree_at("Person", &group, id, Some(head.clone()), cx))
+        });
+        cx.run_until_parked();
+        for count in counts {
+            count.await.unwrap();
+        }
+        let first = |id: &str, search: Option<&str>| {
+            let narrow = builder::Narrow {
+                search,
+                ..builder::Narrow::default()
+            };
+            builder::neighbours(&schema, "Person", &group, id, None, narrow, 51).unwrap()
+        };
+        let read = |query: BuiltQuery, cx: &mut TestAppContext| {
+            let at = Some(head.clone());
+            session.update(cx, |session, cx| session.read(&query, at, cx))
+        };
+        session.update(cx, |session, _| session.ledger_mut().clear());
+
+        let none = read(first("p1", None), cx).await.unwrap();
+        assert_eq!(none.rows.as_ref(), &json!([]));
+        assert_eq!(none.row_count, 0);
+        assert_eq!(none.columns, ["id", "edge_id", "label"]);
+        assert_eq!(none.graph_commit_id.as_deref(), Some(head.as_str()));
+        session.read_with(cx, |session, _| {
+            let ledger = session.ledger();
+            assert_eq!(
+                ledger.count("studio_neighbours", |a| a == Answered::Seeded),
+                1
+            );
+            assert_eq!(ledger.sent(), 0, "{}", ledger.table());
+        });
+
+        read(first("p2", None), cx).await.unwrap();
+        read(first("p1", Some("Ed")), cx).await.unwrap();
+        read(first("p4", None), cx).await.unwrap();
+        session.read_with(cx, |session, _| {
+            let ledger = session.ledger();
+            assert_eq!(
+                ledger.count("studio_neighbours", |a| a.sent()),
+                3,
+                "{}",
+                ledger.table()
             );
         });
     }

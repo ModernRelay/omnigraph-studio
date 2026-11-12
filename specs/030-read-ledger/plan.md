@@ -1,6 +1,6 @@
 # 030: The read ledger: how each read was answered, how long a view took, and whether a kept answer was right
 
-Status: in progress; step 1 built (2026-11-12) · drafted 2026-11-12, research added and claims checked against Studio and Omnigraph `7711e4a` the same day
+Status: in progress; step 1 built (2026-11-12); part 5's first seed, a group counted empty, built (2026-11-12) · drafted 2026-11-12, research added and claims checked against Studio and Omnigraph `7711e4a` the same day
 
 ## Problem
 
@@ -37,7 +37,9 @@ Three questions need numbers that stay comparable over time:
 
 - **Where a read with a commit is decided.** `GraphSession::read` (`crates/graph_store/src/session.rs`)
   works in this order:
-  1. A page's rows answered it (`seeded_reads`).
+  1. A page's rows answered it (`seeded_reads`), or, since 2026-11-12, a count of 0 held at
+     the commit answers a group's first neighbours with no rows (part 5, "Seeding before
+     prefetch").
   2. Else it is carried from an earlier commit (`carried`), and the carried answer is then
      **inserted into `pinned_reads`** like an answer read.
   3. Else `share` either returns a held answer or joins a read under way.
@@ -242,6 +244,25 @@ Each is its own plan when it is built.
   far below it, so this matters only when several clients share one server.
 - **Seeding before prefetch.** A seed costs no request. Peeks and node pages should take
   everything a held answer already says.
+  - *Built (2026-11-12): a group counted empty lists no neighbours.* A node page reads each
+    group's first neighbours (`studio_neighbours`), and before this it read them for every
+    group, the ones the table it was opened from had just counted 0 included. Now a first page
+    narrowed by nothing but its limit carries `builder::EmptyWithout` (the node, the group and
+    the projection's column names), and `GraphSession::read` answers it with no rows when the
+    session holds that node's count through the group at the same commit and schema epoch, read
+    or carried, and it is 0. The ledger records it as `Seeded`. Why the answer is the server's:
+    the count's read (`studio_page_degrees`) and the page's match the same node type, the node
+    by id and the same traversal, so a node without a match in the one has no row in the other.
+    The count is the session's own, forgotten with the token as every count is.
+  - *Measured, not taken: a table's chips for a page's neighbours.* `studio_page_neighbours`
+    returns the neighbour and its label but not the edge, while a page and a peek list each
+    edge with its id (`edge_id`) and the edge's properties, so no row of it is a row of
+    `studio_neighbours`. Seeding them would need the table to read the edges too.
+  - *Next: one group's first neighbours at another limit.* After a page, a peek of the same row
+    sends `studio_neighbours` again for each group with neighbours (3 in the fixture below),
+    because a peek reads 9 rows and a page 51, so their keys differ. The order (`$m.@id`, then
+    `$e.@id`) is total, so a read of limit `a` answers a read of limit `b` with its first `b`
+    rows when `b <= a`, or when it returned fewer than `a`. That is the next class to seed.
 - **Prefetch** in the speculative lane, at the commit the view shows, never at a moving head:
   - the next table page as the scroll nears the end;
   - a node page's or peek's cheap reads on hover or keyboard focus after a short dwell;
@@ -375,3 +396,4 @@ The research (2026-11-12) is summarized here; a claim not checked in a primary s
 | 2026-11-12 | The ledger records how each read was answered | `graph_store` `the_ledger_says_how_each_read_was_answered`: two asks of a page (one `Sent(HeadCommit, Ok)`, one `Joined`), the node `Seeded` with no request, the neighbours sent once, `Carried(Read)` to a commit that touched another person, then `Held(Carried)`; two reads attributed to the page's scope. `type_table`: a peek of a table's row sends no `studio_node` and three `studio_neighbours`, all asked by the peek; Refresh carries knows out and in and sends likes out and in | Pass; workspace 1,380 tests pass, clippy clean |
 | 2026-11-12 | Found by the ledger: a page opened before the session knows its branch's head reads its node with no commit, and that answer is not kept, so Refresh sends the node again though nothing of it changed | `type_table` `refresh_reads_again_only_the_groups_a_commit_changed`, ledger before Refresh: `studio_node … Sent(Branch, Ok)`; after: `Sent(HeadCommit, Ok)`, nothing carried | Open at the time; fixed in the next row |
 | 2026-11-12 | A read with no commit, kept at the commit its answer names, then holds and carries | Fake servers only. `type_table` `refresh_reads_again_only_the_groups_a_commit_changed`, ledger for Refresh. Before: 4 sent (`studio_neighbours` 2 `Sent(HeadCommit)`, `studio_head` 1, `studio_node` 1 `Sent(HeadCommit)`), 2 carried. After: 3 sent (`studio_neighbours` 2, `studio_head` 1), 3 carried (`studio_neighbours` 2, `studio_node` 1 `Carried(Read)`). `graph_store` `a_read_with_no_commit_is_kept_at_the_commit_it_answered`: a branch read, then the same read at its commit (`Held(Read)`, before: sent again) and at a commit to another person (`Carried(Read)`): `studio_node` sent once in all (`Sent(Branch)`), before twice (`Sent(Branch)`, then `Sent(HeadCommit)` at c1). The guards: an answer naming a commit the head watch has not seen is kept there and the head stays; a schema epoch or credential changed while the read was out, or `Depends::Unknown`, keeps nothing; removing any one guard fails the test | Pass. Two `type_table` tests read a first page again at the commit a branch read answered at, and now send nothing (`a_first_read_pins_the_head_the_session_holds`, `a_read_out_when_a_commit_to_another_type_moves_the_pin_lands`: 1 request each before, 0 after); their assertions changed with a note. Not covered: a live graph, and branch reads outside `GraphSession::read` (`read_on` another branch, `read_request` called directly), which are still not kept |
+| 2026-11-12 | A node page opened from a table reads no neighbours of a group the table counted empty | `type_table` `the_ledger_of_a_table_a_rows_page_and_its_peek`: a Person table over a small graph that answers Studio's queries as a server would (`test_support::Graph`; Ada has 6 groups, 3 with neighbours), then Ada's page, then her peek. Table: 1 `studio_page`, 1 `studio_count`, 6 `studio_page_degrees`, 6 `studio_page_neighbours`. Page before: `studio_node` `Seeded`, 6 `studio_neighbours` sent. Page after: `studio_node` `Seeded`, 3 `studio_neighbours` `Seeded`, 3 sent. Peek after the page: 3 `studio_neighbours` sent, for the groups with neighbours; it reads none for the empty ones, which the table hands it as `KnownRelation` counts, so this change does not touch it. Each of the 6 page queries, answered by the session at `c1`, has the same rows, byte for byte, and row count as the fake's answer to the same query text and parameters; the 3 it sent are among them. `graph_store` `a_group_counted_empty_lists_no_neighbours_without_a_read`: a count of 0 answers with no request, a count of 1, a search and a node not counted are sent | Pass. A page's requests at open fall from 6 to 3 in the fixture. On the personal graph a table counts only the relationship columns it draws (20 `studio_page_degrees` in the count above), so a page saves the empty ones of those for its row; a group no view counted is read as before. Not proven against the fake: `columns` (the fake answers `["n"]` to every read); the session gives the projection's names, and no reader of these answers reads them |

@@ -23,6 +23,21 @@ pub struct BuiltQuery {
     pub depends: Depends,
     /// What its rows also answer at the same commit, read under the same schema.
     pub seeds: Option<Seeds>,
+    /// When it has no rows without being read ([`EmptyWithout`]).
+    pub empty_without: Option<EmptyWithout>,
+}
+
+/// A generated query whose rows all come from one node's edges through one relationship group,
+/// matched as [`page_degrees`] matches them: the same node type, the node by id and the same
+/// traversal, and nothing more narrowing them than a limit. A node with no neighbours through the
+/// group at a commit, as `page_degrees` counts under the same schema, has no rows there; the
+/// answer then is no rows under `columns`, the names its projection gives.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmptyWithout {
+    pub type_name: String,
+    pub group: RelationshipGroup,
+    pub id: String,
+    pub columns: Vec<String>,
 }
 
 /// What a generated query's rows also answer, at the commit and under the schema they were read
@@ -1775,6 +1790,7 @@ fn node_page_reading(
         params: params.values,
         depends: Depends::rows_of(schema, &node.name, false, filters),
         seeds,
+        empty_without: None,
     })
 }
 
@@ -1860,6 +1876,7 @@ pub fn stored_view_query(
         params: values,
         depends: Depends::rows_of(schema, &node.name, false, filters),
         seeds: None,
+        empty_without: None,
     })
 }
 
@@ -1988,6 +2005,7 @@ pub fn node_count(
         params: params.values,
         depends: Depends::rows_of(schema, &node.name, false, filters),
         seeds: None,
+        empty_without: None,
     })
 }
 
@@ -2020,6 +2038,7 @@ fn one_by_id(node: &NodeType, id: &str, name: &str, returns: &str) -> BuiltQuery
             id: id.to_owned(),
         },
         seeds: None,
+        empty_without: None,
     }
 }
 
@@ -2065,6 +2084,7 @@ pub fn nodes_fields_by_id(
         params: params.values,
         depends,
         seeds: None,
+        empty_without: None,
     })
 }
 
@@ -2115,6 +2135,7 @@ pub fn head_probe(schema: &SchemaModel) -> Option<BuiltQuery> {
         params: Map::new(),
         depends: Depends::Unknown,
         seeds: None,
+        empty_without: None,
     })
 }
 
@@ -2241,6 +2262,7 @@ pub fn edge_page_without(
         params: params.values,
         depends: Depends::rows_of(schema, &edge.name, true, filters),
         seeds: None,
+        empty_without: None,
     })
 }
 
@@ -2276,6 +2298,7 @@ pub fn edge_count(
         params: params.values,
         depends: Depends::rows_of(schema, &edge.name, true, filters),
         seeds: None,
+        empty_without: None,
     })
 }
 
@@ -2340,6 +2363,7 @@ pub fn value_counts(
         params: params.values,
         depends: Depends::rows_counted_by(schema, type_name, edge_table, filters, property_name),
         seeds: None,
+        empty_without: None,
     })
 }
 
@@ -2396,6 +2420,7 @@ pub fn neighbour_counts(
         params: params.values,
         depends: Depends::rows_counted_by(schema, type_name, false, filters, key),
         seeds: None,
+        empty_without: None,
     })
 }
 
@@ -2458,6 +2483,7 @@ pub fn neighbour_value_counts(
         params: params.values,
         depends: Depends::rows_counted_by(schema, type_name, false, filters, key),
         seeds: None,
+        empty_without: None,
     })
 }
 
@@ -2520,6 +2546,7 @@ pub fn endpoint_value_counts(
         params: params.values,
         depends: Depends::rows_counted_by(schema, edge_name, true, filters, key),
         seeds: None,
+        empty_without: None,
     })
 }
 
@@ -2563,6 +2590,7 @@ pub fn edge_degree(
         params: params.values,
         depends,
         seeds: None,
+        empty_without: None,
     })
 }
 
@@ -2602,6 +2630,7 @@ pub fn page_degrees(
             group: group.clone(),
             ids: node_ids,
         }),
+        empty_without: None,
     })
 }
 
@@ -2646,6 +2675,7 @@ pub fn page_neighbours(
         params: params.values,
         depends,
         seeds: None,
+        empty_without: None,
     })
 }
 
@@ -2913,6 +2943,13 @@ pub fn neighbours_without_properties(
             narrow.filters,
         )
     };
+    // The first page, narrowed by nothing but its limit, matches what `page_degrees` counts.
+    let unnarrowed = after.is_none()
+        && narrow.search.is_none_or(str::is_empty)
+        && narrow.value.is_none()
+        && narrow.filters.is_empty()
+        && narrow.sort.is_none();
+    let node_id = id.to_owned();
     let mut params = Params::new();
     let id = params.add("id", "String", Value::String(id.to_owned()));
     // A sorted page starts where its keyset says, and orders by the property, then the
@@ -3018,12 +3055,23 @@ pub fn neighbours_without_properties(
         traversal = traversal_clause(group, Some("e")),
         columns = columns.join(", "),
     );
+    let empty_without = unnarrowed.then(|| EmptyWithout {
+        type_name: node.name.clone(),
+        group: group.clone(),
+        id: node_id,
+        columns: columns
+            .iter()
+            .filter_map(|column| column.rsplit(" as ").next())
+            .map(str::to_owned)
+            .collect(),
+    });
     Ok(BuiltQuery {
         name: "studio_neighbours".into(),
         text,
         params: params.values,
         depends,
         seeds: None,
+        empty_without,
     })
 }
 
@@ -3077,6 +3125,7 @@ pub fn neighbour_values(
         params: params.values,
         depends: Depends::neighbours_narrowed(schema, group, Some(by), filters),
         seeds: None,
+        empty_without: None,
     })
 }
 
@@ -3114,6 +3163,7 @@ pub fn neighbours_without(
         params: params.values,
         depends: Depends::neighbours_narrowed(schema, group, Some(by), filters),
         seeds: None,
+        empty_without: None,
     })
 }
 
@@ -3147,6 +3197,7 @@ pub fn neighbour_count(
         params: params.values,
         depends: Depends::neighbours_narrowed(schema, group, None, filters),
         seeds: None,
+        empty_without: None,
     })
 }
 
@@ -3198,6 +3249,7 @@ pub fn node_label(
         params: params.values,
         depends,
         seeds: None,
+        empty_without: None,
     })
 }
 
@@ -3232,6 +3284,7 @@ pub fn node_labels(
             edges: Vec::new(),
         },
         seeds: None,
+        empty_without: None,
     }))
 }
 
@@ -3275,6 +3328,7 @@ pub fn node_search(
             edges: Vec::new(),
         },
         seeds: None,
+        empty_without: None,
     })
 }
 
@@ -3432,6 +3486,7 @@ pub fn update_rows(
         params: params.values,
         depends: Depends::Unknown,
         seeds: None,
+        empty_without: None,
     })
 }
 
@@ -3490,6 +3545,7 @@ pub fn update_cells(
         params: params.values,
         depends: Depends::Unknown,
         seeds: None,
+        empty_without: None,
     })
 }
 
@@ -3526,6 +3582,7 @@ pub fn insert_node(
         params: params.values,
         depends: Depends::Unknown,
         seeds: None,
+        empty_without: None,
     })
 }
 
@@ -3549,6 +3606,7 @@ pub fn delete_node(
         params: params.values,
         depends: Depends::Unknown,
         seeds: None,
+        empty_without: None,
     })
 }
 
@@ -3572,6 +3630,7 @@ pub fn delete_nodes(
         params: params.values,
         depends: Depends::Unknown,
         seeds: None,
+        empty_without: None,
     })
 }
 
@@ -3595,6 +3654,7 @@ pub fn delete_edges(
         params: params.values,
         depends: Depends::Unknown,
         seeds: None,
+        empty_without: None,
     })
 }
 
@@ -3639,6 +3699,7 @@ pub fn required_dependents(
         params: params.values,
         depends: Depends::Unknown,
         seeds: None,
+        empty_without: None,
     })
 }
 
@@ -3684,6 +3745,7 @@ pub fn insert_edge(
         params: params.values,
         depends: Depends::Unknown,
         seeds: None,
+        empty_without: None,
     })
 }
 
@@ -3707,6 +3769,7 @@ pub fn delete_edge(
         params: params.values,
         depends: Depends::Unknown,
         seeds: None,
+        empty_without: None,
     })
 }
 

@@ -1017,3 +1017,117 @@ fn serve_blobs(
     let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
     cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx))
 }
+
+/// A small graph that answers Studio's own relationship reads as a server would, from its
+/// nodes and edges, so an answer kept without a request can be compared with the server's
+/// answer to the same query. Edges are `(type, id, from, to)`; nodes `(type, id, name)`.
+pub(crate) struct Graph {
+    pub(crate) nodes: Vec<(&'static str, &'static str, &'static str)>,
+    pub(crate) edges: Vec<(&'static str, &'static str, &'static str, &'static str)>,
+}
+
+impl Graph {
+    /// The rows the server answers `request` with: a page or a node of a type, a page's
+    /// relationship counts and first neighbours, and one node's neighbours and edge count.
+    /// Any other read answers no rows.
+    pub(crate) fn answer(&self, request: &Value) -> Value {
+        let query = request["query"].as_str().unwrap_or_default();
+        let params = &request["params"];
+        let node = |id: &str| self.nodes.iter().find(|(_, n, _)| *n == id);
+        let whole = |id: &str| {
+            node(id).map(|(_, id, name)| json!({ "n": { "@id": id, "slug": id, "name": name } }))
+        };
+        let limit = query
+            .rsplit("limit ")
+            .next()
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(usize::MAX);
+        match request["name"].as_str().unwrap_or_default() {
+            "studio_page" => {
+                let ty = query
+                    .split("$n: ")
+                    .nth(1)
+                    .and_then(|rest| rest.split_whitespace().next())
+                    .unwrap_or_default();
+                let mut ids: Vec<&str> = self
+                    .nodes
+                    .iter()
+                    .filter(|(t, ..)| *t == ty)
+                    .map(|(_, id, _)| *id)
+                    .collect();
+                ids.sort();
+                ids.into_iter().filter_map(whole).take(limit).collect()
+            }
+            "studio_node" => params["id"].as_str().and_then(whole).into_iter().collect(),
+            "studio_page_degrees" => self
+                .ids(params)
+                .into_iter()
+                .filter_map(|id| {
+                    let n = self.ends(query, id).len();
+                    (n > 0).then(|| json!({ "id": id, "n": n }))
+                })
+                .collect(),
+            "studio_page_neighbours" => {
+                let mut ids = self.ids(params);
+                ids.sort();
+                let mut rows = Vec::new();
+                for id in ids {
+                    let mut ends = self.ends(query, id);
+                    ends.sort_by_key(|(other, _)| *other);
+                    for (other, _) in ends {
+                        let label = node(other).map(|(_, _, name)| *name);
+                        rows.push(json!({ "id": id, "other": other, "label": label }));
+                    }
+                }
+                rows.into_iter().take(limit).collect()
+            }
+            "studio_neighbours" => {
+                let id = params["id"].as_str().unwrap_or_default();
+                let mut ends = self.ends(query, id);
+                ends.sort();
+                ends.into_iter()
+                    .take(limit)
+                    .map(|(other, edge)| {
+                        let label = node(other).map(|(_, _, name)| *name);
+                        json!({ "id": other, "edge_id": edge, "label": label })
+                    })
+                    .collect()
+            }
+            "studio_edge_degree" => {
+                let id = params["id"].as_str().unwrap_or_default();
+                json!([{ "n": self.ends(query, id).len() }])
+            }
+            _ => json!([]),
+        }
+    }
+
+    fn ids<'a>(&self, params: &'a Value) -> Vec<&'a str> {
+        params["ids"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect()
+    }
+
+    /// The other end and the edge of each edge at `id` through the group `query` traverses
+    /// (`$n knows $m` out, `$m knows $n` in, with or without an edge variable).
+    fn ends(&self, query: &str, id: &str) -> Vec<(&'static str, &'static str)> {
+        self.edges
+            .iter()
+            .filter_map(|(ty, edge, from, to)| {
+                let token = gq_language::traversal_token(ty);
+                let out = [format!("$n {token} $m"), format!("$n $e:{token} $m")];
+                let back = [format!("$m {token} $n"), format!("$m $e:{token} $n")];
+                if out.iter().any(|t| query.contains(t.as_str())) && *from == id {
+                    Some((*to, *edge))
+                } else if back.iter().any(|t| query.contains(t.as_str())) && *to == id {
+                    Some((*from, *edge))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+}
