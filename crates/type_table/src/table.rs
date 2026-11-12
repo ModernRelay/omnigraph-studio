@@ -16319,16 +16319,20 @@ mod tests {
         assert_eq!(held.as_deref(), Some("c1"));
         // Another writer's commit, which only the server has seen.
         writer.commit("c2", vec![changed("node", "Person", "p1", None)]);
+        let sent = pages.lock().unwrap().len();
         table.update(cx, |table, cx| table.reload(false, cx));
         cx.run_until_parked();
         table.read_with(cx, |table, _| {
             assert_eq!(table.paging.pinned.as_deref(), Some("c1"));
             assert!(!table.newer);
         });
+        // The first page, read before the session knew the head, was kept at c1, the commit it
+        // answered at (spec 030): read again at c1, it asks the server nothing, and never the
+        // branch, which would answer at c2.
         assert_eq!(
-            pages.lock().unwrap().last(),
-            Some(&serde_json::json!("c1")),
-            "read at the head the session holds"
+            pages.lock().unwrap()[sent..],
+            [] as [Value; 0],
+            "read at the head the session holds, from what it answered there"
         );
         session.update(cx, |session, cx| session.check_heads(cx));
         cx.run_until_parked();
@@ -18606,7 +18610,10 @@ mod tests {
             assert!(!table.newer);
         });
         cx.run_until_parked();
-        assert_eq!(*pages.lock().unwrap(), ["c1"], "one request");
+        // The first page was read before the session knew the head and kept at c1, the commit
+        // it answered at (spec 030), so the read at c1 is answered without a request; it is
+        // still out, a task the table waits on, when the pin moves.
+        assert!(pages.lock().unwrap().is_empty(), "no request");
         table.read_with(cx, |table, _| {
             assert_eq!(table.reads_sent_again, 0, "the read landed as it was");
             let ids: Vec<&str> = table.rows.iter().map(|row| row.id.as_str()).collect();
