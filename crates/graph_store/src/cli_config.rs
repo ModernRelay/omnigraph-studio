@@ -216,6 +216,18 @@ pub struct CliTargets {
     /// The managed targets' profiles whose control plane and organization the CLI said, each
     /// once (spec 021).
     pub profiles: Vec<ProfileOwner>,
+    /// Why there is no CLI Studio can drive, when that is why the targets were not listed: the
+    /// Open dialog shows it until one is found (spec 029), rather than a notice.
+    pub no_cli: Option<NoCli>,
+}
+
+/// Why Studio found no Omnigraph CLI it can drive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoCli {
+    /// Whether some `omnigraph` was found, too old or otherwise unfit, or none at all.
+    pub unfit: bool,
+    /// The CLI's reason, naming each program found.
+    pub why: String,
 }
 
 /// A CLI profile's control plane and organization, as `credentials status --profile NAME
@@ -265,6 +277,7 @@ pub async fn read_targets(
             watched: vec![(config.clone(), stamp)],
             managed: Vec::new(),
             profiles: Vec::new(),
+            no_cli: None,
         }
     };
     let asked = "`omnigraph target list --json`";
@@ -280,15 +293,30 @@ pub async fn read_targets(
     };
     let cli = match cli_tokens::found_cli(programs, &turn).await {
         Ok(cli) => cli,
-        Err(why) => {
+        // One that may pass (a CLI just replaced, slow to start) is tried again; one that stands
+        // is said in the Open dialog, with how to install one, until a CLI is found.
+        Err(why) if why.passing => {
             return failed(
-                why.passing,
+                true,
                 format!(
                     "Studio lists the CLI's targets with the Omnigraph CLI, and {}",
                     why.why
                 ),
-                stamp_of(&config),
+                None,
             );
+        }
+        Err(why) => {
+            return CliTargets {
+                servers: None,
+                errors: Vec::new(),
+                watched: vec![(config.clone(), stamp_of(&config))],
+                managed: Vec::new(),
+                profiles: Vec::new(),
+                no_cli: Some(NoCli {
+                    unfit: !cli_tokens::installed(programs).is_empty(),
+                    why: why.why,
+                }),
+            };
         }
     };
     // Taken before the CLI reads the file: a write while it lists changes the next stamp.
@@ -406,6 +434,7 @@ pub(crate) fn unlisted(config: &Path, why: String) -> CliTargets {
         watched: vec![(config.to_path_buf(), Some(UNLISTED))],
         managed: Vec::new(),
         profiles: Vec::new(),
+        no_cli: None,
     }
 }
 
@@ -548,6 +577,7 @@ pub(crate) fn servers_from(
         watched,
         managed,
         profiles: Vec::new(),
+        no_cli: None,
     }
 }
 

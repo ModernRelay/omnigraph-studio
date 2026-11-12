@@ -93,9 +93,32 @@ pub(crate) fn resolve(program: &str, env: &mut BTreeMap<String, String>) -> Resu
     }
 }
 
-/// What the agent panel says when `program` cannot be found.
+/// What the agent panel says when `program` cannot be found: for Node.js's own tools, which
+/// the presets run, that the agent needs Node.js (spec 029).
 pub(crate) fn missing_message(program: &str) -> String {
-    format!("Studio could not find `{program}`. Install it, or set its path in Settings → Agent.")
+    if runs_on_node(program) {
+        return NODE_MISSING.to_owned();
+    }
+    format!(
+        "Studio could not find `{program}`. Install it, or choose another agent in Settings → \
+         Agent."
+    )
+}
+
+/// What the agent panel says when the agent runs on Node.js and Studio finds none.
+pub(crate) const NODE_MISSING: &str = "The agent runs on Node.js, which Studio could not find. \
+                                       Install Node.js 18 or later from nodejs.org, then Restart.";
+
+/// Whether `program` is one of Node.js's tools (`npx`, `npm`, `node`), which run only where
+/// `node` does.
+pub(crate) fn runs_on_node(program: &str) -> bool {
+    let name = Path::new(program)
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .unwrap_or_default();
+    ["npx", "npm", "node"]
+        .iter()
+        .any(|tool| name.eq_ignore_ascii_case(tool))
 }
 
 /// `program` as a shell finds it: a name with a folder as it is, when it can run; a bare name
@@ -248,6 +271,16 @@ fn marked_path(output: &[u8]) -> Option<OsString> {
 mod tests {
     use super::*;
 
+    /// The presets run `npx`, which needs Node.js: a missing one says so, naming Node.js rather
+    /// than the tool (spec 029).
+    #[test]
+    fn a_missing_node_tool_names_node() {
+        assert!(runs_on_node("npx"));
+        assert!(runs_on_node("/opt/homebrew/bin/npx"));
+        assert!(runs_on_node("npx.cmd"));
+        assert!(!runs_on_node("codex"));
+        assert_eq!(missing_message("npx"), NODE_MISSING);
+    }
     #[cfg(unix)]
     fn joined(folders: &[&str]) -> OsString {
         std::env::join_paths(folders).unwrap()
@@ -411,7 +444,8 @@ mod tests {
 
         assert_eq!(
             missing_message("codex"),
-            "Studio could not find `codex`. Install it, or set its path in Settings → Agent."
+            "Studio could not find `codex`. Install it, or choose another agent in Settings → \
+             Agent."
         );
     }
 }

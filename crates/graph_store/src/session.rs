@@ -623,6 +623,38 @@ fn commit_changes_bytes(page: &CommitChanges) -> usize {
             .sum::<usize>()
 }
 
+/// What a failed read of a graph's schema says of the graph, by the server's answer: the graph
+/// the window opened is not there, the token was refused or may not read it, or the server did
+/// not answer (spec 029).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaFailure {
+    /// A 404: no graph by that id.
+    NotFound,
+    /// A 401: the token sent was refused, or none was sent.
+    Unauthorized,
+    /// A 403: the credential may not read this graph.
+    Forbidden,
+    /// No answer from the server: refused, timed out, DNS, TLS, or a proxy's error.
+    Unreachable,
+    /// Anything else: an answer Studio could not read, another contract, too large.
+    Other,
+}
+
+impl SchemaFailure {
+    pub fn of(error: &ReadError) -> Self {
+        match error {
+            ReadError::Refused(refusal) => match refusal.status {
+                404 => Self::NotFound,
+                401 => Self::Unauthorized,
+                403 => Self::Forbidden,
+                _ => Self::Other,
+            },
+            ReadError::Transport(_) => Self::Unreachable,
+            _ => Self::Other,
+        }
+    }
+}
+
 fn parse_schema(source: &str) -> Loadable<Arc<SchemaModel>> {
     match SchemaModel::parse(source) {
         Ok(model) => Loadable::Loaded(Arc::new(model)),
@@ -681,6 +713,9 @@ pub struct GraphSession {
     /// nothing saved.
     server_key: String,
     pub schema: Loadable<Arc<SchemaModel>>,
+    /// Why the last read of the schema failed, while [`Self::schema`] is failed: what the
+    /// window's page for a graph that would not open says and offers (spec 029).
+    pub schema_failure: Option<SchemaFailure>,
     pub branches: Loadable<Vec<String>>,
     /// Each type's row count at the branch head, by kind and type (a node type and an edge type
     /// may share a name), from the branch's storage snapshot at `counts_version`: the sidebar
@@ -908,6 +943,7 @@ impl GraphSession {
             canvas_positions: Default::default(),
             server_key,
             schema: Loadable::NotLoaded,
+            schema_failure: None,
             branches: Loadable::NotLoaded,
             counts: Loadable::NotLoaded,
             counts_stale: None,
@@ -1498,6 +1534,7 @@ impl GraphSession {
             this.update(cx, |this, cx| this.note_read(&read, cx)).ok();
             this.update(cx, |this, cx| {
                 this.reloading_schema = false;
+                let failure = read.as_ref().err().map(SchemaFailure::of);
                 let result = match (read, parsed) {
                     (Ok(()), Some(parsed)) => parsed,
                     (Err(error), _) => Loadable::Failed(error.to_string()),
@@ -1505,6 +1542,9 @@ impl GraphSession {
                     (Ok(()), None) => this.schema.clone(),
                 };
                 this.install_schema(result, cx);
+                // Said only while no schema is held: a failed read again keeps the one held.
+                this.schema_failure =
+                    failure.filter(|_| matches!(this.schema, Loadable::Failed(_)));
                 // A reason to check that came while the read was out may postdate its answer.
                 if std::mem::take(&mut this.recheck_schema_again) {
                     this.recheck_schema(None, cx);
@@ -8945,6 +8985,30 @@ mod tests {
         read(&page, cx).await.unwrap();
         read(&node, cx).await.unwrap();
         assert_eq!(reads(), 1);
+    }
+
+    /// A schema read the server answers 404 is kept as a graph not found, for the window's page;
+    /// one that is read again and lands lets it go (spec 029).
+    #[gpui::test]
+    async fn a_graph_that_is_not_there_is_said_so(cx: &mut TestAppContext) {
+        const SCHEMA: &str = "node Person {\n  slug: String @key\n}\n";
+        let (session, served) =
+            crate::test_server::followed_session(SCHEMA, |_| serde_json::json!([]), cx);
+        cx.run_until_parked();
+        served.lock().unwrap().schema_status = Some(404);
+        session.update(cx, |session, cx| {
+            session.schema = Loadable::NotLoaded;
+            session.reload_schema(cx)
+        });
+        cx.run_until_parked();
+        session.read_with(cx, |session, _| {
+            assert!(matches!(session.schema, Loadable::Failed(_)));
+            assert_eq!(session.schema_failure, Some(SchemaFailure::NotFound));
+        });
+        served.lock().unwrap().schema_status = None;
+        session.update(cx, |session, cx| session.reload_schema(cx));
+        cx.run_until_parked();
+        session.read_with(cx, |session, _| assert_eq!(session.schema_failure, None));
     }
 
     #[gpui::test]

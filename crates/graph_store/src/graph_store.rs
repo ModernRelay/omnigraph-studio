@@ -58,15 +58,15 @@ pub use registry::ConnectionRegistry;
 /// ([`cli::omnigraph_variables`]).
 pub mod cli {
     pub use crate::cli_tokens::{
-        FIRST_CLI_RELEASE, FoundCli, Held, MAX_ANSWER_BYTES, READ_TIMEOUT, Ran, TargetDigests,
-        Unrun, VARIABLE_PREFIX, candidates, configured, installed, omnigraph_variables, probe, run,
-        take_turn,
+        FIRST_CLI_RELEASE, FoundCli, Held, INSTALL, MAX_ANSWER_BYTES, READ_TIMEOUT, Ran,
+        TargetDigests, Unrun, VARIABLE_PREFIX, candidates, configured, installed,
+        omnigraph_variables, probe, run, take_turn,
     };
 }
 pub use session::{
     BranchStart, DraftEntry, DraftKey, ExternalWrite, FollowUp, GraphSession, HeadWatch, HeldAs,
-    Loadable, MergeEntry, MergeSent, MergeSettled, OutcomeEntry, OutcomeKind, SessionEvent, Wrote,
-    nothing_sent, open_session, open_session_behind,
+    Loadable, MergeEntry, MergeSent, MergeSettled, OutcomeEntry, OutcomeKind, SchemaFailure,
+    SessionEvent, Wrote, nothing_sent, open_session, open_session_behind,
 };
 
 /// The user agent of Studio's requests.

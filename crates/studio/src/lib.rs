@@ -7,6 +7,7 @@ mod cloud_settings;
 pub mod deep_link;
 #[cfg(debug_assertions)]
 mod design_gallery;
+mod first_run;
 mod keymaps;
 pub mod logging;
 mod menus;
@@ -197,8 +198,17 @@ pub fn init(cx: &mut App) {
         );
         workspace.register_action(|workspace, _: &OpenGraph, window, cx| {
             let handle = cx.entity().downgrade();
+            // The window's own server is the one chosen: the page for a graph it would not open
+            // sends the person here for a new token or another graph (spec 029).
+            let shown = workspace
+                .session()
+                .map(|session| session.read(cx).connection.clone());
             workspace.toggle_modal(window, cx, |window, cx| {
-                OpenGraphModal::new(handle, window, cx)
+                let mut modal = OpenGraphModal::new(handle, window, cx);
+                if let Some(connection) = shown.filter(|c| modal.lists(c)) {
+                    modal.select(connection, window, cx);
+                }
+                modal
             });
         });
     })

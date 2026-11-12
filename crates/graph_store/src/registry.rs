@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cli_config::{
     self, CliAuth, CliCredential, CliServer, CliTargets, CliTransport, FileStamp, ManagedTarget,
-    Platform, ProfileOwner,
+    NoCli, Platform, ProfileOwner,
 };
 use crate::cli_tokens::{self, CliTokenSource, TargetDigests, Token, TokenSource};
 use crate::connection::{Connection, ServerEntry, ServerSource};
@@ -114,6 +114,10 @@ pub struct ConnectionRegistry {
     /// what the CLI's targets could not give when last listed. One list, each said as it
     /// happened.
     notices: Vec<String>,
+    /// Why no CLI Studio can drive was found, until one is ([`Self::no_cli`]).
+    no_cli: Option<NoCli>,
+    /// A look for the CLI asked by the person is under way ([`Self::check_cli_again`]).
+    check_again: bool,
     http: Arc<dyn HttpClient>,
     transported: TransportHttp,
     /// The client made for each transport a CLI connection uses, which every target naming it
@@ -644,6 +648,8 @@ impl ConnectionRegistry {
             connections: Vec::new(),
             environment_notice: None,
             notices: Vec::new(),
+            no_cli: None,
+            check_again: false,
             http,
             transported: Arc::new(move |_| Ok(same.clone())),
             transport_clients: Vec::new(),
@@ -682,6 +688,27 @@ impl ConnectionRegistry {
     /// CLI Studio can drive, a configuration the CLI refuses, a target Studio does not connect
     /// to, the other targets on an address). Each says what happened, and the workspace shows
     /// each new one in a toast.
+    /// Why Studio found no Omnigraph CLI it can drive, until it finds one (spec 029).
+    pub fn no_cli(&self) -> Option<&NoCli> {
+        self.no_cli.as_ref()
+    }
+
+    /// Whether a look for the CLI asked by [`Self::check_cli_again`] is under way.
+    pub fn checking_cli(&self) -> bool {
+        self.check_again
+    }
+
+    /// Looks for the CLI and lists its targets again now, rather than at the next change where
+    /// Studio looks for it: the dialog's Check again, after the person installed one.
+    pub fn check_cli_again(&mut self, cx: &mut Context<Self>) {
+        if self._watch.is_none() {
+            return;
+        }
+        self.check_again = true;
+        cx.notify();
+        self.watch_cli_targets(cx);
+    }
+
     pub fn notices(&self) -> &[String] {
         &self.notices
     }
@@ -759,14 +786,17 @@ impl ConnectionRegistry {
                 if !std::mem::take(&mut first) {
                     cx.background_executor().timer(OPERATOR_POLL).await;
                 }
-                let Ok((watched, places, listing, platform)) = this.update(cx, |this, _| {
-                    (
-                        this.watched.clone(),
-                        this.cli_places.clone(),
-                        !this.listed,
-                        this.platform,
-                    )
-                }) else {
+                let Ok((watched, places, listing, platform, forced)) =
+                    this.update(cx, |this, _| {
+                        (
+                            this.watched.clone(),
+                            this.cli_places.clone(),
+                            !this.listed,
+                            this.platform,
+                            this.check_again,
+                        )
+                    })
+                else {
                     break;
                 };
                 let (stamp, cli_stamp, places) = cx
@@ -784,7 +814,7 @@ impl ConnectionRegistry {
                 }) else {
                     break;
                 };
-                if !listing && !listed_files && !cli_moved {
+                if !listing && !listed_files && !cli_moved && !forced {
                     continue;
                 }
                 let Ok(prepare) = this.update(cx, |this, _| this.transport_preparer()) else {
@@ -815,7 +845,8 @@ impl ConnectionRegistry {
                         let held_back = listing && targets.lists_again() && patient;
                         this.cli_stamp = cli_stamp;
                         this.keep_stamp(&targets);
-                        let changed = this.apply_cli_targets(targets, prepared, cx);
+                        let mut changed = this.apply_cli_targets(targets, prepared, cx);
+                        changed |= std::mem::take(&mut this.check_again);
                         if asks_again {
                             this.ask_cli_tokens_again(cx);
                         }
@@ -1263,11 +1294,19 @@ impl ConnectionRegistry {
             watched: _,
             managed,
             profiles,
+            no_cli,
         } = targets;
         let Some(servers) = servers else {
-            return self.keep_notices(errors);
+            // A CLI that cannot be driven is kept until one is found; a listing that failed for
+            // another reason says nothing of it.
+            let cli_changed = no_cli.is_some() && self.no_cli != no_cli;
+            if cli_changed {
+                self.no_cli = no_cli;
+            }
+            return self.keep_notices(errors) | cli_changed;
         };
-        let mut changed = self.apply_control_planes(profiles, cx);
+        let cli_found = self.no_cli.take().is_some();
+        let mut changed = self.apply_control_planes(profiles, cx) | cli_found;
         if self.managed_targets != managed {
             self.managed_targets = managed;
             changed = true;
@@ -1453,6 +1492,9 @@ impl ConnectionRegistry {
     /// secure store. Studio writes neither the CLI's file nor the token. The targets are listed
     /// again at once, and the new target's connection is the answer. An address Studio connects
     /// to already is that connection, and nothing is added. A refusal is the CLI's own words.
+    /// A token for an `http://` server on this machine, which the CLI keeps for no `http://`
+    /// server, goes to the new connection in memory instead, and the target is added anonymous
+    /// (spec 029); for another `http://` server it is refused before the CLI is asked.
     /// Where the CLI gives Studio no token (Windows), a token is refused before the CLI is asked:
     /// Studio could not use the target it would add. The Open dialog disables its token field
     /// there, so this refusal is what stands behind it.
@@ -1485,10 +1527,22 @@ impl ConnectionRegistry {
                  letters, digits, `.`, `_` and `-`"
             )));
         }
-        let token = token
+        let mut token = token
             .map(|token| token.trim().to_owned())
             .filter(|token| !token.is_empty())
             .map(Token::typed);
+        // The CLI keeps a token only for an `https://` server (spec 012 E46): one at `http://` on
+        // this machine is added anonymous, and its token kept in memory, as Update token keeps
+        // one. Another `http://` server is refused here, in the CLI's words.
+        let held = match &token {
+            Some(_) if url.starts_with("http://") && !graph_client::is_loopback(&url) => {
+                return Task::ready(Err(
+                    "endpoint requires HTTPS; HTTP is only allowed for loopback servers".into(),
+                ));
+            }
+            Some(_) if url.starts_with("http://") => token.take(),
+            _ => None,
+        };
         let platform = self.platform;
         if token.is_some() && !platform.exports_tokens() {
             return Task::ready(Err(format!(
@@ -1526,9 +1580,15 @@ impl ConnectionRegistry {
                         cx.notify();
                     }
                     added?;
-                    this.find(&name, cx).ok_or_else(|| {
+                    let found = this.find(&name, cx).ok_or_else(|| {
                         format!("The CLI added the target '{name}', but does not list it")
-                    })
+                    })?;
+                    if let Some(held) = held {
+                        found.update(cx, |connection, cx| {
+                            connection.set_token(Some(held.into_string()), cx)
+                        });
+                    }
+                    Ok(found)
                 })
                 .map_err(|error| error.to_string())
                 .and_then(|found| found);
@@ -2856,6 +2916,89 @@ mod tests {
                 registry.find("new", cx).is_some(),
                 "listed again after the add"
             );
+        });
+    }
+
+    /// A listing that found no CLI Studio can drive keeps why, for the Open dialog, and says it
+    /// in no notice; a later listing that finds one lets it go. A listing that failed for another
+    /// reason says nothing of the CLI (spec 029).
+    #[gpui::test]
+    async fn a_missing_cli_is_kept_until_one_is_found(cx: &mut TestAppContext) {
+        let (http, _) = answering();
+        let cli = Arc::new(FakeCli::default());
+        let registry = registry_with(http, &cli, cx);
+        let missing = cli_config::NoCli {
+            unfit: false,
+            why: "Studio found no Omnigraph CLI it can drive".into(),
+        };
+        assert!(apply(
+            &registry,
+            CliTargets {
+                no_cli: Some(missing.clone()),
+                ..CliTargets::default()
+            },
+            cx
+        ));
+        registry.read_with(cx, |registry, _| {
+            assert_eq!(registry.no_cli(), Some(&missing));
+            assert!(registry.notices().is_empty(), "{:?}", registry.notices());
+        });
+        apply(
+            &registry,
+            CliTargets {
+                errors: vec!["the CLI refuses its configuration".into()],
+                ..CliTargets::default()
+            },
+            cx,
+        );
+        registry.read_with(cx, |registry, _| assert!(registry.no_cli().is_some()));
+        assert!(apply(
+            &registry,
+            files(vec![server("a", "http://a.test", "1")]),
+            cx
+        ));
+        registry.read_with(cx, |registry, _| assert_eq!(registry.no_cli(), None));
+    }
+
+    /// A token for an `http://` server on this machine, which the CLI keeps for no `http://`
+    /// server, is not handed to the CLI: the target is added anonymous and the connection holds
+    /// the token for the run. One for an `http://` server elsewhere is refused before the CLI is
+    /// asked (spec 029).
+    #[gpui::test]
+    async fn a_loopback_servers_token_is_kept_in_memory(cx: &mut TestAppContext) {
+        let (http, _) = answering();
+        let listing = HeldListing::default();
+        let answer = listing.next();
+        let handed = Arc::new(Mutex::new(Vec::new()));
+        let registry = cx.new(|_| {
+            let mut registry = ConnectionRegistry::empty(http, None);
+            registry.lister = listing.lister();
+            let handed = handed.clone();
+            registry.adder = Arc::new(move |_, name, _, token: Option<Token>| {
+                handed.lock().unwrap().push((name, token.is_some()));
+                async move { Ok(()) }.boxed()
+            });
+            registry
+        });
+        let refused = registry.update(cx, |registry, cx| {
+            let token = Some("secret".to_owned());
+            registry.add_target("far".into(), "http://far.test".into(), token, cx)
+        });
+        assert!(refused.await.unwrap_err().contains("requires HTTPS"));
+        assert!(handed.lock().unwrap().is_empty(), "the CLI was not asked");
+
+        let adding = registry.update(cx, |registry, cx| {
+            let token = Some(" secret ".to_owned());
+            registry.add_target("local".into(), "http://127.0.0.1:8787".into(), token, cx)
+        });
+        cx.run_until_parked();
+        answer
+            .send(files(vec![server("local", "http://127.0.0.1:8787", "1")]))
+            .ok();
+        let local = adding.await.unwrap();
+        assert_eq!(*handed.lock().unwrap(), [("local".to_owned(), false)]);
+        local.read_with(cx, |connection, _| {
+            assert!(connection.token_given(), "the connection holds the token");
         });
     }
 

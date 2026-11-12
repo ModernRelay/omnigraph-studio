@@ -23,7 +23,9 @@ pub(crate) fn nav_places(planes: &[Entity<ControlPlane>], cx: &App) -> Vec<Place
         let id = plane.entity_id();
         let p = plane.read(cx);
         match (p.sign_in_state(), p.organizations()) {
-            (SignIn::SignedIn { .. }, Some(Organizations::Listed(organizations))) => {
+            (SignIn::SignedIn { .. }, Some(Organizations::Listed(organizations)))
+                if !organizations.is_empty() =>
+            {
                 places.extend(organizations.iter().map(|organization| {
                     Place::Organization(id, organization.organization_id.clone())
                 }))
@@ -64,7 +66,9 @@ pub(crate) fn enter(plane: &mut ControlPlane, cx: &mut gpui::Context<ControlPlan
     match plane.sign_in_state() {
         SignIn::SignedIn { .. } => plane.read_clusters(cx),
         SignIn::Waiting { .. } | SignIn::Reading => plane.cancel_sign_in(cx),
-        SignIn::Finishing { .. } | SignIn::Unavailable(_) => {}
+        SignIn::Finishing { .. } => {}
+        // Reads the sign-in details again: what failed may have passed (spec 029).
+        SignIn::Unavailable(_) => plane.sign_in(cx),
         SignIn::Offered { .. } | SignIn::NotOffered => plane.sign_in(cx),
     }
 }
@@ -227,8 +231,11 @@ pub(crate) fn nav(
                 .pt(px(space::XL))
                 .into_any_element(),
         );
+        // A sign-in in no organization keeps the plane's one row, which says so.
         let listed = match (&state, &organizations) {
-            (SignIn::SignedIn { .. }, Some(Organizations::Listed(list))) => Some(list),
+            (SignIn::SignedIn { .. }, Some(Organizations::Listed(list))) if !list.is_empty() => {
+                Some(list)
+            }
             _ => None,
         };
         let Some(list) = listed else {
@@ -319,6 +326,7 @@ pub(crate) fn plane_name(route: &str, cloud: bool) -> String {
 fn plane_row_label(state: &SignIn, organizations: Option<&Organizations>) -> &'static str {
     match (state, organizations) {
         (SignIn::SignedIn { .. }, Some(Organizations::Failed(_))) => "Organizations unavailable",
+        (SignIn::SignedIn { .. }, Some(Organizations::Listed(_))) => "No organizations",
         (SignIn::SignedIn { .. }, _) => "Reading organizations…",
         (SignIn::Waiting { .. } | SignIn::Finishing { .. } | SignIn::Reading, _) => "Signing in…",
         (SignIn::Unavailable(_), _) => "Sign-in unavailable",
@@ -383,6 +391,26 @@ fn sign_in_pane(plane: &Entity<ControlPlane>, cx: &mut Context<OpenGraphModal>) 
                     .into_any_element(),
             ),
         ),
+        (SignIn::SignedIn { account, .. }, Some(Organizations::Listed(_))) => {
+            let refresh = p.clone();
+            (
+                format!(
+                    "You are signed in as {account}, but no organization has you as a member. \
+                     Ask an owner of one to invite you, then Refresh."
+                ),
+                Some(
+                    h_flex()
+                        .gap(px(space::SM))
+                        .child(action("Refresh", "plane-refresh").on_click(cx.listener(
+                            move |_, _, _, cx| refresh.update(cx, |p, cx| p.read_clusters(cx)),
+                        )))
+                        .child(action("Sign out", "plane-sign-out").on_click(
+                            cx.listener(move |_, _, _, cx| p.update(cx, |p, cx| p.sign_out(cx))),
+                        ))
+                        .into_any_element(),
+                ),
+            )
+        }
         (SignIn::SignedIn { .. }, _) => ("Reading your organizations…".to_owned(), None),
         (SignIn::Finishing { .. }, _) => ("Keeping the sign-in in your keychain…".to_owned(), None),
         (SignIn::Waiting { service }, _) => (
@@ -396,7 +424,14 @@ fn sign_in_pane(plane: &Entity<ControlPlane>, cx: &mut Context<OpenGraphModal>) 
             ),
         ),
         (SignIn::Reading, _) => ("Reading the control plane's sign-in…".to_owned(), None),
-        (SignIn::Unavailable(refusal), _) => (refusal.why.to_string(), None),
+        (SignIn::Unavailable(refusal), _) => (
+            refusal.why.to_string(),
+            Some(
+                action("Try again", "plane-sign-in-again")
+                    .on_click(cx.listener(move |_, _, _, cx| p.update(cx, |p, cx| p.sign_in(cx))))
+                    .into_any_element(),
+            ),
+        ),
         (SignIn::Offered { why, .. }, _) => (
             why.clone().map(|why| why.to_string()).unwrap_or_else(|| {
                 "One sign-in lists every organization you are a member of, with its clusters."

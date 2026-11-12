@@ -69,6 +69,16 @@ const PROTOCOL: u64 = 2;
 /// The first Omnigraph release whose CLI Studio drives.
 pub const FIRST_CLI_RELEASE: &str = "0.14.0";
 
+/// How to install the newest Omnigraph release, as its install guide gives it: what the agent's
+/// CLI and the Open dialog show for a missing or old CLI (spec 029).
+pub const INSTALL: &str = if cfg!(windows) {
+    "powershell -NoProfile -ExecutionPolicy Bypass -Command \"iwr -UseBasicParsing \
+     https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install.ps1 | iex\""
+} else {
+    "curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install.sh \
+     | bash"
+};
+
 /// The CLI's own bound on a token (`credential_sources::MAX_CREDENTIAL_BYTES`, 64 KiB).
 const MAX_TOKEN_BYTES: usize = 64 * 1024;
 

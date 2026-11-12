@@ -9,6 +9,7 @@
 
 mod item;
 pub mod models;
+mod open_failure;
 mod pane;
 mod panels;
 mod persistence;
@@ -52,6 +53,7 @@ use ui::{ButtonLike, PopoverMenu, right_click_menu};
 
 use item::ItemHandle;
 pub use item::{Item, ItemEvent, ItemStatus, KeyHint};
+pub use open_failure::open_failure;
 use pane::{Member, Pane, PaneId, SplitAxis, SplitDirection, Tab};
 pub use panels::PanelPosition;
 use panels::{Dock, PanelEntry};
@@ -3137,7 +3139,12 @@ impl Workspace {
             ServerEnvironment::Staging => Color::Warning,
             ServerEnvironment::Development | ServerEnvironment::Unset => Color::Muted,
         };
+        // A server on this machine is a development one until the person says otherwise: shown,
+        // not saved, so the menu still sets one.
         let label = match environment {
+            ServerEnvironment::Unset if graph_client::is_loopback(&url) => {
+                ServerEnvironment::Development.label()
+            }
             ServerEnvironment::Unset => "Environment not set",
             known => known.label(),
         };
@@ -3573,8 +3580,9 @@ impl Workspace {
                 let state = match (&connection.state, connection.latency) {
                     (ConnectionState::Ready, Some(latency)) => {
                         format!(
-                            "{} · {}",
+                            "{} · contract {} · {}",
                             connection.label(),
+                            graph_client::CONTRACT,
                             studio_ui::format_elapsed(latency)
                         )
                     }
@@ -4103,8 +4111,16 @@ impl Workspace {
         let prompt = active
             .filter(|item| item.reads_graph(cx))
             .and_then(|_| sign_in_prompt(&self.session.as_ref()?.read(cx).connection, cx));
+        // A graph that would not open says why where the centre would be empty (spec 029); a
+        // tab open there stays, showing what it can.
+        let prompt = prompt.or_else(|| {
+            active
+                .is_none()
+                .then(|| open_failure(self.session.as_ref()?, cx))
+                .flatten()
+        });
         let body = match active {
-            Some(_) if prompt.is_some() => div()
+            _ if prompt.is_some() => div()
                 .flex_1()
                 .min_h_0()
                 .overflow_hidden()

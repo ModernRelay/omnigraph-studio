@@ -237,14 +237,7 @@ fn agents_md(graph: &str, branch: &str, base: &str, windows: bool, network: bool
     )
 }
 
-/// How to install the newest Omnigraph release, as its install guide gives it.
-const INSTALL: &str = if cfg!(windows) {
-    "powershell -NoProfile -ExecutionPolicy Bypass -Command \"iwr -UseBasicParsing \
-     https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install.ps1 | iex\""
-} else {
-    "curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install.sh \
-     | bash"
-};
+use graph_store::cli::INSTALL;
 
 /// How long the choice of a conversation's CLI waits for its turn at the CLI, which Studio's own
 /// commands may hold (a token's export waits for its credential helper). The choice goes before

@@ -438,6 +438,30 @@ count them; a commit with more shows a partial count. `CommitOutput` in `GET /co
 commit is made, would make the counts of History and the Commits panel one field each and exact.
 *Waits:* 009, 026. *Today:* one changes page per drawn row, kept per commit, partial past 100.
 
+### First run
+
+**E45. A direct `cluster apply` that leaves no lock behind.** A direct apply keeps the
+cluster's admission lock after it ends, and `omnigraph-server --cluster DIR` will not start until
+`cluster force-unlock LOCK_ID` releases it, with the id read from `cluster status --json`. A
+first local graph needs three commands where one would do. Release the lock at the end of a
+successful direct apply, or offer `--release-lock`.
+*Waits:* 029. *Today:* the first-run recipe releases it with a one-line pipe from `cluster
+status` into `force-unlock`.
+
+**E46. A token for a loopback `http://` server.** The CLI refuses a token target whose endpoint
+is `http://` ("endpoint requires HTTPS; HTTP is only allowed for anonymous loopback servers"),
+loopback included, so a local server started with a static token cannot be a target with its
+token. Allow a token over `http://` to a loopback address.
+*Waits:* 029. *Today:* Studio adds such a server as an anonymous target and keeps the token in
+memory until it quits.
+
+**E47. Graph listing on an unauthenticated server.** `GET /graphs` needs a cluster policy permit
+even under `--unauthenticated`, so a server started by hand lists nothing and a missing id is a
+bare 404. List graphs to anyone on a server that runs unauthenticated (or let a 404 name the
+graphs the caller may read).
+*Waits:* 029. *Today:* Add server takes an optional graph id, and the 404 page says the server
+does not list its graphs.
+
 ### In 0.14, not in 0.13.0
 
 Studio's minimum server serves these, so it uses them without asking the server's OpenAPI

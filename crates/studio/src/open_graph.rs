@@ -9,7 +9,7 @@ use gpui::{
     ScrollHandle, SharedString, Subscription, Task, WeakEntity, Window,
 };
 use graph_client::Unauthorized;
-use graph_store::cli_config::{self, ManagedTarget, Platform};
+use graph_store::cli_config::{self, ManagedTarget, NoCli, Platform};
 use graph_store::sign_in::{Kept, SignIn, left_in_keychain};
 use graph_store::{
     Connection, ConnectionEvent, ConnectionRegistry, ConnectionState, ConnectionWatch,
@@ -20,6 +20,7 @@ use studio_ui::ds::{self, MenuRow, size, space};
 use studio_workspace::ModalView;
 use studio_workspace::{Workspace, connection_color};
 
+use crate::first_run::{self, Choice};
 use crate::organizations;
 use ui::prelude::*;
 
@@ -41,6 +42,39 @@ pub(crate) enum Place {
     Token,
     /// The graph id field.
     GraphId,
+    /// A row of the start screen (spec 029).
+    Choice(Choice),
+}
+
+/// What the start screen shows: its choices, or the recipe for a graph on this computer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Start {
+    Choices,
+    Local,
+}
+
+/// The recipe's server, added and waited for: checked every [`first_run::WAIT_EVERY`] while the
+/// pane waits, for at most [`first_run::WAIT_AT_MOST`].
+struct Waiting {
+    connection: Entity<Connection>,
+    /// The wait ran out without an answer.
+    gave_up: bool,
+    _task: Option<Task<()>>,
+}
+
+/// Where a line the dialog says is shown: beside what it is about (constitution VII).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Said {
+    /// Under the pane: about the server or cluster chosen.
+    Pane,
+    /// Under the graph id field and Open.
+    GraphId,
+    /// Under the field for a new token and Update token.
+    Token,
+    /// Under the add form's buttons: the add's refusal.
+    Add,
+    /// Under the add form's buttons, as progress rather than an error.
+    Adding,
 }
 
 pub struct OpenGraphModal {
@@ -59,9 +93,15 @@ pub struct OpenGraphModal {
     cursor: Option<Place>,
     graph_id: Entity<Editor>,
     adding: bool,
+    /// The start screen, shown in place of the add form while no server is listed (spec 029).
+    start: Option<Start>,
+    /// The recipe's server, while the dialog waits for it to answer.
+    waiting: Option<Waiting>,
     new_name: Entity<Editor>,
     new_url: Entity<Editor>,
     new_token: Entity<Editor>,
+    /// The graph to open on the server added, for one that does not list its graphs (spec 029).
+    new_graph: Entity<Editor>,
     /// Whether the CLI gives Studio a token here, as the registry holds it: where it gives none
     /// (Windows), the new server's token field is disabled and says why.
     platform: Platform,
@@ -70,6 +110,8 @@ pub struct OpenGraphModal {
     /// A replacement for a token the selected server refused.
     replacement_token: Entity<Editor>,
     error: Option<SharedString>,
+    /// Where [`Self::error`] shows: beside the field or button it is about.
+    error_at: Said,
     /// The server and graph lists, which scroll within the dialog: the keyboard's row is
     /// scrolled into view ([`Self::move_to`]).
     servers_scroll: ScrollHandle,
@@ -151,9 +193,18 @@ impl OpenGraphModal {
     ) -> Self {
         let graph_id = input("Graph id, for example knowledge", window, cx);
         let new_name = input("Name, for example dev", window, cx);
-        let new_url = input("http://127.0.0.1:8787", window, cx);
+        let new_url = input(
+            "https://omnigraph.example.com or http://127.0.0.1:8787",
+            window,
+            cx,
+        );
         let new_token = input("Token (kept by the Omnigraph CLI)", window, cx);
         new_token.update(cx, |editor, cx| editor.set_masked(true, cx));
+        let new_graph = input(
+            "Graph id, if the server does not list its graphs",
+            window,
+            cx,
+        );
         let replacement_token = input("New token", window, cx);
         replacement_token.update(cx, |editor, cx| editor.set_masked(true, cx));
         // An error is about what was typed: typing again clears it. Typing in a field puts the
@@ -163,6 +214,7 @@ impl OpenGraphModal {
             (&graph_id, Some(Place::GraphId)),
             (&new_url, None),
             (&new_token, None),
+            (&new_graph, None),
             (&replacement_token, Some(Place::Token)),
         ] {
             subscriptions.push(cx.subscribe_in(
@@ -186,25 +238,32 @@ impl OpenGraphModal {
         if let Some(connection) = &selected {
             connection.update(cx, |c, cx| c.connect_if_idle(cx));
         }
+        // With no server listed the dialog starts on its choices, the first under the keyboard.
+        let start = connections.is_empty().then_some(Start::Choices);
         let mut this = Self {
             workspace,
             focus_handle: cx.focus_handle(),
             connections: Vec::new(),
             followed: Vec::new(),
-            cursor: selected
-                .as_ref()
-                .map(|connection| Place::Server(connection.entity_id())),
+            cursor: match &selected {
+                Some(connection) => Some(Place::Server(connection.entity_id())),
+                None => Some(Place::Choice(Choice::Cloud)),
+            },
             selected,
             plane_shown: None,
             graph_id,
-            adding: connections.is_empty(),
+            adding: false,
+            start,
+            waiting: None,
             new_name,
             new_url,
             new_token,
+            new_graph,
             platform,
             replacement_token,
             _adding: None,
             error: None,
+            error_at: Said::Pane,
             servers_scroll: ScrollHandle::new(),
             graphs_scroll: ScrollHandle::new(),
             planes: Vec::new(),
@@ -287,18 +346,24 @@ impl OpenGraphModal {
                 self.followed.push((id, subscription, watch));
             }
         }
-        // Opened before the CLI's targets were listed, it showed the form to add a server for
-        // want of one: the first listed is chosen once they land, as it would have been, unless
-        // a server is being added or the form was typed in.
+        // Opened before the CLI's targets were listed, it showed its start screen for want of
+        // one: the first listed is chosen once they land, as it would have been, unless a server
+        // is being added, the form was typed in, or the recipe is shown.
         let first_listed = self.selected.is_none()
             && self.connections.is_empty()
             && !connections.is_empty()
             && self._adding.is_none()
+            && self.start != Some(Start::Local)
+            && self.waiting.is_none()
             && [&self.new_name, &self.new_url, &self.new_token]
                 .iter()
                 .all(|editor| editor.read(cx).text(cx).is_empty());
         if first_listed {
             self.adding = false;
+            self.start = None;
+            if matches!(self.cursor, Some(Place::Choice(_))) {
+                self.cursor = Some(Place::Server(connections[0].entity_id()));
+            }
         }
         if first_listed
             || self
@@ -332,6 +397,22 @@ impl OpenGraphModal {
             .map(|connection| Place::Server(connection.entity_id()))
             .collect();
         places.extend(organizations::nav_places(&self.planes, cx));
+        match self.start {
+            Some(Start::Choices) => {
+                let no_cli = self.no_cli(cx);
+                places.extend(
+                    Choice::ALL
+                        .into_iter()
+                        .filter(|choice| !(no_cli && choice.needs_cli()))
+                        .map(Place::Choice),
+                );
+                return places;
+            }
+            // The recipe is one pane with one action (Connect, ↵): the keyboard stays on it, as
+            // it does on the form to add a server.
+            Some(Start::Local) => return Vec::new(),
+            None => {}
+        }
         match self.shown_plane() {
             Some((plane, Some(organization))) => places.extend(organizations::pane_places(
                 &plane,
@@ -382,6 +463,7 @@ impl OpenGraphModal {
             if self.token_refusal().is_none() {
                 fields.push(&self.new_token);
             }
+            fields.push(&self.new_graph);
             let at = fields
                 .iter()
                 .position(|field| field.focus_handle(cx).is_focused(window));
@@ -415,6 +497,8 @@ impl OpenGraphModal {
         match &place {
             Place::Server(id) => {
                 self.plane_shown = None;
+                self.leave_recipe();
+                self.start = None;
                 if let Some(connection) = self
                     .connections
                     .iter()
@@ -438,6 +522,7 @@ impl OpenGraphModal {
             Place::Graph(_) | Place::Cluster(..) => window.focus(&self.focus_handle, cx),
             Place::Token => window.focus(&self.replacement_token.focus_handle(cx), cx),
             Place::GraphId => window.focus(&self.graph_id.focus_handle(cx), cx),
+            Place::Choice(_) => window.focus(&self.focus_handle, cx),
         }
         // However long its list, the row the keyboard is on shows.
         match &place {
@@ -465,6 +550,7 @@ impl OpenGraphModal {
             }
             Place::Token
             | Place::GraphId
+            | Place::Choice(_)
             | Place::Plane(_)
             | Place::Organization(..)
             | Place::Cluster(..) => {}
@@ -476,8 +562,10 @@ impl OpenGraphModal {
     /// Shows the control plane `id` in the pane, with `organization`'s clusters when it names
     /// one, in place of a server's graphs or the form to add one.
     fn show_plane(&mut self, id: EntityId, organization: Option<String>) {
+        self.leave_recipe();
         self.plane_shown = Some((id, organization));
         self.adding = false;
+        self.start = None;
         self.error = None;
     }
 
@@ -510,6 +598,14 @@ impl OpenGraphModal {
     /// graph whose id is typed; with the keyboard on a row, chooses that server or opens that
     /// graph.
     fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.start == Some(Start::Local) {
+            self.connect_local(window, cx);
+            return;
+        }
+        if let (Some(Start::Choices), Some(Place::Choice(choice))) = (self.start, &self.cursor) {
+            self.take_choice(*choice, window, cx);
+            return;
+        }
         if self.adding {
             self.add_server(window, cx);
         } else if self.replacement_token.focus_handle(cx).is_focused(window) {
@@ -571,15 +667,225 @@ impl OpenGraphModal {
         }
     }
 
+    /// Shows `text` at `at`, in place of anything said before.
+    pub(crate) fn say(&mut self, at: Said, text: impl Into<SharedString>) {
+        self.error = Some(text.into());
+        self.error_at = at;
+    }
+
+    /// What is said at `at`, if anything, drawn there.
+    fn said_at(&self, at: Said) -> Option<AnyElement> {
+        let text = self.error.clone().filter(|_| self.error_at == at)?;
+        Some(match at {
+            Said::Adding => ds::text::muted(text).into_any_element(),
+            _ => ds::text::error(text).into_any_element(),
+        })
+    }
+
     fn show_add(&mut self, adding: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if adding {
+            self.leave_recipe();
+        }
         self.adding = adding;
         if adding {
             self.plane_shown = None;
+            self.start = None;
         }
         self.error = None;
         if adding {
             window.focus(&self.new_url.focus_handle(cx), cx);
+        } else if self.connections.is_empty() {
+            // Nothing else to show: back to the start screen.
+            self.show_start(Start::Choices, window, cx);
         }
+        cx.notify();
+    }
+
+    /// Whether Studio found no Omnigraph CLI it can drive, which the start screen's choices that
+    /// add a CLI target need.
+    fn no_cli(&self, cx: &App) -> bool {
+        ConnectionRegistry::try_global(cx)
+            .is_some_and(|registry| registry.read(cx).no_cli().is_some())
+    }
+
+    /// Leaves the recipe's pane, if it shows: its wait for the server stops with it, so an
+    /// answer that comes later does not take the dialog from what the person went to.
+    fn leave_recipe(&mut self) {
+        if self.start == Some(Start::Local) {
+            self.waiting = None;
+        }
+    }
+
+    /// Shows the start screen at `start`, its first choice under the keyboard.
+    pub(crate) fn show_start(&mut self, start: Start, window: &mut Window, cx: &mut Context<Self>) {
+        if start != Start::Local {
+            self.leave_recipe();
+        }
+        self.start = Some(start);
+        self.adding = false;
+        self.plane_shown = None;
+        self.error = None;
+        if start == Start::Choices {
+            self.cursor = Some(Place::Choice(Choice::Cloud));
+        }
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    /// Takes a choice of the start screen: Omnigraph Cloud's sign-in, the add form, or the
+    /// recipe. One that needs the CLI does nothing while there is none (its row says so).
+    pub(crate) fn take_choice(
+        &mut self,
+        choice: Choice,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if choice.needs_cli() && self.no_cli(cx) {
+            return;
+        }
+        match choice {
+            Choice::Cloud => {
+                let plane = self
+                    .planes
+                    .iter()
+                    .find(|plane| plane.read(cx).is_default())
+                    .or_else(|| self.planes.first())
+                    .map(|plane| plane.entity_id());
+                match plane {
+                    Some(id) => self.move_to(Place::Plane(id), window, cx),
+                    None => {
+                        self.say(
+                            Said::Pane,
+                            "Omnigraph Cloud's address is not set. Set it in Settings → Omnigraph \
+                             Cloud.",
+                        );
+                        cx.notify();
+                    }
+                }
+            }
+            Choice::Server => self.show_add(true, window, cx),
+            Choice::Local => self.show_start(Start::Local, window, cx),
+        }
+    }
+
+    /// The recipe's Connect: adds its server as the anonymous CLI target `local` (one listed at
+    /// its address already is used as it is), then waits for it to answer.
+    fn connect_local(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self._adding.is_some() || self.waiting.as_ref().is_some_and(|w| !w.gave_up) {
+            return;
+        }
+        let listed = self
+            .connections
+            .iter()
+            .find(|connection| connection.read(cx).server.url == first_run::LOCAL_ADDRESS)
+            .cloned();
+        if let Some(connection) = listed {
+            self.wait_for(connection, window, cx);
+            return;
+        }
+        let adding = ConnectionRegistry::global(cx).update(cx, |registry, cx| {
+            registry.add_target(
+                first_run::LOCAL_TARGET.into(),
+                first_run::LOCAL_ADDRESS.into(),
+                None,
+                cx,
+            )
+        });
+        self.say(Said::Adding, "Adding the server through the Omnigraph CLI…");
+        cx.notify();
+        self._adding = Some(cx.spawn_in(window, async move |this, cx| {
+            let added = adding.await;
+            this.update_in(cx, |this, window, cx| {
+                this._adding = None;
+                this.error = None;
+                match added {
+                    Ok(connection) => {
+                        let registry = ConnectionRegistry::global(cx);
+                        this.follow(registry.read(cx).connections.clone(), window, cx);
+                        this.wait_for(connection, window, cx);
+                    }
+                    Err(error) => this.say(Said::Add, format!("The server was not added: {error}")),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Waits for `connection`, the recipe's server, to answer: it is connected again every
+    /// [`first_run::WAIT_EVERY`] while the pane shows the wait, for at most
+    /// [`first_run::WAIT_AT_MOST`]. Once it answers, its graph opens; once it refuses (a token,
+    /// another contract), the dialog shows it, as a server chosen would be.
+    fn wait_for(
+        &mut self,
+        connection: Entity<Connection>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        connection.update(cx, |c, cx| c.connect(cx));
+        let task = cx.spawn_in(window, async move |this, cx| {
+            let mut waited = std::time::Duration::ZERO;
+            loop {
+                cx.background_executor().timer(first_run::WAIT_EVERY).await;
+                waited += first_run::WAIT_EVERY;
+                let done = this
+                    .update_in(cx, |this, window, cx| this.check_wait(waited, window, cx))
+                    .unwrap_or(true);
+                if done {
+                    break;
+                }
+            }
+        });
+        self.waiting = Some(Waiting {
+            connection,
+            gave_up: false,
+            _task: Some(task),
+        });
+        cx.notify();
+    }
+
+    /// One check of the wait, `waited` into it: whether it is over.
+    fn check_wait(
+        &mut self,
+        waited: std::time::Duration,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(waiting) = &mut self.waiting else {
+            return true;
+        };
+        let connection = waiting.connection.clone();
+        let state = connection.read(cx).state.clone();
+        match state {
+            ConnectionState::Ready => {
+                self.waiting = None;
+                self.select(connection, window, cx);
+                self.open(first_run::LOCAL_GRAPH.to_owned(), window, cx);
+                true
+            }
+            ConnectionState::Unauthorized | ConnectionState::ContractMismatch { .. } => {
+                self.waiting = None;
+                self.select(connection, window, cx);
+                true
+            }
+            ConnectionState::Connecting => false,
+            ConnectionState::Idle | ConnectionState::Unreachable(_)
+                if waited >= first_run::WAIT_AT_MOST =>
+            {
+                waiting.gave_up = true;
+                cx.notify();
+                true
+            }
+            ConnectionState::Idle | ConnectionState::Unreachable(_) => {
+                connection.update(cx, |c, cx| c.connect(cx));
+                false
+            }
+        }
+    }
+
+    /// Stops waiting for the recipe's server. The target stays, for the next try.
+    fn cancel_wait(&mut self, cx: &mut Context<Self>) {
+        self.waiting = None;
         cx.notify();
     }
 
@@ -603,13 +909,13 @@ impl OpenGraphModal {
                 self.select(connection, window, cx);
             }
             None => {
-                self.error = Some(
+                self.say(
+                    Said::Pane,
                     format!(
                         "Studio could not open {}: sign in to its organization's control plane \
                          first.",
                         cluster.name
-                    )
-                    .into(),
+                    ),
                 );
                 cx.notify();
             }
@@ -634,10 +940,18 @@ impl OpenGraphModal {
                 self.select(connection, window, cx);
             }
             None => {
-                self.error = Some(format!("Studio lists no CLI target named {name}.").into());
+                self.say(
+                    Said::Pane,
+                    format!("Studio lists no CLI target named {name}."),
+                );
                 cx.notify();
             }
         }
+    }
+
+    /// Whether the dialog lists `connection`'s server.
+    pub(crate) fn lists(&self, connection: &Entity<Connection>) -> bool {
+        self.connections.contains(connection)
     }
 
     pub(crate) fn select(
@@ -653,6 +967,8 @@ impl OpenGraphModal {
         self.cursor = Some(Place::Server(connection.entity_id()));
         self.choose(Some(connection), window, cx);
         self.adding = false;
+        self.leave_recipe();
+        self.start = None;
         self.error = None;
         cx.notify();
     }
@@ -687,11 +1003,18 @@ impl OpenGraphModal {
             return;
         };
         if graph_id.trim().is_empty() {
-            self.error = Some("Enter a graph id.".into());
+            self.say(Said::GraphId, "Enter a graph id.");
             cx.notify();
             return;
         }
         let graph_id = graph_id.trim().to_owned();
+        // A server that says which graphs the token reaches does not have one it leaves out: the
+        // dialog says so beside the field, rather than closing on a window that cannot open it.
+        if let Some(missing) = missing_graph(connection.read(cx), &graph_id) {
+            self.say(Said::GraphId, missing);
+            cx.notify();
+            return;
+        }
         // A graph id typed in is kept with its server, for a token that cannot list graphs. Where
         // the server says which graphs the token reaches, none is kept: one it lists needs no
         // keeping, and kept would be offered after its deletion; one it does not is a mistyped
@@ -745,6 +1068,7 @@ impl OpenGraphModal {
         let name = self.new_name.read(cx).text(cx);
         let url = self.new_url.read(cx).text(cx);
         let token = self.new_token.read(cx).text(cx);
+        let graph = self.new_graph.read(cx).text(cx).trim().to_owned();
         // What the fields held as the add began, to clear them once it lands.
         let fields = [name.clone(), url.clone(), token.clone()];
         let token = (!token.trim().is_empty()).then(|| token.trim().to_owned());
@@ -756,7 +1080,7 @@ impl OpenGraphModal {
             .map(|connection| connection.entity_id())
             .collect();
         let adding = registry.update(cx, |registry, cx| registry.add_target(name, url, token, cx));
-        self.error = Some("Adding the target through the Omnigraph CLI…".into());
+        self.say(Said::Adding, "Adding the target through the Omnigraph CLI…");
         cx.notify();
         self._adding = Some(cx.spawn_in(window, async move |this, cx| {
             let added = adding.await;
@@ -769,7 +1093,7 @@ impl OpenGraphModal {
                     Ok(connection) if listed.contains(&connection.entity_id()) => {
                         let name = connection.read(cx).server.name.clone();
                         this.select(connection, window, cx);
-                        this.error = Some(format!("{name} has that address already.").into());
+                        this.say(Said::Pane, format!("{name} has that address already."));
                     }
                     Ok(connection) => {
                         // Followed now, before the registry's notice reaches the dialog.
@@ -778,10 +1102,18 @@ impl OpenGraphModal {
                         connection.update(cx, |c, cx| c.connect(cx));
                         this.select(connection, window, cx);
                         this.clear_added(&fields, window, cx);
+                        // A graph named with it is opened now: a server that lists none (one run
+                        // without a cluster policy, spec 012 E47) shows its graph this way.
+                        if !graph.is_empty() {
+                            this.new_graph
+                                .update(cx, |editor, cx| editor.set_text("", window, cx));
+                            this.open(graph.clone(), window, cx);
+                            return;
+                        }
                         window.focus(&this.graph_id.focus_handle(cx), cx);
                     }
                     Err(error) => {
-                        this.error = Some(format!("The server was not added: {error}").into());
+                        this.say(Said::Add, format!("The server was not added: {error}"));
                     }
                 }
                 cx.notify();
@@ -810,7 +1142,7 @@ impl OpenGraphModal {
         };
         let token = self.replacement_token.read(cx).text(cx);
         if token.trim().is_empty() {
-            self.error = Some("Enter the new token.".into());
+            self.say(Said::Token, "Enter the new token.");
             cx.notify();
             return;
         }
@@ -827,7 +1159,7 @@ impl OpenGraphModal {
     /// The sidebar: the CLI's servers, Add server…, then each control plane's organizations.
     /// It scrolls within the dialog.
     fn render_nav(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let server_shown = self.plane_shown.is_none() && !self.adding;
+        let server_shown = self.plane_shown.is_none() && !self.adding && self.start.is_none();
         let servers = self
             .connections
             .clone()
@@ -869,11 +1201,162 @@ impl OpenGraphModal {
                     ))
                     .on_click(cx.listener(|this, _, window, cx| this.show_add(true, window, cx))),
             )
+            .child(
+                ds::SidebarRow::new("get-started", "Get started")
+                    .icon(IconName::Sparkle)
+                    .muted(self.start.is_none())
+                    .selected(self.start.is_some())
+                    .tip(ds::tooltip(
+                        "Omnigraph Cloud, a server by its address, or a graph on this computer",
+                    ))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.show_start(Start::Choices, window, cx)
+                    })),
+            )
             .children(organizations::nav(
                 &self.planes,
                 self.plane_shown.as_ref(),
                 cx,
             ))
+    }
+
+    /// While Studio finds no Omnigraph CLI it can drive, a band over the pane says so, with the
+    /// CLI's reason, how to install one, and Check again; it stays until one is found (spec 029),
+    /// where a toast would have gone by behind the dialog.
+    fn render_cli_band(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let registry = ConnectionRegistry::try_global(cx)?;
+        let (no_cli, checking) = {
+            let registry = registry.read(cx);
+            (registry.no_cli()?.clone(), registry.checking_cli())
+        };
+        Some(cli_band(&no_cli, checking, registry, cx))
+    }
+
+    /// The start screen's choices: a row each, ↑/↓ and ↵, one that needs the CLI disabled while
+    /// there is none, saying so (spec 029).
+    fn render_start(&self, cx: &mut Context<Self>) -> AnyElement {
+        let no_cli = self.no_cli(cx);
+        let rows = Choice::ALL.into_iter().enumerate().map(|(index, choice)| {
+            let disabled = no_cli && choice.needs_cli();
+            let icon = match choice {
+                Choice::Cloud => IconName::UserCheck,
+                Choice::Server => IconName::Server,
+                Choice::Local => IconName::Terminal,
+            };
+            MenuRow::new(("start", index))
+                .height(size::ROW)
+                .disabled(disabled)
+                .toggle_state(self.cursor == Some(Place::Choice(choice)))
+                .start_slot(studio_ui::ds::icon::lead(icon))
+                .child(
+                    h_flex()
+                        .gap(px(space::MD))
+                        .child(studio_ui::ds::text::body(choice.title()))
+                        .child(studio_ui::ds::text::meta(if disabled {
+                            "Needs the Omnigraph CLI"
+                        } else {
+                            choice.line()
+                        })),
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.cursor = Some(Place::Choice(choice));
+                    this.take_choice(choice, window, cx)
+                }))
+        });
+        v_flex()
+            .size_full()
+            .gap(px(space::LG))
+            .child(pane_head(
+                "Get started",
+                Some(ds::text::meta("Open a graph you have, or make one.").into_any_element()),
+                Vec::new(),
+            ))
+            .child(v_flex().gap(px(space::XXS)).children(rows))
+            .into_any_element()
+    }
+
+    /// The recipe for a graph on this computer: its steps, each a command to copy, then
+    /// Connect, which adds the server they start and waits for it (spec 029).
+    fn render_local(&self, cx: &mut Context<Self>) -> AnyElement {
+        let steps = first_run::steps(cfg!(windows));
+        let footer = match &self.waiting {
+            Some(waiting) if waiting.gave_up => {
+                h_flex()
+                    .gap(px(space::MD))
+                    .child(div().flex_1().min_w_0().child(ds::text::error(
+                        "The server did not start. Check the terminal where you ran step 4.",
+                    )))
+                    .child(ds::action_button("retry-local", "Retry").on_click(
+                        cx.listener(|this, _, window, cx| this.connect_local(window, cx)),
+                    ))
+            }
+            Some(_) => h_flex()
+                .gap(px(space::MD))
+                .child(div().flex_1().min_w_0().child(ds::text::muted(format!(
+                    "Waiting for the server at {}…",
+                    first_run::LOCAL_ADDRESS
+                ))))
+                .child(
+                    ds::cancel_button("cancel-local")
+                        .on_click(cx.listener(|this, _, _, cx| this.cancel_wait(cx))),
+                ),
+            None => h_flex()
+                .gap(px(space::MD))
+                .justify_end()
+                .child(ds::cancel_button("back-local").on_click(
+                    cx.listener(|this, _, window, cx| this.show_start(Start::Choices, window, cx)),
+                ))
+                .child(
+                    ds::action_button("connect-local", "Connect")
+                        .tip(studio_ui::ds::tooltip(format!(
+                            "Adds {} as the CLI target {}, and opens the graph {} once it answers",
+                            first_run::LOCAL_ADDRESS,
+                            first_run::LOCAL_TARGET,
+                            first_run::LOCAL_GRAPH
+                        )))
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.connect_local(window, cx)),
+                        ),
+                ),
+        };
+        v_flex()
+            .size_full()
+            .min_h_0()
+            .gap(px(space::LG))
+            .child(pane_head(
+                "Make a local graph",
+                Some(
+                    ds::text::meta(
+                        "Run these in a terminal, in order. Studio connects once the server \
+                         answers.",
+                    )
+                    .into_any_element(),
+                ),
+                Vec::new(),
+            ))
+            .child(
+                v_flex()
+                    .id("local-recipe")
+                    .flex_1()
+                    .min_h_0()
+                    .px(px(space::MD))
+                    .gap(px(space::LG))
+                    .overflow_y_scroll()
+                    .children(steps.into_iter().enumerate().map(|(index, step)| {
+                        v_flex()
+                            .gap(px(space::XS))
+                            .child(ds::text::meta(format!("{}. {}", index + 1, step.says)))
+                            .child(studio_ui::ds::command_block(
+                                ("local-step", index),
+                                step.command,
+                                cx,
+                            ))
+                    })),
+            )
+            .child(footer)
+            .children(self.said_at(Said::Add))
+            .children(self.said_at(Said::Adding))
+            .into_any_element()
     }
 
     fn render_graphs(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -890,18 +1373,16 @@ impl OpenGraphModal {
         let token_tooltip = token_tooltip(c, self.platform);
         let selected = connection.clone();
         let listing_note = match &c.graphs {
-            GraphListing::NotAllowed => Some("This token may not list graphs. Enter a graph id."),
+            GraphListing::NotAllowed => {
+                Some("This server does not list its graphs. Enter a graph id.")
+            }
             GraphListing::Failed(_) => Some("The graph list could not be read. Enter a graph id."),
             _ => None,
         };
         let graphs = c.graph_ids();
         // An empty list says why, rather than leaving a blank pane.
-        let listing_note = listing_note.or_else(|| {
-            graphs.is_empty().then_some(match c.state {
-                ConnectionState::Ready => "This server lists no graphs. Enter a graph id.",
-                _ => "Its graphs show once Studio connects to it.",
-            })
-        });
+        let listing_note =
+            listing_note.or_else(|| graphs.is_empty().then_some(empty_list_note(&c.state)));
         // What each id's row says: a listed graph's state, nothing more for one the server
         // named by discovery, and "remembered" for one only typed in before.
         let discovered =
@@ -969,6 +1450,7 @@ impl OpenGraphModal {
                                 ),
                         ),
                 )
+                .children(self.said_at(Said::Token))
             })
             .child(
                 v_flex()
@@ -1036,6 +1518,7 @@ impl OpenGraphModal {
                             })),
                     ),
             )
+            .children(self.said_at(Said::GraphId))
     }
 
     fn render_add(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1050,8 +1533,11 @@ impl OpenGraphModal {
         };
         // Disabled where Studio could not use a token (Windows): it takes no text, Tab passes it
         // by, and it says why.
+        let token_note = new_token_note(&self.new_url.read(cx).text(cx));
         let token = match self.token_refusal() {
-            None => field("Bearer token", &self.new_token).into_any_element(),
+            None => field("Bearer token", &self.new_token)
+                .children(token_note.map(studio_ui::ds::text::meta))
+                .into_any_element(),
             Some(reason) => v_flex()
                 .gap(px(space::XS))
                 .child(studio_ui::ds::text::meta("Bearer token"))
@@ -1074,6 +1560,7 @@ impl OpenGraphModal {
             .child(field("Address", &self.new_url))
             .child(field("Name", &self.new_name))
             .child(token)
+            .child(field("Graph (optional)", &self.new_graph))
             .child(
                 h_flex()
                     .gap(px(space::MD))
@@ -1087,6 +1574,97 @@ impl OpenGraphModal {
                         ),
                     ),
             )
+            .children(self.said_at(Said::Add))
+            .children(self.said_at(Said::Adding))
+    }
+}
+
+/// The band [`OpenGraphModal::render_cli_band`] draws for `no_cli`, its Check again acting on
+/// `registry`; "Looking for the CLI…" while a look it asked is under way.
+fn cli_band(
+    no_cli: &NoCli,
+    checking: bool,
+    registry: Entity<ConnectionRegistry>,
+    cx: &mut Context<OpenGraphModal>,
+) -> AnyElement {
+    let title = if no_cli.unfit {
+        "Studio needs a newer Omnigraph CLI"
+    } else {
+        "Studio needs the Omnigraph CLI"
+    };
+    let check = studio_ui::ds::button("check-cli", "Check again")
+        .style(ButtonStyle::Subtle)
+        .disabled(checking)
+        .tip(studio_ui::ds::tooltip(
+            "Looks for the Omnigraph CLI again and lists its targets",
+        ))
+        .on_click(cx.listener(move |_, _, _, cx| {
+            registry.update(cx, |registry, cx| registry.check_cli_again(cx))
+        }));
+    studio_ui::ds::callout(ui::Severity::Warning, title)
+        .description_slot(
+            v_flex()
+                .gap(px(space::SM))
+                .child(ds::text::muted(if checking {
+                    "Looking for the CLI…".to_owned()
+                } else {
+                    format!("{} Install it, then Check again:", sentence(&no_cli.why))
+                }))
+                .child(studio_ui::ds::command_block(
+                    "copy-install",
+                    graph_store::cli::INSTALL,
+                    cx,
+                )),
+        )
+        .actions_slot(check)
+        .into_any_element()
+}
+
+/// `text` ending in a full stop.
+fn sentence(text: &str) -> String {
+    let text = text.trim_end();
+    if text.ends_with('.') {
+        text.to_owned()
+    } else {
+        format!("{text}.")
+    }
+}
+
+/// What the dialog says of `graph_id` on `c`'s server when the server says which graphs the
+/// token reaches and it is not one: the graphs it has instead. `None` for a server that lists
+/// none, whose 404 the window's page explains.
+fn missing_graph(c: &Connection, graph_id: &str) -> Option<String> {
+    let listed = match &c.graphs {
+        GraphListing::Listed(infos) => infos.iter().map(|info| info.graph_id.clone()).collect(),
+        GraphListing::Discovered(ids) => ids.clone(),
+        _ => return None,
+    };
+    if listed.iter().any(|id: &String| id == graph_id) {
+        return None;
+    }
+    let name = &c.server.name;
+    Some(match listed.as_slice() {
+        [] => format!("{name} has no graph “{graph_id}”, and lists none."),
+        listed => format!(
+            "{name} has no graph “{graph_id}”. It has: {}.",
+            listed.join(", ")
+        ),
+    })
+}
+
+/// Why a server's graph list is empty, by its state: what would show them, never a connect
+/// that will not.
+fn empty_list_note(state: &ConnectionState) -> &'static str {
+    match state {
+        ConnectionState::Ready => "This server lists no graphs. Enter a graph id.",
+        ConnectionState::Unauthorized => "Its graphs show once the server accepts a token.",
+        ConnectionState::Unreachable(_) => "Its graphs show once Studio reaches it.",
+        ConnectionState::ContractMismatch { .. } => {
+            "Studio cannot read this server's graphs: it speaks another contract."
+        }
+        ConnectionState::Idle | ConnectionState::Connecting => {
+            "Its graphs show once Studio connects."
+        }
     }
 }
 
@@ -1224,7 +1802,11 @@ fn retry_button(selected: &Entity<Connection>, cx: &mut Context<OpenGraphModal>)
 /// CLI server the CLI gave no token is asked nothing, and says why. A server that offers a
 /// sign-in says where, and who is signed in (spec 016).
 fn server_status(c: &Connection) -> String {
-    let status = state_status(c);
+    let mut status = state_status(c);
+    // A token typed for a target the CLI keeps none for is Studio's alone, for this run.
+    if c.token_given() && c.server.source == ServerSource::Cli && !c.has_token_source() {
+        status.push_str(" Token kept until Studio quits.");
+    }
     // An item the keychain would not delete, which Studio may read again later, is said
     // whatever the state.
     match c.keychain_left() {
@@ -1332,6 +1914,12 @@ fn state_status(c: &Connection) -> String {
         (ConnectionState::Unreachable(error), _) => {
             format!("Could not reach the server: {error}")
         }
+        // A cluster opened from its control plane asks the control plane, not the CLI.
+        (ConnectionState::Unauthorized, Some(reason))
+            if c.server.source == ServerSource::ControlPlane =>
+        {
+            format!("The control plane gave no token for this cluster: {reason}")
+        }
         (ConnectionState::Unauthorized, Some(reason)) => {
             format!("The Omnigraph CLI gave no token for this server: {reason}")
         }
@@ -1373,11 +1961,29 @@ fn retries_on_select(c: &Connection) -> bool {
 /// the CLI's login, which offers no sign-in of its own, it first says where that cluster's token
 /// comes from.
 fn token_tooltip(c: &Connection, platform: Platform) -> String {
+    // A CLI target added anonymous has no credential the CLI could keep a token in.
+    if c.server.source == ServerSource::Cli && !c.has_token_source() {
+        return ANONYMOUS_TOKEN.to_owned();
+    }
     tooltip_for(
         &c.server.source,
         &c.server.name,
         c.login_profile().as_deref(),
         platform,
+    )
+}
+
+/// What a token typed for a CLI target that takes none does: the CLI keeps none for it.
+const ANONYMOUS_TOKEN: &str = "Used until Studio quits. The Omnigraph CLI keeps no token for a \
+                               server it reaches without one.";
+
+/// What the new server's token field says of a token for `url`: one at `http://` on this
+/// machine lasts until Studio quits, since the CLI keeps tokens only for `https://` servers.
+fn new_token_note(url: &str) -> Option<&'static str> {
+    let url = graph_client::server_root(url).ok()?;
+    (url.starts_with("http://") && graph_client::is_loopback(&url)).then_some(
+        "The Omnigraph CLI keeps tokens only for https:// servers. Studio keeps this one until \
+         it quits.",
     )
 }
 
@@ -1477,8 +2083,11 @@ fn first_choice(connections: &[Entity<Connection>], cx: &App) -> Option<Entity<C
 impl Render for OpenGraphModal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let nav = self.render_nav(cx).into_any_element();
+        let cli_band = self.render_cli_band(cx);
         let body = match (self.adding, self.shown_plane()) {
             (true, _) => self.render_add(cx).into_any_element(),
+            (false, _) if self.start == Some(Start::Choices) => self.render_start(cx),
+            (false, _) if self.start == Some(Start::Local) => self.render_local(cx),
             (false, Some((plane, organization))) => organizations::pane(
                 &plane,
                 organization.as_deref(),
@@ -1539,8 +2148,9 @@ impl Render for OpenGraphModal {
                             .pt(px(space::XL))
                             .pb(px(space::LG))
                             .gap(px(space::MD))
+                            .children(cli_band)
                             .child(div().flex_1().min_h_0().child(body))
-                            .children(self.error.clone().map(ds::text::error)),
+                            .children(self.said_at(Said::Pane)),
                     ),
             )
     }
@@ -1606,6 +2216,199 @@ mod tests {
 
     /// ↓ and Tab move through the servers, choosing each, then the chosen one's graphs and the
     /// id field, wrapping around; ↵ on a server goes to its graphs, and on a graph opens it.
+    /// An empty graph list says what would show its graphs: a connect while connecting, a token
+    /// while refused, reaching it while unreachable; never a connect that will not.
+    #[test]
+    fn an_empty_list_says_what_would_show_it() {
+        assert_eq!(
+            empty_list_note(&ConnectionState::Unauthorized),
+            "Its graphs show once the server accepts a token."
+        );
+        assert_eq!(
+            empty_list_note(&ConnectionState::Unreachable("refused".into())),
+            "Its graphs show once Studio reaches it."
+        );
+        assert_eq!(
+            empty_list_note(&ConnectionState::Connecting),
+            "Its graphs show once Studio connects."
+        );
+    }
+
+    /// An id the server does not list is said beside the field, naming the graphs it has, and
+    /// the dialog stays open; one it lists opens (spec 029).
+    #[gpui::test]
+    fn an_id_the_server_does_not_list_is_said_before_the_dialog_closes(cx: &mut TestAppContext) {
+        let connection = server(&[], cx);
+        connection.update(cx, |connection, _| {
+            connection.graphs = GraphListing::Discovered(vec!["knowledge".into(), "notes".into()])
+        });
+        let name = connection.read_with(cx, |c, _| c.server.name.clone());
+        let (modal, cx) = dialog(vec![connection], cx);
+        let dismissed = Rc::new(Cell::new(false));
+        let _dismissed = cx.update(|_, cx| {
+            let dismissed = dismissed.clone();
+            cx.subscribe(&modal, move |_, _: &DismissEvent, _| dismissed.set(true))
+        });
+        modal.update_in(cx, |modal, window, cx| {
+            modal.open("knowlege".into(), window, cx)
+        });
+        assert_eq!(
+            modal.read_with(cx, |modal, _| (modal.error_at, modal.error.clone())),
+            (
+                Said::GraphId,
+                Some(format!("{name} has no graph “knowlege”. It has: knowledge, notes.").into())
+            )
+        );
+        cx.run_until_parked();
+        assert!(!dismissed.get());
+        modal.update_in(cx, |modal, window, cx| {
+            modal.open("notes".into(), window, cx)
+        });
+        cx.run_until_parked();
+        assert!(dismissed.get());
+    }
+
+    /// An empty dialog starts on its choices: ↓ moves through them, ↵ on Connect to a server
+    /// shows the form, whose Cancel comes back; ↵ on Make a local graph shows the recipe
+    /// (spec 029).
+    #[gpui::test]
+    fn an_empty_dialog_starts_on_its_choices(cx: &mut TestAppContext) {
+        let (modal, cx) = dialog(Vec::new(), cx);
+        let at = |cx: &mut VisualTestContext| {
+            modal.read_with(cx, |modal, _| {
+                (modal.start, modal.adding, modal.cursor.clone())
+            })
+        };
+        assert_eq!(
+            at(cx),
+            (
+                Some(Start::Choices),
+                false,
+                Some(Place::Choice(Choice::Cloud))
+            )
+        );
+        cx.dispatch_action(menu::SelectNext);
+        assert_eq!(at(cx).2, Some(Place::Choice(Choice::Server)));
+        cx.dispatch_action(menu::Confirm);
+        assert_eq!(at(cx).0, None);
+        assert!(at(cx).1, "the form to add a server");
+        modal.update_in(cx, |modal, window, cx| modal.show_add(false, window, cx));
+        assert_eq!(at(cx).0, Some(Start::Choices), "back to the choices");
+        cx.dispatch_action(menu::SelectLast);
+        assert_eq!(at(cx).2, Some(Place::Choice(Choice::Local)));
+        cx.dispatch_action(menu::Confirm);
+        assert_eq!(at(cx).0, Some(Start::Local));
+    }
+
+    /// The keyboard stays on the recipe, and leaving it for anything else stops its wait, so the
+    /// server answering later takes nothing from where the person went.
+    #[gpui::test]
+    fn leaving_the_recipe_stops_its_wait(cx: &mut TestAppContext) {
+        let local = server(&[], cx);
+        let (modal, cx) = dialog(vec![local.clone()], cx);
+        modal.update_in(cx, |modal, window, cx| {
+            modal.show_start(Start::Local, window, cx);
+            modal.waiting = Some(Waiting {
+                connection: local.clone(),
+                gave_up: false,
+                _task: None,
+            });
+        });
+        cx.dispatch_action(menu::SelectNext);
+        assert_eq!(
+            modal.read_with(cx, |modal, _| modal.start),
+            Some(Start::Local),
+            "↓ stays on the recipe"
+        );
+        modal.update_in(cx, |modal, window, cx| modal.show_add(true, window, cx));
+        assert!(modal.read_with(cx, |modal, _| modal.waiting.is_none()));
+    }
+
+    /// The recipe's wait opens its graph once the server answers, shows the server once it
+    /// refuses, and gives up after its time, keeping nothing running.
+    #[gpui::test]
+    fn the_recipes_wait_opens_its_graph_once_the_server_answers(cx: &mut TestAppContext) {
+        let local = server(&[], cx);
+        let (modal, cx) = dialog(Vec::new(), cx);
+        let dismissed = Rc::new(Cell::new(false));
+        let _dismissed = cx.update(|_, cx| {
+            let dismissed = dismissed.clone();
+            cx.subscribe(&modal, move |_, _: &DismissEvent, _| dismissed.set(true))
+        });
+        let wait = |modal: &Entity<OpenGraphModal>, cx: &mut VisualTestContext| {
+            modal.update_in(cx, |modal, _, _| {
+                modal.waiting = Some(Waiting {
+                    connection: local.clone(),
+                    gave_up: false,
+                    _task: None,
+                });
+            });
+        };
+        let check = |waited: u64, cx: &mut VisualTestContext| {
+            modal.update_in(cx, |modal, window, cx| {
+                modal.check_wait(std::time::Duration::from_secs(waited), window, cx)
+            })
+        };
+
+        wait(&modal, cx);
+        local.update(cx, |c, _| {
+            c.state = ConnectionState::Unreachable("refused".into())
+        });
+        assert!(!check(2, cx), "still waiting");
+        local.update(cx, |c, _| {
+            c.state = ConnectionState::Unreachable("refused".into())
+        });
+        assert!(check(first_run::WAIT_AT_MOST.as_secs(), cx), "gave up");
+        assert!(modal.read_with(cx, |modal, _| modal.waiting.as_ref().unwrap().gave_up));
+
+        wait(&modal, cx);
+        local.update(cx, |c, _| c.state = ConnectionState::Unauthorized);
+        assert!(check(2, cx));
+        assert_eq!(
+            modal.read_with(cx, |modal, _| modal.selected.clone()),
+            Some(local.clone()),
+            "a refusal shows the server"
+        );
+        assert!(!dismissed.get());
+
+        wait(&modal, cx);
+        local.update(cx, |c, _| c.state = ConnectionState::Ready);
+        assert!(check(4, cx));
+        cx.run_until_parked();
+        assert!(dismissed.get(), "its graph opens");
+    }
+
+    /// A token for a server on this machine at `http://` is said to last until Studio quits,
+    /// before it is added; one for an `https://` server is the CLI's to keep.
+    #[test]
+    fn a_loopback_token_is_said_to_last_until_studio_quits() {
+        assert!(new_token_note("127.0.0.1:8787").is_some());
+        assert!(new_token_note("http://localhost:8080").is_some());
+        assert!(new_token_note("https://graph.example.com").is_none());
+        assert!(new_token_note("").is_none());
+    }
+
+    /// What the dialog says shows beside what it is about: an id not entered under the id field,
+    /// a token not entered under Update token.
+    #[gpui::test]
+    fn an_error_shows_beside_its_field(cx: &mut TestAppContext) {
+        let alpha = server(&["one"], cx);
+        alpha.update(cx, |connection, _| {
+            connection.state = ConnectionState::Unauthorized;
+            connection.refusal = Some(Unauthorized::TokenRefused);
+        });
+        let (modal, cx) = dialog(vec![alpha], cx);
+        let said = |cx: &mut VisualTestContext| {
+            modal.read_with(cx, |modal, _| (modal.error_at, modal.error.clone()))
+        };
+        modal.update_in(cx, |modal, window, cx| {
+            modal.open(String::new(), window, cx)
+        });
+        assert_eq!(said(cx), (Said::GraphId, Some("Enter a graph id.".into())));
+        modal.update_in(cx, |modal, window, cx| modal.update_token(window, cx));
+        assert_eq!(said(cx), (Said::Token, Some("Enter the new token.".into())));
+    }
+
     #[gpui::test]
     fn the_keyboard_chooses_a_server_and_opens_its_graph(cx: &mut TestAppContext) {
         let alpha = server(&["one"], cx);
@@ -2188,24 +2991,38 @@ mod tests {
         assert_eq!(drawn.get(), before + 1, "its replacement is");
     }
 
-    /// Opened before the CLI's targets were listed, the dialog shows the form to add a server;
-    /// when they land, the first is chosen, as it would have been, unless the form was typed in.
+    /// Opened before the CLI's targets were listed, the dialog shows its start screen; when they
+    /// land, the first is chosen, as it would have been, unless the form was typed in or the
+    /// recipe is shown.
     #[gpui::test]
     fn the_first_server_listed_after_the_dialog_opened_is_chosen(cx: &mut TestAppContext) {
         let alpha = server(&["one"], cx);
         let (modal, cx) = dialog(Vec::new(), cx);
-        modal.read_with(cx, |modal, _| assert!(modal.adding));
+        modal.read_with(cx, |modal, _| assert_eq!(modal.start, Some(Start::Choices)));
         modal.update_in(cx, |modal, window, cx| {
             modal.follow(vec![alpha.clone()], window, cx)
         });
         modal.read_with(cx, |modal, _| {
             assert_eq!(modal.selected, Some(alpha.clone()));
             assert!(!modal.adding);
+            assert_eq!(modal.start, None);
+            assert_eq!(modal.cursor, Some(Place::Server(alpha.entity_id())));
+        });
+
+        let gamma = server(&["three"], cx);
+        let (modal, cx) = dialog(Vec::new(), cx);
+        modal.update_in(cx, |modal, window, cx| {
+            modal.show_start(Start::Local, window, cx);
+            modal.follow(vec![gamma.clone()], window, cx)
+        });
+        modal.read_with(cx, |modal, _| {
+            assert_eq!(modal.start, Some(Start::Local), "the recipe stays");
         });
 
         let beta = server(&["two"], cx);
         let (modal, cx) = dialog(Vec::new(), cx);
         modal.update_in(cx, |modal, window, cx| {
+            modal.show_add(true, window, cx);
             modal.new_url.update(cx, |editor, cx| {
                 editor.set_text("https://typed.test", window, cx)
             });
@@ -2287,6 +3104,7 @@ mod tests {
                 ("address", &modal.new_url),
                 ("name", &modal.new_name),
                 ("token", &modal.new_token),
+                ("graph", &modal.new_graph),
             ];
             fields
                 .into_iter()
@@ -2302,7 +3120,7 @@ mod tests {
     ) -> Vec<&'static str> {
         modal.update_in(cx, |modal, window, cx| modal.show_add(true, window, cx));
         let mut visited = vec![add_field_focused(modal, cx)];
-        for _ in 0..3 {
+        for _ in 0..4 {
             cx.dispatch_action(menu::SelectNext);
             visited.push(add_field_focused(modal, cx));
         }
@@ -2331,7 +3149,7 @@ mod tests {
         );
         assert_eq!(
             add_tab_order(&modal, cx),
-            ["address", "name", "address", "name"]
+            ["address", "name", "graph", "address", "name"]
         );
         cx.run_until_parked();
         assert!(
@@ -2415,6 +3233,30 @@ mod tests {
             plane.sign_in_state(),
             SignIn::Offered { .. }
         )));
+    }
+
+    /// A sign-in that no organization has as a member keeps the plane's row, which the
+    /// keyboard reaches and which says so, rather than an empty section (spec 029).
+    #[gpui::test]
+    fn a_sign_in_in_no_organization_keeps_its_row(cx: &mut TestAppContext) {
+        let alpha = server(&["one"], cx);
+        let (modal, cx) = dialog(vec![alpha.clone()], cx);
+        let plane = cx.new(|cx| {
+            let mut plane = ControlPlane::new("https://control.test".into(), None, cx);
+            plane.signed_in_for_test(Vec::new(), Vec::new(), cx);
+            plane
+        });
+        modal.update(cx, |modal, cx| {
+            modal.follow_planes(vec![plane.clone()], Vec::new(), cx)
+        });
+        let places = modal.read_with(cx, |modal, cx| modal.places(cx));
+        assert_eq!(
+            places[..2],
+            [
+                Place::Server(alpha.entity_id()),
+                Place::Plane(plane.entity_id())
+            ]
+        );
     }
 
     /// A control plane signed in to, listing `org_1` (Acme) with two clusters: `acme` (`01C`),
@@ -2561,7 +3403,7 @@ mod tests {
         assert_eq!(modal.read_with(cx, |modal, _| modal.token_refusal()), None);
         assert_eq!(
             add_tab_order(&modal, cx),
-            ["address", "name", "token", "address"]
+            ["address", "name", "token", "graph", "address"]
         );
         cx.run_until_parked();
         assert!(cx.debug_bounds("new-token-disabled").is_none());

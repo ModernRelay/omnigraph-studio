@@ -25,6 +25,8 @@ pub struct Served {
     pub schema: String,
     /// The schema read fails, as a server that cannot answer it.
     pub schema_fails: bool,
+    /// The schema read is refused with this status, as a server without the graph (404).
+    pub schema_status: Option<u16>,
     /// How many times the schema was asked for.
     pub schema_reads: usize,
     /// How many times a branch's storage snapshot was asked for.
@@ -130,6 +132,7 @@ pub fn followed_session(
         head: "c1".into(),
         schema: schema.into(),
         schema_fails: false,
+        schema_status: None,
         schema_reads: 0,
         snapshot_reads: 0,
         commits: Vec::new(),
@@ -160,6 +163,15 @@ pub fn followed_session(
             }
             if path.ends_with("/schema") {
                 served.schema_reads += 1;
+            }
+            if let Some(status) = served.schema_status.filter(|_| path.ends_with("/schema")) {
+                return Ok(Response::builder()
+                    .status(status)
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                    .body(AsyncBody::from(
+                        r#"{"error":"graph not found","code":"not_found","disposition":{"effects":"none","action":"fix"}}"#,
+                    ))
+                    .unwrap());
             }
             if path.ends_with("/schema") && served.schema_fails {
                 return Ok(Response::builder()

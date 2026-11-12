@@ -15,7 +15,7 @@ pub use api::{CommitChanges, ErrorOutput};
 pub use client::{
     ApiErrorSummary, BlobAt, BlobCell, BlobMeta, CHANGE_READ_TIMEOUT, Challenge, FeedAt,
     ForwardRequest, ForwardResponse, GraphClient, HistoricalGap, MergePreview, NoAnswer,
-    PropertyThen, ReadError, ServerHealth, Unauthorized, judge_write, server_root,
+    PropertyThen, ReadError, ServerHealth, Unauthorized, is_loopback, judge_write, server_root,
 };
 pub use http_client::{
     AsyncBody,

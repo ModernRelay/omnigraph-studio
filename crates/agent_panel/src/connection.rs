@@ -54,6 +54,15 @@ impl AgentConnection {
         answer
     }
 
+    /// Signs in with the agent's own method `method` (spec 029).
+    pub fn authenticate(&self, method: String) -> oneshot::Receiver<Result<(), String>> {
+        let (reply, answer) = oneshot::channel();
+        self.commands
+            .unbounded_send(ConnectionCommand::Authenticate { method, reply })
+            .ok();
+        answer
+    }
+
     pub fn delete(&self, session: String) -> oneshot::Receiver<Result<(), String>> {
         let (reply, answer) = oneshot::channel();
         self.commands

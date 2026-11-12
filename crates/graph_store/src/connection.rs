@@ -76,7 +76,7 @@ impl ConnectionState {
         match self {
             ConnectionState::Idle => "Not connected".into(),
             ConnectionState::Connecting => "Connecting…".into(),
-            ConnectionState::Ready => format!("contract {}", graph_client::CONTRACT),
+            ConnectionState::Ready => "Connected".into(),
             ConnectionState::ContractMismatch { served } => match served {
                 Some(served) => format!(
                     "Server speaks {served}; Studio speaks {}",
@@ -441,6 +441,11 @@ impl Connection {
             }
         }
         match (&self.state, &self.token_unread) {
+            (ConnectionState::Unauthorized, Some(_))
+                if self.server.source == ServerSource::ControlPlane =>
+            {
+                "No token from the control plane".into()
+            }
             (ConnectionState::Unauthorized, Some(_)) => "No token from the CLI".into(),
             (ConnectionState::Unauthorized, None) if self.token_not_received() => {
                 "Token not received".into()
@@ -1315,6 +1320,18 @@ impl Connection {
     /// ([`TokenSource::login_profile`]).
     pub fn login_profile(&self) -> Option<String> {
         self.token_source.as_ref()?.login_profile()
+    }
+
+    /// Whether the token held was given to Studio (typed in), so it lasts until Studio quits or
+    /// asks the source again (spec 029).
+    pub fn token_given(&self) -> bool {
+        self.token_given
+    }
+
+    /// Whether the server's token comes from a source Studio asks (the CLI's `credentials
+    /// export`, a control plane): a CLI target added anonymous has none.
+    pub fn has_token_source(&self) -> bool {
+        self.token_source.is_some()
     }
 
     /// Whether a connect asks its token source first: it has one, and no token was given.
@@ -2291,8 +2308,10 @@ async fn list_graphs(client: &GraphClient) -> Result<GraphListing, Failed> {
                 Ok(found) => {
                     GraphListing::Discovered(found.graphs.into_iter().map(|g| g.graph_id).collect())
                 }
-                // A static token is refused discovery too; any other failure is a failed read.
-                Err(ReadError::Refused(summary)) if summary.status == 403 => {
+                // A static token is refused discovery too, and a request with no token (a server
+                // run `--unauthenticated`) is asked for an identity credential it does not have:
+                // neither lists (spec 029). Any other failure is a failed read.
+                Err(ReadError::Refused(summary)) if matches!(summary.status, 401 | 403) => {
                     GraphListing::NotAllowed
                 }
                 Err(error) => GraphListing::Failed(error.to_string()),
@@ -2394,10 +2413,12 @@ mod tests {
     }
 
     /// A token that may not list the server's graphs discovers the ones it may know of; one
-    /// refused discovery too (a static token) has graph ids typed in.
+    /// refused discovery too (a static token, 403, or no token on a server run
+    /// `--unauthenticated`, 401) has graph ids typed in.
     #[gpui::test]
     async fn a_token_that_may_not_list_graphs_discovers_them(cx: &mut TestAppContext) {
-        for discovers in [true, false] {
+        for discovery in [200u16, 403, 401] {
+            let discovers = discovery == 200;
             let http = FakeHttpClient::create(move |request| {
                 let path = request.uri().path().to_owned();
                 async move {
@@ -2410,6 +2431,11 @@ mod tests {
                         (
                             200,
                             r#"{"graphs":[{"graph_id":"knowledge","display_name":"knowledge"}]}"#,
+                        )
+                    } else if path.ends_with("/graphs/discovery") && discovery == 401 {
+                        (
+                            401,
+                            r#"{"error":"missing bearer token","code":"unauthorized"}"#,
                         )
                     } else {
                         (403, r#"{"error":"forbidden","code":"forbidden"}"#)
