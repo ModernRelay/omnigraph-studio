@@ -440,7 +440,8 @@ commit is made, would make the counts of History and the Commits panel one field
 
 ### First run
 
-**E45. A direct `cluster apply` that leaves no lock behind.** A direct apply keeps the
+**E45. A direct `cluster apply` that leaves no lock behind.** Filed as
+[ModernRelay/omnigraph#1359](https://github.com/ModernRelay/omnigraph/issues/1359). A direct apply keeps the
 cluster's admission lock after it ends, and `omnigraph-server --cluster DIR` will not start until
 `cluster force-unlock LOCK_ID` releases it, with the id read from `cluster status --json`. A
 first local graph needs three commands where one would do. Release the lock at the end of a
