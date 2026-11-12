@@ -728,7 +728,13 @@ impl NodePeek {
         cx.on_release(|this: &mut Self, cx| this.release(cx))
             .detach();
         let branch = session.read(cx).branch.clone();
-        let scope = session.update(cx, |session, _| session.read_scope(&branch));
+        let scope = session.update(cx, |session, _| {
+            let view = match page {
+                true => graph_store::ledger::ReadView::Page,
+                false => graph_store::ledger::ReadView::Peek,
+            };
+            session.read_scope(&branch, view)
+        });
         let mut this = Self {
             session,
             branch,
@@ -5693,6 +5699,7 @@ impl NodePeek {
 mod tests {
     use super::*;
     use gpui::{TestAppContext, VisualTestContext};
+    use graph_store::ledger::{Answered, Asker, ReadView};
     use serde_json::json;
 
     use crate::test_support::{
@@ -6548,6 +6555,8 @@ mod tests {
         ]);
         let values: Map<String, Value> =
             serde_json::from_value(json!({ "@id": "p1", "slug": "p1", "name": "Ada" })).unwrap();
+        let ledger_of = session.clone();
+        ledger_of.update(cx, |session, _| session.ledger_mut().clear());
         let (view, cx) = cx.add_window_view(move |_, cx| {
             NodePeek::new(
                 session,
@@ -6585,6 +6594,27 @@ mod tests {
             !read.iter().any(|query| query.contains("$n $e:knows $m")),
             "knows out as the table read it: {read:?}"
         );
+        // The ledger's budget for a peek of a table's row (spec 030): no read of the node, and
+        // only the neighbours the table did not list, each asked by the peek.
+        ledger_of.read_with(cx, |session, _| {
+            let ledger = session.ledger();
+            assert_eq!(
+                ledger.count("studio_node", |_| true),
+                0,
+                "{}",
+                ledger.table()
+            );
+            let neighbours_sent: u64 = ledger
+                .tallies()
+                .filter(|((what, asker, answered), _)| {
+                    what.as_ref() == "studio_neighbours"
+                        && *asker == Asker::View(ReadView::Peek)
+                        && answered.sent()
+                })
+                .map(|(_, tally)| tally.count)
+                .sum();
+            assert_eq!(neighbours_sent, 3, "{}", ledger.table());
+        });
     }
 
     /// A peek given only a table's count for a group lists the group's neighbours itself, one
@@ -7125,6 +7155,7 @@ mod tests {
             "an edge at the node"
         );
 
+        session.update(cx, |session, _| session.ledger_mut().clear());
         view.update(cx, |view, cx| view.refresh(cx));
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
@@ -7136,6 +7167,18 @@ mod tests {
             (2, 4),
             "only the groups of the edge type the commit wrote"
         );
+        // The ledger's budget for Refresh (spec 030): knows, out and in, carried from c1; only
+        // likes, out and in, sent. The node is sent again: the page opened before the session
+        // knew the head, so it read its node with no commit, and such an answer is not kept to
+        // carry (spec 030, validation log, 2026-11-12). Kept, this becomes one carried.
+        session.read_with(cx, |session, _| {
+            let ledger = session.ledger();
+            let carried = |what: &str| ledger.count(what, |a| matches!(a, Answered::Carried(_)));
+            assert_eq!(carried("studio_neighbours"), 2, "{}", ledger.table());
+            assert_eq!(ledger.count("studio_neighbours", |a| a.sent()), 2);
+            assert_eq!(carried("studio_node"), 0, "{}", ledger.table());
+            assert_eq!(ledger.count("studio_node", |a| a.sent()), 1);
+        });
     }
 
     /// A relationship is removed on the second press of its ×, as its own commit, which the

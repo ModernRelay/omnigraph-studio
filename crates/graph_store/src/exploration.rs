@@ -1631,7 +1631,7 @@ impl Exploration {
     fn new(session: Entity<GraphSession>, cx: &mut Context<Self>) -> Self {
         let scope = session.update(cx, |session, _| {
             let branch = session.branch.clone();
-            session.read_scope(&branch)
+            session.read_scope(&branch, crate::ledger::ReadView::Exploration)
         });
         let schema = session.read(cx).schema_model();
         let subscription = cx.subscribe(&session, |this, session, event, cx| match event {

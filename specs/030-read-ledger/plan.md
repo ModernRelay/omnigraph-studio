@@ -1,6 +1,6 @@
 # 030: The read ledger: how each read was answered, how long a view took, and whether a kept answer was right
 
-Status: draft · 2026-11-12 (research added, claims checked against Studio and Omnigraph `7711e4a` the same day)
+Status: in progress; step 1 built (2026-11-12) · drafted 2026-11-12, research added and claims checked against Studio and Omnigraph `7711e4a` the same day
 
 ## Problem
 
@@ -253,6 +253,38 @@ Each is its own plan when it is built.
 - **No hedged reads.** Sending a slow read twice halves tail latency only where requests are
   cheap; here they are what is scarce.
 
+### Step 1 as built (2026-11-12)
+
+- **Where it lives.** `graph_store::ledger` holds `ReadLedger`, `ReadEvent`, `Answered`,
+  `Origin`, `Asker`, `ReadView`, `Target` and `Status`. The session owns one ledger
+  (`GraphSession::ledger`, `ledger_mut`).
+- **Answers from the cache.** `GraphSession::read` records `Seeded`, `Carried(origin)`,
+  `Held(origin)` and `Joined`. A carried answer is marked (`carried_keys`) until a read keeps
+  one at its key. Relationship counts record `Held`, `Carried` or `Batched` under the name
+  `count`.
+- **Requests.**
+  - Every `counted_read` records its route's name (`access`, `commit_page`, `commit_changes`,
+    `changes`, `diff`, `merge_base`, `blob_head`, …). Each query records the name Studio gave
+    it.
+  - The session's own reads (`branches`, `snapshot`, `stored_queries`, `studio_head`) are
+    recorded through `ledgered`.
+  - The time is from asking for a slot to the answer, on the executor's clock.
+  - Status is ok, refused (with its HTTP status), failed, or dropped while every asker let go.
+- **Targets.** There are four: `Branch` (no commit; not kept), `HeadCommit` (a commit that is
+  its branch's head, sent as a branch read; kept), `Pinned` and `Route`.
+- **Who asked.** `read_scope` takes the `ReadView` (table, peek, page, exploration), and the
+  scoped reads (`read_in`, `degree_in`, `blob_meta_in`) name it, including when a head-commit
+  read is sent again pinned. Every other read is `Unnamed` for now.
+- **Not yet:**
+  - The schema reads, which run inside larger background tasks.
+  - Named askers for unscoped views, and the test that refuses `Unnamed`.
+  - Queue and wire time apart, and bytes: `graph_client` would have to report them.
+  - The ring's switch by environment variable. Tests use `keep_events` and the tallies.
+- **Tests.**
+  - `graph_store`: `ledger::tests` (2) and `the_ledger_says_how_each_read_was_answered`.
+  - Budgets added to `type_table`'s `a_peek_reads_only_what_the_table_did_not` and
+    `refresh_reads_again_only_the_groups_a_commit_changed`.
+
 ## Decisions
 
 | Decision | Rejected | Why |
@@ -333,3 +365,5 @@ The research (2026-11-12) is summarized here; a claim not checked in a primary s
 | 2026-11-12 | What stands between Studio and the personal server | `curl -sI https://omnigraph.ragnor.co/healthz`: `server: railway-hikari`, `x-railway-edge: sjc1`; HTTP version 2 | Railway's edge proxy over HTTP/2 |
 | 2026-11-12 | Time-dependent functions | `7711e4a` `omnigraph-compiler/src/query/query.pest`: `now_call` is the only one | Confirmed |
 | 2026-11-12 | No `Server-Timing` or `priority` handling | `git grep -i` for both in `7711e4a` `crates/omnigraph-server/src` | Neither found |
+| 2026-11-12 | The ledger records how each read was answered | `graph_store` `the_ledger_says_how_each_read_was_answered`: two asks of a page (one `Sent(HeadCommit, Ok)`, one `Joined`), the node `Seeded` with no request, the neighbours sent once, `Carried(Read)` to a commit that touched another person, then `Held(Carried)`; two reads attributed to the page's scope. `type_table`: a peek of a table's row sends no `studio_node` and three `studio_neighbours`, all asked by the peek; Refresh carries knows out and in and sends likes out and in | Pass; workspace 1,380 tests pass, clippy clean |
+| 2026-11-12 | Found by the ledger: a page opened before the session knows its branch's head reads its node with no commit, and that answer is not kept, so Refresh sends the node again though nothing of it changed | `type_table` `refresh_reads_again_only_the_groups_a_commit_changed`, ledger before Refresh: `studio_node … Sent(Branch, Ok)`; after: `Sent(HeadCommit, Ok)`, nothing carried | Open. A branch read's answer names its commit (`graph_commit_id`); kept at that commit under the epoch it was sent with, it would carry. The test asserts today's count, with a note |

@@ -30,6 +30,9 @@ use crate::access::{Access, AccessScope, Allowed};
 use crate::carry::{ChangeLog, ChangesSince, FeedFold, Since, answer_unchanged};
 use crate::connection::{Connection, ConnectionEvent, ConnectionState, ConnectionWatch};
 use crate::degrees::{DEGREE_BATCH, DegreeBatchKey, DegreeBatches, page_counts};
+use crate::ledger::{
+    Answered, Asker, Origin, ReadEvent, ReadLedger, ReadView, Sending, Status, Target,
+};
 use crate::memo::{Held, Memo};
 use crate::scope::{ReadScope, Scope, ScopeSince};
 
@@ -830,6 +833,14 @@ pub struct GraphSession {
     /// What each view has read at the commit it shows ([`ReadScope`]), while it holds its scope.
     scopes: HashMap<u64, Scope>,
     next_scope: u64,
+    /// The view each live scope reads for (spec 030).
+    scope_views: HashMap<u64, ReadView>,
+    /// How each read was answered (spec 030).
+    ledger: ReadLedger,
+    /// Who is asking for the read being started: set by the scoped reads around their call.
+    asking: Asker,
+    /// Answers kept in `pinned_reads` that were carried there, not read (spec 030, origin).
+    carried_keys: HashSet<PinnedRead>,
     /// Each followed branch's commits as the change feed described them.
     change_logs: HashMap<String, ChangeLog>,
     /// Change-feed reads under way, by branch, and the branches whose head moved meanwhile.
@@ -1001,6 +1012,10 @@ impl GraphSession {
             gone_branches: HashSet::new(),
             scopes: HashMap::new(),
             next_scope: 0,
+            scope_views: HashMap::new(),
+            ledger: ReadLedger::default(),
+            asking: Asker::Unnamed,
+            carried_keys: HashSet::new(),
             change_logs: HashMap::new(),
             change_reads: HashMap::new(),
             change_reads_again: HashSet::new(),
@@ -1104,6 +1119,7 @@ impl GraphSession {
         let graph = self.graph_id.clone();
         let (branch, target) = (scope.branch.clone(), scope.target.clone());
         let read = self.counted_read(
+            "access",
             async move {
                 client
                     .access(&graph, branch.as_deref(), target.as_deref())
@@ -1426,6 +1442,7 @@ impl GraphSession {
         let client = self.client(cx);
         let graph = self.graph_id.clone();
         let read = cx.background_spawn(async move { client.stored_queries(&graph).await });
+        let read = self.ledgered("stored_queries", Target::Route, read, cx);
         self._stored_queries_task = Some(cx.spawn(async move |this, cx| {
             let read = read.await;
             this.update(cx, |this, cx| this.note_read(&read, cx)).ok();
@@ -1472,6 +1489,7 @@ impl GraphSession {
         let graph = self.graph_id.clone();
         let name = name.to_owned();
         self.counted_read(
+            "stored_read",
             async move { client.invoke_stored_read(&graph, &name, &request).await },
             cx,
         )
@@ -1771,6 +1789,7 @@ impl GraphSession {
         let graph = self.graph_id.clone();
         let moves = self.branch_moves;
         let read = cx.background_spawn(async move { client.branches(&graph).await });
+        let read = self.ledgered("branches", Target::Route, read, cx);
         self._branches_task = Some(cx.spawn(async move |this, cx| {
             let read = read.await;
             this.update(cx, |this, cx| this.note_read(&read, cx)).ok();
@@ -1899,6 +1918,7 @@ impl GraphSession {
             let branch = branch.clone();
             cx.background_spawn(async move { client.snapshot(&graph, &branch).await })
         };
+        let read = self.ledgered("snapshot", Target::Branch, read, cx);
         self._datasets_task = Some(cx.spawn(async move |this, cx| {
             let read = read.await;
             this.update(cx, |this, cx| this.note_read(&read, cx)).ok();
@@ -2185,12 +2205,72 @@ impl GraphSession {
 
     /// A scope for a view of `branch`: the view reads what it shows through it
     /// ([`GraphSession::read_in`]) while it holds it.
-    pub fn read_scope(&mut self, branch: &str) -> ReadScope {
+    pub fn read_scope(&mut self, branch: &str, view: ReadView) -> ReadScope {
         self.next_scope += 1;
         let (scope, handle) = Scope::new(self.next_scope, branch.to_owned());
         self.scopes.retain(|_, scope| scope.is_alive());
+        self.scope_views
+            .retain(|id, _| self.scopes.contains_key(id));
         self.scopes.insert(self.next_scope, scope);
+        self.scope_views.insert(self.next_scope, view);
         handle
+    }
+
+    /// How the reads asked of this session were answered (spec 030).
+    pub fn ledger(&self) -> &ReadLedger {
+        &self.ledger
+    }
+
+    pub fn ledger_mut(&mut self) -> &mut ReadLedger {
+        &mut self.ledger
+    }
+
+    /// Runs `read` asked for by `scope`'s view, so the ledger names who asked.
+    fn asked_by<T>(&mut self, scope: u64, read: impl FnOnce(&mut Self) -> T) -> T {
+        let asker = self
+            .scope_views
+            .get(&scope)
+            .map_or(Asker::Unnamed, |view| Asker::View(*view));
+        let before = std::mem::replace(&mut self.asking, asker);
+        let result = read(self);
+        self.asking = before;
+        result
+    }
+
+    /// Records a read the session answered without sending it.
+    fn answered_here(&mut self, what: &str, answered: Answered) {
+        self.ledger.record(ReadEvent {
+            what: what.to_owned().into(),
+            asker: self.asking,
+            answered,
+            took: Duration::ZERO,
+        });
+    }
+
+    /// `read`, a request to the server, recorded in the ledger as `what` when it ends.
+    fn ledgered<T: 'static>(
+        &mut self,
+        what: &'static str,
+        target: Target,
+        read: Task<Result<T, ReadError>>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<T, ReadError>> {
+        let sending = Sending {
+            what: what.into(),
+            asker: self.asking,
+            target,
+            started: cx.background_executor().now(),
+        };
+        cx.spawn(async move |this, cx| {
+            let result = read.await;
+            let status = read_status(&result);
+            this.update(cx, |this, cx| {
+                let now = cx.background_executor().now();
+                this.ledger.record(sending.finish(status, now));
+            })
+            .ok();
+            result
+        })
     }
 
     /// The view shows none of what it read through `scope` any more, and now reads `branch`.
@@ -2230,7 +2310,7 @@ impl GraphSession {
             .scopes
             .get_mut(&id)
             .map(|scope| scope.add(query.depends.clone()));
-        let read = self.read(query, snapshot, cx);
+        let read = self.asked_by(id, |this| this.read(query, snapshot, cx));
         // The token goes with this task: dropped by the view, the read stops counting as out.
         cx.spawn(async move |this, cx| {
             let result = read.await;
@@ -2291,7 +2371,9 @@ impl GraphSession {
                 listed: None,
             })
         });
-        let count = self.degree_at(type_name, group, id, snapshot, cx);
+        let count = self.asked_by(scope_id, |this| {
+            this.degree_at(type_name, group, id, snapshot, cx)
+        });
         let Some((entry, token)) = entry else {
             return count;
         };
@@ -2336,7 +2418,7 @@ impl GraphSession {
             };
             scope.add_known(depends, Some(Vec::new()));
         }
-        self.blob_meta(cell, snapshot, cx)
+        self.asked_by(scope.id, |this| this.blob_meta(cell, snapshot, cx))
     }
 
     /// What `branch`'s commits after `from`, up to and including `to`, changed among the types
@@ -2810,6 +2892,7 @@ impl GraphSession {
         let graph = self.graph_id.clone();
         let key = branch.clone();
         let probe = cx.background_spawn(async move { client.query(&graph, &request).await });
+        let probe = self.ledgered("studio_head", Target::Branch, probe, cx);
         let read = cx.spawn(async move |this, cx| {
             let read = probe.await;
             this.update(cx, |this, cx| {
@@ -2850,6 +2933,7 @@ impl GraphSession {
         let graph = self.graph_id.clone();
         let moves = self.branch_moves;
         let read = cx.background_spawn(async move { client.branches(&graph).await });
+        let read = self.ledgered("branches", Target::Route, read, cx);
         self.branch_recheck = Some(cx.spawn(async move |this, cx| {
             let read = read.await;
             this.update(cx, |this, cx| {
@@ -2996,9 +3080,9 @@ impl GraphSession {
 
     /// A node's count through a group kept at `key`'s commit, or at an earlier commit of the
     /// session's branch when no edge of the group's type at the node changed in between.
-    fn degree_kept(&mut self, key: &DegreeAt) -> Option<u64> {
+    fn degree_kept(&mut self, key: &DegreeAt) -> Option<(u64, Answered)> {
         if let Some(Held::Done(n)) = self.degree_counts.get(key) {
-            return Some(n);
+            return Some((n, Answered::Held(Origin::Read)));
         }
         let family = (
             key.type_name.clone(),
@@ -3026,7 +3110,7 @@ impl GraphSession {
         )?;
         self.count_kept_at(key);
         self.degree_counts.insert(key.clone(), carried);
-        Some(carried)
+        Some((carried, Answered::Carried(Origin::Read)))
     }
 
     /// Notes that a count for `key` is kept, so a miss at another commit finds it.
@@ -3043,12 +3127,13 @@ impl GraphSession {
     /// An answer to the same query and parameters read at an earlier commit of the session's
     /// branch, standing for `key`'s commit because no commit in between changed what it
     /// depends on (spec 015, carry-forward). Answered as read at `key`'s commit.
-    fn carried(&mut self, key: &PinnedRead, depends: &Depends) -> Option<ReadOutput> {
+    fn carried(&mut self, key: &PinnedRead, depends: &Depends) -> Option<(ReadOutput, Origin)> {
         if *depends == Depends::Unknown {
             return None;
         }
         let family = (key.query.clone(), key.params.clone(), key.schema);
         let (reads, seeded) = (&self.pinned_reads, &self.seeded_reads);
+        let carried_keys = &self.carried_keys;
         let log = self.change_logs.get(&self.branch);
         let at = |commit: &str| PinnedRead {
             commit: commit.to_owned(),
@@ -3056,7 +3141,11 @@ impl GraphSession {
         };
         let answer = |commit: &str| {
             let at = at(commit);
-            reads.peek(&at).or_else(|| seeded.peek(&at))
+            match reads.peek(&at) {
+                Some(output) if carried_keys.contains(&at) => Some((output, Origin::Carried)),
+                Some(output) => Some((output, Origin::Read)),
+                None => seeded.peek(&at).map(|output| (output, Origin::Seeded)),
+            }
         };
         // The commits it was read at, then those a page's rows gave it at.
         let mut output = [&mut self.pinned_commits, &mut self.seeded_commits]
@@ -3069,14 +3158,14 @@ impl GraphSession {
                     |commit| answer(commit).is_some(),
                     |start, since| {
                         answer(start)
-                            .filter(|output| answer_unchanged(since, depends, &output.rows))
-                            .cloned()
+                            .filter(|(output, _)| answer_unchanged(since, depends, &output.rows))
+                            .map(|(output, origin)| (output.clone(), origin))
                     },
                 )
             })?;
-        output.graph_commit_id = Some(key.commit.clone());
-        output.target.branch = None;
-        output.target.snapshot = Some(key.commit.clone());
+        output.0.graph_commit_id = Some(key.commit.clone());
+        output.0.target.branch = None;
+        output.0.target.snapshot = Some(key.commit.clone());
         Some(output)
     }
 
@@ -3095,6 +3184,12 @@ impl GraphSession {
     fn kept_at(&mut self, key: &PinnedRead) {
         let family = (key.query.clone(), key.params.clone(), key.schema);
         remember(&mut self.pinned_commits, family, &key.commit, PINNED_READS);
+        // Kept by a read (a carry marks it again after this); the marks follow the memo.
+        self.carried_keys.remove(key);
+        if self.carried_keys.len() > PINNED_READS {
+            let reads = &self.pinned_reads;
+            self.carried_keys.retain(|key| reads.peek(key).is_some());
+        }
     }
 
     /// Runs a read on the session's branch, or at `snapshot` when given (constitution II). A
@@ -3124,19 +3219,35 @@ impl GraphSession {
         if !self.pinned_reads.holds(&key)
             && let Some(Held::Done(output)) = self.seeded_reads.get(&key)
         {
+            self.answered_here(&query.name, Answered::Seeded);
             return self.seeding(query.seeds.clone(), Task::ready(Ok(output)), cx);
         }
         // Neither an answer nor a read someone still waits for: carried from an earlier
         // commit when nothing it depends on changed since.
-        let none = match self.pinned_reads.held(&key) {
-            None => true,
-            Some(Held::Pending(pending)) => pending.read.upgrade().is_none(),
-            Some(Held::Done(_)) => false,
+        let held = match self.pinned_reads.held(&key) {
+            None => None,
+            Some(Held::Pending(pending)) => pending.read.upgrade().is_some().then_some(false),
+            Some(Held::Done(_)) => Some(true),
         };
-        if none && let Some(output) = self.carried(&key, &query.depends) {
+        if held.is_none()
+            && let Some((output, origin)) = self.carried(&key, &query.depends)
+        {
+            self.answered_here(&query.name, Answered::Carried(origin));
             self.kept_at(&key);
+            self.carried_keys.insert(key.clone());
             self.pinned_reads.insert(key, output.clone());
             return self.seeding(query.seeds.clone(), Task::ready(Ok(output)), cx);
+        }
+        match held {
+            Some(true) => {
+                let origin = match self.carried_keys.contains(&key) {
+                    true => Origin::Carried,
+                    false => Origin::Read,
+                };
+                self.answered_here(&query.name, Answered::Held(origin));
+            }
+            Some(false) => self.answered_here(&query.name, Answered::Joined),
+            None => {}
         }
         // An answer kept filed what its rows answer when it was read; a read under way files
         // them as it ends, for everyone who shares it.
@@ -3340,7 +3451,8 @@ impl GraphSession {
             snapshot: None,
             ..request.clone()
         };
-        let branch_read = self.read_request(at_branch, cx);
+        let branch_read = self.read_request_as(at_branch, Target::HeadCommit, cx);
+        let asker = self.asking;
         cx.spawn(async move |this, cx| {
             let elsewhere = match branch_read.await {
                 Ok(mut output) if output.graph_commit_id.as_deref() == Some(commit.as_str()) => {
@@ -3362,6 +3474,7 @@ impl GraphSession {
                 Err(error) => return Err(error),
             };
             let pinned = this.update(cx, |this, cx| {
+                let before = std::mem::replace(&mut this.asking, asker);
                 // The reads at the commit after this one go to it at once, rather than each
                 // reading the branch and then the commit until the next poll moves the head (up
                 // to 30 s). The head itself is left to the head watch: the other commit is not
@@ -3371,7 +3484,9 @@ impl GraphSession {
                 if elsewhere && this.heads.get(&branch) == Some(&commit) {
                     this.not_at_head.insert(branch, commit.clone());
                 }
-                this.read_request(request, cx)
+                let read = this.read_request(request, cx);
+                this.asking = before;
+                read
             });
             match pinned {
                 Ok(pinned) => pinned.await,
@@ -3387,9 +3502,37 @@ impl GraphSession {
         request: QueryRequest,
         cx: &mut Context<Self>,
     ) -> Task<Result<ReadOutput, ReadError>> {
+        let target = match request.snapshot {
+            Some(_) => Target::Pinned,
+            None => Target::Branch,
+        };
+        self.read_request_as(request, target, cx)
+    }
+
+    /// [`Self::read_request`], recorded in the ledger as sent to `target`.
+    fn read_request_as(
+        &mut self,
+        request: QueryRequest,
+        target: Target,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<ReadOutput, ReadError>> {
         let client = self.client(cx);
         let graph = self.graph_id.clone();
-        self.counted_read(async move { client.query(&graph, &request).await }, cx)
+        let sending = Sending {
+            what: request
+                .name
+                .clone()
+                .unwrap_or_else(|| "query".into())
+                .into(),
+            asker: self.asking,
+            target,
+            started: cx.background_executor().now(),
+        };
+        self.counted_read_as(
+            Some(sending),
+            async move { client.query(&graph, &request).await },
+            cx,
+        )
     }
 
     /// Runs a read counted in [`Self::reads_in_flight`] for exactly as long as it runs. A read
@@ -3405,6 +3548,24 @@ impl GraphSession {
     /// no change.
     fn counted_read<T: Send + 'static>(
         &mut self,
+        what: &'static str,
+        request: impl Future<Output = Result<T, ReadError>> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<T, ReadError>> {
+        let sending = Sending {
+            what: what.into(),
+            asker: self.asking,
+            target: Target::Route,
+            started: cx.background_executor().now(),
+        };
+        self.counted_read_as(Some(sending), request, cx)
+    }
+
+    /// [`Self::counted_read`], recorded in the ledger as `sending` says when it ends or is
+    /// dropped.
+    fn counted_read_as<T: Send + 'static>(
+        &mut self,
+        sending: Option<Sending>,
         request: impl Future<Output = Result<T, ReadError>> + Send + 'static,
         cx: &mut Context<Self>,
     ) -> Task<Result<T, ReadError>> {
@@ -3426,6 +3587,14 @@ impl GraphSession {
                 .update(cx, |this, cx| {
                     if let Some(result) = &result {
                         this.note_read(result, cx);
+                    }
+                    if let Some(sending) = sending {
+                        let status = match &result {
+                            Some(result) => read_status(result),
+                            None => Status::Dropped,
+                        };
+                        let now = cx.background_executor().now();
+                        this.ledger.record(sending.finish(status, now));
                     }
                     this.reads_in_flight = this.reads_in_flight.saturating_sub(1);
                     cx.emit(SessionEvent::ActivityChanged);
@@ -3512,7 +3681,7 @@ impl GraphSession {
             };
             client.blob_head(&graph, &cell, at).await
         };
-        self.counted_read(request, cx)
+        self.counted_read("blob_head", request, cx)
     }
 
     /// A page of `branch`'s history, newest first ([`GraphClient::commit_page`]): its newest
@@ -3529,6 +3698,7 @@ impl GraphSession {
         let graph = self.graph_id.clone();
         let branch = branch.to_owned();
         self.counted_read(
+            "commit_page",
             async move {
                 client
                     .commit_page(&graph, &branch, limit, page_token.as_deref())
@@ -3549,7 +3719,11 @@ impl GraphSession {
         let client = self.client(cx);
         let graph = self.graph_id.clone();
         let commit_id = commit_id.to_owned();
-        self.counted_read(async move { client.commit(&graph, &commit_id).await }, cx)
+        self.counted_read(
+            "commit",
+            async move { client.commit(&graph, &commit_id).await },
+            cx,
+        )
     }
 
     /// `branch`'s newest commit, as a list of branches shows it: read alone (a page of one) and
@@ -3574,6 +3748,7 @@ impl GraphSession {
                 let client = session.client(cx);
                 let graph = session.graph_id.clone();
                 let read = session.counted_read(
+                    "head_commit",
                     async move { client.commit_page(&graph, &branch, 1, None).await },
                     cx,
                 );
@@ -3616,6 +3791,7 @@ impl GraphSession {
             move |session, _, cx| {
                 let (client, graph) = (session.client(cx), session.graph_id.clone());
                 session.counted_read(
+                    "commit_changes",
                     async move {
                         client
                             .commit_changes(&graph, &commit, page_token.as_deref(), limit)
@@ -3659,6 +3835,7 @@ impl GraphSession {
         let (client, graph) = (self.client(cx), self.graph_id.clone());
         let (source, target) = (source.to_owned(), target.to_owned());
         self.counted_read(
+            "merge_base",
             async move { client.merge_base(&graph, &source, &target).await },
             cx,
         )
@@ -3675,6 +3852,7 @@ impl GraphSession {
         let (client, graph) = (self.client(cx), self.graph_id.clone());
         let (source, target) = (source.to_owned(), target.to_owned());
         self.counted_read(
+            "merge_preview",
             async move { client.merge_preview(&graph, &source, &target).await },
             cx,
         )
@@ -3692,6 +3870,7 @@ impl GraphSession {
     ) -> Task<Result<ChangeFeedOutput, ReadError>> {
         let (client, graph, branch) = (self.client(cx), self.graph_id.clone(), branch.to_owned());
         self.counted_read(
+            "changes",
             async move {
                 let at = match (&page_token, &start) {
                     (Some(token), _) => FeedAt::Page(token),
@@ -3716,6 +3895,7 @@ impl GraphSession {
         let (client, graph) = (self.client(cx), self.graph_id.clone());
         let (from, to) = (from.to_owned(), to.to_owned());
         self.counted_read(
+            "diff",
             async move {
                 client
                     .diff(&graph, &from, &to, page_token.as_deref(), limit)
@@ -3749,10 +3929,12 @@ impl GraphSession {
                 commit: commit.clone(),
                 schema: self.schema_epoch,
             };
-            if let Some(n) = self.degree_kept(&at) {
+            if let Some((n, answered)) = self.degree_kept(&at) {
+                self.answered_here(COUNT, answered);
                 return Task::ready(Ok((n, Some(commit.clone()))));
             }
         }
+        self.answered_here(COUNT, Answered::Batched);
         let (tx, rx) = oneshot::channel();
         let key = DegreeBatchKey {
             type_name: type_name.to_owned(),
@@ -3867,6 +4049,7 @@ impl GraphSession {
         let graph = self.graph_id.clone();
         let branch = self.branch.clone();
         self.counted_read(
+            "blob_head",
             async move {
                 let at = match &snapshot {
                     Some(commit) => BlobAt::Snapshot(commit),
@@ -3890,6 +4073,7 @@ impl GraphSession {
         let graph = self.graph_id.clone();
         let branch = branch.to_owned();
         self.counted_read(
+            "blob_head_on",
             async move {
                 client
                     .blob_head(&graph, &cell, BlobAt::Branch(&branch))
@@ -4572,6 +4756,18 @@ pub fn open_session_behind(
     cx.new(|cx| GraphSession::parked(connection, graph_id, branch, cx))
 }
 
+/// What the ledger calls a node's relationship count, however it is read.
+const COUNT: &str = "count";
+
+/// What came of a sent read, for the ledger.
+fn read_status<T>(result: &Result<T, ReadError>) -> Status {
+    match result {
+        Ok(_) => Status::Ok,
+        Err(ReadError::Refused(refusal)) => Status::Refused(refusal.status),
+        Err(_) => Status::Failed,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -4601,7 +4797,7 @@ mod tests {
 
     /// A scope on main showing answers that depend on these node and edge types.
     fn watching(session: &mut GraphSession, nodes: &[&str], edges: &[&str]) -> ReadScope {
-        let scope = session.read_scope("main");
+        let scope = session.read_scope("main", ReadView::Table);
         let depends = Depends::Types {
             nodes: nodes.iter().map(|n| n.to_string()).collect(),
             edges: edges.iter().map(|e| e.to_string()).collect(),
@@ -9017,6 +9213,118 @@ mod tests {
         read(&page, cx).await.unwrap();
         read(&node, cx).await.unwrap();
         assert_eq!(reads(), 1);
+    }
+
+    /// The ledger says how each read was answered and who asked (spec 030): sent once and
+    /// joined by the second view, seeded by a page's rows, carried past a commit that changed
+    /// nothing it reads, and then held with the origin it was carried with.
+    #[gpui::test]
+    async fn the_ledger_says_how_each_read_was_answered(cx: &mut TestAppContext) {
+        use crate::ledger::{Answered, Asker, Origin, ReadView, Status, Target};
+        use crate::test_server::{followed_session, node_change};
+        use serde_json::json;
+
+        const SCHEMA: &str =
+            "node Person {\n  slug: String @key\n  name: String\n}\nedge Knows: Person -> Person\n";
+        let (session, served) = followed_session(
+            SCHEMA,
+            |request| match request["name"].as_str() {
+                Some("studio_page") => {
+                    json!([{ "n": { "@id": "p1", "slug": "p1", "name": "Ada" } }])
+                }
+                _ => json!([{ "id": "p2", "edge_id": "e1", "label": "Grace" }]),
+            },
+            cx,
+        );
+        cx.run_until_parked();
+        let schema = session.read_with(cx, |session, _| session.schema_model().unwrap());
+        let _watch = session.update(cx, |session, _| watching(session, &["Person"], &["Knows"]));
+        let page = builder::node_page(&schema, "Person", &[], None, &builder::PageStart::First, 10)
+            .unwrap();
+        let node = builder::node_by_id(&schema, "Person", "p1").unwrap();
+        let group = schema.relationships_of("Person")[0].clone();
+        let neighbours = builder::neighbours(
+            &schema,
+            "Person",
+            &group,
+            "p1",
+            None,
+            builder::Narrow::default(),
+            51,
+        )
+        .unwrap();
+        let scope = session.update(cx, |session, _| session.read_scope("main", ReadView::Page));
+        let head = session.read_with(cx, |session, _| session.heads.get("main").cloned().unwrap());
+        session.update(cx, |session, _| session.ledger_mut().clear());
+
+        // Two asks of the page: one request, at the head, so to the branch; the other joins it.
+        let (first, second) = session.update(cx, |session, cx| {
+            (
+                session.read(&page, Some(head.clone()), cx),
+                session.read(&page, Some(head.clone()), cx),
+            )
+        });
+        cx.run_until_parked();
+        first.await.unwrap();
+        second.await.unwrap();
+        // The node, through the page view's scope: its row answered it.
+        session
+            .update(cx, |session, cx| {
+                session.read_in(&scope, &node, Some(head.clone()), cx)
+            })
+            .await
+            .unwrap();
+        session
+            .update(cx, |session, cx| {
+                session.read_in(&scope, &neighbours, Some(head.clone()), cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        // A commit to another person: the neighbours carry to it, then are held as carried.
+        served
+            .lock()
+            .unwrap()
+            .commit("c9", vec![node_change("Person", "p9")]);
+        session.update(cx, |session, cx| session.check_heads(cx));
+        cx.run_until_parked();
+        for _ in 0..2 {
+            session
+                .update(cx, |session, cx| {
+                    session.read(&neighbours, Some("c9".into()), cx)
+                })
+                .await
+                .unwrap();
+        }
+
+        session.read_with(cx, |session, _| {
+            let ledger = session.ledger();
+            let count = |what: &str, answered: Answered| ledger.count(what, |a| a == answered);
+            let sent_ok = Answered::Sent(Target::HeadCommit, Status::Ok);
+            assert_eq!(count("studio_page", sent_ok), 1, "{}", ledger.table());
+            assert_eq!(count("studio_page", Answered::Joined), 1);
+            assert_eq!(count("studio_node", Answered::Seeded), 1);
+            assert_eq!(ledger.count("studio_node", |a| a.sent()), 0);
+            assert_eq!(count("studio_neighbours", sent_ok), 1);
+            assert_eq!(
+                count("studio_neighbours", Answered::Carried(Origin::Read)),
+                1
+            );
+            assert_eq!(
+                count("studio_neighbours", Answered::Held(Origin::Carried)),
+                1
+            );
+            let asked_by_page = ledger
+                .tallies()
+                .filter(|((_, asker, _), _)| *asker == Asker::View(ReadView::Page))
+                .map(|(_, tally)| tally.count)
+                .sum::<u64>();
+            assert_eq!(
+                asked_by_page, 2,
+                "the node and the neighbours, through the scope"
+            );
+        });
     }
 
     /// A schema read the server answers 404 is kept as a graph not found, for the window's page;

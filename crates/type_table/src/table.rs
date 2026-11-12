@@ -12287,7 +12287,7 @@ impl Render for DraggedColumn {
 fn new_scope(session: &Entity<GraphSession>, cx: &mut App) -> ReadScope {
     session.update(cx, |session, _| {
         let branch = session.branch.clone();
-        session.read_scope(&branch)
+        session.read_scope(&branch, graph_store::ledger::ReadView::Table)
     })
 }
 
