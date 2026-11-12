@@ -21,9 +21,18 @@
 //! inspector; `,live` lets reads and timers land before each frame, timed and counted with it); `measure:<n>,type` types a letter into the focused
 //! field and takes it back, alternately. Each also prints the main thread's CPU time per
 //! frame, which a busy machine does not inflate, and its allocations per frame, which are
-//! exact on any machine. `SNAPSHOT_WAIT_MS` (default 1500) is how
-//! long to let each step's network work finish; `SNAPSHOT_SIZE` is `WIDTHxHEIGHT` (default
-//! 1440x900). Remembered tabs are not restored unless `OMNIGRAPH_STUDIO_NO_RESTORE=0`. The run
+//! exact on any machine. `record:<dir>[,fps=60][,ms=<n>]` records the rest of the run as a
+//! film (`script/demo-video`): from then on the time each step lets pass is drawn and saved
+//! every 1/fps s, paced to real time with GPUI's clock moved forward by the same step, so
+//! timers and Studio's own animations play out as in the app (motion is not reduced while
+//! recording). `ms` is how long each step is given while recording, in place of
+//! `SNAPSHOT_WAIT_MS`, and `type:` types a character at a time. A frame the same as the one
+//! before is not saved again. `record:stop` ends it; the run's end does too.
+//! `<dir>/timeline.json` lists each 1/fps slot's file and each step with the slot it began at,
+//! and for a click, hover or drag its point in window coordinates. `mark:<text>` does nothing
+//! but appear there, for what draws the film (a zoom, a caption). `SNAPSHOT_WAIT_MS` (default
+//! 1500) is how long to let each step's network work finish; `SNAPSHOT_SIZE` is
+//! `WIDTHxHEIGHT` (default 1440x900). Remembered tabs are not restored unless `OMNIGRAPH_STUDIO_NO_RESTORE=0`. The run
 //! keeps its state in a fresh temporary directory unless `OMNIGRAPH_STUDIO_DATA` names one, so
 //! it neither reads nor writes the app's settings, tabs or conversations.
 
@@ -220,6 +229,213 @@ fn settle(cx: &mut HeadlessAppContext, wait: Duration) {
     cx.run_until_parked();
 }
 
+/// A film being recorded by `record:`: the frames saved so far and the steps they show.
+struct Recorder {
+    dir: std::path::PathBuf,
+    frame: Duration,
+    /// How long each step is given while recording, in place of `SNAPSHOT_WAIT_MS`.
+    step_wait: Option<Duration>,
+    started: Instant,
+    /// Each 1/fps slot's file name.
+    slots: Vec<String>,
+    steps: Vec<serde_json::Value>,
+    last: Option<image::RgbaImage>,
+    saved: usize,
+    /// PNGs are encoded on other threads; a full queue makes the recording wait.
+    queue: Option<std::sync::mpsc::SyncSender<(std::path::PathBuf, image::RgbaImage)>>,
+    encoders: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl Recorder {
+    fn start(spec: &str) -> Self {
+        let mut parts = spec.split(',').map(str::trim);
+        let dir = std::path::PathBuf::from(parts.next().expect("record:<dir>"));
+        let (mut fps, mut step_wait) = (60., None);
+        for part in parts {
+            if let Some(n) = part.strip_prefix("fps=") {
+                fps = n.parse().expect("fps=<frames a second>");
+            } else if let Some(ms) = part.strip_prefix("ms=") {
+                step_wait = Some(Duration::from_millis(
+                    ms.parse().expect("ms=<milliseconds>"),
+                ));
+            }
+        }
+        std::fs::create_dir_all(&dir).expect("create the recording's directory");
+        let (queue, frames) =
+            std::sync::mpsc::sync_channel::<(std::path::PathBuf, image::RgbaImage)>(8);
+        let frames = Arc::new(std::sync::Mutex::new(frames));
+        let encoders = (0..std::thread::available_parallelism().map_or(4, |n| n.get().min(8)))
+            .map(|_| {
+                let frames = frames.clone();
+                std::thread::spawn(move || {
+                    loop {
+                        let next = frames.lock().expect("the frame queue").recv();
+                        let Ok((path, image)) = next else { break };
+                        save_png(&path, &image);
+                    }
+                })
+            })
+            .collect();
+        Recorder {
+            dir,
+            frame: Duration::from_secs_f64(1. / fps),
+            step_wait,
+            started: Instant::now(),
+            slots: Vec::new(),
+            steps: Vec::new(),
+            last: None,
+            saved: 0,
+            queue: Some(queue),
+            encoders,
+        }
+    }
+
+    /// Notes that `spec` begins at the next slot, with its point when it has one.
+    fn step(&mut self, spec: &str) {
+        let numbers = |at: &str| -> Vec<f32> {
+            at.split(',')
+                .filter_map(|n| n.trim().parse().ok())
+                .collect()
+        };
+        let mut step = serde_json::json!({ "step": spec, "frame": self.slots.len() });
+        for kind in ["click", "hover", "drag"] {
+            if let Some(at) = spec.strip_prefix(kind).and_then(|s| s.strip_prefix(':')) {
+                let n = numbers(at);
+                step["kind"] = kind.into();
+                step["x"] = n[0].into();
+                step["y"] = n[1].into();
+                if kind == "drag" {
+                    step["to"] = serde_json::json!([n[2], n[3]]);
+                }
+            }
+        }
+        self.steps.push(step);
+    }
+
+    /// Lets `wait` pass a frame at a time, drawing and saving each.
+    fn film(&mut self, cx: &mut HeadlessAppContext, handle: AnyWindowHandle, wait: Duration) {
+        let frames = (wait.as_secs_f64() / self.frame.as_secs_f64())
+            .round()
+            .max(1.) as usize;
+        for _ in 0..frames {
+            // Animations read the real clock, so each frame is drawn when its slot comes.
+            let due = self.started + self.frame * self.slots.len() as u32;
+            if let Some(early) = due.checked_duration_since(Instant::now()) {
+                std::thread::sleep(early);
+            }
+            cx.advance_clock(self.frame);
+            cx.run_until_parked();
+            let image = cx
+                .update_window(handle, |_, window, cx| {
+                    // A headless window gets no animation frames, so each is drawn here.
+                    window.refresh();
+                    window.draw(cx).clear(cx);
+                    window.render_to_image()
+                })
+                .expect("draw a frame")
+                .expect("render the window");
+            if self.last.as_ref() != Some(&image) {
+                self.saved += 1;
+                let name = format!("{:05}.png", self.saved);
+                self.queue
+                    .as_ref()
+                    .expect("recording")
+                    .send((self.dir.join(&name), image.clone()))
+                    .expect("queue a frame");
+                self.last = Some(image);
+            }
+            self.slots.push(format!("{:05}.png", self.saved));
+        }
+    }
+
+    /// Waits for the last PNGs and writes `timeline.json`.
+    fn finish(mut self, width: f32, height: f32) {
+        drop(self.queue.take());
+        for encoder in self.encoders.drain(..) {
+            encoder.join().expect("encode the frames");
+        }
+        let timeline = serde_json::json!({
+            "fps": 1. / self.frame.as_secs_f64(),
+            "width": width,
+            "height": height,
+            "frames": self.slots,
+            "steps": self.steps,
+        });
+        let path = self.dir.join("timeline.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&timeline).expect("timeline JSON"),
+        )
+        .expect("write timeline.json");
+        eprintln!(
+            "recorded {} frames ({} saved) in {:.1?}, for {:.1?} of film, to {}",
+            timeline["frames"].as_array().map_or(0, Vec::len),
+            self.saved,
+            self.started.elapsed(),
+            self.frame * timeline["frames"].as_array().map_or(0, Vec::len) as u32,
+            self.dir.display()
+        );
+    }
+}
+
+/// Saves a PNG with fast compression: a film has thousands, and they are read once.
+fn save_png(path: &std::path::Path, image: &image::RgbaImage) {
+    use image::ImageEncoder as _;
+    let file = std::io::BufWriter::new(std::fs::File::create(path).expect("create a frame"));
+    image::codecs::png::PngEncoder::new_with_quality(
+        file,
+        image::codecs::png::CompressionType::Fast,
+        image::codecs::png::FilterType::Adaptive,
+    )
+    .write_image(
+        image.as_raw(),
+        image.width(),
+        image.height(),
+        image::ExtendedColorType::Rgba8,
+    )
+    .expect("write a frame");
+}
+
+/// Lets a step's time pass: filmed while recording, settled otherwise.
+fn rest(
+    cx: &mut HeadlessAppContext,
+    handle: AnyWindowHandle,
+    recorder: &mut Option<Recorder>,
+    wait: Duration,
+) {
+    match recorder {
+        Some(recorder) => recorder.film(cx, handle, wait),
+        None => settle(cx, wait),
+    }
+}
+
+/// How long a recorded `type:` takes over each character.
+const TYPING: Duration = Duration::from_millis(70);
+
+/// Dispatches the action `name` with `data` in the window.
+fn dispatch(
+    cx: &mut HeadlessAppContext,
+    handle: AnyWindowHandle,
+    name: &str,
+    data: Option<serde_json::Value>,
+) {
+    cx.update_window(handle, |_, window, cx| {
+        // With nothing focused an action reaches only global handlers, so give the
+        // workspace focus first, as a click in the window would.
+        if window.focused(cx).is_none()
+            && let Some(workspace) = studio_workspace::workspace_for(window)
+        {
+            let focus = workspace.read(cx).focus_handle(cx);
+            window.focus(&focus, cx);
+        }
+        let action = cx
+            .build_action(name, data)
+            .unwrap_or_else(|error| panic!("unknown action {name}: {error:?}"));
+        window.dispatch_action(action, cx);
+    })
+    .expect("dispatch an action");
+}
+
 fn main() {
     // On Windows the agent panel starts the running executable as the agent's launcher (spec
     // 013); answer that here as Studio's own binary does.
@@ -280,7 +496,31 @@ fn main() {
         .expect("activate the snapshot window");
     settle(&mut cx, wait);
 
+    let mut recorder: Option<Recorder> = None;
     for spec in actions {
+        if let Some(rest) = spec.strip_prefix("record:") {
+            if let Some(done) = recorder.take() {
+                done.finish(width, height);
+            }
+            if rest.trim() != "stop" {
+                // A film shows Studio's motion, which a still would catch halfway.
+                cx.update(|cx| cx.set_reduce_motion(false));
+                let mut started = Recorder::start(rest);
+                started.film(&mut cx, handle, started.frame);
+                recorder = Some(started);
+            } else {
+                cx.update(|cx| cx.set_reduce_motion(true));
+            }
+            continue;
+        }
+        if let Some(recorder) = recorder.as_mut() {
+            recorder.step(&spec);
+        }
+        // A note for the film (a zoom, a caption): the timeline keeps it, the window does not.
+        if spec.starts_with("mark:") {
+            continue;
+        }
+        let step_wait = recorder.as_ref().and_then(|r| r.step_wait).unwrap_or(wait);
         // `measure:<n>` draws n frames, each after the workspace (the window's root view) is
         // notified, as a toast or a hover in the frame would, and prints the draw times;
         // `measure:<n>,refresh` redraws everything each time, cached views included.
@@ -474,8 +714,10 @@ fn main() {
             continue;
         }
         if let Some(ms) = spec.strip_prefix("wait:") {
-            settle(
+            rest(
                 &mut cx,
+                handle,
+                &mut recorder,
                 Duration::from_millis(ms.trim().parse().expect("wait is milliseconds")),
             );
             continue;
@@ -499,7 +741,7 @@ fn main() {
                 );
             })
             .expect("move the pointer");
-            settle(&mut cx, wait);
+            rest(&mut cx, handle, &mut recorder, step_wait);
             continue;
         }
         if let Some(keys) = spec.strip_prefix("key:") {
@@ -512,7 +754,7 @@ fn main() {
                 .expect("press a key");
                 cx.run_until_parked();
             }
-            settle(&mut cx, wait);
+            rest(&mut cx, handle, &mut recorder, step_wait);
             continue;
         }
         if let Some(points) = spec.strip_prefix("drag:") {
@@ -533,7 +775,7 @@ fn main() {
                 point(px(x2), px(y2)),
                 modifiers,
             );
-            settle(&mut cx, wait);
+            rest(&mut cx, handle, &mut recorder, step_wait);
             continue;
         }
         if let Some(at) = spec.strip_prefix("click:") {
@@ -553,7 +795,17 @@ fn main() {
                 MouseButton::Left
             };
             click(&mut cx, handle, point(px(x), px(y)), modifiers, button);
-            settle(&mut cx, wait);
+            rest(&mut cx, handle, &mut recorder, step_wait);
+            continue;
+        }
+        // While recording, text is typed a character at a time, as a person types it.
+        if let (Some(text), Some(film)) = (spec.strip_prefix("type:"), recorder.as_mut()) {
+            for character in text.replace("\\n", "\n").chars() {
+                let data = serde_json::Value::String(character.to_string());
+                dispatch(&mut cx, handle, "editor::HandleInput", Some(data));
+                film.film(&mut cx, handle, TYPING);
+            }
+            rest(&mut cx, handle, &mut recorder, step_wait);
             continue;
         }
         let (name, data) = match spec.strip_prefix("type:") {
@@ -569,22 +821,11 @@ fn main() {
                 None => (spec.clone(), None),
             },
         };
-        cx.update_window(handle, |_, window, cx| {
-            // With nothing focused an action reaches only global handlers, so give the
-            // workspace focus first, as a click in the window would.
-            if window.focused(cx).is_none()
-                && let Some(workspace) = studio_workspace::workspace_for(window)
-            {
-                let focus = workspace.read(cx).focus_handle(cx);
-                window.focus(&focus, cx);
-            }
-            let action = cx
-                .build_action(&name, data)
-                .unwrap_or_else(|error| panic!("unknown action {name}: {error:?}"));
-            window.dispatch_action(action, cx);
-        })
-        .expect("dispatch an action");
-        settle(&mut cx, wait);
+        dispatch(&mut cx, handle, &name, data);
+        rest(&mut cx, handle, &mut recorder, step_wait);
+    }
+    if let Some(done) = recorder.take() {
+        done.finish(width, height);
     }
 
     let image = cx.capture_screenshot(handle).expect("render the window");
