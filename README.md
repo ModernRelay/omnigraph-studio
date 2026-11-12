@@ -28,11 +28,10 @@ Studio reaches your graphs through the `omnigraph` CLI, so install it first:
 curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install.sh | bash
 ```
 
-Then open a graph from the terminal:
+`omnigraph target list` shows the servers the CLI knows. Open one of their graphs in Studio:
 
 ```bash
-omnigraph target list                              # the servers the CLI knows
-omnigraph studio --target <server> --graph <graph> # opens that graph in Studio
+omnigraph studio --target <server> --graph <graph>
 ```
 
 `omnigraph studio` (CLI 0.15 or later) launches Studio through an `omnigraph-studio://` link.
