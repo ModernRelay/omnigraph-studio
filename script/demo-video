@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# Make the README's demo video: Studio recorded offscreen against the development graph, then
+# framed by Remotion (demo/) as a window on a desktop, with a pointer and zooms.
+#
+#   script/dev-server &        # once, in another shell
+#   script/demo-video          # records, renders, and writes the outputs below
+#   script/demo-video --render # renders again from the last recording (demo/public/film)
+#
+# Writes demo/out/demo.mp4 (H.264, for uploading), docs/images/demo-poster.png and
+# docs/images/demo.gif (the README's fallback, under 5 MB).
+#
+# The story is demo/story.steps (docs/demo-video.md says how to change it). The branch it
+# switches to, q4-hires, is made on the development graph the first time, and left as it is
+# after that. Nothing is merged.
+#
+# Needs Node 20 or later and npm. Remotion is free for individuals and for companies of up to
+# three people; others need a company licence (demo/README.md).
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+DEMO=$ROOT/demo
+FILM=$DEMO/public/film
+export OMNIGRAPH_STUDIO_SERVER=${OMNIGRAPH_STUDIO_SERVER:-http://127.0.0.1:8787}
+export OMNIGRAPH_STUDIO_TOKEN=${OMNIGRAPH_STUDIO_TOKEN:-dev-token}
+export OMNIGRAPH_STUDIO_GRAPH=knowledge
+GRAPH_URL=$OMNIGRAPH_STUDIO_SERVER/graphs/$OMNIGRAPH_STUDIO_GRAPH
+
+record=1
+if [[ "${1:-}" == "--render" ]]; then
+  record=0
+  [[ -f "$FILM/timeline.json" ]] || { echo "no recording in $FILM; run script/demo-video first" >&2; exit 1; }
+fi
+
+if ((record)); then
+  if ! curl -sf -o /dev/null "$OMNIGRAPH_STUDIO_SERVER/healthz"; then
+    echo "no server at $OMNIGRAPH_STUDIO_SERVER; start script/dev-server first" >&2
+    exit 1
+  fi
+
+  # The branch the story switches to: two people added, three titles changed, one person removed.
+  # Made once; a branch already there is used as it is.
+  api() {
+    curl -sf -X "$1" -H "Authorization: Bearer $OMNIGRAPH_STUDIO_TOKEN" -H 'Omnigraph-Http-Api: 0.14' \
+      -H 'Content-Type: application/json' "$GRAPH_URL/$2" ${3:+-d "$3"}
+  }
+  if ! api GET branches | grep -q '"q4-hires"'; then
+    echo "Making the q4-hires branch on $GRAPH_URL"
+    api POST branches '{"name":"q4-hires"}' > /dev/null
+    mutate() {
+      api POST mutate "$(python3 -c 'import json, sys; print(json.dumps({"branch": "q4-hires", "query": sys.argv[1], "params": json.loads(sys.argv[2])}))' "$1" "$2")" > /dev/null
+    }
+    ADD='query add($slug: String, $name: String, $title: String, $email: String) { insert Person { slug: $slug, name: $name, title: $title, email: $email } }'
+    HIRE='query hire($p: String, $c: String, $role: String) { insert WorksAt { from: $p, to: $c, role: $role } }'
+    PROMOTE='query promote($slug: String, $t: String) { update Person set { title: $t } where slug = $slug }'
+    mutate "$ADD" '{"slug":"person-0000035","name":"Ada Hopper","title":"Engineer","email":"ada.hopper@example.com"}'
+    mutate "$ADD" '{"slug":"person-0000115","name":"Alan Lamport","title":"Researcher","email":"alan.lamport@example.com"}'
+    mutate "$HIRE" '{"p":"person-0000035","c":"company-00003","role":"lead"}'
+    mutate "$HIRE" '{"p":"person-0000115","c":"company-00003","role":"member"}'
+    mutate "$PROMOTE" '{"slug":"person-000009","t":"CTO"}'
+    mutate "$PROMOTE" '{"slug":"person-000002","t":"Design Lead"}'
+    mutate "$PROMOTE" '{"slug":"person-000016","t":"Data Scientist"}'
+    mutate 'query drop($slug: String) { delete Person where slug = $slug }' '{"slug":"person-000018"}'
+  fi
+
+  cargo build --quiet --profile release-fast -p studio --example snapshot --manifest-path "$ROOT/Cargo.toml"
+  SNAPSHOT="${CARGO_TARGET_DIR:-$ROOT/target}/release-fast/examples/snapshot"
+
+  # A fresh data directory without the status bar's memory and CPU, and an empty operator home,
+  # so the window shows the development graph alone (script/measure-frames).
+  work=$(mktemp -d)
+  trap 'rm -rf "$work"' EXIT
+  mkdir -p "$work/data" "$work/omnigraph-home"
+  echo '{"studio": {"show_performance": false}}' > "$work/data/settings.json"
+  export OMNIGRAPH_STUDIO_DATA=$work/data OMNIGRAPH_HOME=$work/omnigraph-home
+  export SNAPSHOT_WAIT_MS=2000 SNAPSHOT_SIZE=1440x900
+
+  # The story: one step a line, comments and blank lines skipped, {film} the recording's folder.
+  steps=()
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "${line//[[:space:]]/}" || "$line" =~ ^[[:space:]]*# ]] && continue
+    steps+=("${line//\{film\}/$FILM}")
+  done < "$DEMO/story.steps"
+  rm -rf "$FILM"
+  "$SNAPSHOT" "$work/last.png" "${steps[@]}" 2>&1 | grep -v '^snapshot data' >&2
+fi
+
+cd "$DEMO"
+if [[ ! -d node_modules ]] || [[ package-lock.json -nt node_modules ]]; then
+  npm ci --no-audit --no-fund
+fi
+mkdir -p out
+# One bundle for both renders: a bundle copies public/, which holds the film's frames.
+npx remotion bundle src/index.ts --out-dir build --log=warn
+npx remotion render build Demo out/demo.mp4 --codec=h264 --crf=16 --x264-preset=slow \
+  --pixel-format=yuv420p --color-space=bt709 --concurrency=50% --log=warn
+npx remotion still build Poster "$ROOT/docs/images/demo-poster.png" --log=warn
+
+# The fallback GIF, from the MP4 with Remotion's own FFmpeg (which has no fps filter, so the
+# rate is the output's): 10 frames a second, 800 pixels wide, one 64-colour palette for the
+# whole film, and only what changed between frames redrawn. The camera's moves change every
+# pixel, so more of any of these goes over 5 MB.
+gif=$ROOT/docs/images/demo.gif
+npx remotion ffmpeg -v error -y -i out/demo.mp4 \
+  -r 10 -vf "scale=800:-1:flags=lanczos,split[a][b];[a]palettegen=max_colors=64:stats_mode=diff[p];[b][p]paletteuse=dither=none:diff_mode=rectangle" \
+  -loop 0 "$gif"
+size=$(wc -c < "$gif")
+echo "Wrote demo/out/demo.mp4, docs/images/demo-poster.png and docs/images/demo.gif ($((size / 1024)) KB)."
+if ((size > 5 * 1024 * 1024)); then
+  echo "demo.gif is over 5 MB; GitHub shows it, but slowly" >&2
+fi
+cat <<'EOF'
+
+GitHub plays a video inline only from a user-attachments URL. To get one, drag demo/out/demo.mp4
+into a comment box on any issue or pull request of this repository (no need to post it), wait for
+the upload, and copy the https://github.com/user-attachments/assets/... line it writes. Put that
+line on its own in README.md, where GitHub draws it as a player.
+EOF

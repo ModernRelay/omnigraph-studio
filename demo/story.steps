@@ -1,0 +1,76 @@
+# The README demo's story: the snapshot tool's steps (crates/studio/examples/snapshot.rs), one
+# a line, run in order against the development graph by script/demo-video. Blank lines and
+# lines starting with # are skipped; {film} is where the recording goes.
+#
+# Points are in window coordinates (1440x900). Steps that only the film reads:
+#   mark:zoom=<scale>,<x>,<y>   the camera eases to that scale around that point
+#   mark:zoom=1                 back to the whole window
+#   mark:caption=<text>         the line under the window (empty to hide it)
+#   mark:poster                 the poster is the film at this moment
+# While recording, each step is given 700 ms (`ms=`), `wait:<ms>` holds longer, and `type:`
+# types a character at a time. The pointer's glide to a click or hover is added by the film.
+
+studio_graph::OpenType={"type_name":"Person"}
+record:{film},fps=60,ms=700
+
+# 1. The table, then a branch: its table shows the added, changed and removed rows inline.
+mark:caption=Switch to a branch: its table shows what it adds, changes and removes
+wait:1000
+key:cmd-shift-b
+type:q4-hires
+wait:400
+key:enter
+mark:poster
+mark:zoom=1.4,720,380
+wait:2600
+mark:zoom=1
+
+# 2. Open a person from the table as a page.
+mark:caption=Open a person from the table as a page
+mark:zoom=1.45,480,400
+hover:495,475
+wait:300
+click:495,475
+key:cmd-enter
+wait:1400
+mark:zoom=1
+
+# 3. Explore their relationships on the canvas and in the tree.
+mark:caption=Explore their relationships on the canvas and in the tree
+click:407,87
+wait:400
+mark:zoom=1.35,860,467
+click:1025,445
+click:692,467
+click:1014,489
+wait:900
+mark:zoom=1
+click:353,87
+wait:1600
+
+# 4. Catch a typo in a query before it runs.
+mark:caption=Catch a typo in a query before it runs
+studio_graph::NewQueryWithText={"text":"query london_founders() {\n    match {\n        $p: Person { title: \"Founder\" }\n        $p worksAt $c\n        $c: Company { city: \"London\" }\n    }\n    return { $p.name, $p.email, $c.nme as company }\n}"}
+wait:500
+mark:zoom=1.7,640,320
+hover:655,289
+wait:1400
+click:652,289
+type:a
+wait:700
+mark:zoom=1
+click:1381,87
+wait:1800
+
+# 5. Review the branch's changes before the merge (nothing is merged).
+mark:caption=Review the changes before the merge
+key:cmd-shift-r
+wait:900
+click:366,369
+wait:900
+mark:zoom=1.5,1100,700
+hover:1327,847
+wait:2200
+mark:zoom=1
+wait:1500
+record:stop

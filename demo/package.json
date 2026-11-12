@@ -1,0 +1,21 @@
+{
+  "name": "omnigraph-studio-demo",
+  "private": true,
+  "description": "The README's demo video: Studio's recorded frames framed as a window on a desktop, with a pointer and zooms (script/demo-video)",
+  "license": "GPL-3.0-or-later",
+  "type": "module",
+  "scripts": {
+    "studio": "remotion studio src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@remotion/cli": "4.0.543",
+    "react": "19.2.9",
+    "react-dom": "19.2.9",
+    "remotion": "4.0.543"
+  },
+  "devDependencies": {
+    "@types/react": "19.2.18",
+    "typescript": "5.9.3"
+  }
+}
