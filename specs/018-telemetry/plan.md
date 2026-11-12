@@ -75,7 +75,7 @@ variable turns all of it off.
 | Report | Setting | Default | What it is for |
 |---|---|---|---|
 | Crash reports | `studio.telemetry.crash_reports`: `"ask"`, `"always"` or `"never"` | `"ask"` | Finding and fixing crashes |
-| Usage events and performance summaries | `studio.telemetry.usage`: `true` or `false` | `false` | Which features are used, and how fast Studio is on real graphs |
+| Usage events and performance summaries | `studio.telemetry.usage`: `anonymous`, `with_install_id` or `off` | `anonymous` (since 2026-11-12) | Which features are used, and how fast Studio is on real graphs |
 
 Nothing is sent, whatever the settings say, when:
 
@@ -144,8 +144,11 @@ its row in `docs/telemetry.md`.
 | `agent_turn_finished` | outcome (`done`, `stopped`, `failed`), duration bucket, tool calls bucket |
 | `update` | step (`found`, `downloaded`, `installed`, `failed`) |
 
-The install ID is a random UUID (version 4) written to `telemetry/install-id` when usage is
-first turned on, deleted when it is turned off, and replaced by **Reset ID**. Nothing ties it to
+Usage events go under a random ID made at each start and never written down, so one run of
+Studio cannot be tied to the next (since 2026-11-12). Only a person who chooses to be counted
+across runs (`with_install_id`) has an install ID: a random UUID (version 4) written to
+`telemetry/install-id` when that is chosen, deleted when it is not, and replaced by **Reset
+ID**. Nothing ties it to
 an account, a machine or a server, including a managed sign-in. The session ID is a new random
 UUID version 7 each start, kept in memory, and a new one after 24 hours of running: PostHog
 counts a custom session ID only when it is a UUIDv7 whose time plus 24 hours is after the
@@ -221,12 +224,13 @@ summary once it is checked what GPUI exposes about a frame (Open questions).
 
 ### What the person sees
 
-- First start of a release build with no `studio.telemetry.usage` in the settings: one status bar
-  item, "Usage data: not shared · Choose…". It opens a popover: "Send anonymous usage data to
-  help improve Studio?", a line on what that is and is not ("Which features you use and how fast
-  they are; never names, queries, values or server addresses"), **Share**, **Don't share** and
-  **What Studio sends** (`docs/telemetry.md`). The item goes once either is chosen; until then
-  nothing is recorded.
+- A release build tells of anonymous usage data from its first start (since 2026-11-12): one
+  status bar item, "Anonymous usage data is on · Change…", until the person answers it. It
+  opens a popover: "Studio sends anonymous usage data", a line on what that is and is not
+  (which features are used and how fast; never names, queries, values or server addresses, and
+  nothing that ties one run to the next), **Keep it on**, **Count my runs** (the install ID),
+  **Turn off** and **What Studio sends** (`docs/telemetry.md`). Any answer sets the choice and
+  the item goes for good (`telemetry/usage-notice-seen`); turning usage off also removes it.
 - Settings, "Privacy": the crash reports choice (Ask each time, Always send, Never send), Share
   usage data, Reset ID, View Telemetry Log, What Studio sends.
 
@@ -284,7 +288,7 @@ What step 1 changed from the design above:
 | Decision | Rejected alternatives | Why |
 |---|---|---|
 | A closed, typed catalog with no free text | Zed's `FlexibleEvent` (a name and any JSON); an analytics SDK's `capture(name, properties)` | Free text is how a branch name or an error message carrying a value leaks; a type that cannot hold one cannot leak one, and a test can prove it |
-| Usage off until chosen; crash reports asked for each time | Usage on unless turned off | Studio shows private graphs to people who never agreed to share anything; asking once costs one status bar item |
+| Anonymous usage on by default, an install ID only by choice; crash reports asked for each time | Usage off until chosen (the decision until 2026-11-12); usage with an install ID on by default | Decided 2026-11-12 by Ragnor: opt-in left Studio blind to how it is used. Without an install ID nothing ties one run to the next, which keeps the events far from personal data under the GDPR and the ePrivacy rule on storing an ID on a person's machine; retention, which needs an ID, is counted from those who opt in. Crash reports stay asked for: they carry more of what the person was doing |
 | One status bar item, not a dialog at first start | A first-run dialog | Constitution VII: a start that asks a question before showing anything is loud for a choice that can wait |
 | PostHog for usage, summaries and crash reports | A crash tracker beside it (Sentry); a store of Studio's own | Chosen 2026-10-29. One API for all three: events and `$exception` events through the same capture endpoint; anonymous events need no person profile; client IP data discarded by a project setting |
 | PostHog US Cloud (`us.i.posthog.com`) | EU Cloud; self-hosted | Chosen 2026-11-11. ModernRelay and most of Studio's people are in the US; the reports hold no graph content, no IP and no person profile, so the gap EU hosting would close is small. PostHog takes part in the EU-U.S. Data Privacy Framework and its DPA adds Standard Contractual Clauses, so EU users are covered; the region cannot be changed later without a migration |
@@ -342,6 +346,7 @@ What step 1 changed from the design above:
 | 2026-10-29 | An installed build is told from a development build | `studio_settings::is_release_build` and its test `only_an_installed_build_is_a_release_build` | A build directory, a test binary or a bundle under `target/` is not a release build |
 | 2026-11-11 | PostHog US Cloud takes the reports as designed, and the 2026-10-29 row holds for it | PostHog's documentation read whole for US Cloud (the `.md` of each page): capture (`/docs/api/capture`), API (`/docs/api`), anonymous events, sessions (`/docs/data/sessions`), timestamps, ingestion warnings, data collection, data storage, GDPR compliance (`/docs/privacy/gdpr-compliance`), transformations, events retention, projects settings, error tracking (manual capture, fingerprints, Rust), the Rust SDK reference, pricing, the DPA | `/batch/` on `us.i.posthog.com`, body under 20 MB, events under 1 MB, gzip; no request rate limit, 200 does not mean ingested; a US organization's projects capture IP until set by hand; GeoIP enrichment is on by default and survives discarding the IP; transformations skip exceptions; a custom session ID must be a UUIDv7; Free keeps events 1 year, unchangeable; moving regions is a migration on top plans only. Three claims corrected (Corrections) |
 | 2026-11-11 | Step 1 records, keeps and sends as designed | `studio_telemetry` (21 tests): `no_report_field_holds_free_text`, `docs_telemetry_md_matches_the_catalog`, `nothing_is_recorded_until_usage_is_shared`, `a_shared_event_is_sent_anonymously_and_logged` (gzipped batch, `api_key`, `sent_at`, `$process_person_profile: false`, `$geoip_disable: true`), `a_server_error_is_retried_and_a_refusal_is_not`, `turning_usage_off_deletes_its_reports_and_the_id`, `a_crash_report_waits_for_an_answer_then_goes_as_an_exception`, `never_sending_crash_reports_deletes_them`, `a_blocked_build_sends_nothing`, the backtrace, home-folder and `.ips` tests; the workspace's tests and clippy | Pass. Not yet sent to a real PostHog project: none exists yet, and its IP and GeoIP settings are still to be set by hand (Open question 7 waits on it) |
+| 2026-11-12 | Usage is anonymous by default and an install ID exists only when chosen | `studio_telemetry`: `usage_is_anonymous_by_default` (sent under a run's own ID, no install ID kept, the notice gone once answered), `a_shared_event_is_sent_anonymously_and_logged` (with the install ID chosen, under it), `turning_usage_off_deletes_its_reports_and_the_id`; the workspace's tests | Pass |
 
 ## Corrections
 

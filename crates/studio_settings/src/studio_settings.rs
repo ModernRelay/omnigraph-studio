@@ -213,9 +213,10 @@ pub struct TelemetryOptions {
     /// it.
     #[schemars(title = "Crash reports")]
     pub crash_reports: CrashReports,
-    /// Which features are used and how fast Studio is, never what they were used on. Until it
-    /// is chosen, nothing is recorded.
-    #[schemars(title = "Share usage data")]
+    /// Which features are used and how fast Studio is, never what they were used on. Anonymous
+    /// by default: each run of Studio is a stranger to the next, unless you choose to be counted
+    /// across runs with a random install ID.
+    #[schemars(title = "Usage data")]
     pub usage: UsageSharing,
 }
 
@@ -232,17 +233,17 @@ pub enum CrashReports {
     Never,
 }
 
-/// Whether Studio shares anonymous usage data (spec 018): not until the person chooses.
+/// How Studio shares usage data (spec 018): anonymously unless the person chooses otherwise.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum UsageSharing {
-    /// Not chosen yet: nothing is recorded, and the status bar asks.
+    /// Share anonymous usage data and a daily performance summary, tied to one run of Studio.
     #[default]
-    NotChosen,
-    /// Share anonymous usage data and a daily performance summary.
-    Share,
+    Anonymous,
+    /// Share them with a random install ID, so your runs are counted as one person's.
+    WithInstallId,
     /// Share nothing.
-    DontShare,
+    Off,
 }
 
 impl Default for StudioOptions {

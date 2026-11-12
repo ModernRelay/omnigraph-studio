@@ -2,7 +2,7 @@
 
 # What Omnigraph Studio sends
 
-Studio sends nothing unless you say so (spec 018). Crash reports are asked for at the next start, and usage data is off until you choose to share it. Nothing is sent from a development build, or while `DO_NOT_TRACK` or `OMNIGRAPH_STUDIO_TELEMETRY=0` is set. Change either choice under Settings, Privacy.
+Studio sends anonymous usage data unless you turn it off (spec 018): which features are used and how fast they are, tied to one run of Studio and nothing else. You can choose to be counted across runs with a random install ID. Crash reports are shown to you and sent only when you say so. Nothing is sent from a development build, or while `DO_NOT_TRACK` or `OMNIGRAPH_STUDIO_TELEMETRY=0` is set. Change either choice under Settings, Privacy, or from the status bar's notice.
 
 No report holds a graph, type, property, branch, query or file name, a server address, an account or token, query text, a value, a row, an error message or your IP address. Reports go to PostHog US Cloud, which is told to discard the IP address a request comes from and to add no location.
 
@@ -15,7 +15,7 @@ No report holds a graph, type, property, branch, query or file name, a server ad
 | `os_version` | the system's major version, or `unknown` |
 | `arch` | `aarch64` or `x86_64` |
 
-Usage events also carry a random install ID, made when you turn usage on, deleted when you turn it off and replaced by Reset ID, and a random session ID made at each start. Crash reports carry neither: each has a random ID of its own.
+Usage events go under a random ID made at each start and never written down, or, if you chose to be counted across runs, under a random install ID, deleted when you turn that off and replaced by Reset ID. They also carry a random session ID. Crash reports carry neither: each has a random ID of its own.
 
 ## Usage events
 

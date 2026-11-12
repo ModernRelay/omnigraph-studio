@@ -124,29 +124,37 @@ fn the_environment_can_turn_telemetry_off() {
     );
 }
 
-/// Until the person chooses, nothing is recorded or sent, and the status bar asks.
+/// By default usage data is on and anonymous: events go under an ID for this run alone, no
+/// install ID is kept, and the status bar tells of it until the notice is answered.
 #[gpui::test]
-fn nothing_is_recorded_until_usage_is_shared(cx: &mut TestAppContext) {
+fn usage_is_anonymous_by_default(cx: &mut TestAppContext) {
     let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let (http, sent) = http(&[]);
+    let (http, sent) = http(&[200]);
     let (_dir, telemetry) = start(cx, None, http);
     assert!(cx.update(|cx| telemetry.read(cx).asks_about_usage(cx)));
     record(query());
     wait_a_minute(cx);
-    assert!(telemetry.read_with(cx, |t, _| t.store().pending().is_empty()));
-    assert!(sent.bodies.lock().unwrap().is_empty());
+    let bodies = sent.bodies.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 1);
+    let event = &bodies[0]["batch"][0];
+    assert_eq!(event["event"], "query_ran");
     assert!(!telemetry.read_with(cx, |t, _| t.store().has_install_id()));
+    let run_id = event["distinct_id"].as_str().unwrap().to_owned();
+    assert!(uuid::Uuid::parse_str(&run_id).is_ok());
+    // The notice answered, the status bar says no more.
+    telemetry.update(cx, |t, cx| t.notice_seen(cx));
+    assert!(!cx.update(|cx| telemetry.read(cx).asks_about_usage(cx)));
 }
 
-/// Shared, an event is written down within a minute and sent as PostHog's batch: anonymous,
-/// with no location, under the install ID; once received it moves to the sent log.
+/// Counted across runs, an event is written down within a minute and sent as PostHog's batch:
+/// with no person profile and no location, under the install ID; once received it moves to the
+/// sent log.
 #[gpui::test]
 fn a_shared_event_is_sent_anonymously_and_logged(cx: &mut TestAppContext) {
     let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let (http, sent) = http(&[200]);
     let (_dir, telemetry) = start(cx, None, http);
-    set(cx, UsageSharing::Share, CrashReports::Ask);
-    assert!(!cx.update(|cx| telemetry.read(cx).asks_about_usage(cx)));
+    set(cx, UsageSharing::WithInstallId, CrashReports::Ask);
     record(query());
     wait_a_minute(cx);
     let bodies = sent.bodies.lock().unwrap().clone();
@@ -173,7 +181,7 @@ fn a_server_error_is_retried_and_a_refusal_is_not(cx: &mut TestAppContext) {
     let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let (http, sent) = http(&[503, 400]);
     let (_dir, telemetry) = start(cx, None, http);
-    set(cx, UsageSharing::Share, CrashReports::Ask);
+    set(cx, UsageSharing::WithInstallId, CrashReports::Ask);
     record(query());
     wait_a_minute(cx);
     assert_eq!(sent.bodies.lock().unwrap().len(), 1);
@@ -195,11 +203,11 @@ fn turning_usage_off_deletes_its_reports_and_the_id(cx: &mut TestAppContext) {
     let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let (http, _sent) = http(&[503]);
     let (_dir, telemetry) = start(cx, None, http);
-    set(cx, UsageSharing::Share, CrashReports::Ask);
+    set(cx, UsageSharing::WithInstallId, CrashReports::Ask);
     record(query());
     wait_a_minute(cx);
     assert_eq!(telemetry.read_with(cx, |t, _| t.store().pending().len()), 1);
-    set(cx, UsageSharing::DontShare, CrashReports::Ask);
+    set(cx, UsageSharing::Off, CrashReports::Ask);
     telemetry.read_with(cx, |t, _| {
         assert!(t.store().pending().is_empty());
         assert!(!t.store().has_install_id());
@@ -263,7 +271,7 @@ fn never_sending_crash_reports_deletes_them(cx: &mut TestAppContext) {
     let (_dir, telemetry) = start(cx, None, http);
     let store = telemetry.read_with(cx, |t, _| t.store().clone());
     a_crash(&store);
-    set(cx, UsageSharing::NotChosen, CrashReports::Never);
+    set(cx, UsageSharing::Off, CrashReports::Never);
     assert!(telemetry.read_with(cx, |t, _| t.store().crashes().is_empty()));
     assert!(sent.bodies.lock().unwrap().is_empty());
 }
@@ -276,7 +284,7 @@ fn a_blocked_build_sends_nothing(cx: &mut TestAppContext) {
     let (http, sent) = http(&[]);
     let (_dir, telemetry) = start(cx, Some(Blocked::DevelopmentBuild), http);
     assert!(!cx.update(|cx| telemetry.read(cx).asks_about_usage(cx)));
-    set(cx, UsageSharing::Share, CrashReports::Always);
+    set(cx, UsageSharing::WithInstallId, CrashReports::Always);
     record(query());
     wait_a_minute(cx);
     cx.executor().advance_clock(SEND_EVERY);

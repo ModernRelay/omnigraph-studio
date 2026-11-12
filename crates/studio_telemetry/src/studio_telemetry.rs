@@ -213,6 +213,8 @@ pub struct Telemetry {
     context: ReportContext,
     http: Arc<dyn HttpClient>,
     session: (String, Instant),
+    /// The ID anonymous usage events go under: random, for this run alone.
+    run_id: String,
     /// Crash reports waiting for the person's answer (crash reports set to ask).
     waiting: Vec<(PathBuf, CrashReport)>,
     first_start_of_version: bool,
@@ -237,9 +239,29 @@ impl Telemetry {
         self.blocked
     }
 
-    /// Whether the person still has to choose about usage data: the status bar asks.
+    /// Whether the status bar still tells of usage data: until the person has seen the notice
+    /// and answered it, or turned usage data off.
     pub fn asks_about_usage(&self, cx: &App) -> bool {
-        self.blocked.is_none() && settings(cx).usage == UsageSharing::NotChosen
+        self.blocked.is_none()
+            && settings(cx).usage != UsageSharing::Off
+            && self.store.read_marker("usage-notice-seen").is_none()
+    }
+
+    /// The notice was answered: the status bar no longer shows it.
+    pub fn notice_seen(&mut self, cx: &mut Context<Self>) {
+        self.store
+            .write_marker("usage-notice-seen", &store::now_text(Utc::now()));
+        cx.notify();
+    }
+
+    /// The ID usage events go under: the install ID when the person chose to be counted across
+    /// runs, otherwise a random one for this run alone, never written down.
+    fn distinct_id(&self, cx: &App) -> String {
+        if settings(cx).usage == UsageSharing::WithInstallId {
+            self.store.install_id()
+        } else {
+            self.run_id.clone()
+        }
     }
 
     /// The crash reports waiting for an answer.
@@ -320,19 +342,21 @@ impl Telemetry {
     /// Follows the settings: the switches, and what a switch turned off deletes at once.
     fn follow_settings(&mut self, cx: &mut Context<Self>) {
         let options = settings(cx);
-        let usage = self.blocked.is_none() && options.usage == UsageSharing::Share;
+        let usage = self.blocked.is_none() && options.usage != UsageSharing::Off;
         let was = USAGE_ON.swap(usage, Ordering::SeqCst);
-        if usage && !was {
+        // The install ID exists only while the person chose it.
+        if usage && options.usage == UsageSharing::WithInstallId {
             self.store.install_id();
-            if self.store.read_marker("summary-sent").is_none() {
-                self.store
-                    .write_marker("summary-sent", &store::now_text(Utc::now()));
-            }
+        } else {
+            self.store.delete_install_id();
+        }
+        if usage && !was && self.store.read_marker("summary-sent").is_none() {
+            self.store
+                .write_marker("summary-sent", &store::now_text(Utc::now()));
         }
         if !usage {
             with_recorded(|recorded| *recorded = Recorded::default());
             self.store.retain_pending(is_exception);
-            self.store.delete_install_id();
             self.store.remove_marker("summary-sent");
         }
         let crash = match (self.blocked, options.crash_reports) {
@@ -354,7 +378,7 @@ impl Telemetry {
     }
 
     /// Writes down what was recorded: the queue, and the day's summary once a day.
-    fn write_down(&mut self) {
+    fn write_down(&mut self, cx: &App) {
         if self.blocked.is_some() {
             return;
         }
@@ -373,7 +397,7 @@ impl Telemetry {
         if !USAGE_ON.load(Ordering::SeqCst) {
             return;
         }
-        let install = self.store.install_id();
+        let install = self.distinct_id(cx);
         let session = self.session_id();
         let mut events: Vec<Value> = taken
             .events
@@ -407,7 +431,7 @@ impl Telemetry {
 
     /// Writes down and, when it is time, sends one batch.
     fn tick(&mut self, cx: &mut Context<Self>) {
-        self.write_down();
+        self.write_down(cx);
         // The executor's clock, which a test can move.
         let now = cx.background_executor().now();
         let due = self
@@ -576,6 +600,7 @@ pub fn init_with(options: Options, http: Arc<dyn HttpClient>, cx: &mut App) {
             context: options.context,
             http,
             session: (uuid::Uuid::now_v7().to_string(), Instant::now()),
+            run_id: uuid::Uuid::new_v4().to_string(),
             first_start_of_version,
             started: Instant::now(),
             last_sent: None,
@@ -610,7 +635,7 @@ pub fn init_with(options: Options, http: Arc<dyn HttpClient>, cx: &mut App) {
     let quitting = telemetry.downgrade();
     cx.on_app_quit(move |cx| {
         if let Some(telemetry) = quitting.upgrade() {
-            telemetry.update(cx, |telemetry, _| telemetry.write_down());
+            telemetry.update(cx, |telemetry, cx| telemetry.write_down(cx));
         }
         async {}
     })

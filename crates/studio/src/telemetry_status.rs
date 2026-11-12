@@ -26,14 +26,8 @@ pub(crate) fn offers_a_crash_report(telemetry: &Entity<Telemetry>, cx: &App) -> 
     !telemetry.read(cx).waiting_crashes().is_empty()
 }
 
-pub(crate) fn choose_usage(share: bool, cx: &mut App) {
-    studio_settings::update(cx, |settings| {
-        settings.studio.telemetry.usage = if share {
-            UsageSharing::Share
-        } else {
-            UsageSharing::DontShare
-        };
-    });
+pub(crate) fn choose_usage(usage: UsageSharing, cx: &mut App) {
+    studio_settings::update(cx, |settings| settings.studio.telemetry.usage = usage);
 }
 
 /// The usage item: drawn again when telemetry or the settings change.
@@ -62,28 +56,44 @@ impl Render for UsageStatus {
             .flex_none()
             .gap(px(space::XS))
             .items_center()
-            .child(studio_ui::ds::text::meta("Usage data: not shared").single_line())
+            .child(studio_ui::ds::text::meta("Anonymous usage data is on").single_line())
             .child(
                 PopoverMenu::new("usage-choice")
                     .anchor(gpui::Anchor::BottomRight)
                     .attach(gpui::Anchor::TopRight)
-                    .trigger(studio_ui::ds::button("usage-choose", "Choose…"))
-                    .menu(|_, cx| Some(cx.new(UsagePopover::new))),
+                    .trigger(studio_ui::ds::button("usage-choose", "Change…"))
+                    .menu({
+                        let telemetry = self.telemetry.clone();
+                        move |_, cx| {
+                            let telemetry = telemetry.clone();
+                            Some(cx.new(|cx| UsagePopover::new(telemetry, cx)))
+                        }
+                    }),
             )
             .into_any_element()
     }
 }
 
-/// "Send anonymous usage data to help improve Studio?"
+/// "Studio sends anonymous usage data": keep it, turn it off, or be counted across runs.
 pub(crate) struct UsagePopover {
+    telemetry: Entity<Telemetry>,
     focus: FocusHandle,
 }
 
 impl UsagePopover {
-    fn new(cx: &mut Context<Self>) -> Self {
+    fn new(telemetry: Entity<Telemetry>, cx: &mut Context<Self>) -> Self {
         Self {
+            telemetry,
             focus: cx.focus_handle(),
         }
+    }
+
+    /// Sets the choice, and the notice goes.
+    fn answer(&mut self, usage: UsageSharing, cx: &mut Context<Self>) {
+        choose_usage(usage, cx);
+        self.telemetry
+            .update(cx, |telemetry, cx| telemetry.notice_seen(cx));
+        cx.emit(DismissEvent);
     }
 }
 
@@ -99,29 +109,32 @@ impl Render for UsagePopover {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         popover(&self.focus, cx)
             .child(studio_ui::ds::text::heading(
-                "Send anonymous usage data to help improve Studio?",
+                "Studio sends anonymous usage data",
             ))
             .child(studio_ui::ds::text::muted(
-                "Which features you use and how fast they are; never names, queries, values or \
-                 server addresses. Change it any time in Settings, Privacy.",
+                "Which features are used and how fast they are, to improve Studio; never names, \
+                 queries, values or server addresses, and nothing that ties one run of Studio to \
+                 the next. You can also be counted across runs with a random install ID, which \
+                 helps us see whether people keep using Studio.",
             ))
             .child(
                 h_flex()
                     .gap(px(space::SM))
                     .child(
-                        studio_ui::ds::button("usage-share", "Share")
+                        studio_ui::ds::button("usage-keep", "Keep it on")
                             .style(ButtonStyle::Filled)
-                            .on_click(cx.listener(|_, _, _, cx| {
-                                choose_usage(true, cx);
-                                cx.emit(DismissEvent);
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.answer(UsageSharing::Anonymous, cx)
                             })),
                     )
-                    .child(studio_ui::ds::button("usage-dont", "Don't share").on_click(
-                        cx.listener(|_, _, _, cx| {
-                            choose_usage(false, cx);
-                            cx.emit(DismissEvent);
-                        }),
+                    .child(studio_ui::ds::button("usage-id", "Count my runs").on_click(
+                        cx.listener(|this, _, _, cx| this.answer(UsageSharing::WithInstallId, cx)),
                     ))
+                    .child(
+                        studio_ui::ds::button("usage-off", "Turn off").on_click(
+                            cx.listener(|this, _, _, cx| this.answer(UsageSharing::Off, cx)),
+                        ),
+                    )
                     .child(div().flex_1())
                     .child(
                         studio_ui::ds::button("usage-what", "What Studio sends")
