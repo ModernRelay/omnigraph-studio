@@ -15,12 +15,26 @@ GPU, through Metal on macOS and Vulkan (wgpu) on Linux; there is no web view or 
 ## Download
 
 [Releases](https://github.com/ModernRelay/omnigraph-studio/releases) have a macOS DMG (Apple
-silicon), Linux tarballs (x86_64, arm64) and a Windows zip (x86_64, Windows 10 1809 or later).
-From 0.4.1 the macOS app is signed with a Developer ID of team `6XQX9HAB25` (EQTR INC) and
-notarized; the Windows build is not signed yet, and its release notes say how to open it. The
-newest release's files are also at version-free names,
-`https://github.com/ModernRelay/omnigraph-studio/releases/latest/download/Omnigraph-Studio-arm64.dmg`
-for macOS. To build from source instead, see below.
+silicon), Linux tarballs (x86_64, arm64), and for Windows (x86_64, Windows 10 1809 or later) an
+installer and a zip. From 0.4.1 the macOS app is signed with a Developer ID of team `6XQX9HAB25`
+(EQTR INC) and notarized. The newest release's files are also at version-free names under
+`https://github.com/ModernRelay/omnigraph-studio/releases/latest/download/`:
+
+| File | Platform |
+|---|---|
+| `Omnigraph-Studio-arm64.dmg` | macOS 11 or later, Apple silicon |
+| `omnigraph-studio-linux-x86_64.tar.gz` | Linux x86_64, glibc 2.35 or later |
+| `omnigraph-studio-linux-aarch64.tar.gz` | Linux arm64, glibc 2.35 or later |
+| `omnigraph-studio-windows-x86_64-setup.exe` | Windows installer |
+| `omnigraph-studio-windows-x86_64.zip` | Windows, to unzip anywhere |
+
+The Windows installer puts Studio in `%LOCALAPPDATA%\Programs\Omnigraph Studio` for you alone,
+with no administrator rights, and adds it to the Start menu and Installed apps; uninstalling
+keeps your settings in `%APPDATA%\Omnigraph Studio`. It registers as
+`com.modernrelay.omnigraph-studio`, the name `omnigraph studio` looks up
+([spec 027](specs/027-windows-installer/plan.md)). Neither Windows file is signed yet, so
+SmartScreen may ask first: choose More info, then Run anyway. To build from source instead, see
+below.
 
 Studio checks for a newer version half a minute after launch and every hour (Settings →
 Updates, or Check for Updates in the app menu). On macOS it downloads the update, checks its

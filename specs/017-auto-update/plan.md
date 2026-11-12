@@ -372,7 +372,9 @@ next launch is the new version.
 
 - Linux in place, as an AppImage built by `cargo-packager` (`format: appimage`), and Windows,
   as an NSIS installer built by it (`format: nsis`), which also gives Windows the package
-  identity issue #3 asks for. Both reuse the same manifest and keys.
+  identity issue #3 asks for. Both reuse the same manifest and keys. Windows ships an Inno
+  Setup installer instead (spec 027), and installing its updates in place is that plan's
+  step 2.
 - Intel Macs: there is no x86_64 macOS build (issue #3 asks whether to support them).
 - An edge channel in the updater (an edge Studio offered the next edge build), a beta channel,
   delta updates, and a policy that turns updates off for

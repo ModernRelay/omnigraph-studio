@@ -103,7 +103,7 @@ pub fn download_url(platform: &str) -> String {
         "macos-aarch64" => "Omnigraph-Studio-arm64.dmg",
         "linux-x86_64" => "omnigraph-studio-linux-x86_64.tar.gz",
         "linux-aarch64" => "omnigraph-studio-linux-aarch64.tar.gz",
-        "windows-x86_64" => "omnigraph-studio-windows-x86_64.zip",
+        "windows-x86_64" => "omnigraph-studio-windows-x86_64-setup.exe",
         _ => return format!("{RELEASES}/latest"),
     };
     format!("{RELEASES}/latest/download/{file}")
@@ -256,7 +256,7 @@ mod tests {
         );
         assert_eq!(
             download_url("windows-x86_64"),
-            format!("{base}omnigraph-studio-windows-x86_64.zip")
+            format!("{base}omnigraph-studio-windows-x86_64-setup.exe")
         );
         assert_eq!(
             download_url("macos-x86_64"),

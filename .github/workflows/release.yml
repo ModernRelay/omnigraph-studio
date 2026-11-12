@@ -18,8 +18,8 @@ name: Release
 # macOS builds are signed and notarized when the Apple secrets below are set, and signed ad hoc
 # otherwise. A tag's release is the latest only when they are set: without them it is published
 # as a pre-release, which neither Studio's updater nor `omnigraph studio` reads (both take
-# `latest`), so no unsigned app reaches them (spec 017). Linux builds are tarballs, the Windows
-# build a zip.
+# `latest`), so no unsigned app reaches them (spec 017). Linux builds are tarballs; Windows
+# builds an installer and a zip (spec 027), neither signed: there is no Windows certificate.
 #
 #   APPLE_CERTIFICATE_P12        base64 of a "Developer ID Application" certificate (.p12)
 #   APPLE_CERTIFICATE_PASSWORD   its export password
@@ -33,7 +33,8 @@ name: Release
 # only, with these secrets of the `update-signing` environment (give that environment required
 # reviewers, so a workflow change alone cannot sign a release). While update-key.pub is empty
 # the release still says which version is newest (latest.json), and Studio offers the download
-# instead; once it holds the key, a release without a signature is refused.
+# instead; once it holds the key, a release without a signature is refused. The same job signs
+# the Windows installer with the key, for `omnigraph studio` to check (spec 027).
 #
 #   STUDIO_UPDATER_KEY           the private key `cargo packager signer generate` writes
 #   STUDIO_UPDATER_KEY_PASSWORD  its password
@@ -224,11 +225,48 @@ jobs:
             -R="identifier \"com.modernrelay.omnigraph-studio\" and anchor apple generic and certificate leaf[subject.OU] = \"$team\"" \
             "target/bundle/Omnigraph Studio.app"
 
+      # What `omnigraph studio` reads on Windows (spec 027): the installer installs for this user
+      # without admin rights, under the uninstall key its AppId names and an App Paths key, and
+      # its uninstaller removes them and the files.
+      - name: The installer installs and registers
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = python -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])'
+          $setup = (Get-Item "target/bundle/omnigraph-studio-$version-windows-x86_64-setup.exe").FullName
+          $log = Join-Path $env:RUNNER_TEMP 'setup.log'
+          $run = Start-Process $setup -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/LOG=`"$log`"" -Wait -PassThru
+          if ($run.ExitCode -ne 0) { Get-Content $log; throw "the installer exited $($run.ExitCode)" }
+          $uninstall = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\com.modernrelay.omnigraph-studio_is1'
+          $entry = Get-ItemProperty "HKCU:\$uninstall"
+          $entry | Format-List DisplayName, DisplayVersion, Publisher, InstallLocation, UninstallString
+          if ($entry.DisplayVersion -ne $version) { throw "DisplayVersion is $($entry.DisplayVersion), not $version" }
+          if ($entry.Publisher -ne 'ModernRelay') { throw "Publisher is $($entry.Publisher)" }
+          $exe = Join-Path $entry.InstallLocation 'omnigraph-studio.exe'
+          $expected = Join-Path $env:LOCALAPPDATA 'Programs\Omnigraph Studio\omnigraph-studio.exe'
+          if ([IO.Path]::GetFullPath($exe) -ne [IO.Path]::GetFullPath($expected)) { throw "installed at $exe, not $expected" }
+          if (-not (Test-Path $exe)) { throw "$exe is missing" }
+          foreach ($file in 'LICENSE', 'THIRD-PARTY-NOTICES.md') {
+            if (-not (Test-Path (Join-Path $entry.InstallLocation $file))) { throw "$file is not installed" }
+          }
+          $appPath = (Get-Item 'HKCU:\Software\Microsoft\Windows\CurrentVersion\App Paths\omnigraph-studio.exe').GetValue('')
+          if ($appPath -ne $exe) { throw "App Paths names $appPath, not $exe" }
+          if (Test-Path "HKLM:\$uninstall") { throw "an install for one user wrote HKLM" }
+          $uninstaller = $entry.UninstallString.Trim('"')
+          Start-Process $uninstaller -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait
+          # The uninstaller runs a copy of itself from %TEMP%; wait for that copy to finish.
+          for ($i = 0; $i -lt 60 -and ((Test-Path "HKCU:\$uninstall") -or (Test-Path $exe)); $i++) { Start-Sleep 1 }
+          if (Test-Path "HKCU:\$uninstall") { throw "the uninstall key is still there" }
+          if (Test-Path $exe) { throw "$exe is still there" }
+          if (Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\App Paths\omnigraph-studio.exe') { throw "the App Paths key is still there" }
+          Write-Output "installed, registered and uninstalled $version"
+
       - name: Collect
         shell: bash
         run: |
           mkdir -p dist
-          cp target/bundle/*.dmg target/bundle/*.tar.gz target/bundle/*.zip dist/ 2>/dev/null || true
+          cp target/bundle/*.dmg target/bundle/*.tar.gz target/bundle/*.zip target/bundle/*-setup.exe dist/ 2>/dev/null || true
           ls -la dist
 
       - uses: actions/upload-artifact@v7
@@ -265,12 +303,19 @@ jobs:
           name: macos-arm64
           path: dist
 
+      - uses: actions/download-artifact@v8
+        if: steps.key.outputs.published == 'true'
+        with:
+          name: windows-x86_64
+          path: dist
+
       # Built from crates.io's source with its lock file, so the signer is the published crate.
       - name: cargo-packager
         if: steps.key.outputs.published == 'true'
         run: cargo install cargo-packager --version 0.11.8 --locked
 
-      # Writes the .sig beside the update archive: base64 of its minisign signature.
+      # Writes the .sig beside the update archive and the Windows installer: base64 of each one's
+      # minisign signature.
       - name: Sign
         if: steps.key.outputs.published == 'true'
         env:
@@ -288,6 +333,12 @@ jobs:
             exit 1
           fi
           cargo packager signer sign "${updates[0]}"
+          installers=(dist/*-windows-x86_64-setup.exe)
+          if (( ${#installers[@]} != 1 )); then
+            echo "expected one Windows installer, found ${#installers[@]}" >&2
+            exit 1
+          fi
+          cargo packager signer sign "${installers[0]}"
 
       # Every updating Studio checks the signature against the committed key; a release signed
       # with any other key would be downloaded and refused by every one of them.
@@ -296,7 +347,7 @@ jobs:
         run: |
           sudo apt-get install -y minisign
           base64 --decode crates/studio_update/update-key.pub > "$RUNNER_TEMP/update.pub"
-          for update in dist/*.app.tar.gz; do
+          for update in dist/*.app.tar.gz dist/*-setup.exe; do
             base64 --decode "$update.sig" > "$RUNNER_TEMP/update.minisig"
             minisign -V -p "$RUNNER_TEMP/update.pub" -m "$update" -x "$RUNNER_TEMP/update.minisig"
           done
@@ -353,9 +404,10 @@ jobs:
           | \`Omnigraph-Studio-$version-arm64.dmg\` | macOS 11 or later, Apple silicon |
           | \`omnigraph-studio-$version-linux-x86_64.tar.gz\` | Linux x86_64, glibc 2.35 or later (Ubuntu 22.04, Debian 12 and later); Wayland or X11, Vulkan |
           | \`omnigraph-studio-$version-linux-aarch64.tar.gz\` | Linux arm64, glibc 2.35 or later; Wayland or X11, Vulkan |
-          | \`omnigraph-studio-$version-windows-x86_64.zip\` | Windows 10 (1809) or later, x86_64 |
+          | \`omnigraph-studio-$version-windows-x86_64-setup.exe\` | Windows 10 (1809) or later, x86_64: the installer |
+          | \`omnigraph-studio-$version-windows-x86_64.zip\` | Windows 10 (1809) or later, x86_64: the same files, to unzip anywhere |
 
-          The same four files without the version in their names are always the newest release's, at \`https://github.com/$GITHUB_REPOSITORY/releases/latest/download/<name>\`. \`Omnigraph-Studio-$version-arm64.app.tar.gz\` with its \`.sig\`, and \`latest.json\`, are for Studio's own updater.
+          The same five files without the version in their names are always the newest release's, at \`https://github.com/$GITHUB_REPOSITORY/releases/latest/download/<name>\`. \`Omnigraph-Studio-$version-arm64.app.tar.gz\` with its \`.sig\`, and \`latest.json\`, are for Studio's own updater.
 
           \`SHA256SUMS\` lists every file's checksum. Each download carries \`LICENSE\` (GPL-3.0-or-later) and \`THIRD-PARTY-NOTICES.md\`, the licences of the crates, fonts, icons and themes it includes.
 
@@ -363,7 +415,7 @@ jobs:
 
           On Linux, unpack the tarball and run \`bin/omnigraph-studio\`; copy its \`share/\` into \`~/.local/share\` to list Studio, with its icon, in a launcher.
 
-          On Windows, unzip anywhere and run \`omnigraph-studio.exe\`. It is not signed, so SmartScreen may ask first: choose More info, then Run anyway.
+          On Windows, run the installer. It installs Studio for you alone, without administrator rights, into \`%LOCALAPPDATA%\\Programs\\Omnigraph Studio\`, with a Start menu entry; Installed apps uninstalls it, and leaves your settings in \`%APPDATA%\\Omnigraph Studio\`. Or unzip the zip anywhere and run \`omnigraph-studio.exe\`. Neither is signed, so SmartScreen may ask first: choose More info, then Run anyway.
 
           Studio connects to an Omnigraph server of v0.14.0 or later (HTTP contract 0.14); see the README for connecting and for a sample graph. The servers of your \`omnigraph\` CLI's targets, and the agent panel, need that CLI at v0.14.0 or later.
           NOTES
@@ -425,7 +477,8 @@ jobs:
           | \`Omnigraph-Studio-arm64.dmg\` | macOS 11 or later, Apple silicon |
           | \`omnigraph-studio-linux-x86_64.tar.gz\` | Linux x86_64, glibc 2.35 or later |
           | \`omnigraph-studio-linux-aarch64.tar.gz\` | Linux arm64, glibc 2.35 or later |
-          | \`omnigraph-studio-windows-x86_64.zip\` | Windows 10 (1809) or later, x86_64 |
+          | \`omnigraph-studio-windows-x86_64-setup.exe\` | Windows 10 (1809) or later, x86_64: the installer |
+          | \`omnigraph-studio-windows-x86_64.zip\` | Windows 10 (1809) or later, x86_64: to unzip anywhere |
 
           Each is at \`https://github.com/$GITHUB_REPOSITORY/releases/download/edge/<name>\`. \`SHA256SUMS\` lists every file's checksum.
 
