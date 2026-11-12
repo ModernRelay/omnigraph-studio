@@ -4,6 +4,7 @@
 //! Other crates' tests reach it through the `test-support` feature.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use gpui::{AppContext as _, Entity, TestAppContext};
 use http_client::http::{Method, Response};
@@ -19,6 +20,10 @@ pub type Rows = Box<dyn Fn(&Value) -> Value + Send>;
 /// Which reads, by their request body, are never answered, as a slow server's are not
 /// before their view stops waiting.
 pub type Hold = Box<dyn Fn(&Value) -> bool + Send>;
+
+/// How long the server takes to answer a read, by its request body, on the test executor's
+/// clock: a slow server's hub groups and ordinary ones.
+pub type Wait = Box<dyn Fn(&Value) -> Duration + Send>;
 
 pub struct Served {
     pub head: String,
@@ -40,6 +45,8 @@ pub struct Served {
     pub branches: Vec<String>,
     /// Reads never answered: none at first.
     pub hold: Hold,
+    /// How long each read takes: none at first.
+    pub wait: Wait,
     rows: Rows,
 }
 
@@ -139,22 +146,31 @@ pub fn followed_session(
         feeds: Vec::new(),
         branches: vec!["main".into()],
         hold: Box::new(|_| false),
+        wait: Box::new(|_| Duration::ZERO),
         rows: Box::new(rows),
     }));
     let state = served.clone();
+    let executor = cx.executor();
     let http = FakeHttpClient::create(move |request| {
         let path = request.uri().path().to_owned();
         let query = request.uri().query().unwrap_or_default().to_owned();
         let deletes = request.method() == Method::DELETE;
         let state = state.clone();
+        let executor = executor.clone();
         async move {
             let mut bytes = Vec::new();
             request.into_body().read_to_end(&mut bytes).await.ok();
             if path.ends_with("/query") {
                 let asked: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-                let held = (state.lock().unwrap().hold)(&asked);
+                let (held, wait) = {
+                    let served = state.lock().unwrap();
+                    ((served.hold)(&asked), (served.wait)(&asked))
+                };
                 if held {
                     futures::future::pending::<()>().await;
+                }
+                if !wait.is_zero() {
+                    executor.timer(wait).await;
                 }
             }
             let mut served = state.lock().unwrap();
