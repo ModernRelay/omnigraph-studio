@@ -10,8 +10,24 @@
 #   script/measure-frames      # prints one line per case
 #   script/measure-frames 2    # each case twice
 #
+# `--reads` measures reads instead of frames (spec 030): a Person table, a person's page, a
+# commit by another writer to that person, seen by the head poll (up to 30 s), and the page's
+# Refresh. After each step it prints the step's reads by answer from the session's ledger, the
+# time to the first answer and to settled, and writes them all as JSON. Requests go through
+# script/latency-proxy.py, which holds each one STUDIO_READS_LATENCY_MS (default 700, the
+# personal graph's median; 0 sends them straight to the server). It writes to the development
+# graph: a new title for person-000001.
+#
+#   script/measure-frames --reads before.json              # on one build
+#   script/measure-frames --reads after.json               # on another
+#   script/measure-frames --reads before.json after.json   # compares the two
+#
 # Needs the snapshot tool's build; it builds it first.
 set -euo pipefail
+
+if [[ "${1:-}" == "--reads" && $# -eq 3 ]]; then
+  exec python3 "$(dirname "$0")/compare-reads.py" "$2" "$3"
+fi
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 ROUNDS=${1:-1}
@@ -38,9 +54,44 @@ cargo build --quiet --profile release-fast -p studio --example snapshot --manife
 SNAPSHOT="${CARGO_TARGET_DIR:-$ROOT/target}/release-fast/examples/snapshot"
 
 PERSON='studio_graph::OpenType={"type_name":"Person"}'
+PAGE='studio_graph::OpenNodePage={"type_name":"Person","id":"person-000001"}'
+
+if [[ "${1:-}" == "--reads" ]]; then
+  if [[ $# -ne 2 ]]; then
+    echo "usage: script/measure-frames --reads <out.json> [<after.json>]" >&2
+    exit 2
+  fi
+  export STUDIO_READS_LATENCY_MS=${STUDIO_READS_LATENCY_MS:-700}
+  server=$OMNIGRAPH_STUDIO_SERVER
+  if [[ $STUDIO_READS_LATENCY_MS != 0 ]]; then
+    python3 "$ROOT/script/latency-proxy.py" "$server" --delay-ms "$STUDIO_READS_LATENCY_MS" > "$OUT/proxy" &
+    proxy=$!
+    trap 'kill "$proxy" 2>/dev/null || true; rm -rf "$OUT"' EXIT
+    for _ in $(seq 1 50); do
+      if [[ -s "$OUT/proxy" ]]; then break; fi
+      sleep 0.1
+    done
+    OMNIGRAPH_STUDIO_SERVER=$(head -1 "$OUT/proxy")
+  fi
+  # The other writer: a new title for the person whose page is open, sent straight to the server.
+  python3 -c 'import json, sys, time
+query = "query scenario_write($t: String) { update Person set { title: $t } where slug = \"person-000001\" }"
+json.dump({"query": query, "params": {"t": "Title %d" % time.time()}}, sys.stdout)' > "$OUT/write.json"
+  cat > "$OUT/write" <<EOF
+#!/bin/sh
+exec curl -sf -o /dev/null -X POST '$server/graphs/$OMNIGRAPH_STUDIO_GRAPH/mutate' \
+  -H 'Authorization: Bearer $OMNIGRAPH_STUDIO_TOKEN' -H 'Content-Type: application/json' \
+  -H 'Omnigraph-Http-Api: 0.14' --data @'$OUT/write.json'
+EOF
+  chmod +x "$OUT/write"
+  # The page's "Newer data · Refresh" is at (523, 210) in the default 1440x900 window.
+  "$SNAPSHOT" "$OUT/frame.png" "reads:$2" "$PERSON" "$PAGE" "run:$OUT/write" head:60000 \
+    click:523,210 2>&1 | grep -v '^snapshot data\|frame\.png$'
+  exit "${PIPESTATUS[0]}"
+fi
+
 QUERY='query people() { match { $p: Person } return { $p.slug, $p.name, $p.title, $p.email, $p.born, $p.tags } }'
 NEW_QUERY="studio_graph::NewQueryWithText={\"text\":\"$QUERY\"}"
-PAGE='studio_graph::OpenNodePage={"type_name":"Person","id":"person-000001"}'
 # A company with its people, in the inspector, scrolled with the pointer over the dock.
 INSPECTOR='studio_graph::PeekNode={"type_name":"Company","id":"company-00009"}'
 

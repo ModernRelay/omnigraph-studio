@@ -30,7 +30,13 @@
 //! before is not saved again. `record:stop` ends it; the run's end does too.
 //! `<dir>/timeline.json` lists each 1/fps slot's file and each step with the slot it began at,
 //! and for a click, hover or drag its point in window coordinates. `mark:<text>` does nothing
-//! but appear there, for what draws the film (a zoom, a caption). `SNAPSHOT_WAIT_MS` (default
+//! but appear there, for what draws the film (a zoom, a caption). `reads:<path>`, anywhere in
+//! the steps, measures the run's reads (spec 030, `script/measure-frames --reads`): the start,
+//! and then each action, `click:` and `head:` step lasts until the session has no read out and has
+//! answered none for a second, and prints the step's reads by answer from the session's ledger,
+//! with the time to its first answer and to its last; the steps' tallies are written to `path`
+//! as JSON. `run:<command>` runs a command and waits for it (another writer's commit);
+//! `head:<ms>` waits, at most that long, for the session's branch head to move. `SNAPSHOT_WAIT_MS` (default
 //! 1500) is how long to let each step's network work finish; `SNAPSHOT_SIZE` is
 //! `WIDTHxHEIGHT` (default 1440x900). Remembered tabs are not restored unless `OMNIGRAPH_STUDIO_NO_RESTORE=0`. The run
 //! keeps its state in a fresh temporary directory unless `OMNIGRAPH_STUDIO_DATA` names one, so
@@ -436,6 +442,160 @@ fn dispatch(
     .expect("dispatch an action");
 }
 
+/// The scenario runner's reads (spec 030), on with `reads:<path>`: each step's reads by
+/// answer, from the window's session ledger, and the time to its first answer and to settled.
+struct Reads {
+    path: std::path::PathBuf,
+    steps: Vec<serde_json::Value>,
+}
+
+/// How long a step must see no read out and none answered to be settled, and how long a step
+/// may take at most.
+const READS_QUIET: Duration = Duration::from_millis(1000);
+const READS_CAP: Duration = Duration::from_secs(120);
+
+/// The window's graph session, once it has one.
+fn window_session(
+    cx: &mut HeadlessAppContext,
+    handle: AnyWindowHandle,
+) -> Option<gpui::Entity<graph_store::GraphSession>> {
+    cx.update_window(handle, |_, window, cx| {
+        studio_workspace::workspace_for(window).and_then(|w| w.read(cx).session().cloned())
+    })
+    .ok()
+    .flatten()
+}
+
+impl Reads {
+    /// Starts a step: the session's ledger keeps events from now, and forgets what came
+    /// before, so its table is the step's alone. Called before the step's action, since an
+    /// answer held or seeded is recorded as it is asked.
+    fn begin(cx: &mut HeadlessAppContext, handle: AnyWindowHandle) -> Instant {
+        if let Some(session) = window_session(cx, handle) {
+            cx.update(|cx| {
+                session.update(cx, |session, _| {
+                    session.ledger_mut().keep_events(true);
+                    session.ledger_mut().clear();
+                })
+            });
+        }
+        Instant::now()
+    }
+
+    /// Lets real time pass from `start`, with GPUI's clock moved by as much, so the ledger's
+    /// times are wire times, until the session is `ready` and has had no read out and none
+    /// answered for [`READS_QUIET`]; then prints and keeps the step's reads.
+    fn step(
+        &mut self,
+        name: &str,
+        start: Instant,
+        cx: &mut HeadlessAppContext,
+        handle: AnyWindowHandle,
+        cap: Duration,
+        ready: impl Fn(&graph_store::GraphSession) -> bool,
+    ) {
+        let mut clock = Instant::now();
+        let (mut first, mut last, mut calm_from) = (None, None, Duration::ZERO);
+        let timed_out = loop {
+            std::thread::sleep(Duration::from_millis(10));
+            let now = Instant::now();
+            cx.advance_clock(now - clock);
+            clock = now;
+            cx.run_until_parked();
+            let at = start.elapsed();
+            let session = window_session(cx, handle);
+            let (answered, calm) = session.map_or((0, false), |session| {
+                cx.update(|cx| {
+                    session.update(cx, |session, _| {
+                        // A session opened during the step (the first) keeps from then.
+                        let ledger = session.ledger_mut();
+                        ledger.keep_events(true);
+                        let answered = ledger.take_events().len();
+                        (answered, session.reads_in_flight == 0 && ready(session))
+                    })
+                })
+            });
+            if answered > 0 {
+                first.get_or_insert(at);
+                last = Some(at);
+            }
+            if answered > 0 || !calm {
+                calm_from = at;
+            }
+            if at - calm_from >= READS_QUIET {
+                break false;
+            }
+            if at >= cap {
+                break true;
+            }
+        };
+        let ms = |d: Option<Duration>| d.map(|d| d.as_secs_f64() * 1000.);
+        let Some(session) = window_session(cx, handle) else {
+            eprintln!("reads {name}: no graph session");
+            return;
+        };
+        let (table, mut reads, sent) = cx.update(|cx| {
+            let ledger = session.read(cx).ledger();
+            let reads: Vec<_> = ledger
+                .tallies()
+                .map(|((what, asker, answered), tally)| {
+                    let mean = tally.took / tally.count.max(1) as u32;
+                    serde_json::json!({
+                        "what": what.as_ref(),
+                        "asker": format!("{asker:?}"),
+                        "answered": format!("{answered:?}"),
+                        "count": tally.count,
+                        "mean_ms": ms(Some(mean)),
+                        "slowest_ms": ms(Some(tally.slowest)),
+                    })
+                })
+                .collect();
+            (ledger.table(), reads, ledger.sent())
+        });
+        reads.sort_by_key(|read| {
+            (
+                std::cmp::Reverse(read["count"].as_u64()),
+                read["what"].to_string(),
+                read["asker"].to_string(),
+                read["answered"].to_string(),
+            )
+        });
+        let asked: u64 = reads.iter().filter_map(|r| r["count"].as_u64()).sum();
+        let shown =
+            |d: Option<Duration>| d.map_or("-".to_owned(), |d| format!("{} ms", d.as_millis()));
+        eprintln!(
+            "reads {name}: {asked} asked, {sent} sent | first answer {}, settled {}{}",
+            shown(first),
+            shown(last),
+            if timed_out { " (not settled)" } else { "" }
+        );
+        eprint!("{table}");
+        self.steps.push(serde_json::json!({
+            "step": name,
+            "first_ms": ms(first),
+            "settled_ms": ms(last),
+            "timed_out": timed_out,
+            "asked": asked,
+            "sent": sent,
+            "reads": reads,
+        }));
+    }
+
+    fn write(&self) {
+        let latency = std::env::var("STUDIO_READS_LATENCY_MS").ok();
+        let json = serde_json::json!({
+            "latency_ms": latency.and_then(|ms| ms.parse::<u64>().ok()),
+            "steps": self.steps,
+        });
+        std::fs::write(
+            &self.path,
+            serde_json::to_string_pretty(&json).expect("reads JSON"),
+        )
+        .expect("write the reads JSON");
+        eprintln!("reads: {}", self.path.display());
+    }
+}
+
 fn main() {
     // On Windows the agent panel starts the running executable as the agent's launcher (spec
     // 013); answer that here as Studio's own binary does.
@@ -486,6 +646,7 @@ fn main() {
     // A headless window gets no animation frames, so a glide would be captured at its first
     // frame: snapshots are stills, taken with motion reduced.
     cx.update(|cx| cx.set_reduce_motion(true));
+    let opened = Instant::now();
     let window = cx
         .open_window(size(px(width), px(height)), studio::build_workspace)
         .expect("open the snapshot window");
@@ -494,10 +655,63 @@ fn main() {
     // while a window is active (the branch-head poll) run.
     cx.update_window(handle, |_, window, _| window.activate_window())
         .expect("activate the snapshot window");
-    settle(&mut cx, wait);
+    // `reads:<path>` measures the whole run, the start (until the schema is read) among it.
+    let mut reads = actions
+        .iter()
+        .find_map(|spec| spec.strip_prefix("reads:"))
+        .map(|path| Reads {
+            path: path.into(),
+            steps: Vec::new(),
+        });
+    match reads.as_mut() {
+        Some(reads) => reads.step("start", opened, &mut cx, handle, READS_CAP, |session| {
+            session.schema.loaded().is_some()
+        }),
+        None => settle(&mut cx, wait),
+    }
 
     let mut recorder: Option<Recorder> = None;
     for spec in actions {
+        if spec.starts_with("reads:") {
+            continue;
+        }
+        // `run:<command>` runs a command and waits for it: another writer's commit.
+        if let Some(command) = spec.strip_prefix("run:") {
+            let status = std::process::Command::new("sh")
+                .args(["-c", command])
+                .status()
+                .expect("run the command");
+            assert!(status.success(), "run: the command failed ({status})");
+            continue;
+        }
+        // `head:<ms>` waits for the session's branch head to move, at most that long: another
+        // writer's commit, seen by the head poll. Measured as a step while `reads:` is on.
+        if let Some(ms) = spec.strip_prefix("head:") {
+            let cap = Duration::from_millis(ms.trim().parse().expect("head:<milliseconds>"));
+            let Some(session) = window_session(&mut cx, handle) else {
+                panic!("head: the window has no graph session");
+            };
+            let was = cx.update(|cx| {
+                let session = session.read(cx);
+                session.head(&session.branch).map(str::to_owned)
+            });
+            let moved = move |session: &graph_store::GraphSession| {
+                session.head(&session.branch).map(str::to_owned) != was
+            };
+            match reads.as_mut() {
+                Some(reads) => {
+                    let start = Reads::begin(&mut cx, handle);
+                    reads.step("head", start, &mut cx, handle, cap, moved);
+                }
+                None => {
+                    let deadline = Instant::now() + cap;
+                    while Instant::now() < deadline && !cx.update(|cx| moved(session.read(cx))) {
+                        settle(&mut cx, Duration::from_millis(100));
+                    }
+                }
+            }
+            continue;
+        }
         if let Some(rest) = spec.strip_prefix("record:") {
             if let Some(done) = recorder.take() {
                 done.finish(width, height);
@@ -794,8 +1008,17 @@ fn main() {
             } else {
                 MouseButton::Left
             };
-            click(&mut cx, handle, point(px(x), px(y)), modifiers, button);
-            rest(&mut cx, handle, &mut recorder, step_wait);
+            match reads.as_mut() {
+                Some(reads) if recorder.is_none() => {
+                    let start = Reads::begin(&mut cx, handle);
+                    click(&mut cx, handle, point(px(x), px(y)), modifiers, button);
+                    reads.step("click", start, &mut cx, handle, READS_CAP, |_| true);
+                }
+                _ => {
+                    click(&mut cx, handle, point(px(x), px(y)), modifiers, button);
+                    rest(&mut cx, handle, &mut recorder, step_wait);
+                }
+            }
             continue;
         }
         // While recording, text is typed a character at a time, as a person types it.
@@ -821,11 +1044,24 @@ fn main() {
                 None => (spec.clone(), None),
             },
         };
-        dispatch(&mut cx, handle, &name, data);
-        rest(&mut cx, handle, &mut recorder, step_wait);
+        match reads.as_mut() {
+            // Measured: the step lasts until its reads settle.
+            Some(reads) if recorder.is_none() => {
+                let start = Reads::begin(&mut cx, handle);
+                dispatch(&mut cx, handle, &name, data);
+                reads.step(&name, start, &mut cx, handle, READS_CAP, |_| true);
+            }
+            _ => {
+                dispatch(&mut cx, handle, &name, data);
+                rest(&mut cx, handle, &mut recorder, step_wait);
+            }
+        }
     }
     if let Some(done) = recorder.take() {
         done.finish(width, height);
+    }
+    if let Some(reads) = &reads {
+        reads.write();
     }
 
     let image = cx.capture_screenshot(handle).expect("render the window");
