@@ -28,9 +28,20 @@ Studio reaches your graphs through the `omnigraph` CLI, so install it first:
 curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install.sh | bash
 ```
 
-Studio lists every server you have as a CLI target (`omnigraph target list`) and uses the
-CLI's credentials. To add a server, choose File → Open Graph… in Studio. It needs Omnigraph
-0.14 or later.
+Then open a graph from the terminal:
+
+```bash
+omnigraph target list                              # the servers the CLI knows
+omnigraph studio --target <server> --graph <graph> # opens that graph in Studio
+```
+
+`omnigraph studio` (CLI 0.15 or later) launches Studio through an `omnigraph-studio://` link.
+The link names the target and graph but carries no token; Studio gets the token from the CLI
+itself. Without `--target` it uses your default target. It works for server targets, not for
+a local storage path or a managed target.
+
+Studio also lists every server target when it starts, and File → Open Graph… adds a new one.
+The server needs to run Omnigraph 0.14 or later.
 
 ## What you can do
 
