@@ -60,6 +60,7 @@ Add tasks, contracts or data-model files only for large features.
 | 027 | [A Windows installer the launcher can find](027-windows-installer/plan.md) | step 1 built |
 | 028 | [The table in front follows its branch](028-live-tables/plan.md) | step 1 built |
 | 029 | [The first run](029-first-run/plan.md) | implemented |
+| 030 | [The read ledger](030-read-ledger/plan.md) | draft |
 
 Each plan's first line holds its full status. 012 is not scheduled: it records every Omnigraph change Studio would use, what Studio does
 without it, and which plan waits on it. Each feature plan's Deferred section names its IDs.

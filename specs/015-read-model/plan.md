@@ -443,6 +443,11 @@ commit can be cleaned up; measure first).
 
 ## Corrections
 
+- 2026-11-12 (spec 030): "waits out a `429`'s `Retry-After` twice" holds only when the server asks
+  for 30 s or less (`MAX_RETRY_AFTER`). Omnigraph answers every 429 with `Retry-After: 60`
+  (`omnigraph-server` `RETRY_AFTER_SECONDS`, checked at `7711e4a`, the personal server's build),
+  so against it a 429 is shown at once and never retried. The server's read caps are 128 reads
+  in all and 64 with a body, not 64 alone.
 - 2026-10-17, before building: the first draft said Studio's reads were unbounded and the server
   had no read admission. The client caps reads at 8 per connection and handles `429`; the server
   admits 64 reads at once. The scheduler shrinks to single flight and the head-read choice.
