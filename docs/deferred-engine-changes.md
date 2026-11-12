@@ -39,7 +39,7 @@ it goes through Omnigraph's own RFC process.
 | E42 | A per-graph view registry clients may write, so a view is shared with everyone who opens the graph; a view names a stored query or a type, never its own query text | 024 | Views are personal, in Studio's settings |
 | E43 | A stored query's result columns with the variable, type and property each comes from, in its catalog entry | 024 | Stored-query views are read-only |
 | E44 | A commit's added, changed and removed counts in `CommitOutput` | 009, 026 | One changes page per drawn commit, partial past 100 |
-| E45 | A direct `cluster apply` that releases its admission lock when it ends (or `--release-lock`) | 029 | The local recipe releases it with `cluster status --json` piped into `cluster force-unlock` |
+| E45 | A direct `cluster apply` that releases its admission lock when it ends (or `--release-lock`; [#1359](https://github.com/ModernRelay/omnigraph/issues/1359)) | 029 | The local recipe releases it with `cluster status --json` piped into `cluster force-unlock` |
 | E46 | The CLI keeps a token for a loopback `http://` server | 029 | Adds the server as an anonymous target and keeps the token in memory until Studio quits |
 | E47 | `GET /graphs` on an `--unauthenticated` server without a cluster policy | 029 | Add server takes an optional graph id; a 404 page says the server does not list its graphs |
 
