@@ -1,6 +1,6 @@
 # 018: Telemetry, with consent
 
-Status: draft · 2026-10-29 · reports go to PostHog (decided 2026-10-29)
+Status: draft · 2026-10-29 · reports go to PostHog (decided 2026-10-29), US Cloud (decided 2026-11-11)
 
 ## Problem
 
@@ -147,7 +147,9 @@ its row in `docs/telemetry.md`.
 The install ID is a random UUID (version 4) written to `telemetry/install-id` when usage is
 first turned on, deleted when it is turned off, and replaced by **Reset ID**. Nothing ties it to
 an account, a machine or a server, including a managed sign-in. The session ID is a new random
-UUID each start, kept in memory.
+UUID version 7 each start, kept in memory, and a new one after 24 hours of running: PostHog
+counts a custom session ID only when it is a UUIDv7 whose time plus 24 hours is after the
+session's last event.
 
 ### Performance summaries
 
@@ -165,27 +167,47 @@ summary once it is checked what GPUI exposes about a frame (Open questions).
   a frame waits on.
 - A background task writes the queue to `telemetry/pending.jsonl` every 60 s and at quit (at
   most 1 MB; older lines go first), and sends batches of at most 200 reports or 256 KB once an
-  hour while anything is pending. A batch is deleted when the endpoint answers 2xx; anything else
-  is retried after 1 h, doubling to at most 24 h. A report older than 7 days is deleted unsent.
+  hour while anything is pending. A batch is deleted when the endpoint answers 2xx (which says it was received, not that every
+  event was valid: a test checks each report against the fields PostHog requires); on a timeout,
+  a 429 or a 5xx it is retried after 1 h, doubling to at most 24 h; any other 4xx (a body PostHog
+  refuses, a wrong token, a billing quota) deletes it, since sending it again cannot succeed. A
+  report older than 7 days is deleted unsent. PostHog's capture endpoints have no request rate
+  limit, and a batch may be up to 20 MB and an event 1 MB, far above Studio's caps.
 - Uploads go through Studio's one HTTP client (the global `graph_store::init` sets), with the
-  user agent it already sends, to PostHog's batch endpoint (`/batch/` on the project's host,
-  `https://eu.i.posthog.com` for EU Cloud; Open question 1). The body is PostHog's: the project
-  token as `api_key` and the reports as `batch`. The token is compiled into release builds; a
+  user agent it already sends, to PostHog US Cloud's batch endpoint,
+  `https://us.i.posthog.com/batch/`, gzipped (`Content-Encoding: gzip`). The body is PostHog's:
+  the project token as `api_key`, the reports as `batch`, and `sent_at`, so PostHog corrects
+  each `timestamp` for a client clock that is wrong. The host is compiled in with the token: an
+  installed build keeps sending where it was built to, so the region is fixed for good (moving a
+  project between regions is a migration PostHog does only on its top plans). The token is compiled into release builds; a
   development build has none. The request carries no cookies and no credential of the
   person's.
 - A usage report is one PostHog event: its tag as `event`, the install ID as `distinct_id`, its
   fields as `properties` with `$process_person_profile: false` (PostHog's anonymous events: no
-  person profile is made or updated) and `$session_id`, and the time it was recorded as
-  `timestamp`. A daily summary is the event `daily_summary`.
+  person profile is made or updated), `$geoip_disable: true` and `$session_id`, and the time
+  it was recorded as `timestamp`. A daily summary is the event `daily_summary`.
 - A crash report is a `$exception` event, the shape PostHog's error tracking reads: the panic's
-  line (or the signal) as the exception's `value`, `mechanism.handled: false`, and the frames as
+  line (or the signal) as the exception's `value`, its kind (`panic`, or the signal's name) as
+  `type`, which PostHog groups issues by, `$exception_level: "fatal"`, `mechanism.handled:
+  false`, `$geoip_disable: true`, and the frames as
   a raw stack trace (`platform: "custom"`, `lang: "rust"`, `function`, `in_app` for Studio's
   crates). Its `distinct_id` is a new random UUID for that report alone, with
   `$process_person_profile: false`, so a crash report is tied to no install.
-- PostHog's project for Studio discards client IP data (its IP data capture setting, which an
-  EU organization's projects start with) and runs no GeoIP transformation.
+- PostHog's project for Studio, on US Cloud, is set up by hand, since a US organization's
+  projects start the other way round: **Discard client IP data** on (US projects capture it until
+  it is set, and changing the organization's default later leaves existing projects as they
+  are), and the default GeoIP enrichment transformation off. GeoIP runs before the IP is
+  dropped, so discarding the IP alone still stores a location; each report's
+  `$geoip_disable: true` keeps it off if the project setting is ever changed. PostHog still
+  receives the request's IP and removes it before storing the event; the privacy notice says so
+  (Open question 3). Transformations do not run on error tracking's exceptions, so whether the IP
+  setting covers `$exception` events is checked on a test project before crash reports ship
+  (Open question 7).
 - Turning a switch off deletes everything pending for that report at once, and turning usage
-  off deletes the install ID.
+  off deletes the install ID. Events already sent carry no person profile, so PostHog's
+  person deletion does not reach them; a person who asks for their data to be erased gives their
+  install ID (shown in Settings), and its events are removed with PostHog's event deletion
+  (a HogQL deletion request, run in PostHog's weekly batch).
 - Zed's telemetry queue is never started: Studio does not call `telemetry::init`, and a source
   guard test refuses one.
 
@@ -234,8 +256,9 @@ client; feature crates depend on it only to call `record`. The panic hook in
 | A closed, typed catalog with no free text | Zed's `FlexibleEvent` (a name and any JSON); an analytics SDK's `capture(name, properties)` | Free text is how a branch name or an error message carrying a value leaks; a type that cannot hold one cannot leak one, and a test can prove it |
 | Usage off until chosen; crash reports asked for each time | Usage on unless turned off | Studio shows private graphs to people who never agreed to share anything; asking once costs one status bar item |
 | One status bar item, not a dialog at first start | A first-run dialog | Constitution VII: a start that asks a question before showing anything is loud for a choice that can wait |
-| PostHog for usage, summaries and crash reports | A crash tracker beside it (Sentry); a store of Studio's own | Chosen 2026-10-29. One API for all three: events and `$exception` events through the same capture endpoint; anonymous events need no person profile; EU Cloud or self-hosting; client IP data discarded by a project setting |
-| Studio's own uploader through its one HTTP client, speaking PostHog's capture API | PostHog's or Sentry's Rust SDK | SDKs gather device and environment data by default, bring their own HTTP stack, and would be a second client making requests; the catalog and queue are small, and the capture API is a JSON body |
+| PostHog for usage, summaries and crash reports | A crash tracker beside it (Sentry); a store of Studio's own | Chosen 2026-10-29. One API for all three: events and `$exception` events through the same capture endpoint; anonymous events need no person profile; client IP data discarded by a project setting |
+| PostHog US Cloud (`us.i.posthog.com`) | EU Cloud; self-hosted | Chosen 2026-11-11. ModernRelay and most of Studio's people are in the US; the reports hold no graph content, no IP and no person profile, so the gap EU hosting would close is small. PostHog takes part in the EU-U.S. Data Privacy Framework and its DPA adds Standard Contractual Clauses, so EU users are covered; the region cannot be changed later without a migration |
+| Studio's own uploader through its one HTTP client, speaking PostHog's capture API | PostHog's or Sentry's Rust SDK | An SDK brings its own HTTP stack (`posthog-rs` is built on `reqwest`) and would be a second client making requests, and its `capture` takes any properties, where the catalog takes none; the catalog and queue are small, and the capture API is a JSON body |
 | A random install ID the person can reset | A hardware or system ID; none | Without an ID retention cannot be counted; a hardware ID follows a person across resets and installs |
 | Bucketed numbers | Exact durations and counts | A bucket says enough to rank and compare; an exact row count can identify a graph |
 | Performance as a daily summary of histograms | One event per query or frame | A summary sends a few hundred bytes a day and nothing about when someone worked |
@@ -255,10 +278,12 @@ client; feature crates depend on it only to call `record`. The panic hook in
 
 ## Open questions
 
-1. ~~Where reports go.~~ PostHog, for all three (2026-10-29). Still open: EU Cloud or
-   self-hosted, which organization holds the project, and who can read it.
-2. How long PostHog keeps raw events for this project (a proposal: 90 days, insights kept), with
-   the project's IP data capture set to discard and no GeoIP transformation.
+1. ~~Where reports go.~~ PostHog, for all three (2026-10-29), on US Cloud (2026-11-11). Still
+   open: which organization holds the project, and who can read it.
+2. How long PostHog keeps raw events. The Free plan keeps them a year and cannot shorten it;
+   paid plans keep two years by default and can be set, in months, to less (a proposal: 3
+   months). Exceptions are kept as long. Free covers 1 million events and 100,000 exceptions a
+   month, and one project.
 3. The privacy notice the first popover and `docs/telemetry.md` link to, and its legal review: a
    resettable install ID is still pseudonymous personal data under the GDPR.
 4. Whether an organization signed in to a managed cluster may turn usage off for its people.
@@ -267,7 +292,13 @@ client; feature crates depend on it only to call `record`. The panic hook in
    frames itself from the snapshot tool (`docs/drawing.md`); an installed Studio's frames are
    driven by the display.
 6. Whether release builds should also archive their debug files (`dSYM`) for line numbers in
-   crash reports, beyond the function names the binary keeps.
+   crash reports, beyond the function names the binary keeps. PostHog symbolicates Rust only
+   from the frame format `posthog-rs` 0.16+ sends (instruction addresses and a build ID, not
+   `platform: "custom"`), with `debug = "line-tables-only"`, `split-debuginfo = "packed"` and
+   the `.dSYM` uploaded by `posthog-cli` 0.8.1+; the frame fields are documented only in the
+   `posthog-rs` repository.
+7. Whether the project's **Discard client IP data** also covers `$exception` events, which skip
+   transformations. Checked on a test project before crash reports are turned on.
 
 ## Validation log
 
@@ -277,9 +308,21 @@ client; feature crates depend on it only to call `record`. The panic hook in
 | 2026-10-29 | Zed's telemetry crate is linked and drops every event | `Cargo.lock` (packages depending on `telemetry`); Zed `v1.23.2` `crates/telemetry/src/telemetry.rs`; a search of Studio's `crates/` for `telemetry` | Depended on by `client`, `dap`, `editor`, `fs`, `remote`, `workspace`; `send_event` sends only once `init` set the queue; no match in Studio |
 | 2026-10-29 | Panics are written as one line with quoted text removed | `crates/studio/src/logging.rs` (`init`, `report_panic`, `panic_line`, `without_quotes`) and its two tests | As described; Rust's report not chained |
 | 2026-10-29 | Release builds unwind and keep symbol names | `Cargo.toml` `[profile.release]` and `[profile.release-fast]`; `nm -U` on the bundle `script/bundle-mac --fast` built from `09e459b` | No `panic` setting (unwind); 328,592 defined symbols, 3,918 from `studio_workspace` |
-| 2026-10-29 | PostHog takes the reports as designed | PostHog's documentation: "Capture and batch API endpoints" (`/docs/api/capture`), "Data collection" (`/docs/privacy/data-collection`), "GeoIP" (`/docs/cdp/geoip-enrichment`), error tracking's manual capture (`/docs/error-tracking/installation/manual`) | `/i/v0/e` and `/batch/` on `us.i.posthog.com`, `eu.i.posthog.com` or a self-hosted domain; every event needs the project token, `distinct_id` and `event`; `$process_person_profile: false` with a random ID makes an anonymous event; IP data capture is set per organization and project, and EU organizations start with it off; GeoIP is a transformation a project adds; `$exception` with `$exception_list` takes raw frames with `platform: "custom"`, `lang` and `function` |
+| 2026-10-29 | PostHog takes the reports as designed (two claims corrected 2026-11-11) | PostHog's documentation: "Capture and batch API endpoints" (`/docs/api/capture`), "Data collection" (`/docs/privacy/data-collection`), "GeoIP" (`/docs/cdp/geoip-enrichment`), error tracking's manual capture (`/docs/error-tracking/installation/manual`) | `/i/v0/e` and `/batch/` on `us.i.posthog.com`, `eu.i.posthog.com` or a self-hosted domain; every event needs the project token, `distinct_id` and `event`; `$process_person_profile: false` with a random ID makes an anonymous event; IP data capture is set per organization and project, and EU organizations start with it off; GeoIP is a transformation a project adds; `$exception` with `$exception_list` takes raw frames with `platform: "custom"`, `lang` and `function` |
 | 2026-10-29 | An installed build is told from a development build | `studio_settings::is_release_build` and its test `only_an_installed_build_is_a_release_build` | A build directory, a test binary or a bundle under `target/` is not a release build |
+| 2026-11-11 | PostHog US Cloud takes the reports as designed, and the 2026-10-29 row holds for it | PostHog's documentation read whole for US Cloud (the `.md` of each page): capture (`/docs/api/capture`), API (`/docs/api`), anonymous events, sessions (`/docs/data/sessions`), timestamps, ingestion warnings, data collection, data storage, GDPR compliance (`/docs/privacy/gdpr-compliance`), transformations, events retention, projects settings, error tracking (manual capture, fingerprints, Rust), the Rust SDK reference, pricing, the DPA | `/batch/` on `us.i.posthog.com`, body under 20 MB, events under 1 MB, gzip; no request rate limit, 200 does not mean ingested; a US organization's projects capture IP until set by hand; GeoIP enrichment is on by default and survives discarding the IP; transformations skip exceptions; a custom session ID must be a UUIDv7; Free keeps events 1 year, unchangeable; moving regions is a migration on top plans only. Three claims corrected (Corrections) |
 
 ## Corrections
 
-None yet.
+- 2026-11-11: "IP data capture … which an EU organization's projects start with" applied to EU
+  Cloud; on US Cloud the project is set to discard client IP data by hand.
+- 2026-11-11: "GeoIP is a transformation a project adds" was wrong: PostHog enriches events with
+  GeoIP by default, before the IP is dropped. The project turns it off, and each report sets
+  `$geoip_disable: true`.
+- 2026-11-11: The session ID was a UUID version 4; PostHog counts a custom session ID only when it
+  is a UUIDv7, so it is one, renewed after 24 hours.
+- 2026-11-11: "Anything else is retried" would have retried a refused batch for 7 days; only a
+  timeout, a 429 or a 5xx is retried now.
+- 2026-11-11: The SDK was rejected partly because "SDKs gather device and environment data by
+  default"; PostHog's Rust SDK documents no such default, so the reason now rests on its own HTTP
+  stack and its free-form properties.
