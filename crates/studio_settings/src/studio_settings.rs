@@ -1496,8 +1496,9 @@ mod tests {
             ),
             "a bundle built here is never replaced by a release"
         );
+        // A folder of its own: another test makes and deletes `studio-build-dir-<pid>` meanwhile.
         let elsewhere =
-            std::env::temp_dir().join(format!("studio-build-dir-{}", std::process::id()));
+            std::env::temp_dir().join(format!("studio-release-dir-{}", std::process::id()));
         std::fs::create_dir_all(&elsewhere).unwrap();
         std::fs::write(elsewhere.join("CACHEDIR.TAG"), "Signature").unwrap();
         let bundle = elsewhere.join("bundle/Omnigraph Studio.app/Contents/MacOS/omnigraph-studio");
