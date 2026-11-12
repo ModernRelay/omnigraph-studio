@@ -79,4 +79,74 @@ pub fn init(cx: &mut App) {
     );
     cx.set_http_client(http.clone());
     ConnectionRegistry::init(http, cx);
+    record_connection_changes(cx);
+}
+
+/// Where a server is, for telemetry (spec 018): a managed cluster, this machine, or elsewhere.
+/// Only the class leaves Studio, never the address.
+pub fn server_class(server: &connection::ServerEntry) -> studio_telemetry::ServerClass {
+    if server.source == connection::ServerSource::ControlPlane {
+        return studio_telemetry::ServerClass::Managed;
+    }
+    let host = server
+        .url
+        .split("://")
+        .nth(1)
+        .unwrap_or(&server.url)
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    let host = host.rsplit_once(':').map_or(host, |(name, port)| {
+        if port.chars().all(|c| c.is_ascii_digit()) {
+            name
+        } else {
+            host
+        }
+    });
+    if matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1") || host.ends_with(".localhost") {
+        studio_telemetry::ServerClass::Local
+    } else {
+        studio_telemetry::ServerClass::Remote
+    }
+}
+
+/// Records each connection's change to a state worth counting, once per change (spec 018).
+fn record_connection_changes(cx: &mut App) {
+    cx.observe_new(
+        |_: &mut Connection, _, cx: &mut gpui::Context<Connection>| {
+            let mut last: Option<studio_telemetry::ConnectionState> = None;
+            cx.subscribe_self(
+                move |connection: &mut Connection, event: &ConnectionEvent, _| {
+                    if !matches!(event, ConnectionEvent::StateChanged) {
+                        return;
+                    }
+                    let state = match connection.state {
+                        ConnectionState::Ready => studio_telemetry::ConnectionState::Ready,
+                        ConnectionState::Unauthorized => {
+                            studio_telemetry::ConnectionState::Unauthorized
+                        }
+                        ConnectionState::Unreachable(_) => {
+                            studio_telemetry::ConnectionState::Unreachable
+                        }
+                        ConnectionState::ContractMismatch { .. } => {
+                            studio_telemetry::ConnectionState::ContractMismatch
+                        }
+                        ConnectionState::Idle | ConnectionState::Connecting => return,
+                    };
+                    if last.replace(state) == Some(state) {
+                        return;
+                    }
+                    studio_telemetry::record(studio_telemetry::Event::ConnectionChanged {
+                        state,
+                        round_trip: connection
+                            .latency
+                            .filter(|_| state == studio_telemetry::ConnectionState::Ready)
+                            .map(studio_telemetry::DurationBucket::of),
+                    });
+                },
+            )
+            .detach();
+        },
+    )
+    .detach();
 }

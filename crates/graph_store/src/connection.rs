@@ -2165,6 +2165,9 @@ impl Connection {
         let first_failure =
             health.is_err() && self.state == ConnectionState::Ready && self.latency.is_some();
         let latency = health.is_ok().then_some(latency);
+        if let Some(latency) = latency {
+            studio_telemetry::note_round_trip(latency);
+        }
         // Shown in whole milliseconds, so a change under one is not a change.
         if latency.map(|l| l.as_millis()) != self.latency.map(|l| l.as_millis()) {
             self.latency = latency;

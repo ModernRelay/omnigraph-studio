@@ -30,7 +30,7 @@ const KEYMAPS: [(&str, &str); 3] = [
 
 /// The actions without a default key, as in Zed: rare, or destructive enough that a key would
 /// be reached by accident. Each is in the command palette, and most in a menu as well.
-const PALETTE_ONLY: [&str; 28] = [
+const PALETTE_ONLY: [&str; 33] = [
     "studio_graph::OpenAsReview",
     "studio_graph::OpenAsHistory",
     "studio_graph::OpenAsTable",
@@ -61,6 +61,12 @@ const PALETTE_ONLY: [&str; 28] = [
     "studio_update::RestartToUpdate",
     "studio_update::DownloadUpdate",
     "studio_update::ViewReleaseNotes",
+    // Rare: telemetry's choices and its log, also in Settings and the status bar (spec 018).
+    "studio_telemetry::ViewTelemetryLog",
+    "studio_telemetry::ChooseUsageSharing",
+    "studio_telemetry::SendCrashReport",
+    "studio_telemetry::ResetTelemetryId",
+    "studio_telemetry::WhatStudioSends",
 ];
 
 /// The platform's command modifier, as keymaps write it.

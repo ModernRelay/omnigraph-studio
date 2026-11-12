@@ -19,6 +19,7 @@ LAYERS = {
     "studio_ui": 2,
     "graph_store": 3,
     "studio_update": 3,
+    "studio_telemetry": 2,
     "filter_words": 3,
     "studio_workspace": 4,
     "change_cards": 4,

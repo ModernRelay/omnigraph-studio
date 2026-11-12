@@ -828,6 +828,8 @@ pub struct AgentPanel {
     /// Whether the tab last said it holds unsaved work ([`AgentPanel::holds_work`]): the tab
     /// is told when that changes, not at every change.
     dirty: bool,
+    /// When the turn under way began and how many tools it called, for telemetry (spec 018).
+    turn: Option<(std::time::Instant, u64)>,
     /// The agent's replies as rendered markdown, by entry index, with how much of the text each
     /// has taken in; a streaming reply appends its new tail.
     markdown: std::collections::HashMap<usize, (Entity<Markdown>, usize)>,
@@ -1067,6 +1069,7 @@ impl AgentPanel {
             workspace,
             sessions,
             dirty: false,
+            turn: None,
             focus_handle,
             composer,
             has_draft: false,
@@ -1643,6 +1646,17 @@ impl AgentPanel {
                 }));
             }
             HostEvent::TurnEnded { stop } => {
+                if let Some((started, calls)) = self.turn.take() {
+                    studio_telemetry::record(studio_telemetry::Event::AgentTurnFinished {
+                        outcome: match &stop {
+                            Ok(StopReason::Cancelled) => studio_telemetry::TurnOutcome::Stopped,
+                            Ok(_) => studio_telemetry::TurnOutcome::Done,
+                            Err(_) => studio_telemetry::TurnOutcome::Failed,
+                        },
+                        duration: studio_telemetry::DurationBucket::of(started.elapsed()),
+                        tool_calls: studio_telemetry::CountBucket::of(calls),
+                    });
+                }
                 // A tool still shown running when the turn ends is not running: the turn
                 // finished it, or stopping, failing or leaving cut it short. Either way its
                 // spinner stops, so an idle thread never animates.
@@ -1765,6 +1779,9 @@ impl AgentPanel {
                 }
             }
             SessionUpdate::ToolCall(call) => {
+                if let Some((_, calls)) = self.turn.as_mut() {
+                    *calls += 1;
+                }
                 self.entries.push(Entry::Tool {
                     id: call.tool_call_id.to_string(),
                     title: call.title,
@@ -1989,6 +2006,7 @@ impl AgentPanel {
                 });
             }
             self.entries.push(Entry::User(text));
+            self.turn = Some((std::time::Instant::now(), 0));
             self.state = State::Prompting { agent };
             self.thread.scroll_to_end();
             cx.notify();

@@ -14,6 +14,7 @@ mod menus;
 mod open_graph;
 mod organizations;
 mod settings_view;
+mod telemetry_status;
 mod update_status;
 
 use std::collections::HashSet;
@@ -46,6 +47,10 @@ pub fn init(cx: &mut App) {
     studio_workspace::models::Models::init(cx);
     // After `graph_store`, whose HTTP client it sends through (spec 017).
     studio_update::init(cx);
+    // After `graph_store`, whose HTTP client it sends through, and before any window, so a
+    // crash report the last run left is offered at once (spec 018).
+    studio_telemetry::init(cx);
+    init_telemetry_actions(cx);
     keymaps::load(cx);
 
     command_palette::init(cx);
@@ -181,9 +186,24 @@ pub fn init(cx: &mut App) {
         });
         if let Some(updater) = Updater::global(cx) {
             let status = cx.new(|cx| update_status::UpdateStatus::new(updater.clone(), cx));
-            workspace.set_status_item(
+            workspace.add_status_item(
                 status.into(),
                 move |cx| update_status::says_something(updater.read(cx)),
+                cx,
+            );
+        }
+        if let Some(telemetry) = studio_telemetry::Telemetry::global(cx) {
+            let crash = cx.new(|cx| telemetry_status::CrashStatus::new(telemetry.clone(), cx));
+            let asked = telemetry.clone();
+            workspace.add_status_item(
+                crash.into(),
+                move |cx| telemetry_status::offers_a_crash_report(&asked, cx),
+                cx,
+            );
+            let usage = cx.new(|cx| telemetry_status::UsageStatus::new(telemetry.clone(), cx));
+            workspace.add_status_item(
+                usage.into(),
+                move |cx| telemetry_status::asks_about_usage(&telemetry, cx),
                 cx,
             );
         }
@@ -295,16 +315,111 @@ const KEPT_SIGN_IN_PATIENCE: Duration = Duration::from_secs(5);
 /// for a graph. The CLI's targets are listed off the main thread
 /// ([`ConnectionRegistry::when_listed`]), so the saved windows open at once, where they were,
 /// and take their graphs once the targets are listed.
+/// Records Studio's start, with how many windows it restored, while usage is shared.
+fn record_start(windows_restored: usize, cx: &App) {
+    let first_start_of_version = studio_telemetry::Telemetry::global(cx)
+        .is_some_and(|telemetry| telemetry.read(cx).first_start_of_version());
+    studio_telemetry::record(studio_telemetry::Event::AppStarted {
+        first_start_of_version,
+        windows_restored: studio_telemetry::CountBucket::of(windows_restored as u64),
+    });
+}
+
+/// The palette's telemetry actions (spec 018): app-wide, as Settings and the status bar offer
+/// the same choices.
+fn init_telemetry_actions(cx: &mut App) {
+    use studio_actions::telemetry::{
+        ChooseUsageSharing, ResetTelemetryId, SendCrashReport, ViewTelemetryLog, WhatStudioSends,
+    };
+    cx.on_action(|_: &WhatStudioSends, cx| cx.open_url(telemetry_status::WHAT_STUDIO_SENDS));
+    // Choosing from the palette opens Settings at the choice; the status bar asks in place.
+    cx.on_action(|_: &ChooseUsageSharing, cx| {
+        cx.defer(|cx| {
+            if let Some(handle) = link_window(cx).and_then(|w| w.downcast::<Workspace>()) {
+                handle
+                    .update(cx, |workspace, window, cx| {
+                        open_settings(workspace, window, cx)
+                    })
+                    .ok();
+            }
+        });
+    });
+    cx.on_action(|_: &SendCrashReport, cx| {
+        if let Some(telemetry) = studio_telemetry::Telemetry::global(cx) {
+            telemetry.update(cx, |telemetry, cx| telemetry.send_crashes(cx));
+        }
+    });
+    cx.on_action(|_: &ResetTelemetryId, cx| {
+        if let Some(telemetry) = studio_telemetry::Telemetry::global(cx) {
+            telemetry.update(cx, |telemetry, cx| telemetry.reset_id(cx));
+        }
+    });
+    // The log as JSON in a file, opened in the system's viewer: every report held and every one
+    // sent in the last 7 days. Written off the main thread.
+    cx.on_action(|_: &ViewTelemetryLog, cx| {
+        let Some(telemetry) = studio_telemetry::Telemetry::global(cx) else {
+            return;
+        };
+        let telemetry = telemetry.read(cx);
+        let log = telemetry.log();
+        let file = telemetry.store().dir().join("log.json");
+        cx.spawn(async move |cx| {
+            let written = cx
+                .background_spawn({
+                    let file = file.clone();
+                    async move {
+                        if let Some(dir) = file.parent() {
+                            std::fs::create_dir_all(dir)?;
+                        }
+                        let text =
+                            serde_json::to_vec_pretty(&log).map_err(std::io::Error::other)?;
+                        studio_settings::write_atomic(
+                            &file,
+                            &text,
+                            studio_settings::Access::Private,
+                        )
+                    }
+                })
+                .await;
+            cx.update(|cx| match written {
+                Ok(()) => cx.open_with_system(&file),
+                Err(error) => tell(
+                    cx,
+                    ToastKind::Error,
+                    format!("The telemetry log could not be written: {error}"),
+                ),
+            });
+        })
+        .detach();
+    });
+    studio_actions::offered::when::<SendCrashReport>(
+        |cx| {
+            studio_telemetry::Telemetry::global(cx)
+                .is_some_and(|telemetry| !telemetry.read(cx).waiting_crashes().is_empty())
+        },
+        cx,
+    );
+    studio_actions::offered::when::<ResetTelemetryId>(
+        |cx| {
+            studio_telemetry::Telemetry::global(cx)
+                .is_some_and(|telemetry| telemetry.read(cx).store().has_install_id())
+        },
+        cx,
+    );
+}
+
 pub fn open_windows(cx: &mut App) {
     if environment_graph(cx).is_some() {
         // A run for the environment's graph opens that alone, and keeps the windows the last
         // ordinary run saved for the next one.
         studio_workspace::keep_saved_windows(cx);
+        record_start(0, cx);
         cx.open_window(window_options(None, cx), build_workspace)
             .ok();
         return;
     }
     let saved = studio_workspace::load_windows();
+    record_start(saved.len(), cx);
     if saved.is_empty() {
         cx.open_window(window_options(None, cx), build_workspace)
             .ok();

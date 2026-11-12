@@ -318,7 +318,7 @@ struct FocusMode {
     made_fullscreen: bool,
 }
 
-/// The view at the right of the status bar ([`Workspace::set_status_item`]), and whether it
+/// A view at the right of the status bar ([`Workspace::add_status_item`]), and whether it
 /// has anything to say now.
 struct StatusItem {
     view: AnyView,
@@ -398,7 +398,8 @@ pub struct Workspace {
     /// default), read every two seconds while the window is in front.
     performance: Option<Performance>,
     /// A view of the window's own at the right of the status bar: the updater's (spec 017).
-    status_item: Option<StatusItem>,
+    /// The window's own items, in the order added (the updater's, telemetry's consent).
+    status_items: Vec<StatusItem>,
     /// Whether this window is in front, which the memory and CPU reading waits for.
     window_active: bool,
     _performance: Option<Task<()>>,
@@ -717,7 +718,7 @@ impl Workspace {
             server_notices: Vec::new(),
             _settings_subscription: settings_subscription,
             performance: None,
-            status_item: None,
+            status_items: Vec::new(),
             window_active: window.is_window_active(),
             _performance: None,
             _performance_subscription: performance_subscription,
@@ -789,6 +790,9 @@ impl Workspace {
                         return;
                     }
                     let sample = process_stats::Sample::now();
+                    if let Some((bytes, _)) = sample.memory {
+                        studio_telemetry::note_memory(bytes);
+                    }
                     this.performance = Some(Performance::next(this.performance.as_ref(), sample));
                     cx.notify();
                 });
@@ -2498,13 +2502,13 @@ impl Workspace {
     /// The view drawn at the right of the status bar in every state, with the memory and CPU
     /// readout on the window's side of its rule: the updater's (spec 017). `shown` says whether
     /// it has anything to say now; while it has not, it and its rule take no room.
-    pub fn set_status_item(
+    pub fn add_status_item(
         &mut self,
         view: AnyView,
         shown: impl Fn(&App) -> bool + 'static,
         cx: &mut Context<Self>,
     ) {
-        self.status_item = Some(StatusItem {
+        self.status_items.push(StatusItem {
             view,
             shown: Box::new(shown),
         });
@@ -4363,13 +4367,14 @@ impl Workspace {
             .children(status.start);
         let has_end = !status.end.is_empty();
         let performance = self.render_performance();
-        let item = self
-            .status_item
-            .as_ref()
+        let items: Vec<AnyView> = self
+            .status_items
+            .iter()
             .filter(|item| (item.shown)(cx))
-            .map(|item| item.view.clone());
-        // The window's side of the bar: its own item and the memory and CPU readout.
-        let readout = item.is_some() || performance.is_some();
+            .map(|item| item.view.clone())
+            .collect();
+        // The window's side of the bar: its own items and the memory and CPU readout.
+        let readout = !items.is_empty() || performance.is_some();
         // Zed's 4 px between the left side's items, which are chips with padding of their own;
         // the right side's are bare text, so they keep 8 px, and a rule sets the window's
         // readout apart from the tab's facts. Bare text also needs more room at the bar's end
@@ -4418,7 +4423,7 @@ impl Workspace {
             .when(has_end && readout, |bar| {
                 bar.child(studio_ui::ds::divider_v(cx))
             })
-            .children(item)
+            .children(items)
             .children(performance);
         h_flex()
             .id("status-bar")
@@ -6557,7 +6562,7 @@ mod tests {
         workspace.update(cx, |workspace, cx| {
             let probe = cx.new(|_| StatusProbe);
             let shown = says.clone();
-            workspace.set_status_item(probe.into(), move |_| shown.get(), cx);
+            workspace.add_status_item(probe.into(), move |_| shown.get(), cx);
         });
         cx.run_until_parked();
         assert!(cx.debug_bounds("status-probe").is_some());

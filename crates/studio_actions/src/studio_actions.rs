@@ -965,6 +965,25 @@ pub mod update {
         ]
     );
 }
+pub mod telemetry {
+    use gpui::actions;
+
+    actions!(
+        studio_telemetry,
+        [
+            /// Show every telemetry report Studio holds, and every one sent in the last 7 days.
+            ViewTelemetryLog,
+            /// Choose whether to share anonymous usage data.
+            ChooseUsageSharing,
+            /// Show the report of the crash Studio had, to send it or not.
+            SendCrashReport,
+            /// Replace the random ID Studio sends with usage data by a new one.
+            ResetTelemetryId,
+            /// Open the list of everything Studio may send.
+            WhatStudioSends,
+        ]
+    );
+}
 /// When an app-wide action is offered (constitution VIII). An action registered with
 /// `App::on_action` is available in every window and from the app menu with none in front,
 /// which GPUI cannot make conditional; one that runs only in some states says so here, and the

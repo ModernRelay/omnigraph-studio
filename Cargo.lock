@@ -203,6 +203,7 @@ dependencies = [
  "smol",
  "studio_actions",
  "studio_settings",
+ "studio_telemetry",
  "studio_theme",
  "studio_ui",
  "studio_workspace",
@@ -4070,6 +4071,7 @@ dependencies = [
  "serde_json",
  "smol",
  "studio_settings",
+ "studio_telemetry",
  "studio_ui",
  "url",
  "zed-reqwest",
@@ -7745,6 +7747,7 @@ dependencies = [
  "serde_json",
  "studio_actions",
  "studio_settings",
+ "studio_telemetry",
  "studio_theme",
  "studio_ui",
  "studio_workspace",
@@ -9528,6 +9531,7 @@ dependencies = [
  "smol",
  "studio_actions",
  "studio_settings",
+ "studio_telemetry",
  "studio_theme",
  "studio_ui",
  "studio_update",
@@ -9563,6 +9567,24 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "settings",
+]
+
+[[package]]
+name = "studio_telemetry"
+version = "0.4.4"
+dependencies = [
+ "chrono",
+ "flate2",
+ "futures",
+ "gpui",
+ "http_client",
+ "log",
+ "schemars 1.0.4",
+ "serde",
+ "serde_json",
+ "studio_settings",
+ "tempfile",
+ "uuid",
 ]
 
 [[package]]
@@ -9615,6 +9637,7 @@ dependencies = [
  "serde",
  "serde_json",
  "studio_settings",
+ "studio_telemetry",
  "tar",
  "tempfile",
 ]
@@ -9636,6 +9659,7 @@ dependencies = [
  "serde_json",
  "studio_actions",
  "studio_settings",
+ "studio_telemetry",
  "studio_theme",
  "studio_ui",
  "theme_settings",

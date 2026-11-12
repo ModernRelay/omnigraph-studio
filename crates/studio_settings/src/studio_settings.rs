@@ -198,6 +198,51 @@ pub struct StudioOptions {
     /// macOS, ready at the next restart. Off, Studio checks only when asked.
     #[schemars(title = "Update automatically", extend("x-section" = "Updates"))]
     pub auto_update: bool,
+    /// What Studio sends to help improve it (spec 018). Never a graph's names, queries, values
+    /// or server addresses; nothing from a development build, or while `DO_NOT_TRACK` or
+    /// `OMNIGRAPH_STUDIO_TELEMETRY=0` is set.
+    #[schemars(extend("x-section" = "Privacy"))]
+    pub telemetry: TelemetryOptions,
+}
+
+/// Studio's two telemetry switches (spec 018).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct TelemetryOptions {
+    /// What happens to a report of a crash: Studio asks at the next start, sends it, or deletes
+    /// it.
+    #[schemars(title = "Crash reports")]
+    pub crash_reports: CrashReports,
+    /// Which features are used and how fast Studio is, never what they were used on. Until it
+    /// is chosen, nothing is recorded.
+    #[schemars(title = "Share usage data")]
+    pub usage: UsageSharing,
+}
+
+/// What Studio does with a crash report (spec 018).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CrashReports {
+    /// Ask at the next start, showing the report.
+    #[default]
+    Ask,
+    /// Send each report without asking.
+    Always,
+    /// Delete each report unsent.
+    Never,
+}
+
+/// Whether Studio shares anonymous usage data (spec 018): not until the person chooses.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageSharing {
+    /// Not chosen yet: nothing is recorded, and the status bar asks.
+    #[default]
+    NotChosen,
+    /// Share anonymous usage data and a daily performance summary.
+    Share,
+    /// Share nothing.
+    DontShare,
 }
 
 impl Default for StudioOptions {
@@ -213,6 +258,7 @@ impl Default for StudioOptions {
             health_check_seconds: 30,
             show_performance: true,
             auto_update: true,
+            telemetry: TelemetryOptions::default(),
         }
     }
 }

@@ -1,6 +1,6 @@
 # 018: Telemetry, with consent
 
-Status: draft · 2026-10-29 · reports go to PostHog (decided 2026-10-29), US Cloud (decided 2026-11-11)
+Status: step 1 built 2026-11-11 · 2026-10-29 · reports go to PostHog (decided 2026-10-29), US Cloud (decided 2026-11-11)
 
 ## Problem
 
@@ -237,6 +237,36 @@ the crash report builders. It depends on `studio_settings` and on `http_client` 
 client; feature crates depend on it only to call `record`. The panic hook in
 `crates/studio/src/logging.rs` calls into it to keep a crash report.
 
+### Build order
+
+1. *Built 2026-11-11.* The `studio_telemetry` crate (layer 2, so `graph_store` and the
+   features record into it): the catalog and its free-text test, the buckets, the queue, the
+   pending and sent files, the uploader with the retry rules, panic and macOS crash reports,
+   `docs/telemetry.md` generated from the catalog. The settings (`studio.telemetry`), the two
+   status bar items and their popovers, the panic hook's report, the palette's actions, and
+   the events `app_started`, `graph_opened`, `query_ran`, `write_finished`,
+   `connection_changed`, `agent_turn_finished`, `update` and `daily_summary`.
+2. The `action` event (every action's name and how it was invoked), once GPUI is checked for
+   one place that sees every dispatch; the log as a tab of its own; Reset ID and the log as
+   buttons in Settings, Privacy; native crash reports on Linux and Windows (Deferred).
+
+What step 1 changed from the design above:
+
+- **Settings.** `studio.telemetry.usage` is a choice, `not_chosen` (the default), `share` or
+  `dont_share`, rather than a `bool` that is absent until chosen: the settings tab draws a
+  choice, and a choice says "not chosen" where an absent value says nothing.
+- **`write_finished`.** Its `kind` is what `graph_store` knows of a write, `mutation`,
+  `stored_query`, `blob`, `branch` or `merge`, rather than the feature that made it (a cell,
+  a bulk set, drafts, an insert, a delete), which reaches `graph_store` as a mutation; its
+  outcomes add `held` (a proposal or a snapshot). It carries no row count: the log holds none.
+- **The log.** View Telemetry Log writes every report held and every one sent in the last 7
+  days to `telemetry/log.json` and opens it in the system's viewer, for now (step 2).
+- **The token** is the repository variable `OMNIGRAPH_STUDIO_POSTHOG_TOKEN`, compiled in by
+  the release workflow (`option_env!`); a build without it is blocked as `NoToken` and asks
+  nothing.
+- **Duplicates.** Each event carries a UUIDv7 as PostHog's `uuid`, so a batch sent twice after
+  an answer that never came is counted once.
+
 ### Limits
 
 | What | Limit |
@@ -311,6 +341,7 @@ client; feature crates depend on it only to call `record`. The panic hook in
 | 2026-10-29 | PostHog takes the reports as designed (two claims corrected 2026-11-11) | PostHog's documentation: "Capture and batch API endpoints" (`/docs/api/capture`), "Data collection" (`/docs/privacy/data-collection`), "GeoIP" (`/docs/cdp/geoip-enrichment`), error tracking's manual capture (`/docs/error-tracking/installation/manual`) | `/i/v0/e` and `/batch/` on `us.i.posthog.com`, `eu.i.posthog.com` or a self-hosted domain; every event needs the project token, `distinct_id` and `event`; `$process_person_profile: false` with a random ID makes an anonymous event; IP data capture is set per organization and project, and EU organizations start with it off; GeoIP is a transformation a project adds; `$exception` with `$exception_list` takes raw frames with `platform: "custom"`, `lang` and `function` |
 | 2026-10-29 | An installed build is told from a development build | `studio_settings::is_release_build` and its test `only_an_installed_build_is_a_release_build` | A build directory, a test binary or a bundle under `target/` is not a release build |
 | 2026-11-11 | PostHog US Cloud takes the reports as designed, and the 2026-10-29 row holds for it | PostHog's documentation read whole for US Cloud (the `.md` of each page): capture (`/docs/api/capture`), API (`/docs/api`), anonymous events, sessions (`/docs/data/sessions`), timestamps, ingestion warnings, data collection, data storage, GDPR compliance (`/docs/privacy/gdpr-compliance`), transformations, events retention, projects settings, error tracking (manual capture, fingerprints, Rust), the Rust SDK reference, pricing, the DPA | `/batch/` on `us.i.posthog.com`, body under 20 MB, events under 1 MB, gzip; no request rate limit, 200 does not mean ingested; a US organization's projects capture IP until set by hand; GeoIP enrichment is on by default and survives discarding the IP; transformations skip exceptions; a custom session ID must be a UUIDv7; Free keeps events 1 year, unchangeable; moving regions is a migration on top plans only. Three claims corrected (Corrections) |
+| 2026-11-11 | Step 1 records, keeps and sends as designed | `studio_telemetry` (21 tests): `no_report_field_holds_free_text`, `docs_telemetry_md_matches_the_catalog`, `nothing_is_recorded_until_usage_is_shared`, `a_shared_event_is_sent_anonymously_and_logged` (gzipped batch, `api_key`, `sent_at`, `$process_person_profile: false`, `$geoip_disable: true`), `a_server_error_is_retried_and_a_refusal_is_not`, `turning_usage_off_deletes_its_reports_and_the_id`, `a_crash_report_waits_for_an_answer_then_goes_as_an_exception`, `never_sending_crash_reports_deletes_them`, `a_blocked_build_sends_nothing`, the backtrace, home-folder and `.ips` tests; the workspace's tests and clippy | Pass. Not yet sent to a real PostHog project: none exists yet, and its IP and GeoIP settings are still to be set by hand (Open question 7 waits on it) |
 
 ## Corrections
 

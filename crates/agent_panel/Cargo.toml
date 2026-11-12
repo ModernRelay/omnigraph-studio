@@ -32,6 +32,7 @@ serde_json = { workspace = true }
 smol = { workspace = true }
 studio_actions = { workspace = true }
 studio_settings = { workspace = true }
+studio_telemetry = { workspace = true }
 studio_ui = { workspace = true }
 studio_workspace = { workspace = true }
 ui = { workspace = true }

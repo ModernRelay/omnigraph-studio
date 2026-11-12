@@ -3334,6 +3334,22 @@ impl QueryEditor {
 
     /// Shows a read's answer, its rows already built ([`BuiltRows`]).
     fn show_read(&mut self, prepared: Prepared, sent: ReadAt, answer: Answer, elapsed: Duration) {
+        let (outcome, rows) = match &answer {
+            Answer::Plan(output) | Answer::Rows(output, _) => {
+                (studio_telemetry::QueryOutcome::Ok, output.row_count as u64)
+            }
+            Answer::Refused(_) => (studio_telemetry::QueryOutcome::Refused, 0),
+        };
+        studio_telemetry::record(studio_telemetry::Event::QueryRan {
+            kind: if prepared.write {
+                studio_telemetry::QueryKind::Mutation
+            } else {
+                studio_telemetry::QueryKind::Read
+            },
+            outcome,
+            duration: studio_telemetry::DurationBucket::of(elapsed),
+            rows: studio_telemetry::CountBucket::of(rows),
+        });
         let note = match &answer {
             Answer::Plan(output) | Answer::Rows(output, _) => RunNote {
                 text: format!(
