@@ -10,7 +10,7 @@ The UI is built on [GPUI](https://github.com/zed-industries/zed/tree/main/crates
 Rust UI framework from Zed, with its editor, UI and theme crates. GPUI draws every frame on the
 GPU, through Metal on macOS and Vulkan (wgpu) on Linux; there is no web view or browser engine.
 
-![Studio opening a person from the Person table as a page, exploring their relationships on the canvas and in the tree, catching a typo in a query before it runs, then switching to a branch whose table shows the added, changed and removed rows inline and reviewing those changes before the merge](docs/images/demo.gif)
+![Studio switching the Person table to a branch, whose rows show what it adds, changes and removes inline, then opening a person as a page, exploring their relationships on the canvas and in the tree, catching a typo in a query before it runs, and reviewing the branch's changes before the merge](docs/images/demo.gif)
 
 ## Download
 
@@ -226,6 +226,11 @@ OMNIGRAPH_STUDIO_SERVER=http://127.0.0.1:8787 OMNIGRAPH_STUDIO_TOKEN=dev-token \
   'studio_graph::OpenType={"type_name":"Person"}'
 ```
 
+The same tool records the demo above: `script/dev-server`, then `script/demo-video`, which
+records the story in `demo/story.steps` and frames it with Remotion. See
+[`docs/demo-video.md`](docs/demo-video.md) for what to install, how to change the story, and how
+to put a new video in this README.
+
 Each feature has a plan in [`specs/`](specs/README.md): the design, the alternatives rejected,
 what is deferred, and a dated validation log of the checks behind each claim.
 
@@ -237,7 +242,8 @@ what is deferred, and a dated validation log of the checks behind each claim.
 | `crates/` | The workspace; `crates/studio` is the binary |
 | `grammars/` | Tree-sitter grammars for `.gq` and `.pg` |
 | `assets/` | Default keymaps and settings |
-| `script/` | Dev server, sample data, bundling, release files, layer and spelling checks |
+| `script/` | Dev server, sample data, demo video, bundling, release files, layer and spelling checks |
+| `demo/` | The demo video's Remotion project and story |
 
 ## Status
 
