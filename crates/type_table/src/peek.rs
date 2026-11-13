@@ -55,7 +55,7 @@ pub const NEIGHBOUR_LIMIT: u32 = 8;
 
 /// Neighbours a page reads at a time under each relationship group, with "Show more" for the
 /// next (constitution IX).
-const PAGE_NEIGHBOURS: u32 = 50;
+pub(crate) const PAGE_NEIGHBOURS: u32 = 50;
 
 /// The widest a page's text runs: the design system's reading width, as settings' is.
 const PAGE_WIDTH: f32 = studio_ui::ds::size::READING_WIDTH;

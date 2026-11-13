@@ -15386,6 +15386,200 @@ mod tests {
         });
     }
 
+    /// People and companies with four relationships between them: a Person has six groups.
+    const CIRCLE: &str = "node Person {\n  slug: String @key\n  name: String\n}\nnode Company {\n  slug: String @key\n  name: String\n}\nedge WorksAt: Person -> Company\nedge Founded: Person -> Company\nedge Knows: Person -> Person\nedge Likes: Person -> Person\n";
+
+    /// Ada works at one company, knows Grace and is known by Edsger: three of her six groups
+    /// have neighbours.
+    fn circle() -> crate::test_support::Graph {
+        crate::test_support::Graph {
+            nodes: vec![
+                ("Person", "p1", "Ada"),
+                ("Person", "p2", "Grace"),
+                ("Person", "p3", "Edsger"),
+                ("Company", "c1", "Analytical Engines"),
+                ("Company", "c2", "Navy"),
+            ],
+            edges: vec![
+                ("WorksAt", "w1", "p1", "c1"),
+                ("WorksAt", "w2", "p2", "c2"),
+                ("Knows", "k1", "p1", "p2"),
+                ("Knows", "k2", "p3", "p1"),
+            ],
+        }
+    }
+
+    /// The requests the ledger saw sent, by query name.
+    fn sent_by_name(
+        session: &Entity<GraphSession>,
+        cx: &mut VisualTestContext,
+    ) -> std::collections::BTreeMap<String, u64> {
+        session.read_with(cx, |session, _| {
+            let mut sent = std::collections::BTreeMap::new();
+            for ((what, _, answered), tally) in session.ledger().tallies() {
+                if answered.sent() {
+                    *sent.entry(what.to_string()).or_default() += tally.count;
+                }
+            }
+            sent
+        })
+    }
+
+    /// The ledger's measure of opening a table, a row's page and then the row's peek (spec
+    /// 030, part 5, "Seeding before prefetch"). The page reads only the groups the table did not
+    /// count empty: before, it sent one `studio_neighbours` for each of Ada's six groups; now
+    /// three, the other three answered with no rows from the table's counts of 0. Each answer
+    /// the page is given, sent or not, is byte for byte what the server answers to the page's own
+    /// query at that commit.
+    #[gpui::test]
+    async fn the_ledger_of_a_table_a_rows_page_and_its_peek(cx: &mut TestAppContext) {
+        use graph_store::ledger::Answered;
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let graph = std::sync::Arc::new(circle());
+        let (answers, sent) = (
+            graph.clone(),
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        );
+        let asked = sent.clone();
+        let (session, _writer) = session_followed(
+            CIRCLE,
+            move |read| {
+                asked.lock().unwrap().push(read.clone());
+                answers.answer(read)
+            },
+            cx,
+        );
+        let mut app = cx.clone();
+        let table_session = session.clone();
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                table_session,
+                "Person".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        // The table: its page, then each of its six relationship columns counted and listed.
+        let table_sent = sent_by_name(&session, cx);
+        assert_eq!(
+            table_sent.get("studio_page_degrees"),
+            Some(&6),
+            "{table_sent:?}"
+        );
+        assert_eq!(
+            table_sent.get("studio_page_neighbours"),
+            Some(&6),
+            "{table_sent:?}"
+        );
+
+        session.update(cx, |session, _| session.ledger_mut().clear());
+        sent.lock().unwrap().clear();
+        let page_session = session.clone();
+        let (_page, page_cx) = app.add_window_view(move |_, cx| {
+            NodePeek::page(page_session, "Person".into(), "p1".into(), None, cx)
+        });
+        page_cx.run_until_parked();
+        session.read_with(cx, |session, _| {
+            let ledger = session.ledger();
+            let table = ledger.table();
+            let seeded = |what| ledger.count(what, |a| a == Answered::Seeded);
+            assert_eq!(seeded("studio_node"), 1, "{table}");
+            assert_eq!(ledger.count("studio_node", |a| a.sent()), 0, "{table}");
+            assert_eq!(seeded("studio_neighbours"), 3, "{table}");
+            assert_eq!(
+                ledger.count("studio_neighbours", |a| a.sent()),
+                3,
+                "{table}"
+            );
+            assert_eq!(ledger.sent(), 3, "{table}");
+        });
+
+        // The page's own query for each group, read at the page's commit, is the server's
+        // answer to it there: those it sent are among them, and those it did not have no rows.
+        let page_sent: Vec<Value> = sent.lock().unwrap().clone();
+        let schema = session.read_with(cx, |session, _| session.schema_model().unwrap());
+        let mut seeded = Vec::new();
+        for group in schema.relationships_of("Person") {
+            let query = builder::neighbours(
+                &schema,
+                "Person",
+                group,
+                "p1",
+                None,
+                builder::Narrow::default(),
+                crate::peek::PAGE_NEIGHBOURS + 1,
+            )
+            .unwrap();
+            let request = serde_json::json!({
+                "name": query.name,
+                "query": query.text,
+                "params": query.params_value(),
+            });
+            let was_sent = page_sent.iter().any(|read| {
+                read["query"] == request["query"] && read["params"] == request["params"]
+            });
+            session.update(cx, |session, _| session.ledger_mut().clear());
+            let read = session.update(cx, |session, cx| {
+                session.read(&query, Some("c1".into()), cx)
+            });
+            let output = read.await.unwrap();
+            let server = graph.answer(&request);
+            assert_eq!(
+                serde_json::to_string(output.rows.as_ref()).unwrap(),
+                serde_json::to_string(&server).unwrap(),
+                "{}",
+                builder::relationship_key(group)
+            );
+            assert_eq!(output.row_count, server.as_array().unwrap().len() as i64);
+            assert_eq!(output.graph_commit_id.as_deref(), Some("c1"));
+            let given = session.read_with(cx, |session, _| {
+                session
+                    .ledger()
+                    .count("studio_neighbours", |a| a == Answered::Seeded)
+            });
+            assert_eq!(
+                given == 1,
+                !was_sent,
+                "{}",
+                builder::relationship_key(group)
+            );
+            if given == 1 {
+                seeded.push(builder::relationship_key(group));
+            }
+        }
+        assert_eq!(seeded, ["out:Founded", "out:Likes", "in:Likes"]);
+
+        // The peek, after the page: the table's counts answer its empty groups, and it reads the
+        // three others at its own limit, which the page's longer reads do not answer yet.
+        session.update(cx, |session, _| session.ledger_mut().clear());
+        let peek = table.update(cx, |table, cx| table.peek_row(0, cx));
+        // The workspace's inspector draws a peek; here a window of its own does.
+        let (_, peek_cx) = app.add_window_view(move |_, _| Shown(peek));
+        peek_cx.run_until_parked();
+        let peek_sent = sent_by_name(&session, cx);
+        assert_eq!(
+            peek_sent.get("studio_neighbours"),
+            Some(&3),
+            "{peek_sent:?}"
+        );
+        assert_eq!(peek_sent.values().sum::<u64>(), 3, "{peek_sent:?}");
+    }
+
+    /// A view drawn as the root of a window of its own.
+    struct Shown(Entity<NodePeek>);
+
+    impl Render for Shown {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.0.clone()
+        }
+    }
+
     /// People who work at companies: one relationship column, `WorksAt`, on Person.
     const WORKERS: &str = "node Person {\n  slug: String @key\n  name: String\n}\nnode Company {\n  slug: String @key\n  name: String\n}\nedge WorksAt: Person -> Company\n";
 
