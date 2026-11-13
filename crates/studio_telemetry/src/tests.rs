@@ -124,26 +124,45 @@ fn the_environment_can_turn_telemetry_off() {
     );
 }
 
-/// By default usage data is on and anonymous: events go under an ID for this run alone, no
-/// install ID is kept, and the status bar tells of it until the notice is answered.
+/// Usage data waits for the person's answer: until the notice is answered nothing is recorded,
+/// whatever the setting says. Answered, events go under an ID for this run alone, no install ID
+/// is kept, and the status bar says no more.
 #[gpui::test]
-fn usage_is_anonymous_by_default(cx: &mut TestAppContext) {
+fn usage_waits_for_the_notice_then_is_anonymous(cx: &mut TestAppContext) {
     let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let (http, sent) = http(&[200]);
     let (_dir, telemetry) = start(cx, None, http);
     assert!(cx.update(|cx| telemetry.read(cx).asks_about_usage(cx)));
     record(query());
     wait_a_minute(cx);
+    assert!(sent.bodies.lock().unwrap().is_empty());
+    assert!(telemetry.read_with(cx, |t, _| t.store().pending().is_empty()));
+
+    telemetry.update(cx, |t, cx| t.notice_seen(cx));
+    assert!(!cx.update(|cx| telemetry.read(cx).asks_about_usage(cx)));
+    record(query());
+    wait_a_minute(cx);
     let bodies = sent.bodies.lock().unwrap().clone();
     assert_eq!(bodies.len(), 1);
+    assert_eq!(bodies[0]["batch"].as_array().unwrap().len(), 1);
     let event = &bodies[0]["batch"][0];
     assert_eq!(event["event"], "query_ran");
     assert!(!telemetry.read_with(cx, |t, _| t.store().has_install_id()));
     let run_id = event["distinct_id"].as_str().unwrap().to_owned();
     assert!(uuid::Uuid::parse_str(&run_id).is_ok());
-    // The notice answered, the status bar says no more.
-    telemetry.update(cx, |t, cx| t.notice_seen(cx));
+}
+
+/// A choice made in Settings answers the notice as the popover does.
+#[gpui::test]
+fn a_choice_in_settings_answers_the_notice(cx: &mut TestAppContext) {
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let (http, sent) = http(&[200]);
+    let (_dir, telemetry) = start(cx, None, http);
+    set(cx, UsageSharing::WithInstallId, CrashReports::Ask);
     assert!(!cx.update(|cx| telemetry.read(cx).asks_about_usage(cx)));
+    record(query());
+    wait_a_minute(cx);
+    assert_eq!(sent.bodies.lock().unwrap().len(), 1);
 }
 
 /// Counted across runs, an event is written down within a minute and sent as PostHog's batch:

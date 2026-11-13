@@ -56,12 +56,12 @@ impl Render for UsageStatus {
             .flex_none()
             .gap(px(space::XS))
             .items_center()
-            .child(studio_ui::ds::text::meta("Anonymous usage data is on").single_line())
+            .child(studio_ui::ds::text::meta("Share anonymous usage data?").single_line())
             .child(
                 PopoverMenu::new("usage-choice")
                     .anchor(gpui::Anchor::BottomRight)
                     .attach(gpui::Anchor::TopRight)
-                    .trigger(studio_ui::ds::button("usage-choose", "Change…"))
+                    .trigger(studio_ui::ds::button("usage-choose", "Choose…"))
                     .menu({
                         let telemetry = self.telemetry.clone();
                         move |_, cx| {
@@ -74,7 +74,7 @@ impl Render for UsageStatus {
     }
 }
 
-/// "Studio sends anonymous usage data": keep it, turn it off, or be counted across runs.
+/// "Share anonymous usage data?": share it, share it counted across runs, or not.
 pub(crate) struct UsagePopover {
     telemetry: Entity<Telemetry>,
     focus: FocusHandle,
@@ -108,34 +108,36 @@ impl Focusable for UsagePopover {
 impl Render for UsagePopover {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         popover(&self.focus, cx)
-            .child(studio_ui::ds::text::heading(
-                "Studio sends anonymous usage data",
-            ))
+            .child(studio_ui::ds::text::heading("Share anonymous usage data?"))
             .child(studio_ui::ds::text::muted(
                 "Which features are used and how fast they are, to improve Studio; never names, \
                  queries, values or server addresses, and nothing that ties one run of Studio to \
-                 the next. You can also be counted across runs with a random install ID, which \
-                 helps us see whether people keep using Studio.",
+                 the next. Nothing is sent until you choose. You can also be counted across runs \
+                 with a random install ID, which helps us see whether people keep using Studio.",
             ))
             .child(
                 h_flex()
                     .gap(px(space::SM))
+                    .flex_wrap()
                     .child(
-                        studio_ui::ds::button("usage-keep", "Keep it on")
+                        studio_ui::ds::button("usage-keep", "Share")
                             .style(ButtonStyle::Filled)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.answer(UsageSharing::Anonymous, cx)
                             })),
                     )
-                    .child(studio_ui::ds::button("usage-id", "Count my runs").on_click(
-                        cx.listener(|this, _, _, cx| this.answer(UsageSharing::WithInstallId, cx)),
-                    ))
                     .child(
-                        studio_ui::ds::button("usage-off", "Turn off").on_click(
+                        studio_ui::ds::button("usage-id", "Share and count my runs").on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.answer(UsageSharing::WithInstallId, cx)
+                            }),
+                        ),
+                    )
+                    .child(
+                        studio_ui::ds::button("usage-off", "Don't share").on_click(
                             cx.listener(|this, _, _, cx| this.answer(UsageSharing::Off, cx)),
                         ),
                     )
-                    .child(div().flex_1())
                     .child(
                         studio_ui::ds::button("usage-what", "What Studio sends")
                             .on_click(|_, _, cx| cx.open_url(WHAT_STUDIO_SENDS)),

@@ -215,6 +215,11 @@ pub struct Telemetry {
     session: (String, Instant),
     /// The ID anonymous usage events go under: random, for this run alone.
     run_id: String,
+    /// Whether the person answered the usage notice, or chose in Settings. Until then nothing
+    /// is recorded, whatever the setting says: usage data is shared only once the person agrees.
+    usage_answered: bool,
+    /// The usage choice last followed, to tell a choice made in Settings from the default.
+    last_usage: Option<UsageSharing>,
     /// Crash reports waiting for the person's answer (crash reports set to ask).
     waiting: Vec<(PathBuf, CrashReport)>,
     first_start_of_version: bool,
@@ -242,16 +247,16 @@ impl Telemetry {
     /// Whether the status bar still tells of usage data: until the person has seen the notice
     /// and answered it, or turned usage data off.
     pub fn asks_about_usage(&self, cx: &App) -> bool {
-        self.blocked.is_none()
-            && settings(cx).usage != UsageSharing::Off
-            && self.store.read_marker("usage-notice-seen").is_none()
+        self.blocked.is_none() && settings(cx).usage != UsageSharing::Off && !self.usage_answered
     }
 
-    /// The notice was answered: the status bar no longer shows it.
+    /// The notice was answered: the status bar no longer shows it, and usage data is shared
+    /// from now on if the setting says so.
     pub fn notice_seen(&mut self, cx: &mut Context<Self>) {
         self.store
             .write_marker("usage-notice-seen", &store::now_text(Utc::now()));
-        cx.notify();
+        self.usage_answered = true;
+        self.follow_settings(cx);
     }
 
     /// The ID usage events go under: the install ID when the person chose to be counted across
@@ -342,7 +347,15 @@ impl Telemetry {
     /// Follows the settings: the switches, and what a switch turned off deletes at once.
     fn follow_settings(&mut self, cx: &mut Context<Self>) {
         let options = settings(cx);
-        let usage = self.blocked.is_none() && options.usage != UsageSharing::Off;
+        // A choice changed in Settings answers the notice as the popover does.
+        if self.last_usage.is_some_and(|last| last != options.usage) && !self.usage_answered {
+            self.store
+                .write_marker("usage-notice-seen", &store::now_text(Utc::now()));
+            self.usage_answered = true;
+        }
+        self.last_usage = Some(options.usage);
+        let usage =
+            self.blocked.is_none() && options.usage != UsageSharing::Off && self.usage_answered;
         let was = USAGE_ON.swap(usage, Ordering::SeqCst);
         // The install ID exists only while the person chose it.
         if usage && options.usage == UsageSharing::WithInstallId {
@@ -586,6 +599,7 @@ pub fn init_with(options: Options, http: Arc<dyn HttpClient>, cx: &mut App) {
             .set((store.clone(), version, Instant::now()))
             .ok();
     }
+    let usage_answered = store.read_marker("usage-notice-seen").is_some();
     let telemetry = cx.new(|cx| {
         let mut telemetry = Telemetry {
             blocked: options.blocked,
@@ -601,6 +615,8 @@ pub fn init_with(options: Options, http: Arc<dyn HttpClient>, cx: &mut App) {
             http,
             session: (uuid::Uuid::now_v7().to_string(), Instant::now()),
             run_id: uuid::Uuid::new_v4().to_string(),
+            usage_answered,
+            last_usage: None,
             first_start_of_version,
             started: Instant::now(),
             last_sent: None,

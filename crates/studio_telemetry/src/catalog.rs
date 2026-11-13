@@ -360,8 +360,9 @@ pub fn catalog_markdown() -> String {
         "<!-- Generated from crates/studio_telemetry/src/catalog.rs by its test \
          `docs_telemetry_md_matches_the_catalog`. Do not edit by hand. -->\n\n\
          # What Omnigraph Studio sends\n\n\
-         Studio sends anonymous usage data unless you turn it off (spec 018): which features are \
-         used and how fast they are, tied to one run of Studio and nothing else. You can choose \
+         Studio asks before it sends anonymous usage data (spec 018), and sends none until you \
+         answer: which features are used and how fast they are, tied to one run of Studio and \
+         nothing else. You can choose \
          to be counted across runs with a random install ID. Crash reports are shown to you and \
          sent only when you say so. Nothing is sent from a development build, or while \
          `DO_NOT_TRACK` or `OMNIGRAPH_STUDIO_TELEMETRY=0` is set. Change either choice under \

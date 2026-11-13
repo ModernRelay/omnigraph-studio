@@ -23,7 +23,8 @@ report from Studio contains them.
 Studio sends nothing from a development build, or while the `DO_NOT_TRACK` or
 `OMNIGRAPH_STUDIO_TELEMETRY=0` environment variable is set.
 
-**Usage data, on unless you turn it off.** It includes the features you use (for example,
+**Usage data, only if you agree.** Studio asks you in the status bar and sends no usage data
+until you choose **Share** or **Share and count my runs**. It includes the features you use (for example,
 "a query ran" or "a write finished") and their outcomes, durations and sizes. Numbers are rounded
 into ranges, so a report says "11 to 100 rows", never the exact count. A daily summary adds
 counts of query times, the peak memory range, and how many times Studio crashed. Every report
@@ -33,7 +34,7 @@ architecture.
 Each run of Studio gets a new random ID that is never saved. As a result, we cannot connect one
 run to the next, and we cannot tell which reports came from you.
 
-**An install ID, only if you choose it.** If you choose **Count my runs**, Studio saves a random
+**An install ID, only if you choose it.** If you choose **Share and count my runs**, Studio saves a random
 ID on your computer and sends it with your usage data. This lets us count how many people come
 back to Studio. The ID is not linked to your name, email, account, computer or servers. You can
 reset it, and turning usage data off deletes it.
@@ -62,11 +63,10 @@ We use these reports only to find and fix crashes, to learn which features are u
 Studio faster. We do not sell them, use them for advertising, or combine them with other data
 about you.
 
-- Usage data without an install ID is processed under our legitimate interest in keeping Studio
-  working and improving it (Article 6(1)(f) of the GDPR). We believe it holds no personal data
-  once stored. You can object at any time by turning it off.
-- The install ID and crash reports are processed with your consent (Article 6(1)(a) of the GDPR),
-  which you give by choosing them and can withdraw at any time in Settings.
+Usage data, the install ID and crash reports are each sent only with your consent (Article 6(1)(a)
+of the GDPR, and the rules on sending information from your device). You give it by choosing
+them, and you can withdraw it at any time in Settings. We believe usage data without an install
+ID holds no personal data once stored.
 
 ## Who receives it
 
@@ -84,7 +84,8 @@ the Standard Contractual Clauses in that agreement.
 
 ## Your choices and rights
 
-- **Turn usage data off:** choose **Turn off** in the status bar notice or in Settings, Privacy.
+- **Turn usage data off:** choose **Don't share** in the status bar notice, or change it in
+  Settings, Privacy.
   Crash reports have their own choice: Ask each time, Always send or Never send.
 - **See what is sent:** **View Telemetry Log** in the command palette shows every report Studio
   is holding and every report it sent in the last 7 days.

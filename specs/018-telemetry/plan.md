@@ -75,7 +75,7 @@ variable turns all of it off.
 | Report | Setting | Default | What it is for |
 |---|---|---|---|
 | Crash reports | `studio.telemetry.crash_reports`: `"ask"`, `"always"` or `"never"` | `"ask"` | Finding and fixing crashes |
-| Usage events and performance summaries | `studio.telemetry.usage`: `anonymous`, `with_install_id` or `off` | `anonymous` (since 2026-11-12) | Which features are used, and how fast Studio is on real graphs |
+| Usage events and performance summaries | `studio.telemetry.usage`: `anonymous`, `with_install_id` or `off` | `anonymous`, sent only once the notice is answered (since 2026-11-13) | Which features are used, and how fast Studio is on real graphs |
 
 Nothing is sent, whatever the settings say, when:
 
@@ -224,13 +224,15 @@ summary once it is checked what GPUI exposes about a frame (Open questions).
 
 ### What the person sees
 
-- A release build tells of anonymous usage data from its first start (since 2026-11-12): one
-  status bar item, "Anonymous usage data is on · Change…", until the person answers it. It
-  opens a popover: "Studio sends anonymous usage data", a line on what that is and is not
-  (which features are used and how fast; never names, queries, values or server addresses, and
-  nothing that ties one run to the next), **Keep it on**, **Count my runs** (the install ID),
-  **Turn off** and **What Studio sends** (`docs/telemetry.md`). Any answer sets the choice and
-  the item goes for good (`telemetry/usage-notice-seen`); turning usage off also removes it.
+- A release build asks about anonymous usage data from its first start, and records and sends
+  none until the person answers (since 2026-11-13): one status bar item, "Share anonymous usage
+  data? · Choose…". It opens a popover: "Share anonymous usage data?", a line on what that is
+  and is not (which features are used and how fast; never names, queries, values or server
+  addresses, nothing that ties one run to the next, and nothing sent until you choose),
+  **Share**, **Share and count my runs** (the install ID), **Don't share** and **What Studio
+  sends** (`docs/telemetry.md`). Any answer sets the choice and the item goes for good
+  (`telemetry/usage-notice-seen`); a choice changed in Settings answers it too, and turning
+  usage off also removes it.
 - Settings, "Privacy": the crash reports choice (Ask each time, Always send, Never send), Share
   usage data, Reset ID, View Telemetry Log, What Studio sends.
 
@@ -288,7 +290,7 @@ What step 1 changed from the design above:
 | Decision | Rejected alternatives | Why |
 |---|---|---|
 | A closed, typed catalog with no free text | Zed's `FlexibleEvent` (a name and any JSON); an analytics SDK's `capture(name, properties)` | Free text is how a branch name or an error message carrying a value leaks; a type that cannot hold one cannot leak one, and a test can prove it |
-| Anonymous usage on by default, an install ID only by choice; crash reports asked for each time | Usage off until chosen (the decision until 2026-11-12); usage with an install ID on by default | Decided 2026-11-12 by Ragnor: opt-in left Studio blind to how it is used. Without an install ID nothing ties one run to the next, which keeps the events far from personal data under the GDPR and the ePrivacy rule on storing an ID on a person's machine; retention, which needs an ID, is counted from those who opt in. Crash reports stay asked for: they carry more of what the person was doing |
+| Anonymous usage asked for once, and sent only after a yes; an install ID only by choice; crash reports asked for each time | Usage sent from the first start until turned off (2026-11-12 to 2026-11-13); usage off with no question asked (until 2026-11-12); usage with an install ID on by default | Decided 2026-11-13 by Ragnor: the EU's ePrivacy rule (Article 5(3), EDPB Guidelines 2/2023) asks consent before software sends information from a device for analytics, whether or not it is personal data, so the default notice became a question. Before that, decided 2026-11-12: opt-in left Studio blind to how it is used. Without an install ID nothing ties one run to the next, which keeps the events far from personal data under the GDPR and the ePrivacy rule on storing an ID on a person's machine; retention, which needs an ID, is counted from those who opt in. Crash reports stay asked for: they carry more of what the person was doing |
 | One status bar item, not a dialog at first start | A first-run dialog | Constitution VII: a start that asks a question before showing anything is loud for a choice that can wait |
 | PostHog for usage, summaries and crash reports | A crash tracker beside it (Sentry); a store of Studio's own | Chosen 2026-10-29. One API for all three: events and `$exception` events through the same capture endpoint; anonymous events need no person profile; client IP data discarded by a project setting |
 | PostHog US Cloud (`us.i.posthog.com`) | EU Cloud; self-hosted | Chosen 2026-11-11. ModernRelay and most of Studio's people are in the US; the reports hold no graph content, no IP and no person profile, so the gap EU hosting would close is small. PostHog takes part in the EU-U.S. Data Privacy Framework and its DPA adds Standard Contractual Clauses, so EU users are covered; the region cannot be changed later without a migration |
@@ -323,8 +325,8 @@ What step 1 changed from the design above:
    privacy@modernrelay.com; legitimate interest for usage without an ID, consent for the install
    ID and crash reports; PostHog US Cloud under the Data Privacy Framework and its DPA; one year
    kept. Still open: its legal review; confirming PostHog's DPA is in place for the
-   organization; whether the EU's ePrivacy rule (Article 5(3), EDPB Guidelines 2/2023) asks
-   consent before anonymous usage is sent, which today it is not; and whether an EU
+   organization; consent under the EU's ePrivacy rule is now asked before anything is sent
+   (2026-11-13); and whether an EU
    representative (GDPR Article 27) is needed.
 4. Whether an organization signed in to a managed cluster may turn usage off for its people.
 5. What GPUI exposes about a frame's time at Zed `v1.23.2`, to time frames without adding work to
@@ -357,6 +359,7 @@ What step 1 changed from the design above:
 | 2026-11-12 | Studio's PostHog project discards client IPs and adds no location | PostHog's API: the US Cloud project whose token the repository variable `OMNIGRAPH_STUDIO_POSTHOG_TOKEN` holds (the token checked by comparison, never printed), read back after the change | It had no events yet. `anonymize_ips` was `false` and its default GeoIP transformation was on; now `anonymize_ips` is `true` and GeoIP is off. Open question 7 answered the same day (next row) |
 | 2026-11-12 | Crash reports keep no IP or location either | One `$exception` sent to the project as Studio sends one (gzipped batch, a one-off `distinct_id`, `$geoip_disable`, `$process_person_profile: false`; labelled `setup_check`), read back with a HogQL query | Stored, with `$ip`, `$geoip_city_name` and `$geoip_country_code` empty. The test event stays in the project, marked `setup_check: true` |
 | 2026-11-13 | The privacy notice states what Studio does | `docs/privacy.md` read against `studio_telemetry` (`distinct_id`, `follow_settings`, `crash.rs` `without_home`), `graph_store::USER_AGENT`, `studio_settings` `auto_update`, and PostHog's API for the organization's plan (`product_analytics_data_retention`: 1 year) | Matches. `docs/telemetry.md` links it; the popover reaches it through that page |
+| 2026-11-13 | Usage data waits for the notice's answer | `studio_telemetry`: `usage_waits_for_the_notice_then_is_anonymous` (nothing recorded, held or sent before the answer; after it, one event under the run's own ID and no install ID), `a_choice_in_settings_answers_the_notice`; the other telemetry tests, which choose in Settings first | Pass. A person who had not answered before 0.4.6 sends nothing until they do |
 
 ## Corrections
 

@@ -237,7 +237,8 @@ pub enum CrashReports {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum UsageSharing {
-    /// Share anonymous usage data and a daily performance summary, tied to one run of Studio.
+    /// Share anonymous usage data and a daily performance summary, tied to one run of Studio,
+    /// once the person has answered the status bar's question or chosen here.
     #[default]
     Anonymous,
     /// Share them with a random install ID, so your runs are counted as one person's.
