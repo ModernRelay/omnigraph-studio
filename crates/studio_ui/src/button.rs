@@ -340,6 +340,7 @@ pub struct Button {
     key_binding: Option<KeyBinding>,
     key_caps: Option<ds::KeyCaps>,
     value: Option<SharedString>,
+    label_hidden: bool,
 }
 
 impl Button {
@@ -356,6 +357,7 @@ impl Button {
             key_binding: None,
             key_caps: None,
             value: None,
+            label_hidden: false,
         }
     }
 
@@ -403,6 +405,14 @@ impl Button {
     /// a toolbar's control chip (`ds::chip_button`).
     pub fn value(mut self, value: impl Into<Option<SharedString>>) -> Self {
         self.value = value.into();
+        self
+    }
+
+    /// Leaves the label out where there is no room for it (a toolbar's chip in a narrow tab):
+    /// the start icon says what the control is, what it is set to still shows, and its tooltip
+    /// names it. A button with no start icon keeps its label, which is all it has.
+    pub fn label_hidden(mut self, hidden: bool) -> Self {
+        self.label_hidden = hidden;
         self
     }
 }
@@ -515,6 +525,17 @@ impl RenderOnce for Button {
         // at the end. Without keys its content stays centred.
         let spread =
             self.base.width.is_some() && (self.key_binding.is_some() || self.key_caps.is_some());
+        let label = (!(self.label_hidden && self.start_icon.is_some())).then(|| {
+            Label::new(self.label)
+                .color(ink)
+                .weight(ds::text::weight::BODY)
+                .size(label_size(size))
+        });
+        // With its label left out and nothing set, the button is its icon alone.
+        let says = label.is_some()
+            || self.value.is_some()
+            || self.key_binding.is_some()
+            || self.key_caps.is_some();
         self.base.frame(paint, cx).child(
             h_flex()
                 .when(spread, |content| content.w_full())
@@ -524,30 +545,27 @@ impl RenderOnce for Button {
                     _ => ds::space::XS,
                 }))
                 .children(self.start_icon.map(icon))
-                .child(
-                    h_flex()
-                        .debug_selector(|| "button-label".into())
-                        .when(spread, |label| label.flex_1())
-                        .gap(px(ds::space::SM))
-                        .justify_between()
-                        .child(
-                            Label::new(self.label)
-                                .color(ink)
-                                .weight(ds::text::weight::BODY)
-                                .size(label_size(size)),
-                        )
-                        .children(self.value.map(|value| {
-                            Label::new(value)
-                                .color(Color::Accent)
-                                .weight(ds::text::weight::BODY)
-                                .size(label_size(size))
-                        }))
-                        .children(self.key_binding.map(|key| match key_ink {
-                            Some(ink) => key.color(ink),
-                            None => key,
-                        }))
-                        .children(self.key_caps),
-                )
+                .when(says, |content| {
+                    content.child(
+                        h_flex()
+                            .debug_selector(|| "button-label".into())
+                            .when(spread, |label| label.flex_1())
+                            .gap(px(ds::space::SM))
+                            .justify_between()
+                            .children(label)
+                            .children(self.value.map(|value| {
+                                Label::new(value)
+                                    .color(Color::Accent)
+                                    .weight(ds::text::weight::BODY)
+                                    .size(label_size(size))
+                            }))
+                            .children(self.key_binding.map(|key| match key_ink {
+                                Some(ink) => key.color(ink),
+                                None => key,
+                            }))
+                            .children(self.key_caps),
+                    )
+                })
                 .children(self.end_icon.map(end_icon)),
         )
     }

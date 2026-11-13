@@ -397,19 +397,59 @@ A person may have placed nodes and pills by hand, and an upgrade mustn't lose th
 ### The inspector
 
 The inspector describes what's selected in the active tab, and the workspace remembers one per tab.
+It is a panel as the sidebar's are: a new window shows it, and only the person hides or shows it.
 
-- `set_inspector` records its view against the active tab, in place of replacing the single view. A
-  finished view already holds its node or edge, values, commit and saving state, so no shared
-  descriptor is needed and the layer rule holds.
-- When the active tab changes, the workspace shows that tab's remembered view. With none, it reads
-  "Nothing selected".
-- A selection change inside a tab already goes through `set_inspector`, so it updates at once.
+**The rules (2026-11-13)**
+
+1. **A click only selects.** No click opens or closes the inspector, in any view or on any column.
+2. **The inspector shows the active tab's selection.** It changes as the selection changes, by
+   click or by key, and reads "Nothing selected" only when nothing is.
+3. **One switch.** The top bar's button, ⌘⌥B and Space all run `studio::ToggleInspector`. Space is
+   bound in a table, a tree, a canvas, a node's page and the map.
+4. **Opening is a second click or ⌘↵.** It opens the node's page; the view strip opens the
+   selection as a Tree or a Canvas.
+5. **A link in the inspector opens in the center.** A related node there opens its page as a
+   preview tab, which a second click keeps. The tab it was followed from stays, so Back returns to
+   it with its selection.
+
+**What each view selects**
+
+| View | Selection | A second click |
+|---|---|---|
+| Table | The row under the cursor: a node or an edge | Edits a value; opens the node's page from its key |
+| Tree | The selected row's node; a relationship's row shows the node it belongs to | Opens the node's page; opens or closes a group |
+| Canvas | The selected chip's node; a pill or "+K more" shows the node it belongs to | Opens the node's page |
+| Page | The related node clicked on the page | Opens that node's page |
+| Map | The selected type, as the schema describes it | Opens the type between the types it relates to |
+
+A Tree and a Canvas of one node open with that node selected. On a Canvas, ⇧-click and ⌘-click
+mark a chip, as they pick rows in a table, and ⌫ or the menu closes an open node.
+
+**How it is built**
+
+- A tab says its selection changed with `ItemEvent::Selected` and answers `Item::inspected`: a
+  view it made (a table's row, with the values, commit and saving state the table holds), or a
+  node, which the crate that shows nodes makes into a view (`register_node_inspector`), so the
+  layer rule holds.
+- The workspace asks the tab in front, when it says so and when it comes to the front, and only
+  while the inspector is shown. A hidden inspector costs a tab nothing, and is read when shown.
+- A tab that names the same thing again keeps its view, with what is being edited in it.
+- The panel is always in its dock. What is selected never opens the dock and never closes it.
+- A view that follows a selection waits a moment before it reads, so the rows an arrow key passes
+  read nothing.
 - A held selection stays read-only and shows its commit's values.
 - Closing a tab drops its view, and a session change drops them all. A hidden inspector reads
   nothing, since it reads only the groups in view.
+- When the canvas changes size under a view the person placed, as when the inspector opens beside
+  it, the view moves just enough to keep the selected chip in sight.
 
 **Example:** select an edge in its table, switch to a node page, then return. The inspector shows
 the edge's properties and endpoints again.
+
+**The table toolbar beside it.** In a window of the default size the tab between the two panels is
+about 840 px wide, less than the toolbar's labels need. The toolbar's sentence field gives way
+first, down to 140 px. In a tab under 1,000 px its chips are their icons, what each is set to still
+shows, and their tooltips name them.
 
 ### What Item gains
 
@@ -442,7 +482,7 @@ fn view_action(&self, kind: ViewKind, cx: &App) -> Option<Box<dyn Action>>;
 | Surface | Follows by |
 |---|---|
 | Sidebar | Lights the row for `thing` |
-| Inspector | Shows the tab's remembered view; with none, "Nothing selected" |
+| Inspector | Shows what the tab has selected; with nothing selected, "Nothing selected" |
 | View strip | Each tab draws its own from `views` |
 | Status bar | The tab's facts, as today |
 
@@ -495,7 +535,7 @@ A restored session mustn't lose tabs, lose work or show errors.
 | Plan PR 11: Tree bound to one session, one tab | Tree bound to a session, root and read context | One walk per root and commit |
 | Plan PR 14: an `Item` hook so Back steps inside a tab | Removed | Views are tabs, so each pane's history covers Back |
 | Plan PR 15: move `schema_view` into `graph_canvas` | Removed | Sibling tabs can stay in their crates |
-| Plan PR 16: an `Item::inspector()` hook | The workspace remembers each tab's inspector | Peeks can be requested from other crates, and no new `Item` method is needed |
+| Plan PR 16: an `Item::inspector()` hook | First left out; built on 2026-11-13 as `Item::inspected` | The inspector follows the selection, so the workspace asks the tab in front what it has selected. It still remembers each tab's view |
 | Conversation: a switcher inside the tab | Dropped | See Decisions |
 | First build: a table's rows drawn on Canvas | Rows go to Tree; Canvas takes one node | Rows have no relationships loaded, so Canvas drew a grid of unconnected chips |
 | First build: labeled navigation rows in the sidebar | The status bar's icons, as before | The requester's call: the selector was not the problem |
@@ -514,7 +554,10 @@ bar, environment marking and the message ladder.
 | Canvas is always of something | A free-standing blank Canvas | Each tab keeps a clear "what". A collecting canvas can return as its own thing |
 | Saved positions move to a per-graph store | Drop them; keep a legacy tab; convert them to a collection | Dropping loses work. A legacy tab is a blank Canvas. Positions are keyed by node, so a store keeps them with no new concept |
 | Each tab copies positions at opening | All Canvas tabs share live positions | Moving a node in one tab mustn't move it in another (article V) |
-| The workspace remembers each tab's inspector | A shared selection descriptor that rebuilds the inspector; an `Item::inspector()` hook | The view already holds values, commit and saving state, which a descriptor would have to carry through the layers |
+| The workspace remembers each tab's inspector | A shared selection descriptor that rebuilds the inspector | The view already holds values, commit and saving state, which a descriptor would have to carry through the layers. A table hands over its own view; a tab of another crate names a node |
+| The inspector mirrors the selection, and only its switch shows or hides it | A peek asked for by Space, a click on a key cell or ⇧-click on a chip, which also opened the dock | The inspector opened in six ways and followed the selection in one view of three, so nobody could say what a click would do |
+| A click on a canvas chip still expands a closed node | A click that only selects, with expanding left to ↵ | Walking by clicking is what a canvas is for, and it changes nothing outside the tab |
+| A link in the inspector opens a page in the center | The inspector moves on to the linked node | The right describes the selection and is no place to go (article XIII); it showed a node two steps from the tab, with no way back |
 | Keep reusing tabs across panes, and define Back per pane | Reuse only in the current pane (Zed's preview does); record the origin for a return | Studio assumes a key is unique in the window, so per-pane reuse would allow two Person tables. Recording origins adds state for little gain, since the source pane stays on screen. Deliberate deviation |
 | A view holds only what can answer its question | Every view takes any subject | Canvas of unconnected rows answers nothing. Tree of a set does what a set needs |
 | Tree of a set keeps its filter and pages | A copy of the loaded rows | The whole filter, at one commit, with nothing partial to explain |
@@ -578,6 +621,11 @@ Canvas after a changed filter.
   - An edge selection returns across a tab switch with its properties and endpoints.
   - A held selection stays read-only with its commit's values.
   - A selection change inside a tab updates the inspector without another tab activation.
+  - A selection never opens the inspector and never closes it. Hidden, it asks a tab nothing;
+    shown again, it reads what is selected by then.
+  - A click on any column of a table moves the cursor and opens nothing.
+  - A Tree and a Canvas of a node open with it selected. A second click on a chip opens its page.
+  - A page opened from the inspector leaves the tab it was followed from open.
 - **Pane navigation:** Back and Forward after opening in the same pane, reusing a tab in another pane
   and opening beside, including a source tab closed since. The source's filter, cursor and drafts
   survive whenever it stays open.
@@ -634,6 +682,12 @@ No engine changes are needed, so nothing goes in `docs/deferred-engine-changes.m
 | 2026-11-01 | An old session upgrades without loss | A real saved `workspaces/*.json` with a root-less `canvas` tab and `explore` and `history` panels, restored twice by the snapshot tool | The tab went, its positions stayed in `canvas_positions` through both restarts, and the panels fell back to `types` and `activity`, with the table tab intact |
 | 2026-11-01 | Tree holds a set and Canvas one node, on real reads | `relationship_tree` `a_set_opens_closed_and_canvas_takes_the_selected_node`, `listed_nodes_are_the_set_and_a_set_is_known_by_what_it_holds`; `type_table` `tree_holds_the_tables_rows_and_canvas_the_row_under_the_cursor`; `graph_store` `a_set_is_paged_and_its_rows_open_on_their_own`; offscreen snapshots on `script/dev-server` | Person filtered to Founder opened as "Tree: Person, Founder", rows closed, a row opened to its relationships with counts; selecting Edsger Hamilton, Canvas opened a walk from that one node with both tabs kept |
 | 2026-11-02 | A result read at a commit opens its views there (issue #44) | `query_editor` `a_result_read_at_a_commit_opens_its_views_there` (a tab held at `c1` and one at the head, each running a two-node query against a fake server, then unpinned); `graph_canvas` `a_result_read_at_a_commit_opens_its_nodes_there` (a results canvas at `c1` and one at the head: Space's peek and ⌘↵'s page, before and after the session moves to branch `fix`) | Held: the Tree and Canvas actions carry `c1`, unpinned too; the canvas's tab reads "people · result @ c1", and its peek and page carry `c1` on both branches. At the head: `None` throughout. Before, the query editor sent the Canvas action with no commit and the Tree action with the tab's pin when pressed (`at_commit: None` once unpinned), `ShowResultsOnCanvas` had no commit, `GraphCanvas::held_at` knew only a walk's, and ⌘↵ sent `None` even from a held walk; "Open related table" from a held walk's relationship pill sent `None` too |
+| 2026-11-13 | The inspector mirrors the selection, and only its switch shows or hides it | `studio_workspace` `the_inspector_shows_the_selection_and_only_its_switch_hides_it` (a new window shows it; a selection shows at once; hidden, three selection changes ask the tab nothing and leave the dock closed; shown, it reads the selection; nothing selected keeps it open), `each_tab_keeps_its_inspector` (a selection changed behind another tab is read when its tab comes back), `a_named_node_keeps_its_view_while_it_stays_selected`, `the_keyboard_in_a_replaced_inspector_goes_to_the_active_tab` | Pass |
+| 2026-11-13 | Each view reports its selection, and a second click opens | `type_table` `a_click_selects_and_the_inspector_follows_the_cursors_row` (a click on the key and on a value moves the cursor and opens nothing; one view while the cursor stays in the row; a second click on the key opens the page; Esc selects nothing), `a_related_node_selected_on_a_page_is_what_the_inspector_shows` (at the head and held at a commit); `relationship_tree` `the_inspector_reads_the_selected_node_at_the_commit_the_tree_shows`; `graph_canvas` `a_click_selects_a_chip_and_a_second_opens_its_page` (⇧-click marks and does not select; a click on the canvas lets both go), `the_inspector_shows_the_type_selected_on_the_map`, `a_result_read_at_a_commit_opens_its_nodes_there` | Pass |
+| 2026-11-13 | The journey reads as designed | Offscreen snapshots on `script/dev-server` at 1440 × 900, clicks and keys through the snapshot tool, which gained `,double`: a new window; a table (a click on a value and on the key, ↓, Space twice, a click while hidden, Esc); an edge table; Tree from the table (a click, ↓, a relationship's row, Space twice); Canvas from the table (a pill, another node, ↓, Space twice); the inspector's Page link; a related node selected on a page; a link in the inspector, then Back; the map (a click, a double click) | As designed, after one fault found here: a link followed from the inspector replaced the preview tab it came from, so Back skipped it. A page now leaves the tab it is opened from open. The running app was not driven by hand. A double click on a canvas chip was checked by its test only: the offscreen layout moves a few pixels between runs, and two clicks aimed from a screenshot missed |
+| 2026-11-13 | The table toolbar fits beside the inspector | `type_table` `a_narrow_tab_leaves_the_toolbars_labels_out`; snapshots of Person's toolbar in an 836 px tab (six icon chips, the sentence field 240 px, nothing cut) and in a 1,176 px tab (every label) | Pass. Before, the toolbar ended at Columns in the 836 px tab. A tab narrower still, or with several controls set, can still cut the last chip: the toolbar has no overflow menu |
+| 2026-11-13 | The suite | `cargo test --workspace`: 1,390 passed, 0 failed, and the keymap test; clippy `-D warnings`, fmt, layers, brand, design tokens, release files | Pass. `cargo deny` not run: no dependency changed |
+| | The inspector's rules on Linux and Windows | Real builds | **Not run.** Space and ⌘⌥B are bound in all three keymaps; only macOS drew a frame |
 | | The top bar is right on Linux and Windows | Real builds | **Not run.** Compiled by CI only; whether those platforms draw window controls in it is unknown |
 | | The rule improves prediction | Prediction test | **Not run. No users have seen any of this** |
 | | Two walks perform acceptably | Tree baseline | **Not run** |
@@ -658,6 +712,15 @@ The first four record changes to the draft before it was built.
   walk moved from Deferred to the core of Tree.
 - 2026-11-01 · The sidebar's labeled navigation rows were reverted at the requester's call: the
   status bar's icons were not the problem. The ⌘⇧ keys stayed.
+- 2026-11-13 · The inspector was filled by a peek a view asked for, and the peek opened its dock:
+  Space, a click on a table's key cell or on a value nobody may edit, ⇧-click on a chip, a click
+  on a related node. A click-through of `main` found it opening in six ways and following the
+  selection in one view of three; on a canvas nothing on screen said how to get it. At the
+  requester's call it now mirrors the selection, starts shown, and is shown or hidden only by its
+  switch. `PeekNode` went; `PeekRow` and the two `PeekSelected` are aliases of `ToggleInspector`,
+  so a saved keymap still loads. This reverses the click rule the cell cursor brought (#85): a
+  click on a key no longer opens the inspector. A table row's hover button opens the node's page
+  where it peeked.
 - 2026-11-01 · Item actions take `views` and `view_action`, not one `views` holding actions: the strip
   asks at every draw, and a set's action copies every loaded row.
 - 2026-11-01 · A key is not strictly unique in the window, since a split copies its tab, so the

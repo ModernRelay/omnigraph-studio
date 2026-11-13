@@ -51,8 +51,9 @@ Typed filter text shows as a field above the rows on the toolbar's edge, with `e
 
 ### Keys (context `Tree`)
 
-↑/↓ move; → expand or step into the first child; ← collapse or go to the parent; ↵ open in the
-inspector; Space peek; ⌘↵ open a table filtered to this node; ⌥→ expand every relationship of
+↑/↓ move; → expand or step into the first child; ← collapse or go to the parent; ↵ open the
+node's page; Space show or hide the inspector, which follows the selected row (spec 020); ⌘↵
+open a table filtered to this node; ⌥→ expand every relationship of
 this node; ⌥← collapse the subtree; F re-root here (the old path becomes the breadcrumb); G show
 on the canvas. Typing filters the visible rows.
 
@@ -251,8 +252,9 @@ on the canvas. Typing filters the visible rows.
   The frame (spec 002) should own this.
 - **Key bindings** were first registered in `relationship_tree::init` with `cx.bind_keys`; they
   now live in `assets/keymaps/` (contexts `Tree`, `Tree && !filtering`, `Tree && filtering`).
-- **Built since:** Space peeks (`studio_graph::PeekNode`: the inspector only, focus stays in
-  the tree); ⌘↵ opens the node's table filtered to its id, or on a relationship group the other
+- **Built since:** the inspector follows the selected row, a relationship's row showing the
+  node it belongs to, and Space shows or hides it (spec 020; before 2026-11-13 Space peeked
+  with `studio_graph::PeekNode`, and the inspector stayed on that node); ⌘↵ opens the node's table filtered to its id, or on a relationship group the other
   type's table filtered to "related to" this node (spec 004's relationship filter); the eye
   toggle (or `h`) shows groups with none, hidden by default (decided 2026-11-01); with text typed, a
   group not read in full offers "Find “text” among N", which reads that group again on the

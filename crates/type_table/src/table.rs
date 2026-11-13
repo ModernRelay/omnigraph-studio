@@ -5,7 +5,7 @@
 //! configuration Zed's `tabular_data_preview` uses: resizable columns, the first column pinned,
 //! rows virtualized by `uniform_list`.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
@@ -37,9 +37,10 @@ use studio_actions::blob::{ChooseFile, ClearValue};
 use studio_actions::table::{
     AddFilter, Cancel, ClearFilters, ConfirmEdit, CopyAsStoredQuery, CopyCell, DeleteRow, EditCell,
     ExpandCell, FillColumn, FilterBySelection, FilterInWords, InsertRow, MoveDown, MoveLeft,
-    MoveRight, MoveUp, OpenRowPage, PeekRow, RefreshTable, RevertView, SaveDrafts, SaveView,
-    SaveViewAsNew, SelectNextSuggestion, SelectPreviousSuggestion, ShowRowOnCanvas, StageEdit,
+    MoveRight, MoveUp, OpenRowPage, RefreshTable, RevertView, SaveDrafts, SaveView, SaveViewAsNew,
+    SelectNextSuggestion, SelectPreviousSuggestion, ShowRowOnCanvas, StageEdit,
 };
+use studio_actions::workspace::ToggleInspector;
 use studio_actions::{ViewKind, ViewLink};
 use studio_ui::ds::Tipped;
 use studio_ui::ds::space;
@@ -47,7 +48,9 @@ use studio_ui::menu::{ContextMenu, ContextMenuEntry};
 use studio_ui::plural;
 use studio_ui::{ColumnDrag, ColumnResize, GridPlace, ROW_HEIGHT, columns_in_view, grid_places};
 use studio_workspace::models::{Error as ModelError, Models, Request as ModelRequest};
-use studio_workspace::{Item, ItemEvent, ItemStatus, KeyHint, SavedItem, ToastKind, Workspace};
+use studio_workspace::{
+    Inspected, Item, ItemEvent, ItemStatus, KeyHint, SavedItem, ToastKind, Workspace,
+};
 use ui::prelude::*;
 use ui::{
     ColumnWidthConfig, PopoverMenu, PopoverMenuHandle, Table, TableInteractionState, TintColor,
@@ -572,6 +575,14 @@ const KEY_INSET: f32 = space::EDGE;
 /// from the page's edge, so the box sits evenly between them and the text does not move when a
 /// row's checkbox shows.
 const KEY_TEXT_INSET: f32 = KEY_INSET + studio_ui::ds::size::CHECK + KEY_INSET;
+/// The tab width under which the toolbar's chips are their icons alone
+/// ([`TypeTable::compact_toolbar`]). With every label, the toolbar of a type with a short name
+/// and nothing set takes about 1,110 px at the sentence field's full width and 930 at its least:
+/// a tab narrower than this cuts its last controls off, as beside the inspector in a window of
+/// the default size, where the tab is about 840 px wide.
+const COMPACT_TOOLBAR_BELOW: f32 = 1000.;
+/// The least the toolbar's sentence field is squeezed to before the chips after it are cut.
+const WORDS_FIELD_MIN: f32 = 140.;
 
 use studio_workspace::property_icon;
 
@@ -1073,6 +1084,9 @@ pub struct TypeTable {
     /// while open.
     /// Views, Columns, Group and Sort, in that order.
     toolbar_menus: [PopoverMenuHandle<ContextMenu>; 4],
+    /// The toolbar's width as last laid out, 0 before its first frame: in a narrow tab its
+    /// chips are their icons alone ([`Self::compact_toolbar`]). A change draws the table again.
+    toolbar_width: Rc<Cell<f32>>,
     filter_draft: Option<FilterDraft>,
     filter_editor: Entity<Editor>,
     /// Filter in words (spec 019): the toolbar's sentence field, what its call is doing, and
@@ -1150,7 +1164,11 @@ pub struct TypeTable {
     /// value is read as markdown to show its first line, too slow to do for every cell every
     /// frame. A cell set, or rows read again, are made again.
     cell_text: RefCell<HashMap<String, HashMap<String, CellText>>>,
+    /// The inspector's view of a row, by the row's id: made when the workspace asks what is
+    /// selected ([`Item::inspected`]), and told of the table's writes while it is that row's.
     peek: Option<(String, Entity<NodePeek>)>,
+    /// The row under the cursor as the workspace was last told of it ([`ItemEvent::Selected`]).
+    inspected_row: Option<String>,
     newer: bool,
     /// Writes out for this table: its own saves and the dialogs' inserts and deletes. Each moves
     /// the pin itself when it lands, so a head the session sees meanwhile waits for them.
@@ -1226,6 +1244,16 @@ impl Focusable for TypeTable {
 impl Item for TypeTable {
     fn thing(&self, _cx: &App) -> Option<studio_actions::Thing> {
         Some(studio_actions::Thing::Type(self.type_name.clone()))
+    }
+
+    /// The row under the cursor, with the values the table holds of it.
+    fn inspected(&mut self, cx: &mut Context<Self>) -> Option<Inspected> {
+        let peek = self.inspect_selected(cx)?;
+        Some(Inspected::View {
+            view: peek.into(),
+            // The view is a list that draws, and reads, only the relationship groups in view.
+            scrolls_itself: true,
+        })
     }
 
     /// An edge table has one view. A node table's Tree holds what it shows; its Canvas holds one
@@ -1410,6 +1438,9 @@ impl TypeTable {
         });
         let grid = TableGrid::new(cx);
         let subscriptions = vec![
+            // The inspector shows the row under the cursor (spec 020): the workspace is told
+            // when that is another row, however the cursor or the rows came to change.
+            cx.observe_self(|this, cx| this.report_selection(cx)),
             // A view renamed, saved or deleted elsewhere: the tab's name and dot follow it.
             cx.observe_global::<studio_settings::StudioSettings>(|this, cx| {
                 if this.view_id.is_some() {
@@ -1492,6 +1523,7 @@ impl TypeTable {
             node_labels: HashMap::new(),
             filter_menus: Default::default(),
             toolbar_menus: Default::default(),
+            toolbar_width: Rc::default(),
             filter_draft: None,
             filter_editor,
             words_editor,
@@ -1530,6 +1562,7 @@ impl TypeTable {
             menu_choices: Default::default(),
             cell_text: RefCell::new(HashMap::new()),
             peek: None,
+            inspected_row: None,
             newer: false,
             saves_in_flight: 0,
             head_moved_while_saving: false,
@@ -3192,11 +3225,13 @@ impl TypeTable {
                     "Columns",
                     (hidden > 0).then(|| format!("{hidden} hidden").into()),
                 )
+                .label_hidden(self.compact_toolbar())
                 .disabled(self.all_columns.len() < 2)
                 .when(!open, |button| {
-                    button.tip(studio_ui::ds::tooltip(
+                    button.tip(studio_ui::ds::tooltip(self.chip_tip(
+                        "Columns",
                         "Show or hide columns · drag a column's header to move it",
-                    ))
+                    )))
                 }),
             )
             .menu(move |window, cx| {
@@ -3283,11 +3318,13 @@ impl TypeTable {
                     "Group",
                     current_label.map(SharedString::from),
                 )
+                .label_hidden(self.compact_toolbar())
                 .disabled(choices.is_empty())
                 .when(!open, |button| {
-                    button.tip(studio_ui::ds::tooltip(
+                    button.tip(studio_ui::ds::tooltip(self.chip_tip(
+                        "Group",
                         "Group the rows by a property, a relationship or a property of a neighbour",
-                    ))
+                    )))
                 }),
             )
             .menu(move |window, cx| {
@@ -3432,11 +3469,13 @@ impl TypeTable {
             .with_handle(self.toolbar_menus[3].clone())
             .trigger(
                 studio_ui::ds::chip_button("sort", IconName::ChevronUpDown, "Sort", current_label)
+                    .label_hidden(self.compact_toolbar())
                     .disabled(choices.is_empty())
                     .when(!open, |button| {
-                        button.tip(studio_ui::ds::tooltip(
+                        button.tip(studio_ui::ds::tooltip(self.chip_tip(
+                            "Sort",
                             "Order the rows by a property · a column's header orders by it too",
-                        ))
+                        )))
                     }),
             )
             .menu(move |window, cx| {
@@ -3490,10 +3529,12 @@ impl TypeTable {
                     "Views",
                     active.clone().map(SharedString::from),
                 )
+                .label_hidden(self.compact_toolbar())
                 .when(!open, |button| {
-                    button.tip(studio_ui::ds::tooltip(
+                    button.tip(studio_ui::ds::tooltip(self.chip_tip(
+                        "Views",
                         "Saved filters, order, grouping and columns for this type",
-                    ))
+                    )))
                 }),
             )
             .menu(move |window, cx| {
@@ -5480,9 +5521,6 @@ impl TypeTable {
             })
             .ok();
         }));
-        if self.peek.is_some() {
-            self.close_peek(cx);
-        }
         window.focus(&self.focus_handle, cx);
     }
 
@@ -5654,7 +5692,7 @@ impl TypeTable {
             .collect();
         self.selection.retain(|id| !going.contains(id.as_str()));
         let gone: Vec<usize> = rows.iter().rev().map(|(index, _)| *index).collect();
-        self.take_out(&gone, &going, cx);
+        self.take_out(&gone, &going);
         self.deleting.push(PendingDelete {
             ids: ids.to_vec(),
             rows,
@@ -5825,7 +5863,7 @@ impl TypeTable {
         if gone.is_empty() {
             return;
         }
-        self.take_out(&gone, &going, cx);
+        self.take_out(&gone, &going);
         self.cells
             .retain(|(row_id, _), _| !going.contains(row_id.as_str()));
         self.drop_rows_drafts(&going, cx);
@@ -5833,7 +5871,7 @@ impl TypeTable {
 
     /// Takes the rows at `gone` (from the last up) out of the list, the cursor and the anchor
     /// kept on their rows, and the peek closed on one of them. Their drafts stay.
-    fn take_out(&mut self, gone: &[usize], going: &HashSet<&str>, cx: &mut Context<Self>) {
+    fn take_out(&mut self, gone: &[usize], going: &HashSet<&str>) {
         for &index in gone {
             if let Some(grouping) = &mut self.grouping {
                 grouping.removed(index);
@@ -5847,12 +5885,13 @@ impl TypeTable {
         } else if let Some(cursor) = &mut self.cursor {
             cursor.row = cursor.row.min(self.rows.len() - 1);
         }
+        // The inspector's view of a row that went goes with it; the cursor's row now is shown.
         if self
             .peek
             .as_ref()
             .is_some_and(|(peeked, _)| going.contains(peeked.as_str()))
         {
-            self.close_peek(cx);
+            self.peek = None;
         }
     }
 
@@ -5928,16 +5967,7 @@ impl TypeTable {
         {
             self.load_more(cx);
         }
-        // A peek follows the cursor from row to row.
-        let peeked = self.peek.as_ref().map(|(id, _)| id.clone());
-        if let Some(peeked) = peeked
-            && self
-                .rows
-                .get(cursor.row)
-                .is_some_and(|row| row.id != peeked)
-        {
-            self.show_peek(cursor.row, true, cx);
-        }
+        // The inspector follows the cursor from row to row ([`Self::report_selection`]).
         cx.notify();
     }
 
@@ -5975,18 +6005,10 @@ impl TypeTable {
     ) {
         // The columns can change between the frame clicked and the click: a column gone is no
         // cell.
-        let Some(column) = self.columns.get(col) else {
-            return;
-        };
-        let (role, editable) = (column.role.clone(), column.editable(self.kind));
-        let relationship = column.relationship().is_some();
-        let cursor = Cursor { row, col };
-        // A double click on a node's key opens its page (spec 014); the first click peeked it.
-        if clicks >= 2 && self.kind == TableKind::Node && matches!(role, ColumnRole::Key) {
-            self.set_cursor(cursor, cx);
-            self.open_row_page(row, window, cx);
+        if self.columns.get(col).is_none() {
             return;
         }
+        let cursor = Cursor { row, col };
         // ⌘-click picks a row for a bulk set; ⇧-click picks the rows from the last one picked.
         if modifiers.secondary(cx) || modifiers.shift {
             self.pick_rows(row, modifiers.shift, cx);
@@ -5997,25 +6019,33 @@ impl TypeTable {
             self.clear_selection(cx);
         }
         self.set_cursor(cursor, cx);
-        // One click puts the cursor on the cell, as a spreadsheet's does, so the arrows go on
-        // from there; a second opens it, as ↵ does. A key, or a value nobody may edit here,
-        // peeks its row at once.
+        // One click puts the cursor on the cell, in every column, as a spreadsheet's does: the
+        // arrows go on from there, and the inspector shows the cursor's row while it is shown.
+        // A click opens nothing; a second opens the cell, as ↵ does.
         if clicks >= 2 {
             self.open_cell(cursor, window, cx);
-        } else if !relationship && !(editable && self.write_refusal(cx).is_none()) {
-            self.show_peek(row, false, cx);
         }
     }
 
-    /// ↵ or a double click: a value's edit, or a relationship's related rows, the other type
-    /// filtered to those related to this row through the same relationship seen from the other
-    /// end. A row the branch removed opens neither, as [`Self::start_edit`] refuses it.
+    /// ↵ or a double click: a value's edit, a node's page from its key (spec 014), or a
+    /// relationship's related rows, the other type filtered to those related to this row
+    /// through the same relationship seen from the other end. A row the branch removed opens
+    /// nothing, as [`Self::start_edit`] refuses it.
     fn open_cell(&mut self, cursor: Cursor, window: &mut Window, cx: &mut Context<Self>) {
         if self
             .rows
             .get(cursor.row)
             .is_some_and(|row| self.is_removed(&row.id))
         {
+            return;
+        }
+        if self.kind == TableKind::Node
+            && self
+                .columns
+                .get(cursor.col)
+                .is_some_and(|column| matches!(column.role, ColumnRole::Key))
+        {
+            self.open_row_page(cursor.row, window, cx);
             return;
         }
         let group = self
@@ -6044,14 +6074,55 @@ impl TypeTable {
         );
     }
 
-    // ---- peek ----
+    // ---- the inspector ----
 
-    fn show_peek(&mut self, row: usize, debounce: bool, cx: &mut Context<Self>) {
-        let Some(row) = self.rows.get(row) else {
-            return;
+    /// The row under the cursor, which the inspector shows: none while no cell holds the
+    /// cursor, and none for a row the branch removed.
+    fn selected_row_id(&self) -> Option<&str> {
+        let row = self.rows.get(self.cursor?.row)?;
+        (!self.is_removed(&row.id)).then_some(row.id.as_str())
+    }
+
+    /// Tells the workspace when the row under the cursor is another one, or none: called
+    /// whenever the table notifies, so every way the cursor and the rows change is seen. The
+    /// inspector then asks for the row ([`Item::inspected`]) if it is shown.
+    fn report_selection(&mut self, cx: &mut Context<Self>) {
+        let selected = self.selected_row_id();
+        if selected != self.inspected_row.as_deref() {
+            self.inspected_row = selected.map(str::to_owned);
+            cx.emit(ItemEvent::Selected);
+        }
+    }
+
+    /// The inspector's view of the row under the cursor: the one it has while the cursor stays
+    /// on that row, so what is being edited in it stays, else a new one.
+    fn inspect_selected(&mut self, cx: &mut Context<Self>) -> Option<Entity<NodePeek>> {
+        let Some(id) = self.selected_row_id().map(str::to_owned) else {
+            self.peek = None;
+            return None;
         };
+        if let Some((shown, peek)) = &self.peek
+            && *shown == id
+        {
+            return Some(peek.clone());
+        }
+        let row = self.cursor?.row;
+        // The view follows the cursor, which may be moving: what it reads waits a moment, so
+        // the rows the cursor passes read nothing.
+        self.make_peek(row, true, cx)
+    }
+
+    /// Makes the inspector's view of the row at `row`, and holds it as the one to tell of the
+    /// table's writes. With `waits`, what it reads waits a moment first.
+    fn make_peek(
+        &mut self,
+        row: usize,
+        waits: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<NodePeek>> {
+        let row = self.rows.get(row)?;
         if self.is_removed(&row.id) {
-            return;
+            return None;
         }
         let subject = match self.kind {
             TableKind::Node => PeekSubject::Node {
@@ -6059,13 +6130,10 @@ impl TypeTable {
                 id: row.id.clone(),
             },
             TableKind::Edge => {
-                let Some(edge) = self
+                let edge = self
                     .schema
                     .as_ref()
-                    .and_then(|schema| schema.edge(&self.type_name))
-                else {
-                    return;
-                };
+                    .and_then(|schema| schema.edge(&self.type_name))?;
                 PeekSubject::Edge {
                     edge_type: edge.name.clone(),
                     id: row.id.clone(),
@@ -6123,32 +6191,16 @@ impl TypeTable {
         // table's own Blob write over another writer's commit.
         let blobs = self.shown_blobs(&id);
         let peek = cx.new(|cx| {
-            let mut peek = NodePeek::from_table(
-                session, subject, values, snapshot, known, blobs, debounce, cx,
-            );
+            let mut peek =
+                NodePeek::from_table(session, subject, values, snapshot, known, blobs, waits, cx);
             if holds_commit {
                 peek.hold_commit();
             }
             peek.table_saves(saving, cx);
             peek
         });
-        if let Some(workspace) = self.workspace.upgrade() {
-            let view: gpui::AnyView = peek.clone().into();
-            let tab = cx.entity_id();
-            workspace.update(cx, |workspace, cx| {
-                workspace.set_inspector_of(tab, Some(view.clone()), cx);
-                // The peek is a list that draws, and reads, only the relationship groups in
-                // view.
-                workspace.set_panel_scrolls_itself(&view, cx);
-                // A peek asked for (Space, ↵, a click) shows the inspector even when its dock
-                // is hidden; one that follows the cursor does not reopen it.
-                if !debounce {
-                    workspace.reveal_inspector(cx);
-                }
-            });
-        }
-        self.peek = Some((id, peek));
-        cx.notify();
+        self.peek = Some((id, peek.clone()));
+        Some(peek)
     }
 
     /// The cells of the row with `row_id` with a save out, each with the value the row holds
@@ -6245,6 +6297,7 @@ impl TypeTable {
                 type_name: self.type_name.clone(),
                 id: row.id.clone(),
                 at_commit: self.at_commit.clone(),
+                preview: false,
             }),
             cx,
         );
@@ -6255,29 +6308,17 @@ impl TypeTable {
         self.open_row_page(row, window, cx);
     }
 
-    fn close_peek(&mut self, cx: &mut Context<Self>) {
-        if self.peek.take().is_some()
-            && let Some(workspace) = self.workspace.upgrade()
-        {
-            let tab = cx.entity_id();
-            workspace.update(cx, |workspace, cx| {
-                workspace.set_inspector_of(tab, None, cx)
-            });
-        }
-        cx.notify();
-    }
-
     // ---- editing ----
 
     fn start_edit(&mut self, cursor: Cursor, window: &mut Window, cx: &mut Context<Self>) {
         let Some(column) = self.columns.get(cursor.col) else {
             return;
         };
+        // A value nobody may edit here opens nothing: the inspector shows its row.
         if !column.editable(self.kind)
             || self.at_commit.is_some()
             || self.change_refusal(cx).is_some()
         {
-            self.show_peek(cursor.row, false, cx);
             return;
         }
         let Some(row) = self.rows.get(cursor.row) else {
@@ -6983,12 +7024,13 @@ impl TypeTable {
         self.sync_drafts(cx);
     }
 
-    /// Peeks the row at `row`, as a click does, and hands back the peek.
+    /// Puts the cursor on the row at `row` and hands back the inspector's view of it, as the
+    /// workspace is handed it while the inspector is shown, but reading at once: a test waits
+    /// for no cursor to settle.
     #[cfg(test)]
     pub(crate) fn peek_row(&mut self, row: usize, cx: &mut Context<Self>) -> Entity<NodePeek> {
-        self.show_peek(row, false, cx);
-        let (_, peek) = self.peek.as_ref().expect("a row to peek");
-        peek.clone()
+        self.cursor = Some(Cursor { row, col: 0 });
+        self.make_peek(row, false, cx).expect("a row to inspect")
     }
 
     /// The draft text a cell shows, if any.
@@ -7774,10 +7816,6 @@ impl TypeTable {
             self.finish_editing(window, cx);
             return;
         }
-        if self.peek.is_some() {
-            self.close_peek(cx);
-            return;
-        }
         if self.cursor.take().is_some() {
             cx.notify();
         }
@@ -7971,23 +8009,6 @@ impl TypeTable {
             }),
             cx,
         );
-    }
-
-    fn on_peek(&mut self, _: &PeekRow, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(cursor) = self
-            .cursor
-            .or_else(|| (!self.rows.is_empty()).then_some(Cursor { row: 0, col: 0 }))
-        else {
-            return;
-        };
-        let peeking_this = self.peek.as_ref().map(|(id, _)| id.as_str())
-            == self.rows.get(cursor.row).map(|row| row.id.as_str());
-        if peeking_this {
-            self.close_peek(cx);
-        } else {
-            self.cursor = Some(cursor);
-            self.show_peek(cursor.row, false, cx);
-        }
     }
 
     fn on_copy(&mut self, _: &CopyCell, _window: &mut Window, cx: &mut Context<Self>) {
@@ -8968,7 +8989,11 @@ impl TypeTable {
         };
         studio_ui::ds::pill_field("filter-words", failed, cx)
             .key_context("FilterWords")
+            // As wide as a search field where there is room, and the first to give way where
+            // there is not, so the controls after it are not cut off.
             .w(px(studio_ui::ds::size::FIELD_WIDE))
+            .min_w(px(WORDS_FIELD_MIN))
+            .flex_shrink(1.)
             .tip(studio_ui::ds::tooltip(about))
             .child(studio_ui::ds::icon::meta(IconName::ZedAssistant))
             .child(studio_ui::ds::field_input(self.words_editor.clone()))
@@ -9399,7 +9424,48 @@ impl TypeTable {
 
     // ---- rendering ----
 
+    /// Whether the toolbar leaves its chips' labels out: in a tab too narrow for them all, as
+    /// beside the inspector in a window of the default size. The sentence field gives way
+    /// first, down to [`WORDS_FIELD_MIN`]; then the chips are their icons, what each is set to
+    /// still showing, and their tooltips name them.
+    fn compact_toolbar(&self) -> bool {
+        let width = self.toolbar_width.get();
+        width > 0. && width < COMPACT_TOOLBAR_BELOW
+    }
+
+    /// A toolbar chip's tooltip: what the chip does, after its name while its label is left out.
+    fn chip_tip(&self, name: &str, about: &str) -> String {
+        if self.compact_toolbar() {
+            format!("{name} · {about}")
+        } else {
+            about.to_owned()
+        }
+    }
+
+    /// Reads the toolbar's width as it is laid out; a new one draws the table again once this
+    /// frame is done.
+    fn measure_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let width = self.toolbar_width.clone();
+        let table = cx.entity_id();
+        gpui::canvas(
+            move |bounds, _, cx| {
+                let now = f32::from(bounds.size.width);
+                if (width.get() - now).abs() > 0.5 {
+                    width.set(now);
+                    cx.defer(move |cx| cx.notify(table));
+                }
+            },
+            |_, (), _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .w_full()
+        .h(px(0.))
+    }
+
     fn render_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let compact = self.compact_toolbar();
         let count = match (&self.count, &self.total, self.filters.is_empty()) {
             (Loadable::Loaded(n), _, true) => {
                 format!(
@@ -9440,6 +9506,8 @@ impl TypeTable {
             format!("Edits, inserts and deletes here commit to {}", self.branch)
         };
         studio_ui::ds::toolbar(cx)
+            .relative()
+            .child(self.measure_toolbar(cx))
             .children(studio_workspace::view_strip(Item::views(self, cx), cx))
             .child(studio_ui::kind_swatch(
                 &self.type_name,
@@ -9514,6 +9582,7 @@ impl TypeTable {
                                     studio_ui::group_count(self.filters.len() as i64).into()
                                 }),
                             )
+                            .label_hidden(compact)
                             .tip_fn(|_, cx| {
                                 studio_ui::ds::tooltip_for_action_view(
                                     "Add a filter",
@@ -9537,6 +9606,7 @@ impl TypeTable {
                     .child(studio_ui::ds::control_chip(
                         "insert-row-chip",
                         studio_ui::ds::chip_button("insert-row", IconName::Plus, "Row", None)
+                            .label_hidden(compact)
                             .disabled(pinned || refused.is_some())
                             .tip_fn(move |_, cx| match &refused {
                                 _ if pinned => {
@@ -10306,13 +10376,6 @@ impl TypeTable {
                 .map_or(IconName::CaseSensitive, property_icon),
             ColumnRole::Endpoint { .. } | ColumnRole::Relationship(_) => IconName::ArrowRight,
         }
-    }
-
-    /// Peeks at row `ix`, as Space does with the cursor on it: the cursor moves to its key, and
-    /// a second press closes the peek.
-    fn peek_at(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.cursor = Some(Cursor { row: ix, col: 0 });
-        self.on_peek(&PeekRow, window, cx);
     }
 
     /// A grouped grid's header line: the value, how many rows hold it, and the disclosure.
@@ -11780,22 +11843,31 @@ impl TypeTable {
         } else {
             tooltip
         };
-        // The key's cell ends in the row's Peek while the row is hovered, as the reference
-        // table's cells end in their action.
-        // Peek and ⤢ show only under the pointer, so they are built only in the pointer's row
+        // A node's key cell ends in Open page while the row is hovered, as the reference
+        // table's cells end in their action: a click on the row selects it, and this opens it.
+        // It and ⤢ show only under the pointer, so they are built only in the pointer's row
         // and cell (and the cursor's cell), not hidden in every row of every frame.
         let pointer = self.frame_pointer;
-        let peek = (col == 0 && pointer.is_some_and(|(row, _)| row == ix)).then(|| {
+        let opens_page = self.kind == TableKind::Node && col == 0;
+        let open_page = (opens_page && pointer.is_some_and(|(row, _)| row == ix)).then(|| {
             div().ml_auto().flex_none().child(
-                studio_ui::ds::cell_action(("peek-row", ix), IconName::Eye)
+                studio_ui::ds::cell_action(("open-row-page", ix), IconName::ArrowUpRight)
                     .visible_on_hover(ROW_GROUP)
                     .tip_fn({
                         let focus = self.focus_handle.clone();
                         move |_, cx| {
-                            studio_ui::ds::tooltip_for_action_in_view("Peek", &PeekRow, &focus, cx)
+                            studio_ui::ds::tooltip_for_action_in_view(
+                                "Open page",
+                                &OpenRowPage,
+                                &focus,
+                                cx,
+                            )
                         }
                     })
-                    .on_click(cx.listener(move |this, _, window, cx| this.peek_at(ix, window, cx))),
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.set_cursor(Cursor { row: ix, col: 0 }, cx);
+                        this.open_row_page(ix, window, cx);
+                    })),
             )
         });
         // Over the text's end on the row's fill, as a header's menu sits over its name.
@@ -11818,7 +11890,7 @@ impl TypeTable {
             .debug_selector(move || format!("cell-{ix}-{col}"))
             .children(dot.map(studio_ui::ds::dot))
             .child(content)
-            .children(peek)
+            .children(open_page)
             .children(expand)
             // The cursor rings what the cell holds, its action too.
             .when(is_cursor, |cell| cell.child(studio_ui::ds::cell_cursor(cx)));
@@ -11974,7 +12046,7 @@ impl TypeTable {
             }
             // A table pinned to a commit only reads.
             (false, kind) if self.at_commit.is_some() => {
-                let mut keys = vec![key("Peek", &PeekRow), key("Copy", &CopyCell)];
+                let mut keys = vec![key("Inspector", &ToggleInspector), key("Copy", &CopyCell)];
                 if kind == TableKind::Node {
                     keys.insert(1, key("Open page", &OpenRowPage));
                 }
@@ -11983,7 +12055,7 @@ impl TypeTable {
             (false, TableKind::Node) => {
                 let mut keys = vec![
                     key("Edit", &EditCell),
-                    key("Peek", &PeekRow),
+                    key("Inspector", &ToggleInspector),
                     key("Open page", &OpenRowPage),
                     key("Canvas", &ShowRowOnCanvas),
                     key("Copy", &CopyCell),
@@ -12003,7 +12075,7 @@ impl TypeTable {
                 keys
             }
             (false, TableKind::Edge) => vec![
-                key("Peek", &PeekRow),
+                key("Inspector", &ToggleInspector),
                 key("Copy", &CopyCell),
                 key("New row", &InsertRow),
                 key("Delete row", &DeleteRow),
@@ -12137,7 +12209,6 @@ impl Render for TypeTable {
                 |table| table.on_action(cx.listener(Self::on_expand_cell)),
             )
             .on_action(cx.listener(Self::on_cancel))
-            .on_action(cx.listener(Self::on_peek))
             .on_action(cx.listener(Self::on_open_row_page))
             .on_action(cx.listener(Self::on_explore))
             .on_action(cx.listener(|this, _: &RefreshTable, window, cx| this.refresh(window, cx)))
@@ -14833,6 +14904,121 @@ mod tests {
         });
     }
 
+    /// A click puts the cursor on its cell and opens nothing, in every column: the table says
+    /// when the cursor's row is another one, and hands the inspector that row's view, the same
+    /// view while the cursor stays in the row, so what is being edited in it stays. A second
+    /// click opens the cell, a node's page from its key. With no cursor nothing is selected.
+    #[gpui::test]
+    async fn a_click_selects_and_the_inspector_follows_the_cursors_row(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let pages: Rc<RefCell<Vec<studio_actions::graph::OpenNodePage>>> = Rc::default();
+        cx.update(|cx| {
+            let heard = pages.clone();
+            cx.on_action(move |action: &studio_actions::graph::OpenNodePage, _| {
+                heard.borrow_mut().push(action.clone())
+            });
+        });
+        let session = session(PEOPLE, cx);
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session,
+                "Person".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let told = Rc::new(std::cell::Cell::new(0));
+        let heard = told.clone();
+        let _hearing = cx.update(|_, cx| {
+            cx.subscribe(&table, move |_, event: &ItemEvent, _| {
+                if matches!(event, ItemEvent::Selected) {
+                    heard.set(heard.get() + 1);
+                }
+            })
+        });
+        let name = table.read_with(cx, |table, _| table.column_index("name").unwrap());
+        let click = |row: usize, col: usize, clicks: usize, cx: &mut VisualTestContext| {
+            table.update_in(cx, |table, window, cx| {
+                table.click_cell(row, col, gpui::Modifiers::default(), clicks, window, cx)
+            });
+            cx.run_until_parked();
+        };
+        let inspected = |cx: &mut VisualTestContext| {
+            table.update(cx, |table, cx| match Item::inspected(table, cx) {
+                Some(Inspected::View { view, .. }) => Some(view.entity_id()),
+                Some(Inspected::Node(_)) => panic!("a table hands over its own view"),
+                None => None,
+            })
+        };
+        assert_eq!(inspected(cx), None, "no cursor, nothing selected");
+
+        // The key's cell, which nobody edits, is selected as any other is.
+        click(0, 0, 1, cx);
+        assert_eq!(told.get(), 1);
+        let first = inspected(cx);
+        assert!(first.is_some());
+        assert!(pages.borrow().is_empty(), "a click opens nothing");
+
+        // Another cell of the same row: the same row is selected, in the same view.
+        click(0, name, 1, cx);
+        assert_eq!(told.get(), 1);
+        assert_eq!(inspected(cx), first);
+        table.read_with(cx, |table, _| assert!(table.editing.is_none()));
+
+        // Another row is another view.
+        click(1, name, 1, cx);
+        assert_eq!(told.get(), 2);
+        let second = inspected(cx);
+        assert!(second.is_some() && second != first);
+
+        // A second click on a node's key opens its page, kept.
+        click(1, 0, 2, cx);
+        assert_eq!(told.get(), 2);
+        let opened = pages.borrow_mut().drain(..).collect::<Vec<_>>();
+        assert_eq!(opened.len(), 1);
+        assert_eq!(
+            (opened[0].id.as_str(), opened[0].preview),
+            ("p2", false),
+            "{opened:?}"
+        );
+
+        // Esc lets the cursor go: nothing is selected, and the view is let go.
+        table.update_in(cx, |table, window, cx| table.on_cancel(&Cancel, window, cx));
+        cx.run_until_parked();
+        assert_eq!(told.get(), 3);
+        assert_eq!(inspected(cx), None);
+        table.read_with(cx, |table, _| assert!(table.peek.is_none()));
+    }
+
+    /// The toolbar is measured as it is drawn, and in a tab too narrow for its labels (beside
+    /// the inspector, in a window of the default size) its chips are their icons, their
+    /// tooltips naming them. In a wide tab, and before the first frame, they keep their labels.
+    #[gpui::test]
+    async fn a_narrow_tab_leaves_the_toolbars_labels_out(cx: &mut TestAppContext) {
+        let session = session(PEOPLE, cx);
+        let (table, cx) = people_table(&session, cx);
+        table.read_with(cx, |table, _| {
+            assert!(table.toolbar_width.get() > 0., "measured when drawn");
+        });
+        let about = "Order the rows by a property";
+        table.update(cx, |table, _| {
+            table.toolbar_width.set(0.);
+            assert!(!table.compact_toolbar(), "not before it is measured");
+            table.toolbar_width.set(840.);
+            assert!(table.compact_toolbar());
+            assert_eq!(table.chip_tip("Sort", about), format!("Sort · {about}"));
+            table.toolbar_width.set(1176.);
+            assert!(!table.compact_toolbar());
+            assert_eq!(table.chip_tip("Sort", about), about);
+        });
+    }
+
     /// Rows deleted together leave in one pass: the cursor stays on its row, and a deleted row
     /// the table never loaded still leaves the selection.
     #[gpui::test]
@@ -17006,7 +17192,7 @@ mod tests {
         assert_eq!(
             keys,
             [
-                "Peek",
+                "Inspector",
                 "Open page",
                 "Canvas",
                 "Copy",

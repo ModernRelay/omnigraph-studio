@@ -101,6 +101,19 @@ pub mod workspace {
     use schemars::JsonSchema;
     use serde::Deserialize;
 
+    /// Show or hide the inspector, the right dock: what the active tab has selected (spec 020).
+    /// Space in a table, a tree and a canvas, which each had an action of their own for it.
+    #[derive(Clone, Debug, Default, PartialEq, Action)]
+    #[action(
+        namespace = studio,
+        deprecated_aliases = [
+            "studio_table::PeekRow",
+            "studio_tree::PeekSelected",
+            "studio_canvas::PeekSelected"
+        ]
+    )]
+    pub struct ToggleInspector;
+
     /// Open the active tab's view at this place in its view strip.
     #[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Action)]
     #[action(namespace = studio)]
@@ -147,8 +160,6 @@ pub mod workspace {
             ActivatePreviousItem,
             /// Show or hide the sidebar, the left dock.
             ToggleSidebar,
-            /// Show or hide the inspector, the right dock.
-            ToggleInspector,
             /// Show or hide the bottom panel: nodes, history and the activity log.
             ToggleActivity,
             /// Zoom the active pane over the document area, or end a zoom.
@@ -403,21 +414,6 @@ pub mod graph {
         pub held: bool,
     }
 
-    /// Show one node in the inspector without revealing it in the tree, read at the branch
-    /// head or held at a commit.
-    #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
-    #[action(namespace = studio_graph)]
-    pub struct PeekNode {
-        pub type_name: String,
-        pub id: String,
-        #[serde(default)]
-        pub at_commit: Option<String>,
-        /// The commit the view it comes from shows while that view follows the head: the peek
-        /// reads there, as the view does, and offers Refresh when the branch has moved past it.
-        #[serde(default)]
-        pub snapshot: Option<String>,
-    }
-
     /// Open one node in the inspector and the Explore panel.
     #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
     #[action(namespace = studio_graph)]
@@ -481,6 +477,9 @@ pub mod graph {
         pub id: String,
         #[serde(default)]
         pub at_commit: Option<String>,
+        /// Open as the pane's preview tab, which the next preview replaces.
+        #[serde(default)]
+        pub preview: bool,
     }
 
     /// Open a new query tab with this text. It is not run.
@@ -626,8 +625,6 @@ pub mod table {
             SelectPreviousSuggestion,
             /// Cancel the edit, or step back one level.
             Cancel,
-            /// Show the selected row in the inspector, or hide it.
-            PeekRow,
             /// Open the selected row's node as a page.
             OpenRowPage,
             /// Read the table again: from the branch head, or at the commit it is held at.
@@ -715,7 +712,7 @@ pub mod tree {
             ExpandAll,
             /// Collapse the selected row's subtree.
             CollapseAll,
-            /// Open the selected node in the inspector.
+            /// Open the selected node's page, or open or close the selected group.
             OpenSelected,
             /// Make the selected node the tree's root.
             RerootHere,
@@ -723,8 +720,6 @@ pub mod tree {
             ShowOnCanvas,
             /// Clear the text typed to filter the tree.
             ClearFilter,
-            /// Show the selected node in the inspector, keeping focus in the tree.
-            PeekSelected,
             /// Open a table filtered to the selected node, or to its neighbours in a group.
             OpenTable,
             /// Open the selected node's page, or a relationship group's table.
@@ -859,8 +854,6 @@ pub mod canvas {
             MoveUp,
             /// Select the nearest node below.
             MoveDown,
-            /// Show the selected node in the inspector.
-            PeekSelected,
             /// Open the selected node's page.
             OpenSelectedPage,
             /// Center and zoom on the selected node.
