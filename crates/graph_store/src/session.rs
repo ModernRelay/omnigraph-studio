@@ -9585,6 +9585,123 @@ mod tests {
         });
     }
 
+    /// Spec 030 part 5, "A cap on the slow class": a node page asks for its 43 groups' first
+    /// neighbours. The server answers 3 hub groups in 60 s and the 40 others in 1 s, as the
+    /// personal graph answered a Person's `spokenBy` (61.2 s) against a median of 1.25 s (spec
+    /// 015). The ledger's times, from asking for a slot to the answer, say when each group
+    /// settled. With the hubs on the wire first they hold 3 of the client's 8 slots for a
+    /// minute, so the ordinary groups go 5 at a time and settle at 8 s. Capping the hubs at 2
+    /// slots was measured here and not kept (spec 030's validation log, 2026-11-12): 7 s, and
+    /// only on a page read again, while the third hub waited to 120 s.
+    #[gpui::test]
+    async fn a_pages_hub_groups_hold_slots_its_ordinary_groups_wait_for(cx: &mut TestAppContext) {
+        use crate::ledger::{ReadView, Status, Target};
+        use crate::test_server::followed_session;
+        use serde_json::json;
+
+        const HUB: Duration = Duration::from_secs(60);
+        const ORDINARY: Duration = Duration::from_secs(1);
+        let mut schema = String::from(
+            "node Person {\n  slug: String @key\n  name: String\n}\nnode Thing {\n  slug: String @key\n}\n",
+        );
+        for hub in 0..3 {
+            schema.push_str(&format!("edge Hub{hub}: Person -> Thing\n"));
+        }
+        for group in 0..40 {
+            schema.push_str(&format!("edge Group{group}: Person -> Thing\n"));
+        }
+        let (session, served) = followed_session(
+            &schema,
+            |_| json!([{ "id": "t1", "edge_id": "e1", "label": "One" }]),
+            cx,
+        );
+        served.lock().unwrap().wait = Box::new(|asked| {
+            let text = asked["query"].as_str().unwrap_or_default();
+            match asked["name"].as_str() {
+                Some("studio_neighbours") if text.to_lowercase().contains("hub") => HUB,
+                Some("studio_neighbours") => ORDINARY,
+                _ => Duration::ZERO,
+            }
+        });
+        cx.run_until_parked();
+        let schema = session.read_with(cx, |session, _| session.schema_model().unwrap());
+        let mut groups = schema.relationships_of("Person").to_vec();
+        groups.sort_by_key(|group| !group.edge.starts_with("Hub"));
+        assert_eq!(groups.len(), 43);
+        let queries: Vec<BuiltQuery> = groups
+            .iter()
+            .map(|group| {
+                builder::neighbours_without_properties(
+                    &schema,
+                    "Person",
+                    group,
+                    "p1",
+                    None,
+                    builder::Narrow::default(),
+                    51,
+                    &[],
+                )
+                .unwrap()
+            })
+            .collect();
+        let scope = session.update(cx, |session, _| session.read_scope("main", ReadView::Page));
+        let head = session.read_with(cx, |session, _| session.heads.get("main").cloned().unwrap());
+        session.update(cx, |session, _| session.ledger_mut().keep_events(true));
+
+        // Asks for every group, the hubs first, runs the clock a second at a time, and gives the
+        // ledger's time for each hub group and each ordinary one.
+        let read_page = async |cx: &mut TestAppContext| {
+            session.update(cx, |session, _| session.ledger_mut().clear());
+            // The hubs are on the wire when the others are asked, as when they are drawn first.
+            let mut reads = Vec::new();
+            for asked in [&queries[..3], &queries[3..]] {
+                reads.extend(session.update(cx, |session, cx| {
+                    asked
+                        .iter()
+                        .map(|query| session.read_in(&scope, query, Some(head.clone()), cx))
+                        .collect::<Vec<_>>()
+                }));
+                cx.run_until_parked();
+            }
+            for _ in 0..3 * HUB.as_secs() {
+                cx.executor().advance_clock(Duration::from_secs(1));
+                cx.run_until_parked();
+            }
+            for read in reads {
+                read.await.unwrap();
+            }
+            let events = session.update(cx, |session, _| session.ledger_mut().take_events());
+            let sent = Answered::Sent(Target::HeadCommit, Status::Ok);
+            let took: Vec<Duration> = events
+                .iter()
+                .filter(|event| event.what.as_ref() == "studio_neighbours")
+                .inspect(|event| assert_eq!(event.answered, sent))
+                .map(|event| event.took)
+                .collect();
+            assert_eq!(took.len(), 43);
+            let (hubs, ordinary): (Vec<_>, Vec<_>) =
+                took.into_iter().partition(|took| *took >= HUB);
+            assert_eq!(hubs.len(), 3);
+            (hubs, ordinary)
+        };
+        let settled = |took: &[Duration]| took.iter().max().copied().unwrap_or_default();
+        let mean = |took: &[Duration]| took.iter().sum::<Duration>() / took.len() as u32;
+
+        // Five slots for 40 one-second reads: eight rounds.
+        let (hubs, ordinary) = read_page(cx).await;
+        assert_eq!(settled(&ordinary), Duration::from_secs(8));
+        assert_eq!(mean(&ordinary), Duration::from_millis(4500));
+        assert_eq!(hubs, [HUB; 3]);
+
+        // The same again once the session holds none of it, as at a commit that changed every
+        // group: what the first read learnt of the hubs changes nothing.
+        session.update(cx, |session, _| session.forget_reads());
+        let (hubs, ordinary) = read_page(cx).await;
+        assert_eq!(settled(&ordinary), Duration::from_secs(8));
+        assert_eq!(mean(&ordinary), Duration::from_millis(4500));
+        assert_eq!(hubs, [HUB; 3]);
+    }
+
     /// A schema read the server answers 404 is kept as a graph not found, for the window's page;
     /// one that is read again and lands lets it go (spec 029).
     #[gpui::test]

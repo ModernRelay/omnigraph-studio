@@ -226,11 +226,27 @@ Each is its own plan when it is built.
 - **Lanes inside the 8 slots.** Use shares, as Netflix's concurrency-limits partitions do, not a
   strict priority queue. Visible reads get most of the slots and near reads some. The
   speculative lane (prefetch, the audit) gets only slots nobody else is using.
-- **A cap on the slow class.** A hub group's read took 61 s on the personal graph (spec 015), so
-  one holds a slot as long as 15 to 120 ordinary reads. The client already keeps such a lane for
-  reads of changes (`LONG_READ_CONCURRENCY`, 4 of the 8). They get at most 2 slots, so a node
-  page's neighbours never queue behind them. The ledger's latency per query name decides which
-  names are slow.
+- **A cap on the slow class: measured, not kept (2026-11-12).** A hub group's read took 61 s on
+  the personal graph (spec 015), so one holds a slot as long as 15 to 120 ordinary reads. The
+  idea was a lane like the one for reads of changes (`LONG_READ_CONCURRENCY`, 4 of the 8): reads
+  known to be slow get at most 2 slots. Measured against the fake server
+  (`a_pages_hub_groups_hold_slots_its_ordinary_groups_wait_for`, validation log), it does not pay:
+  - **Little to free.** A page has few hubs (3 of a Person's 92 groups), and while fewer than
+    8 slow reads are out the ordinary ones still have slots. Capping 3 hubs at 2 frees one slot of
+    five: the 40 ordinary groups settle at 7 s, not 8.
+  - **It costs the hubs.** The third hub waits for a slow slot and is answered at 120 s, not 60.
+  - **Nothing is known on the first open.** No read says it is slow before it is sent: a group's
+    count comes from the same slow read, or from a table, and a page opened from a table does not
+    open a large group by itself. History only helps the same node's page read again.
+  - **Order matters more than the cap.** With the hubs taking slots as others freed them (the
+    test executor's own order), the ordinary groups settled at 7 s with no cap.
+  
+  What would change this: a page or canvas that has 6 or more slow reads out at once, which the
+  ledger's slowest time per name would show in the scenarios (step 4), or a lane beside the 8
+  instead of inside them. A lane beside them is a different bound: it lets 10 reads onto the wire.
+  Separately, Studio sends a query with a 60 s timeout (`READ_TIMEOUT`, set in `send_now`), so a
+  hub read as slow as `spokenBy` (61.2 s) would fail in Studio rather than finish. This was read in
+  the source, not checked live.
 - **Already true:** a read every asker dropped is dropped from the client's queue before it is
   sent (`counted_read`). The ledger counts these as `Dropped`, which shows how much a view
   abandons.
@@ -397,3 +413,4 @@ The research (2026-11-12) is summarized here; a claim not checked in a primary s
 | 2026-11-12 | Found by the ledger: a page opened before the session knows its branch's head reads its node with no commit, and that answer is not kept, so Refresh sends the node again though nothing of it changed | `type_table` `refresh_reads_again_only_the_groups_a_commit_changed`, ledger before Refresh: `studio_node … Sent(Branch, Ok)`; after: `Sent(HeadCommit, Ok)`, nothing carried | Open at the time; fixed in the next row |
 | 2026-11-12 | A read with no commit, kept at the commit its answer names, then holds and carries | Fake servers only. `type_table` `refresh_reads_again_only_the_groups_a_commit_changed`, ledger for Refresh. Before: 4 sent (`studio_neighbours` 2 `Sent(HeadCommit)`, `studio_head` 1, `studio_node` 1 `Sent(HeadCommit)`), 2 carried. After: 3 sent (`studio_neighbours` 2, `studio_head` 1), 3 carried (`studio_neighbours` 2, `studio_node` 1 `Carried(Read)`). `graph_store` `a_read_with_no_commit_is_kept_at_the_commit_it_answered`: a branch read, then the same read at its commit (`Held(Read)`, before: sent again) and at a commit to another person (`Carried(Read)`): `studio_node` sent once in all (`Sent(Branch)`), before twice (`Sent(Branch)`, then `Sent(HeadCommit)` at c1). The guards: an answer naming a commit the head watch has not seen is kept there and the head stays; a schema epoch or credential changed while the read was out, or `Depends::Unknown`, keeps nothing; removing any one guard fails the test | Pass. Two `type_table` tests read a first page again at the commit a branch read answered at, and now send nothing (`a_first_read_pins_the_head_the_session_holds`, `a_read_out_when_a_commit_to_another_type_moves_the_pin_lands`: 1 request each before, 0 after); their assertions changed with a note. Not covered: a live graph, and branch reads outside `GraphSession::read` (`read_on` another branch, `read_request` called directly), which are still not kept |
 | 2026-11-12 | A node page opened from a table reads no neighbours of a group the table counted empty | `type_table` `the_ledger_of_a_table_a_rows_page_and_its_peek`: a Person table over a small graph that answers Studio's queries as a server would (`test_support::Graph`; Ada has 6 groups, 3 with neighbours), then Ada's page, then her peek. Table: 1 `studio_page`, 1 `studio_count`, 6 `studio_page_degrees`, 6 `studio_page_neighbours`. Page before: `studio_node` `Seeded`, 6 `studio_neighbours` sent. Page after: `studio_node` `Seeded`, 3 `studio_neighbours` `Seeded`, 3 sent. Peek after the page: 3 `studio_neighbours` sent, for the groups with neighbours; it reads none for the empty ones, which the table hands it as `KnownRelation` counts, so this change does not touch it. Each of the 6 page queries, answered by the session at `c1`, has the same rows, byte for byte, and row count as the fake's answer to the same query text and parameters; the 3 it sent are among them. `graph_store` `a_group_counted_empty_lists_no_neighbours_without_a_read`: a count of 0 answers with no request, a count of 1, a search and a node not counted are sent | Pass. A page's requests at open fall from 6 to 3 in the fixture. On the personal graph a table counts only the relationship columns it draws (20 `studio_page_degrees` in the count above), so a page saves the empty ones of those for its row; a group no view counted is read as before. Not proven against the fake: `columns` (the fake answers `["n"]` to every read); the session gives the projection's names, and no reader of these answers reads them |
+| 2026-11-12 | A cap of 2 slots on reads known to be slow lets a node page's ordinary groups settle much sooner (part 5) | `graph_store` `a_pages_hub_groups_hold_slots_its_ordinary_groups_wait_for`: a fake server (`test_server`'s new `wait`, on the executor's clock) answers 3 hub groups' `studio_neighbours` in 60 s and 40 others in 1 s; the hubs are asked first and the ledger's `took` times each read. A prototype added a slow lane to `graph_client` (2 slots taken before one of the 8) and, in the session, sent a read in it when the same name, text and parameters had taken 15 s or more | **Not kept.** Before, on the first read and again: ordinary groups settled at 8 s (mean 4.5 s), hubs 60, 60, 60 s. With the cap, first read: unchanged, since nothing is known yet. Read again: 7 s (mean 3.85 s), hubs 60, 60, **120 s**. With the executor's own order and no cap, ordinary groups settled at 7 s (mean 3.55 s), hubs 60, 63, 64 s. The test keeps the 8 s baseline |
