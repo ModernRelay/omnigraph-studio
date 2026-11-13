@@ -176,7 +176,7 @@ dependencies = [
 
 [[package]]
 name = "agent_panel"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "agent-client-protocol",
  "chrono",
@@ -1382,7 +1382,7 @@ dependencies = [
 
 [[package]]
 name = "change_cards"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "gpui",
  "gq_language",
@@ -1652,7 +1652,7 @@ dependencies = [
 
 [[package]]
 name = "command_palette"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "editor",
  "gpui",
@@ -1801,7 +1801,7 @@ dependencies = [
 
 [[package]]
 name = "control_client"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "anyhow",
  "futures",
@@ -3042,7 +3042,7 @@ dependencies = [
 
 [[package]]
 name = "filter_words"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "gq_language",
  "model",
@@ -4000,7 +4000,7 @@ dependencies = [
 
 [[package]]
 name = "gq_language"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "chrono",
  "omnigraph-compiler",
@@ -4020,7 +4020,7 @@ dependencies = [
 
 [[package]]
 name = "graph_canvas"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "gpui",
  "gq_language",
@@ -4037,7 +4037,7 @@ dependencies = [
 
 [[package]]
 name = "graph_client"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "anyhow",
  "futures",
@@ -4052,7 +4052,7 @@ dependencies = [
 
 [[package]]
 name = "graph_store"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4221,7 +4221,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "history"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "change_cards",
  "editor",
@@ -5959,7 +5959,7 @@ dependencies = [
 
 [[package]]
 name = "model"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "futures",
  "http_client",
@@ -6392,7 +6392,7 @@ dependencies = [
 
 [[package]]
 name = "oauth_client"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -7729,7 +7729,7 @@ dependencies = [
 
 [[package]]
 name = "query_editor"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "anyhow",
  "clock",
@@ -8180,7 +8180,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "relationship_tree"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "chrono",
  "editor",
@@ -8279,7 +8279,7 @@ dependencies = [
 
 [[package]]
 name = "review"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "change_cards",
  "editor",
@@ -9502,7 +9502,7 @@ dependencies = [
 
 [[package]]
 name = "studio"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "agent_panel",
  "command_palette",
@@ -9545,7 +9545,7 @@ dependencies = [
 
 [[package]]
 name = "studio_actions"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "gpui",
  "schemars 1.0.4",
@@ -9555,7 +9555,7 @@ dependencies = [
 
 [[package]]
 name = "studio_settings"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "futures",
  "getrandom 0.3.4",
@@ -9571,7 +9571,7 @@ dependencies = [
 
 [[package]]
 name = "studio_telemetry"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "chrono",
  "flate2",
@@ -9589,7 +9589,7 @@ dependencies = [
 
 [[package]]
 name = "studio_theme"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "assets",
  "gpui",
@@ -9605,7 +9605,7 @@ dependencies = [
 
 [[package]]
 name = "studio_ui"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "gpui",
  "markdown",
@@ -9621,7 +9621,7 @@ dependencies = [
 
 [[package]]
 name = "studio_update"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -9644,7 +9644,7 @@ dependencies = [
 
 [[package]]
 name = "studio_workspace"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "gpui",
  "gq_language",
@@ -10527,7 +10527,7 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter-gq"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "cc",
  "tree-sitter",
@@ -10551,7 +10551,7 @@ source = "git+https://github.com/tree-sitter/tree-sitter?rev=803c6ebaac27d69e180
 
 [[package]]
 name = "tree-sitter-pg"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "cc",
  "tree-sitter",
@@ -10594,7 +10594,7 @@ dependencies = [
 
 [[package]]
 name = "type_table"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "chrono",
  "collections",
