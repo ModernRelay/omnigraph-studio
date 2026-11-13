@@ -318,8 +318,14 @@ What step 1 changed from the design above:
    paid plans keep two years by default and can be set, in months, to less (a proposal: 3
    months). Exceptions are kept as long. Free covers 1 million events and 100,000 exceptions a
    month, and one project.
-3. The privacy notice the first popover and `docs/telemetry.md` link to, and its legal review: a
-   resettable install ID is still pseudonymous personal data under the GDPR.
+3. ~~The privacy notice the first popover and `docs/telemetry.md` link to.~~ `docs/privacy.md`
+   (2026-11-13): EQTR, Inc., doing business as Modern Relay, is the controller, reached at
+   privacy@modernrelay.com; legitimate interest for usage without an ID, consent for the install
+   ID and crash reports; PostHog US Cloud under the Data Privacy Framework and its DPA; one year
+   kept. Still open: its legal review; confirming PostHog's DPA is in place for the
+   organization; whether the EU's ePrivacy rule (Article 5(3), EDPB Guidelines 2/2023) asks
+   consent before anonymous usage is sent, which today it is not; and whether an EU
+   representative (GDPR Article 27) is needed.
 4. Whether an organization signed in to a managed cluster may turn usage off for its people.
 5. What GPUI exposes about a frame's time at Zed `v1.23.2`, to time frames without adding work to
    one. `script/measure-frames` reads the main thread's CPU time per frame, but by driving the
@@ -350,6 +356,7 @@ What step 1 changed from the design above:
 | 2026-11-12 | Usage is anonymous by default and an install ID exists only when chosen | `studio_telemetry`: `usage_is_anonymous_by_default` (sent under a run's own ID, no install ID kept, the notice gone once answered), `a_shared_event_is_sent_anonymously_and_logged` (with the install ID chosen, under it), `turning_usage_off_deletes_its_reports_and_the_id`; the workspace's tests | Pass |
 | 2026-11-12 | Studio's PostHog project discards client IPs and adds no location | PostHog's API: the US Cloud project whose token the repository variable `OMNIGRAPH_STUDIO_POSTHOG_TOKEN` holds (the token checked by comparison, never printed), read back after the change | It had no events yet. `anonymize_ips` was `false` and its default GeoIP transformation was on; now `anonymize_ips` is `true` and GeoIP is off. Open question 7 answered the same day (next row) |
 | 2026-11-12 | Crash reports keep no IP or location either | One `$exception` sent to the project as Studio sends one (gzipped batch, a one-off `distinct_id`, `$geoip_disable`, `$process_person_profile: false`; labelled `setup_check`), read back with a HogQL query | Stored, with `$ip`, `$geoip_city_name` and `$geoip_country_code` empty. The test event stays in the project, marked `setup_check: true` |
+| 2026-11-13 | The privacy notice states what Studio does | `docs/privacy.md` read against `studio_telemetry` (`distinct_id`, `follow_settings`, `crash.rs` `without_home`), `graph_store::USER_AGENT`, `studio_settings` `auto_update`, and PostHog's API for the organization's plan (`product_analytics_data_retention`: 1 year) | Matches. `docs/telemetry.md` links it; the popover reaches it through that page |
 
 ## Corrections
 

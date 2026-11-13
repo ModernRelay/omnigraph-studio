@@ -6,6 +6,8 @@ Studio sends anonymous usage data unless you turn it off (spec 018): which featu
 
 No report holds a graph, type, property, branch, query or file name, a server address, an account or token, query text, a value, a row, an error message or your IP address. Reports go to PostHog US Cloud, which is told to discard the IP address a request comes from and to add no location.
 
+Who receives this data, how long it is kept and your rights over it are in the [privacy notice](privacy.md).
+
 ## Sent with every report
 
 | Property | Value |

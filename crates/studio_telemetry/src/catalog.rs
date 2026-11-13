@@ -370,6 +370,8 @@ pub fn catalog_markdown() -> String {
          an account or token, query text, a value, a row, an error message or your IP address. \
          Reports go to PostHog US Cloud, which is told to discard the IP address a request comes \
          from and to add no location.\n\n\
+         Who receives this data, how long it is kept and your rights over it are in the \
+         [privacy notice](privacy.md).\n\n\
          ## Sent with every report\n\n\
          | Property | Value |\n|---|---|\n\
          | `version` | Studio's version |\n\
