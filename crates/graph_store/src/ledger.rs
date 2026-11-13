@@ -197,7 +197,7 @@ impl ReadLedger {
             out.push_str(&format!(
                 "{:>6}  {:<32} {:<20} {:<28} mean {:>7.1} ms  slowest {:>7.1} ms\n",
                 tally.count,
-                what,
+                what.as_ref(),
                 format!("{asker:?}"),
                 format!("{answered:?}"),
                 mean.as_secs_f64() * 1000.0,
@@ -261,6 +261,18 @@ mod tests {
         assert_eq!(tally.slowest, Duration::from_millis(30));
         assert_eq!(ledger.take_events().len(), 2);
         assert!(ledger.table().contains("studio_node"));
+    }
+
+    /// Each name is padded to its column, so who asked lines up whatever the name's length.
+    #[test]
+    fn the_table_lines_up_its_columns() {
+        let mut ledger = ReadLedger::default();
+        ledger.record(event("access", Answered::Joined, 0));
+        ledger.record(event("studio_page_neighbours", Answered::Joined, 0));
+        let table = ledger.table();
+        let columns: Vec<_> = table.lines().map(|line| line.find("Unnamed")).collect();
+        assert_eq!(columns.len(), 2);
+        assert_eq!(columns[0], columns[1], "{table}");
     }
 
     #[test]

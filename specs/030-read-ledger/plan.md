@@ -1,6 +1,6 @@
 # 030: The read ledger: how each read was answered, how long a view took, and whether a kept answer was right
 
-Status: in progress; step 1 built (2026-11-12); part 5's first seed, a group counted empty, built (2026-11-12) · drafted 2026-11-12, research added and claims checked against Studio and Omnigraph `7711e4a` the same day
+Status: in progress; steps 1 and 4 built (2026-11-12); part 5's first seed, a group counted empty, built (2026-11-12) · drafted 2026-11-12, research added and claims checked against Studio and Omnigraph `7711e4a` the same day
 
 ## Problem
 
@@ -329,6 +329,48 @@ Each is its own plan when it is built.
   - Budgets added to `type_table`'s `a_peek_reads_only_what_the_table_did_not` and
     `refresh_reads_again_only_the_groups_a_commit_changed`.
 
+### Step 4 as built (2026-11-12)
+
+- **The runner.** `reads:<path>` in the snapshot example (`crates/studio/examples/snapshot.rs`)
+  turns on the window session's ledger events (`keep_events`) for the run. The start and then
+  each action, `click:` and `head:` step clears the ledger before it acts and lasts until the
+  session has no read out (`reads_in_flight`) and has answered none for 1 s (at most 120 s).
+  Real time passes and GPUI's clock is moved by as much, so the ledger's times are wire times.
+  After each step it prints `ReadLedger::table()` and the time to the first answer and to the
+  last, and at the end writes every step's tallies as JSON.
+- **New steps.** `run:<command>` runs a command and waits for it (another writer).
+  `head:<ms>` waits for the session's branch head to move, as the 30 s head poll sees it.
+- **The scenario.** `script/measure-frames --reads <out.json>` against `script/dev-server`:
+  open Person, open person-000001's page, another writer gives that person a new title, wait
+  for the head to move, and click the page's "Newer data · Refresh". With two files it
+  compares them (`script/compare-reads.py`).
+- **Wire time.** `script/latency-proxy.py` (Python standard library only) holds each request
+  `STUDIO_READS_LATENCY_MS` before passing it on, 700 ms by default, the personal graph's
+  median. Set it to 0 to send requests straight to the server.
+- **Not yet:**
+  - `--target`, a read-only run against a real graph.
+  - The audit's mismatches (step 3 is not built).
+  - The schema read, which the ledger does not record (step 1, "Not yet").
+  - A step's name is its action's name, `click` or `head`, and never its arguments.
+
+### Baseline (2026-11-12)
+
+Linux 4.19 under gVisor, 2 cores, no GPU (lavapipe). `release-fast` build of main at `3466c50`
+with this change. `omnigraph-server` `v0.15.0` (contract 0.14) on the development graph: Person
+has 200 rows and 6 relationship columns. 700 ms a request. Two runs gave the same counts, and
+times within 10 ms of each other.
+
+| Step | Asked | Sent | How | First answer | Settled |
+|---|---|---|---|---|---|
+| Start, until the schema is read | 5 | 5 | `access`, `branches`, `head_commit`, `snapshot`, `studio_head`, each sent once | 859 ms | 1,573 ms |
+| Open Person | 13 | 13 | 1 `studio_page`, 6 `studio_page_degrees`, 6 `studio_page_neighbours`, all `Sent(HeadCommit)` by the table | 784 ms | 2,289 ms |
+| Open person-000001's page | 5 | 4 | `studio_node` `Seeded`; 4 `studio_neighbours` sent | 26 ms | 755 ms |
+| Another writer's commit, until it is seen | 4 | 4 | the head poll: `studio_head`, `branches`, `snapshot`, `head_commit` | 23,242 ms | 24,668 ms |
+| The page's Refresh | 6 | 2 | `studio_head` sent, then `studio_node` sent; the 4 neighbour groups `Carried(Read)` | 724 ms | 1,451 ms |
+
+With no added latency the same counts: open Person settles in 232 ms, the page in 50 ms, its
+Refresh in 68 ms.
+
 ## Decisions
 
 | Decision | Rejected | Why |
@@ -352,8 +394,8 @@ Each is its own plan when it is built.
 2. The scope's load times.
 3. The audit, on in every `graph_store` and `type_table` test that carries or seeds.
 4. The scenario steps and their JSON in the snapshot example, and `--reads` in
-   `script/measure-frames`. The first live baseline on the personal graph goes in spec 015's
-   validation log.
+   `script/measure-frames` (built 2026-11-12, against the development graph). The first live
+   baseline on the personal graph, with `--target`, goes in spec 015's validation log.
 5. The telemetry events.
 
 ## Deferred
@@ -414,3 +456,7 @@ The research (2026-11-12) is summarized here; a claim not checked in a primary s
 | 2026-11-12 | A read with no commit, kept at the commit its answer names, then holds and carries | Fake servers only. `type_table` `refresh_reads_again_only_the_groups_a_commit_changed`, ledger for Refresh. Before: 4 sent (`studio_neighbours` 2 `Sent(HeadCommit)`, `studio_head` 1, `studio_node` 1 `Sent(HeadCommit)`), 2 carried. After: 3 sent (`studio_neighbours` 2, `studio_head` 1), 3 carried (`studio_neighbours` 2, `studio_node` 1 `Carried(Read)`). `graph_store` `a_read_with_no_commit_is_kept_at_the_commit_it_answered`: a branch read, then the same read at its commit (`Held(Read)`, before: sent again) and at a commit to another person (`Carried(Read)`): `studio_node` sent once in all (`Sent(Branch)`), before twice (`Sent(Branch)`, then `Sent(HeadCommit)` at c1). The guards: an answer naming a commit the head watch has not seen is kept there and the head stays; a schema epoch or credential changed while the read was out, or `Depends::Unknown`, keeps nothing; removing any one guard fails the test | Pass. Two `type_table` tests read a first page again at the commit a branch read answered at, and now send nothing (`a_first_read_pins_the_head_the_session_holds`, `a_read_out_when_a_commit_to_another_type_moves_the_pin_lands`: 1 request each before, 0 after); their assertions changed with a note. Not covered: a live graph, and branch reads outside `GraphSession::read` (`read_on` another branch, `read_request` called directly), which are still not kept |
 | 2026-11-12 | A node page opened from a table reads no neighbours of a group the table counted empty | `type_table` `the_ledger_of_a_table_a_rows_page_and_its_peek`: a Person table over a small graph that answers Studio's queries as a server would (`test_support::Graph`; Ada has 6 groups, 3 with neighbours), then Ada's page, then her peek. Table: 1 `studio_page`, 1 `studio_count`, 6 `studio_page_degrees`, 6 `studio_page_neighbours`. Page before: `studio_node` `Seeded`, 6 `studio_neighbours` sent. Page after: `studio_node` `Seeded`, 3 `studio_neighbours` `Seeded`, 3 sent. Peek after the page: 3 `studio_neighbours` sent, for the groups with neighbours; it reads none for the empty ones, which the table hands it as `KnownRelation` counts, so this change does not touch it. Each of the 6 page queries, answered by the session at `c1`, has the same rows, byte for byte, and row count as the fake's answer to the same query text and parameters; the 3 it sent are among them. `graph_store` `a_group_counted_empty_lists_no_neighbours_without_a_read`: a count of 0 answers with no request, a count of 1, a search and a node not counted are sent | Pass. A page's requests at open fall from 6 to 3 in the fixture. On the personal graph a table counts only the relationship columns it draws (20 `studio_page_degrees` in the count above), so a page saves the empty ones of those for its row; a group no view counted is read as before. Not proven against the fake: `columns` (the fake answers `["n"]` to every read); the session gives the projection's names, and no reader of these answers reads them |
 | 2026-11-12 | A cap of 2 slots on reads known to be slow lets a node page's ordinary groups settle much sooner (part 5) | `graph_store` `a_pages_hub_groups_hold_slots_its_ordinary_groups_wait_for`: a fake server (`test_server`'s new `wait`, on the executor's clock) answers 3 hub groups' `studio_neighbours` in 60 s and 40 others in 1 s; the hubs are asked first and the ledger's `took` times each read. A prototype added a slow lane to `graph_client` (2 slots taken before one of the 8) and, in the session, sent a read in it when the same name, text and parameters had taken 15 s or more | **Not kept.** Before, on the first read and again: ordinary groups settled at 8 s (mean 4.5 s), hubs 60, 60, 60 s. With the cap, first read: unchanged, since nothing is known yet. Read again: 7 s (mean 3.85 s), hubs 60, 60, **120 s**. With the executor's own order and no cap, ordinary groups settled at 7 s (mean 3.55 s), hubs 60, 63, 64 s. The test keeps the 8 s baseline |
+| 2026-11-12 | The scenario runner measures a table, a page, another writer's commit and the page's Refresh, headless on Linux | `script/measure-frames --reads` twice and `--reads a.json b.json` on the development graph, lavapipe, 700 ms a request | Pass. Counts the same in both runs, times within 10 ms: open Person 13 sent of 13 asked (settled 2,289 ms), the page 4 of 5 (`studio_node` seeded, 755 ms), the head move 4 of 4 (seen after 23.2 s), the page's Refresh 2 of 6 (4 groups carried, 1,451 ms). Table in "Baseline" |
+| 2026-11-12 | `ReadLedger::table()` lines up its columns | `ledger::tests::the_table_lines_up_its_columns` | Fixed: `SharedString`'s `Display` ignores width, so names longer or shorter than others pushed the columns along; the name is now padded as a `str` |
+| 2026-11-12 | Found by the runner: the page's Refresh reads the head before the node, one after the other | The Refresh step: `studio_head` answers at 724 ms, and only then is `studio_node` sent, settled at 1,451 ms. The head poll read the same head about 1 s before | Open. Two round trips where one could do: the next hypothesis to measure with this runner |
+| 2026-11-12 | Found by the runner: Studio's Refresh (`studio::Refresh`, ctrl-r) does not read again the page in front, though its description says "and the view in focus" | The same scenario with `studio::Refresh` in place of the page's button: `branches`, `snapshot`, `head_commit` and `studio_head` sent, no `studio_node` or `studio_neighbours`, and the page still offers "Newer data · Refresh" | Open. The scenario clicks the page's button |
