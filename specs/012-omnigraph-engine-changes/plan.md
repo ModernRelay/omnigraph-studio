@@ -463,6 +463,18 @@ graphs the caller may read).
 *Waits:* 029. *Today:* Add server takes an optional graph id, and the 404 page says the server
 does not list its graphs.
 
+**E48. A precondition scoped to what a write touches.** `Omnigraph-If-Graph-Commit` is a
+compare-and-set on the branch head, so on a branch other writers commit to every minute or two
+a write bound to the commit its rows were read at is refused nearly always, and publishing an
+unpublished commit is refused the same way once the head moves. Add a precondition that refuses
+only when a commit since changed a row (or, coarser, a table) the mutation matches, deletes or
+updates. Separately, a mutation dry run returning its `ChangeOutput` and `@card` violations
+would replace the reads a delete's plan sends (dependents in rounds, a count per relationship
+type). [#1397](https://github.com/ModernRelay/omnigraph/issues/1397).
+*Waits:* 004. *Today:* a delete is planned at the branch head the session last saw and sent
+unbound; the write path's `@card` recount refuses one that would leave a dependent behind, and
+a row changed elsewhere since it was read may still be deleted.
+
 ### In 0.14, not in 0.13.0
 
 Studio's minimum server serves these, so it uses them without asking the server's OpenAPI

@@ -42,6 +42,7 @@ it goes through Omnigraph's own RFC process.
 | E45 | A direct `cluster apply` that releases its admission lock when it ends (or `--release-lock`; [#1359](https://github.com/ModernRelay/omnigraph/issues/1359)) | 029 | The local recipe releases it with `cluster status --json` piped into `cluster force-unlock` |
 | E46 | The CLI keeps a token for a loopback `http://` server | 029 | Adds the server as an anonymous target and keeps the token in memory until Studio quits |
 | E47 | `GET /graphs` on an `--unauthenticated` server without a cluster policy | 029 | Add server takes an optional graph id; a 404 page says the server does not list its graphs |
+| E48 | A mutation precondition scoped to what the write touches, not the graph head; a mutation dry run that returns its changes and `@card` violations ([#1397](https://github.com/ModernRelay/omnigraph/issues/1397)) | 004 | Plans a delete at the branch head it last saw and sends it unbound, relying on the write path's `@card` check |
 
 Every server Studio supports serves these (checked against `v0.14.0`'s OpenAPI document, 2026-10-24):
 
