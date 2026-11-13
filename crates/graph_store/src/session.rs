@@ -3212,6 +3212,7 @@ impl GraphSession {
         };
         let Some(commit) = snapshot else {
             let read = self.read_request(request, cx);
+            let read = self.keeping(query, read, cx);
             return self.seeding(query.seeds.clone(), read, cx);
         };
         let key = self.pinned_key(query, &commit);
@@ -3262,6 +3263,48 @@ impl GraphSession {
             Self::kept_at,
             cx,
         )
+    }
+
+    /// `read`, a read of the branch with no commit, whose answer is also kept at the commit it
+    /// names (`graph_commit_id`) as a read at that commit would be, so a later read there is
+    /// held and one at a later commit can carry it (spec 030). Only when the schema epoch and
+    /// the credential it was sent under still stand, and only for a read whose dependencies are
+    /// known: an unknown one never carries. Nothing already held at that commit is replaced,
+    /// and the head is left to the head watch.
+    fn keeping(
+        &mut self,
+        query: &BuiltQuery,
+        read: Task<Result<ReadOutput, ReadError>>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<ReadOutput, ReadError>> {
+        if query.depends == Depends::Unknown {
+            return read;
+        }
+        let (epoch, credential) = (self.schema_epoch, self.credential);
+        let key = PinnedRead::of(query, "", epoch);
+        cx.spawn(async move |this, cx| {
+            let result = read.await;
+            if let Ok(output) = &result
+                && let Some(commit) = output.graph_commit_id.clone()
+            {
+                this.update(cx, |this, _| {
+                    let key = PinnedRead { commit, ..key };
+                    if epoch != this.schema_epoch
+                        || credential != this.credential
+                        || this.pinned_reads.holds(&key)
+                    {
+                        return;
+                    }
+                    let mut kept = output.clone();
+                    kept.target.branch = None;
+                    kept.target.snapshot = Some(key.commit.clone());
+                    this.kept_at(&key);
+                    this.pinned_reads.insert(key, kept);
+                })
+                .ok();
+            }
+            result
+        })
     }
 
     /// `read`, which on its answer also keeps what its rows answer (`seeds`, [`Self::seed`]),
@@ -9323,6 +9366,112 @@ mod tests {
             assert_eq!(
                 asked_by_page, 2,
                 "the node and the neighbours, through the scope"
+            );
+        });
+    }
+
+    /// A read with no commit is kept at the commit its answer names, under the schema and
+    /// credential it was sent with, and then holds and carries like a read at that commit
+    /// (spec 030, validation log, 2026-11-12). The head watch alone moves the head.
+    #[gpui::test]
+    async fn a_read_with_no_commit_is_kept_at_the_commit_it_answered(cx: &mut TestAppContext) {
+        use crate::ledger::{Answered, Origin, Status, Target};
+        use crate::test_server::{followed_session, node_change};
+        use serde_json::json;
+
+        const SCHEMA: &str =
+            "node Person {\n  slug: String @key\n  name: String\n}\nedge Knows: Person -> Person\n";
+        let (session, served) = followed_session(
+            SCHEMA,
+            |_| json!([{ "n": { "@id": "p1", "slug": "p1", "name": "Ada" } }]),
+            cx,
+        );
+        cx.run_until_parked();
+        let schema = session.read_with(cx, |session, _| session.schema_model().unwrap());
+        let _watch = session.update(cx, |session, _| watching(session, &["Person"], &["Knows"]));
+        let node = builder::node_by_id(&schema, "Person", "p1").unwrap();
+        session.update(cx, |session, _| session.ledger_mut().clear());
+        let read = |snapshot: Option<&str>, cx: &mut TestAppContext| {
+            let snapshot = snapshot.map(str::to_owned);
+            let task = session.update(cx, |session, cx| session.read(&node, snapshot, cx));
+            cx.run_until_parked();
+            task
+        };
+
+        // Read on the branch, then at the commit it answered and at a commit to another person.
+        read(None, cx).await.unwrap();
+        read(Some("c1"), cx).await.unwrap();
+        served
+            .lock()
+            .unwrap()
+            .commit("c9", vec![node_change("Person", "p9")]);
+        session.update(cx, |session, cx| session.check_heads(cx));
+        cx.run_until_parked();
+        let carried = read(Some("c9"), cx).await.unwrap();
+        assert_eq!(carried.graph_commit_id.as_deref(), Some("c9"));
+        session.read_with(cx, |session, _| {
+            let ledger = session.ledger();
+            let count = |answered: Answered| ledger.count("studio_node", |a| a == answered);
+            assert_eq!(
+                count(Answered::Sent(Target::Branch, Status::Ok)),
+                1,
+                "{}",
+                ledger.table()
+            );
+            assert_eq!(count(Answered::Held(Origin::Read)), 1, "at c1");
+            assert_eq!(count(Answered::Carried(Origin::Read)), 1, "to c9");
+            assert_eq!(ledger.count("studio_node", |a| a.sent()), 1);
+        });
+
+        // Another writer's commit the head watch has not seen: kept at the commit the answer
+        // names, and the head stays where the watch put it.
+        served
+            .lock()
+            .unwrap()
+            .commit("c10", vec![node_change("Person", "p1")]);
+        read(None, cx).await.unwrap();
+        session.read_with(cx, |session, _| {
+            assert_eq!(session.heads.get("main").map(String::as_str), Some("c9"));
+            let at = |commit| session.pinned_key(&node, commit);
+            assert!(session.pinned_reads.peek(&at("c10")).is_some());
+            assert!(
+                !session.carried_keys.contains(&at("c10")),
+                "read, not carried"
+            );
+        });
+
+        // Not kept when the schema or the credential changed while it was out, nor when what it
+        // depends on is unknown (such a read never carries).
+        served.lock().unwrap().commit("c11", Vec::new());
+        let changed: [fn(&mut GraphSession); 2] = [|s| s.schema_epoch += 1, |s| s.credential += 1];
+        for change in changed {
+            let task = session.update(cx, |session, cx| {
+                let task = session.read(&node, None, cx);
+                change(session);
+                task
+            });
+            cx.run_until_parked();
+            task.await.unwrap();
+        }
+        let unknown = BuiltQuery {
+            depends: Depends::Unknown,
+            ..node.clone()
+        };
+        let task = session.update(cx, |session, cx| session.read(&unknown, None, cx));
+        cx.run_until_parked();
+        task.await.unwrap();
+        session.read_with(cx, |session, _| {
+            let kept = |epoch| {
+                session
+                    .pinned_reads
+                    .peek(&PinnedRead::of(&node, "c11", epoch))
+                    .is_some()
+            };
+            assert!(!kept(session.schema_epoch) && !kept(session.schema_epoch - 1));
+            let c10 = PinnedRead::of(&node, "c10", session.schema_epoch - 1);
+            assert!(
+                session.pinned_reads.peek(&c10).is_some(),
+                "nothing was forgotten"
             );
         });
     }

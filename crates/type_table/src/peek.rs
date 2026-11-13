@@ -7168,16 +7168,16 @@ mod tests {
             "only the groups of the edge type the commit wrote"
         );
         // The ledger's budget for Refresh (spec 030): knows, out and in, carried from c1; only
-        // likes, out and in, sent. The node is sent again: the page opened before the session
-        // knew the head, so it read its node with no commit, and such an answer is not kept to
-        // carry (spec 030, validation log, 2026-11-12). Kept, this becomes one carried.
+        // likes, out and in, sent. The page opened before the session knew the head, so it read
+        // its node with no commit; that answer was kept at the commit it named, so the node
+        // carries too and is not sent (spec 030, validation log, 2026-11-12).
         session.read_with(cx, |session, _| {
             let ledger = session.ledger();
             let carried = |what: &str| ledger.count(what, |a| matches!(a, Answered::Carried(_)));
             assert_eq!(carried("studio_neighbours"), 2, "{}", ledger.table());
             assert_eq!(ledger.count("studio_neighbours", |a| a.sent()), 2);
-            assert_eq!(carried("studio_node"), 0, "{}", ledger.table());
-            assert_eq!(ledger.count("studio_node", |a| a.sent()), 1);
+            assert_eq!(carried("studio_node"), 1, "{}", ledger.table());
+            assert_eq!(ledger.count("studio_node", |a| a.sent()), 0);
         });
     }
 

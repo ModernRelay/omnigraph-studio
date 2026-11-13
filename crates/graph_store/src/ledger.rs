@@ -46,7 +46,7 @@ pub enum Origin {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Target {
     /// A branch's head, asked for with no commit: the server answers at its newest, and the
-    /// answer is not kept.
+    /// answer is kept at the commit it names when what it depends on is known.
     Branch,
     /// A commit that is its branch's head, sent as a read of the branch, which the server
     /// answers faster; its answer is kept at the commit.

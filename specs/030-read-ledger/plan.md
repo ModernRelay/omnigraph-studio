@@ -270,8 +270,15 @@ Each is its own plan when it is built.
     recorded through `ledgered`.
   - The time is from asking for a slot to the answer, on the executor's clock.
   - Status is ok, refused (with its HTTP status), failed, or dropped while every asker let go.
-- **Targets.** There are four: `Branch` (no commit; not kept), `HeadCommit` (a commit that is
-  its branch's head, sent as a branch read; kept), `Pinned` and `Route`.
+- **Targets.** There are four: `Branch` (no commit; kept at the commit its answer names, below),
+  `HeadCommit` (a commit that is its branch's head, sent as a branch read; kept), `Pinned` and
+  `Route`.
+- **A read with no commit is kept** (2026-11-12, found by the ledger). `GraphSession::keeping`
+  files a branch read's answer in `pinned_reads` at the commit it names (`graph_commit_id`), as a
+  read at that commit, so a later read there is `Held(Read)` and one at a later commit can be
+  `Carried`. Only when the schema epoch and the credential it was sent under still stand, only
+  for a read whose dependencies are known (`Depends::Unknown` is neither kept nor carried),
+  never over what is already held there, and the head stays the head watch's to move.
 - **Who asked.** `read_scope` takes the `ReadView` (table, peek, page, exploration), and the
   scoped reads (`read_in`, `degree_in`, `blob_meta_in`) name it, including when a head-commit
   read is sent again pinned. Every other read is `Unnamed` for now.
@@ -366,4 +373,5 @@ The research (2026-11-12) is summarized here; a claim not checked in a primary s
 | 2026-11-12 | Time-dependent functions | `7711e4a` `omnigraph-compiler/src/query/query.pest`: `now_call` is the only one | Confirmed |
 | 2026-11-12 | No `Server-Timing` or `priority` handling | `git grep -i` for both in `7711e4a` `crates/omnigraph-server/src` | Neither found |
 | 2026-11-12 | The ledger records how each read was answered | `graph_store` `the_ledger_says_how_each_read_was_answered`: two asks of a page (one `Sent(HeadCommit, Ok)`, one `Joined`), the node `Seeded` with no request, the neighbours sent once, `Carried(Read)` to a commit that touched another person, then `Held(Carried)`; two reads attributed to the page's scope. `type_table`: a peek of a table's row sends no `studio_node` and three `studio_neighbours`, all asked by the peek; Refresh carries knows out and in and sends likes out and in | Pass; workspace 1,380 tests pass, clippy clean |
-| 2026-11-12 | Found by the ledger: a page opened before the session knows its branch's head reads its node with no commit, and that answer is not kept, so Refresh sends the node again though nothing of it changed | `type_table` `refresh_reads_again_only_the_groups_a_commit_changed`, ledger before Refresh: `studio_node … Sent(Branch, Ok)`; after: `Sent(HeadCommit, Ok)`, nothing carried | Open. A branch read's answer names its commit (`graph_commit_id`); kept at that commit under the epoch it was sent with, it would carry. The test asserts today's count, with a note |
+| 2026-11-12 | Found by the ledger: a page opened before the session knows its branch's head reads its node with no commit, and that answer is not kept, so Refresh sends the node again though nothing of it changed | `type_table` `refresh_reads_again_only_the_groups_a_commit_changed`, ledger before Refresh: `studio_node … Sent(Branch, Ok)`; after: `Sent(HeadCommit, Ok)`, nothing carried | Open at the time; fixed in the next row |
+| 2026-11-12 | A read with no commit, kept at the commit its answer names, then holds and carries | Fake servers only. `type_table` `refresh_reads_again_only_the_groups_a_commit_changed`, ledger for Refresh. Before: 4 sent (`studio_neighbours` 2 `Sent(HeadCommit)`, `studio_head` 1, `studio_node` 1 `Sent(HeadCommit)`), 2 carried. After: 3 sent (`studio_neighbours` 2, `studio_head` 1), 3 carried (`studio_neighbours` 2, `studio_node` 1 `Carried(Read)`). `graph_store` `a_read_with_no_commit_is_kept_at_the_commit_it_answered`: a branch read, then the same read at its commit (`Held(Read)`, before: sent again) and at a commit to another person (`Carried(Read)`): `studio_node` sent once in all (`Sent(Branch)`), before twice (`Sent(Branch)`, then `Sent(HeadCommit)` at c1). The guards: an answer naming a commit the head watch has not seen is kept there and the head stays; a schema epoch or credential changed while the read was out, or `Depends::Unknown`, keeps nothing; removing any one guard fails the test | Pass. Two `type_table` tests read a first page again at the commit a branch read answered at, and now send nothing (`a_first_read_pins_the_head_the_session_holds`, `a_read_out_when_a_commit_to_another_type_moves_the_pin_lands`: 1 request each before, 0 after); their assertions changed with a note. Not covered: a live graph, and branch reads outside `GraphSession::read` (`read_on` another branch, `read_request` called directly), which are still not kept |
