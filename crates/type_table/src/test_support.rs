@@ -358,6 +358,29 @@ pub(crate) fn session_recording_writes(
     (session, sent)
 }
 
+/// As [`session_recording_writes`], with another writer committing on the branch.
+pub(crate) fn session_followed_recording_writes(
+    schema: &str,
+    cx: &mut TestAppContext,
+) -> (Entity<GraphSession>, Arc<Writer>, Arc<Mutex<Vec<Value>>>) {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let log = sent.clone();
+    let writes: Writes = Arc::new(move |request: &Value| {
+        log.lock().unwrap().push(request.clone());
+        (200, committed("c3", "c2"))
+    });
+    let writer = Arc::new(Writer::default());
+    let rows = Arc::new(people());
+    let session = serve_with(
+        schema,
+        Arc::new(move |_: &Value| (*rows).clone()),
+        writes,
+        Some(writer.clone()),
+        cx,
+    );
+    (session, writer, sent)
+}
+
 /// As [`session`], the writes answered in turn by `answers`; any after the last get the last.
 pub(crate) fn session_writing(
     schema: &str,

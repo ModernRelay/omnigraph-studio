@@ -907,8 +907,10 @@ const DEPENDENTS_NAMED: usize = 6;
 
 /// Deleting rows (spec 004, constitution IV): the picked rows, or the cursor's. Before it is
 /// sent the dialog reads what else the delete removes: a node's relationships go with it, and
-/// a node that needs one of them (`@card(n..)`) goes too, listed here, all in one commit bound
-/// to the commit the table was read at. ↵ deletes, and the toast offers Undo; typing the key
+/// a node that needs one of them (`@card(n..)`) goes too, listed here, all in one commit. The
+/// plan reads at the branch's newest commit the session holds, and the delete is not bound to a
+/// commit: other writers' commits do not refuse it, and the server refuses one that would leave
+/// a node without a relationship it needs (spec 004, 2026-11-13). ↵ deletes, and the toast offers Undo; typing the key
 /// is asked for only when Undo could not bring it all back.
 pub struct DeleteRowModal {
     table: WeakEntity<TypeTable>,
@@ -919,7 +921,8 @@ pub struct DeleteRowModal {
     targets: Vec<DeleteTarget>,
     /// Relationships rather than nodes: nothing depends on them.
     edges: bool,
-    if_commit: Option<String>,
+    /// The commit the plan reads at: the branch's newest the session holds, else the table's.
+    plan_at: Option<String>,
     /// What a node delete removes, read before it is offered.
     plan: Loadable<DeletePlan>,
     /// Why Undo could not restore this delete, once known; typing is then asked for.
@@ -969,6 +972,14 @@ impl DeleteRowModal {
         cx: &mut Context<Self>,
     ) -> Self {
         let branch = session.read(cx).branch.clone();
+        // What the delete removes is read where it will be applied: the branch's newest commit.
+        // The table's own commit, behind it on a busy branch, would neither find what depends
+        // on the rows now nor use the session's totals, which are held at the newest.
+        let plan_at = session
+            .read(cx)
+            .head(&branch)
+            .map(str::to_owned)
+            .or(if_commit);
         // The table's kind, not the schema's first match: a node type and an edge type may
         // share a name, and the table shows the one it was opened on.
         let edges = kind == TableKind::Edge;
@@ -998,7 +1009,7 @@ impl DeleteRowModal {
             branch,
             targets,
             edges,
-            if_commit,
+            plan_at,
             plan: Loadable::NotLoaded,
             undo_unavailable: None,
             confirm,
@@ -1046,7 +1057,7 @@ impl DeleteRowModal {
             self.schema.clone(),
             self.type_name.clone(),
             ids,
-            self.if_commit.clone(),
+            self.plan_at.clone(),
             self.progress.clone(),
             cx,
         );
@@ -1174,9 +1185,11 @@ impl DeleteRowModal {
             .is_none()
             .then_some(FollowUp::UndoDelete);
         let (branch, session) = (self.branch.clone(), self.session.clone());
+        // Not bound to a commit: a delete names its nodes, or its relationships, by id, and the
+        // server checks every relationship a node needs as it applies it, so a commit of
+        // another writer since the plan read changes nothing it relies on.
         let write = self.session.update(cx, |session, cx| {
-            let if_commit = self.if_commit.clone();
-            session.write_on(&branch, &query, if_commit, description, follow_up, cx)
+            session.write_on(&branch, &query, None, description, follow_up, cx)
         });
         let table = self.table.clone();
         // The rows leave the table now and the dialog closes: the person goes on while the
@@ -1702,6 +1715,68 @@ mod tests {
                 assert_eq!(matches!(modal.plan, Loadable::NotLoaded), edges, "{kind:?}");
             });
         }
+    }
+
+    /// On a busy branch the table is behind its head. A delete reads what it removes at the
+    /// head the session holds, and is sent bound to no commit: another writer's commit since
+    /// the table was read does not refuse it (spec 004, 2026-11-13).
+    #[gpui::test]
+    async fn a_delete_behind_its_branch_plans_at_the_head_and_is_not_bound(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, writer, writes) =
+            crate::test_support::session_followed_recording_writes(crate::test_support::PEOPLE, cx);
+        cx.run_until_parked();
+        writer.commit("c2", Vec::new());
+        let head = session.update(cx, |session, cx| session.head_now("main", cx));
+        cx.run_until_parked();
+        head.await;
+        assert_eq!(
+            session.read_with(cx, |session, _| session.head("main").map(str::to_owned)),
+            Some("c2".to_owned())
+        );
+        let schema = Arc::new(SchemaModel::parse(crate::test_support::PEOPLE).unwrap());
+        let target = DeleteTarget {
+            id: "p1".into(),
+            label: None,
+            endpoints: None,
+        };
+        let (modal, cx) = cx.add_window_view(|window, cx| {
+            DeleteRowModal::new(
+                WeakEntity::new_invalid(),
+                session.clone(),
+                schema,
+                "Person".into(),
+                TableKind::Node,
+                vec![target],
+                Some("c1".into()),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        modal.read_with(cx, |modal, _| {
+            assert_eq!(
+                modal.plan_at.as_deref(),
+                Some("c2"),
+                "the head, not the table's c1"
+            );
+            assert!(modal.ready(), "{:?}", modal.plan.is_loading());
+        });
+        modal.update_in(cx, |modal, window, cx| modal.submit(window, cx));
+        cx.run_until_parked();
+        let writes = writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert!(
+            writes[0].get("if_graph_commit").is_none(),
+            "bound to {:?}",
+            writes[0].get("if_graph_commit")
+        );
     }
 
     /// More relationships picked than Undo puts back in one commit are deleted only once typed
