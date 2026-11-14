@@ -421,9 +421,22 @@ It is a panel as the sidebar's are: a new window shows it, and only the person h
 | Canvas | The selected chip's node; a pill or "+K more" shows the node it belongs to | Opens the node's page |
 | Page | The related node clicked on the page | Opens that node's page |
 | Map | The selected type, as the schema describes it | Opens the type between the types it relates to |
+| Query result | The selected cell: the node it holds; a value shows its row, every column in full | Nothing: a result is read-only |
+| History | The selected commit: who wrote it, when, on which branch, its parents, the branches whose head it is, its counts | A click previews the commit's changes in a tab; a second keeps it |
+| Review | The node whose card holds the selected change | A click unfolds the card; a second folds it |
 
-A Tree and a Canvas of one node open with that node selected. On a Canvas, ⇧-click and ⌘-click
-mark a chip, as they pick rows in a table, and ⌫ or the menu closes an open node.
+A Tree and a Canvas of one node open with that node selected, and History with its newest commit.
+On a Canvas, ⇧-click and ⌘-click mark a chip, as they pick rows in a table, and ⌫ or the menu
+closes an open node.
+
+A query's result, History and a Review follow the rule since 2026-11-14. Before, the inspector
+read "Nothing selected" beside a selected cell, commit or change, in a panel that is shown from
+the start. A result's node is read where its rows were: held at the tab's commit, or at the rows'
+commit while they follow the window's branch; rows of a branch the window has left since are held
+at their commit, so nothing is edited from another branch's values. A review's node is held at
+the reviewed head, and one the branch removes at the fork, where it last was. Tabs that select
+nothing still say so: Settings, a schema's Source, a commit's own tab, a conversation. An edge
+with a card of its own in a review, whose type the schema lacks, has no node to show.
 
 **How it is built**
 
@@ -438,6 +451,9 @@ mark a chip, as they pick rows in a table, and ⌫ or the menu closes an open no
 - A view that follows a selection waits a moment before it reads, so the rows an arrow key passes
   read nothing.
 - A held selection stays read-only and shows its commit's values.
+- A result's row and a commit are views their tabs make (`query_editor` `RowNote`, `history`
+  `CommitNote`), from what the tab already holds: neither reads. A commit's view takes its counts
+  when History reads them for the rows it draws.
 - Closing a tab drops its view, and a session change drops them all. A hidden inspector reads
   nothing, since it reads only the groups in view.
 - When the canvas changes size under a view the person placed, as when the inspector opens beside
@@ -687,6 +703,7 @@ No engine changes are needed, so nothing goes in `docs/deferred-engine-changes.m
 | 2026-11-13 | The journey reads as designed | Offscreen snapshots on `script/dev-server` at 1440 × 900, clicks and keys through the snapshot tool, which gained `,double`: a new window; a table (a click on a value and on the key, ↓, Space twice, a click while hidden, Esc); an edge table; Tree from the table (a click, ↓, a relationship's row, Space twice); Canvas from the table (a pill, another node, ↓, Space twice); the inspector's Page link; a related node selected on a page; a link in the inspector, then Back; the map (a click, a double click) | As designed, after one fault found here: a link followed from the inspector replaced the preview tab it came from, so Back skipped it. A page now leaves the tab it is opened from open. The running app was not driven by hand. A double click on a canvas chip was checked by its test only: the offscreen layout moves a few pixels between runs, and two clicks aimed from a screenshot missed |
 | 2026-11-13 | The table toolbar fits beside the inspector | `type_table` `a_narrow_tab_leaves_the_toolbars_labels_out`; snapshots of Person's toolbar in an 836 px tab (six icon chips, the sentence field 240 px, nothing cut) and in a 1,176 px tab (every label) | Pass. Before, the toolbar ended at Columns in the 836 px tab. A tab narrower still, or with several controls set, can still cut the last chip: the toolbar has no overflow menu |
 | 2026-11-13 | The suite | `cargo test --workspace`: 1,390 passed, 0 failed, and the keymap test; clippy `-D warnings`, fmt, layers, brand, design tokens, release files | Pass. `cargo deny` not run: no dependency changed |
+| 2026-11-14 | A result, History and a Review show their selection | `query_editor` `the_inspector_shows_a_results_selected_node_or_row` (a tab held at a commit and one at the head: a node cell names its node, held or read at the rows' commit; a value shows its row, the same view from another value of the row and another for another row; a run clears it) and `row_note` `a_row_reads_each_column_whole`; `history` `the_inspector_shows_the_selected_commit` (the newest from the start, the same view while it stays selected, its counts taken when read); `review` `the_inspector_shows_the_selected_changes_node_where_the_review_reads_it` (an added node at the reviewed head, a removed one at the fork, the workspace told once). Offscreen on `script/dev-server`: a query returning a node and three values, with the node's cell and then a value selected; History with each of its two commits selected; the review of `try-edits` with a removed node's card selected | Passed. The pictures show the node, the row ("Row 5 of 200", its list in full), each commit's facts and the removed node as it was at the fork. Review's edge cards and a result read by a statement were not driven |
 | | The inspector's rules on Linux and Windows | Real builds | **Not run.** Space and ⌘⌥B are bound in all three keymaps; only macOS drew a frame |
 | | The top bar is right on Linux and Windows | Real builds | **Not run.** Compiled by CI only; whether those platforms draw window controls in it is unknown |
 | | The rule improves prediction | Prediction test | **Not run. No users have seen any of this** |
@@ -721,6 +738,10 @@ The first four record changes to the draft before it was built.
   so a saved keymap still loads. This reverses the click rule the cell cursor brought (#85): a
   click on a key no longer opens the inspector. A table row's hover button opens the node's page
   where it peeked.
+- 2026-11-14 · The first build of the inspector's rule left three tabs outside it: a query's
+  result, History and a Review each hold a selection, and the inspector, now shown from the
+  start, read "Nothing selected" beside it and took its width from a result's columns. They
+  report it as the other views do.
 - 2026-11-01 · Item actions take `views` and `view_action`, not one `views` holding actions: the strip
   asks at every draw, and a set's action copies every loaded row.
 - 2026-11-01 · A key is not strictly unique in the window, since a split copies its tab, so the

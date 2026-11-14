@@ -40,7 +40,9 @@ use studio_ui::{
     type_swatch,
 };
 use studio_workspace::models::{Error as ModelError, Models, Request as ModelRequest};
-use studio_workspace::{Item, ItemEvent, SavedItem, Workspace, workspace_for};
+use studio_workspace::{
+    Inspected, InspectedNode, Item, ItemEvent, SavedItem, Workspace, workspace_for,
+};
 use ui::prelude::*;
 use ui::{KeyBinding, PopoverMenu, Severity};
 
@@ -488,6 +490,9 @@ pub struct ReviewView {
     headers: Vec<GroupRun>,
     /// The selected change: an entity's own, or one relationship on its card.
     selected: Option<usize>,
+    /// The node whose card holds the selected change, as the workspace was last told of it
+    /// ([`ItemEvent::Selected`]): the inspector shows it.
+    inspected: Option<InspectedNode>,
     /// Names of the nodes the review knows only by id, read at the reviewed head after it
     /// loads; until then, and for a node without a name, its id shows.
     names: NodeNames,
@@ -591,6 +596,11 @@ impl Focusable for ReviewView {
 }
 
 impl Item for ReviewView {
+    /// The node whose card holds the selected change (spec 020).
+    fn inspected(&mut self, _cx: &mut Context<Self>) -> Option<Inspected> {
+        self.selected_node().map(Inspected::Node)
+    }
+
     fn tab_title(&self, _cx: &App) -> SharedString {
         format!("Review {} → {}", self.branch, self.target).into()
     }
@@ -709,6 +719,7 @@ impl ReviewView {
             rows: Vec::new(),
             headers: Vec::new(),
             selected: None,
+            inspected: None,
             names: NodeNames::default(),
             names_at: None,
             card_lines: CardLines::default(),
@@ -755,7 +766,12 @@ impl ReviewView {
             _search_task: None,
             _regroup_task: None,
             _fix_task: None,
-            _subscriptions: vec![subscription, search_subscription],
+            _subscriptions: vec![
+                subscription,
+                search_subscription,
+                // The inspector shows the selected change's node (spec 020).
+                cx.observe_self(|this, cx| this.report_selection(cx)),
+            ],
         };
         // Read as any Refresh is, once shown: a merge of these branches whose response was lost
         // and may still land, sent from a review closed since or open elsewhere, is where this
@@ -1242,6 +1258,47 @@ impl ReviewView {
         self.rows
             .iter()
             .position(|row| matches!(row, Row::Entity(ix) if *ix == group))
+    }
+
+    /// The node whose card holds the selected change, as the inspector shows it (spec 020): a
+    /// change of its own, or of a relationship reviewed on its card. It is read where the
+    /// review reads it, and held there, so it is read-only as the review is: at the reviewed
+    /// head, or, for a node the branch removes, at the fork, where it last was. None for an
+    /// edge whose type the schema lacks, which has a card of its own and no node.
+    fn selected_node(&self) -> Option<InspectedNode> {
+        let data = self.data.as_ref()?;
+        let at = *data.groups.home.get(self.selected?)?;
+        let group = data.groups.groups.get(at)?;
+        if group.is_edge {
+            return None;
+        }
+        // What the branch does to the node itself; one standing only for its relationships is
+        // unchanged, and read at the head as a changed one is.
+        let removed = group.change.is_some_and(|own| {
+            change_cards::kind_of_change(&data.folded.changes[own]) == ChangeKind::Removed
+        });
+        let commit = if removed {
+            data.fork.clone()
+        } else {
+            data.head.clone()
+        }?;
+        Some(InspectedNode {
+            type_name: group.type_name.clone(),
+            id: group.id.clone(),
+            at_commit: Some(commit),
+            snapshot: None,
+        })
+    }
+
+    /// Tells the workspace when the selected change's node is another one, or none: called
+    /// whenever the review notifies, so every way the selection and the changes move is seen
+    /// (a key, a click, a conflict's "Show change", a review read again at another head).
+    fn report_selection(&mut self, cx: &mut Context<Self>) {
+        let node = self.selected_node();
+        if node != self.inspected {
+            self.inspected = node;
+            cx.emit(ItemEvent::Selected);
+        }
     }
 
     /// Selects a change, on its entity's card, and scrolls the card into view.
@@ -5188,6 +5245,85 @@ pub(crate) mod tests {
             assert!(!open(view, second));
             assert!(view.expanded.contains(&id));
         });
+    }
+
+    /// The inspector shows the node whose card holds the selected change (spec 020), read where
+    /// the review reads it and held there, so it is read-only as the review is: at the reviewed
+    /// head, or, for a node the branch removes, at the fork, where it last was. The workspace
+    /// is told when the selection is another node's, and not when it stays on the same one.
+    /// Before, the inspector read "Nothing selected" beside a selected change.
+    #[gpui::test]
+    async fn the_inspector_shows_the_selected_changes_node_where_the_review_reads_it(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::{cell::Cell, rc::Rc};
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        // feature adds p1 at f1 and removes p2 at f2, forked from main at m1.
+        let person = |id: &str, op: &str, before: Value, after: Value| json!({ "kind": "node", "type": { "id": "Person", "name": "Person" }, "id": id, "op": op, "before": before, "after": after });
+        let block = |id: &str, parent: &str, change: Value| json!({ "cause": { "graph_commit_id": id, "parent_commit_id": parent, "authored_branch": "feature", "authored_at": 0, "actor_id": "act-dev" }, "changes": [change] });
+        let image = |id: &str| json!({ "properties": { "slug": id } });
+        let added = person("p1", "insert", Value::Null, image("p1"));
+        let removed = person("p2", "delete", image("p2"), Value::Null);
+        let feed = json!({ "blocks": [block("f1", "m1", added), block("f2", "f1", removed)], "cursor": "c", "caught_up": true });
+        let (session, _asked) = review_server(false, Some(feed), "f2", |_| (200, json!({})), cx);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            ReviewView::new(session, "feature".into(), "main".into(), window, cx)
+        });
+        cx.run_until_parked();
+        let told = Rc::new(Cell::new(0));
+        let _subscription = cx.update(|_, cx| {
+            let told = told.clone();
+            cx.subscribe(&view, move |_, event: &ItemEvent, _| {
+                if matches!(event, ItemEvent::Selected) {
+                    told.set(told.get() + 1);
+                }
+            })
+        });
+        let select = |id: &str, cx: &mut gpui::VisualTestContext| {
+            view.update(cx, |view, cx| {
+                let data = view.data.as_ref().unwrap();
+                let change = data
+                    .folded
+                    .changes
+                    .iter()
+                    .position(|change| change.id == id)
+                    .unwrap_or_else(|| panic!("the review holds {id}"));
+                view.select(change, cx);
+            });
+            cx.run_until_parked();
+        };
+        let inspected = |cx: &mut gpui::VisualTestContext| {
+            view.update(cx, |view, cx| match Item::inspected(view, cx) {
+                Some(Inspected::Node(node)) => Some(node),
+                _ => None,
+            })
+        };
+        let node = |id: &str, commit: &str| InspectedNode {
+            type_name: "Person".into(),
+            id: id.into(),
+            at_commit: Some(commit.into()),
+            snapshot: None,
+        };
+
+        select("p1", cx);
+        assert_eq!(
+            inspected(cx),
+            Some(node("p1", "f2")),
+            "at the reviewed head"
+        );
+        let before = told.get();
+        select("p2", cx);
+        assert_eq!(
+            inspected(cx),
+            Some(node("p2", "m1")),
+            "a removed node is read at the fork, where it last was"
+        );
+        assert_eq!(told.get(), before + 1, "told of the other node, once");
+        select("p2", cx);
+        assert_eq!(told.get(), before + 1, "the same node again says nothing");
     }
 
     /// A change selected from elsewhere (a conflict's "Show change", a mirror line) whose
