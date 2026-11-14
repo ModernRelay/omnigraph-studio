@@ -20,6 +20,8 @@ use crate::model::{Scene, SceneKind, SceneNode};
 pub(crate) struct Palette {
     pub text: Hsla,
     pub muted: Hsla,
+    /// A read that failed says so in this colour.
+    pub error: Hsla,
     /// The chip fill.
     pub card: Hsla,
     /// A chip's shadow, its ring first: interfaces.dev's `--shadow-custom`, painted as a
@@ -103,6 +105,8 @@ pub(crate) enum Role {
     Count,
     OpenHub,
     Muted,
+    /// A read that failed.
+    Error,
 }
 
 impl Role {
@@ -156,10 +160,28 @@ pub(crate) fn chip_text(node: &SceneNode) -> ChipText {
                 size: HUB_TEXT,
             }
         }
-        SceneKind::More { .. } => ChipText {
+        SceneKind::More { note, .. } => ChipText {
             mark: false,
             initial,
-            pieces: vec![(label.into_owned().into(), Role::Muted)],
+            pieces: vec![(
+                label.into_owned().into(),
+                match note {
+                    Some(crate::model::Note::Failed(_)) => Role::Error,
+                    _ => Role::Muted,
+                },
+            )],
+            size: HUB_TEXT,
+        },
+        SceneKind::Note { note, .. } => ChipText {
+            mark: false,
+            initial,
+            pieces: vec![(
+                label.into_owned().into(),
+                match note {
+                    crate::model::Note::Failed(_) => Role::Error,
+                    _ => Role::Muted,
+                },
+            )],
             size: HUB_TEXT,
         },
     }
@@ -242,7 +264,9 @@ pub(crate) fn paint(
         .map(|index| {
             if mark_only(index) {
                 match scene.nodes[index].kind {
-                    SceneKind::Hub { .. } | SceneKind::More { .. } => HUB_DOT,
+                    SceneKind::Hub { .. } | SceneKind::More { .. } | SceneKind::Note { .. } => {
+                        HUB_DOT
+                    }
                     SceneKind::Node { .. } => MARK_SIZE / 2.,
                 }
             } else {
@@ -261,6 +285,7 @@ pub(crate) fn paint(
                 color: match role {
                     Role::Name | Role::RootName | Role::OpenHub => palette.text,
                     Role::Count | Role::Muted => palette.muted,
+                    Role::Error => palette.error,
                 },
                 weight: role.weight(),
             })
@@ -366,7 +391,7 @@ pub(crate) fn paint(
         let pointed = hovered == Some(index) || lit.contains(&index);
         if mark_only(index) {
             rects[index] = match node.kind {
-                SceneKind::Hub { .. } | SceneKind::More { .. } => {
+                SceneKind::Hub { .. } | SceneKind::More { .. } | SceneKind::Note { .. } => {
                     paint_dot(p, HUB_DOT, palette.hub_dot, window)
                 }
                 SceneKind::Node { .. } => {
@@ -531,10 +556,10 @@ fn line_tone(
     };
     let dotted = matches!(
         kinds.0,
-        SceneKind::More { .. } | SceneKind::Hub { open: false, .. }
+        SceneKind::More { .. } | SceneKind::Note { .. } | SceneKind::Hub { open: false, .. }
     ) || matches!(
         kinds.1,
-        SceneKind::More { .. } | SceneKind::Hub { open: false, .. }
+        SceneKind::More { .. } | SceneKind::Note { .. } | SceneKind::Hub { open: false, .. }
     );
     Tone {
         alpha: (alpha * 1000.) as u16,
