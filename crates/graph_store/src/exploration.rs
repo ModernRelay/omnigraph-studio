@@ -307,6 +307,25 @@ enum Pinned {
     Elsewhere(String),
 }
 
+/// An answer that landed, waiting to be taken with the others that landed beside it
+/// ([`Exploration::take_landed`]).
+struct Landed {
+    target: LoadTarget,
+    /// The number its read was started under, in `tasks`.
+    ticket: u64,
+    /// The exploration's generation when it was sent: one read since lands nowhere.
+    generation: u64,
+    /// The commit it was read at; the head when none.
+    sent_at: Option<String>,
+    answer: Answer,
+}
+
+enum Answer {
+    Read(Result<ReadOutput, ReadError>),
+    /// A count read with the others asked for in its turn, and the commit it holds at.
+    Count(GroupKey, Result<(u64, Option<String>), String>),
+}
+
 /// Something the exploration reads.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum LoadTarget {
@@ -537,24 +556,6 @@ impl ExploreState {
         match value {
             None => Some(key),
             Some(value) => Some(key.with_value(self.grouping.get(group)?, value)),
-        }
-    }
-
-    /// Whether `path` is the path of `key`'s group, or of its value: [`Self::group_key`] without
-    /// making the key.
-    fn is_group_path(&self, root: &NodeRef, path: &ExplorePath, key: &GroupKey) -> bool {
-        let Some((group, value)) = path.group_step() else {
-            return false;
-        };
-        if *group != key.group || *path.node(root) != key.node {
-            return false;
-        }
-        match (value, &key.within) {
-            (None, None) => true,
-            (Some(value), Some(within)) => {
-                within.value == *value && self.grouping.get(group) == Some(&within.by)
-            }
-            _ => false,
         }
     }
 
@@ -1174,29 +1175,28 @@ impl ExploreState {
     /// open, or (for counts and single-target fields) the node it belongs to is. An answer read
     /// ahead for something closed shows nothing until that opens, and opening it redraws.
     pub fn shows(&self, schema: &SchemaModel, target: &LoadTarget) -> bool {
+        self.openness().shows(schema, target)
+    }
+
+    /// What is open, indexed: which nodes and which relationships or values. Made once for a
+    /// batch of answers or a look for what is missing, so each answer or read asks a set,
+    /// not every path expanded (thousands after Expand all on many nodes).
+    fn openness(&self) -> Openness {
         let Some(root) = &self.root else {
-            return false;
+            return Openness::default();
         };
-        let node_open = |node: &NodeRef| {
-            self.expanded
-                .iter()
-                .any(|path| path.ends_at_node() && path.node(root) == node)
+        let mut open = Openness {
+            rooted: true,
+            ..Openness::default()
         };
-        let group_open = |key: &GroupKey| {
-            self.expanded
-                .iter()
-                .any(|path| self.is_group_path(root, path, key))
-        };
-        match target {
-            LoadTarget::Root => true,
-            // A set's rows are what the tree shows.
-            LoadTarget::Page(key) if key.is_set() => true,
-            LoadTarget::Count(key) => node_open(&key.node),
-            LoadTarget::Page(key) if key.within.is_none() && is_field(schema, &key.group) => {
-                node_open(&key.node)
+        for path in &self.expanded {
+            if path.ends_at_node() {
+                open.nodes.insert(path.node(root).clone());
+            } else if let Some(key) = self.group_key(path) {
+                open.groups.insert(key);
             }
-            LoadTarget::Page(key) | LoadTarget::Values(key, _) => group_open(key),
         }
+        open
     }
 
     /// The reads opening `path` would need that are not made yet: a node's relationship
@@ -1432,6 +1432,35 @@ impl ExploreState {
     }
 }
 
+/// What is open in an exploration ([`ExploreState::openness`]): the nodes expanded, and the
+/// relationships and values expanded, by key.
+#[derive(Debug, Default)]
+struct Openness {
+    /// The exploration has a root: without one nothing shows.
+    rooted: bool,
+    nodes: HashSet<NodeRef>,
+    groups: HashSet<GroupKey>,
+}
+
+impl Openness {
+    /// [`ExploreState::shows`], asked of the index.
+    fn shows(&self, schema: &SchemaModel, target: &LoadTarget) -> bool {
+        if !self.rooted {
+            return false;
+        }
+        match target {
+            LoadTarget::Root => true,
+            // A set's rows are what the tree shows.
+            LoadTarget::Page(key) if key.is_set() => true,
+            LoadTarget::Count(key) => self.nodes.contains(&key.node),
+            LoadTarget::Page(key) if key.within.is_none() && is_field(schema, &key.group) => {
+                self.nodes.contains(&key.node)
+            }
+            LoadTarget::Page(key) | LoadTarget::Values(key, _) => self.groups.contains(key),
+        }
+    }
+}
+
 fn rows(output: &ReadOutput) -> Vec<&serde_json::Map<String, Value>> {
     match &*output.rows {
         Value::Array(rows) => rows.iter().filter_map(Value::as_object).collect(),
@@ -1466,6 +1495,10 @@ impl Global for ExplorationRegistry {}
 struct Flattened {
     state: ExploreState,
     entries: RefCell<Option<MadeEntries>>,
+    /// How many times the tree was walked to flatten it, for tests that bound the walks an
+    /// interaction costs (`docs/drawing.md`, "Guards").
+    #[cfg(test)]
+    walks: std::cell::Cell<usize>,
 }
 
 /// A flattening, and the schema it was made under.
@@ -1480,6 +1513,8 @@ impl Flattened {
             return entries.clone();
         }
         let entries = Arc::new(self.state.entries(schema));
+        #[cfg(test)]
+        self.walks.set(self.walks.get() + 1);
         *held = Some((schema.clone(), entries.clone()));
         entries
     }
@@ -1548,13 +1583,15 @@ pub struct Exploration {
     scope: ReadScope,
     /// The head moved and the session is reading what changed.
     awaiting_changes: bool,
-    /// A look for what is missing is due at the end of this turn: many answers come in one
-    /// turn (a node's counts), and each look walks the whole tree.
-    missing_due: bool,
-    /// A look for what is missing that the session's events asked for (another branch,
-    /// schema or token), owed until a view that draws the exploration is drawn
-    /// ([`Self::read_owed`]): a hidden tree, a results canvas or a background tab reads nothing
-    /// for it.
+    /// Answers in, waiting to be taken together ([`Self::take_landed`]): the counts of one
+    /// batch read (a hundred nodes' counts through one relationship) each land in a task of
+    /// their own, and taking each alone walked the whole tree once an answer.
+    landed: Vec<Landed>,
+    /// Takes what landed, once the answers in the queue ahead of it have landed too.
+    taking: Option<Task<()>>,
+    /// What is open, while a batch of answers is taken or what is missing is read: made once
+    /// for them all ([`Self::with_openness`]).
+    open: Option<Openness>,
     owed: bool,
     _subscription: Subscription,
 }
@@ -1710,7 +1747,9 @@ impl Exploration {
             prune_at: KEPT_READS,
             scope,
             awaiting_changes: false,
-            missing_due: false,
+            landed: Vec::new(),
+            taking: None,
+            open: None,
             owed: false,
             _subscription: subscription,
         }
@@ -1996,11 +2035,7 @@ impl Exploration {
         let target = LoadTarget::Page(key.clone());
         self.tasks.remove(&target);
         // A group that is not open reads its first page when it opens, as missing.
-        if self
-            .schema
-            .as_ref()
-            .is_none_or(|schema| self.state.shows(schema, &target))
-        {
+        if self.shows(&target) {
             self.start(target, cx);
         }
         self.changed(cx);
@@ -2063,11 +2098,11 @@ impl Exploration {
         let Some((_, targets)) = self.ahead.take() else {
             return;
         };
-        let Some(schema) = self.schema.clone() else {
+        if self.schema.is_none() {
             return;
-        };
+        }
         for target in targets {
-            if self.state.shows(&schema, &target) || self.tasks.remove(&target).is_none() {
+            if self.shows(&target) || self.tasks.remove(&target).is_none() {
                 continue;
             }
             // Dropping the read's task stops it: a count left out of its batch, a read
@@ -2161,6 +2196,7 @@ impl Exploration {
     fn read_again(&mut self, cx: &mut Context<Self>) {
         self.generation += 1;
         self.tasks.clear();
+        self.drop_landed();
         self.ahead = None;
         self.prune_at = KEPT_READS;
         self.state.clear_loaded();
@@ -2191,6 +2227,7 @@ impl Exploration {
     fn reset_reads(&mut self, cx: &mut Context<Self>) {
         self.generation += 1;
         self.tasks.clear();
+        self.drop_landed();
         self.ahead = None;
         self.prune_at = KEPT_READS;
         self.carried.clear();
@@ -2222,8 +2259,31 @@ impl Exploration {
             return;
         }
         let entries = self.state.entries(&schema);
-        for target in self.state.missing_in(&entries) {
-            self.start(target, cx);
+        self.with_openness(|this| {
+            for target in this.state.missing_in(&entries) {
+                this.start(target, cx);
+            }
+        });
+    }
+
+    /// Runs `f` with what is open indexed once ([`ExploreState::openness`]), for many answers
+    /// or reads that each ask whether they show. `f` must not open or close anything.
+    fn with_openness<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        if self.open.is_some() {
+            return f(self);
+        }
+        self.open = Some(self.state.openness());
+        let result = f(self);
+        self.open = None;
+        result
+    }
+
+    /// Whether an answer to `target` can change what is shown ([`ExploreState::shows`]).
+    fn shows(&self, target: &LoadTarget) -> bool {
+        match (&self.schema, &self.open) {
+            (None, _) => true,
+            (Some(schema), Some(open)) => open.shows(schema, target),
+            (Some(schema), None) => self.state.shows(schema, target),
         }
     }
 
@@ -2231,11 +2291,7 @@ impl Exploration {
     /// when the answer can change what is shown, else leaving the flattening as made, so a
     /// read ahead for a row that is closed walks no tree when it lands.
     fn state_for(&mut self, target: &LoadTarget) -> &mut ExploreState {
-        let shows = match &self.schema {
-            Some(schema) => self.state.shows(schema, target),
-            None => true,
-        };
-        if shows {
+        if self.shows(target) {
             &mut self.state
         } else {
             self.state.unseen()
@@ -2467,20 +2523,16 @@ impl Exploration {
                 };
             }
             this.update(cx, |this, cx| {
-                if this.generation != generation {
-                    return;
-                }
-                this.finished(&key, ticket);
-                let unpinned = this.pin.is_none();
-                if !this.apply(&key, result, sent_at.as_deref(), cx) {
-                    return;
-                }
-                this.loaded(&key, cx);
-                // The first answer pins the exploration: a head seen move while it was out is
-                // compared now, which it could not be before.
-                if unpinned && this.pin.is_some() {
-                    this.compare_head(cx);
-                }
+                this.land(
+                    Landed {
+                        target: key,
+                        ticket,
+                        generation,
+                        sent_at,
+                        answer: Answer::Read(result),
+                    },
+                    cx,
+                )
             })
             .ok();
         });
@@ -2537,27 +2589,16 @@ impl Exploration {
         let task = cx.spawn(async move |this, cx| {
             let count = count.await;
             this.update(cx, |this, cx| {
-                if this.generation != generation {
-                    return;
-                }
-                this.finished(&key, ticket);
-                let unpinned = this.pin.is_none();
-                match count {
-                    Ok((count, commit)) => {
-                        match this.pinned_at(&key, commit.as_deref(), sent_at.as_deref(), cx) {
-                            Pinned::Taken => this.state_for(&key).apply_count(group, count),
-                            Pinned::Again => return,
-                            Pinned::Elsewhere(message) => this.apply_failure(&key, message),
-                        }
-                    }
-                    Err(message) => this.apply_failure(&key, message),
-                }
-                this.loaded(&key, cx);
-                // A count that pinned the exploration: a head seen move meanwhile is compared
-                // now, as after the first read.
-                if unpinned && this.pin.is_some() {
-                    this.compare_head(cx);
-                }
+                this.land(
+                    Landed {
+                        target: key,
+                        ticket,
+                        generation,
+                        sent_at,
+                        answer: Answer::Count(group, count),
+                    },
+                    cx,
+                )
             })
             .ok();
         });
@@ -2600,30 +2641,96 @@ impl Exploration {
         }
     }
 
-    /// After an answer: reads what it made visible, and redraws when it shows. An answer read
-    /// ahead for something closed shows nothing yet and makes nothing visible: nothing is read
-    /// for it and nothing drawn, and the tree is not walked again, since the answer left the
-    /// flattening as made ([`Self::state_for`]); opening it draws.
-    fn loaded(&mut self, key: &LoadTarget, cx: &mut Context<Self>) {
-        self.bound_reads();
-        let shows = self
-            .schema()
-            .is_some_and(|schema| self.state.shows(&schema, key));
-        if !shows {
+    /// Files an answer that landed, to be taken with every other answer landed before the
+    /// exploration's next turn ([`Self::take_landed`]): a batch read's counts each land in a
+    /// task of their own, one after another, and are taken in one update.
+    fn land(&mut self, landed: Landed, cx: &mut Context<Self>) {
+        if landed.generation != self.generation {
             return;
         }
-        if !std::mem::replace(&mut self.missing_due, true) {
-            let this = cx.entity().downgrade();
-            cx.defer(move |cx| {
-                this.update(cx, |this, cx| {
-                    this.missing_due = false;
-                    this.request_missing(cx);
-                })
-                .ok();
-            });
+        self.landed.push(landed);
+        if self.taking.is_none() {
+            // Spawned behind the answers already queued, so it takes them all at once.
+            self.taking = Some(cx.spawn(async move |this, cx| {
+                this.update(cx, |this, cx| this.take_landed(cx)).ok();
+            }));
         }
-        cx.emit(ExplorationEvent::Loaded);
-        cx.notify();
+    }
+
+    /// Lets go of what landed and was not taken yet: it was read under a generation that ended.
+    fn drop_landed(&mut self) {
+        self.landed.clear();
+        self.taking = None;
+    }
+
+    /// Takes every answer that landed since the last time, in one update: each is checked
+    /// against the pin as before ([`Self::pinned_at`]); then, once for them all, what they made
+    /// visible is read, and views hear one [`ExplorationEvent::Loaded`]. An answer read ahead
+    /// for something closed shows nothing yet and makes nothing visible: nothing is read for
+    /// it and nothing drawn, and the tree is not walked again, since the answer left the
+    /// flattening as made ([`Self::state_for`]); opening it draws.
+    fn take_landed(&mut self, cx: &mut Context<Self>) {
+        self.taking = None;
+        let landed = std::mem::take(&mut self.landed);
+        let unpinned = self.pin.is_none();
+        let shown = self.with_openness(|this| {
+            let mut shown = false;
+            for Landed {
+                target,
+                ticket,
+                generation,
+                sent_at,
+                answer,
+            } in landed
+            {
+                if generation != this.generation {
+                    continue;
+                }
+                this.finished(&target, ticket);
+                let taken = match answer {
+                    Answer::Read(result) => this.apply(&target, result, sent_at.as_deref(), cx),
+                    Answer::Count(group, count) => {
+                        this.apply_count(&target, group, count, sent_at.as_deref(), cx)
+                    }
+                };
+                shown |= taken && this.shows(&target);
+            }
+            shown
+        });
+        self.bound_reads();
+        // The first answer pins the exploration: a head seen move while it was out is compared
+        // now, which it could not be before, and before what the answers made visible is read,
+        // so that is read at the head when the pin moves there.
+        if unpinned && self.pin.is_some() {
+            self.compare_head(cx);
+        }
+        if shown {
+            self.request_missing(cx);
+            cx.emit(ExplorationEvent::Loaded);
+            cx.notify();
+        }
+    }
+
+    /// Takes a count read with the others asked for in its turn, read at `sent_at` (the head
+    /// when `None`), checked against the pin as every answer is. Whether it was taken (`false`
+    /// when it is read again).
+    fn apply_count(
+        &mut self,
+        target: &LoadTarget,
+        group: GroupKey,
+        count: Result<(u64, Option<String>), String>,
+        sent_at: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match count {
+            Ok((count, commit)) => match self.pinned_at(target, commit.as_deref(), sent_at, cx) {
+                Pinned::Taken => self.state_for(target).apply_count(group, count),
+                Pinned::Again => return false,
+                Pinned::Elsewhere(message) => self.apply_failure(target, message),
+            },
+            Err(message) => self.apply_failure(target, message),
+        }
+        true
     }
 
     /// Keeps what the state holds bounded: past [`KEPT_READS`] counts, neighbour lists, values
@@ -4586,5 +4693,166 @@ mod tests {
         );
         state.clear_loaded();
         assert_eq!(state.root_status, Loadable::Loaded(()), "no root to read");
+    }
+
+    /// Ten relationships of Person to Person, each two groups of a node (out and in).
+    fn dense_schema() -> String {
+        let mut text =
+            "node Person {\n  slug: String @key\n  name: String\n  title: String?\n}\n".to_owned();
+        for edge in 0..10 {
+            text.push_str(&format!("edge E{edge}: Person -> Person @card(0..)\n"));
+        }
+        text
+    }
+
+    /// A dense graph's answers: `p0` has 7 neighbours in each of its 20 groups, every other
+    /// node none, so a walk from `p0` shows 140 people one hop out; names are `Name <id>` and
+    /// titles `Title <id>`, whichever the query reads.
+    fn dense_rows(asked: &Value) -> Value {
+        use std::hash::{Hash, Hasher};
+        let label = |id: &str| {
+            let text = asked["query"].as_str().unwrap_or_default();
+            if text.contains(".title as label") {
+                format!("Title {id}")
+            } else {
+                format!("Name {id}")
+            }
+        };
+        match asked["name"].as_str() {
+            Some("studio_node") => {
+                let id = asked["params"]["id"].as_str().unwrap_or_default();
+                json!([{ "id": id, "label": label(id) }])
+            }
+            Some("studio_node_labels") => Value::Array(
+                asked["params"]["ids"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(|id| json!({ "id": id, "label": label(id) }))
+                    .collect(),
+            ),
+            Some("studio_page_degrees") => Value::Array(
+                asked["params"]["ids"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(|id| json!({ "id": id, "n": if id == "p0" { 7 } else { 0 } }))
+                    .collect(),
+            ),
+            Some("studio_neighbours") if asked["params"]["after"].is_null() => {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                asked["query"].as_str().hash(&mut hasher);
+                let group = hasher.finish() % 100_000;
+                Value::Array(
+                    (0..7)
+                        .map(|i| {
+                            let id = format!("q{group}-{i}");
+                            json!({ "id": id, "edge_id": format!("e{group}-{i}"), "label": label(&id) })
+                        })
+                        .collect(),
+                )
+            }
+            _ => json!([]),
+        }
+    }
+
+    /// A walk from `p0` with every group of the root open: 140 people one hop out. With it, the
+    /// name of every read the server answered since, but the head's.
+    fn dense_walk(
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        Entity<GraphSession>,
+        Entity<Exploration>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let asked: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let log = asked.clone();
+        let (session, _served) = crate::test_server::followed_session(
+            &dense_schema(),
+            move |request| {
+                log.lock()
+                    .unwrap()
+                    .push(request["name"].as_str().unwrap_or_default().to_owned());
+                dense_rows(request)
+            },
+            cx,
+        );
+        cx.run_until_parked();
+        let exploration = cx.update(|cx| Exploration::for_session(&session, cx));
+        exploration.update(cx, |exploration, cx| {
+            exploration.root_at(NodeRef::new("Person", "p0"), cx)
+        });
+        cx.run_until_parked();
+        exploration.update(cx, |exploration, cx| {
+            exploration.expand_all(&ExplorePath::root(), cx)
+        });
+        cx.run_until_parked();
+        asked.lock().unwrap().clear();
+        (session, exploration, asked)
+    }
+
+    /// The people one hop out of a walk, by their paths.
+    fn people_one_hop_out(exploration: &Exploration) -> Vec<ExplorePath> {
+        exploration
+            .entries()
+            .iter()
+            .filter(|entry| entry.depth == 2 && matches!(entry.kind, EntryKind::Node { .. }))
+            .map(|entry| entry.path.clone())
+            .collect()
+    }
+
+    /// Expand all on many nodes at once (the canvas's marked chips) asks thousands of counts,
+    /// which land in a few batches. Each batch is taken in one update and the walk flattened
+    /// once for it, not once an answer: before, each of 2,800 counts walked the whole tree
+    /// again, which on a dense graph froze Studio for seconds (a server that answered in 0.4 s,
+    /// the first answer shown at 15.7 s).
+    #[gpui::test]
+    async fn counts_landing_together_are_taken_in_one_walk(cx: &mut gpui::TestAppContext) {
+        let (_session, exploration, _asked) = dense_walk(cx);
+        let people = exploration.read_with(cx, |exploration, _| people_one_hop_out(exploration));
+        assert_eq!(people.len(), 140);
+        let loaded = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let heard = loaded.clone();
+        let _loads = cx.update(|cx| {
+            cx.subscribe(&exploration, move |_, event: &ExplorationEvent, _| {
+                if *event == ExplorationEvent::Loaded {
+                    heard.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            })
+        });
+        let walks = |cx: &mut gpui::TestAppContext| {
+            exploration.read_with(cx, |exploration, _| exploration.state.walks.get())
+        };
+        let before = walks(cx);
+        exploration.update(cx, |exploration, cx| {
+            exploration.set_open(&people, true, cx)
+        });
+        cx.run_until_parked();
+        let walked = walks(cx) - before;
+        let loads = loaded.load(std::sync::atomic::Ordering::SeqCst);
+        exploration.read_with(cx, |exploration, _| {
+            let counted = exploration
+                .entries()
+                .iter()
+                .filter(|entry| {
+                    entry.depth == 3
+                        && matches!(
+                            entry.kind,
+                            EntryKind::Group {
+                                count: Loadable::Loaded(0),
+                                ..
+                            }
+                        )
+                })
+                .count();
+            assert_eq!(counted, 140 * 20, "every count taken");
+        });
+        // The counts are 40 reads: 20 groups, each of two batches of at most a hundred nodes.
+        // At most one walk for each, and the one opening them made; measured, 3 walks and 2
+        // events. Before: 2,801 walks and 2,800 events.
+        assert!(walked <= 41, "{walked} walks of the tree for 2,800 counts");
+        assert!(loads <= 40, "{loads} loaded events for 2,800 counts");
     }
 }
