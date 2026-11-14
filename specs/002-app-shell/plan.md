@@ -900,6 +900,19 @@ than styling one-off elements.
   roles too (`canvas_label`, `canvas_hub`). The interface font is Inter by default (Tower's face; Inter 4.1, OFL-1.1, the
   regular, italic, medium, semibold and bold static files in `assets/fonts/inter/`, loaded
   with Zed's fonts); IBM Plex Sans and every installed font stay selectable.
+- **Text-size keys.** ⌘= (or ⌘+), ⌘− and ⌘0, with Ctrl on Linux and Windows, make text one
+  size larger, one smaller, or the default again (`studio::IncreaseFontSize`,
+  `DecreaseFontSize`, `ResetFontSize`; View has them as Make Text Bigger, Make Text Smaller and
+  Default Text Size). This is Zed's zoom. A step moves `ui_font_size` and `buffer_font_size`
+  by 1 px together, so the editor's text stays as much smaller than the interface's as it
+  was, and writes both to `settings.json`: the size stays, and every window follows. Neither
+  leaves the 10 to 24 px the settings page offers (`FONT_SIZES`); a step that would changes
+  nothing. Only what is sized from the rem scales: text, and `ui`'s icons and controls. Rows,
+  columns, panels and bars are sized in px and keep their size, so a value is cut sooner at a
+  larger size and no more rows show at a smaller one; scaling them is not built. The keys
+  mean one thing everywhere: an image and the canvas zoom on `=`, `+`, `-` and `0` alone, and
+  an image no longer takes ⌘=, ⌘− and ⌘0 (since 2026-11-14; before, the size was changed in
+  Settings only, and those keys did nothing outside an image).
 - **Toolbars.** A document's toolbar and every header or notice strip (a table's, a query's,
   history's and its commit pane's, the review's, storage's, the inspector's header, the text
   editor's, a newer-data notice) holds `ds::button`s and `ds::icon_button`s;
@@ -1026,6 +1039,7 @@ opens a link from inside Studio.
 ## Validation log
 
 | Date | Claim | Check | Result |
+| 2026-11-14 | The text-size keys move the interface's and the editor's sizes together within the settings page's range, keep them, and act app-wide | `studio_settings` `text_sizes_step_together_and_stop_at_the_limits` (a step each way, the top and the bottom limit, and `FONT_SIZES` held to the two settings' ranges) and `the_text_size_steps_change_the_settings_in_effect` (two steps up, one down, a reset, and forty steps stopping at 24 with the two sizes as far apart); `studio` `tests/keymaps.rs` (the three actions bound on every platform); offscreen on `script/dev-server`, with a `settings.json` holding a comment: ⌘= twice wrote 17 and 16 and drew larger text over rows of the same height, ⌘− three times wrote 14 and 13, ⌘0 took both keys out again, and the comment stayed each time | Passed. Not run on Linux or Windows, and the View menu's three items were not pressed |
 | 2026-11-05 | Focus mode shows the active tab alone, full screen, and the markdown editor writes in a centred column | `studio_workspace` `focus_mode_shows_the_active_tab_alone_full_screen` (⌃⌘↵ in, the tab told, the window full screen, no tab strip; another tab activated takes its place; Escape out of full screen; a window already full screen stays so; closing the last tab ends it), `type_table` `focus_mode_hides_the_toolbar_until_something_needs_the_person`; offscreen snapshots of Keyset paging's body against the sample graph: ⌘⇧↵, a line typed, Escape | All pass. The first snapshot caught ⌘⇧↵ bound under `TextEditor` alone: Zed's editor took it as Newline Above, so it is bound under `TextEditor > Editor` too. A split editor alone on the screen still showed the preview, so Split shows the text only while in focus mode |
 | 2026-11-01 | Memory and CPU show by default again | `studio_settings` tests (`default.json` against the struct) | Ragnor asked for the readout back; the setting stays under Appearance for turning it off |
 | 2026-11-01 | A tooltip is measured where it draws: it stays inside the window at its real width, and hangs over its control when its lines would run past the bottom; no panel but the inspector docks right | `studio_ui` `tooltip` `a_tooltip_sits_under_its_control_and_flips_at_the_bottom` (one line fits under a control 50 px from the bottom, two flip above); `studio_workspace` `a_panel_goes_where_the_settings_place_it` (a panel saved in the right dock goes home); offscreen snapshots of a strip segment and the Collapse all button at the window's right | The frame hangs from a GPUI `anchored` at the control's corner with `snap_to_window_with_margin`, so a short tooltip at the right edge no longer sits 100–280 px left of its control as the fixed 288 px estimate placed it; the flip still goes by an estimate of the lines (`size::TOOLTIP_HEIGHT` each), since the height is known only once drawn. The panel menu offers Left and Bottom only: the right dock draws no panel buttons, so a panel moved there had no way back |

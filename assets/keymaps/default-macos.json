@@ -17,7 +17,11 @@
       "cmd-[": "studio::GoBack",
       "cmd-]": "studio::GoForward",
       "cmd-q": "studio::Quit",
-      "cmd-alt-shift-f": "studio::ToggleFrameOverlay"
+      "cmd-alt-shift-f": "studio::ToggleFrameOverlay",
+      "cmd-=": "studio::IncreaseFontSize",
+      "cmd-+": "studio::IncreaseFontSize",
+      "cmd--": "studio::DecreaseFontSize",
+      "cmd-0": "studio::ResetFontSize"
     }
   },
   {
@@ -82,10 +86,7 @@
       "1": "studio_canvas::ActualSize",
       "=": "studio_canvas::ZoomIn",
       "+": "studio_canvas::ZoomIn",
-      "-": "studio_canvas::ZoomOut",
-      "cmd-0": "studio_canvas::FitToWindow",
-      "cmd-=": "studio_canvas::ZoomIn",
-      "cmd--": "studio_canvas::ZoomOut"
+      "-": "studio_canvas::ZoomOut"
     }
   },
   {

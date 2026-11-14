@@ -29,7 +29,8 @@ use graph_store::{ConnectionRegistry, ServerSource, open_session, open_session_b
 use studio_actions::offered;
 use studio_actions::update::{CheckForUpdates, DownloadUpdate, RestartToUpdate, ViewReleaseNotes};
 use studio_actions::workspace::{
-    About, NewWindow, OpenGraph, OpenLink, OpenSettings, Quit, RevealLog,
+    About, DecreaseFontSize, IncreaseFontSize, NewWindow, OpenGraph, OpenLink, OpenSettings, Quit,
+    ResetFontSize, RevealLog,
 };
 use studio_update::{UpdateState, Updater};
 use studio_workspace::{SavedGraph, SavedWindow, ToastKind, Workspace};
@@ -73,6 +74,11 @@ pub fn init(cx: &mut App) {
     // unsaved tabs are asked about first. Deferred, as `OpenLink` is below: the window the
     // action came from is held for dispatch, and could not be asked.
     cx.on_action(|_: &Quit, cx| cx.defer(|cx| studio_workspace::quit(false, cx)));
+    // The text-size keys (spec 002, "Text sizes"): app-wide, so they act whatever window, tab
+    // or field has the keyboard, and every window follows.
+    cx.on_action(|_: &IncreaseFontSize, cx| studio_settings::step_font_sizes(1., cx));
+    cx.on_action(|_: &DecreaseFontSize, cx| studio_settings::step_font_sizes(-1., cx));
+    cx.on_action(|_: &ResetFontSize, cx| studio_settings::reset_font_sizes(cx));
     // The file when it exists; a run from a terminal logs to its output, so then the folder.
     // A folder that cannot be made is said, with its path and why: the menu item would
     // otherwise do nothing at all. Looked for and made off the main thread; the window the

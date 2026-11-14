@@ -10,9 +10,10 @@ use studio_actions::query::{Save, SaveAs};
 use studio_actions::update::{CheckForUpdates, RestartToUpdate};
 use studio_actions::workspace::{
     About, ActivateNextPane, ActivatePreviousPane, CloseActiveItem, CloseAllItems, CloseOtherItems,
-    GoBack, GoForward, GoTo, NewWindow, OpenGraph, OpenSettings, Quit, Refresh, RevealLog,
-    ShowKeyBindings, SplitDown, SplitRight, SwitchBranch, ToggleActivity, ToggleCommandPalette,
-    ToggleFocusMode, ToggleInspector, TogglePinTab, ToggleSidebar,
+    DecreaseFontSize, GoBack, GoForward, GoTo, IncreaseFontSize, NewWindow, OpenGraph,
+    OpenSettings, Quit, Refresh, ResetFontSize, RevealLog, ShowKeyBindings, SplitDown, SplitRight,
+    SwitchBranch, ToggleActivity, ToggleCommandPalette, ToggleFocusMode, ToggleInspector,
+    TogglePinTab, ToggleSidebar,
 };
 
 pub fn set(cx: &mut App) {
@@ -75,6 +76,10 @@ pub fn set(cx: &mut App) {
             MenuItem::action("Inspector", ToggleInspector),
             MenuItem::action("Bottom Panel", ToggleActivity),
             MenuItem::action("Focus Mode", ToggleFocusMode),
+            MenuItem::separator(),
+            MenuItem::action("Make Text Bigger", IncreaseFontSize),
+            MenuItem::action("Make Text Smaller", DecreaseFontSize),
+            MenuItem::action("Default Text Size", ResetFontSize),
             MenuItem::separator(),
             MenuItem::action("Split Right", SplitRight),
             MenuItem::action("Split Down", SplitDown),
