@@ -2342,8 +2342,8 @@ impl GraphCanvas {
                     menu.entry(
                         "Expand all",
                         None,
-                        Self::on_menu(&this, move |canvas, _, cx| {
-                            canvas.expand_marked(&expand, true, cx)
+                        Self::on_menu(&this, move |canvas, window, cx| {
+                            canvas.expand_marked_asking(&expand, window, cx)
                         }),
                     )
                     .entry(
@@ -2398,9 +2398,15 @@ impl GraphCanvas {
             self.close_all(ids, cx);
             return;
         }
+        let paths = self.marked_paths(ids);
+        self.exploration
+            .update(cx, |e, cx| e.set_open(&paths, true, cx));
+    }
+
+    /// The paths of the marked nodes and pills among `ids`.
+    fn marked_paths(&self, ids: &[SceneId]) -> Vec<ExplorePath> {
         let at = self.scene.indices();
-        let paths: Vec<ExplorePath> = ids
-            .iter()
+        ids.iter()
             .filter_map(|id| at.get(id).copied())
             .filter_map(|index| {
                 let node = &self.scene.nodes[index];
@@ -2409,9 +2415,29 @@ impl GraphCanvas {
                     _ => None,
                 }
             })
-            .collect();
-        self.exploration
-            .update(cx, |e, cx| e.set_open(&paths, true, cx));
+            .collect()
+    }
+
+    /// Expand all on the marked chips, asked first when it opens more than a canvas can show
+    /// well or asks thousands of reads ([`graph_store::Opening::asks`]; spec 006).
+    fn expand_marked_asking(
+        &mut self,
+        ids: &[SceneId],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let paths = self.marked_paths(ids);
+        let opening = self.exploration.read(cx).opening(&paths, false);
+        let exploration = self.exploration.clone();
+        let expand = move |_: &mut Window, cx: &mut App| {
+            exploration.update(cx, |e, cx| e.set_open(&paths, true, cx));
+        };
+        if opening.asks() {
+            let (title, description, action) = opening.question();
+            studio_workspace::confirm(window, cx, title, description, action, expand);
+        } else {
+            expand(window, cx);
+        }
     }
 
     /// Keeps the marked chips where they are drawn now.

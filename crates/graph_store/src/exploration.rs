@@ -356,6 +356,54 @@ pub const VALUES_LIMIT: u32 = 100;
 /// connection keeps on the wire, so a read ahead never waits behind itself.
 pub const PREFETCH_LIMIT: usize = 8;
 
+/// The most nodes one Expand all opens without asking first (spec 006, "Expand all"). Each node
+/// opened asks a count of every relationship it has: Expand all on 143 nodes of a dense graph
+/// asked about 2,000, and drew a hub for each relationship with neighbours.
+pub const EXPAND_NODES_WITHOUT_ASKING: usize = 50;
+
+/// The most reads one Expand all asks for without asking first: counts, single-target fields
+/// and first lists not held already.
+pub const EXPAND_READS_WITHOUT_ASKING: usize = 500;
+
+/// What opening some paths costs ([`Exploration::opening`]): the nodes it opens and the reads it
+/// asks for that are not held.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Opening {
+    pub nodes: usize,
+    pub reads: usize,
+}
+
+impl Opening {
+    /// Whether it is past what is opened without asking.
+    pub fn asks(&self) -> bool {
+        self.nodes > EXPAND_NODES_WITHOUT_ASKING || self.reads > EXPAND_READS_WITHOUT_ASKING
+    }
+
+    /// What a view asks before it opens this: a title, what it costs, and the action's label.
+    pub fn question(&self) -> (String, String, String) {
+        let reads = match self.reads {
+            1 => "1 read".to_owned(),
+            n => format!("{} reads", studio_ui::group_digits(n)),
+        };
+        if self.nodes == 0 {
+            return (
+                "Open these relationships?".to_owned(),
+                format!("Opening them asks the server for {reads}, and shows what they hold."),
+                "Open".to_owned(),
+            );
+        }
+        let nodes = studio_ui::group_digits(self.nodes);
+        (
+            format!("Expand {nodes} nodes?"),
+            format!(
+                "Each node shows its relationships: that asks the server for {reads}, and \
+                 draws a hub for every relationship with neighbours."
+            ),
+            format!("Expand {nodes} nodes"),
+        )
+    }
+}
+
 /// How many counts, neighbour lists, values and labels an exploration holds before it lets go
 /// of those nothing open can reach: rows the pointer rested on and never opened, and what was
 /// read below a subtree closed whole. What is let go is read again at the pin when it opens,
@@ -643,6 +691,63 @@ impl ExploreState {
                 self.expand(&path.child_group(group));
             }
         }
+    }
+
+    /// What opening `paths` costs, and with `all` each node's every relationship too, as
+    /// [`Self::expand_all`] opens them: the nodes opened, and the reads asked for that are not
+    /// held (a node's counts and fields; a relationship's first list, or its values). A count
+    /// not read yet counts the list as a read, though one of none reads nothing.
+    pub fn opening(&self, schema: &SchemaModel, paths: &[ExplorePath], all: bool) -> Opening {
+        let Some(root) = &self.root else {
+            return Opening::default();
+        };
+        let mut opening = Opening::default();
+        let mut seen = HashSet::new();
+        let list = |key: &GroupKey| -> usize {
+            if matches!(self.counts.get(key), Some(Loadable::Loaded(0))) {
+                return 0;
+            }
+            let held = match self.grouping.get(&key.group) {
+                Some(by) if key.within.is_none() => {
+                    self.values.contains_key(&(key.clone(), by.clone()))
+                }
+                _ => self.neighbours.contains_key(key),
+            };
+            usize::from(!held)
+        };
+        for path in paths {
+            if !seen.insert(path) {
+                continue;
+            }
+            if !path.ends_at_node() {
+                if !self.expanded.contains(path)
+                    && let Some(key) = self.group_key(path)
+                {
+                    opening.reads += list(&key);
+                }
+                continue;
+            }
+            let node = path.node(root);
+            if !self.expanded.contains(path) {
+                opening.nodes += 1;
+            }
+            for group in schema.relationships_of(&node.type_name) {
+                let key = GroupKey::new(node.clone(), group.clone());
+                if is_field(schema, group) {
+                    if !self.expanded.contains(path) {
+                        opening.reads += usize::from(!self.neighbours.contains_key(&key));
+                    }
+                    continue;
+                }
+                if !self.expanded.contains(path) {
+                    opening.reads += usize::from(!self.counts.contains_key(&key));
+                }
+                if all && !self.expanded.contains(&path.child_group(group)) {
+                    opening.reads += list(&key);
+                }
+            }
+        }
+        opening
     }
 
     /// Forgets everything read, keeping the root, expansions and selection.
@@ -1904,6 +2009,16 @@ impl Exploration {
             self.state.expand_all(&schema, path);
             self.request_missing(cx);
             self.changed(cx);
+        }
+    }
+
+    /// What opening `paths` costs ([`ExploreState::opening`]), with `all` as Expand all on a
+    /// node opens its every relationship: a view asks before opening past
+    /// [`EXPAND_NODES_WITHOUT_ASKING`] nodes or [`EXPAND_READS_WITHOUT_ASKING`] reads.
+    pub fn opening(&self, paths: &[ExplorePath], all: bool) -> Opening {
+        match &self.schema {
+            Some(schema) => self.state.opening(schema, paths, all),
+            None => Opening::default(),
         }
     }
 
@@ -5284,5 +5399,57 @@ mod tests {
             2,
             "Knows sent again, Likes searched again"
         );
+    }
+
+    /// What an Expand all costs, so a view asks before a large one (spec 006): each node opened
+    /// asks a count of each of its relationships, and Expand all on one node a first list of
+    /// each, nothing counted once held.
+    #[gpui::test]
+    async fn expanding_many_nodes_is_asked_first(cx: &mut gpui::TestAppContext) {
+        let (_session, exploration, _asked) = dense_walk(cx);
+        exploration.read_with(cx, |exploration, _| {
+            let people = people_one_hop_out(exploration);
+            let all = exploration.opening(&people, false);
+            assert_eq!(
+                all,
+                Opening {
+                    nodes: 140,
+                    reads: 2_800
+                }
+            );
+            assert!(all.asks());
+            assert_eq!(
+                all.question(),
+                (
+                    "Expand 140 nodes?".to_owned(),
+                    "Each node shows its relationships: that asks the server for 2,800 reads, \
+                     and draws a hub for every relationship with neighbours."
+                        .to_owned(),
+                    "Expand 140 nodes".to_owned(),
+                )
+            );
+            let few = exploration.opening(&people[..10], false);
+            assert_eq!(
+                few,
+                Opening {
+                    nodes: 10,
+                    reads: 200
+                }
+            );
+            assert!(!few.asks());
+            // One node and every relationship of it: its 20 counts and 20 first lists.
+            assert_eq!(
+                exploration.opening(&people[..1], true),
+                Opening {
+                    nodes: 1,
+                    reads: 40
+                }
+            );
+            // The root is open, its counts and lists held: nothing to open or read.
+            assert_eq!(
+                exploration.opening(&[ExplorePath::root()], true),
+                Opening::default()
+            );
+        });
     }
 }
