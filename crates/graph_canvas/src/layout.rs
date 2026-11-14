@@ -1,9 +1,12 @@
 //! Canvas layout, without GPUI, so it can run on a background thread and be tested.
 //!
-//! The exploration places each new node in a column beside the node it hangs off, on the side
-//! away from where the walk came from, then relaxes overlaps for a fixed number of iterations.
-//! Nodes laid out before keep their positions exactly, so expanding never moves what the person
-//! already sees. No randomness: the same input gives the same output.
+//! A walk ([`walk_positions`]) is a tree of bands: each node's children stand in a column
+//! beside it, the first on its row, and each subtree owns the rows from its top to its bottom,
+//! so what opens pushes the chips below it down and nothing else moves; a line from a node to
+//! its children runs in the gutter between them, where no other chip stands. A query result
+//! ([`explore_positions`]) keeps its roots where they are put and places each new node in a
+//! column beside the node it hangs off, then relaxes overlaps. No randomness: the same input
+//! gives the same output.
 
 use std::collections::HashMap;
 use std::f32::consts::{PI, TAU};
@@ -61,8 +64,12 @@ pub struct LayoutNode {
     /// The node this one hangs off; it must come earlier in the list.
     pub parent: Option<usize>,
     pub kind: LayoutKind,
-    /// The room the node and its label need.
+    /// The room the node and its label need: half its chip's width.
     pub space: f32,
+    /// Half its chip's height, as tall as its name wraps ([`CHIP_HALF_HEIGHT`] for one line).
+    pub half_height: f32,
+    /// Where the person placed it by hand: it stands there, and what hangs off it with it.
+    pub pinned: Option<Vec2>,
     /// Where it was drawn before; such a node does not move.
     pub previous: Option<Vec2>,
     /// The side of its root it stands on, right (1) or left (-1), when it hangs off a root:
@@ -72,8 +79,8 @@ pub struct LayoutNode {
     pub side: Option<f32>,
 }
 
-/// Half a chip's height, for overlap removal.
-const CHIP_HALF_HEIGHT: f32 = 16.;
+/// Half the room a one-line chip takes up and down: its chip and the space about it.
+pub const CHIP_HALF_HEIGHT: f32 = 16.;
 
 /// Chips on a circle in the order given, so positions depend only on that order: a few
 /// result roots stand this way.
@@ -175,7 +182,10 @@ pub fn spaced_positions(nodes: &[LayoutNode], spacing: Spacing) -> Vec<Vec2> {
         }
     }
     // How tall each new subtree is: its chip, or its children's subtrees stacked.
-    let mut height = vec![row; count];
+    let mut height: Vec<f32> = nodes
+        .iter()
+        .map(|node| row.max(2. * node.half_height + row - 2. * CHIP_HALF_HEIGHT))
+        .collect();
     for index in (0..count).rev() {
         let new_children: Vec<usize> = children[index]
             .iter()
@@ -183,7 +193,7 @@ pub fn spaced_positions(nodes: &[LayoutNode], spacing: Spacing) -> Vec<Vec2> {
             .filter(|c| nodes[*c].previous.is_none())
             .collect();
         if !new_children.is_empty() {
-            height[index] = spacing.stacked(&new_children, &height).max(row);
+            height[index] = spacing.stacked(&new_children, &height).max(height[index]);
         }
     }
     let mut position = vec![Vec2::default(); count];
@@ -196,14 +206,14 @@ pub fn spaced_positions(nodes: &[LayoutNode], spacing: Spacing) -> Vec<Vec2> {
         [
             at.x - nodes[index].space - GAP / 2.,
             at.x + nodes[index].space + GAP / 2.,
-            at.y - CHIP_HALF_HEIGHT - GAP / 2.,
-            at.y + CHIP_HALF_HEIGHT + GAP / 2.,
+            at.y - nodes[index].half_height - GAP / 2.,
+            at.y + nodes[index].half_height + GAP / 2.,
         ]
     };
     let mut roots = 0;
     // Drawn nodes first, all of them: where a column ends is read from them.
     for index in 0..count {
-        if let Some(previous) = nodes[index].previous {
+        if let Some(previous) = nodes[index].pinned.or(nodes[index].previous) {
             position[index] = previous;
             fixed[index] = true;
             placed[index] = true;
@@ -305,6 +315,162 @@ pub fn spaced_positions(nodes: &[LayoutNode], spacing: Spacing) -> Vec<Vec2> {
     }
     relax(nodes, &mut position, &fixed);
     position
+}
+
+/// Positions for a walk (the exploration, and a schema walked a type at a time): a tree of
+/// bands. A node's children stand in a column beside it, near edges aligned, the first on the
+/// node's own row; each child's subtree owns the rows from its top to its bottom, and the next
+/// child starts below them (with a gap after an open subtree, so groups read as groups). So:
+///
+/// - What opens pushes the chips below it down, and only down; it and everything above stay.
+/// - A chip's row, read leftward, meets its parent first: no other chip stands between them,
+///   and the parent's other children are below it.
+/// - A line from a node to its children turns in the gutter between them, where no other
+///   chip stands ([`elbow_route`]).
+///
+/// A root's children share its two sides: on the side they ask for, else the one they were
+/// drawn on, else the lighter by chips (not by what is open below them, which changes). Below
+/// a root every column goes outward. A pinned chip stands where it was placed, with what hangs
+/// off it, and keeps its slot in its parent's column, so nothing moves up into it.
+pub fn walk_positions(nodes: &[LayoutNode], spacing: Spacing) -> Vec<Vec2> {
+    let count = nodes.len();
+    let parent_of = |index: usize| nodes[index].parent.filter(|parent| *parent < index);
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); count];
+    for index in 0..count {
+        if let Some(parent) = parent_of(index) {
+            children[parent].push(index);
+        }
+    }
+    // "+K more" ends its column, after the neighbours it stands for.
+    for list in &mut children {
+        list.sort_by_key(|child| nodes[*child].kind == LayoutKind::More);
+    }
+    // Which side of its root each root child stands on, right (index 0) or left (1).
+    let mut columns: Vec<[Vec<usize>; 2]> = vec![[Vec::new(), Vec::new()]; count];
+    for index in 0..count {
+        if parent_of(index).is_some() {
+            columns[index][0] = children[index].clone();
+            continue;
+        }
+        let origin = nodes[index].pinned.or(nodes[index].previous);
+        let mut weight = [0usize; 2];
+        let mut undecided = Vec::new();
+        let mut sides = vec![None; children[index].len()];
+        for (k, &child) in children[index].iter().enumerate() {
+            let drawn = match (nodes[child].previous, origin) {
+                (Some(at), Some(root)) => Some(at.x < root.x),
+                (Some(at), None) => Some(at.x < 0.),
+                _ => None,
+            };
+            let side = nodes[child].side.map(|side| side < 0.).or(drawn);
+            match side {
+                Some(left) => {
+                    sides[k] = Some(usize::from(left));
+                    weight[usize::from(left)] += 1;
+                }
+                None => undecided.push(k),
+            }
+        }
+        for k in undecided {
+            let side = usize::from(weight[1] < weight[0]);
+            sides[k] = Some(side);
+            weight[side] += 1;
+        }
+        for (k, &child) in children[index].iter().enumerate() {
+            columns[index][sides[k].unwrap_or(0)].push(child);
+        }
+    }
+    let row_gap = (spacing.row - 2. * CHIP_HALF_HEIGHT).max(0.);
+    // Each subtree's reach above and below its node's centre, and each child's offset from its
+    // parent's centre, children before parents.
+    let mut up: Vec<f32> = nodes.iter().map(|node| node.half_height).collect();
+    let mut down = up.clone();
+    let mut offset = vec![0f32; count];
+    for index in (0..count).rev() {
+        for members in &columns[index] {
+            let mut previous: Option<usize> = None;
+            for &child in members {
+                offset[child] = match previous {
+                    None => 0.,
+                    Some(before) => {
+                        let opened = !children[before].is_empty();
+                        offset[before]
+                            + down[before]
+                            + row_gap
+                            + if opened { spacing.group_gap } else { 0. }
+                            + up[child]
+                    }
+                };
+                previous = Some(child);
+            }
+            if let (Some(&first), Some(&last)) = (members.first(), members.last()) {
+                up[index] = up[index].max(up[first] - offset[first]);
+                down[index] = down[index].max(offset[last] + down[last]);
+            }
+        }
+    }
+    let mut position = vec![Vec2::default(); count];
+    let mut roots = 0;
+    for index in 0..count {
+        let Some(parent) = parent_of(index) else {
+            position[index] = nodes[index]
+                .pinned
+                .or(nodes[index].previous)
+                .unwrap_or_else(|| Vec2::new(roots as f32 * 900., 0.));
+            roots += 1;
+            continue;
+        };
+        let direction = match parent_of(parent) {
+            // Outward, away from where the parent hangs.
+            Some(grandparent) => {
+                if position[parent].x >= position[grandparent].x {
+                    1.
+                } else {
+                    -1.
+                }
+            }
+            None => {
+                if columns[parent][1].contains(&index) {
+                    -1.
+                } else {
+                    1.
+                }
+            }
+        };
+        let gap = match nodes[index].kind {
+            LayoutKind::Hub => spacing.hub_gap,
+            LayoutKind::Node | LayoutKind::More => spacing.node_gap,
+        };
+        position[index] = nodes[index].pinned.unwrap_or_else(|| {
+            Vec2::new(
+                position[parent].x + direction * (nodes[parent].space + gap + nodes[index].space),
+                position[parent].y + offset[index],
+            )
+        });
+    }
+    position
+}
+
+/// How far beyond a node a line to its children turns, at zoom 1: inside the narrower of the
+/// gaps a walk leaves between a node and its hubs and a hub and its neighbours, so a column of
+/// children hangs from one upright.
+pub const ELBOW: f32 = 18.;
+
+/// A line from a parent at `parent` (its sides `parent_reach` either side) to a child at
+/// `child`, as right-angle pieces: out of the parent's side towards the child, turning `turn`
+/// beyond it (or halfway, where the two are closer), and into the child's side. What the
+/// canvas paints, in world or screen coordinates alike.
+pub fn elbow_route(
+    (parent, parent_reach): (Vec2, f32),
+    (child, child_reach): (Vec2, f32),
+    turn: f32,
+) -> [Vec2; 4] {
+    let side = if child.x >= parent.x { 1. } else { -1. };
+    let start = Vec2::new(parent.x + side * parent_reach, parent.y);
+    let end = Vec2::new(child.x - side * child_reach, child.y);
+    let room = (end.x - start.x).abs();
+    let x = start.x + side * turn.min(room / 2.);
+    [start, Vec2::new(x, parent.y), Vec2::new(x, child.y), end]
 }
 
 /// Where a column `total` tall starts: at `ideal` when no chip in `taken` (left, right, top,
@@ -426,7 +592,8 @@ fn relax(nodes: &[LayoutNode], position: &mut [Vec2], fixed: &[bool]) {
                         // apart along the axis they overlap least, so a column stays a column.
                         let delta = position[j] - position[i];
                         let overlap_x = nodes[i].space + nodes[j].space + GAP - delta.x.abs();
-                        let overlap_y = 2. * CHIP_HALF_HEIGHT + GAP - delta.y.abs();
+                        let overlap_y =
+                            nodes[i].half_height + nodes[j].half_height + GAP - delta.y.abs();
                         if overlap_x <= 0. || overlap_y <= 0. {
                             continue;
                         }
@@ -544,6 +711,8 @@ mod tests {
                 kind: LayoutKind::Node,
                 space: 40.,
                 previous: fixed[i],
+                half_height: CHIP_HALF_HEIGHT,
+                pinned: None,
                 side: None,
             })
             .collect()
@@ -666,6 +835,8 @@ mod tests {
             kind: LayoutKind::Node,
             space: 24.,
             previous: None,
+            half_height: CHIP_HALF_HEIGHT,
+            pinned: None,
             side: None,
         }];
         for _ in 0..hubs {
@@ -675,6 +846,8 @@ mod tests {
                 kind: LayoutKind::Hub,
                 space: 34.,
                 previous: None,
+                half_height: CHIP_HALF_HEIGHT,
+                pinned: None,
                 side: None,
             });
             for _ in 0..per_hub {
@@ -683,6 +856,8 @@ mod tests {
                     kind: LayoutKind::Node,
                     space: 22.,
                     previous: None,
+                    half_height: CHIP_HALF_HEIGHT,
+                    pinned: None,
                     side: None,
                 });
             }
@@ -729,6 +904,8 @@ mod tests {
                 kind,
                 space: 22.,
                 previous: None,
+                half_height: CHIP_HALF_HEIGHT,
+                pinned: None,
                 side: None,
             });
         }
@@ -771,6 +948,8 @@ mod tests {
             kind,
             space,
             previous: None,
+            half_height: CHIP_HALF_HEIGHT,
+            pinned: None,
             side: None,
         };
         let mut nodes = vec![chip(None, LayoutKind::Node, 70.)];
@@ -878,6 +1057,8 @@ mod tests {
             kind,
             space: 40.,
             previous: None,
+            half_height: CHIP_HALF_HEIGHT,
+            pinned: None,
             side,
         };
         let mut nodes = vec![node(None, LayoutKind::Node, None)];
@@ -901,5 +1082,253 @@ mod tests {
         let roomy = spaced_positions(&nodes, Spacing::SCHEMA);
         assert!(roomy[2].y - roomy[1].y > at[2].y - at[1].y);
         assert!(roomy[1].x - roomy[0].x > at[1].x - at[0].x);
+    }
+    /// A deterministic walk: a root with hubs, hubs with neighbours (and sometimes "+K more"),
+    /// some neighbours opened to hubs of their own, three levels deep, with chips of many
+    /// widths and of one to three lines.
+    fn random_walk(seed: u64) -> Vec<LayoutNode> {
+        let mut state = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let mut next = move |below: u64| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) % below.max(1)
+        };
+        let mut nodes = Vec::new();
+        let chip = |nodes: &mut Vec<LayoutNode>,
+                    parent: Option<usize>,
+                    kind,
+                    next: &mut dyn FnMut(u64) -> u64| {
+            let lines = 1. + next(3) as f32;
+            nodes.push(LayoutNode {
+                parent,
+                kind,
+                space: 20. + next(120) as f32,
+                half_height: CHIP_HALF_HEIGHT + (lines - 1.) * 9.,
+                pinned: None,
+                previous: None,
+                side: None,
+            });
+            nodes.len() - 1
+        };
+        let root = chip(&mut nodes, None, LayoutKind::Node, &mut next);
+        let mut open = vec![(root, 0)];
+        while let Some((node, depth)) = open.pop() {
+            for _ in 0..1 + next(5) {
+                let hub = chip(&mut nodes, Some(node), LayoutKind::Hub, &mut next);
+                if next(3) == 0 {
+                    continue;
+                }
+                for _ in 0..1 + next(6) {
+                    let child = chip(&mut nodes, Some(hub), LayoutKind::Node, &mut next);
+                    if depth < 2 && next(4) == 0 {
+                        open.push((child, depth + 1));
+                    }
+                }
+                if next(2) == 0 {
+                    chip(&mut nodes, Some(hub), LayoutKind::More, &mut next);
+                }
+            }
+        }
+        nodes
+    }
+
+    /// A chip's box: its half width and half height about its centre.
+    fn chip_box(node: &LayoutNode, at: Vec2) -> (f32, f32, f32, f32) {
+        (
+            at.x - node.space,
+            at.x + node.space,
+            at.y - node.half_height,
+            at.y + node.half_height,
+        )
+    }
+
+    /// Whether a straight, level or upright piece from `a` to `b` passes through the inside of
+    /// `rect` (left, right, top, bottom), a pixel in from its edges.
+    fn piece_crosses(a: Vec2, b: Vec2, (left, right, top, bottom): (f32, f32, f32, f32)) -> bool {
+        let (x0, x1) = (a.x.min(b.x), a.x.max(b.x));
+        let (y0, y1) = (a.y.min(b.y), a.y.max(b.y));
+        x1 > left + 1. && x0 < right - 1. && y1 > top + 1. && y0 < bottom - 1.
+    }
+
+    /// The canvas's chips as they stand: their boxes do not overlap, every line from a chip to
+    /// one hanging off it runs clear of every other chip, and a chip's row read leftward meets
+    /// its parent first, so no line can be read as joining a chip to another relationship (H2
+    /// in the canvas UX report). Each column starts on its parent's row.
+    fn assert_readable(nodes: &[LayoutNode], at: &[Vec2], case: &str) {
+        let boxes: Vec<_> = nodes.iter().zip(at).map(|(n, p)| chip_box(n, *p)).collect();
+        for i in 0..nodes.len() {
+            for j in i + 1..nodes.len() {
+                let (a, b) = (boxes[i], boxes[j]);
+                let apart = a.1 <= b.0 + 0.01
+                    || b.1 <= a.0 + 0.01
+                    || a.3 <= b.2 + 0.01
+                    || b.3 <= a.2 + 0.01;
+                assert!(apart, "{case}: chips {i} and {j} overlap");
+            }
+        }
+        let mut first_child: HashMap<usize, usize> = HashMap::new();
+        for (child, node) in nodes.iter().enumerate() {
+            let Some(parent) = node.parent else { continue };
+            first_child.entry(parent).or_insert(child);
+            let route = elbow_route(
+                (at[parent], nodes[parent].space),
+                (at[child], nodes[child].space),
+                ELBOW,
+            );
+            for (other, rect) in boxes.iter().enumerate() {
+                if other == parent || other == child {
+                    continue;
+                }
+                for piece in route.windows(2) {
+                    assert!(
+                        !piece_crosses(piece[0], piece[1], *rect),
+                        "{case}: the line from {parent} to {child} crosses chip {other}"
+                    );
+                }
+            }
+            // Read leftward along the child's row, the first chip met is its parent.
+            let (row_top, row_bottom) = (boxes[child].2, boxes[child].3);
+            let (from, to) = if at[child].x >= at[parent].x {
+                (boxes[parent].0, boxes[child].0)
+            } else {
+                (boxes[child].1, boxes[parent].1)
+            };
+            for (other, rect) in boxes.iter().enumerate() {
+                if other == parent || other == child {
+                    continue;
+                }
+                let in_row = rect.3 > row_top + 0.5 && rect.2 < row_bottom - 0.5;
+                let between = rect.1 > from + 0.5 && rect.0 < to - 0.5;
+                assert!(
+                    !(in_row && between),
+                    "{case}: chip {other} stands between {child} and its parent {parent}"
+                );
+            }
+        }
+        for (parent, child) in first_child {
+            if nodes[child].pinned.is_none() {
+                assert!(
+                    (at[child].y - at[parent].y).abs() < 0.01,
+                    "{case}: {parent}'s column starts on its row"
+                );
+            }
+        }
+    }
+
+    /// Over 300 random walks with chips of every size, a walk's layout keeps every chip with
+    /// its own relationship (H2): no overlaps, no line through a chip, no chip between one and
+    /// its parent, each column on its parent's row. The old layout centred a column on its hub
+    /// and moved it to free room, so it stood level with its hub's siblings.
+    #[test]
+    fn a_walk_never_reads_as_joining_a_chip_to_the_wrong_relationship() {
+        for seed in 0..300 {
+            let full = random_walk(seed);
+            for spacing in [Spacing::EXPLORE, Spacing::SCHEMA] {
+                // Opened a few chips at a time, as a person clicks: each layout starts from
+                // where the one before drew the chips.
+                let mut drawn: Vec<Vec2> = Vec::new();
+                let mut end = 1;
+                while end < full.len() {
+                    end = (end + 1 + (seed as usize + end) % 6).min(full.len());
+                    let mut nodes = full[..end].to_vec();
+                    for (node, at) in nodes.iter_mut().zip(&drawn) {
+                        node.previous = Some(*at);
+                    }
+                    drawn = walk_positions(&nodes, spacing);
+                    assert_readable(&nodes, &drawn, &format!("seed {seed}, {end} chips"));
+                }
+            }
+        }
+    }
+
+    /// Opening a node pushes the chips below it down, and only down: it, and every chip at
+    /// or above its row, stays where it was drawn, and nothing moves sideways.
+    #[test]
+    fn what_opens_pushes_only_the_chips_below_it_down() {
+        for seed in 0..200 {
+            let mut nodes = random_walk(seed);
+            let before = walk_positions(&nodes, Spacing::EXPLORE);
+            for (node, at) in nodes.iter_mut().zip(&before) {
+                node.previous = Some(*at);
+            }
+            // Open one of its chips (a neighbour or a hub) to four more.
+            let opened = 1 + (seed as usize * 7919) % (nodes.len() - 1).max(1);
+            let opened = opened.min(nodes.len() - 1);
+            let kind = match nodes[opened].kind {
+                LayoutKind::Node => LayoutKind::Hub,
+                _ => LayoutKind::Node,
+            };
+            for k in 0..4 {
+                nodes.push(LayoutNode {
+                    parent: Some(opened),
+                    kind,
+                    space: 30. + k as f32 * 10.,
+                    half_height: CHIP_HALF_HEIGHT,
+                    pinned: None,
+                    previous: None,
+                    side: None,
+                });
+            }
+            let after = walk_positions(&nodes, Spacing::EXPLORE);
+            assert_readable(&nodes, &after, &format!("seed {seed}, opened"));
+            for (index, (was, now)) in before.iter().zip(&after).enumerate() {
+                assert_eq!(was.x, now.x, "seed {seed}: chip {index} moved sideways");
+                assert!(now.y >= was.y - 0.01, "seed {seed}: chip {index} moved up");
+                if was.y <= before[opened].y + 0.01 {
+                    assert!(
+                        (now.y - was.y).abs() < 0.01,
+                        "seed {seed}: chip {index} at or above the opened chip moved"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A chip placed by hand stands there with what hangs off it, and keeps its slot in its
+    /// parent's column, so its siblings below do not move up into it.
+    #[test]
+    fn a_pinned_chip_takes_what_hangs_off_it_and_keeps_its_slot() {
+        let nodes = star(2, 4);
+        let at = walk_positions(&nodes, Spacing::EXPLORE);
+        let mut pinned = nodes.clone();
+        // The first hub's second neighbour, placed far away; give it a hub of its own.
+        let moved = 3;
+        pinned[moved].pinned = Some(Vec2::new(900., 900.));
+        pinned.push(LayoutNode {
+            parent: Some(moved),
+            kind: LayoutKind::Hub,
+            space: 30.,
+            half_height: CHIP_HALF_HEIGHT,
+            pinned: None,
+            previous: None,
+            side: None,
+        });
+        let now = walk_positions(&pinned, Spacing::EXPLORE);
+        assert_eq!(now[moved], Vec2::new(900., 900.));
+        let hub = pinned.len() - 1;
+        assert!(
+            (now[hub].y - 900.).abs() < 0.01 && now[hub].x > 900.,
+            "beside its pin"
+        );
+        for index in 0..nodes.len() {
+            if index != moved {
+                assert!(now[index].y >= at[index].y - 0.01, "{index} moved up");
+            }
+        }
+    }
+
+    /// A taller chip (a name wrapped over three lines) takes the rows it needs: the chips
+    /// below it start under its bottom.
+    #[test]
+    fn a_tall_chip_takes_its_rows() {
+        let mut nodes = star(1, 3);
+        nodes[3].half_height = CHIP_HALF_HEIGHT + 18.;
+        let at = walk_positions(&nodes, Spacing::EXPLORE);
+        let bottom = at[3].y + nodes[3].half_height;
+        assert!(at[4].y - nodes[4].half_height >= bottom, "{at:?}");
+        assert_readable(&nodes, &at, "tall");
     }
 }

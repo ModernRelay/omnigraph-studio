@@ -902,13 +902,14 @@ impl ExploreState {
             let list = self.neighbours.get(&key);
             if is_field(schema, group) {
                 let index_of_field = out.len();
+                let target = list.and_then(|list| list.rows.first().cloned());
                 out.push(Entry {
                     path: group_path.clone(),
                     depth: depth + 1,
                     parent: Some(index),
                     kind: EntryKind::Field {
                         key: key.clone(),
-                        target: list.and_then(|list| list.rows.first().cloned()),
+                        target: target.clone(),
                         loading: list.is_none_or(|list| list.status == PageStatus::Loading),
                     },
                 });
@@ -922,6 +923,37 @@ impl ExploreState {
                             message: message.clone(),
                         },
                     });
+                    continue;
+                }
+                // A field opened (the canvas opens one as a relationship, spec 006) walks on to
+                // its target: a node of the walk under it, expandable as any, so a chain of
+                // single parents (an org chart, a folder path) is walked on one canvas.
+                if let Some(target) = target
+                    && self.expanded.contains(&group_path)
+                {
+                    let node_path = group_path.child_node(&target.node);
+                    match ancestors.iter().find(|(n, _)| *n == target.node) {
+                        Some((_, ancestor)) => out.push(Entry {
+                            path: node_path,
+                            depth: depth + 2,
+                            parent: Some(index_of_field),
+                            kind: EntryKind::Cycle {
+                                node: target.node.clone(),
+                                via: target.clone(),
+                                ancestor: *ancestor,
+                            },
+                        }),
+                        None => self.push_node(
+                            schema,
+                            &target.node,
+                            Some(&target),
+                            node_path,
+                            depth + 2,
+                            Some(index_of_field),
+                            ancestors,
+                            out,
+                        ),
+                    }
                 }
                 continue;
             }
@@ -2922,6 +2954,60 @@ mod tests {
         assert_eq!(
             state.path_of(&schema, &person("cy")),
             Some(knows_path.child_node(&person("cy")))
+        );
+    }
+
+    /// A field opened walks on to its target, a node of the walk that expands as any: its own
+    /// field is read and opens in turn, so a chain of single parents goes on, and a target
+    /// already on the path is a cycle row. Closed, the field shows its target inline only.
+    #[test]
+    fn an_opened_field_walks_on_to_its_target() {
+        let schema = schema();
+        let mut state = loaded_root(&schema);
+        let manager = group(&schema, "Person", "Manager", Direction::Outgoing);
+        let key = |node: &str| GroupKey::new(person(node), manager.clone());
+        let page = |id: &str| output(&["id", "label"], json!([{"id": id, "label": id}]));
+        state.apply_page(key("ada"), &page("bob"), 50);
+        let root = ExplorePath::root();
+        state.expand(&root);
+        let field = root.child_group(&manager);
+        let shown = kinds(&state.entries(&schema));
+        assert!(!shown.iter().any(|row| row == "    node bob"), "{shown:#?}");
+        state.expand(&field);
+        let bob = field.child_node(&person("bob"));
+        let entries = state.entries(&schema);
+        let at = entries
+            .iter()
+            .position(|entry| entry.path == bob)
+            .expect("bob is a node of the walk");
+        assert!(matches!(
+            entries[at].kind,
+            EntryKind::Node {
+                expanded: false,
+                ..
+            }
+        ));
+        let field_row = entries[at].parent.expect("under the field");
+        assert!(matches!(entries[field_row].kind, EntryKind::Field { .. }));
+        // Bob expands: his counts and his own field are read.
+        state.expand(&bob);
+        let missing = state.missing_loads(&schema);
+        assert!(
+            missing.contains(&LoadTarget::Page(key("bob"))),
+            "{missing:?}"
+        );
+        // Bob's manager is Cy, whose manager is Ada: the walk goes on, then cycles.
+        state.apply_page(key("bob"), &page("cy"), 50);
+        let bob_field = bob.child_group(&manager);
+        state.expand(&bob_field);
+        let cy = bob_field.child_node(&person("cy"));
+        state.expand(&cy);
+        state.apply_page(key("cy"), &page("ada"), 50);
+        state.expand(&cy.child_group(&manager));
+        let shown = kinds(&state.entries(&schema));
+        assert!(
+            shown.contains(&"            cycle ada -> 0".to_owned()),
+            "{shown:#?}"
         );
     }
 

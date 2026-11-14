@@ -44,7 +44,8 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
   a graph can override (spec 002). An open canvas draws a changed cap at once, and the banner
   names the cap its drawn scene was built under (`Scene::cap`), never a newer setting.
 - **Keys (context `Canvas`):** arrows move to the nearest node; ↵ expand; Space peek; ⌫ collapse;
-  `0` fit; `+`/`-` zoom; F focus; `[`/`]` walk the expansion path.
+  `0` fit; `+`/`-` zoom; F focus; `[`/`]` walk the expansion path; ⌥↵ follow a single-target
+  relationship all the way.
 - **Query results:** a query whose result has node or edge columns can open as a canvas.
 
 ## Decisions
@@ -137,9 +138,15 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
   - **Keys** (context `Ontology`): ↑ and ↓ (`SelectPrevious`, `SelectNext`) point at the
     types in the order the page lists them, or at the type in focus's lines, the side
     reaching it first, as the pointer does; ↵ (`Open`) brings the type pointed at into focus.
-- **Opened chips** (2026-10-19). A node's chip shows 32 characters of its name, then "…"
-  (`CHIP_LABEL_CHARS`); layout always measures that, so opening a chip never moves another.
-  Pointing at a cut chip for a moment opens it: its whole name, wrapped at 320 px at zoom 1
+- **Chips that wrap** (2026-11-14, replacing the 32-character cut of 2026-10-19). A node's name
+  wraps over up to three lines (`CHIP_MAX_LINES`), at spaces and after the marks paths, emails
+  and keys break at (`/ - _ . @ ,`), a word wider than a line where its room ends; past three
+  lines its last line ends in "…". Its chip is as wide as its widest line, between 56 and
+  240 px at zoom 1 (`CHIP_MIN_WIDTH`, `CHIP_MAX_WIDTH`); pills stay on one line. Names are
+  wrapped once, when the walk is laid out, with the canvas's measured character widths, and
+  the layout takes each chip's real height (`paint::chip_half_height`), so a frame wraps
+  nothing and no chip overlaps another.
+- **Opened chips** (2026-10-19). Pointing at a chip whose name is cut for a moment opens it: its whole name, wrapped at 320 px at zoom 1
   (`OPEN_CHIP_MAX_WIDTH`) in lines of even length, drawn over its neighbours from where the
   chip starts, never narrower than it, with its mark and the pointed shadow or the selected
   border. It is laid out before the lines, which meet its sides level with its middle (not
@@ -181,9 +188,23 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
   The Explore panel's closed rows do the same.
 - **Clicks:** a click expands a closed node, opens or closes a relationship pill, and shows
   more on "+K more"; a click on an open node only selects it (a double click closes it), so
-  a click never folds away what was walked. ⇧-click shows the chip in the inspector
+  a click never folds away what was walked. The node a single-target pill opens to is a node
+  of the walk like any other (since 2026-11-14): a click or ↵ expands it. ⇧-click shows the chip in the inspector
   (`PeekNode`; a pill shows its node) and opens nothing. On a query's result canvas a node is
   selected by a click and opened by a double click.
+- **Following a chain** (2026-11-14). ⌥↵ on a single-target pill (`FollowRelationship`; "Follow
+  ReportsTo all the way" in its menu), or on a node reached through one, opens that
+  relationship hop after hop, each node it reaches expanded, until a node has none, the walk
+  comes back to a node on its path, or 100 hops are taken; the view centres on each node
+  reached. A 41-level reporting chain is one action on one canvas.
+- **What a chip says of its reads** (2026-11-14). An open node with no relationship drawn has a
+  note chip under it: "Reading relationships…", "No relationships", or "Couldn't read
+  relationships · Retry" in the error colour when a count or a single target failed, which a
+  click or its menu reads again. An open relationship's "+K more" says "Reading…" until its
+  first neighbours come and "Couldn't read · Retry" when they failed. A root that could not
+  be read draws no chip; the banner says why.
+- **Pointing lights the way back** (2026-11-14): the pointed chip, the chips it hangs off back
+  to the root and the lines between them draw at the pointed tone.
 - **Marking:** ⇧-drag on empty space draws an area and marks every chip it touches (added to
   those marked); ⌘-click marks or unmarks one chip, as it picks rows in a table; ⌘A marks
   all, Esc unmarks. Marked chips
@@ -206,8 +227,12 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
 ## Validation log
 
 | Date | Claim | Check | Result |
-| 2026-11-01 | A hub appears only once counted and non-empty | `graph_canvas` `model` tests (`a_single_target_hub_reached_twice_is_open_by_either_path` with counts, `the_cap_counts_relationships_and_each_node_once` counting only drawn hubs) | Pass. Ragnor's call: hubs that appeared and then went as their counts came in empty were noise |
 |---|---|---|---|
+| 2026-11-14 | A node reached through a single-target relationship expands, and a chain is walked on one canvas | `graph_store` `an_opened_field_walks_on_to_its_target`; `graph_canvas` `a_single_target_node_expands_as_any_node`, `a_node_reached_through_a_single_target_relationship_expands` (↵ expands it and opens no page), `following_a_relationship_walks_its_whole_chain` (41 people from one ⌥↵), `the_caption_says_what_a_click_does`; offscreen snapshots on a 17k-node org chart, before and after: a 41-level ReportsTo chain | Before: a click on the manager only selected it and ↵ opened its page in another tab. After: ↵ expands it; ⌥↵ on Priya Turing's ReportsTo pill walks all 42 people to the top and centres on Ines Petrov, who reports to nobody |
+| 2026-11-14 | A walk's layout cannot attach a chip to the wrong relationship | `graph_canvas` `layout` `a_walk_never_reads_as_joining_a_chip_to_the_wrong_relationship` (300 random walks grown a few chips at a time, chips of every width and one to three lines: no overlap, no line through a chip, no chip between one and its parent, each column on its parent's row), `what_opens_pushes_only_the_chips_below_it_down` (200 cases), `a_pinned_chip_takes_what_hangs_off_it_and_keeps_its_slot`, `a_tall_chip_takes_its_rows`; `paint` `pointing_at_a_chip_lights_its_way_back_to_the_root`; offscreen snapshots of the CRM walk Northwind → MeetingWith → a meeting → Attended, and of Ada's Knows, Reviewed and ExpertIn on the knowledge graph | The old layout fails the first test at seed 0 ("chip 8 stands between 3 and its parent 1"). Before: "Kickoff with co-0000 → MeetingWith 1" and Ada's Knows column level with Coined and Endorses. After: each column starts on its parent's row, the meeting's siblings and OpportunityAt and WorksAt move down below what opened, and pointing at an attendee lights the way back to Northwind |
+| 2026-11-14 | Each chip says what its reads have come to | `graph_canvas` `an_open_node_says_what_its_relationships_have_come_to`, `an_open_relationship_says_when_its_neighbours_are_read_or_failed`, `a_root_that_could_not_be_read_draws_no_chip`; offscreen snapshots with the server's proxy killed mid-walk, at 300 ms, of a company with no relationships, and of a missing key | Before: a bare "+1502 more", an expanded person drawing nothing, a lone chip, a chip "co-nobody" counted as 1 node. After: "Couldn't read · Retry", "Couldn't read relationships · Retry", "Reading relationships…" then the pills, "Reading…", "No relationships", and the banner alone with 0 nodes |
+| 2026-11-14 | Chips grow and wrap; drawing them wraps nothing | `graph_canvas` `paint` `a_name_wraps_over_three_lines_and_then_is_cut`, `a_chip_sizes_to_its_name_within_its_bounds`; `long_names_wrap_and_drawing_them_wraps_nothing` (a chain of file paths and meeting titles drawn: every name wrapped, no two drawn chips overlap; pointing at every chip and zooming draw the canvas, wrap no name and lay out nothing; in docs/drawing.md); offscreen snapshots of meeting titles, topic names and file paths, before and after | Before: "Quarterly business review with…", "/archive/2024/q3/contracts/nort…". After: "Quarterly business review with / Northwind Global procurement, / security and data platform…", "/archive/2024/q3/contracts/ / northwind-global-master- / services-agreement-v7-final-…" |
+| 2026-11-01 | A hub appears only once counted and non-empty | `graph_canvas` `model` tests (`a_single_target_hub_reached_twice_is_open_by_either_path` with counts, `the_cap_counts_relationships_and_each_node_once` counting only drawn hubs) | Pass. Ragnor's call: hubs that appeared and then went as their counts came in empty were noise |
 | 2026-11-01 | A canvas walks from one node; a set goes to a tree | `graph_canvas` tests; an offscreen snapshot of a walk opened from a selected tree row | Spec 020 removes drawing a table's rows, which was a grid of unconnected chips. A query's picture is Graph, and only when its result links |
 | 2026-11-01 | One canvas per root and commit; a table's rows draw as a captured set | `graph_canvas` `a_canvas_starts_from_the_graphs_saved_positions`, `a_captured_set_is_known_by_what_it_holds`; offscreen snapshots; a saved root-less canvas restored twice | Spec 020. No blank canvas; a saved one's positions stay for each new canvas of its graph |
 | 2026-10-28 | A walk's change that leaves its scene as drawn lays out nothing | `graph_canvas` `a_change_that_moves_no_chip_lays_out_nothing` (a walk laid out, then a change owed with the same scene: no layout; then another root: laid out) | Pass. Before, every change of the walk laid its scene out again off the main thread, as "+K more" did while its page was read; pins and Reset layout still lay the same scene out again |
@@ -327,6 +352,18 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
   connectors; a closed hub hangs on a dotted line (1 on 2 off). A dash sits at a whole number
   of periods from the world's origin on screen, so lines sharing a stretch share their dashes,
   drawn once in the strongest tone among them.
+- **A walk is a tree of bands (2026-11-14).** A new column was centred on its hub and moved
+  to free room among the chips drawn, which never moved, so it stood level with its hub's
+  siblings and a sibling's line read as running on to it ("Kickoff with co-0000 → Attended 3",
+  "ForOpportunity 1 → Niklaus Matsumoto"); uprights crossed chips (H2 in the canvas UX
+  investigation of 2026-11-14). A walk, of data or of the schema, is now laid out by
+  `layout::walk_positions`: a node's children stand in a column whose first chip is on the
+  node's row, each subtree owns its rows, and the next sibling starts below
+  them. What opens pushes the chips below it down, and only down; nothing at or above it
+  moves and nothing moves sideways, and the chips glide there. A root's children keep the side
+  they were drawn on; a chip placed by hand keeps its slot, with what hangs off it. Lines are
+  routed by `layout::elbow_route`, which the painter and the layout tests share, in the gutter
+  beside the parent, where no other chip stands. A query result keeps the layout below.
 - **Explorer layout (2026-10-12).** Radial rings put neighbours ~450 px from their node: chips
   are wide and short, and a ring spaces them by width. The explorer is now a mind map: a node's
   hubs stand in a column beside it (a root's split across both sides), a hub's neighbours in a
@@ -376,7 +413,8 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
   neutral arrow wherever a type is listed.
 - **Keys:** ←↑→↓ (`canvas::MoveLeft` …, nearest node in a 45° cone, `along + 2 × across`),
   `0`, `=`/`+`, `-`, ↵ expand, ⌫ collapse, Space peek, F focus on the selected node's
-  neighbourhood, `[`/`]` step back and forward along the nodes walked. Bound in the `Canvas`
+  neighbourhood, `[`/`]` step back and forward along the nodes walked, ⌥↵ follow a
+  single-target relationship all the way. Bound in the `Canvas`
   context of `assets/keymaps/`. Scroll and pinch zoom, drag pans.
 - **The cap exit** offers "Open as table" for the type with most hidden nodes and "Show in
   tree" (the Explore panel). The cap is the `canvas_max_nodes` setting, per graph if set.

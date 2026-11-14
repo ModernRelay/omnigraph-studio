@@ -296,6 +296,7 @@ pub(crate) fn schema_scene(
                     kind: SceneKind::More {
                         key: more,
                         hidden: hidden as u64,
+                        note: None,
                     },
                     label: format!("+{hidden} more"),
                     color_key: ty.clone(),
