@@ -38,7 +38,10 @@
 //! as JSON. `run:<command>` runs a command and waits for it (another writer's commit);
 //! `head:<ms>` waits, at most that long, for the session's branch head to move. `SNAPSHOT_WAIT_MS` (default
 //! 1500) is how long to let each step's network work finish; `SNAPSHOT_SIZE` is
-//! `WIDTHxHEIGHT` (default 1440x900). Remembered tabs are not restored unless `OMNIGRAPH_STUDIO_NO_RESTORE=0`. The run
+//! `WIDTHxHEIGHT` (default 1440x900). `SNAPSHOT_WINDOW_BUTTONS` draws the window's own buttons
+//! as another platform's, which this one would leave to the system: `windows`, `linux` (all
+//! three at the right) or `linux-left` (close at the left, as some desktops lay them out).
+//! Remembered tabs are not restored unless `OMNIGRAPH_STUDIO_NO_RESTORE=0`. The run
 //! keeps its state in a fresh temporary directory unless `OMNIGRAPH_STUDIO_DATA` names one, so
 //! it neither reads nor writes the app's settings, tabs or conversations.
 
@@ -655,6 +658,31 @@ fn main() {
     // while a window is active (the branch-head poll) run.
     cx.update_window(handle, |_, window, _| window.activate_window())
         .expect("activate the snapshot window");
+    if let Ok(platform) = std::env::var("SNAPSHOT_WINDOW_BUTTONS") {
+        use gpui::{WindowButton, WindowButtonLayout};
+        use studio_ui::window_buttons::{RIGHT_SIDE, WindowButtons};
+        let buttons = match platform.as_str() {
+            "windows" => WindowButtons::Windows,
+            "linux" => WindowButtons::Linux(RIGHT_SIDE),
+            "linux-left" => WindowButtons::Linux(WindowButtonLayout {
+                left: [Some(WindowButton::Close), None, None],
+                right: [
+                    Some(WindowButton::Minimize),
+                    Some(WindowButton::Maximize),
+                    None,
+                ],
+            }),
+            other => panic!("SNAPSHOT_WINDOW_BUTTONS is windows, linux or linux-left: {other}"),
+        };
+        cx.update_window(handle, |_, window, cx| {
+            if let Some(workspace) = studio_workspace::workspace_for(window) {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.draw_window_buttons_as(buttons, cx)
+                });
+            }
+        })
+        .expect("draw the window's buttons");
+    }
     // `reads:<path>` measures the whole run, the start (until the schema is read) among it.
     let mut reads = actions
         .iter()

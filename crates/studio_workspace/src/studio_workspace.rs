@@ -48,6 +48,7 @@ use studio_settings::{BottomDockLayout, ServerEnvironment, StudioSettings};
 use studio_ui::ds::IconButton;
 use studio_ui::ds::Tipped;
 use studio_ui::menu::{ContextMenu, ContextMenuEntry, ContextMenuItem};
+use studio_ui::window_buttons::{self, WindowButtons};
 use ui::prelude::*;
 use ui::{ButtonLike, PopoverMenu, right_click_menu};
 
@@ -388,6 +389,12 @@ pub struct Workspace {
     /// Whether the window shows traffic lights the top-left strips make room for, read each
     /// frame: on macOS, and not in full screen, where they hide with the menu bar.
     lights_shown: bool,
+    /// Who draws the window's minimize, maximize and close buttons, read each frame: Studio
+    /// where the system draws none, in the top bar (spec 002, "The window's buttons").
+    window_buttons: WindowButtons,
+    /// The buttons to draw whatever the platform, for a test or a picture of them made where
+    /// the platform draws its own ([`Self::draw_window_buttons_as`]).
+    window_buttons_as: Option<WindowButtons>,
     /// The settings file problem last shown, so a toast appears once per problem.
     settings_error: Option<String>,
     /// The registry's notices about the servers ([`ConnectionRegistry::notices`]), as last
@@ -619,30 +626,8 @@ impl Workspace {
         // tabs asks first.
         let this = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
-            this.update(cx, |workspace, cx| match workspace.running_write(cx) {
-                None => {
-                    let unsaved = workspace.unsaved_tabs(cx);
-                    if !unsaved.is_empty() {
-                        workspace.confirm_close(Closing::Window, unsaved, window, cx);
-                        return false;
-                    }
-                    // Closing drops the save waiting for its delay: written now, in turn on
-                    // the write thread; only a quit waits for the disk.
-                    workspace.flush_saves(cx);
-                    true
-                }
-                Some(graph) => {
-                    workspace.show_toast(
-                        ToastKind::Error,
-                        format!(
-                            "A write to {graph} is still running. Close the window when it finishes."
-                        ),
-                        cx,
-                    );
-                    false
-                }
-            })
-            .unwrap_or(true)
+            this.update(cx, |workspace, cx| workspace.may_close(window, cx))
+                .unwrap_or(true)
         });
         let bounds_subscription = cx.observe_window_bounds(window, move |this, window, cx| {
             let bounds = window.bounds();
@@ -714,6 +699,8 @@ impl Workspace {
             drag_pending: false,
             traffic_lights: None,
             lights_shown: cfg!(target_os = "macos"),
+            window_buttons: WindowButtons::System,
+            window_buttons_as: None,
             settings_error: None,
             server_notices: Vec::new(),
             _settings_subscription: settings_subscription,
@@ -2965,6 +2952,53 @@ impl Workspace {
         });
     }
 
+    // ---- the window ----
+
+    /// Whether the window may close now, as its close button asks: one with a write still
+    /// running stays open until the write ends and says so, and one with unsaved tabs asks
+    /// about them first and closes from the answer.
+    fn may_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        match self.running_write(cx) {
+            None => {
+                let unsaved = self.unsaved_tabs(cx);
+                if !unsaved.is_empty() {
+                    self.confirm_close(Closing::Window, unsaved, window, cx);
+                    return false;
+                }
+                // Closing drops the save waiting for its delay: written now, in turn on the
+                // write thread; only a quit waits for the disk.
+                self.flush_saves(cx);
+                true
+            }
+            Some(graph) => {
+                self.show_toast(
+                    ToastKind::Error,
+                    format!(
+                        "A write to {graph} is still running. Close the window when it finishes."
+                    ),
+                    cx,
+                );
+                false
+            }
+        }
+    }
+
+    /// Closes the window from a close button Studio draws itself, where the desktop leaves
+    /// the frame to the window: asked what the system's own close is asked ([`Self::may_close`]).
+    fn close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.may_close(window, cx) {
+            window.remove_window();
+        }
+    }
+
+    /// Draws the window's buttons as `buttons` whatever the platform, so a test or a picture
+    /// can show Windows' or a Linux desktop's where the platform draws its own.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn draw_window_buttons_as(&mut self, buttons: WindowButtons, cx: &mut Context<Self>) {
+        self.window_buttons_as = Some(buttons);
+        cx.notify();
+    }
+
     // ---- rendering ----
 
     /// A column's header strip (spec 002, after Delta): fixed height, and a place
@@ -3004,9 +3038,22 @@ impl Workspace {
                     window.start_window_move();
                 }
             }))
-            .on_click(|event, window, _| {
-                if event.click_count() == 2 {
-                    window.titlebar_double_click();
+            .on_click({
+                // Where Studio draws the window's frame, a double click on a strip is its own
+                // to act on, as a title bar's: the window fills the screen, or comes back.
+                // macOS has its own call, and Windows acts on the drag area itself.
+                let frames_itself = self.window_buttons.frames_itself();
+                move |event, window, _| {
+                    if event.click_count() != 2 {
+                        return;
+                    }
+                    if frames_itself {
+                        if window.window_controls().maximize && window.is_resizable() {
+                            window.zoom_window();
+                        }
+                    } else {
+                        window.titlebar_double_click();
+                    }
                 }
             })
     }
@@ -3070,15 +3117,34 @@ impl Workspace {
 
     /// The top bar (spec 020): which server, graph and branch the window reads, always in the
     /// same place, with what shows and hides the frame's docks. It takes the window's title bar
-    /// band, so the traffic lights sit in it.
+    /// band, so the traffic lights sit in it, and where the system draws no buttons for the
+    /// window, Studio's do (spec 002, "The window's buttons"): at the right end, to the
+    /// window's corner, or at the end a Linux desktop's layout names.
     fn render_top_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let shown = self.session.is_some();
         let hairline = studio_ui::ds::surface::rule(cx);
         let inspector_lit = self.right.visible();
         let environment = self.server_environment(cx);
+        let buttons = self.window_buttons;
+        let close = |cx: &mut Context<Self>| {
+            let this = cx.entity().downgrade();
+            move |window: &mut Window, cx: &mut App| {
+                this.update(cx, |this, cx| this.close_window(window, cx))
+                    .ok();
+            }
+        };
+        let left = buttons
+            .left()
+            .map(|left| window_buttons::frame_buttons("window-buttons-left", left, close(cx)));
+        let right = buttons
+            .right()
+            .map(|right| window_buttons::frame_buttons("window-buttons", right, close(cx)));
         self.strip("top-bar", HEADER_HEIGHT, cx)
             .debug_selector(|| "top-bar".into())
-            .pr(px(studio_ui::ds::space::SM))
+            // Buttons at the right end reach the window's edge, as a title bar's do.
+            .when(!buttons.at_right(), |strip| {
+                strip.pr(px(studio_ui::ds::space::SM))
+            })
             .gap(px(studio_ui::ds::space::XS))
             .bg(studio_ui::ds::surface::status_bar(cx))
             // Production is marked twice, by this line and the chip: a mode needs both to be seen.
@@ -3088,9 +3154,10 @@ impl Workspace {
                     .border_color(studio_ui::ds::surface::error_border(cx)),
                 _ => strip.border_b_1().border_color(hairline),
             })
-            .map(|strip| match lights_room(self.lights_shown) {
-                Some(room) => strip.child(div().w(px(room)).flex_none()),
-                None => strip.pl(px(studio_ui::ds::space::SM)),
+            .map(|strip| match (left, lights_room(self.lights_shown)) {
+                (Some(left), _) => strip.child(left),
+                (None, Some(room)) => strip.child(div().w(px(room)).flex_none()),
+                (None, None) => strip.pl(px(studio_ui::ds::space::SM)),
             })
             .child(self.render_graph_switcher(cx))
             .children(self.render_branch(cx))
@@ -3117,6 +3184,10 @@ impl Workspace {
                             }),
                     )
             })
+            .when(buttons == WindowButtons::Windows, |bar| {
+                bar.child(window_buttons::caption_buttons())
+            })
+            .children(right)
     }
 
     /// What the shown graph's server is, by its address; none without a graph.
@@ -5101,6 +5172,9 @@ impl Render for Workspace {
         let live =
             self.server_ready(cx) && window.is_window_active() && studio_ui::motion::enabled(cx);
         self.count_beats(live, cx);
+        self.window_buttons = self
+            .window_buttons_as
+            .unwrap_or_else(|| WindowButtons::of(window, cx));
         if self._save_check.is_none() {
             self._save_check = Some(cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(SAVE_CHECK).await;
@@ -6420,6 +6494,123 @@ mod tests {
         workspace.read_with(cx, |workspace, _| {
             assert!(workspace.session().is_none(), "closed once confirmed");
         });
+    }
+
+    /// Where the system draws no buttons for the window, the top bar does (spec 002, "The
+    /// window's buttons"). Windows' three are at the bar's right end, side by side, as tall as
+    /// the bar and to the window's corner; where the system draws its own, Studio draws none.
+    /// Before, the window had no minimize, maximize or close button on Windows: its top bar
+    /// takes the title bar's place there, and drew only a place to drag from.
+    #[gpui::test]
+    fn the_top_bar_draws_the_windows_buttons_where_the_system_draws_none(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+        });
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        let draw_as = |buttons: WindowButtons, cx: &mut gpui::VisualTestContext| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.draw_window_buttons_as(buttons, cx)
+            });
+            cx.run_until_parked();
+        };
+        draw_as(WindowButtons::System, cx);
+        for name in [
+            "window-button-minimize",
+            "window-button-maximize",
+            "window-button-close",
+        ] {
+            assert!(cx.debug_bounds(name).is_none(), "{name} is the system's");
+        }
+
+        draw_as(WindowButtons::Windows, cx);
+        let bar = cx.debug_bounds("top-bar").expect("the top bar");
+        let [minimize, maximize, close] = [
+            "window-button-minimize",
+            "window-button-maximize",
+            "window-button-close",
+        ]
+        .map(|name| {
+            cx.debug_bounds(name)
+                .unwrap_or_else(|| panic!("{name} is drawn"))
+        });
+        assert_eq!(close.right(), bar.right(), "to the window's corner");
+        assert_eq!(close.top(), bar.top(), "from the window's top");
+        assert_eq!(minimize.right(), maximize.left());
+        assert_eq!(maximize.right(), close.left());
+        assert_eq!(minimize.size, close.size, "each as large as the next");
+        assert!(
+            close.size.height >= bar.size.height - px(1.),
+            "as tall as the bar, less its hairline: {close:?} in {bar:?}"
+        );
+    }
+
+    /// On a Linux desktop that leaves the frame to the window, the bar draws the buttons the
+    /// desktop's layout names, each side's at that end. Close asks what the system's close
+    /// asks: a window with unsaved work stays and asks about it, and closes once that is
+    /// confirmed.
+    #[gpui::test]
+    fn a_window_that_frames_itself_has_its_desktops_buttons(cx: &mut gpui::TestAppContext) {
+        use gpui::{WindowButton, WindowButtonLayout};
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+        });
+        let session = idle_session("http://a.test", "notes", cx);
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        let close_left = WindowButtonLayout {
+            left: [Some(WindowButton::Close), None, None],
+            right: [
+                Some(WindowButton::Minimize),
+                Some(WindowButton::Maximize),
+                None,
+            ],
+        };
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.graph_order.push(session.entity_id());
+            workspace.subscribe_session(session.clone(), cx);
+            workspace.open_item("draft".to_owned(), window, cx, |_, cx| Unsaved {
+                focus_handle: cx.focus_handle(),
+            });
+            workspace.draw_window_buttons_as(WindowButtons::Linux(close_left), cx);
+        });
+        cx.run_until_parked();
+        let bar = cx.debug_bounds("top-bar").expect("the top bar");
+        let [minimize, maximize, close] = [
+            "window-button-minimize",
+            "window-button-maximize",
+            "window-button-close",
+        ]
+        .map(|name| {
+            cx.debug_bounds(name)
+                .unwrap_or_else(|| panic!("{name} is drawn"))
+        });
+        assert!(close.right() < bar.center().x, "close at the left end");
+        assert!(
+            bar.center().x < minimize.left() && minimize.right() <= maximize.left(),
+            "the others at the right, in the layout's order"
+        );
+        assert!(maximize.right() <= bar.right());
+
+        cx.simulate_click(close.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        let dialog = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .modal
+                .as_ref()
+                .and_then(|modal| modal.view.clone().downcast::<ConfirmClose>().ok())
+                .expect("the window asks about its unsaved tab")
+        });
+        assert!(matches!(
+            dialog.read_with(cx, |dialog, _| dialog.closing),
+            Closing::Window
+        ));
+        assert_eq!(cx.windows().len(), 1, "still open");
+        dialog.update_in(cx, |dialog, window, cx| dialog.close(window, cx));
+        cx.run_until_parked();
+        assert!(cx.windows().is_empty(), "closed once confirmed");
     }
 
     /// A tab that draws `name`, reading the window's graph or not.
