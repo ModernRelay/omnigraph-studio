@@ -5159,6 +5159,9 @@ impl TypeTable {
             });
             self.next_relation_task += 1;
             let task_id = self.next_relation_task;
+            // The schema the names are read under: a read that lands after another choice names
+            // nothing of a type named otherwise since.
+            let read_under = schema.clone();
             let task = cx.spawn(async move |this, cx| {
                 let (names, answered) = read.await;
                 this.update(cx, |this, cx| {
@@ -5166,12 +5169,21 @@ impl TypeTable {
                     let Some(schema) = this.schema.clone() else {
                         return;
                     };
+                    let named_by = |schema: &SchemaModel, other: &str| {
+                        schema
+                            .node(other)
+                            .and_then(|node| node.label_property())
+                            .map(str::to_owned)
+                    };
                     let mut cells = std::mem::take(&mut this.relations.0);
                     for row in cells.values_mut() {
                         for (key, relation) in row.iter_mut() {
                             let Some(other) = this.relation_type(&schema, key) else {
                                 continue;
                             };
+                            if named_by(&schema, other) != named_by(&read_under, other) {
+                                continue;
+                            }
                             for (id, label) in &mut relation.neighbours {
                                 let end = (other.to_owned(), id.clone());
                                 if !asked.contains(&end) {

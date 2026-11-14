@@ -504,7 +504,9 @@ pub struct NodePeek {
     _refresh: Option<Task<()>>,
     /// The names of the neighbours shown, read under a new choice of what names their type
     /// ([`Self::rename_neighbours`]); let go with what was read.
-    _renaming: Option<Task<()>>,
+    _renaming: HashMap<u64, Task<()>>,
+    /// The number the next of those reads is kept under.
+    next_renaming: u64,
     /// Takes the copied mark down; a refresh keeps it, and a second copy starts it again.
     _copied: Option<Task<()>>,
     _subscription: Subscription,
@@ -780,7 +782,8 @@ impl NodePeek {
             node_owed: false,
             focus_handle: cx.focus_handle(),
             _refresh: None,
-            _renaming: None,
+            _renaming: HashMap::new(),
+            next_renaming: 0,
             _copied: None,
             _subscription: subscription,
         };
@@ -985,14 +988,30 @@ impl NodePeek {
                 (asked, read)
             })
             .collect();
-        let renamed = renamed.clone();
-        self._renaming = Some(cx.spawn(async move |this, cx| {
+        // What each type is named by under this choice: a read that lands after another
+        // choice names nothing of a type named otherwise since.
+        let named_by: HashMap<String, Option<String>> = renamed
+            .iter()
+            .map(|type_name| {
+                (
+                    type_name.clone(),
+                    names_by(self.schema.as_deref(), type_name),
+                )
+            })
+            .collect();
+        self.next_renaming += 1;
+        let id = self.next_renaming;
+        let task = cx.spawn(async move |this, cx| {
             for (asked, read) in reads {
                 let (names, answered) = read.await;
                 this.update(cx, |this, cx| {
+                    let schema = this.schema.clone();
                     for group in &mut this.groups {
                         let type_name = &group.group.other_type;
-                        if !renamed.contains(type_name) {
+                        let still = named_by
+                            .get(type_name)
+                            .is_some_and(|by| *by == names_by(schema.as_deref(), type_name));
+                        if !still {
                             continue;
                         }
                         let Loadable::Loaded(rows) = &mut group.neighbours else {
@@ -1016,7 +1035,9 @@ impl NodePeek {
                 })
                 .ok();
             }
-        }));
+            this.update(cx, |this, _| this._renaming.remove(&id)).ok();
+        });
+        self._renaming.insert(id, task);
     }
 
     /// The connection's token changed ([`SessionEvent::CredentialChanged`]): the new one may
@@ -1035,7 +1056,7 @@ impl NodePeek {
     fn forget_read(&mut self, cx: &mut Context<Self>) {
         self.known.clear();
         self.groups.clear();
-        self._renaming = None;
+        self._renaming.clear();
         self.absent.clear();
         self.groups_absent.clear();
         // So do the Blob values shown, their previews and the reads still out: nothing of them
@@ -5742,6 +5763,11 @@ fn listed_properties<'a>(
         .flatten()
         .filter(|p| p.projectable())
         .collect()
+}
+
+/// The property `type_name`'s nodes are named by under `schema`, none for their key.
+fn names_by(schema: Option<&SchemaModel>, type_name: &str) -> Option<String> {
+    schema?.node(type_name)?.label_property().map(str::to_owned)
 }
 
 /// A group as the view shows it, for tests: its relationship's key, its count, whether it is
