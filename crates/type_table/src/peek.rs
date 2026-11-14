@@ -502,6 +502,9 @@ pub struct NodePeek {
     node_owed: bool,
     /// Refresh asking after the branch's head before it reads the node again.
     _refresh: Option<Task<()>>,
+    /// The names of the neighbours shown, read under a new choice of what names their type
+    /// ([`Self::rename_neighbours`]); let go with what was read.
+    _renaming: Option<Task<()>>,
     /// Takes the copied mark down; a refresh keeps it, and a second copy starts it again.
     _copied: Option<Task<()>>,
     _subscription: Subscription,
@@ -622,21 +625,18 @@ impl NodePeek {
                 return;
             }
             // The schema names some type's nodes otherwise (spec 002, "Node names"): the title
-            // takes its new name from the values held, and the neighbours shown are read again
-            // under theirs; a group not read yet waits to be drawn, as before.
+            // takes its new name from the values held, and the neighbours shown take theirs in
+            // place; a group not read yet waits to be drawn, as before.
             if let SessionEvent::SchemaChanged = event
                 && let Some(now) = session.read(cx).schema_model()
-                && this
+                && let Some(was) = this
                     .schema
-                    .as_ref()
-                    .is_some_and(|was| was.source == now.source && !was.same_as(&now))
+                    .clone()
+                    .filter(|was| was.source == now.source && !was.same_as(&now))
             {
+                let renamed = now.renamed_since(&was);
                 this.schema = Some(now);
-                for index in 0..this.groups.len() {
-                    if matches!(this.groups[index].neighbours, Loadable::Loaded(_)) {
-                        this.load_group(index, false, cx);
-                    }
-                }
+                this.rename_neighbours(&renamed, cx);
                 cx.notify();
                 return;
             }
@@ -780,6 +780,7 @@ impl NodePeek {
             node_owed: false,
             focus_handle: cx.focus_handle(),
             _refresh: None,
+            _renaming: None,
             _copied: None,
             _subscription: subscription,
         };
@@ -942,6 +943,82 @@ impl NodePeek {
         }
     }
 
+    /// Names the neighbours shown of the `renamed` types by what names them now, in place
+    /// (spec 002, "Node names"): every group stays as it is, open or closed, with its count and
+    /// rows, and the names are read at the commit each group was read at, a read per type of
+    /// at most 500 ids ([`GraphSession::node_names`]), none for a type now named by its key.
+    /// Before, every group with neighbours was read again whole: it closed, showed as loading,
+    /// and read its count too, whatever type it reached.
+    fn rename_neighbours(
+        &mut self,
+        renamed: &std::collections::BTreeSet<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut by_commit: HashMap<Option<String>, Vec<(String, String)>> = HashMap::new();
+        for group in &self.groups {
+            if !renamed.contains(&group.group.other_type) {
+                continue;
+            }
+            if let Loadable::Loaded(rows) = &group.neighbours {
+                let ends = by_commit.entry(group.read_at.clone()).or_default();
+                ends.extend(
+                    rows.iter()
+                        .map(|row| (group.group.other_type.clone(), row.id.clone())),
+                );
+            }
+        }
+        if by_commit.is_empty() {
+            return;
+        }
+        let reads: Vec<_> = by_commit
+            .into_iter()
+            .flat_map(|(commit, ends)| {
+                ends.chunks(graph_store::NAME_LIMIT)
+                    .map(|chunk| (commit.clone(), chunk.to_vec()))
+                    .collect::<Vec<_>>()
+            })
+            .map(|(commit, ends)| {
+                let asked: HashSet<(String, String)> = ends.iter().cloned().collect();
+                let read = self
+                    .session
+                    .update(cx, |session, cx| session.node_names(ends, commit, cx));
+                (asked, read)
+            })
+            .collect();
+        let renamed = renamed.clone();
+        self._renaming = Some(cx.spawn(async move |this, cx| {
+            for (asked, read) in reads {
+                let (names, answered) = read.await;
+                this.update(cx, |this, cx| {
+                    for group in &mut this.groups {
+                        let type_name = &group.group.other_type;
+                        if !renamed.contains(type_name) {
+                            continue;
+                        }
+                        let Loadable::Loaded(rows) = &mut group.neighbours else {
+                            continue;
+                        };
+                        for row in rows {
+                            let end = (type_name.clone(), row.id.clone());
+                            if !asked.contains(&end) {
+                                continue;
+                            }
+                            // A node left out of an answered read has no name besides its key;
+                            // one a failed read left out keeps the name it showed.
+                            match names.get(&end) {
+                                Some(name) => row.label = Some(name.clone()),
+                                None if answered => row.label = None,
+                                None => {}
+                            }
+                        }
+                    }
+                    cx.notify();
+                })
+                .ok();
+            }
+        }));
+    }
+
     /// The connection's token changed ([`SessionEvent::CredentialChanged`]): the new one may
     /// see less than the old, so nothing the old one read stays shown (the node, its
     /// relationships, its Blob values and what the table read of it) and the reads still out
@@ -958,6 +1035,7 @@ impl NodePeek {
     fn forget_read(&mut self, cx: &mut Context<Self>) {
         self.known.clear();
         self.groups.clear();
+        self._renaming = None;
         self.absent.clear();
         self.groups_absent.clear();
         // So do the Blob values shown, their previews and the reads still out: nothing of them
@@ -5666,6 +5744,11 @@ fn listed_properties<'a>(
         .collect()
 }
 
+/// A group as the view shows it, for tests: its relationship's key, its count, whether it is
+/// open, and the names of its neighbours, once they are in.
+#[cfg(test)]
+pub(crate) type GroupShown = (String, Loadable<i64>, bool, Option<Vec<Option<String>>>);
+
 #[cfg(test)]
 impl NodePeek {
     /// What the view shows of property `name`, and whether it shows it saving: for tests of the
@@ -5692,6 +5775,24 @@ impl NodePeek {
     /// The commit the Blob values the view shows hold at ([`BlobsAt`]).
     pub(crate) fn blobs_held_at(&self) -> Option<&str> {
         self.blobs_at.commit(self.snapshot.as_deref())
+    }
+
+    /// Each group the view shows ([`GroupShown`]).
+    pub(crate) fn groups_shown(&self) -> Vec<GroupShown> {
+        self.groups
+            .iter()
+            .map(|group| {
+                (
+                    builder::relationship_key(&group.group),
+                    group.count.clone(),
+                    group.expanded,
+                    group
+                        .neighbours
+                        .loaded()
+                        .map(|rows| rows.iter().map(|row| row.label.clone()).collect()),
+                )
+            })
+            .collect()
     }
 }
 
