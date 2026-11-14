@@ -57,6 +57,19 @@ pub fn node_text(state: &ExploreState, node: &NodeRef) -> String {
         .unwrap_or_else(|| node.id.clone())
 }
 
+/// Whether the field at `index` has its target drawn as a row under it: the canvas opened it
+/// (spec 006), so the walk goes on from the target. The field row then names the relationship
+/// alone, as a relationship's row does, and the target's own row names the node, once.
+pub fn target_shown_below(entries: &[Entry], index: usize) -> bool {
+    matches!(
+        entries.get(index).map(|entry| &entry.kind),
+        Some(EntryKind::Field { .. })
+    ) && entries.get(index + 1).is_some_and(|next| {
+        next.parent == Some(index)
+            && matches!(next.kind, EntryKind::Node { .. } | EntryKind::Cycle { .. })
+    })
+}
+
 /// The text a filter matches against: what the row says.
 pub fn row_text(entry: &Entry, state: &ExploreState, schema: Option<&SchemaModel>) -> String {
     match &entry.kind {
@@ -387,6 +400,50 @@ mod tests {
                 format!("{}{}", "  ".repeat(entry.depth), text.trim())
             })
             .collect()
+    }
+
+    /// A field the canvas opened has its target as a row under it, so its own row names
+    /// the relationship alone and the target is named once; closed, the field names it inline.
+    #[test]
+    fn an_opened_field_leaves_its_target_to_the_row_below() {
+        let schema = SchemaModel::parse(&format!(
+            "{SCHEMA}edge Manager: Person -> Person @card(0..1)\n"
+        ))
+        .unwrap();
+        let mut state = ExploreState::rooted(person("ada"));
+        state.root_status = Loadable::Loaded(());
+        let manager = schema
+            .relationships_of("Person")
+            .iter()
+            .find(|group| group.edge == "Manager")
+            .cloned()
+            .unwrap();
+        state.neighbours.insert(
+            GroupKey::new(person("ada"), manager.clone()),
+            NeighbourList {
+                rows: vec![Neighbour {
+                    node: person("bob"),
+                    label: None,
+                    edge: Vec::new(),
+                }],
+                exhausted: true,
+                ..Default::default()
+            },
+        );
+        let field_at = |entries: &[Entry]| {
+            entries
+                .iter()
+                .position(|entry| matches!(entry.kind, EntryKind::Field { .. }))
+                .unwrap()
+        };
+        let entries = state.entries(&schema);
+        assert!(!target_shown_below(&entries, field_at(&entries)));
+        state
+            .expanded
+            .insert(ExplorePath::root().child_group(&manager));
+        let entries = state.entries(&schema);
+        assert!(target_shown_below(&entries, field_at(&entries)));
+        assert!(!target_shown_below(&entries, 0), "a node row is no field");
     }
 
     #[test]

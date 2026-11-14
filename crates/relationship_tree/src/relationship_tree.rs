@@ -1081,8 +1081,12 @@ impl RelationshipTree {
                 target,
                 loading,
             } => {
+                // Opened on the canvas, the target is the row below: named there, once.
+                let below = rows::target_shown_below(&self.entries, self.visible[row]);
+                let target = target.as_ref().filter(|_| !below);
                 let value = match target {
                     Some(target) => rows::node_text(state, &target.node),
+                    None if below => String::new(),
                     None if *loading => "…".to_owned(),
                     None => "—".to_owned(),
                 };
