@@ -52,7 +52,10 @@ use ui::prelude::*;
 use ui::{ButtonLike, PopoverMenu, right_click_menu};
 
 use item::ItemHandle;
-pub use item::{Item, ItemEvent, ItemStatus, KeyHint};
+pub use item::{
+    Inspected, InspectedNode, Item, ItemEvent, ItemStatus, KeyHint, NodeInspector,
+    register_node_inspector,
+};
 pub use open_failure::open_failure;
 use pane::{Member, Pane, PaneId, SplitAxis, SplitDirection, Tab};
 pub use panels::PanelPosition;
@@ -365,7 +368,13 @@ pub struct Workspace {
     dock_hosts: HashMap<EntityId, Entity<DockHost>>,
     /// Each tab's inspector, by the tab's entity: the finished view, with its node or edge, its
     /// values, its commit and its saving state, which come back with the tab (spec 020).
-    inspectors: HashMap<EntityId, AnyView>,
+    inspectors: HashMap<EntityId, TabInspector>,
+    /// What the inspector shows while the active tab has nothing selected: one note, made with
+    /// the window.
+    nothing_selected: AnyView,
+    /// The active tab's selection changed, or another tab came to the front, while the
+    /// inspector was hidden: it is read when the inspector shows ([`Self::read_selection`]).
+    selection_owed: bool,
     /// The tab what follows the active tab last followed.
     followed_item: Option<EntityId>,
     /// The next new tab goes in a pane to the right ([`Self::open_view`]).
@@ -541,6 +550,14 @@ pub fn collapse_all_button() -> studio_ui::ds::IconButton {
         .tip(studio_ui::ds::tooltip("Collapse all"))
 }
 
+/// A tab's inspector as the workspace remembers it (spec 020).
+struct TabInspector {
+    view: AnyView,
+    /// The node the view was made for, when the tab named one ([`Inspected::Node`]): the same
+    /// node selected again keeps the view.
+    node: Option<InspectedNode>,
+}
+
 /// The inspector while the active tab has nothing selected.
 struct NothingSelected;
 
@@ -702,9 +719,17 @@ impl Workspace {
             modal: None,
             dock_hosts: HashMap::new(),
             inspectors: HashMap::new(),
+            nothing_selected: cx.new(|_| NothingSelected).into(),
+            selection_owed: false,
             followed_item: None,
             open_beside: false,
-            _follow_subscription: cx.observe_self(|this, cx| this.follow_active_item(cx)),
+            _follow_subscription: cx.observe_self(|this, cx| {
+                this.follow_active_item(cx);
+                // The inspector shown again reads what its tab selected while it was hidden.
+                if this.selection_owed && this.inspector_shown() {
+                    this.read_selection(cx);
+                }
+            }),
             toasts: Vec::new(),
             next_toast: 0,
             leaving_toasts: Vec::new(),
@@ -747,6 +772,9 @@ impl Workspace {
             this.show_server_notices(&registry, cx);
         }
         this.watch_performance(cx);
+        // The inspector is in its dock from the start, as the sidebar's panels are: a new
+        // window shows it, saying nothing is selected until something is (spec 020).
+        this.show_inspector(None, cx);
         this.register_view_action::<OpenAsTable>(ViewKind::Table);
         this.register_view_action::<OpenAsPage>(ViewKind::Page);
         this.register_view_action::<OpenAsTree>(ViewKind::Tree);
@@ -1245,7 +1273,7 @@ impl Workspace {
         session.update(cx, |session, cx| session.set_shown(false, cx));
         // The inspector shows the graph's rows, and holds its session.
         self.inspectors.clear();
-        self.remove_panel(INSPECTOR_PANEL);
+        self.show_inspector(None, cx);
         self.zoomed = None;
         // A modal about this graph goes with it: a close asked about the graph, confirmed over
         // the next one shown, would close that one and drop its unsaved tabs unasked. Another
@@ -1724,6 +1752,7 @@ impl Workspace {
                     Some((pane, index)) => this.force_close(pane, index, window, cx),
                     None => this.close_parked(item.entity_id()),
                 },
+                ItemEvent::Selected => this.selection_changed(item.entity_id(), cx),
             },
         );
         self._item_subscriptions
@@ -2308,17 +2337,13 @@ impl Workspace {
         let live: HashSet<EntityId> = [&self.left, &self.right, &self.bottom]
             .iter()
             .flat_map(|dock| dock.panels.iter().map(|panel| panel.view.entity_id()))
-            .chain(self.inspectors.values().map(|view| view.entity_id()))
+            .chain(
+                self.inspectors
+                    .values()
+                    .map(|inspector| inspector.view.entity_id()),
+            )
             .collect();
         self.dock_hosts.retain(|id, _| live.contains(id));
-    }
-
-    /// Takes a panel out of its dock, with its host.
-    fn remove_panel(&mut self, id: &str) {
-        if let Some(position) = self.dock_of(id) {
-            self.dock_mut(position).remove(id);
-        }
-        self.drop_stale_hosts();
     }
 
     /// Lets a side panel scroll itself, as a list that draws only the rows in view does: its
@@ -2391,27 +2416,107 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The inspector: the right dock's panel for what the active tab has selected. `None` removes
-    /// it. It stays that tab's, and comes back with it.
-    pub fn set_inspector(&mut self, view: Option<AnyView>, cx: &mut Context<Self>) {
-        match self.active_item().map(|item| item.item_id()) {
-            Some(tab) => self.set_inspector_of(tab, view, cx),
-            None => self.show_inspector(view, cx),
+    /// Whether the inspector is shown: its dock open, with the inspector in front. Zoom and
+    /// focus mode, which draw no dock for a while, leave this as it is.
+    pub fn inspector_shown(&self) -> bool {
+        self.dock_of(INSPECTOR_PANEL).is_some_and(|position| {
+            let dock = match position {
+                PanelPosition::Left => &self.left,
+                PanelPosition::Right => &self.right,
+                PanelPosition::Bottom => &self.bottom,
+            };
+            dock.open && dock.active_id().as_deref() == Some(INSPECTOR_PANEL)
+        })
+    }
+
+    /// Reads what the active tab has selected into the inspector (spec 020): the inspector
+    /// shows the selection, in whichever view it was made, and says so when there is none. A
+    /// hidden inspector asks nothing of a tab; it is owed the read, and takes it when shown.
+    ///
+    /// A tab that names the same thing again keeps its view, with what is being edited in it.
+    fn read_selection(&mut self, cx: &mut Context<Self>) {
+        if !self.inspector_shown() {
+            self.selection_owed = true;
+            return;
+        }
+        self.selection_owed = false;
+        let Some(item) = self.active_item() else {
+            return;
+        };
+        let tab = item.item_id();
+        let inspected = item.inspected(cx);
+        match inspected {
+            Some(Inspected::View {
+                view,
+                scrolls_itself,
+            }) => {
+                let same = self
+                    .inspectors
+                    .get(&tab)
+                    .is_some_and(|held| held.view.entity_id() == view.entity_id());
+                if !same {
+                    self.set_inspector_of(tab, Some(TabInspector { view, node: None }), cx);
+                    if scrolls_itself && let Some(held) = self.inspectors.get(&tab) {
+                        let view = held.view.clone();
+                        self.set_panel_scrolls_itself(&view, cx);
+                    }
+                }
+            }
+            Some(Inspected::Node(node)) => {
+                let same = self
+                    .inspectors
+                    .get(&tab)
+                    .is_some_and(|held| held.node.as_ref() == Some(&node));
+                if same {
+                    return;
+                }
+                let made = match (&self.session, item::node_inspector(cx)) {
+                    (Some(session), Some(make)) => Some(make(&node, session, cx)),
+                    _ => None,
+                };
+                match made {
+                    Some(view) => {
+                        let inspector = TabInspector {
+                            view: view.clone(),
+                            node: Some(node),
+                        };
+                        self.set_inspector_of(tab, Some(inspector), cx);
+                        // A node's view is a list that draws, and reads, only what is in view.
+                        self.set_panel_scrolls_itself(&view, cx);
+                    }
+                    None => self.set_inspector_of(tab, None, cx),
+                }
+            }
+            None => {
+                if self.inspectors.contains_key(&tab) {
+                    self.set_inspector_of(tab, None, cx);
+                }
+            }
         }
     }
 
-    /// [`Self::set_inspector`] for one tab, which may have stopped being the active one while
-    /// its selection was read: another tab's inspector stays shown.
-    pub fn set_inspector_of(
+    /// A tab's selection changed ([`ItemEvent::Selected`]): the inspector follows the tab in
+    /// front. Another tab's selection is read when that tab comes to the front.
+    fn selection_changed(&mut self, tab: EntityId, cx: &mut Context<Self>) {
+        if self.active_item().map(|item| item.item_id()) == Some(tab) {
+            self.read_selection(cx);
+        }
+    }
+
+    /// Remembers a tab's inspector, or forgets it, and shows it when the tab is in front. The
+    /// tab may have stopped being the active one while its selection was read: another tab's
+    /// inspector stays shown.
+    fn set_inspector_of(
         &mut self,
         tab: EntityId,
-        view: Option<AnyView>,
+        inspector: Option<TabInspector>,
         cx: &mut Context<Self>,
     ) {
-        match &view {
-            Some(view) => {
-                self.host_for(view, cx);
-                self.inspectors.insert(tab, view.clone());
+        let view = inspector.as_ref().map(|inspector| inspector.view.clone());
+        match inspector {
+            Some(inspector) => {
+                self.host_for(&inspector.view, cx);
+                self.inspectors.insert(tab, inspector);
             }
             None => {
                 self.inspectors.remove(&tab);
@@ -2424,9 +2529,9 @@ impl Workspace {
         }
     }
 
-    /// Follows the active tab (spec 020): shows its inspector, or says nothing is selected where
-    /// an inspector was showing, and tells whoever else follows. Every change of the active tab
-    /// notifies the workspace, so this one place sees them all.
+    /// Follows the active tab (spec 020): shows its inspector, or says nothing is selected,
+    /// and tells whoever else follows. Every change of the active tab notifies the workspace,
+    /// so this one place sees them all.
     fn follow_active_item(&mut self, cx: &mut Context<Self>) {
         let active = self.active_item().map(|item| item.item_id());
         if active == self.followed_item {
@@ -2439,64 +2544,52 @@ impl Workspace {
             .flat_map(|pane| pane.items.iter().map(|item| item.item_id()))
             .collect();
         self.inspectors.retain(|tab, _| open.contains(tab));
-        match active.and_then(|tab| self.inspectors.get(&tab).cloned()) {
-            Some(view) => self.show_inspector(Some(view), cx),
-            None if self.dock_of(INSPECTOR_PANEL).is_some() => {
-                self.show_inspector(Some(cx.new(|_| NothingSelected).into()), cx)
-            }
-            None => self.drop_stale_hosts(),
-        }
+        // What the tab showed when it was last in front, at once; then what it has selected
+        // now, which may have changed behind another tab.
+        let held = active
+            .and_then(|tab| self.inspectors.get(&tab))
+            .map(|inspector| inspector.view.clone());
+        self.show_inspector(held, cx);
+        self.read_selection(cx);
         cx.emit(WorkspaceEvent::ActiveItemChanged);
     }
 
-    /// Shows or hides the inspector, which says so when nothing is selected: its button is always
-    /// there, so it never moves what is beside it (constitution V).
+    /// Shows or hides the inspector: its button is always there, so it never moves what is
+    /// beside it (constitution V), and the inspector always holds something to show, what is
+    /// selected or that nothing is, so one press always shows it.
     fn toggle_inspector(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // What the button shows is whether the dock is seen: a dock open with no panel in it
-        // yet (a fresh window's) shows nothing, so the first press shows the inspector.
-        let shown = self.right.visible();
-        if self.dock_of(INSPECTOR_PANEL).is_none() {
-            self.show_inspector(Some(cx.new(|_| NothingSelected).into()), cx);
-        }
-        self.set_dock_open(PanelPosition::Right, !shown, window, cx);
-    }
-
-    fn show_inspector(&mut self, view: Option<AnyView>, cx: &mut Context<Self>) {
-        match view {
-            Some(view) => {
-                self.host_for(&view, cx);
-                let position = self
-                    .dock_of(INSPECTOR_PANEL)
-                    .unwrap_or_else(|| placed(INSPECTOR_PANEL, PanelPosition::Right, cx));
-                let dock = self.dock_mut(position);
-                dock.insert(PanelEntry {
-                    id: INSPECTOR_PANEL.into(),
-                    title: "Inspector".into(),
-                    icon: IconName::Info,
-                    home: PanelPosition::Right,
-                    view,
-                    actions: None,
-                    focus: None,
-                });
-                // Selection shows the inspector but never reopens a dock the user closed.
-                let open = dock.open;
-                dock.activate(INSPECTOR_PANEL);
-                dock.open = open;
-                // The inspector it replaced goes with its host.
-                self.drop_stale_hosts();
-            }
-            None => self.remove_panel(INSPECTOR_PANEL),
-        }
-        cx.notify();
-    }
-
-    /// Opens the inspector's dock on the inspector. An explicit peek (Space, a click) shows it
-    /// even when the person hid the dock; a peek that follows the cursor does not.
-    pub fn reveal_inspector(&mut self, cx: &mut Context<Self>) {
-        if let Some(position) = self.dock_of(INSPECTOR_PANEL) {
+        let position = self
+            .dock_of(INSPECTOR_PANEL)
+            .unwrap_or(PanelPosition::Right);
+        if self.inspector_shown() {
+            self.set_dock_open(position, false, window, cx);
+        } else {
             self.dock_mut(position).activate(INSPECTOR_PANEL);
-            cx.notify();
+            self.set_dock_open(position, true, window, cx);
         }
+    }
+
+    /// Puts a view in the inspector's panel: a tab's selection, or with `None` the note that
+    /// nothing is selected. The panel is always in its dock, so the inspector is shown or
+    /// hidden by the person alone: what is selected never opens it, and never closes it.
+    fn show_inspector(&mut self, view: Option<AnyView>, cx: &mut Context<Self>) {
+        let view = view.unwrap_or_else(|| self.nothing_selected.clone());
+        self.host_for(&view, cx);
+        let position = self
+            .dock_of(INSPECTOR_PANEL)
+            .unwrap_or_else(|| placed(INSPECTOR_PANEL, PanelPosition::Right, cx));
+        self.dock_mut(position).insert(PanelEntry {
+            id: INSPECTOR_PANEL.into(),
+            title: "Inspector".into(),
+            icon: IconName::Info,
+            home: PanelPosition::Right,
+            view,
+            actions: None,
+            focus: None,
+        });
+        // The view it replaced goes with its host.
+        self.drop_stale_hosts();
+        cx.notify();
     }
 
     /// The view drawn at the right of the status bar in every state, with the memory and CPU
@@ -3074,7 +3167,7 @@ impl Workspace {
     fn render_top_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let shown = self.session.is_some();
         let hairline = studio_ui::ds::surface::rule(cx);
-        let inspector_lit = self.right.visible();
+        let inspector_lit = self.inspector_shown();
         let environment = self.server_environment(cx);
         self.strip("top-bar", HEADER_HEIGHT, cx)
             .debug_selector(|| "top-bar".into())
@@ -6854,11 +6947,74 @@ mod tests {
         assert_eq!(height(cx, "status-bar"), studio_ui::ds::size::STATUS_BAR);
     }
 
-    /// Selection fills the inspector without reopening a dock the person hid; a peek asked for
-    /// (Space, a click) shows it. An inspector replaced or taken away goes with its host, which
+    /// A tab that has something selected: what the inspector shows of it, and how often the
+    /// workspace asked.
+    struct Selects {
+        focus_handle: FocusHandle,
+        selected: Option<AnyView>,
+        asked: usize,
+    }
+
+    impl Selects {
+        fn new(cx: &mut Context<Self>) -> Self {
+            Self {
+                focus_handle: cx.focus_handle(),
+                selected: None,
+                asked: 0,
+            }
+        }
+
+        fn select(&mut self, view: Option<AnyView>, cx: &mut Context<Self>) {
+            self.selected = view;
+            cx.emit(ItemEvent::Selected);
+        }
+    }
+
+    impl EventEmitter<ItemEvent> for Selects {}
+
+    impl Focusable for Selects {
+        fn focus_handle(&self, _: &App) -> FocusHandle {
+            self.focus_handle.clone()
+        }
+    }
+
+    impl Render for Selects {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().track_focus(&self.focus_handle).size_full()
+        }
+    }
+
+    impl Item for Selects {
+        fn tab_title(&self, _: &App) -> SharedString {
+            "Selects".into()
+        }
+
+        fn inspected(&mut self, _: &mut Context<Self>) -> Option<Inspected> {
+            self.asked += 1;
+            self.selected.clone().map(|view| Inspected::View {
+                view,
+                scrolls_itself: false,
+            })
+        }
+    }
+
+    /// The view in the inspector's panel.
+    fn inspector_view(workspace: &Workspace) -> Option<EntityId> {
+        workspace
+            .right
+            .panels
+            .iter()
+            .find(|panel| panel.id == INSPECTOR_PANEL)
+            .map(|panel| panel.view.entity_id())
+    }
+
+    /// The inspector is a panel as the sidebar's are (spec 020): a new window shows it, it shows
+    /// what the active tab has selected, and only its switch hides or shows it. What is selected
+    /// never opens it and never closes it; hidden, it asks nothing of the tab, and shown again it
+    /// reads what is selected by then. A view it no longer shows goes with its host, which
     /// would otherwise keep the view, and the graph session it holds, alive.
     #[gpui::test]
-    fn an_asked_for_peek_shows_the_inspector_that_selection_leaves_hidden(
+    fn the_inspector_shows_the_selection_and_only_its_switch_hides_it(
         cx: &mut gpui::TestAppContext,
     ) {
         cx.update(|cx| {
@@ -6866,27 +7022,69 @@ mod tests {
             cx.set_global(StudioSettings::default());
         });
         let (workspace, cx) = cx.add_window_view(Workspace::new);
-        workspace.update_in(cx, |workspace, window, cx| {
-            let hosted = |workspace: &Workspace, view: &Entity<Field>| {
-                workspace.dock_hosts.contains_key(&view.entity_id())
-            };
-            workspace.set_dock_open(PanelPosition::Right, false, window, cx);
-            let view = cx.new(|_| Field);
-            workspace.set_inspector(Some(view.clone().into()), cx);
-            assert!(!workspace.right.open, "selection leaves the dock hidden");
-            assert_eq!(
-                workspace.right.active_id().as_deref(),
-                Some(INSPECTOR_PANEL)
+        let hosted = |workspace: &Workspace, view: &Entity<Field>| {
+            workspace.dock_hosts.contains_key(&view.entity_id())
+        };
+        let tab = workspace.update_in(cx, |workspace, window, cx| {
+            assert!(workspace.right.visible(), "a new window shows it");
+            assert!(workspace.inspector_shown());
+            assert!(
+                inspector_view(workspace).is_some(),
+                "saying nothing is selected"
             );
-            workspace.reveal_inspector(cx);
-            assert!(workspace.right.open, "an asked-for peek shows it");
-            assert!(hosted(workspace, &view));
-            let next = cx.new(|_| Field);
-            workspace.set_inspector(Some(next.clone().into()), cx);
-            assert!(!hosted(workspace, &view), "the replaced one's host goes");
-            assert!(hosted(workspace, &next));
-            workspace.set_inspector(None, cx);
-            assert!(!hosted(workspace, &next), "and the removed one's");
+            workspace.add_item(window, cx, |_, cx| Selects::new(cx))
+        });
+        cx.run_until_parked();
+        let nothing = workspace.read_with(cx, |workspace, _| inspector_view(workspace));
+
+        // What the tab selects shows at once.
+        let first = cx.new(|_| Field);
+        tab.update(cx, |tab, cx| tab.select(Some(first.clone().into()), cx));
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(inspector_view(workspace), Some(first.entity_id()));
+            assert!(hosted(workspace, &first));
+        });
+
+        // Hidden by its switch, it stays hidden whatever is selected, and asks nothing.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_inspector(window, cx)
+        });
+        cx.run_until_parked();
+        let asked = tab.read_with(cx, |tab, _| tab.asked);
+        let second = cx.new(|_| Field);
+        tab.update(cx, |tab, cx| tab.select(Some(second.clone().into()), cx));
+        cx.run_until_parked();
+        tab.update(cx, |tab, cx| tab.select(None, cx));
+        cx.run_until_parked();
+        tab.update(cx, |tab, cx| tab.select(Some(second.clone().into()), cx));
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert!(!workspace.inspector_shown(), "a selection never opens it");
+            assert!(!workspace.right.open);
+        });
+        assert_eq!(tab.read_with(cx, |tab, _| tab.asked), asked);
+
+        // Shown again, it reads what is selected now; the view it replaced goes with its host.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_inspector(window, cx)
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.inspector_shown());
+            assert_eq!(inspector_view(workspace), Some(second.entity_id()));
+            assert!(!hosted(workspace, &first), "the replaced one's host goes");
+            assert!(hosted(workspace, &second));
+        });
+
+        // Nothing selected: it says so in the same place, and stays shown.
+        tab.update(cx, |tab, cx| tab.select(None, cx));
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.inspector_shown(), "no selection never closes it");
+            assert!(nothing.is_some());
+            assert_eq!(inspector_view(workspace), nothing, "the note it began with");
+            assert!(!hosted(workspace, &second), "and the removed one's");
         });
     }
 
@@ -7065,33 +7263,8 @@ mod tests {
         });
     }
 
-    /// The inspector's first press shows it, with "Nothing selected" when nothing is, and the
-    /// next hides it: the dock starts open with no panel, which shows nothing.
-    #[gpui::test]
-    fn the_inspector_shows_on_its_first_press(cx: &mut gpui::TestAppContext) {
-        cx.update(|cx| {
-            studio_theme::init_test(cx);
-            cx.set_global(StudioSettings::default());
-        });
-        let (workspace, cx) = cx.add_window_view(Workspace::new);
-        workspace.update_in(cx, |workspace, window, cx| {
-            workspace.add_item(window, cx, |_, cx| TabProbe {
-                focus_handle: cx.focus_handle(),
-                name: "first",
-                reads: false,
-            });
-            assert!(!workspace.right.visible(), "nothing to show yet");
-            workspace.toggle_inspector(window, cx);
-            assert!(workspace.right.visible(), "the first press shows it");
-            assert!(workspace.dock_of(INSPECTOR_PANEL).is_some());
-            workspace.toggle_inspector(window, cx);
-            assert!(!workspace.right.visible(), "the next hides it");
-            workspace.toggle_inspector(window, cx);
-            assert!(workspace.right.visible());
-        });
-    }
-
     /// Each tab keeps its own inspector, and whoever follows the active tab hears of the change.
+    /// A tab's selection that changes behind another tab is read when the tab comes back.
     #[gpui::test]
     fn each_tab_keeps_its_inspector(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
@@ -7108,65 +7281,132 @@ mod tests {
                 }
             })
         });
-        let shown = |workspace: &Workspace| {
-            workspace
-                .right
-                .panels
-                .iter()
-                .find(|panel| panel.id == INSPECTOR_PANEL)
-                .map(|panel| panel.view.entity_id())
-        };
-        let (first, second, first_peek, second_peek) =
-            workspace.update_in(cx, |workspace, window, cx| {
-                let first = workspace.add_item(window, cx, |_, cx| TabProbe {
-                    focus_handle: cx.focus_handle(),
-                    name: "first",
-                    reads: false,
-                });
-                let first_peek = cx.new(|_| Field);
-                workspace.set_inspector(Some(first_peek.clone().into()), cx);
-                let second = workspace.add_item(window, cx, |_, cx| TabProbe {
-                    focus_handle: cx.focus_handle(),
-                    name: "second",
-                    reads: false,
-                });
-                let second_peek = cx.new(|_| Field);
-                (first, second, first_peek, second_peek)
-            });
+        let first = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item(window, cx, |_, cx| Selects::new(cx))
+        });
+        let first_peek = cx.new(|_| Field);
+        first.update(cx, |tab, cx| {
+            tab.select(Some(first_peek.clone().into()), cx)
+        });
         cx.run_until_parked();
-        workspace.update(cx, |workspace, _| {
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(inspector_view(workspace), Some(first_peek.entity_id()));
+        });
+        let second = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item(window, cx, |_, cx| Selects::new(cx))
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
             assert_ne!(
-                shown(workspace),
+                inspector_view(workspace),
                 Some(first_peek.entity_id()),
                 "the new tab has nothing selected"
             );
-            assert!(shown(workspace).is_some(), "and says so, in the same place");
+            assert!(
+                inspector_view(workspace).is_some(),
+                "and says so, in the same place"
+            );
         });
         let heard_so_far = changes.get();
         assert!(heard_so_far > 0);
+        let second_peek = cx.new(|_| Field);
+        second.update(cx, |tab, cx| {
+            tab.select(Some(second_peek.clone().into()), cx)
+        });
+        cx.run_until_parked();
         workspace.update_in(cx, |workspace, window, cx| {
-            // A selection read in the tab behind arrives while the other is active.
-            workspace.set_inspector_of(first.entity_id(), Some(first_peek.clone().into()), cx);
-            workspace.set_inspector(Some(second_peek.clone().into()), cx);
-            assert_eq!(shown(workspace), Some(second_peek.entity_id()));
+            assert_eq!(inspector_view(workspace), Some(second_peek.entity_id()));
             workspace.activate_item_by_id(first.entity_id(), window, cx);
         });
         cx.run_until_parked();
-        workspace.update(cx, |workspace, _| {
-            assert_eq!(shown(workspace), Some(first_peek.entity_id()));
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(inspector_view(workspace), Some(first_peek.entity_id()));
             assert!(
                 workspace.dock_hosts.contains_key(&second_peek.entity_id()),
                 "a remembered inspector keeps its host"
             );
         });
         assert!(changes.get() > heard_so_far);
+        // The tab behind selects something else: the tab in front keeps the inspector, and the
+        // other's selection shows when it comes to the front.
+        let later = cx.new(|_| Field);
+        second.update(cx, |tab, cx| tab.select(Some(later.clone().into()), cx));
+        cx.run_until_parked();
         workspace.update_in(cx, |workspace, window, cx| {
+            assert_eq!(inspector_view(workspace), Some(first_peek.entity_id()));
             workspace.activate_item_by_id(second.entity_id(), window, cx);
         });
         cx.run_until_parked();
-        workspace.update(cx, |workspace, _| {
-            assert_eq!(shown(workspace), Some(second_peek.entity_id()));
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(inspector_view(workspace), Some(later.entity_id()));
+            assert!(!workspace.dock_hosts.contains_key(&second_peek.entity_id()));
         });
+    }
+
+    /// A node a tab names is made into a view by whoever shows nodes, once for as long as the
+    /// same node stays selected, so what is being edited in the view stays.
+    #[gpui::test]
+    fn a_named_node_keeps_its_view_while_it_stays_selected(cx: &mut gpui::TestAppContext) {
+        struct Names {
+            focus_handle: FocusHandle,
+            node: Option<InspectedNode>,
+        }
+        impl EventEmitter<ItemEvent> for Names {}
+        impl Focusable for Names {
+            fn focus_handle(&self, _: &App) -> FocusHandle {
+                self.focus_handle.clone()
+            }
+        }
+        impl Render for Names {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+        impl Item for Names {
+            fn tab_title(&self, _: &App) -> SharedString {
+                "Names".into()
+            }
+            fn inspected(&mut self, _: &mut Context<Self>) -> Option<Inspected> {
+                self.node.clone().map(Inspected::Node)
+            }
+        }
+        let node = |id: &str| InspectedNode {
+            type_name: "Person".into(),
+            id: id.into(),
+            at_commit: None,
+            snapshot: None,
+        };
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            cx.set_global(StudioSettings::default());
+            register_node_inspector(cx, |_, _, cx| cx.new(|_| Field).into());
+        });
+        let session = idle_session("http://studio.test", "notes", cx);
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        let tab = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.set_session(session.clone(), window, cx);
+            workspace.add_item(window, cx, |_, cx| Names {
+                focus_handle: cx.focus_handle(),
+                node: None,
+            })
+        });
+        cx.run_until_parked();
+        let select = |id: Option<&str>, cx: &mut gpui::VisualTestContext| {
+            let node = id.map(node);
+            tab.update(cx, |tab, cx| {
+                tab.node = node;
+                cx.emit(ItemEvent::Selected);
+            });
+            cx.run_until_parked();
+            workspace.read_with(cx, |workspace, _| inspector_view(workspace))
+        };
+        let nothing = select(None, cx);
+        let ada = select(Some("ada"), cx);
+        assert_ne!(ada, nothing);
+        assert_eq!(select(Some("ada"), cx), ada, "the same node keeps its view");
+        let grace = select(Some("grace"), cx);
+        assert_ne!(grace, ada, "another node is another view");
+        assert_ne!(select(None, cx), grace);
     }
 
     /// The keyboard in an inspector another replaces is not left with no view to hear it: the
@@ -7178,20 +7418,12 @@ mod tests {
             cx.set_global(StudioSettings::default());
         });
         let (workspace, cx) = cx.add_window_view(Workspace::new);
-        let (tab, inspector) = workspace.update_in(cx, |workspace, window, cx| {
-            let tab = cx.focus_handle();
-            let focus_handle = tab.clone();
-            workspace.open_item("a", window, cx, move |_, cx| Split {
-                field: cx.new(|_| Field),
-                part: cx.new(|_| Part { renders: 0 }),
-                caches: false,
-                focus_handle,
-            });
-            let inspector = cx.new(|_| Field);
-            workspace.set_inspector(Some(inspector.clone().into()), cx);
-            workspace.set_dock_open(PanelPosition::Right, true, window, cx);
-            (tab, inspector)
+        let tab = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item(window, cx, |_, cx| Selects::new(cx))
         });
+        let focus = tab.read_with(cx, |tab, _| tab.focus_handle.clone());
+        let inspector = cx.new(|_| Field);
+        tab.update(cx, |tab, cx| tab.select(Some(inspector.clone().into()), cx));
         cx.run_until_parked();
         workspace.update_in(cx, |workspace, window, cx| {
             let host = workspace.dock_hosts[&inspector.entity_id()]
@@ -7201,13 +7433,11 @@ mod tests {
             window.focus(&host, cx);
         });
         cx.run_until_parked();
-        workspace.update_in(cx, |workspace, window, cx| {
-            assert!(!tab.is_focused(window), "the inspector has the keyboard");
-            let next = cx.new(|_| Field);
-            workspace.set_inspector(Some(next.into()), cx);
-        });
+        cx.update(|window, _| assert!(!focus.is_focused(window), "the inspector has the keyboard"));
+        let next = cx.new(|_| Field);
+        tab.update(cx, |tab, cx| tab.select(Some(next.clone().into()), cx));
         cx.run_until_parked();
-        cx.update(|window, _| assert!(tab.is_focused(window), "the tab has it"));
+        cx.update(|window, _| assert!(focus.is_focused(window), "the tab has it"));
     }
 
     /// As Zed's panel buttons: a button shows its panel and opens the dock; pressed again while
@@ -7808,9 +8038,15 @@ mod tests {
             // The shown graph's inspector goes with it, host and all: the host would keep the
             // inspector, and the session it holds polling, after the graph is put away.
             let inspector = cx.new(|_| Field);
-            workspace.set_inspector(Some(inspector.clone().into()), cx);
+            let tab = workspace.active_item().map(|item| item.item_id()).unwrap();
+            let held = TabInspector {
+                view: inspector.clone().into(),
+                node: None,
+            };
+            workspace.set_inspector_of(tab, Some(held), cx);
+            assert_eq!(inspector_view(workspace), Some(inspector.entity_id()));
             workspace.show_graph(behind.entity_id(), window, cx);
-            assert_eq!(workspace.dock_of(INSPECTOR_PANEL), None);
+            assert_ne!(inspector_view(workspace), Some(inspector.entity_id()));
             assert!(!workspace.dock_hosts.contains_key(&inspector.entity_id()));
             let pane = workspace.pane(workspace.active_pane).unwrap();
             assert_eq!((pane.items.len(), pane.active), (2, 1));

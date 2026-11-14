@@ -102,7 +102,11 @@ write that matched nothing, or a 412, reopens the draft.
   and the Activity and inspector toggles.
 - Each column's header is its panel's own (title and buttons).
 - Left dock: Data (the schema, node types and edge types with counts), Queries, Branches,
-  Conversations. Right dock: the inspector, one per tab. Bottom dock: Activity.
+  Conversations. Right dock: the inspector, which shows what the tab in front has selected
+  (spec 020). A tab says its selection changed (`ItemEvent::Selected`) and the workspace asks it
+  what is selected (`Item::inspected`) while the inspector is shown; it keeps one view per tab.
+  A new window shows the inspector, and only its toggle, ⌘⌥B or Space hides it. Bottom dock:
+  Activity.
 - Center: panes of tabs, each one view of one thing (type table, page, tree, canvas, map, source,
   query editor, review, history, commit), with a view strip to its thing's other views. Each pane's
   tab strip starts with its own Back and Forward.

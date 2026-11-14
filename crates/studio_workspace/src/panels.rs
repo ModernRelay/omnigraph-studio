@@ -187,10 +187,6 @@ impl<V> Dock<V> {
         }
     }
 
-    pub fn remove(&mut self, id: &str) {
-        self.take(id);
-    }
-
     /// Takes a panel out, to put it in another dock. The active panel stays active, or its
     /// neighbor becomes so.
     pub fn take(&mut self, id: &str) -> Option<PanelEntry<V>> {
@@ -285,7 +281,7 @@ mod tests {
         assert!(!dock.activate("types"));
         assert_eq!(dock.active_id(), None);
         assert_eq!(dock.position_of("types"), None);
-        dock.remove("types");
+        dock.take("types");
         assert_eq!(dock.active, 0);
     }
 
@@ -300,7 +296,7 @@ mod tests {
         assert!(dock.activate("explore"));
         assert!(dock.visible(), "activating opens the dock");
         assert_eq!(dock.active_id().as_deref(), Some("explore"));
-        dock.remove("explore");
+        dock.take("explore");
         assert_eq!(dock.active_id().as_deref(), Some("types"));
     }
 

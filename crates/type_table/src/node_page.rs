@@ -8,7 +8,7 @@ use gpui::{
 use graph_store::GraphSession;
 use serde_json::json;
 use studio_actions::{ViewKind, ViewLink};
-use studio_workspace::{Item, ItemEvent, SavedItem};
+use studio_workspace::{Inspected, InspectedNode, Item, ItemEvent, SavedItem};
 use ui::prelude::*;
 
 use crate::peek::NodePeek;
@@ -27,6 +27,8 @@ pub struct NodePage {
     /// The toolbar as it was last drawn: whether the relationships with none are hidden, and
     /// whether there are any.
     toolbar: (bool, bool),
+    /// The related node selected on the page as the inspector was last told of it.
+    selected: Option<InspectedNode>,
     _subscription: Subscription,
 }
 
@@ -62,6 +64,12 @@ impl NodePage {
                 this.toolbar = toolbar;
                 cx.notify();
             }
+            // A related node selected on the page is what the inspector shows (spec 020).
+            let selected = this.view.read(cx).selected_node();
+            if selected != this.selected {
+                this.selected = selected;
+                cx.emit(ItemEvent::Selected);
+            }
         });
         let mut page = Self {
             view,
@@ -71,11 +79,18 @@ impl NodePage {
             saved_label,
             tab: (String::new(), false),
             toolbar: (true, false),
+            selected: None,
             _subscription: subscription,
         };
         page.tab = (page.title(cx), page.view.read(cx).is_newer());
         page.toolbar = page.toolbar_state(cx);
         page
+    }
+
+    /// The page's view of its node.
+    #[cfg(test)]
+    pub(crate) fn view(&self) -> &Entity<NodePeek> {
+        &self.view
     }
 
     /// What names the tab: the node's label once the page reads it, else the one the tab was
@@ -115,6 +130,10 @@ impl Focusable for NodePage {
 impl Item for NodePage {
     fn tab_title(&self, cx: &App) -> SharedString {
         self.title(cx).into()
+    }
+
+    fn inspected(&mut self, _cx: &mut Context<Self>) -> Option<Inspected> {
+        self.selected.clone().map(Inspected::Node)
     }
 
     fn views(&self, _cx: &App) -> Vec<ViewLink> {

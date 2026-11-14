@@ -245,8 +245,8 @@ what was last saved at most every 250 ms rather than serializing every tab on ev
   the palette and cannot start Zed's ⌘K W chord. ⌘N in the agent panel starts a conversation.
 - Global: ⌘K palette, ⌘P go to type or node, ⌘⇧B switch branch, ⌘, settings, ⌘1–⌘9 tabs,
   ⌘[ / ⌘] back and forward, `?` key sheet (outside text fields).
-- In lists and tables: J/K or ↑/↓, ↵ open, Space peek, Esc steps back one level (close editor,
-  then peek, then clear selection).
+- In lists and tables: J/K or ↑/↓, ↵ open, Space shows or hides the inspector (spec 020), Esc
+  steps back one level (close editor, then clear selection).
 - The person's `keymap.json` in the data directory loads after Zed's keymap and Studio's, in
   Zed's format, so its bindings win; `null` removes a key and comments are allowed. Studio reads
   it again when it changes (checked every two seconds) and rebinds from the defaults up, then
@@ -363,7 +363,8 @@ Its action is not registered, so the palette and the keyboard button's list leav
 (constitution VIII); a workspace action is registered with a condition
 (`Workspace::register_action_when`).
 
-- `change` on the branch a view shows: a table's Edit (a click on a value peeks it instead),
+- `change` on the branch a view shows: a table's Edit (a value nobody may edit opens nothing:
+  the inspector shows its row),
   New row, Delete row, the bulk set, Save drafts, and a Blob cell's Choose File, Clear and
   drop, with "Read only" in its toolbar; a node's peek and page (fields do not open, an enum's
   menu and a switch show as values, a relationship's + and × and Save are disabled, Blob slots

@@ -43,7 +43,8 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
   nodes to draw · Open as table · Show in tree". The cap is `studio.canvas_max_nodes`, which
   a graph can override (spec 002). An open canvas draws a changed cap at once, and the banner
   names the cap its drawn scene was built under (`Scene::cap`), never a newer setting.
-- **Keys (context `Canvas`):** arrows move to the nearest node; ↵ expand; Space peek; ⌫ collapse;
+- **Keys (context `Canvas`):** arrows move to the nearest node; ↵ expand; Space show or hide the
+  inspector, which follows the selected chip (spec 020); ⌫ collapse;
   `0` fit; `+`/`-` zoom; F focus; `[`/`]` walk the expansion path.
 - **Query results:** a query whose result has node or edge columns can open as a canvas.
 
@@ -101,10 +102,12 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
     - **Drawn once.** A type is one chip, however it is reached: reaching it again draws a
       line to it. A pill between two types is drawn once: expanding the second of two related
       types draws no pill for what the first already shows.
-    - **Clicks.** A click expands a closed type (and selects an open one), a double click
-      closes it, taking back what only it reached; a click on a pill expands the type it
-      leads to; ⇧-click, Space or ⌘↵ open the type's page (below, "A type in focus"), its
-      description, properties and every relationship either side. A type's menu: Expand or
+    - **Clicks.** A click expands a closed type (and selects an open one), and the inspector
+      shows the selected type as the schema describes it (spec 020); ⌫ or its menu closes it,
+      taking back what only it reached; a click on a pill expands the type it leads to; a
+      double click or ⌘↵ opens the type's page (below, "A type in focus"), its description,
+      properties and every relationship either side. (Before 2026-11-13 a double click closed
+      a type, and ⇧-click or Space opened its page.) A type's menu: Expand or
       Close, Explore from here, Open table, Details. From that page, the way back selects the
       type on the canvas and glides to it.
   - **Domains** (`domains.rs`, kept for the type page's grouping and the starting type). The
@@ -180,12 +183,14 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
   the chip stops what was read ahead for it and is still out (`Exploration::end_prefetch`).
   The Explore panel's closed rows do the same.
 - **Clicks:** a click expands a closed node, opens or closes a relationship pill, and shows
-  more on "+K more"; a click on an open node only selects it (a double click closes it), so
-  a click never folds away what was walked. ⇧-click shows the chip in the inspector
-  (`PeekNode`; a pill shows its node) and opens nothing. On a query's result canvas a node is
-  selected by a click and opened by a double click.
+  more on "+K more"; a click on an open node only selects it, so a click never folds away
+  what was walked. The inspector shows the selected chip's node, a pill showing the node it
+  belongs to, and a walk opens with its root selected (spec 020). A double click opens the
+  node's page, on a walk as on a query's result canvas; ⌫ or the menu closes an open node.
+  (Before 2026-11-13 a double click closed an open node, and ⇧-click or Space showed the chip
+  in the inspector, which then stayed on it.)
 - **Marking:** ⇧-drag on empty space draws an area and marks every chip it touches (added to
-  those marked); ⌘-click marks or unmarks one chip, as it picks rows in a table; ⌘A marks
+  those marked); ⌘-click or ⇧-click marks or unmarks one chip, as they pick rows in a table; ⌘A marks
   all, Esc unmarks. Marked chips
   carry the selection's warm ring and never fade with the pointed-at neighbourhood. Dragging a
   marked chip moves every marked chip, and each stays where it was dropped. A plain click
@@ -375,7 +380,7 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
   top, what a click does bottom left. Colour is kept to node types: relationships show a
   neutral arrow wherever a type is listed.
 - **Keys:** ←↑→↓ (`canvas::MoveLeft` …, nearest node in a 45° cone, `along + 2 × across`),
-  `0`, `=`/`+`, `-`, ↵ expand, ⌫ collapse, Space peek, F focus on the selected node's
+  `0`, `=`/`+`, `-`, ↵ expand, ⌫ collapse, Space the inspector's switch, F focus on the selected node's
   neighbourhood, `[`/`]` step back and forward along the nodes walked. Bound in the `Canvas`
   context of `assets/keymaps/`. Scroll and pinch zoom, drag pans.
 - **The cap exit** offers "Open as table" for the type with most hidden nodes and "Show in

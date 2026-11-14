@@ -106,19 +106,24 @@ Four parts, built in this order; each lands on its own.
   refusal) under it.
 - **How a relationship reads**: under a rule and "Relationships", each group is a fold row,
   "knows → Person ⌄" (← for one pointing at this node) with its count at the end, over its
-  neighbours, a row each: its type's mark and its name, a click peeking it. Under the pointer
+  neighbours, a row each: its type's mark and its name. On a page a click selects it, which
+  the inspector shows, and a second opens its page; in the inspector a click opens its page
+  (spec 020). Under the pointer
   a row shows its × and a header its "+" (the page shows the "+" always).
 - **Keys, the same on every surface**:
-  - Space peeks, and shows the right dock when it is hidden (an explicit request, unlike
-    passive selection, which still never reopens a dock the person closed).
+  - Space shows or hides the inspector, which shows what is selected in the tab in front
+    (spec 020, since 2026-11-13). What is selected never opens the dock and never closes it.
+    Before, Space asked for a peek, which showed the right dock when it was hidden.
   - ↵ is the surface's own action, as today: edit in a table, open in the tree, expand on the
     canvas.
-  - ⌘↵ opens the node page, from a table row, a tree node and a canvas node; the peek's header
-    has an Open button (↗), and the footer's key hints read "⌘↵ Open". On a tree's
+  - ⌘↵ opens the node page, from a table row, a tree node and a canvas node; the inspector's
+    header opens the node it shows as a Page, a Tree or a Canvas, and the footer's key hints
+    read "⌘↵ Open". On a tree's
     relationship group, which has no page, ⌘↵ opens its table as before; "Open in table" for a
     node moves to ⌥↵ (the tree has no row menu).
-  - In the peek and on the page a neighbour or an endpoint is a link: a click peeks it, ⌘-click
-    opens its page. The peek's "+N more" reads "+N more · Open page" and opens the page, which
+  - On a page a neighbour is selected by a click and opened by a second, or by ⌘-click. In
+    the inspector a neighbour or an endpoint is a link to its page, opened in the center as a
+    preview, which a second click keeps; the tab it was followed from stays (spec 020). The peek's "+N more" reads "+N more · Open page" and opens the page, which
     lists a group's neighbours 50 at a time with "+N more" reading the next.
   - In a table, a click selects a cell; ↵ or a double click edits it (as a spreadsheet;
     typing to edit is deferred). A double click on the key cell opens the page.

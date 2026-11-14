@@ -22,18 +22,18 @@ use graph_store::{
     SessionEvent, SetRoots,
 };
 use smallvec::SmallVec;
-use studio_actions::graph::{OpenType, PeekNode};
+use studio_actions::graph::OpenType;
 use studio_actions::graph::{ShowNodeInTree, ShowNodeOnCanvas, ShowSetInTree};
 use studio_actions::tree::{
     ClearFilter, Collapse, CollapseAll, Expand, ExpandAll, OpenPage, OpenSelected, OpenTable,
-    PeekSelected, RerootHere, SelectNext, SelectPrevious, ShowOnCanvas, ToggleEmptyGroups,
+    RerootHere, SelectNext, SelectPrevious, ShowOnCanvas, ToggleEmptyGroups,
 };
 use studio_actions::workspace::Refresh;
 use studio_actions::{ViewKind, ViewLink};
 use studio_ui::ds::Tipped;
 use studio_ui::ds::space;
 use studio_ui::type_swatch;
-use studio_workspace::{Item, ItemEvent, SavedItem, Workspace};
+use studio_workspace::{Inspected, InspectedNode, Item, ItemEvent, SavedItem, Workspace};
 use ui::prelude::*;
 use ui::{IndentGuideColors, StickyCandidate, Tooltip};
 
@@ -275,6 +275,9 @@ pub(crate) struct RelationshipTree {
     /// The groups shown seen with relationships: one keeps its row while its count is read
     /// again, and the others wait for theirs before they show.
     had_relationships: HashSet<graph_store::ExplorePath>,
+    /// The node of the selected row as the workspace was last told of it
+    /// ([`ItemEvent::Selected`]): the inspector shows it.
+    inspected: Option<NodeRef>,
     focus_handle: FocusHandle,
     scroll_handle: UniformListScrollHandle,
     _subscriptions: Vec<Subscription>,
@@ -294,6 +297,18 @@ impl Focusable for RelationshipTree {
 impl EventEmitter<ItemEvent> for RelationshipTree {}
 
 impl Item for RelationshipTree {
+    /// The selected row's node, read as the tree reads: held at its commit, or at the commit
+    /// it shows, which may be behind the head ("Newer data").
+    fn inspected(&mut self, cx: &mut Context<Self>) -> Option<Inspected> {
+        let node = self.walks_from()?;
+        Some(Inspected::Node(InspectedNode {
+            type_name: node.type_name,
+            id: node.id,
+            at_commit: self.at_commit.clone(),
+            snapshot: self.exploration.read(cx).pin().map(str::to_owned),
+        }))
+    }
+
     fn tab_title(&self, cx: &App) -> SharedString {
         let state = self.exploration.read(cx).state();
         let name = match &self.subject {
@@ -365,6 +380,7 @@ impl Item for RelationshipTree {
                     type_name: node.type_name,
                     id: node.id,
                     at_commit,
+                    preview: false,
                 }))
             }
             (Subject::Node(root), ViewKind::Canvas) => Some(Box::new(ShowNodeOnCanvas {
@@ -447,6 +463,8 @@ impl RelationshipTree {
             _ => None,
         };
         let subscriptions = vec![
+            // The inspector shows the selected row's node (spec 020).
+            cx.observe_self(|this, cx| this.report_selection(cx)),
             cx.subscribe(&exploration, |this, _, event, cx| match event {
                 ExplorationEvent::Changed => {
                     this._loaded = None;
@@ -498,6 +516,7 @@ impl RelationshipTree {
             // tree, not what its type allows.
             hide_empty: true,
             had_relationships: HashSet::new(),
+            inspected: None,
             focus_handle: cx.focus_handle(),
             scroll_handle: UniformListScrollHandle::new(),
             _subscriptions: subscriptions,
@@ -804,6 +823,7 @@ impl RelationshipTree {
                 type_name: node.type_name.clone(),
                 id: node.id.clone(),
                 at_commit: self.at_commit.clone(),
+                preview: false,
             }),
             cx,
         );
@@ -838,7 +858,8 @@ impl RelationshipTree {
         }
     }
 
-    /// The node a set's Canvas walks from: the selected row's, or a relationship's own node.
+    /// The node a set's Canvas walks from, and the node the inspector shows: the selected
+    /// row's, or a relationship's own node.
     fn walks_from(&self) -> Option<NodeRef> {
         self.selected_node().or_else(|| {
             self.selected_entry()
@@ -872,21 +893,16 @@ impl RelationshipTree {
         self.exploration.read(cx).state().searches.get(key).cloned()
     }
 
-    /// Space: the selected node in the inspector, focus staying in the tree.
-    fn peek_selected(&mut self, _: &PeekSelected, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(node) = self.selected_node() else {
-            return;
-        };
-        window.dispatch_action(
-            Box::new(PeekNode {
-                type_name: node.type_name,
-                id: node.id,
-                at_commit: self.at_commit.clone(),
-                // The commit the tree shows, which may be behind the head ("Newer data").
-                snapshot: self.exploration.read(cx).pin().map(str::to_owned),
-            }),
-            cx,
-        );
+    /// Tells the workspace when the selected row is another node's, or no node's: called
+    /// whenever the tree notifies, so every way its selection changes is seen (a click, an
+    /// arrow, a canvas of the same walk, rows that went). The inspector then asks for the node
+    /// ([`Item::inspected`]) if it is shown.
+    fn report_selection(&mut self, cx: &mut Context<Self>) {
+        let node = self.walks_from();
+        if node != self.inspected {
+            self.inspected = node;
+            cx.emit(ItemEvent::Selected);
+        }
     }
 
     /// ⌘↵: the selected node's page (spec 014); a relationship group, which has no page,
@@ -899,6 +915,7 @@ impl RelationshipTree {
                         type_name: node.type_name.clone(),
                         id: node.id.clone(),
                         at_commit: self.at_commit.clone(),
+                        preview: false,
                     }),
                     cx,
                 );
@@ -1640,7 +1657,6 @@ impl Render for RelationshipTree {
             .on_action(cx.listener(Self::reroot_here))
             .on_action(cx.listener(Self::show_on_canvas))
             .on_action(cx.listener(Self::clear_filter))
-            .on_action(cx.listener(Self::peek_selected))
             .on_action(cx.listener(Self::open_table))
             .on_action(cx.listener(Self::open_page))
             .on_action(cx.listener(Self::toggle_empty_groups))
@@ -2245,10 +2261,14 @@ mod tests {
         }
     }
 
-    /// A peek from a tree showing "Newer data" reads the commit the tree shows, not the head it
-    /// has not taken yet, and follows the branch as the tree does: it holds no commit.
+    /// The inspector follows the tree's selection: a tree opens with its root selected and
+    /// says so once, and names the node read at the commit the tree shows, not the head it has
+    /// not taken yet ("Newer data"). The node follows the branch as the tree does: it holds no
+    /// commit.
     #[gpui::test]
-    async fn a_peek_reads_the_commit_the_tree_shows(cx: &mut gpui::TestAppContext) {
+    async fn the_inspector_reads_the_selected_node_at_the_commit_the_tree_shows(
+        cx: &mut gpui::TestAppContext,
+    ) {
         cx.update(studio_theme::init_test);
         let (session, served) = followed_session(
             "node Person {\n  slug: String @key\n  name: String\n}\nedge Knows: Person -> Person\n",
@@ -2256,11 +2276,6 @@ mod tests {
             cx,
         );
         cx.run_until_parked();
-        let peeked: std::rc::Rc<std::cell::RefCell<Vec<PeekNode>>> = Default::default();
-        cx.update(|cx| {
-            let heard = peeked.clone();
-            cx.on_action(move |action: &PeekNode, _| heard.borrow_mut().push(action.clone()));
-        });
         let shown = session.clone();
         let (dock, cx) = cx.add_window_view(move |_, cx| Dock {
             tree: cx.new(|cx| {
@@ -2280,8 +2295,25 @@ mod tests {
             }
             cx.run_until_parked();
         };
-        settle(cx);
         let tree = dock.read_with(cx, |dock, _| dock.tree.clone());
+        let told = std::rc::Rc::new(std::cell::Cell::new(0));
+        let heard = told.clone();
+        let _hearing = cx.update(|_, cx| {
+            cx.subscribe(&tree, move |_, event: &ItemEvent, _| {
+                if matches!(event, ItemEvent::Selected) {
+                    heard.set(heard.get() + 1);
+                }
+            })
+        });
+        settle(cx);
+        // The root is selected as the tree opens, and the workspace was told (the window drew
+        // the tree, and so heard, before this test listened).
+        assert_eq!(
+            tree.read_with(cx, |tree, _| tree.inspected.clone()),
+            Some(NodeRef::new("Person", "p1")),
+        );
+        assert!(told.get() <= 1);
+        let told_at_open = told.get();
         let pin = tree.read_with(cx, |tree, cx| {
             tree.exploration.read(cx).pin().map(str::to_owned)
         });
@@ -2293,14 +2325,21 @@ mod tests {
         session.update(cx, |session, cx| session.check_heads(cx));
         settle(cx);
         assert!(tree.read_with(cx, |tree, cx| tree.exploration.read(cx).newer_available()));
-        cx.update(|window, cx| window.focus(&tree.focus_handle(cx), cx));
-        tree.update(cx, |tree, cx| tree.select_row(0, cx));
-        cx.dispatch_action(PeekSelected);
+        tree.update(cx, |tree, cx| {
+            let Some(Inspected::Node(node)) = Item::inspected(tree, cx) else {
+                panic!("the selected row's node");
+            };
+            assert_eq!(
+                (node.type_name.as_str(), node.id.as_str()),
+                ("Person", "p1")
+            );
+            assert_eq!(node.at_commit, None);
+            assert_eq!(node.snapshot, pin, "not c2");
+            // The same row selected again is no news.
+            tree.select_row(0, cx);
+        });
         cx.run_until_parked();
-        let peeked = peeked.borrow();
-        assert_eq!(peeked.len(), 1);
-        assert_eq!(peeked[0].at_commit, None);
-        assert_eq!(peeked[0].snapshot, pin, "not c2");
+        assert_eq!(told.get(), told_at_open);
     }
 
     /// ⌘R where the tree has the keyboard reads it again at the branch head, as its "Newer

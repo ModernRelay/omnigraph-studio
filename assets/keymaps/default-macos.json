@@ -213,7 +213,7 @@
       "left": "studio_table::MoveLeft",
       "right": "studio_table::MoveRight",
       "enter": "studio_table::EditCell",
-      "space": "studio_table::PeekRow",
+      "space": "studio::ToggleInspector",
       "cmd-enter": "studio_table::OpenRowPage",
       "g": "studio_table::ShowRowOnCanvas",
       "cmd-c": "studio_table::CopyCell",
@@ -296,7 +296,7 @@
     "bindings": {
       "f": "studio_tree::RerootHere",
       "g": "studio_tree::ShowOnCanvas",
-      "space": "studio_tree::PeekSelected",
+      "space": "studio::ToggleInspector",
       "h": "studio_tree::ToggleEmptyGroups"
     }
   },
@@ -315,8 +315,15 @@
     }
   },
   {
+    "context": "NodePage && !Editor",
+    "bindings": {
+      "space": "studio::ToggleInspector"
+    }
+  },
+  {
     "context": "Ontology",
     "bindings": {
+      "space": "studio::ToggleInspector",
       "escape": "studio_ontology::Back",
       "up": "studio_ontology::SelectPrevious",
       "down": "studio_ontology::SelectNext",
@@ -336,7 +343,7 @@
       "right": "studio_canvas::MoveRight",
       "up": "studio_canvas::MoveUp",
       "down": "studio_canvas::MoveDown",
-      "space": "studio_canvas::PeekSelected",
+      "space": "studio::ToggleInspector",
       "cmd-enter": "studio_canvas::OpenSelectedPage",
       "f": "studio_canvas::FocusSelected",
       "[": "studio_canvas::WalkBack",
