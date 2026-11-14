@@ -982,10 +982,10 @@ impl NodePeek {
             })
             .map(|(commit, ends)| {
                 let asked: HashSet<(String, String)> = ends.iter().cloned().collect();
-                let read = self
-                    .session
-                    .update(cx, |session, cx| session.node_names(ends, commit, cx));
-                (asked, read)
+                let read = self.session.update(cx, |session, cx| {
+                    session.node_names(ends, commit.clone(), cx)
+                });
+                (commit, asked, read)
             })
             .collect();
         // What each type is named by under this choice: a read that lands after another
@@ -1002,7 +1002,7 @@ impl NodePeek {
         self.next_renaming += 1;
         let id = self.next_renaming;
         let task = cx.spawn(async move |this, cx| {
-            for (asked, read) in reads {
+            for (commit, asked, read) in reads {
                 let (names, answered) = read.await;
                 this.update(cx, |this, cx| {
                     let schema = this.schema.clone();
@@ -1011,7 +1011,8 @@ impl NodePeek {
                         let still = named_by
                             .get(type_name)
                             .is_some_and(|by| *by == names_by(schema.as_deref(), type_name));
-                        if !still {
+                        // Names at the commit the group was read at, not another's.
+                        if !still || group.read_at != commit {
                             continue;
                         }
                         let Loadable::Loaded(rows) = &mut group.neighbours else {
