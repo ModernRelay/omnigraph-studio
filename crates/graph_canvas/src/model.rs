@@ -334,7 +334,7 @@ pub fn explore_scene(
             // node it reaches. (The tree shows it inline, as a field.)
             EntryKind::Field {
                 key,
-                target: Some(target),
+                target: Some(_),
                 ..
             } => {
                 let Some(owner) = parent_scene else {
@@ -375,42 +375,16 @@ pub fn explore_scene(
                         hub
                     }
                     None => {
+                        // Left out by the cap, with the target the walk puts under it.
                         hidden.insert(hub_id);
-                        if open {
-                            hidden.insert(SceneId::Node(target.node.clone()));
-                        }
+                        skipped[index] = true;
+                        capped[index] = true;
                         continue;
                     }
                 };
+                // Opened, its target is the node entry the walk puts under it (a node of the
+                // walk, expandable as any), drawn by the entries that follow.
                 placed[index] = Some(hub);
-                if !open {
-                    continue;
-                }
-                let id = SceneId::Node(target.node.clone());
-                let to = match by_id.get(&id).copied() {
-                    Some(existing) => existing,
-                    None if scene.nodes.len() < cap => add(
-                        &mut scene,
-                        &mut by_id,
-                        SceneNode {
-                            id,
-                            kind: SceneKind::Node {
-                                node: target.node.clone(),
-                                root: false,
-                                expanded: false,
-                            },
-                            label: label_of(&target.node),
-                            color_key: target.node.type_name.clone(),
-                            parent: Some(hub),
-                            path: None,
-                        },
-                    ),
-                    None => {
-                        hidden.insert(id);
-                        continue;
-                    }
-                };
-                push_edge(&mut scene, &mut lines, hub, to);
             }
             EntryKind::Cycle { node, .. } => {
                 if let (Some(hub), Some(existing)) = (
@@ -666,6 +640,64 @@ mod tests {
             .expect("the company once open");
         assert_eq!(open.nodes[company].parent, Some(hub));
         assert!(open.edges.iter().any(|e| e.from == hub && e.to == company));
+    }
+
+    /// The node a single-target relationship reaches is a node of the walk: it has a path,
+    /// so a click or ↵ expands it to its own relationships, as any node does (H1 in the
+    /// canvas UX report). Before, it was drawn with no path and only opened a page.
+    #[test]
+    fn a_single_target_node_expands_as_any_node() {
+        let schema = SchemaModel::parse(&format!(
+            "{SCHEMA}edge Employer: Person -> Company @card(0..1)\n"
+        ))
+        .unwrap();
+        let mut state = ExploreState::rooted(person("ada"));
+        state.root_status = Loadable::Loaded(());
+        let employer = schema
+            .relationships_of("Person")
+            .iter()
+            .find(|g| g.edge == "Employer")
+            .cloned()
+            .unwrap();
+        let acme = NodeRef::new("Company", "acme");
+        state.neighbours.insert(
+            GroupKey::new(person("ada"), employer.clone()),
+            NeighbourList {
+                rows: vec![Neighbour {
+                    node: acme.clone(),
+                    label: None,
+                    edge: Vec::new(),
+                }],
+                exhausted: true,
+                ..Default::default()
+            },
+        );
+        let field = ExplorePath::root().child_group(&employer);
+        state.expanded.insert(field.clone());
+        let scene = explore_scene(&state.entries(&schema), &state, &HashMap::new(), node_cap());
+        let company = scene.index_of(&SceneId::Node(acme.clone())).unwrap();
+        let acme_path = field.child_node(&acme);
+        assert_eq!(scene.nodes[company].path.as_ref(), Some(&acme_path));
+        // Expanded, Acme shows its own relationships once counted.
+        let works_in = schema
+            .relationships_of("Company")
+            .iter()
+            .find(|g| g.edge == "WorksAt")
+            .cloned()
+            .unwrap();
+        let acme_works = GroupKey::new(acme.clone(), works_in);
+        state.counts.insert(acme_works.clone(), Loadable::Loaded(2));
+        state.expanded.insert(acme_path);
+        let scene = explore_scene(&state.entries(&schema), &state, &HashMap::new(), node_cap());
+        let company = scene.index_of(&SceneId::Node(acme)).unwrap();
+        assert!(matches!(
+            scene.nodes[company].kind,
+            SceneKind::Node { expanded: true, .. }
+        ));
+        let hub = scene
+            .index_of(&SceneId::Hub(acme_works))
+            .expect("Acme's own relationship");
+        assert_eq!(scene.nodes[hub].parent, Some(company));
     }
 
     #[test]
