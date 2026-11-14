@@ -298,9 +298,10 @@ pub(crate) fn paint(
     // Each line as right-angle pieces, with its tone: out of the node it hangs from, turning
     // near it, so a column of neighbours shares one upright. A scene has no edge from a node to
     // itself (a node is drawn once, and a result's row joins distinct nodes).
+    let lit = way_back(scene, hovered);
     let mut drawn: Vec<(usize, Vec<Point<Pixels>>, Tone)> = Vec::new();
     for (index, edge) in scene.edges.iter().enumerate() {
-        let tone = line_tone(scene, edge.from, edge.to, hovered, selected);
+        let tone = line_tone(scene, edge.from, edge.to, hovered, selected, &lit);
         let (parent, child) = line_ends(scene, index);
         let ends = (
             (anchor[parent], reach[parent]),
@@ -361,7 +362,8 @@ pub(crate) fn paint(
         }
         // A marked chip is drawn as the selected one is.
         let focus = selected == Some(index) || marked.contains(&index);
-        let pointed = hovered == Some(index);
+        // The pointed chip, and the chips it was reached through, lift together.
+        let pointed = hovered == Some(index) || lit.contains(&index);
         if mark_only(index) {
             rects[index] = match node.kind {
                 SceneKind::Hub { .. } | SceneKind::More { .. } => {
@@ -462,17 +464,40 @@ pub(crate) fn paint_ring(centre: Point<Pixels>, ink: Hsla, fill: Hsla, window: &
     ));
 }
 
+/// The chip the pointer is on and every chip it hangs off, back to the root: the way it was
+/// reached, which pointing at it lights (H2 in the canvas UX report). Empty when the pointer
+/// is on no chip.
+pub(crate) fn way_back(scene: &Scene, hovered: Option<usize>) -> HashSet<usize> {
+    let mut lit = HashSet::new();
+    let mut at = hovered.filter(|index| *index < scene.nodes.len());
+    while let Some(index) = at {
+        if !lit.insert(index) {
+            break;
+        }
+        at = scene.nodes[index]
+            .parent
+            .filter(|parent| *parent < scene.nodes.len());
+    }
+    lit
+}
+
 /// A line's tone: how strong it is drawn, and whether dotted. A hub's line to its node is a
 /// little stronger than its lines to its neighbours, the pointed and the selected chip's lines
-/// stand out, and a closed hub hangs on a dotted line.
+/// stand out, as do the lines of the way back from the pointed chip to the root (`lit`), and a
+/// closed hub hangs on a dotted line.
 fn line_tone(
     scene: &Scene,
     from: usize,
     to: usize,
     hovered: Option<usize>,
     selected: Option<usize>,
+    lit: &HashSet<usize>,
 ) -> Tone {
     let touches = |i: Option<usize>| i.is_some_and(|i| from == i || to == i);
+    // A line of the way back joins a lit chip to the chip it hangs off.
+    let on_way_back = lit.contains(&from)
+        && lit.contains(&to)
+        && (scene.nodes[from].parent == Some(to) || scene.nodes[to].parent == Some(from));
     let kinds = (&scene.nodes[from].kind, &scene.nodes[to].kind);
     let hub_link = matches!(kinds.0, SceneKind::Hub { .. } | SceneKind::More { .. })
         || matches!(kinds.1, SceneKind::Hub { .. } | SceneKind::More { .. });
@@ -491,7 +516,7 @@ fn line_tone(
         };
         scene.nodes[node].parent != Some(hub)
     };
-    let alpha = if touches(hovered) {
+    let alpha = if touches(hovered) || on_way_back {
         0.45
     } else if touches(selected) {
         0.28
@@ -1150,6 +1175,54 @@ fn crosses(points: &[Point<Pixels>], bounds: Bounds<Pixels>, margin: f32) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pointing at a chip lights the way it was reached: its line, and every line back to the
+    /// root through the chips it hangs off, at the pointed tone; a sibling's line stays as it
+    /// was. Before, only the pointed chip's own lines lit.
+    #[test]
+    fn pointing_at_a_chip_lights_its_way_back_to_the_root() {
+        use crate::model::{SceneEdge, SceneId};
+        use graph_store::NodeRef;
+        // root (0) → hub (1) → a (2), b (3); a → hub (4) → c (5).
+        let parents = [None, Some(0), Some(1), Some(1), Some(2), Some(4)];
+        let scene = Scene {
+            nodes: parents
+                .iter()
+                .enumerate()
+                .map(|(i, parent)| SceneNode {
+                    id: SceneId::Node(NodeRef::new("T", i.to_string())),
+                    kind: SceneKind::Node {
+                        node: NodeRef::new("T", i.to_string()),
+                        root: i == 0,
+                        expanded: true,
+                    },
+                    label: i.to_string(),
+                    color_key: "T".into(),
+                    parent: *parent,
+                    path: None,
+                })
+                .collect(),
+            edges: parents
+                .iter()
+                .enumerate()
+                .filter_map(|(i, parent)| parent.map(|p| SceneEdge { from: p, to: i }))
+                .collect(),
+            capped: None,
+            cap: 0,
+        };
+        let lit = way_back(&scene, Some(5));
+        assert_eq!(lit, HashSet::from([5, 4, 2, 1, 0]));
+        let pointed = (0.45 * 1000.) as u16;
+        for edge in &scene.edges {
+            let tone = line_tone(&scene, edge.from, edge.to, Some(5), None, &lit);
+            if edge.to == 3 {
+                assert!(tone.alpha < pointed, "a sibling's line stays faint");
+            } else {
+                assert_eq!(tone.alpha, pointed, "{} → {} lights", edge.from, edge.to);
+            }
+        }
+        assert!(way_back(&scene, None).is_empty());
+    }
 
     /// An opened chip's name wraps into lines of even length, and one that fits stays whole.
     #[test]
