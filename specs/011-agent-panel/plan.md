@@ -204,7 +204,9 @@ context window at 85 % or more (the gauge, "88% of the context window used", the
 and, once the agent's branch exists, the branch ("`agent/<stamp>` · ✎ N · **Review**"), also
 when it was made before the conversation came back (the record's `branch_created`), with ✎ N
 the changes committed on it since the conversation opened in the tab, shown when there are any;
-Review switches the session to the agent branch and opens spec 008's review. The composer's
+Review opens the agent's branch as spec 008's review, and the window stays on the branch it
+reads (since 2026-11-14; before, it moved the session to the agent's branch first, so the
+person's next edit went there). The composer's
 gutter mark and the banner across the panel are gone. Queued messages sit above the card.
 
 ### Actions
@@ -400,6 +402,7 @@ Effort, Fast mode and Agent; the test agent offers the same five.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-11-14 | Review opens the agent's branch and leaves the window where it is | `agent_panel` `panel::tests::review_opens_the_agents_branch_and_leaves_the_window_where_it_is` (a panel on main with a made branch `agent/one`: Review dispatches `OpenBranch` for it, and the session is still on main; with no branch, nothing) | Passed. Before, Review called `set_branch` and then `ReviewBranch` |
 | 2026-11-06 | Agents start in a Studio launched from Finder, a missing program is named, and a waiting message shows once | `agent_panel` `program::tests::the_agent_path_puts_the_shells_folders_first_and_lists_each_once`, `the_path_is_read_between_the_marks`, `the_login_shell_is_read_once_it_answers_and_given_up_on_when_it_hangs`, `a_program_is_found_on_the_path_or_named_as_missing`, `the_settings_path_wins_and_a_missing_program_is_named`, `panel::tests::a_message_sent_again_while_it_waits_is_held_once`; `cargo test -p agent_panel`, clippy `-D warnings`; a debug bundle (`script/bundle-mac --debug`) started with `open`, so with launchd's PATH, a new conversation with Codex | Pass. Before: launched from the Dock, Claude Agent stopped with "env: npx: No such file or directory" (exit 127, the line repeated in a code block) and Codex with "No such file or directory (os error 2)"; "Choose an agent to send this to." showed twice and a message sent again showed both in the thread and as "1 queued message". After: `npx` ran `@agentclientprotocol/codex-acp` under `node` and Codex reached its ready footer (Full access, High, its model); the missing-program message is checked by test, not in the app. A Claude conversation was not run |
 | 2026-10-29 | The model menu lists each agent's models, and a model of another agent runs that agent | `agent_panel` `sessions::tests::an_agents_models_are_kept_apart_from_its_options`; `cargo test -p agent_panel`, clippy `-D warnings` | Pass. The menu is not drawn by a test |
 | 2026-10-29 | A conversation runs the agent it was held with, starts it when shown, and joins the list on its first message | `agent_panel` `panel::tests::a_conversation_runs_the_agent_it_was_held_with` (held agent, default, a custom command offered beside the presets), `a_restored_conversation_starts_its_agent_when_shown`; `cargo test -p agent_panel`, clippy `-D warnings` | Pass. The menu and the in-place switch are not drawn by a test; checked by hand in the running app |
