@@ -1689,18 +1689,16 @@ impl TypeTable {
         }
         // The same text naming some type's nodes otherwise (spec 002, "Node names"): the table
         // keeps its columns, filters, order and grouping, its rows at its commit and an edit
-        // open in them, and reads again at that commit what names neighbours: its relationship
-        // cells, and the sections of a grouping by neighbours.
-        if self
+        // open in them, and its relationship cells, whose neighbours of a type named otherwise
+        // take their new names in place ([`Self::rename_relations`]). A grouping by neighbours
+        // names its sections by them, and is read again.
+        if let Some(was) = self
             .schema
-            .as_ref()
-            .is_some_and(|current| current.source == schema.source)
+            .clone()
+            .filter(|current| current.source == schema.source)
         {
+            let renamed = schema.renamed_since(&was);
             self.schema = Some(schema);
-            self.relations.clear();
-            self.relation_tasks.clear();
-            self.relations_asked.clear();
-            self.relation_lines = None;
             self.cell_text.borrow_mut().clear();
             let by_neighbours = self.grouping.as_ref().is_some_and(|grouping| {
                 matches!(
@@ -1709,13 +1707,17 @@ impl TypeTable {
                 )
             });
             if by_neighbours {
+                self.relations.clear();
+                self.relation_tasks.clear();
+                self.relations_asked.clear();
+                self.relation_lines = None;
                 // Its sections are read again; the open edit's text stays, as the cell's draft.
                 if let Some(editing) = self.editing.take() {
                     self.keep_edit(editing, cx);
                 }
                 self.reload(true, cx);
             } else {
-                self.load_shown_relations(cx);
+                self.rename_relations(&renamed, None, cx);
                 cx.notify();
             }
             return;
@@ -5039,7 +5041,7 @@ impl TypeTable {
                 };
                 let (whole, rest) = NeighbourLists::read(&output.rows).split(sampled, &counts);
                 let shown = this.update(cx, |this, cx| {
-                    this.show_neighbours(&key, whole);
+                    this.show_neighbours(&schema, &key, whole, cx);
                     if rest.is_empty() {
                         this.relation_tasks.remove(&task_id);
                     }
@@ -5067,7 +5069,7 @@ impl TypeTable {
                     // A row this read does not hold whole either shows its count alone.
                     if let Some(output) = output {
                         let (whole, _) = NeighbourLists::read(&output.rows).split(rest, &counts);
-                        this.show_neighbours(&key, whole);
+                        this.show_neighbours(&schema, &key, whole, cx);
                         cx.notify();
                     }
                 })
@@ -5078,13 +5080,131 @@ impl TypeTable {
     }
 
     /// Shows the chips of rows whose whole lists of neighbours through relationship `key` were
-    /// read; their counts show already.
-    fn show_neighbours(&mut self, key: &str, whole: Vec<(String, NeighbourList)>) {
+    /// read under `read_under`; their counts show already. When the schema names their type
+    /// otherwise since (spec 002, "Node names"), their names are read again under it.
+    fn show_neighbours(
+        &mut self,
+        read_under: &Arc<SchemaModel>,
+        key: &str,
+        whole: Vec<(String, NeighbourList)>,
+        cx: &mut Context<Self>,
+    ) {
+        let rows: Vec<String> = whole.iter().map(|(id, _)| id.clone()).collect();
         for (id, neighbours) in whole {
             if let Some(relation) = self.relations.get_mut(&id, key) {
                 relation.neighbours = neighbours;
                 relation.whole = true;
             }
+        }
+        if let Some(now) = self.schema.clone()
+            && !Arc::ptr_eq(&now, read_under)
+            && now.source == read_under.source
+        {
+            let renamed = now.renamed_since(read_under);
+            self.rename_relations(&renamed, Some((key, &rows)), cx);
+        }
+    }
+
+    /// The node type at the other end of relationship column `key`.
+    fn relation_type<'a>(&self, schema: &'a SchemaModel, key: &str) -> Option<&'a str> {
+        let (direction, edge) = builder::parse_relationship_key(key)?;
+        schema
+            .relationships_of(&self.type_name)
+            .iter()
+            .find(|group| group.edge == edge && group.direction == direction)
+            .map(|group| group.other_type.as_str())
+    }
+
+    /// Names the neighbours the relationship cells show of the `renamed` types by what names
+    /// them now, in place (spec 002, "Node names"): every cell keeps its count and chips, and
+    /// the names are read at the table's commit, a read per type of at most 500 ids
+    /// ([`GraphSession::node_names`]), none for a type now named by its key. `only` limits it to
+    /// one column's rows. Before, every relationship cell was let go and read again, whatever
+    /// type it reached: the chips emptied, then filled column by column.
+    fn rename_relations(
+        &mut self,
+        renamed: &std::collections::BTreeSet<String>,
+        only: Option<(&str, &[String])>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(schema) = self.schema.clone() else {
+            return;
+        };
+        let mut ends: Vec<(String, String)> = Vec::new();
+        let mut seen: HashSet<(String, String)> = HashSet::new();
+        for (row, cells) in &self.relations.0 {
+            for (key, relation) in cells {
+                if only.is_some_and(|(column, rows)| column != key || !rows.contains(row)) {
+                    continue;
+                }
+                let Some(other) = self.relation_type(&schema, key) else {
+                    continue;
+                };
+                if !renamed.contains(other) {
+                    continue;
+                }
+                for (id, _) in &relation.neighbours {
+                    let end = (other.to_owned(), id.clone());
+                    if seen.insert(end.clone()) {
+                        ends.push(end);
+                    }
+                }
+            }
+        }
+        let snapshot = self.paging.pinned.clone();
+        for chunk in ends.chunks(graph_store::NAME_LIMIT) {
+            let asked: HashSet<(String, String)> = chunk.iter().cloned().collect();
+            let read = self.session.update(cx, |session, cx| {
+                session.node_names(chunk.to_vec(), snapshot.clone(), cx)
+            });
+            self.next_relation_task += 1;
+            let task_id = self.next_relation_task;
+            // The schema the names are read under: a read that lands after another choice names
+            // nothing of a type named otherwise since.
+            let read_under = schema.clone();
+            let task = cx.spawn(async move |this, cx| {
+                let (names, answered) = read.await;
+                this.update(cx, |this, cx| {
+                    this.relation_tasks.remove(&task_id);
+                    let Some(schema) = this.schema.clone() else {
+                        return;
+                    };
+                    let named_by = |schema: &SchemaModel, other: &str| {
+                        schema
+                            .node(other)
+                            .and_then(|node| node.label_property())
+                            .map(str::to_owned)
+                    };
+                    let mut cells = std::mem::take(&mut this.relations.0);
+                    for row in cells.values_mut() {
+                        for (key, relation) in row.iter_mut() {
+                            let Some(other) = this.relation_type(&schema, key) else {
+                                continue;
+                            };
+                            if named_by(&schema, other) != named_by(&read_under, other) {
+                                continue;
+                            }
+                            for (id, label) in &mut relation.neighbours {
+                                let end = (other.to_owned(), id.clone());
+                                if !asked.contains(&end) {
+                                    continue;
+                                }
+                                // A node left out of an answered read has no name besides its
+                                // key; one a failed read left out keeps the name it showed.
+                                match names.get(&end) {
+                                    Some(name) => *label = Some(name.clone()),
+                                    None if answered => *label = None,
+                                    None => {}
+                                }
+                            }
+                        }
+                    }
+                    this.relations.0 = cells;
+                    cx.notify();
+                })
+                .ok();
+            });
+            self.relation_tasks.insert(task_id, task);
         }
     }
 
@@ -15423,6 +15543,135 @@ mod tests {
             }
             sent
         })
+    }
+
+    /// Naming a type's nodes by another property (spec 002, "Node names") renames them in place
+    /// in a table's relationship cells, a node page and a peek: every count, chip, row and open
+    /// group stays as it is through the change, the other relationships are not read again,
+    /// and one read for each view names its companies at the commit shown. Before, the table let go of every
+    /// relationship cell and read all six columns again, and the page and the peek read every
+    /// group with neighbours again whole, closing each and showing it loading.
+    #[gpui::test]
+    async fn naming_nodes_otherwise_renames_them_in_place(cx: &mut TestAppContext) {
+        const CODED: &str = "node Person {\n  slug: String @key\n  name: String\n}\nnode Company {\n  slug: String @key\n  name: String\n  code: String?\n}\nedge WorksAt: Person -> Company\nedge Founded: Person -> Company\nedge Knows: Person -> Person\nedge Likes: Person -> Person\n";
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+            cx.set_global(studio_settings::StudioSettings::default());
+        });
+        let graph = std::sync::Arc::new(circle());
+        let answers = graph.clone();
+        let (session, _writer) = session_followed(
+            CODED,
+            move |read| {
+                match read["name"].as_str() {
+                // Companies by their code, which is "Code" and the key.
+                Some("studio_node_labels") => serde_json::Value::Array(
+                    read["params"]["ids"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|id| serde_json::json!({ "id": id, "label": format!("Code {}", id.as_str().unwrap()) }))
+                        .collect(),
+                ),
+                _ => answers.answer(read),
+            }
+            },
+            cx,
+        );
+        let mut app = cx.clone();
+        let table_session = session.clone();
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                table_session,
+                "Person".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let page_session = session.clone();
+        let (page, page_cx) = app.add_window_view(move |_, cx| {
+            crate::peek::NodePeek::page(page_session, "Person".into(), "p1".into(), None, cx)
+        });
+        page_cx.run_until_parked();
+        let works_at = |table: &TypeTable| {
+            table
+                .relations
+                .get("p1", "out:WorksAt")
+                .map(|relation| (relation.count.clone(), relation.neighbours.clone()))
+        };
+        let before = table.read_with(cx, |table, _| works_at(table));
+        assert_eq!(
+            before,
+            Some((
+                Ok(1),
+                vec![("c1".to_owned(), Some("Analytical Engines".to_owned()))]
+            ))
+        );
+        let shown = page.read_with(cx, |page, _| page.groups_shown());
+        let company = |shown: &[crate::peek::GroupShown]| {
+            shown
+                .iter()
+                .find(|(key, ..)| key == "out:WorksAt")
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(
+            company(&shown),
+            (
+                "out:WorksAt".to_owned(),
+                Loadable::Loaded(1),
+                true,
+                Some(vec![Some("Analytical Engines".to_owned())])
+            )
+        );
+        session.update(cx, |session, _| session.ledger_mut().clear());
+
+        let key = session.read_with(cx, |session, _| session.overrides_key());
+        cx.update(|_, cx| {
+            cx.update_global::<studio_settings::StudioSettings, _>(|settings, _| {
+                settings.set_label(&key, "Company", Some("code".into()))
+            })
+        });
+        // At once: every cell and group as it was, named as before.
+        assert_eq!(table.read_with(cx, |table, _| works_at(table)), before);
+        assert_eq!(page.read_with(cx, |page, _| page.groups_shown()), shown);
+        cx.run_until_parked();
+        assert_eq!(
+            table.read_with(cx, |table, _| works_at(table)),
+            Some((Ok(1), vec![("c1".to_owned(), Some("Code c1".to_owned()))]))
+        );
+        let renamed = page.read_with(cx, |page, _| page.groups_shown());
+        assert_eq!(
+            company(&renamed).3,
+            Some(vec![Some("Code c1".to_owned())]),
+            "renamed in place"
+        );
+        // Every other group, and the company's count and openness, as before.
+        let unnamed = |shown: Vec<crate::peek::GroupShown>| {
+            shown
+                .into_iter()
+                .map(|(key, count, open, names)| {
+                    let names = (key != "out:WorksAt").then_some(names).flatten();
+                    (key, count, open, names)
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(unnamed(renamed), unnamed(shown));
+        session.read_with(cx, |session, _| {
+            let ledger = session.ledger();
+            let table = ledger.table();
+            // The table's companies (c1 and c2) and the page's (c1), and nothing else.
+            assert_eq!(ledger.sent(), 2, "{table}");
+            assert_eq!(
+                ledger.count("studio_node_labels", |a| a.sent()),
+                2,
+                "{table}"
+            );
+        });
     }
 
     /// The ledger's measure of opening a table, a row's page and then the row's peek (spec

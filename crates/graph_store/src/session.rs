@@ -321,8 +321,8 @@ const COMMIT_CHANGE_BYTES: usize = 32 * 1024 * 1024;
 /// Ids per read of [`GraphSession::node_names`], and the most nodes one call names: a review
 /// of 20,000 changes asks a bounded number of small reads, and an end past the limit keeps its
 /// id.
-const NAME_BATCH: usize = 500;
-const NAME_LIMIT: usize = 5_000;
+pub(crate) const NAME_BATCH: usize = 500;
+pub const NAME_LIMIT: usize = 5_000;
 
 /// What a read answers when the connection's token changed while it was out
 /// ([`GraphSession::counted_read`]): the server's answer was the old token's, so none of it is
@@ -2327,6 +2327,21 @@ impl GraphSession {
             }
             result
         })
+    }
+
+    /// [`GraphSession::read`] asked by `scope`'s view, adding nothing to what the scope holds:
+    /// for an answer about nodes the view already shows, whose changes the scope already
+    /// counts, such as their names under another choice of property (spec 002, "Node
+    /// names"). [`Self::read_in`] would add the answer's own dependencies, which for names by
+    /// id are their whole type.
+    pub(crate) fn read_as(
+        &mut self,
+        scope: &ReadScope,
+        query: &BuiltQuery,
+        snapshot: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<ReadOutput, ReadError>> {
+        self.asked_by(scope.id, |this| this.read(query, snapshot, cx))
     }
 
     /// Reads `query` through `scope` while the view follows the branch ([`Self::read_in`]),

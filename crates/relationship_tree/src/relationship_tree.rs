@@ -715,13 +715,28 @@ impl RelationshipTree {
         }
     }
 
-    fn expand_all(&mut self, _: &ExpandAll, _: &mut Window, cx: &mut Context<Self>) {
+    fn expand_all(&mut self, _: &ExpandAll, window: &mut Window, cx: &mut Context<Self>) {
         let Some(entry) = self.selected_entry().cloned() else {
             return;
         };
         match entry.kind {
+            // Asked first past what opens without asking (spec 006, "Expand all").
             EntryKind::Node { .. } | EntryKind::Group { .. } => {
-                self.with_exploration(cx, |e, cx| e.expand_all(&entry.path, cx));
+                let path = entry.path.clone();
+                let opening = self
+                    .exploration
+                    .read(cx)
+                    .opening(std::slice::from_ref(&path), true);
+                let exploration = self.exploration.clone();
+                let expand = move |_: &mut Window, cx: &mut App| {
+                    exploration.update(cx, |e, cx| e.expand_all(&path, cx));
+                };
+                if opening.asks() {
+                    let (title, description, action) = opening.question();
+                    studio_workspace::confirm(window, cx, title, description, action, expand);
+                } else {
+                    expand(window, cx);
+                }
             }
             EntryKind::Bucket { .. } => {
                 self.with_exploration(cx, |e, cx| e.expand(&entry.path, cx));

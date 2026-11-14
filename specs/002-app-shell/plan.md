@@ -451,6 +451,14 @@ Its action is not registered, so the palette and the keyboard button's list leav
     ("Name rows by") and the settings tab's "Node names" section, which the tab offers with a
     graph open: a row per type, its automatic choice described, a dropdown of the properties
     that can name it, and Reset.
+    A view keeps what it shows through a new choice and renames it in place (since
+    2026-11-14): the tree and canvas, a table's relationship cells, a node page and a peek keep
+    every row, count, chip, open group and place, and read the names of the nodes they hold of
+    the types named otherwise at the commit they show, a read per type of at most 500 ids
+    (`studio_node_labels`), none for a type now named by its key (`SchemaModel::renamed_since`).
+    Before, each let go of what names neighbours and read it again: the tree and canvas
+    emptied to their root, a table's chips gave way to bare counts, and a page's groups closed
+    and showed as loading.
 - `studio_theme` implements `theme::ThemeSettingsProvider` from these settings: UI font,
   buffer font, sizes, density.
 - **Gray tones** (since 2026-10-20). The default themes are Studio Light and Studio Dark
@@ -1026,6 +1034,7 @@ opens a link from inside Studio.
 ## Validation log
 
 | Date | Claim | Check | Result |
+| 2026-11-14 | A new node name renames what views show in place ("Node names") | `type_table` `naming_nodes_otherwise_renames_them_in_place` (a Person table and Ada's page, Company named by `code`: at once every cell and group as it was, then renamed; 2 reads, one a view, nothing else), failing with the old reading again (the table's cell gone at once); `graph_store` tests in spec 005's log; offscreen frames on the dense graph through a 700 ms proxy, Topic named by category, of an Artifact table and Topic `topic-00325`'s page | Before: the table's topic chips gave way to bare counts with 4 reads running, back renamed at +2.2 s; the page's relationship list grew from 4 groups to 9 as empty ones came back unread, Broader closed, 6 reads running. After: the chips and groups stay; one read each, the names changing in place, and the page's title at once from the values held |
 | 2026-11-05 | Focus mode shows the active tab alone, full screen, and the markdown editor writes in a centred column | `studio_workspace` `focus_mode_shows_the_active_tab_alone_full_screen` (⌃⌘↵ in, the tab told, the window full screen, no tab strip; another tab activated takes its place; Escape out of full screen; a window already full screen stays so; closing the last tab ends it), `type_table` `focus_mode_hides_the_toolbar_until_something_needs_the_person`; offscreen snapshots of Keyset paging's body against the sample graph: ⌘⇧↵, a line typed, Escape | All pass. The first snapshot caught ⌘⇧↵ bound under `TextEditor` alone: Zed's editor took it as Newline Above, so it is bound under `TextEditor > Editor` too. A split editor alone on the screen still showed the preview, so Split shows the text only while in focus mode |
 | 2026-11-01 | Memory and CPU show by default again | `studio_settings` tests (`default.json` against the struct) | Ragnor asked for the readout back; the setting stays under Appearance for turning it off |
 | 2026-11-01 | A tooltip is measured where it draws: it stays inside the window at its real width, and hangs over its control when its lines would run past the bottom; no panel but the inspector docks right | `studio_ui` `tooltip` `a_tooltip_sits_under_its_control_and_flips_at_the_bottom` (one line fits under a control 50 px from the bottom, two flip above); `studio_workspace` `a_panel_goes_where_the_settings_place_it` (a panel saved in the right dock goes home); offscreen snapshots of a strip segment and the Collapse all button at the window's right | The frame hangs from a GPUI `anchored` at the control's corner with `snap_to_window_with_margin`, so a short tooltip at the right edge no longer sits 100–280 px left of its control as the fixed 288 px estimate placed it; the flip still goes by an estimate of the lines (`size::TOOLTIP_HEIGHT` each), since the height is known only once drawn. The panel menu offers Left and Bottom only: the right dock draws no panel buttons, so a panel moved there had no way back |

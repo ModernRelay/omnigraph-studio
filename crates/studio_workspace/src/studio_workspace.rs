@@ -7,6 +7,7 @@
 //! Studio rather than forked: Studio has no projects, collaboration or Zed database. Feature
 //! crates attach to it with `cx.observe_new::<Workspace>` and `Workspace::register_action`.
 
+mod confirm;
 mod item;
 pub mod models;
 mod open_failure;
@@ -51,6 +52,7 @@ use studio_ui::menu::{ContextMenu, ContextMenuEntry, ContextMenuItem};
 use ui::prelude::*;
 use ui::{ButtonLike, PopoverMenu, right_click_menu};
 
+pub use confirm::{Confirm, confirm};
 use item::ItemHandle;
 pub use item::{Item, ItemEvent, ItemStatus, KeyHint};
 pub use open_failure::open_failure;
@@ -6239,6 +6241,58 @@ mod tests {
     }
 
     impl ModalView for Other {}
+
+    /// A question runs its action only once the person agrees, with ↵ or its button; Esc
+    /// closes it and runs nothing (spec 006, "Expand all").
+    #[gpui::test]
+    fn a_question_runs_its_action_only_once_agreed(cx: &mut gpui::TestAppContext) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            cx.set_global(StudioSettings::default());
+        });
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        let ran = std::sync::Arc::new(AtomicUsize::new(0));
+        let ask = |cx: &mut gpui::VisualTestContext| {
+            let ran = ran.clone();
+            cx.update(|window, cx| {
+                confirm(
+                    window,
+                    cx,
+                    "Expand 140 nodes?",
+                    "It reads 2,800 counts.",
+                    "Expand",
+                    move |_, _| {
+                        ran.fetch_add(1, Ordering::SeqCst);
+                    },
+                )
+            });
+            cx.run_until_parked();
+            workspace.read_with(cx, |workspace, _| {
+                workspace
+                    .modal
+                    .as_ref()
+                    .and_then(|modal| modal.view.clone().downcast::<Confirm>().ok())
+                    .expect("asked")
+            })
+        };
+        let open = |cx: &mut gpui::VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| workspace.modal.is_some())
+        };
+
+        ask(cx);
+        assert_eq!(ran.load(Ordering::SeqCst), 0, "not before an answer");
+        cx.dispatch_action(menu::Cancel);
+        cx.run_until_parked();
+        assert!(!open(cx));
+        assert_eq!(ran.load(Ordering::SeqCst), 0, "Esc runs nothing");
+
+        ask(cx);
+        cx.dispatch_action(menu::Confirm);
+        cx.run_until_parked();
+        assert!(!open(cx));
+        assert_eq!(ran.load(Ordering::SeqCst), 1, "agreed: run once");
+    }
 
     #[gpui::test]
     fn a_busy_modal_stays_open_until_it_agrees(cx: &mut gpui::TestAppContext) {
