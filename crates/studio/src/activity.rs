@@ -7,7 +7,7 @@ use gpui::{Context, Entity, Render, Subscription, Task, WeakEntity, Window, unif
 use graph_store::{
     GraphSession, HeldAs, Loadable, MergeSettled, OutcomeEntry, OutcomeKind, SessionEvent,
 };
-use studio_actions::graph::OpenHistory;
+use studio_actions::graph::OpenBranchHistory;
 use studio_ui::ds::Tipped;
 use studio_workspace::{Workspace, WorkspaceEvent};
 use ui::prelude::*;
@@ -113,11 +113,12 @@ impl ActivityLog {
         }));
     }
 
-    /// Opens History on `branch`, where a write whose outcome nobody knows went: whether it
-    /// landed is read there (constitution III). The graph is the one the window shows, whose
-    /// writes the log lists; the window moves to the branch first, as a toast's Open history
-    /// did before errors folded into the log. Never to a branch the session's list does not
-    /// hold ([`history_refusal`]), which the row's button is disabled for.
+    /// Opens the History of `branch`, where a write whose outcome nobody knows went: whether
+    /// it landed is read there (constitution III). The graph is the one the window shows, whose
+    /// writes the log lists, and it stays on the branch it reads: looking at a branch is not a
+    /// move to it, so the next edit goes where the top bar says, as before the press. Never for
+    /// a branch the session's list does not hold ([`history_refusal`]), which the row's button
+    /// is disabled for.
     fn open_history(&mut self, branch: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(session) = &self.session else {
             return;
@@ -125,8 +126,13 @@ impl ActivityLog {
         if history_refusal(&branch, &session.read(cx).branches).is_some() {
             return;
         }
-        session.update(cx, |session, cx| session.set_branch(branch, cx));
-        window.dispatch_action(Box::new(OpenHistory), cx);
+        window.dispatch_action(
+            Box::new(OpenBranchHistory {
+                branch,
+                preview: false,
+            }),
+            cx,
+        );
     }
 }
 
@@ -275,8 +281,7 @@ fn history_to_check(entry: &OutcomeEntry) -> Option<&str> {
 /// Why History cannot be opened on `branch`, when the branch list the session holds does not
 /// have it: a log row outlives its toast and the branch it names, which may have been deleted
 /// since (a merge's target), or never made (a create whose outcome nobody knows that did not
-/// land), and Open history moves the window to that branch first. `None` when the list holds
-/// it.
+/// land), and a history of no branch has nothing to read. `None` when the list holds it.
 fn history_refusal(branch: &str, branches: &Loadable<Vec<String>>) -> Option<String> {
     match branches.loaded() {
         Some(listed) if listed.iter().any(|listed| listed == branch) => None,
@@ -443,9 +448,10 @@ mod tests {
     }
 
     /// A write whose outcome nobody knows offers its branch's History in its row, as its toast
-    /// did before errors folded into the log: pressed, the window moves to the branch the write
-    /// went to and History opens there. A refused write's row offers nothing. Before, the row
-    /// only said to check History in its tooltip.
+    /// does: pressed, the History of the branch the write went to opens, and the window stays
+    /// on the branch it reads. A refused write's row offers nothing. Before, the press moved
+    /// the window to the write's branch first, so the next edit went to a branch the person
+    /// had only looked at; and before that, the row only said to check History in its tooltip.
     #[gpui::test]
     async fn an_unknown_outcome_opens_its_branchs_history(cx: &mut TestAppContext) {
         use std::{cell::RefCell, rc::Rc};
@@ -461,17 +467,22 @@ mod tests {
         served.lock().unwrap().branches.push("fix".into());
         cx.run_until_parked();
         let (workspace, cx) = cx.add_window_view(Workspace::new);
-        // The graph and branch the window shows each time History is opened.
-        let opened: Rc<RefCell<Vec<(String, String)>>> = Rc::default();
+        // Each time History is opened: the graph the window shows, the branch whose history
+        // it is, and the branch the window is on.
+        let opened: Rc<RefCell<Vec<(String, String, String)>>> = Rc::default();
         workspace.update_in(cx, |workspace, window, cx| {
             workspace.set_session(session.clone(), window, cx);
             let handle = cx.entity().downgrade();
             let log = cx.new(|cx| ActivityLog::new(handle, Some(session.clone()), window, cx));
             workspace.set_activity_view(log.into(), cx);
             let opened = opened.clone();
-            workspace.register_action(move |workspace, _: &OpenHistory, _, cx| {
+            workspace.register_action(move |workspace, action: &OpenBranchHistory, _, cx| {
                 let shown = workspace.session().unwrap().read(cx);
-                let at = (shown.graph_id.clone(), shown.branch.clone());
+                let at = (
+                    shown.graph_id.clone(),
+                    action.branch.clone(),
+                    shown.branch.clone(),
+                );
                 opened.borrow_mut().push(at);
             });
         });
@@ -505,7 +516,15 @@ mod tests {
         cx.simulate_click(button.center(), gpui::Modifiers::none());
         cx.run_until_parked();
         let graph = session.read_with(cx, |session, _| session.graph_id.clone());
-        assert_eq!(*opened.borrow(), [(graph, "fix".to_owned())]);
+        assert_eq!(
+            *opened.borrow(),
+            [(graph, "fix".to_owned(), "main".to_owned())],
+            "fix's history, with the window still on main"
+        );
+        assert_eq!(
+            session.read_with(cx, |session, _| session.branch.clone()),
+            "main"
+        );
     }
 
     /// Open history is offered while an outcome is unsettled and on a branch the session's
@@ -572,9 +591,8 @@ mod tests {
             let log = cx.new(|cx| ActivityLog::new(handle, Some(session.clone()), window, cx));
             workspace.set_activity_view(log.into(), cx);
             let opened = opened.clone();
-            workspace.register_action(move |workspace, _: &OpenHistory, _, cx| {
-                let branch = workspace.session().unwrap().read(cx).branch.clone();
-                opened.borrow_mut().push(branch);
+            workspace.register_action(move |_, action: &OpenBranchHistory, _, _| {
+                opened.borrow_mut().push(action.branch.clone());
             });
         });
         // A merge into main nobody knows the outcome of, then a write to fix alike.
