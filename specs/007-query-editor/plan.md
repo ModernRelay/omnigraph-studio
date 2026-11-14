@@ -184,7 +184,9 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
   up to 32 MB (`graph_client`'s cap on every query and stored read): a longer one shows
   nothing of itself and says "The answer is over 32 MB, the most Studio reads at once. Add a
   `limit` to the query, or return fewer properties". F6 moves the keyboard to the result grid
-  and back; ↑↓←→ move its cell, ⌘C copies the cell and ⌘⇧C the row. Rows read at the
+  and back; ↑↓←→ move its cell, ⌘C copies the cell and ⌘⇧C the row. The inspector shows the
+  selected cell (spec 020, since 2026-11-14): the node it holds, read where the rows were, or
+  else its row, every column in full. Rows read at the
   session branch's head offer "Newer data · Refresh" in the toolbar, and the tab its stale
   dot, once the branch's head moves past the commit they were read at (constitution II, since
   2026-10-21); Refresh or ⌘R reads the same read again, and nothing is read by itself. A
