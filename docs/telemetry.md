@@ -14,7 +14,7 @@ Three builds of Studio had telemetry, all made between 12 and 14 November 2026. 
 | The edge build of 13 November 2026 | As 0.4.5 | As 0.4.5 |
 | The earlier edge build of 14 November 2026 | Asked first, and sent none until you answered | As 0.4.5 |
 
-No other version, before or after, sends any of this. The later edge build of 14 November 2026, offered since 21:44 UTC that day, is version 0.4.7 and has no telemetry. Nothing was sent from a development build, or while `DO_NOT_TRACK` or `OMNIGRAPH_STUDIO_TELEMETRY=0` was set.
+No other version, before or after, sends any of this. Every edge build downloaded from 21:45 UTC on 14 November 2026 is version 0.4.7 or later and has no telemetry. One of the three builds can be told by the Privacy section in its Settings, which no other build has. Nothing was sent from a development build, or while `DO_NOT_TRACK` or `OMNIGRAPH_STUDIO_TELEMETRY=0` was set.
 
 If you run one of these builds, update to 0.4.7 or later. To stop its reports without updating, open the status bar's notice and turn usage data off, or set usage data to off and crash reports to never under Settings, Privacy.
 

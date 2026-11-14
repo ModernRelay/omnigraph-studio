@@ -77,8 +77,9 @@ under your account with them. Studio runs no agent until you choose one.
 
 Three builds of Studio sent reports to us: version 0.4.5, released on 13 November 2026, and two
 pre-release ("edge") builds, the one of 13 November 2026 and the earlier of the two made on
-14 November 2026. No version before or after them sends any. The later edge build of
-14 November, offered since 21:44 UTC that day, is version 0.4.7 and sends none. None of the
+14 November 2026. No version before or after them sends any. Every edge build downloaded from
+21:45 UTC on 14 November 2026 is version 0.4.7 or later and sends none. You can tell one of the
+three builds by the Privacy section in its Settings, which no other build has. None of the
 three sent anything while the `DO_NOT_TRACK` or `OMNIGRAPH_STUDIO_TELEMETRY=0` environment
 variable was set.
 
