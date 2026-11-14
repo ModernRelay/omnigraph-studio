@@ -20,8 +20,22 @@
       # other than Windows.
       systems = [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f system nixpkgs.legacyPackages.${system});
+      bundle = pkgs: with pkgs; [
+        cargo
+        cmake
+        pkg-config
+        fontconfig
+        libxkbcommon
+        libxcb
+      ];
     in
     {
+      devShells = forAllSystems (system: pkgs: {
+        default = pkgs.mkShell {
+          packages = bundle pkgs;
+        };
+      });
+
       packages = forAllSystems (system: pkgs:
         let
           inherit (pkgs) lib;
@@ -57,14 +71,7 @@
               # "-p" "omnigraph-studio"
             ];
 
-            nativeBuildInputs = with pkgs; [
-              cargo
-              cmake
-              pkg-config
-              fontconfig
-              libxkbcommon
-              libxcb
-            ];
+            nativeBuildInputs = bundle pkgs;
 
             # .cargo/config.toml links Linux through scripts/cargo-linker.sh,
             # which the dependency build's dummy source does not hold (naersk
