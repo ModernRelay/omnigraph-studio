@@ -2703,11 +2703,7 @@ impl GraphCanvas {
     /// The caption, bottom left: what is drawn, and what a click does.
     fn render_caption(&self, cx: &mut Context<Self>) -> impl IntoElement {
         // What a click does; the summary at the top says what is drawn.
-        let text = if self.schema_walk.is_some() {
-            "click to expand · double-click to close · ⇧-click for details"
-        } else {
-            "click to open · ⇧-click to inspect · ⇧-drag to select"
-        };
+        let text = caption(self.mode());
         // A floating bar as the summary and zoom are: one height, surface and corner.
         studio_ui::ds::float_bar("canvas-caption", cx)
             .absolute()
@@ -3035,6 +3031,17 @@ fn chip_texts(
             (text, half)
         })
         .unzip()
+}
+
+/// What a click does on a canvas in `mode`, as its caption says it; [`GraphCanvas::mouse_up`]
+/// and [`GraphCanvas::activate`] do what it says.
+fn caption(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Schema => "click to expand · double-click to close · ⇧-click for details",
+        // A result's node is selected by a click and opened by a double click (spec 006).
+        Mode::Results => "click to select · double-click to open · ⇧-click to inspect",
+        Mode::Explore => "click to open · ⇧-click to inspect · ⇧-drag to select",
+    }
 }
 
 /// How long finished reads are gathered before the canvas is laid out again: about a frame.
@@ -3838,5 +3845,113 @@ mod tests {
                 "a tab's reset leaves the graph's saved positions alone"
             );
         });
+    }
+    /// A reporting chain on a fake server: p1 reports to p2, p2 to p3, and so on up to
+    /// `length` people; the last reports to nobody. Each person's manager is a single-target
+    /// relationship, drawn as a pill.
+    pub(super) const CHAIN_SCHEMA: &str = "node Person {\n  slug: String @key\n  name: String\n}\n\
+        edge ReportsTo: Person -> Person @card(0..1)\n";
+
+    pub(super) fn chain_session(
+        length: usize,
+        cx: &mut gpui::TestAppContext,
+    ) -> Entity<GraphSession> {
+        cx.update(studio_theme::init_test);
+        let (session, _served) = graph_store::test_server::followed_session(
+            CHAIN_SCHEMA,
+            move |asked| {
+                let id = asked["params"]["id"].as_str().unwrap_or("p1").to_owned();
+                let n: usize = id.trim_start_matches('p').parse().unwrap_or(1);
+                match asked["name"].as_str() {
+                    Some("studio_node") => {
+                        serde_json::json!([{ "id": id, "label": format!("Person {n}") }])
+                    }
+                    Some("studio_neighbours") if n < length => serde_json::json!([{
+                        "id": format!("p{}", n + 1),
+                        "label": format!("Person {}", n + 1),
+                    }]),
+                    _ => serde_json::json!([]),
+                }
+            },
+            cx,
+        );
+        cx.run_until_parked();
+        session
+    }
+
+    /// Settles a canvas's reads and layouts.
+    pub(super) fn settle(cx: &mut gpui::VisualTestContext) {
+        for _ in 0..4 {
+            cx.run_until_parked();
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(50));
+        }
+        cx.run_until_parked();
+    }
+
+    /// The node a single-target relationship reaches expands on a click and on ↵, as the
+    /// caption says ("click to open"), and opens no page (H1 in the canvas UX report). Before,
+    /// a click only selected it and ↵ opened its page in another tab, so a chain of managers
+    /// stopped after one hop.
+    #[gpui::test]
+    async fn a_node_reached_through_a_single_target_relationship_expands(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let session = chain_session(3, cx);
+        let pages: Rc<RefCell<usize>> = Rc::default();
+        cx.update(|cx| {
+            let heard = pages.clone();
+            cx.on_action(move |_: &OpenNodePage, _| *heard.borrow_mut() += 1);
+        });
+        let (canvas, cx) = cx.add_window_view(|_, cx| {
+            GraphCanvas::new(session, NodeRef::new("Person", "p1"), None, cx)
+        });
+        cx.update(|window, cx| window.focus(&canvas.focus_handle(cx), cx));
+        settle(cx);
+        let exploration = canvas.read_with(cx, |canvas, _| canvas.exploration.clone());
+        // Open p1's manager pill.
+        canvas.update_in(cx, |canvas, window, cx| {
+            let hub = canvas
+                .scene
+                .nodes
+                .iter()
+                .position(|node| matches!(node.kind, SceneKind::Hub { .. }))
+                .expect("p1's manager pill");
+            canvas.activate(hub, false, window, cx);
+        });
+        settle(cx);
+        let p2 = SceneId::Node(NodeRef::new("Person", "p2"));
+        let p2_path = canvas.read_with(cx, |canvas, _| {
+            let index = canvas.index_of(&p2).expect("p2 is drawn");
+            canvas.scene.nodes[index]
+                .path
+                .clone()
+                .expect("p2 has a path")
+        });
+        // ↵ on p2 expands it, and opens no page.
+        canvas.update_in(cx, |canvas, _, cx| {
+            let index = canvas.index_of(&p2).unwrap();
+            canvas.select(Some(index), cx);
+        });
+        cx.dispatch_action(ExpandNode);
+        settle(cx);
+        assert!(exploration.read_with(cx, |e, _| e.state().is_expanded(&p2_path)));
+        assert_eq!(*pages.borrow(), 0, "no page opened");
+        // p2's own manager pill is drawn, hanging off p2.
+        canvas.read_with(cx, |canvas, _| {
+            let p2 = canvas.index_of(&p2).unwrap();
+            assert!(canvas.scene.nodes.iter().any(|node| {
+                matches!(node.kind, SceneKind::Hub { .. }) && node.parent == Some(p2)
+            }));
+        });
+    }
+
+    /// The caption says what a click does where it is drawn: a result's node is selected by
+    /// a click and opened by a double click.
+    #[test]
+    fn the_caption_says_what_a_click_does() {
+        assert!(caption(Mode::Explore).starts_with("click to open"));
+        assert!(caption(Mode::Results).starts_with("click to select · double-click to open"));
+        assert!(caption(Mode::Schema).starts_with("click to expand"));
     }
 }
