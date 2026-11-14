@@ -1361,6 +1361,15 @@ mod tests {
         let id = "0123456789abcdefghijklmnopqrstuvwxyz";
         let (lines, _) = wrap_name(id, room, CHIP_MAX_LINES, &width);
         assert_eq!(lines, ["0123456789abcdefghij", "klmnopqrstuvwxyz"]);
+        // One with no break, longer than three lines: three, the last cut, and said so.
+        let long_id: String = "0123456789abcdefghijklmnopqrstuvwxyz".repeat(2) + "ABC";
+        let (lines, cut) = wrap_name(&long_id, room, CHIP_MAX_LINES, &width);
+        assert!(cut, "{lines:?}");
+        assert_eq!(lines.len(), CHIP_MAX_LINES, "{lines:?}");
+        assert!(
+            lines[2].ends_with('…') && width(&lines[2]) <= room,
+            "{lines:?}"
+        );
         // Past three lines: cut, the last line ending in "…" within its room.
         let long = "Notes on the history of information retrieval and the systems built for it";
         let (lines, cut) = wrap_name(long, room, CHIP_MAX_LINES, &width);
