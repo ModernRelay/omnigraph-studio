@@ -24,6 +24,7 @@ pub mod rows;
 pub mod text;
 mod tooltip;
 mod values;
+pub mod window_buttons;
 
 pub use cell_text::{CellText, cell_text, shown_part};
 pub use changes::{

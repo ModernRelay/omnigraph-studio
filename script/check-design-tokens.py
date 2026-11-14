@@ -63,6 +63,7 @@ SYSTEM = {
     "crates/studio_ui/src/tooltip.rs",
     "crates/studio_ui/src/modal.rs",
     "crates/studio_ui/src/menu.rs",
+    "crates/studio_ui/src/window_buttons.rs",
 }
 # Crates that are not views: the theme itself, and those that draw nothing.
 NOT_VIEWS = {"studio_theme", "studio_settings", "studio_actions", "graph_client", "graph_store",

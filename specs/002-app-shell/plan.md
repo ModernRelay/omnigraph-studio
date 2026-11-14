@@ -201,6 +201,30 @@ what was last saved at most every 250 ms rather than serializing every tab on ev
   header (the sidebar's, else the top-left pane's), and every header strip moves the window.
   As in Zed's title bar, that room is left on macOS only, and not in full screen, where the
   lights hide with the menu bar; there the strip starts at its own edge.
+- **The window's buttons.** The top bar takes the title bar's place, so who draws minimize,
+  maximize and close depends on the platform (`studio_ui::window_buttons`, from Zed's
+  `platform_title_bar`; `WindowButtons::of` reads it each frame):
+  - **macOS** draws its traffic lights over the bar.
+  - **Windows** gives such a window no title bar and no buttons, so Studio draws the three
+    caption buttons at the top bar's right end: 36 px wide, as tall as the bar, to the
+    window's corner, restore in maximize's place while the window is maximized, and close red
+    under the pointer. A button has no click of its own. It marks its area for the system
+    (`WindowControlArea`), which presses it, shows Windows 11's snap layouts over maximize,
+    and closes as its own close would, through the window's question about unsaved tabs and a
+    write still running (since 2026-11-14; before, the window had no buttons there, and
+    closed by Alt+F4 or from the taskbar).
+  - **Linux.** A desktop that frames windows itself (X11, KDE) draws its title bar above the
+    bar. One that leaves the frame to the window (GNOME on Wayland: `Decorations::Client`)
+    draws nothing, and there Studio draws the buttons the desktop's layout names
+    (`App::button_layout`), each side's at that end of the bar, and acts on a click: close
+    asks what the system's close asks, and a double click on a header strip fills the screen
+    or comes back. The resize edges and the shadow Zed draws around such a window are not
+    built.
+  - **Full screen** has none.
+
+  The drawings are Zed's four generic ones on every platform, where Zed takes Windows' icon
+  font on Windows, so each platform's bar can be drawn offscreen anywhere
+  (`SNAPSHOT_WINDOW_BUTTONS`).
 - Status bar left: the docks' panel buttons, then one breadcrumb (since 2026-10-29, when a
   server chip and a graph chip side by side both switched graphs): the graph switcher, the
   connection's dot with server / graph (its state, `connecting…`, `contract mismatch`,
@@ -1026,6 +1050,7 @@ opens a link from inside Studio.
 ## Validation log
 
 | Date | Claim | Check | Result |
+| 2026-11-14 | The top bar draws the window's buttons where the system draws none | Read GPUI at the pin: `gpui_windows/src/window.rs:478` (`hide_title_bar` is `appears_transparent`) and `events.rs:968-976`, `1128-1150` (a marked area answers `HTCLOSE`, `HTMAXBUTTON` or `HTMINBUTTON`, and a press released on it closes, maximizes or restores, or minimizes); `gpui/src/window.rs:1703` and `gpui_linux/src/linux/wayland/window.rs:2176` (decorations asked of the server, the window's own where the desktop has none). `studio_workspace` `the_top_bar_draws_the_windows_buttons_where_the_system_draws_none` (none drawn for the system's; Windows' three side by side, as tall as the bar, to its corner) and `a_window_that_frames_itself_has_its_desktops_buttons` (close at the left and the others at the right for such a layout; a click on close asks about an unsaved tab, and the window closes once confirmed); `studio_ui` `window_buttons::tests::each_side_of_the_bar_gets_its_buttons`. Offscreen on macOS with `SNAPSHOT_WINDOW_BUTTONS`: Windows' bar at rest and with minimize and close under the pointer, and a Linux bar with all three at the right and with close at the left | Passed, and the pictures read as each platform's buttons. **Not run on Windows or on Linux**: that Windows shows no buttons today, and that these act there, is read from GPUI and from Zed's own bar at the same pin, not seen |
 | 2026-11-05 | Focus mode shows the active tab alone, full screen, and the markdown editor writes in a centred column | `studio_workspace` `focus_mode_shows_the_active_tab_alone_full_screen` (⌃⌘↵ in, the tab told, the window full screen, no tab strip; another tab activated takes its place; Escape out of full screen; a window already full screen stays so; closing the last tab ends it), `type_table` `focus_mode_hides_the_toolbar_until_something_needs_the_person`; offscreen snapshots of Keyset paging's body against the sample graph: ⌘⇧↵, a line typed, Escape | All pass. The first snapshot caught ⌘⇧↵ bound under `TextEditor` alone: Zed's editor took it as Newline Above, so it is bound under `TextEditor > Editor` too. A split editor alone on the screen still showed the preview, so Split shows the text only while in focus mode |
 | 2026-11-01 | Memory and CPU show by default again | `studio_settings` tests (`default.json` against the struct) | Ragnor asked for the readout back; the setting stays under Appearance for turning it off |
 | 2026-11-01 | A tooltip is measured where it draws: it stays inside the window at its real width, and hangs over its control when its lines would run past the bottom; no panel but the inspector docks right | `studio_ui` `tooltip` `a_tooltip_sits_under_its_control_and_flips_at_the_bottom` (one line fits under a control 50 px from the bottom, two flip above); `studio_workspace` `a_panel_goes_where_the_settings_place_it` (a panel saved in the right dock goes home); offscreen snapshots of a strip segment and the Collapse all button at the window's right | The frame hangs from a GPUI `anchored` at the control's corner with `snap_to_window_with_margin`, so a short tooltip at the right edge no longer sits 100–280 px left of its control as the fixed 288 px estimate placed it; the flip still goes by an estimate of the lines (`size::TOOLTIP_HEIGHT` each), since the height is known only once drawn. The panel menu offers Left and Bottom only: the right dock draws no panel buttons, so a panel moved there had no way back |
