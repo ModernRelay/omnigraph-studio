@@ -1007,16 +1007,15 @@ impl GraphCanvas {
                     }
                     _ => None,
                 },
-                previous: if matches!(node.kind, SceneKind::More { .. }) {
-                    None
-                } else {
-                    dragged.get(&node.id).copied().or_else(|| {
-                        pin_key(&node.id)
-                            .and_then(|key| self.pinned.get(&key))
-                            .or_else(|| self.known.get(&node.id))
-                            .copied()
-                    })
-                },
+                // A chip dragged, or placed by hand, stands where it is, with what hangs off
+                // it; where it was drawn keeps a root's chip on its side.
+                pinned: dragged.get(&node.id).copied().or_else(|| {
+                    pin_key(&node.id)
+                        .and_then(|key| self.pinned.get(&key))
+                        .copied()
+                }),
+                previous: self.known.get(&node.id).copied(),
+                half_height: layout::CHIP_HALF_HEIGHT,
             })
             .collect();
         let spacing = if self.schema_walk.is_some() {
@@ -1028,7 +1027,7 @@ impl GraphCanvas {
             scene,
             texts,
             widths,
-            move || layout::spaced_positions(&nodes, spacing),
+            move || layout::walk_positions(&nodes, spacing),
             cx,
         );
     }
@@ -1120,6 +1119,8 @@ impl GraphCanvas {
                 previous: pin_key(&node.id)
                     .and_then(|key| self.pinned.get(&key).copied())
                     .or(fixed[i]),
+                pinned: None,
+                half_height: layout::CHIP_HALF_HEIGHT,
                 side: None,
             })
             .collect();

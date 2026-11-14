@@ -77,9 +77,8 @@ const DOT: (f32, f32) = (1., 2.);
 const DASHES_PER_RUN: f64 = 100_000.;
 /// A line end's ring: its diameter, its 1 px border included, in screen pixels.
 pub(crate) const RING: f32 = 6.;
-/// How far from a node an exploration's line turns, at zoom 1: within the narrower of the gaps
-/// the exploration leaves between a node and its hubs and a hub and its neighbours.
-const ELBOW: f32 = 18.;
+/// How far from a node an exploration's line turns, at zoom 1 ([`layout::ELBOW`]).
+const ELBOW: f32 = crate::layout::ELBOW;
 
 /// What the lines are drawn from, besides the scene: each node's half width at zoom 1, where
 /// its lines meet its chip, and the world's origin on screen, so a line's dashes keep their
@@ -518,20 +517,20 @@ fn line_tone(
     }
 }
 
-/// A line from a parent node to a child as right-angle pieces: out of the parent's side towards
-/// the child, turning `turn` beyond it (or halfway, where the two are closer), and into the
-/// child's side.
+/// A line from a parent node to a child as right-angle pieces, as [`crate::layout::elbow_route`]
+/// routes it in the gutter beside the parent, on screen.
 fn elbow(
     (parent, parent_reach): (Point<Pixels>, f32),
     (child, child_reach): (Point<Pixels>, f32),
     turn: f32,
 ) -> Vec<Point<Pixels>> {
-    let side = if child.x >= parent.x { 1. } else { -1. };
-    let start = point(parent.x + px(side * parent_reach), parent.y);
-    let end = point(child.x - px(side * child_reach), child.y);
-    let room = f32::from(end.x - start.x).abs();
-    let x = start.x + px(side * turn.min(room / 2.));
-    right_angles(vec![start, point(x, parent.y), point(x, child.y), end])
+    let world = |p: Point<Pixels>| crate::layout::Vec2::new(f32::from(p.x), f32::from(p.y));
+    let route = crate::layout::elbow_route(
+        (world(parent), parent_reach),
+        (world(child), child_reach),
+        turn,
+    );
+    right_angles(route.iter().map(|p| point(px(p.x), px(p.y))).collect())
 }
 
 /// The two nodes a line is drawn between: from the node it hangs from to the other.
