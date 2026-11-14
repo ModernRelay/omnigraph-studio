@@ -2,7 +2,7 @@
 
 Nothing. From version 0.4.7, Studio sends no usage data, no crash reports and no ID of you, your computer or your installation. The code that made and sent those reports is removed, and so are its settings. Starting 0.4.7 or later also deletes what an earlier version kept on your computer: the reports not yet sent, the list of those sent and its crash reports. An install ID, if you chose one, stays in its file so that you can still quote it to us; the [privacy notice](privacy.md) says where it is.
 
-Studio still makes the requests its work needs: to the Omnigraph servers you connect it to, and to GitHub to check for a newer version of itself. The privacy notice covers those too.
+Studio still makes the requests its work needs: to the Omnigraph servers you connect it to, to GitHub to check for a newer version of itself, and to OpenRouter for the list of AI models. An AI feature sends its input to OpenRouter once you store your own key, and the agent panel runs an agent once you choose one. The privacy notice covers each of these.
 
 ## The builds that sent reports
 
