@@ -161,6 +161,14 @@ pub mod workspace {
             /// Read the open graph's schema, branches and counts again, and the view in
             /// focus.
             Refresh,
+            /// Make text one size larger, in the interface and the query editor, and keep it:
+            /// zoom in. Rows, columns and panels keep their size.
+            IncreaseFontSize,
+            /// Make text one size smaller, in the interface and the query editor, and keep
+            /// it: zoom out. Rows, columns and panels keep their size.
+            DecreaseFontSize,
+            /// Put the interface's and the query editor's text back at their default sizes.
+            ResetFontSize,
         ]
     );
 

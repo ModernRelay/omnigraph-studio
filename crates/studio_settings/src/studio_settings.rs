@@ -553,6 +553,7 @@ pub struct StudioSettings {
     )]
     pub ui_font_family: Option<String>,
     /// Text size for menus, tables and panels.
+    // The range is `FONT_SIZES`, which a test holds this to.
     #[schemars(
         title = "Interface font size",
         range(min = 10, max = 24),
@@ -1240,6 +1241,49 @@ fn apply(settings: StudioSettings, cx: &mut App) {
     cx.refresh_windows();
 }
 
+/// The text sizes Settings allows, in px: the interface's and the query editor's.
+pub const FONT_SIZES: std::ops::RangeInclusive<f32> = 10.0..=24.0;
+
+impl StudioSettings {
+    /// The interface's and the query editor's text sizes, each moved `by` px: the two move
+    /// together, so the editor stays as much smaller or larger than the interface as it was.
+    /// `None` when either would leave [`FONT_SIZES`]: a step at the limit changes nothing,
+    /// rather than moving one size and not the other.
+    pub fn font_sizes_stepped(&self, by: f32) -> Option<(f32, f32)> {
+        let (interface, editor) = (self.ui_font_size + by, self.buffer_font_size + by);
+        (FONT_SIZES.contains(&interface) && FONT_SIZES.contains(&editor))
+            .then_some((interface, editor))
+    }
+}
+
+/// Makes text `by` px larger (or smaller, below zero) in the interface and the query editor,
+/// and keeps it in the settings file ([`update`]). Nothing changes at the limit.
+pub fn step_font_sizes(by: f32, cx: &mut App) {
+    let Some((interface, editor)) = StudioSettings::get(cx).font_sizes_stepped(by) else {
+        return;
+    };
+    update(cx, |settings| {
+        settings.ui_font_size = interface;
+        settings.buffer_font_size = editor;
+    });
+}
+
+/// Puts the interface's and the query editor's text back at their default sizes, and keeps
+/// that in the settings file. Nothing is written when they are there already.
+pub fn reset_font_sizes(cx: &mut App) {
+    let defaults = StudioSettings::default();
+    let now = StudioSettings::get(cx);
+    if now.ui_font_size == defaults.ui_font_size
+        && now.buffer_font_size == defaults.buffer_font_size
+    {
+        return;
+    }
+    update(cx, |settings| {
+        settings.ui_font_size = defaults.ui_font_size;
+        settings.buffer_font_size = defaults.buffer_font_size;
+    });
+}
+
 /// Applies a change, and writes it into the settings file on the write thread, in turn with
 /// every other write: reading, editing and syncing the file can take tens of milliseconds, too
 /// long for a click. The file is read again first, so an edit another program made since
@@ -1520,6 +1564,80 @@ mod tests {
             let state = cx.global::<SettingsFileState>();
             assert!(state.problems.is_empty());
             assert_eq!(state.modified, modified);
+        });
+    }
+
+    /// The text-size keys move the interface's and the editor's sizes together, and stop at
+    /// the range the settings page offers rather than moving one size and not the other.
+    #[test]
+    fn text_sizes_step_together_and_stop_at_the_limits() {
+        let mut settings = StudioSettings::default();
+        let (interface, editor) = (settings.ui_font_size, settings.buffer_font_size);
+        assert_eq!(
+            settings.font_sizes_stepped(1.),
+            Some((interface + 1., editor + 1.))
+        );
+        assert_eq!(
+            settings.font_sizes_stepped(-1.),
+            Some((interface - 1., editor - 1.))
+        );
+        // At the top the interface's size cannot grow, so the editor's does not either.
+        settings.ui_font_size = *FONT_SIZES.end();
+        assert_eq!(settings.font_sizes_stepped(1.), None);
+        assert_eq!(
+            settings.font_sizes_stepped(-1.),
+            Some((FONT_SIZES.end() - 1., editor - 1.))
+        );
+        // At the bottom the editor's size stops both.
+        settings.ui_font_size = 12.;
+        settings.buffer_font_size = *FONT_SIZES.start();
+        assert_eq!(settings.font_sizes_stepped(-1.), None);
+        for path in ["ui_font_size", "buffer_font_size"] {
+            let field = fields()
+                .iter()
+                .find(|field| field.path.join(".") == path)
+                .unwrap();
+            let FieldKind::Number { min, max, .. } = field.kind else {
+                panic!("{path} is a number");
+            };
+            assert_eq!(
+                (min as f32, max as f32),
+                (*FONT_SIZES.start(), *FONT_SIZES.end()),
+                "{path}'s range on the settings page"
+            );
+        }
+    }
+
+    /// A step changes the settings in effect and a reset puts the defaults back; a step at the
+    /// limit changes nothing, and the two sizes stay as far apart as they were.
+    #[gpui::test]
+    fn the_text_size_steps_change_the_settings_in_effect(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            init_test(cx);
+            keep_changes_in_memory(cx);
+            let sizes = |cx: &App| {
+                let settings = StudioSettings::get(cx);
+                (settings.ui_font_size, settings.buffer_font_size)
+            };
+            let defaults = sizes(cx);
+            reset_font_sizes(cx);
+            assert_eq!(sizes(cx), defaults, "nothing to put back");
+            step_font_sizes(1., cx);
+            step_font_sizes(1., cx);
+            assert_eq!(sizes(cx), (defaults.0 + 2., defaults.1 + 2.));
+            step_font_sizes(-1., cx);
+            assert_eq!(sizes(cx), (defaults.0 + 1., defaults.1 + 1.));
+            reset_font_sizes(cx);
+            assert_eq!(sizes(cx), defaults);
+            for _ in 0..40 {
+                step_font_sizes(1., cx);
+            }
+            assert_eq!(sizes(cx).0, *FONT_SIZES.end(), "it stops at the largest");
+            assert_eq!(
+                sizes(cx).0 - sizes(cx).1,
+                defaults.0 - defaults.1,
+                "and the editor's text is as much smaller as it was"
+            );
         });
     }
 
