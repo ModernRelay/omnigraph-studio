@@ -465,6 +465,19 @@ struct Follow {
     hops: usize,
 }
 
+/// Whether `node`'s type has `group` too, so a follow of it goes on from `node`: the same
+/// relationship, the same way, to the same type (a manager's manager).
+fn continues(
+    schema: &gq_language::SchemaModel,
+    group: &gq_language::RelationshipGroup,
+    node: &NodeRef,
+) -> bool {
+    schema
+        .relationships_of(&node.type_name)
+        .iter()
+        .any(|own| own == group)
+}
+
 /// The most hops one follow takes: a chain longer than this stops there, drawn as far as it
 /// went, and following it again goes on from its end (constitution IX).
 const FOLLOW_MAX: usize = 100;
@@ -2738,13 +2751,21 @@ impl GraphCanvas {
                     .and_then(|parent| parent.path.clone());
                 (key.group.clone(), path.clone(), owner)
             }
-            // A node reached through a single-target relationship goes on along it.
-            (SceneKind::Node { .. }, Some(path)) => match path.steps() {
+            // A node reached through a single-target relationship goes on along it, when its
+            // type has that relationship too (a manager's manager, not a person's employer's).
+            (
+                SceneKind::Node {
+                    node: graph_node, ..
+                },
+                Some(path),
+            ) => match path.steps() {
                 [
                     ..,
                     graph_store::Step::Group(group),
                     graph_store::Step::Node(_),
-                ] if graph_store::is_field(&schema, group) => {
+                ] if graph_store::is_field(&schema, group)
+                    && continues(&schema, group, graph_node) =>
+                {
                     (group.clone(), path.child_group(group), Some(path.clone()))
                 }
                 _ => return,
@@ -2800,7 +2821,14 @@ impl GraphCanvas {
             .iter()
             .any(|entry| entry.path == node_path && matches!(entry.kind, EntryKind::Cycle { .. }));
         self.center_on = Some(SceneId::Node(target.node.clone()));
-        if cycle || follow.hops + 1 >= FOLLOW_MAX {
+        // A relationship that reaches another type (a person's employer) ends at its target,
+        // which has no such relationship to go on along.
+        let goes_on = self
+            .exploration
+            .read(cx)
+            .schema()
+            .is_some_and(|schema| continues(&schema, &follow.group, &target.node));
+        if cycle || !goes_on || follow.hops + 1 >= FOLLOW_MAX {
             self.follow = None;
             return;
         }
@@ -4328,6 +4356,55 @@ mod tests {
                 paint::CHIP_TEXTS_MADE.with(std::cell::Cell::get),
                 made,
                 "no name wrapped again"
+            );
+        });
+    }
+
+    /// Following a single-target relationship to another type (a person's employer) ends at
+    /// its target, which has no such relationship: the company is drawn and the follow
+    /// stops. Before, it opened the relationship on the company too and never ended.
+    #[gpui::test]
+    async fn following_a_relationship_to_another_type_ends_at_its_target(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(studio_theme::init_test);
+        let (session, _served) = graph_store::test_server::followed_session(
+            "node Person {\n  slug: String @key\n  name: String\n}\n\
+             node Company {\n  slug: String @key\n  name: String\n}\n\
+             edge Employer: Person -> Company @card(0..1)\n",
+            |asked| match (asked["name"].as_str(), asked["params"]["id"].as_str()) {
+                (Some("studio_node"), _) => serde_json::json!([{ "id": "p1", "label": "Ada" }]),
+                (Some("studio_neighbours"), Some("p1")) => {
+                    serde_json::json!([{ "id": "c1", "label": "Acme" }])
+                }
+                _ => serde_json::json!([]),
+            },
+            cx,
+        );
+        cx.run_until_parked();
+        let (canvas, cx) = cx.add_window_view(|_, cx| {
+            GraphCanvas::new(session, NodeRef::new("Person", "p1"), None, cx)
+        });
+        settle(cx);
+        canvas.update_in(cx, |canvas, _, cx| {
+            let hub = canvas
+                .scene
+                .nodes
+                .iter()
+                .position(|node| matches!(node.kind, SceneKind::Hub { .. }))
+                .expect("Ada's employer pill");
+            canvas.start_follow(hub, cx);
+        });
+        for _ in 0..10 {
+            settle(cx);
+        }
+        canvas.read_with(cx, |canvas, _| {
+            assert!(canvas.follow.is_none(), "the follow ended at the company");
+            assert!(
+                canvas
+                    .index_of(&SceneId::Node(NodeRef::new("Company", "c1")))
+                    .is_some(),
+                "the company is drawn"
             );
         });
     }
