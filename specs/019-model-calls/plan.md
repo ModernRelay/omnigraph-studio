@@ -22,7 +22,8 @@ is for every later one.
 
 - I: one client owns every request. The crate is a third kind of request, to OpenRouter, not to
   an Omnigraph server. This plan amends I's "in practice" line to name `model` beside
-  `studio_update` and (spec 018) `studio_telemetry` (a patch).
+  `studio_update` (a patch). It also named spec 018's `studio_telemetry`, until telemetry was
+  removed on 2026-11-14.
 - II: a call takes its input from the view's snapshot and answers into the view; it never reads
   the graph itself.
 - III and IV: a model never writes. An answer is a proposal shown in the view's own controls

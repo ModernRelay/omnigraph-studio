@@ -54,8 +54,6 @@ pub fn init() {
 fn report_panic(info: &PanicHookInfo) {
     let line = panic_line(info);
     log::error!("{line}");
-    // Kept as a crash report too, when the person allows it (spec 018).
-    studio_telemetry::keep_panic(&line);
     zlog::flush();
     if !LOGS_TO_TERMINAL.load(Ordering::SeqCst) {
         writeln!(std::io::stderr(), "{line}").ok();

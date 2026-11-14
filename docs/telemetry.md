@@ -1,12 +1,24 @@
-<!-- Generated from crates/studio_telemetry/src/catalog.rs by its test `docs_telemetry_md_matches_the_catalog`. Do not edit by hand. -->
-
 # What Omnigraph Studio sends
 
-Studio asks before it sends anonymous usage data (spec 018), and sends none until you answer: which features are used and how fast they are, tied to one run of Studio and nothing else. You can choose to be counted across runs with a random install ID. Crash reports are shown to you and sent only when you say so. Nothing is sent from a development build, or while `DO_NOT_TRACK` or `OMNIGRAPH_STUDIO_TELEMETRY=0` is set. Change either choice under Settings, Privacy, or from the status bar's notice.
+Nothing. From version 0.4.7, Studio sends no usage data, no crash reports and no ID of you, your computer or your installation. The code that made and sent those reports is removed, and so are its settings. Starting 0.4.7 or later also deletes what an earlier version kept on your computer: the reports not yet sent, the list of those sent and its crash reports. An install ID, if you chose one, stays in its file so that you can still quote it to us; the [privacy notice](privacy.md) says where it is.
 
-No report holds a graph, type, property, branch, query or file name, a server address, an account or token, query text, a value, a row, an error message or your IP address. Reports go to PostHog US Cloud, which is told to discard the IP address a request comes from and to add no location.
+Studio still makes the requests its work needs: to the Omnigraph servers you connect it to, and to GitHub to check for a newer version of itself. The privacy notice covers those too.
 
-Who receives this data, how long it is kept and your rights over it are in the [privacy notice](privacy.md).
+## The builds that sent reports
+
+Three builds of Studio had telemetry, all made between 12 and 14 November 2026. They sent reports to PostHog US Cloud, which was told to discard the IP address a request came from and to add no location.
+
+| Build | Usage data | Crash reports |
+|---|---|---|
+| 0.4.5, released 13 November 2026 | Sent from the first start, unless turned off. The status bar said "Anonymous usage data is on" and did not wait for an answer | Shown to you, and sent only when you chose Send or Always send |
+| The edge build of 13 November 2026 | As 0.4.5 | As 0.4.5 |
+| The edge build of 14 November 2026 | Asked first, and sent none until you answered | As 0.4.5 |
+
+No other version, before or after, sends any of this. Nothing was sent from a development build, or while `DO_NOT_TRACK` or `OMNIGRAPH_STUDIO_TELEMETRY=0` was set.
+
+If you run one of these builds, update to 0.4.7 or later. To stop its reports without updating, open the status bar's notice and turn usage data off, or set usage data to off and crash reports to never under Settings, Privacy.
+
+The rest of this page is what those builds could send, kept for anyone who ran them. No report held a graph, type, property, branch, query or file name, a server address, an account or token, query text, a value, a row, an error message or your IP address.
 
 ## Sent with every report
 
@@ -17,7 +29,7 @@ Who receives this data, how long it is kept and your rights over it are in the [
 | `os_version` | the system's major version, or `unknown` |
 | `arch` | `aarch64` or `x86_64` |
 
-Usage events go under a random ID made at each start and never written down, or, if you chose to be counted across runs, under a random install ID, deleted when you turn that off and replaced by Reset ID. They also carry a random session ID. Crash reports carry neither: each has a random ID of its own.
+Usage events went under a random ID made at each start and never written down, or, if you chose to be counted across runs, under a random install ID. They also carried a random session ID. Crash reports carried neither: each had a random ID of its own.
 
 ## Usage events
 
@@ -56,8 +68,10 @@ A write finished.
 
 | Property | Values |
 |---|---|
-| `kind` | `mutation`, `stored_query`, `branch` |
-| `outcome` | `held` |
+| `kind` | `mutation`, `stored_query`, `blob`, `branch`, `merge` |
+| `outcome` | `published`, `held`, `refused`, `unknown` |
+
+Until 14 November 2026 this page listed only `mutation`, `stored_query` and `branch` as kinds and only `held` as an outcome. The builds could send every value above.
 
 ### `connection_changed`
 
@@ -88,7 +102,7 @@ The updater moved a step.
 
 ## `daily_summary`
 
-Once a day while usage is on: how often things took how long, and what went wrong how often. Each histogram is a list of counts, one per duration bucket in this order: under 10 ms, 30 ms, 100 ms, 300 ms, 1 s, 3 s, 10 s, 30 s, and 30 s or more.
+Once a day while usage data was on: how often things took how long, and what went wrong how often. Each histogram was a list of counts, one per duration bucket in this order: under 10 ms, 30 ms, 100 ms, 300 ms, 1 s, 3 s, 10 s, 30 s, and 30 s or more.
 
 | Property | Values |
 |---|---|
@@ -99,8 +113,8 @@ Once a day while usage is on: how often things took how long, and what went wron
 | `panics` | Panics Studio caught. (a count) |
 | `native_crashes` | Crashes macOS reported for the previous run. (a count) |
 | `dropped` | Reports dropped because the queue was full. (a count) |
-| `ran` | How long Studio has run since its start. (`under_1m`, `under_10m`, `under_1h`, `under_4h`, `under_12h`, `12h_or_more`, or none) |
+| `ran` | How long Studio had run since its start. (`under_1m`, `under_10m`, `under_1h`, `under_4h`, `under_12h`, `12h_or_more`, or none) |
 
 ## Crash reports
 
-A `$exception` event, the shape PostHog's error tracking reads: the kind (`panic` or the signal's name), the panic's one line with every quoted part replaced by `…` and paths under your home folder shortened to `~`, the names of the functions on the crashed thread (at most 64), the thread's name and how long Studio had run, as a range. A crash report is shown to you before it is sent, unless you chose to always send them.
+A `$exception` event, the shape PostHog's error tracking reads: the kind (`panic` or the signal's name), the panic's one line with every quoted part replaced by `…` and paths under your home folder shortened to `~`, the names of the functions on the crashed thread (at most 64), the thread's name and how long Studio had run, as a range. A crash report was shown to you before it was sent, unless you chose to always send them.
