@@ -19,11 +19,7 @@
     "review_layout": "feed",
     "health_check_seconds": 30,
     "show_performance": true,
-    "auto_update": true,
-    "telemetry": {
-      "crash_reports": "ask",
-      "usage": "anonymous"
-    }
+    "auto_update": true
   },
   "omnigraph_cli": null,
   "omnigraph_cloud": "https://platform.omnigraph.dev",

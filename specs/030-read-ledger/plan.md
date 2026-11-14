@@ -70,7 +70,8 @@ Three questions need numbers that stay comparable over time:
 - The snapshot example (`crates/studio/examples/snapshot.rs`) drives real views offscreen; its
   `,live` option lets reads land and times them. `script/measure-frames` runs it.
 - `graph_store::test_server` is a fake server with commits and a change feed by type.
-- Telemetry (spec 018) has `DurationBucket` and `CountBucket`. There is no share bucket yet.
+- ~~Telemetry (spec 018) has `DurationBucket` and `CountBucket`. There is no share bucket yet.~~
+  Telemetry was removed on 2026-11-14 (spec 018), and its buckets with it.
 
 ### Omnigraph (the personal server runs `0.14.1-edge+7711e4a`, read at that commit)
 
@@ -211,10 +212,11 @@ Scientist; see Sources), which have to tell bugs from races.
   audit mismatch) and writes JSON, so two builds can be compared with
   `script/measure-frames --reads`. It runs against `script/dev-server`, or read-only against a
   real graph with `--target`.
-- **Telemetry (spec 018).** One `ViewSettled { view, settled: DurationBucket, sent: CountBucket,
+- ~~**Telemetry (spec 018).** One `ViewSettled { view, settled: DurationBucket, sent: CountBucket,
   from_cache: ShareBucket }` event, and an `AuditMismatch { answer }` count where the audit is
   turned on. Both are added to the catalog and `docs/telemetry.md`. They are anonymous, as the
-  catalog's other events are.
+  catalog's other events are.~~ Dropped 2026-11-14: Studio sends no telemetry (spec 018,
+  removed). The ledger's numbers stay on the machine, in the scenario runner's tables and JSON.
 - **Later: a reads panel** in the developer menu, showing the ring live. It is not needed for the
   rest.
 
@@ -380,7 +382,7 @@ Refresh in 68 ms.
 | Keep each answer's origin | Classify by the lookup's path | A carried answer is filed among answers read, so the path alone would hide it from the audit |
 | Inside `graph_store` | A `studio_perf` crate every view depends on (#90) | #90 was closed; the 2026-11-11 report asks for small instruments in existing layers |
 | Audit kept answers against a pinned read | Trust the change log's tests | The cache's correctness rests on the feed, the epoch and `Depends`; only the server's answer at the commit proves an answer right |
-| Fixed aggregates always on, the ring on demand | Everything on demand | Telemetry and a later panel need numbers from ordinary use, at no measurable cost |
+| Fixed aggregates always on, the ring on demand | Everything on demand | A later panel needs numbers from ordinary use, at no measurable cost (so did telemetry, until it was removed on 2026-11-14) |
 | Query names and routes only | Hashed parameters or ids | Ids are row data; a hash of an id is still a stable identifier |
 | A deterministic, rotating audit sample | Random sampling | A failure repeats on the next run, and every slice is checked over sessions (rustc) |
 | Audit in the speculative lane, never the slow class | Audit inline, or every read | Requests are the scarce resource; a check read must never delay what a person waits for |
@@ -396,7 +398,7 @@ Refresh in 68 ms.
 4. The scenario steps and their JSON in the snapshot example, and `--reads` in
    `script/measure-frames` (built 2026-11-12, against the development graph). The first live
    baseline on the personal graph, with `--target`, goes in spec 015's validation log.
-5. The telemetry events.
+5. ~~The telemetry events.~~ Dropped 2026-11-14 with telemetry (spec 018, removed).
 
 ## Deferred
 

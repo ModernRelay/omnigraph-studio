@@ -1,6 +1,51 @@
 # 018: Telemetry, with consent
 
-Status: step 1 built 2026-11-11 · 2026-10-29 · reports go to PostHog (decided 2026-10-29), US Cloud (decided 2026-11-11)
+Status: superseded · removed 2026-11-14: Studio sends no telemetry, and nothing in it talks to
+PostHog. The last commit with it is `5c5c8ad`; the one release that had it is 0.4.5. What follows
+is the plan as it was built, kept as the record; "Removed" below says what went and what is
+left outside this repository. Step 1 built 2026-11-11 · 2026-10-29 · reports went to PostHog
+(decided 2026-10-29), US Cloud (decided 2026-11-11)
+
+## Removed (2026-11-14)
+
+Telemetry shipped in one release, 0.4.5, on by default: it recorded and sent anonymous usage
+data from its first start and told of it in the status bar, without waiting for an answer. The
+change that made it wait (2026-11-13) reached only the edge build of 2026-11-14. The published
+pages (`docs/telemetry.md`, `docs/privacy.md`), which 0.4.5 links to, by then said usage data was
+sent "only if you agree". Rather than ship a third behaviour, telemetry was taken out whole, in
+0.4.7 (no 0.4.6 was released).
+
+What went:
+
+- `crates/studio_telemetry` (the catalog, the queue, the store, the crash reports, the uploader
+  to PostHog) and every call that recorded into it: Studio's start, a graph opened, a query
+  run, a write finished, a connection's state, an agent's turn, the updater's steps, the health
+  check's round trip, peak memory and the panic hook's crash report.
+- The status bar's two items (`crates/studio/src/telemetry_status.rs`), the five
+  `studio_telemetry::` actions, and the `studio.telemetry` settings with their Privacy section.
+  The key is retired (`studio_settings/src/document.rs` `RETIRED`), so a `settings.json` that
+  0.4.5 wrote it into raises no error and keeps its text.
+- The release workflow's `OMNIGRAPH_STUDIO_POSTHOG_TOKEN`, the `uuid` dependency, the crate's
+  row in `docs/architecture.md` and `script/check-layers.py`, and constitution I's sentence
+  naming it (1.5.2).
+- On a person's machine: Studio empties the `telemetry` folder of its data folder at start
+  (`studio::remove_telemetry_files`): the reports not yet sent, the log of those sent, crash
+  reports and the markers. One file stays, `install-id`, where the person chose to be counted
+  across runs: the reports sent under it are found by it alone, so it is theirs to quote when
+  asking for those reports or their deletion (`docs/privacy.md`). Studio no longer reads it.
+
+What Studio still has, which this plan found already there: the panic hook writes a panic as
+one line to the log, quoted text removed (`crates/studio/src/logging.rs`), and Zed's own
+telemetry crate is linked and drops every event, since nothing starts it.
+
+Left outside this repository, for whoever holds them:
+
+- The PostHog project (US Cloud) and the reports it stores, kept one year by its plan unless
+  deleted sooner. 0.4.5 and the edge builds of 2026-11-13 and 2026-11-14 (the last only once
+  the person agreed) keep sending to its token until they are updated. Those builds delete a
+  batch PostHog refuses (`posthog::answer_for`: any answer but a 2xx, a 429 or a 5xx), so a
+  token revoked there should end it; that was not tried.
+- The repository variable `OMNIGRAPH_STUDIO_POSTHOG_TOKEN`, which no workflow reads now.
 
 ## Problem
 
@@ -360,6 +405,8 @@ What step 1 changed from the design above:
 | 2026-11-12 | Crash reports keep no IP or location either | One `$exception` sent to the project as Studio sends one (gzipped batch, a one-off `distinct_id`, `$geoip_disable`, `$process_person_profile: false`; labelled `setup_check`), read back with a HogQL query | Stored, with `$ip`, `$geoip_city_name` and `$geoip_country_code` empty. The test event stays in the project, marked `setup_check: true` |
 | 2026-11-13 | The privacy notice states what Studio does | `docs/privacy.md` read against `studio_telemetry` (`distinct_id`, `follow_settings`, `crash.rs` `without_home`), `graph_store::USER_AGENT`, `studio_settings` `auto_update`, and PostHog's API for the organization's plan (`product_analytics_data_retention`: 1 year) | Matches. `docs/telemetry.md` links it; the popover reaches it through that page |
 | 2026-11-13 | Usage data waits for the notice's answer | `studio_telemetry`: `usage_waits_for_the_notice_then_is_anonymous` (nothing recorded, held or sent before the answer; after it, one event under the run's own ID and no install ID), `a_choice_in_settings_answers_the_notice`; the other telemetry tests, which choose in Settings first | Pass. A person who had not answered before 0.4.6 sends nothing until they do |
+| 2026-11-14 | What 0.4.5 does, against what the published pages said | `git tag --contains` for `b30f5c2`, `db6279b` and `98edf23`; `v0.4.5:crates/studio_telemetry/src/studio_telemetry.rs` `follow_settings` (`usage = blocked.is_none() && options.usage != Off`) and `v0.4.5:crates/studio/src/telemetry_status.rs` ("Anonymous usage data is on", "Change…"); `v0.4.5:.github/workflows/release.yml`; `gh variable list` (the token variable last changed 2026-11-12T18:59Z, the 0.4.5 build ran 2026-11-13T06:48Z); `gh release list` | 0.4.5 has the first two commits and not the third: usage data on by default, sent without waiting. Its build had the token. No 0.4.6 exists. Not checked: the shipped binary itself, or what PostHog received |
+| 2026-11-14 | Telemetry is removed whole, and Studio builds and runs without it | `rg -i 'studio_telemetry\|posthog' crates assets script .github Cargo.toml` (no match); `Cargo.lock` loses `studio_telemetry` alone (24 lines, the reverse of what adding it gained); `studio_settings`: `the_telemetry_choices_an_earlier_studio_wrote_are_not_a_problem`, `a_retired_setting_is_matched_whole_from_the_root`; `studio`: `the_telemetry_files_an_earlier_studio_kept_are_removed`, `an_install_id_stays_where_the_person_can_find_it`; `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all --check`, `cargo deny check` and the four `script/` checks (macOS) | Pass: 1,369 tests, 0 failed, 9 ignored (main's 1,388, less the crate's 22, plus these 3). Not run as an installed release build, so the deletion at start was not tried on a folder 0.4.5 wrote |
 
 ## Corrections
 
@@ -375,3 +422,10 @@ What step 1 changed from the design above:
 - 2026-11-11: The SDK was rejected partly because "SDKs gather device and environment data by
   default"; PostHog's Rust SDK documents no such default, so the reason now rests on its own HTTP
   stack and its free-form properties.
+- 2026-11-14: "Each off until the person says otherwise" (Problem) did not hold for usage data
+  in the one release that had it: from 2026-11-12 the default was on, and 0.4.5 shipped that.
+  The 2026-11-13 row's "before 0.4.6" named a release that was never made.
+- 2026-11-14: `docs/telemetry.md` listed fewer values of `write_finished` than Studio could
+  send: `kind` also took `blob` and `merge`, and `outcome` also `published`, `refused` and
+  `unknown`. The page was generated from the catalog's JSON schema and kept only the variants
+  that carried a description. The page as it is kept now lists them all.

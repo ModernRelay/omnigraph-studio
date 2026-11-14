@@ -397,8 +397,8 @@ pub struct Workspace {
     /// Studio's memory and CPU for the status bar while `studio.show_performance` is on (the
     /// default), read every two seconds while the window is in front.
     performance: Option<Performance>,
-    /// A view of the window's own at the right of the status bar: the updater's (spec 017).
-    /// The window's own items, in the order added (the updater's, telemetry's consent).
+    /// The window's own views at the right of the status bar, in the order added: the
+    /// updater's (spec 017).
     status_items: Vec<StatusItem>,
     /// Whether this window is in front, which the memory and CPU reading waits for.
     window_active: bool,
@@ -790,9 +790,6 @@ impl Workspace {
                         return;
                     }
                     let sample = process_stats::Sample::now();
-                    if let Some((bytes, _)) = sample.memory {
-                        studio_telemetry::note_memory(bytes);
-                    }
                     this.performance = Some(Performance::next(this.performance.as_ref(), sample));
                     cx.notify();
                 });

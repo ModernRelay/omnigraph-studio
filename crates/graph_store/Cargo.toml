@@ -20,7 +20,6 @@ http_client = { workspace = true }
 reqwest_client = { workspace = true }
 reqwest = { workspace = true }
 studio_settings = { workspace = true }
-studio_telemetry = { workspace = true }
 studio_ui = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }

@@ -40,7 +40,6 @@ studio_settings = { workspace = true }
 studio_theme = { workspace = true }
 studio_ui = { workspace = true }
 studio_workspace = { workspace = true }
-studio_telemetry = { workspace = true }
 studio_update = { workspace = true }
 semver = { workspace = true }
 graph_client = { workspace = true }
