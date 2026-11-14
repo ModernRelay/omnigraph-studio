@@ -1566,6 +1566,14 @@ impl Openness {
     }
 }
 
+/// The property `type_name`'s nodes are named by under `schema`, none for their key.
+fn names_by(schema: &SchemaModel, type_name: &str) -> Option<String> {
+    schema
+        .node(type_name)
+        .and_then(|node| node.label_property())
+        .map(str::to_owned)
+}
+
 fn rows(output: &ReadOutput) -> Vec<&serde_json::Map<String, Value>> {
     match &*output.rows {
         Value::Array(rows) => rows.iter().filter_map(Value::as_object).collect(),
@@ -1701,7 +1709,7 @@ pub struct Exploration {
     /// pin when a view that draws the exploration is next drawn ([`Self::rename`]).
     names_owed: BTreeSet<String>,
     /// The reads of those names out: a reset or a new choice drops them.
-    naming: Vec<Task<()>>,
+    naming: HashMap<u64, Task<()>>,
     /// A look for what is missing that the session's events asked for (another branch,
     /// schema or token), owed until a view that draws the exploration is drawn
     /// ([`Self::read_owed`]): a hidden tree, a results canvas or a background tab reads nothing
@@ -1864,7 +1872,7 @@ impl Exploration {
             taking: None,
             open: None,
             names_owed: BTreeSet::new(),
-            naming: Vec::new(),
+            naming: HashMap::new(),
             owed: false,
             _subscription: subscription,
         }
@@ -2445,9 +2453,14 @@ impl Exploration {
                 });
                 let type_name = type_name.clone();
                 let asked: Vec<String> = chunk.to_vec();
-                self.naming.push(cx.spawn(async move |this, cx| {
+                // The property the read names them by: a later choice makes it stale.
+                let named_by = names_by(schema, &type_name);
+                let id = self.next_ticket();
+                let task = cx.spawn(async move |this, cx| {
+                    let read = read.await;
                     // A read that failed keeps the names shown; Refresh reads them all again.
-                    let Ok(output) = read.await else {
+                    let Ok(output) = read else {
+                        this.update(cx, |this, _| this.naming.remove(&id)).ok();
                         return;
                     };
                     let mut names: HashMap<String, Option<String>> =
@@ -2459,12 +2472,18 @@ impl Exploration {
                         }
                     }
                     this.update(cx, |this, cx| {
-                        if this.generation == generation {
+                        this.naming.remove(&id);
+                        let current = this
+                            .schema
+                            .as_ref()
+                            .and_then(|now| names_by(now, &type_name));
+                        if this.generation == generation && current == named_by {
                             this.take_names(&type_name, &names, cx);
                         }
                     })
                     .ok();
-                }));
+                });
+                self.naming.insert(id, task);
             }
         }
     }
@@ -5450,6 +5469,59 @@ mod tests {
                 exploration.opening(&[ExplorePath::root()], true),
                 Opening::default()
             );
+        });
+    }
+
+    /// Names read under one choice that land after another was made name nothing: a slow read
+    /// of titles, then the key chosen (no read), keeps the key. Each name read lets go of its
+    /// task once it lands.
+    #[gpui::test]
+    async fn names_read_under_an_earlier_choice_name_nothing(cx: &mut gpui::TestAppContext) {
+        use std::time::Duration;
+
+        use crate::test_server::followed_session;
+        const TITLED: &str = "node Person {\n  slug: String @key\n  name: String\n  title: String?\n}\nedge Knows: Person -> Person @card(0..)\n";
+        let (session, served) = followed_session(TITLED, dense_rows, cx);
+        cx.run_until_parked();
+        let exploration = cx.update(|cx| Exploration::for_session(&session, cx));
+        exploration.update(cx, |exploration, cx| {
+            exploration.root_at(NodeRef::new("Person", "p0"), cx);
+        });
+        cx.run_until_parked();
+        exploration.update(cx, |exploration, cx| {
+            exploration.expand_all(&ExplorePath::root(), cx)
+        });
+        cx.run_until_parked();
+        served.lock().unwrap().wait = Box::new(|asked| {
+            if asked["name"] == "studio_node_labels" {
+                Duration::from_secs(10)
+            } else {
+                Duration::ZERO
+            }
+        });
+        let by = |property: &str| {
+            [("Person".to_owned(), property.to_owned())]
+                .into_iter()
+                .collect()
+        };
+        session.update(cx, |session, cx| session.take_labels(by("title"), cx));
+        exploration.update(cx, |exploration, cx| exploration.read_owed(cx));
+        cx.run_until_parked();
+        exploration.read_with(cx, |exploration, _| {
+            assert_eq!(exploration.naming.len(), 1, "the titles are out");
+        });
+        session.update(cx, |session, cx| session.take_labels(by("slug"), cx));
+        exploration.update(cx, |exploration, cx| exploration.read_owed(cx));
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(11));
+        cx.run_until_parked();
+        exploration.read_with(cx, |exploration, _| {
+            assert!(
+                exploration.state().labels.values().all(Option::is_none),
+                "named by the key chosen last: {:?}",
+                exploration.state().labels
+            );
+            assert!(exploration.naming.is_empty(), "the landed read let go of");
         });
     }
 }
