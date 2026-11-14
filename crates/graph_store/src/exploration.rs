@@ -15,7 +15,7 @@
 //! `builder::neighbour_values`, each opening to the neighbours with that value.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
@@ -30,7 +30,7 @@ use graph_client::api::ReadOutput;
 use serde_json::Value;
 
 use crate::scope::{ReadScope, ScopeSince};
-use crate::session::{GraphSession, Loadable, SessionEvent};
+use crate::session::{GraphSession, Loadable, NAME_BATCH, SessionEvent};
 
 /// One node, by type and key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -1592,6 +1592,15 @@ pub struct Exploration {
     /// What is open, while a batch of answers is taken or what is missing is read: made once
     /// for them all ([`Self::with_openness`]).
     open: Option<Openness>,
+    /// The node types the schema now names otherwise, whose held nodes' names are read at the
+    /// pin when a view that draws the exploration is next drawn ([`Self::rename`]).
+    names_owed: BTreeSet<String>,
+    /// The reads of those names out: a reset or a new choice drops them.
+    naming: Vec<Task<()>>,
+    /// A look for what is missing that the session's events asked for (another branch,
+    /// schema or token), owed until a view that draws the exploration is drawn
+    /// ([`Self::read_owed`]): a hidden tree, a results canvas or a background tab reads nothing
+    /// for it.
     owed: bool,
     _subscription: Subscription,
 }
@@ -1684,11 +1693,10 @@ impl Exploration {
             SessionEvent::SchemaChanged => {
                 let now = session.read(cx).schema_model();
                 match (&this.schema, &now) {
-                    // The same text naming some type's nodes otherwise: what is shown is read
-                    // again under the new names, at the same commit.
+                    // The same text naming some type's nodes otherwise: what is shown stays, and
+                    // takes the new names in place.
                     (Some(was), Some(now)) if was.source == now.source && !was.same_as(now) => {
-                        this.schema = Some(now.clone());
-                        this.read_again(cx);
+                        this.rename(now.clone(), cx);
                     }
                     // Another text: what was read under the old one is read again under it,
                     // at the head, as Refresh reads it.
@@ -1750,6 +1758,8 @@ impl Exploration {
             landed: Vec::new(),
             taking: None,
             open: None,
+            names_owed: BTreeSet::new(),
+            naming: Vec::new(),
             owed: false,
             _subscription: subscription,
         }
@@ -2203,6 +2213,219 @@ impl Exploration {
         self.owe(cx);
     }
 
+    /// The schema names some type's nodes otherwise (spec 002, "Node names"). What is shown
+    /// stays as it is, every count, list and value with it, and takes the new names in place:
+    /// the names of the nodes held of each type named otherwise are read at the pin when a
+    /// view that draws the exploration is next drawn ([`Self::read_names`]), a read per type
+    /// of at most [`NAME_BATCH`] ids, and none for a type now named by its key. Before, it let
+    /// go of everything and read it all again, the counts too, so the tree and the canvas
+    /// emptied to their root and grew back.
+    ///
+    /// Reads still out under the old names would land with them, so they are sent again under
+    /// the new ones; and a relationship narrowed by a search, which matches its neighbours'
+    /// names, is read again, as a new search is.
+    fn rename(&mut self, now: Arc<SchemaModel>, cx: &mut Context<Self>) {
+        let Some(was) = self.schema.replace(now.clone()) else {
+            return;
+        };
+        let renamed = now.renamed_since(&was);
+        let named = |target: &LoadTarget| {
+            self.named_type(&now, target)
+                .is_some_and(|type_name| renamed.contains(type_name))
+        };
+        let again: Vec<LoadTarget> = self
+            .tasks
+            .keys()
+            .filter(|target| named(target))
+            .cloned()
+            .collect();
+        let searched: Vec<GroupKey> = self
+            .state
+            .searches
+            .keys()
+            .filter(|key| renamed.contains(&key.group.other_type))
+            .cloned()
+            .collect();
+        self.landed.retain(|landed| !again.contains(&landed.target));
+        for key in searched {
+            self.tasks.remove(&LoadTarget::Page(key.clone()));
+            self.state.neighbours.remove(&key);
+        }
+        for target in again {
+            if self.tasks.remove(&target).is_some() {
+                self.start(target, cx);
+            }
+        }
+        self.names_owed.extend(renamed);
+        self.owe(cx);
+    }
+
+    /// The node type whose names an answer to `target` carries: the root's, a relationship's
+    /// other end, or for values grouped by a relationship of the neighbours, that
+    /// relationship's other end. A count carries none.
+    fn named_type<'a>(
+        &'a self,
+        schema: &'a SchemaModel,
+        target: &'a LoadTarget,
+    ) -> Option<&'a str> {
+        match target {
+            LoadTarget::Root => self.state.root.as_ref().map(|root| root.type_name.as_str()),
+            LoadTarget::Count(_) => None,
+            LoadTarget::Page(key) => Some(&key.group.other_type),
+            LoadTarget::Values(key, by) => by
+                .value_type(schema, &key.group)
+                .map(|other| other.name.as_str()),
+        }
+    }
+
+    /// Reads at the pin the names of the nodes held of each type in [`Self::names_owed`]:
+    /// those listed or rooted, and the values of relationships grouped by one reaching such a
+    /// type.
+    fn read_names(&mut self, schema: &Arc<SchemaModel>, cx: &mut Context<Self>) {
+        let types = std::mem::take(&mut self.names_owed);
+        let mut held: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for node in self.state.labels.keys() {
+            if types.contains(&node.type_name) {
+                held.entry(node.type_name.clone())
+                    .or_default()
+                    .insert(node.id.clone());
+            }
+        }
+        for ((key, by), values) in &self.state.values {
+            let Loadable::Loaded(buckets) = values else {
+                continue;
+            };
+            let Some(type_name) = by.value_type(schema, &key.group).map(|node| &node.name) else {
+                continue;
+            };
+            if !types.contains(type_name) {
+                continue;
+            }
+            let ids = held.entry(type_name.to_owned()).or_default();
+            for (value, _) in &buckets.values {
+                if let Value::String(id) = value.value() {
+                    ids.insert(id);
+                }
+            }
+        }
+        let snapshot = self.read_commit(cx);
+        let generation = self.generation;
+        for (type_name, ids) in held {
+            let ids: Vec<String> = ids.into_iter().collect();
+            for chunk in ids.chunks(NAME_BATCH) {
+                let query = match builder::node_labels(schema, &type_name, chunk) {
+                    Ok(Some(query)) => query,
+                    // Named by its key: no node of it has a name besides its key.
+                    Ok(None) => {
+                        let names = chunk.iter().map(|id| (id.clone(), None)).collect();
+                        self.take_names(&type_name, &names, cx);
+                        continue;
+                    }
+                    // The type is gone from the schema: nothing of it is shown under this one.
+                    Err(_) => continue,
+                };
+                let scope = &self.scope;
+                let read = self.session.update(cx, |session, cx| {
+                    session.read_as(scope, &query, snapshot.clone(), cx)
+                });
+                let type_name = type_name.clone();
+                let asked: Vec<String> = chunk.to_vec();
+                self.naming.push(cx.spawn(async move |this, cx| {
+                    // A read that failed keeps the names shown; Refresh reads them all again.
+                    let Ok(output) = read.await else {
+                        return;
+                    };
+                    let mut names: HashMap<String, Option<String>> =
+                        asked.into_iter().map(|id| (id, None)).collect();
+                    for row in rows(&output) {
+                        if let Some(id) = row.get("id").and_then(Value::as_str) {
+                            let label = row.get("label").and_then(Value::as_str);
+                            names.insert(id.to_owned(), label.map(str::to_owned));
+                        }
+                    }
+                    this.update(cx, |this, cx| {
+                        if this.generation == generation {
+                            this.take_names(&type_name, &names, cx);
+                        }
+                    })
+                    .ok();
+                }));
+            }
+        }
+    }
+
+    /// Takes the names of `type_name`'s nodes read under the schema's new choice, by id: every
+    /// row, root and value that shows one of them is named anew, in place.
+    fn take_names(
+        &mut self,
+        type_name: &str,
+        names: &HashMap<String, Option<String>>,
+        cx: &mut Context<Self>,
+    ) {
+        let schema = self.schema.clone();
+        let far: HashSet<(GroupKey, GroupBy)> = match &schema {
+            Some(schema) => self
+                .state
+                .values
+                .keys()
+                .filter(|(key, by)| {
+                    by.value_type(schema, &key.group)
+                        .is_some_and(|node| node.name == type_name)
+                })
+                .cloned()
+                .collect(),
+            None => HashSet::new(),
+        };
+        let state = &mut *self.state;
+        for (node, label) in state.labels.iter_mut() {
+            if node.type_name == type_name
+                && let Some(name) = names.get(&node.id)
+            {
+                label.clone_from(name);
+            }
+        }
+        let rows = state
+            .neighbours
+            .iter_mut()
+            .filter(|(key, _)| key.group.other_type == type_name)
+            .flat_map(|(_, list)| list.rows.iter_mut());
+        let listed = match &mut state.set {
+            Some(SetRoots::Listed(rows)) => Some(rows.iter_mut()),
+            _ => None,
+        };
+        for row in rows.chain(listed.into_iter().flatten()) {
+            if row.node.type_name == type_name
+                && let Some(name) = names.get(&row.node.id)
+            {
+                row.label.clone_from(name);
+            }
+        }
+        for (key, values) in state.values.iter_mut() {
+            let Loadable::Loaded(buckets) = values else {
+                continue;
+            };
+            if !far.contains(key) {
+                continue;
+            }
+            for (value, _) in &buckets.values {
+                let Value::String(id) = value.value() else {
+                    continue;
+                };
+                match names.get(&id) {
+                    Some(Some(name)) => {
+                        buckets.labels.insert(value.clone(), name.clone());
+                    }
+                    Some(None) => {
+                        buckets.labels.remove(value);
+                    }
+                    None => {}
+                }
+            }
+        }
+        cx.emit(ExplorationEvent::Loaded);
+        cx.notify();
+    }
+
     /// Owes a look for what is missing, and says the exploration changed: a view that draws
     /// it reads what it owes when drawn ([`Self::read_owed`]).
     fn owe(&mut self, cx: &mut Context<Self>) {
@@ -2257,6 +2480,9 @@ impl Exploration {
         // exploration sees the same commit.
         if self.pin.is_none() && self.state.root_status == Loadable::Loading {
             return;
+        }
+        if !self.names_owed.is_empty() {
+            self.read_names(&schema, cx);
         }
         let entries = self.state.entries(&schema);
         self.with_openness(|this| {
@@ -2657,10 +2883,13 @@ impl Exploration {
         }
     }
 
-    /// Lets go of what landed and was not taken yet: it was read under a generation that ended.
+    /// Lets go of what landed and was not taken yet, and of names owed or being read: they were
+    /// read under a generation that ended.
     fn drop_landed(&mut self) {
         self.landed.clear();
         self.taking = None;
+        self.names_owed.clear();
+        self.naming.clear();
     }
 
     /// Takes every answer that landed since the last time, in one update: each is checked
@@ -4400,8 +4629,8 @@ mod tests {
     }
 
     /// Nodes named otherwise in the settings while the graph is parked: nothing is said and
-    /// nothing read until it is shown again, when the tree reads what it shows under the new
-    /// names.
+    /// nothing read until it is shown again, when the tree reads the names of what it shows
+    /// under the new choice, and nothing else.
     #[gpui::test]
     async fn a_parked_graph_reads_under_new_names_only_when_shown(cx: &mut gpui::TestAppContext) {
         use crate::test_server::followed_session;
@@ -4445,20 +4674,17 @@ mod tests {
         session.update(cx, |session, cx| session.set_shown(true, cx));
         cx.run_until_parked();
         assert_eq!(heard(), 1);
-        let read_node = |asked: &Arc<std::sync::Mutex<Vec<String>>>| {
-            asked
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|name| name == "studio_node")
-        };
-        assert!(!read_node(&asked), "nothing read until the tree is drawn");
+        assert!(
+            asked.lock().unwrap().is_empty(),
+            "nothing read until the tree is drawn: {:?}",
+            asked.lock()
+        );
         exploration.update(cx, |exploration, cx| exploration.read_owed(cx));
         cx.run_until_parked();
-        assert!(
-            read_node(&asked),
-            "read again under the new names: {:?}",
-            asked.lock()
+        // The root's name alone, under the new choice: the node itself, and its counts, stand.
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec!["studio_node_labels".to_owned()]
         );
     }
 
@@ -4854,5 +5080,209 @@ mod tests {
         // events. Before: 2,801 walks and 2,800 events.
         assert!(walked <= 41, "{walked} walks of the tree for 2,800 counts");
         assert!(loads <= 40, "{loads} loaded events for 2,800 counts");
+    }
+
+    /// Choosing another property to name a type's nodes by (spec 002, "Node names") renames
+    /// what is shown in place: every count, list and row stays, nothing shows as loading at any
+    /// change, and one read names the 141 people at the pin. Choosing the key reads nothing.
+    /// Before, the walk let go of everything and read it all again: the tree and the canvas
+    /// emptied to their root, then grew back over 21 counts and 20 lists.
+    #[gpui::test]
+    async fn a_new_choice_of_name_renames_what_is_shown_in_place(cx: &mut gpui::TestAppContext) {
+        let (session, exploration, asked) = dense_walk(cx);
+        let shape = |exploration: &Exploration| {
+            let entries = exploration.entries();
+            let nodes = entries
+                .iter()
+                .filter(|entry| matches!(entry.kind, EntryKind::Node { .. }))
+                .count();
+            let loading = entries
+                .iter()
+                .filter(|entry| matches!(entry.kind, EntryKind::Loading { .. }))
+                .count();
+            (entries.len(), nodes, loading)
+        };
+        // How the nodes held are named: by name, by title, or both at once.
+        let names = |exploration: &Exploration| {
+            exploration
+                .state()
+                .labels
+                .iter()
+                .map(|(node, label)| {
+                    let label = label.as_deref().unwrap_or_default();
+                    label
+                        .strip_suffix(&format!(" {}", node.id))
+                        .unwrap_or(label)
+                        .to_owned()
+                })
+                .collect::<BTreeSet<String>>()
+        };
+        let before = exploration.read_with(cx, |exploration, _| shape(exploration));
+        assert_eq!(before.1, 141, "the root and 140 people");
+        assert_eq!(before.2, 0, "nothing loading");
+        exploration.read_with(cx, |exploration, _| {
+            assert_eq!(names(exploration), BTreeSet::from(["Name".to_owned()]));
+        });
+        // Every change views hear, as they hear it: the walk's shape then.
+        let heard: Arc<std::sync::Mutex<Vec<(usize, usize, usize)>>> = Arc::default();
+        let seen = heard.clone();
+        let _heard = cx.update(|cx| {
+            cx.subscribe(
+                &exploration,
+                move |exploration, event: &ExplorationEvent, cx| {
+                    if *event != ExplorationEvent::SelectionChanged {
+                        seen.lock().unwrap().push(shape(exploration.read(cx)));
+                    }
+                },
+            )
+        });
+        let by = |property: &str| {
+            [("Person".to_owned(), property.to_owned())]
+                .into_iter()
+                .collect()
+        };
+
+        session.update(cx, |session, cx| session.take_labels(by("title"), cx));
+        exploration.read_with(cx, |exploration, _| {
+            assert_eq!(shape(exploration), before, "the same rows, none loading");
+            assert_eq!(
+                names(exploration),
+                BTreeSet::from(["Name".to_owned()]),
+                "as before"
+            );
+            assert!(exploration.owes_reads(), "the names are read when drawn");
+        });
+        exploration.update(cx, |exploration, cx| exploration.read_owed(cx));
+        cx.run_until_parked();
+        exploration.read_with(cx, |exploration, _| {
+            assert_eq!(shape(exploration), before);
+            assert_eq!(
+                names(exploration),
+                BTreeSet::from(["Title".to_owned()]),
+                "all renamed"
+            );
+            assert!(
+                exploration
+                    .state()
+                    .neighbours
+                    .values()
+                    .flat_map(|list| &list.rows)
+                    .all(|row| row.label.as_deref() == Some(&format!("Title {}", row.node.id))),
+                "the rows' names too"
+            );
+        });
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec!["studio_node_labels".to_owned()],
+            "one read names them all"
+        );
+        assert!(
+            heard.lock().unwrap().iter().all(|heard| *heard == before),
+            "no change showed fewer rows or a loading one: {:?}",
+            heard.lock()
+        );
+
+        asked.lock().unwrap().clear();
+        session.update(cx, |session, cx| session.take_labels(by("slug"), cx));
+        exploration.update(cx, |exploration, cx| exploration.read_owed(cx));
+        cx.run_until_parked();
+        exploration.read_with(cx, |exploration, _| {
+            assert_eq!(shape(exploration), before);
+            assert!(
+                exploration.state().labels.values().all(Option::is_none),
+                "named by their key"
+            );
+        });
+        assert!(asked.lock().unwrap().is_empty(), "{:?}", asked.lock());
+    }
+
+    /// A list read under the old name while the choice changes is sent again under the new
+    /// one, so it never lands named as before; a relationship narrowed by a search on its
+    /// neighbours' names is read again, since the search now matches the new names.
+    #[gpui::test]
+    async fn reads_out_under_the_old_name_are_sent_again_under_the_new(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::test_server::followed_session;
+        const TITLED: &str = "node Person {\n  slug: String @key\n  name: String\n  title: String?\n}\nedge Knows: Person -> Person @card(0..)\nedge Likes: Person -> Person @card(0..)\n";
+        // The lists read under titles.
+        let titled: Arc<std::sync::Mutex<usize>> = Arc::default();
+        let count = titled.clone();
+        let (session, served) = followed_session(
+            TITLED,
+            move |asked| {
+                if asked["name"] == "studio_neighbours"
+                    && asked["query"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains(".title as label")
+                {
+                    *count.lock().unwrap() += 1;
+                }
+                dense_rows(asked)
+            },
+            cx,
+        );
+        cx.run_until_parked();
+        let schema = SchemaModel::parse(TITLED).unwrap();
+        let knows = group(&schema, "Person", "Knows", Direction::Outgoing);
+        let likes = group(&schema, "Person", "Likes", Direction::Outgoing);
+        let exploration = cx.update(|cx| Exploration::for_session(&session, cx));
+        exploration.update(cx, |exploration, cx| {
+            exploration.root_at(NodeRef::new("Person", "p0"), cx)
+        });
+        cx.run_until_parked();
+        // Likes is searched; Knows's list is out, and its answer under names never comes.
+        let liked = GroupKey::new(NodeRef::new("Person", "p0"), likes.clone());
+        exploration.update(cx, |exploration, cx| {
+            exploration.expand(&ExplorePath::root().child_group(&likes), cx);
+            exploration.search_group(&liked, "Name", cx);
+        });
+        cx.run_until_parked();
+        served.lock().unwrap().hold = Box::new(|asked| {
+            asked["name"] == "studio_neighbours"
+                && asked["query"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains(".name as label")
+        });
+        exploration.update(cx, |exploration, cx| {
+            exploration.expand(&ExplorePath::root().child_group(&knows), cx)
+        });
+        cx.run_until_parked();
+        let known = GroupKey::new(NodeRef::new("Person", "p0"), knows);
+        exploration.read_with(cx, |exploration, _| {
+            assert_eq!(
+                exploration.state().neighbours[&known].status,
+                PageStatus::Loading
+            );
+            assert!(!exploration.state().neighbours[&liked].rows.is_empty());
+        });
+
+        let by_title = [("Person".to_owned(), "title".to_owned())]
+            .into_iter()
+            .collect();
+        session.update(cx, |session, cx| session.take_labels(by_title, cx));
+        exploration.update(cx, |exploration, cx| exploration.read_owed(cx));
+        cx.run_until_parked();
+        exploration.read_with(cx, |exploration, _| {
+            for key in [&known, &liked] {
+                let list = &exploration.state().neighbours[key];
+                assert_eq!(list.status, PageStatus::Idle, "{key:?}");
+                assert_eq!(list.rows.len(), 7, "{key:?}");
+                assert!(
+                    list.rows
+                        .iter()
+                        .all(|row| row.label.as_deref() == Some(&format!("Title {}", row.node.id))),
+                    "{key:?}: {:?}",
+                    list.rows
+                );
+            }
+        });
+        assert_eq!(
+            *titled.lock().unwrap(),
+            2,
+            "Knows sent again, Likes searched again"
+        );
     }
 }
