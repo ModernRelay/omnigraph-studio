@@ -27,6 +27,11 @@
         fontconfig
         libxkbcommon
         libxcb
+
+        glfw
+        wayland-utils
+        wayland.dev
+        wayland-protocols
       ];
     in
     {
