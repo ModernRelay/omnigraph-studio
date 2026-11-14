@@ -449,6 +449,9 @@ pub(crate) struct GraphCanvas {
     chips: Rc<RefCell<Vec<Bounds<Pixels>>>>,
     /// A single-target relationship being followed hop after hop ([`FollowRelationship`]).
     follow: Option<Follow>,
+    /// How many times the canvas was drawn, for the drawing-cost guards (docs/drawing.md).
+    #[cfg(test)]
+    renders: Cell<usize>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -736,6 +739,8 @@ impl GraphCanvas {
             bounds: Rc::new(Cell::new(None)),
             chips: Rc::new(RefCell::new(Vec::new())),
             follow: None,
+            #[cfg(test)]
+            renders: Cell::new(0),
             _subscriptions: subscriptions,
         };
         canvas.rebuild(cx);
@@ -983,8 +988,8 @@ impl GraphCanvas {
         let nodes: Vec<LayoutNode> = scene
             .nodes
             .iter()
-            .zip(&widths)
-            .map(|(node, width)| LayoutNode {
+            .zip(widths.iter().zip(&texts))
+            .map(|(node, (width, text))| LayoutNode {
                 parent: node.parent,
                 kind: match node.kind {
                     SceneKind::Hub { .. } => LayoutKind::Hub,
@@ -1016,7 +1021,7 @@ impl GraphCanvas {
                         .copied()
                 }),
                 previous: self.known.get(&node.id).copied(),
-                half_height: layout::CHIP_HALF_HEIGHT,
+                half_height: paint::chip_half_height(text),
             })
             .collect();
         let spacing = if self.schema_walk.is_some() {
@@ -1121,7 +1126,7 @@ impl GraphCanvas {
                     .and_then(|key| self.pinned.get(&key).copied())
                     .or(fixed[i]),
                 pinned: None,
-                half_height: layout::CHIP_HALF_HEIGHT,
+                half_height: paint::chip_half_height(&texts[i]),
                 side: None,
             })
             .collect();
@@ -1478,13 +1483,13 @@ impl GraphCanvas {
     fn open_after_rest(&mut self, cx: &mut Context<Self>) {
         self.opened = None;
         self._open = None;
-        let Some(node) = self.hovered.and_then(|index| self.scene.nodes.get(index)) else {
+        let Some(index) = self.hovered else {
             return;
         };
-        if paint::whole_label(node).is_none() {
+        if !self.is_cut(index) {
             return;
         }
-        let id = node.id.clone();
+        let id = self.scene.nodes[index].id.clone();
         self._open = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(OPEN_AFTER).await;
             this.update(cx, |this, cx| {
@@ -1495,15 +1500,18 @@ impl GraphCanvas {
         }));
     }
 
+    /// Whether chip `index` is a node whose name its chip cuts.
+    fn is_cut(&self, index: usize) -> bool {
+        match (self.scene.nodes.get(index), self.texts.get(index)) {
+            (Some(node), Some(text)) => paint::whole_label(node, text).is_some(),
+            _ => false,
+        }
+    }
+
     /// The chip shown open: the one the pointer rested on, else the selected one, when its name
     /// is cut (spec 006, "Opened chips").
     fn opened_index(&self) -> Option<usize> {
-        let cut = |index: &usize| {
-            self.scene
-                .nodes
-                .get(*index)
-                .is_some_and(|node| paint::whole_label(node).is_some())
-        };
+        let cut = |index: &usize| self.is_cut(*index);
         self.opened
             .as_ref()
             .and_then(|id| self.index_of(id))
@@ -3208,8 +3216,9 @@ fn measurer(cx: &App, widths: &CharWidths) -> impl Fn(&str, f32, gpui::FontWeigh
 /// Character widths measured so far, by character, size and weight, for one font family.
 type CharWidths = Rc<RefCell<(SharedString, HashMap<(char, u32, u32), f32>)>>;
 
-/// Each chip's text, and half its width as `measure` measures it: made once a layout, for the
-/// layout's room and for drawing the chips it places.
+/// Each chip's text, its name wrapped, and half its width as `measure` measures it: made
+/// once a layout, for the layout's room and for drawing the chips it places, so a frame
+/// wraps and measures nothing.
 fn chip_texts(
     scene: &Scene,
     measure: &impl Fn(&str, f32, gpui::FontWeight) -> f32,
@@ -3218,7 +3227,7 @@ fn chip_texts(
         .nodes
         .iter()
         .map(|node| {
-            let text = paint::chip_text(node);
+            let text = paint::chip_text(node, measure);
             let half = paint::chip_width(&text, measure) / 2.;
             (text, half)
         })
@@ -3286,6 +3295,8 @@ fn to_world(screen: Point<Pixels>, viewport: Bounds<Pixels>, center: Vec2, zoom:
 
 impl Render for GraphCanvas {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        self.renders.set(self.renders.get() + 1);
         // What the session's events left to read is read once the walk is drawn, and what its
         // changes left to lay out is laid out.
         if self.draws_exploration() && self.exploration.read(cx).owes_reads() {
@@ -3587,7 +3598,12 @@ mod tests {
 
     /// The chips' texts of [`scene_of`]'s scene.
     fn texts_of(names: &[&str]) -> Vec<paint::ChipText> {
-        scene_of(names).nodes.iter().map(paint::chip_text).collect()
+        let measure = |text: &str, _: f32, _: gpui::FontWeight| text.len() as f32 * 7.;
+        scene_of(names)
+            .nodes
+            .iter()
+            .map(|node| paint::chip_text(node, &measure))
+            .collect()
     }
 
     fn scene_of(names: &[&str]) -> Scene {
@@ -4059,6 +4075,15 @@ mod tests {
         length: usize,
         cx: &mut gpui::TestAppContext,
     ) -> Entity<GraphSession> {
+        named_chain_session(length, |n| format!("Person {n}"), cx)
+    }
+
+    /// [`chain_session`], each person named by `name`.
+    pub(super) fn named_chain_session(
+        length: usize,
+        name: fn(usize) -> String,
+        cx: &mut gpui::TestAppContext,
+    ) -> Entity<GraphSession> {
         cx.update(studio_theme::init_test);
         let (session, _served) = graph_store::test_server::followed_session(
             CHAIN_SCHEMA,
@@ -4066,12 +4091,10 @@ mod tests {
                 let id = asked["params"]["id"].as_str().unwrap_or("p1").to_owned();
                 let n: usize = id.trim_start_matches('p').parse().unwrap_or(1);
                 match asked["name"].as_str() {
-                    Some("studio_node") => {
-                        serde_json::json!([{ "id": id, "label": format!("Person {n}") }])
-                    }
+                    Some("studio_node") => serde_json::json!([{ "id": id, "label": name(n) }]),
                     Some("studio_neighbours") if n < length => serde_json::json!([{
                         "id": format!("p{}", n + 1),
-                        "label": format!("Person {}", n + 1),
+                        "label": name(n + 1),
                     }]),
                     _ => serde_json::json!([]),
                 }
@@ -4200,6 +4223,111 @@ mod tests {
                     .index_of(&SceneId::Node(NodeRef::new("Person", "p42")))
                     .is_none(),
                 "nobody past the end"
+            );
+        });
+    }
+
+    /// Long names wrap and their chips grow: drawn, a chain of file paths and meeting titles
+    /// shows each over up to three lines, and no two chips overlap, since the layout makes
+    /// room for each chip as tall and as wide as it is drawn. Pointing at chips and zooming
+    /// then draw the canvas and wrap or lay out nothing: names are wrapped once, with the
+    /// layout (docs/drawing.md).
+    #[gpui::test]
+    async fn long_names_wrap_and_drawing_them_wraps_nothing(cx: &mut gpui::TestAppContext) {
+        use gpui::{Modifiers, ScrollDelta};
+        let session = named_chain_session(
+            6,
+            |n| match n % 2 {
+                0 => format!("/archive/2024/q3/contracts/northwind-global-msa-v{n}-final.pdf"),
+                _ => format!("Quarterly business review {n} with Northwind Global procurement"),
+            },
+            cx,
+        );
+        let (canvas, cx) = cx.add_window_view(|_, cx| {
+            GraphCanvas::new(session, NodeRef::new("Person", "p1"), None, cx)
+        });
+        cx.update(|window, cx| window.focus(&canvas.focus_handle(cx), cx));
+        settle(cx);
+        canvas.update_in(cx, |canvas, _, cx| {
+            let hub = canvas
+                .scene
+                .nodes
+                .iter()
+                .position(|node| matches!(node.kind, SceneKind::Hub { .. }))
+                .expect("p1's manager pill");
+            canvas.start_follow(hub, cx);
+        });
+        for _ in 0..40 {
+            settle(cx);
+            if canvas.read_with(cx, |canvas, _| canvas.follow.is_none()) {
+                break;
+            }
+        }
+        // Every layout in, then the whole chain fitted to the window.
+        canvas.update_in(cx, |canvas, _, cx| canvas.lay_out_owed(cx));
+        settle(cx);
+        canvas.update_in(cx, |canvas, window, cx| {
+            canvas.center_on = None;
+            // Glides run on the wall clock, which the test's does not move.
+            canvas.glide = None;
+            canvas.appear.clear();
+            canvas.fit(canvas.viewport(window));
+            cx.notify();
+        });
+        settle(cx);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let rects: Vec<Bounds<Pixels>> = canvas.read_with(cx, |canvas, _| {
+            let wrapped = canvas
+                .texts
+                .iter()
+                .filter(|text| text.rows.len() > 1)
+                .count();
+            assert!(wrapped >= 6, "every long name wraps ({wrapped})");
+            assert!(
+                canvas
+                    .texts
+                    .iter()
+                    .all(|text| text.rows.len() <= paint::CHIP_MAX_LINES)
+            );
+            canvas.chips.borrow().clone()
+        });
+        let drawn: Vec<&Bounds<Pixels>> = rects
+            .iter()
+            .filter(|rect| rect.size.width > px(0.))
+            .collect();
+        assert!(drawn.len() >= 12, "the chain is drawn: {}", drawn.len());
+        for (i, a) in drawn.iter().enumerate() {
+            for b in &drawn[i + 1..] {
+                assert!(!a.intersects(b), "chips overlap: {a:?} {b:?}");
+            }
+        }
+        // Point at every chip, then zoom: drawn again, nothing wrapped or laid out.
+        let (made, generation, renders) = canvas.read_with(cx, |canvas, _| {
+            (
+                paint::CHIP_TEXTS_MADE.with(std::cell::Cell::get),
+                canvas.layout_generation,
+                canvas.renders.get(),
+            )
+        });
+        for rect in &drawn {
+            cx.simulate_mouse_move(rect.center(), None, Modifiers::none());
+            cx.run_until_parked();
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        cx.simulate_event(ScrollEvent {
+            position: drawn[0].center(),
+            delta: ScrollDelta::Pixels(point(px(0.), px(40.))),
+            ..Default::default()
+        });
+        settle(cx);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        canvas.read_with(cx, |canvas, _| {
+            assert!(canvas.renders.get() > renders, "pointing draws the canvas");
+            assert_eq!(canvas.layout_generation, generation, "no layout");
+            assert_eq!(
+                paint::CHIP_TEXTS_MADE.with(std::cell::Cell::get),
+                made,
+                "no name wrapped again"
             );
         });
     }
