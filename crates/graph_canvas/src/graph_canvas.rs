@@ -33,9 +33,9 @@ use graph_store::{
     NodeRef, PageStatus, SessionEvent,
 };
 use studio_actions::canvas::{
-    ClearSelection, CollapseNode, ExpandNode, FitToWindow, FocusSelected, MoveDown, MoveLeft,
-    MoveRight, MoveUp, OpenSelectedPage, PeekSelected, ResetLayout, SelectAll, WalkBack,
-    WalkForward, ZoomIn, ZoomOut,
+    ClearSelection, CollapseNode, ExpandNode, FitToWindow, FocusSelected, FollowRelationship,
+    MoveDown, MoveLeft, MoveRight, MoveUp, OpenSelectedPage, PeekSelected, ResetLayout, SelectAll,
+    WalkBack, WalkForward, ZoomIn, ZoomOut,
 };
 use studio_actions::graph::{
     OpenMap, OpenNodePage, OpenType, PeekNode, ShowNodeInTree, ShowNodeOnCanvas,
@@ -447,8 +447,24 @@ pub(crate) struct GraphCanvas {
     bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     /// Each node's chip on screen as last painted, for hit testing.
     chips: Rc<RefCell<Vec<Bounds<Pixels>>>>,
+    /// A single-target relationship being followed hop after hop ([`FollowRelationship`]).
+    follow: Option<Follow>,
     _subscriptions: Vec<Subscription>,
 }
+
+/// A single-target relationship followed to the end of its chain: the field it waits on to
+/// read its target, then the next node's field, until a node has none, the walk comes back
+/// to a node on its path, or [`FOLLOW_MAX`] hops are taken.
+#[derive(Debug, Clone)]
+struct Follow {
+    group: gq_language::RelationshipGroup,
+    field: ExplorePath,
+    hops: usize,
+}
+
+/// The most hops one follow takes: a chain longer than this stops there, drawn as far as it
+/// went, and following it again goes on from its end (constitution IX).
+const FOLLOW_MAX: usize = 100;
 
 impl EventEmitter<ItemEvent> for GraphCanvas {}
 impl EventEmitter<TypeEvent> for GraphCanvas {}
@@ -631,9 +647,11 @@ impl GraphCanvas {
                     this._loaded = None;
                     cx.emit(ItemEvent::UpdateTab);
                     this.owe_layout(cx);
+                    this.advance_follow(cx);
                 }
                 // Reads that finish together (a node's counts) are laid out in one go.
                 ExplorationEvent::Loaded => {
+                    this.advance_follow(cx);
                     if this._loaded.is_none() {
                         this._loaded = Some(cx.spawn(async move |this, cx| {
                             cx.background_executor().timer(COALESCE_LOADS).await;
@@ -717,6 +735,7 @@ impl GraphCanvas {
             char_widths: CharWidths::default(),
             bounds: Rc::new(Cell::new(None)),
             chips: Rc::new(RefCell::new(Vec::new())),
+            follow: None,
             _subscriptions: subscriptions,
         };
         canvas.rebuild(cx);
@@ -2236,6 +2255,7 @@ impl GraphCanvas {
                         if *open { "Close" } else { "Open" },
                         None,
                         Self::on_menu(&this, {
+                            let id = id.clone();
                             move |canvas, window, cx| {
                                 if let Some(index) = canvas.index_of(&id) {
                                     canvas.activate(index, false, window, cx);
@@ -2243,6 +2263,23 @@ impl GraphCanvas {
                             }
                         }),
                     );
+                    // A single-target relationship (a manager, a parent folder) is followed
+                    // to the end of its chain in one go.
+                    if exploring
+                        && schema
+                            .as_ref()
+                            .is_some_and(|schema| graph_store::is_field(schema, &group))
+                    {
+                        menu = menu.entry(
+                            format!("Follow {} all the way", group.edge),
+                            Some(Box::new(FollowRelationship)),
+                            Self::on_menu(&this, move |canvas, _, cx| {
+                                if let Some(index) = canvas.index_of(&id) {
+                                    canvas.start_follow(index, cx);
+                                }
+                            }),
+                        );
+                    }
                     let sections = schema
                         .as_ref()
                         .map(|schema| gq_language::builder::GroupBy::sections(schema, &group))
@@ -2614,6 +2651,120 @@ impl GraphCanvas {
             self.glide_from(from, cx);
             cx.notify();
         }
+    }
+
+    /// ⌥↵: follows the selected single-target relationship (a manager, a parent folder) to
+    /// the end of its chain, each node it reaches expanded, so a chain of 40 managers is one
+    /// action on one canvas. On a node reached through one, it follows the same relationship
+    /// on from that node.
+    fn follow_relationship(
+        &mut self,
+        _: &FollowRelationship,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(index) = self.selected_index() {
+            self.start_follow(index, cx);
+        }
+    }
+
+    /// Starts following from chip `index`: a single-target pill, or a node reached through one.
+    fn start_follow(&mut self, index: usize, cx: &mut Context<Self>) {
+        if !self.draws_exploration() {
+            return;
+        }
+        let Some(node) = self.scene.nodes.get(index) else {
+            return;
+        };
+        let Some(schema) = self.exploration.read(cx).schema() else {
+            return;
+        };
+        // The relationship, its field's path, and the node it starts from.
+        let (group, field, owner) = match (&node.kind, &node.path) {
+            (SceneKind::Hub { key, .. }, Some(path))
+                if graph_store::is_field(&schema, &key.group) =>
+            {
+                let owner = node
+                    .parent
+                    .and_then(|parent| self.scene.nodes.get(parent))
+                    .and_then(|parent| parent.path.clone());
+                (key.group.clone(), path.clone(), owner)
+            }
+            // A node reached through a single-target relationship goes on along it.
+            (SceneKind::Node { .. }, Some(path)) => match path.steps() {
+                [
+                    ..,
+                    graph_store::Step::Group(group),
+                    graph_store::Step::Node(_),
+                ] if graph_store::is_field(&schema, group) => {
+                    (group.clone(), path.child_group(group), Some(path.clone()))
+                }
+                _ => return,
+            },
+            _ => return,
+        };
+        let opens: Vec<ExplorePath> = owner.into_iter().chain([field.clone()]).collect();
+        self.follow = Some(Follow {
+            group,
+            field,
+            hops: 0,
+        });
+        self.exploration
+            .update(cx, |exploration, cx| exploration.set_open(&opens, true, cx));
+        self.advance_follow(cx);
+    }
+
+    /// Takes the next hop of the relationship being followed once its field's target is read:
+    /// opens the target and its own field. Ends at a node with none, at a node already on the
+    /// path, after [`FOLLOW_MAX`] hops, or when the field could not be read; the view centres on
+    /// each node reached, so it travels with the chain.
+    fn advance_follow(&mut self, cx: &mut Context<Self>) {
+        let Some(follow) = self.follow.clone() else {
+            return;
+        };
+        let entries = self.exploration.read(cx).entries();
+        let Some(at) = entries.iter().position(|entry| {
+            entry.path == follow.field && matches!(entry.kind, EntryKind::Field { .. })
+        }) else {
+            // Its node is not open yet, or the walk closed it: wait, or stop if closed.
+            if !self.exploration.read(cx).state().is_expanded(&follow.field) {
+                self.follow = None;
+            }
+            return;
+        };
+        let EntryKind::Field {
+            target, loading, ..
+        } = &entries[at].kind
+        else {
+            return;
+        };
+        let failed = entries.get(at + 1).is_some_and(|next| {
+            next.parent == Some(at) && matches!(next.kind, EntryKind::Error { .. })
+        });
+        let Some(target) = target else {
+            if !*loading || failed {
+                self.follow = None;
+            }
+            return;
+        };
+        let node_path = follow.field.child_node(&target.node);
+        let cycle = entries
+            .iter()
+            .any(|entry| entry.path == node_path && matches!(entry.kind, EntryKind::Cycle { .. }));
+        self.center_on = Some(SceneId::Node(target.node.clone()));
+        if cycle || follow.hops + 1 >= FOLLOW_MAX {
+            self.follow = None;
+            return;
+        }
+        let next = node_path.child_group(&follow.group);
+        self.follow = Some(Follow {
+            field: next.clone(),
+            hops: follow.hops + 1,
+            ..follow
+        });
+        self.exploration.update(cx, |exploration, cx| {
+            exploration.set_open(&[node_path, next], true, cx)
+        });
     }
 
     fn move_selection(&mut self, direction: Vec2, cx: &mut Context<Self>) {
@@ -3204,6 +3355,7 @@ impl Render for GraphCanvas {
             .on_action(cx.listener(Self::peek_selected))
             .on_action(cx.listener(Self::open_selected_page))
             .on_action(cx.listener(Self::focus_selected))
+            .on_action(cx.listener(Self::follow_relationship))
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::clear_selection))
             .on_action(
@@ -3943,6 +4095,61 @@ mod tests {
             assert!(canvas.scene.nodes.iter().any(|node| {
                 matches!(node.kind, SceneKind::Hub { .. }) && node.parent == Some(p2)
             }));
+        });
+    }
+
+    /// Following a single-target relationship walks its whole chain on one canvas: from p1's
+    /// manager pill, 41 people, each reached through the one before, and it stops at the one
+    /// who reports to nobody. ⌥↵ on a node reached through one goes on from there.
+    #[gpui::test]
+    async fn following_a_relationship_walks_its_whole_chain(cx: &mut gpui::TestAppContext) {
+        let session = chain_session(41, cx);
+        let (canvas, cx) = cx.add_window_view(|_, cx| {
+            GraphCanvas::new(session, NodeRef::new("Person", "p1"), None, cx)
+        });
+        cx.update(|window, cx| window.focus(&canvas.focus_handle(cx), cx));
+        settle(cx);
+        canvas.update_in(cx, |canvas, _, cx| {
+            let hub = canvas
+                .scene
+                .nodes
+                .iter()
+                .position(|node| matches!(node.kind, SceneKind::Hub { .. }))
+                .expect("p1's manager pill");
+            canvas.select(Some(hub), cx);
+        });
+        cx.dispatch_action(FollowRelationship);
+        for _ in 0..200 {
+            settle(cx);
+            if canvas.read_with(cx, |canvas, _| canvas.follow.is_none()) {
+                break;
+            }
+        }
+        canvas.update_in(cx, |canvas, _, cx| canvas.lay_out_owed(cx));
+        settle(cx);
+        canvas.read_with(cx, |canvas, _| {
+            assert!(canvas.follow.is_none(), "the follow ended");
+            for n in 1..=41 {
+                let id = SceneId::Node(NodeRef::new("Person", format!("p{n}")));
+                let index = canvas
+                    .index_of(&id)
+                    .unwrap_or_else(|| panic!("p{n} is drawn"));
+                if n > 1 {
+                    // Each hangs off the pill of the one before.
+                    let pill = canvas.scene.nodes[index].parent.expect("a pill");
+                    let owner = canvas.scene.nodes[pill].parent.expect("an owner");
+                    assert_eq!(
+                        canvas.scene.nodes[owner].id,
+                        SceneId::Node(NodeRef::new("Person", format!("p{}", n - 1)))
+                    );
+                }
+            }
+            assert!(
+                canvas
+                    .index_of(&SceneId::Node(NodeRef::new("Person", "p42")))
+                    .is_none(),
+                "nobody past the end"
+            );
         });
     }
 

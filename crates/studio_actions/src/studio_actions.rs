@@ -865,6 +865,9 @@ pub mod canvas {
             OpenSelectedPage,
             /// Center and zoom on the selected node.
             FocusSelected,
+            /// Follow the selected single-target relationship (a manager, a parent folder) hop
+            /// after hop, to the end of its chain.
+            FollowRelationship,
             /// Select the node the selected one was reached from.
             WalkBack,
             /// Go back down the path walked with WalkBack.

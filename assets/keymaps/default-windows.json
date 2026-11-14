@@ -339,6 +339,7 @@
       "space": "studio_canvas::PeekSelected",
       "ctrl-enter": "studio_canvas::OpenSelectedPage",
       "f": "studio_canvas::FocusSelected",
+      "alt-enter": "studio_canvas::FollowRelationship",
       "[": "studio_canvas::WalkBack",
       "]": "studio_canvas::WalkForward",
       "r": "studio_canvas::ResetLayout",
