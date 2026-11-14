@@ -56,8 +56,19 @@ const HUB_TEXT: f32 = 12.5;
 const PILL_GAP: f32 = studio_ui::ds::space::SM;
 const PILL_PAD_X: f32 = studio_ui::ds::space::CONTROL_INSET;
 const PILL_MARK: f32 = studio_ui::ds::size::ROW_ICON;
-/// The characters a node's chip shows of its name before it cuts it with "…".
-pub(crate) const CHIP_LABEL_CHARS: usize = 32;
+/// The most lines a node's name wraps over in its chip before it is cut with "…"; pointing at
+/// a cut chip shows the whole name (spec 006, "Opened chips").
+pub(crate) const CHIP_MAX_LINES: usize = 3;
+/// The narrowest and widest a node's chip stands at zoom 1: a short name keeps a chip you can
+/// point at, and a long one wraps rather than running across the canvas.
+pub(crate) const CHIP_MIN_WIDTH: f32 = 56.;
+pub(crate) const CHIP_MAX_WIDTH: f32 = 240.;
+/// A line of chip text, at zoom 1, for its size.
+fn line_height(text_size: f32) -> f32 {
+    text_size * 1.4
+}
+/// A chip's padding above and below its lines, at zoom 1.
+const PILL_PAD_Y: f32 = 4.;
 /// The widest an opened chip grows at zoom 1 before its name wraps: an email or an id of 40
 /// characters stays on one line.
 const OPEN_CHIP_MAX_WIDTH: f32 = 320.;
@@ -119,30 +130,57 @@ impl Role {
 }
 
 /// What a chip says, before colour: the same for painting it and for measuring it, so the
-/// layout makes room for the chip the painter draws. Made once per layout, not per frame.
+/// layout makes room for the chip the painter draws. Made once per layout, not per frame: a
+/// node's name is wrapped here, with the canvas's measured character widths.
 pub(crate) struct ChipText {
     pub mark: bool,
     /// The letter of its mark, drawn from afar too.
     pub initial: SharedString,
-    pub pieces: Vec<(SharedString, Role)>,
+    /// Its rows, top to bottom, each of pieces drawn side by side: a node's name wrapped over
+    /// up to [`CHIP_MAX_LINES`], a pill's name and count on one.
+    pub rows: Vec<Vec<(SharedString, Role)>>,
     /// The text size at zoom 1.
     pub size: f32,
+    /// The name did not fit its rows and was cut with "…": pointing at the chip opens it.
+    pub cut: bool,
 }
 
-pub(crate) fn chip_text(node: &SceneNode) -> ChipText {
-    // A label is drawn on one line: a control character shows as its picture.
+/// What `node`'s chip says, its name wrapped to fit a chip at most [`CHIP_MAX_WIDTH`] wide,
+/// as `measure` measures text (width of a text at a size and weight).
+pub(crate) fn chip_text(
+    node: &SceneNode,
+    measure: &impl Fn(&str, f32, FontWeight) -> f32,
+) -> ChipText {
+    #[cfg(test)]
+    CHIP_TEXTS_MADE.with(|made| made.set(made.get() + 1));
+    // A label is drawn as text: a control character shows as its picture.
     let label = ui::utils::replace_control_characters(&node.label);
     let initial = initial(&node.label, &node.color_key);
+    let single = |label: String, role: Role| ChipText {
+        mark: false,
+        initial: initial.clone(),
+        rows: vec![vec![(label.into(), role)]],
+        size: HUB_TEXT,
+        cut: false,
+    };
     match &node.kind {
-        SceneKind::Node { root, .. } => ChipText {
-            mark: true,
-            initial,
-            pieces: vec![(
-                studio_ui::text::cut(&label, CHIP_LABEL_CHARS).into(),
-                if *root { Role::RootName } else { Role::Name },
-            )],
-            size: CHIP_TEXT,
-        },
+        SceneKind::Node { root, .. } => {
+            let role = if *root { Role::RootName } else { Role::Name };
+            let room = CHIP_MAX_WIDTH - PILL_PAD_X * 2. - PILL_MARK - PILL_GAP;
+            let (lines, cut) = wrap_name(&label, room, CHIP_MAX_LINES, &|text: &str| {
+                measure(text, CHIP_TEXT, role.weight())
+            });
+            ChipText {
+                mark: true,
+                initial,
+                rows: lines
+                    .into_iter()
+                    .map(|line| vec![(line.into(), role)])
+                    .collect(),
+                size: CHIP_TEXT,
+                cut,
+            }
+        }
         SceneKind::Hub { open, .. } => {
             let (name, count) = match label.rsplit_once(" · ") {
                 Some((name, count)) => (name.to_owned(), Some(count.to_owned())),
@@ -151,64 +189,143 @@ pub(crate) fn chip_text(node: &SceneNode) -> ChipText {
             ChipText {
                 mark: false,
                 initial,
-                pieces: std::iter::once((
-                    name.into(),
-                    if *open { Role::OpenHub } else { Role::Muted },
-                ))
-                .chain(count.map(|count| (count.into(), Role::Count)))
-                .collect(),
+                rows: vec![
+                    std::iter::once((name.into(), if *open { Role::OpenHub } else { Role::Muted }))
+                        .chain(count.map(|count| (count.into(), Role::Count)))
+                        .collect(),
+                ],
                 size: HUB_TEXT,
+                cut: false,
             }
         }
-        SceneKind::More { note, .. } => ChipText {
-            mark: false,
-            initial,
-            pieces: vec![(
-                label.into_owned().into(),
-                match note {
-                    Some(crate::model::Note::Failed(_)) => Role::Error,
-                    _ => Role::Muted,
-                },
-            )],
-            size: HUB_TEXT,
-        },
-        SceneKind::Note { note, .. } => ChipText {
-            mark: false,
-            initial,
-            pieces: vec![(
-                label.into_owned().into(),
-                match note {
-                    crate::model::Note::Failed(_) => Role::Error,
-                    _ => Role::Muted,
-                },
-            )],
-            size: HUB_TEXT,
-        },
+        SceneKind::More { note, .. } => single(
+            label.into_owned(),
+            match note {
+                Some(crate::model::Note::Failed(_)) => Role::Error,
+                _ => Role::Muted,
+            },
+        ),
+        SceneKind::Note { note, .. } => single(
+            label.into_owned(),
+            match note {
+                crate::model::Note::Failed(_) => Role::Error,
+                _ => Role::Muted,
+            },
+        ),
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many chips' texts were made, their names wrapped and measured, for the drawing-cost
+    /// guard (docs/drawing.md): a frame makes none.
+    pub(crate) static CHIP_TEXTS_MADE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Wraps `text` into at most `max_lines` lines no wider than `room`, as `width` measures them:
+/// at spaces, and after the marks a path, an email or a key breaks at (`/`, `-`, `_`, `.`,
+/// `@`, `,`), a word wider than a line where its room ends. Text beyond the last line is cut
+/// with "…". Returns the lines and whether it was cut.
+pub(crate) fn wrap_name(
+    text: &str,
+    room: f32,
+    max_lines: usize,
+    width: &impl Fn(&str) -> f32,
+) -> (Vec<String>, bool) {
+    // The text in runs that may end a line: a word with the space after it, or a piece of a
+    // path ending at its separator.
+    let mut runs: Vec<&str> = Vec::new();
+    let mut start = 0;
+    for (at, ch) in text.char_indices() {
+        let end = at + ch.len_utf8();
+        if ch == ' ' || matches!(ch, '/' | '-' | '_' | '.' | '@' | ',') {
+            runs.push(&text[start..end]);
+            start = end;
+        }
+    }
+    if start < text.len() {
+        runs.push(&text[start..]);
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut line = String::new();
+    let mut rest = runs.into_iter().peekable();
+    for run in rest.by_ref() {
+        let joined = format!("{line}{run}");
+        if width(joined.trim_end()) <= room {
+            line = joined;
+            continue;
+        }
+        if !line.is_empty() {
+            lines.push(std::mem::take(&mut line).trim_end().to_owned());
+        }
+        // A run wider than a line breaks where its room ends.
+        let mut piece = String::new();
+        for ch in run.chars() {
+            let longer = format!("{piece}{ch}");
+            if !piece.is_empty() && width(longer.trim_end()) > room {
+                lines.push(std::mem::take(&mut piece));
+            }
+            piece.push(ch);
+        }
+        line = piece;
+        if lines.len() >= max_lines {
+            break;
+        }
+    }
+    if !line.trim_end().is_empty() {
+        lines.push(line.trim_end().to_owned());
+    }
+    if lines.len() <= max_lines && rest.peek().is_none() {
+        return (lines, false);
+    }
+    lines.truncate(max_lines);
+    // The last line ends in "…", within its room.
+    if let Some(last) = lines.last_mut() {
+        while !last.is_empty() && width(&format!("{}…", last.trim_end())) > room {
+            last.pop();
+        }
+        *last = format!("{}…", last.trim_end());
+    }
+    (lines, true)
 }
 
 /// A node's whole name when its chip cuts it: what the chip shows opened (spec 006, "Opened
 /// chips").
-pub(crate) fn whole_label(node: &SceneNode) -> Option<String> {
-    if !matches!(node.kind, SceneKind::Node { .. })
-        || studio_ui::text::cut(&node.label, CHIP_LABEL_CHARS) == node.label
-    {
+pub(crate) fn whole_label(node: &SceneNode, text: &ChipText) -> Option<String> {
+    if !matches!(node.kind, SceneKind::Node { .. }) || !text.cut {
         return None;
     }
     Some(ui::utils::replace_control_characters(&node.label).into_owned())
 }
 
 /// A chip's width at zoom 1, as [`paint_pill`] draws it, given the width of a text at a size
-/// and weight.
+/// and weight: its widest row, and a node's never narrower than [`CHIP_MIN_WIDTH`].
 pub(crate) fn chip_width(text: &ChipText, measure: impl Fn(&str, f32, FontWeight) -> f32) -> f32 {
-    let widths: f32 = text
-        .pieces
+    let widest = text
+        .rows
         .iter()
-        .map(|(piece, role)| measure(piece, text.size, role.weight()))
-        .sum();
-    let gaps = PILL_GAP * text.pieces.len().saturating_sub(1) as f32;
+        .map(|row| {
+            let widths: f32 = row
+                .iter()
+                .map(|(piece, role)| measure(piece, text.size, role.weight()))
+                .sum();
+            widths + PILL_GAP * row.len().saturating_sub(1) as f32
+        })
+        .fold(0., f32::max);
     let mark = if text.mark { PILL_MARK + PILL_GAP } else { 0. };
-    PILL_PAD_X * 2. + widths + gaps + mark
+    let width = PILL_PAD_X * 2. + widest + mark;
+    if text.mark {
+        width.max(CHIP_MIN_WIDTH)
+    } else {
+        width
+    }
+}
+
+/// Half the room a chip takes up and down at zoom 1, for the layout: a one-line chip's
+/// [`crate::layout::CHIP_HALF_HEIGHT`], and a line more for each line its name wraps onto.
+pub(crate) fn chip_half_height(text: &ChipText) -> f32 {
+    crate::layout::CHIP_HALF_HEIGHT
+        + line_height(text.size) * text.rows.len().saturating_sub(1) as f32 / 2.
 }
 
 /// One piece of a chip's text.
@@ -275,19 +392,23 @@ pub(crate) fn paint(
         })
         .collect();
 
-    // What each chip says, in its colours.
-    let pieces_of = |index: usize| -> Vec<Piece> {
+    // What each chip says, in its colours, row by row.
+    let rows_of = |index: usize| -> Vec<Vec<Piece>> {
         texts[index]
-            .pieces
+            .rows
             .iter()
-            .map(|(text, role)| Piece {
-                text: text.clone(),
-                color: match role {
-                    Role::Name | Role::RootName | Role::OpenHub => palette.text,
-                    Role::Count | Role::Muted => palette.muted,
-                    Role::Error => palette.error,
-                },
-                weight: role.weight(),
+            .map(|row| {
+                row.iter()
+                    .map(|(text, role)| Piece {
+                        text: text.clone(),
+                        color: match role {
+                            Role::Name | Role::RootName | Role::OpenHub => palette.text,
+                            Role::Count | Role::Muted => palette.muted,
+                            Role::Error => palette.error,
+                        },
+                        weight: role.weight(),
+                    })
+                    .collect()
             })
             .collect()
     };
@@ -296,11 +417,11 @@ pub(crate) fn paint(
     let open: Option<(usize, OpenChip)> = opened
         .filter(|&index| index < scene.nodes.len() && !mark_only(index))
         .and_then(|index| {
-            let label = whole_label(&scene.nodes[index])?;
+            let label = whole_label(&scene.nodes[index], &texts[index])?;
             let size = texts[index].size * scale;
             let (chip, _) = pill_layout(
                 screen[index],
-                &pieces_of(index),
+                &rows_of(index),
                 texts[index].mark,
                 size,
                 palette,
@@ -416,7 +537,7 @@ pub(crate) fn paint(
         let size = text.size * scale;
         rects[index] = paint_pill(
             p,
-            &pieces_of(index),
+            &rows_of(index),
             mark,
             size,
             PillStyle {
@@ -875,57 +996,71 @@ pub(crate) fn paint_chip_body(
     ));
 }
 
-/// A chip's pieces shaped at `text_size`, and the pill around them centred on `at`: one line
-/// high, its mark (when it has one) before them. What painting the chip draws, and what an
+/// A chip's rows of pieces shaped at `text_size`, and the pill around them centred on `at`: as
+/// tall as its rows, as wide as its widest (a node's never narrower than [`CHIP_MIN_WIDTH`]),
+/// its mark (when it has one) before the first. What painting the chip draws, and what an
 /// opened chip grows from.
 fn pill_layout(
     at: Point<Pixels>,
-    pieces: &[Piece],
+    rows: &[Vec<Piece>],
     mark: bool,
     text_size: f32,
     palette: &Palette,
     window: &mut Window,
-) -> (Bounds<Pixels>, Vec<ShapedLine>) {
+) -> (Bounds<Pixels>, Vec<Vec<ShapedLine>>) {
     let s = text_size / CHIP_TEXT;
-    let lines: Vec<ShapedLine> = pieces
+    let shaped: Vec<Vec<ShapedLine>> = rows
         .iter()
-        .map(|piece| {
-            let font = Font {
-                weight: piece.weight,
-                ..palette.font.clone()
-            };
-            window.text_system().shape_line(
-                piece.text.clone(),
-                px(text_size),
-                &[TextRun {
-                    len: piece.text.len(),
-                    font,
-                    color: piece.color,
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                }],
-                None,
-            )
+        .map(|row| {
+            row.iter()
+                .map(|piece| {
+                    let font = Font {
+                        weight: piece.weight,
+                        ..palette.font.clone()
+                    };
+                    window.text_system().shape_line(
+                        piece.text.clone(),
+                        px(text_size),
+                        &[TextRun {
+                            len: piece.text.len(),
+                            font,
+                            color: piece.color,
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        }],
+                        None,
+                    )
+                })
+                .collect()
         })
         .collect();
     let gap = PILL_GAP * s;
-    let height = text_size * 1.4 + 8. * s;
-    let text_width: f32 = lines.iter().map(|l| f32::from(l.width)).sum::<f32>()
-        + gap * lines.len().saturating_sub(1) as f32;
-    let width = PILL_PAD_X * s * 2. + text_width + if mark { PILL_MARK * s + gap } else { 0. };
+    let height = line_height(text_size) * shaped.len().max(1) as f32 + PILL_PAD_Y * 2. * s;
+    let text_width = shaped
+        .iter()
+        .map(|row| {
+            row.iter().map(|l| f32::from(l.width)).sum::<f32>()
+                + gap * row.len().saturating_sub(1) as f32
+        })
+        .fold(0., f32::max);
+    let mut width = PILL_PAD_X * s * 2. + text_width + if mark { PILL_MARK * s + gap } else { 0. };
+    if mark {
+        width = width.max(CHIP_MIN_WIDTH * s);
+    }
     let rect = Bounds::new(
         point(at.x - px(width / 2.), at.y - px(height / 2.)),
         size(px(width), px(height)),
     );
-    (rect, lines)
+    (rect, shaped)
 }
 
-/// A chip centred on `at`: an optional letter mark, then the pieces of text. Returns its bounds.
+/// A chip centred on `at`: an optional letter mark beside its first row, then its rows of
+/// text. Returns its bounds.
 #[expect(clippy::too_many_arguments)]
 pub(crate) fn paint_pill(
     at: Point<Pixels>,
-    pieces: &[Piece],
+    rows: &[Vec<Piece>],
     mark: Option<(Hsla, SharedString)>,
     text_size: f32,
     style: PillStyle,
@@ -933,33 +1068,32 @@ pub(crate) fn paint_pill(
     window: &mut Window,
     cx: &mut App,
 ) -> Bounds<Pixels> {
-    let (rect, lines) = pill_layout(at, pieces, mark.is_some(), text_size, palette, window);
+    let (rect, shaped) = pill_layout(at, rows, mark.is_some(), text_size, palette, window);
     let s = text_size / CHIP_TEXT;
     let gap = PILL_GAP * s;
-    let line_height = text_size * 1.4;
+    let line = line_height(text_size);
     let mark_size = PILL_MARK * s;
     // A chip is not a button: the scale's `sm` corner, zoomed with it, never past round.
     let radius = (studio_ui::ds::radii(cx).sm * s).min(f32::from(rect.size.height) / 2.);
     paint_chip_body(rect, radius, &style, window);
-    let mut x = f32::from(rect.left()) + PILL_PAD_X * s;
-    let middle = at.y;
+    let left = f32::from(rect.left()) + PILL_PAD_X * s;
+    let top = rect.top() + px(PILL_PAD_Y * s);
+    let mut text_left = left;
     if let Some((tint, letter)) = mark {
-        let center = point(px(x + mark_size / 2.), middle);
-        let line = shape_letter(&letter, mark_size, palette, window);
-        paint_letter_mark(center, tint, &line, mark_size, window, cx);
-        x += mark_size + gap;
+        let center = point(px(left + mark_size / 2.), top + px(line / 2.));
+        let shaped_letter = shape_letter(&letter, mark_size, palette, window);
+        paint_letter_mark(center, tint, &shaped_letter, mark_size, window, cx);
+        text_left += mark_size + gap;
     }
-    for line in &lines {
-        line.paint(
-            point(px(x), middle - px(line_height / 2.)),
-            px(line_height),
-            TextAlign::Left,
-            None,
-            window,
-            cx,
-        )
-        .ok();
-        x += f32::from(line.width) + gap;
+    for (index, row) in shaped.iter().enumerate() {
+        let mut x = text_left;
+        let y = top + px(line * index as f32);
+        for piece in row {
+            piece
+                .paint(point(px(x), y), px(line), TextAlign::Left, None, window, cx)
+                .ok();
+            x += f32::from(piece.width) + gap;
+        }
     }
     rect
 }
@@ -1200,6 +1334,76 @@ fn crosses(points: &[Point<Pixels>], bounds: Bounds<Pixels>, margin: f32) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A node's name wraps over up to three lines at words and at the marks a path or an
+    /// email breaks at, each line within its room; a longer one is cut with "…" on its last
+    /// line and says so, so pointing at it opens the whole name. Before, every name was cut at
+    /// 32 characters onto one line.
+    #[test]
+    fn a_name_wraps_over_three_lines_and_then_is_cut() {
+        let width = |text: &str| text.chars().count() as f32 * 7.;
+        let room = 140.; // 20 characters
+        let (lines, cut) = wrap_name("Ada Lovelace", room, CHIP_MAX_LINES, &width);
+        assert_eq!((lines, cut), (vec!["Ada Lovelace".to_owned()], false));
+        let title = "Quarterly business review with Northwind Global";
+        let (lines, cut) = wrap_name(title, room, CHIP_MAX_LINES, &width);
+        assert!(!cut, "{lines:?}");
+        assert_eq!(
+            lines,
+            ["Quarterly business", "review with", "Northwind Global"]
+        );
+        let path = "/archive/q3/contracts/northwind-msa-v7.pdf";
+        let (lines, cut) = wrap_name(path, room, CHIP_MAX_LINES, &width);
+        assert!(!cut && lines.len() <= 3, "{lines:?}");
+        assert!(lines.iter().all(|line| width(line) <= room), "{lines:?}");
+        assert_eq!(lines.concat(), path, "nothing lost but the breaks");
+        // An id with no break wraps where its room ends.
+        let id = "0123456789abcdefghijklmnopqrstuvwxyz";
+        let (lines, _) = wrap_name(id, room, CHIP_MAX_LINES, &width);
+        assert_eq!(lines, ["0123456789abcdefghij", "klmnopqrstuvwxyz"]);
+        // Past three lines: cut, the last line ending in "…" within its room.
+        let long = "Notes on the history of information retrieval and the systems built for it";
+        let (lines, cut) = wrap_name(long, room, CHIP_MAX_LINES, &width);
+        assert!(cut);
+        assert_eq!(lines.len(), 3);
+        assert!(
+            lines[2].ends_with('…') && width(&lines[2]) <= room,
+            "{lines:?}"
+        );
+    }
+
+    /// A node's chip is as wide as its widest line, between its least and most width.
+    #[test]
+    fn a_chip_sizes_to_its_name_within_its_bounds() {
+        use crate::model::SceneId;
+        use graph_store::NodeRef;
+        let measure = |text: &str, _: f32, _: FontWeight| text.chars().count() as f32 * 7.;
+        let chip = |label: &str| SceneNode {
+            id: SceneId::Node(NodeRef::new("T", label)),
+            kind: SceneKind::Node {
+                node: NodeRef::new("T", label),
+                root: false,
+                expanded: false,
+            },
+            label: label.into(),
+            color_key: "T".into(),
+            parent: None,
+            path: None,
+        };
+        let short = chip_text(&chip("Al"), &measure);
+        assert_eq!(chip_width(&short, measure), CHIP_MIN_WIDTH);
+        assert_eq!(chip_half_height(&short), crate::layout::CHIP_HALF_HEIGHT);
+        let long = chip_text(
+            &chip("Quarterly business review with Northwind Global procurement and security"),
+            &measure,
+        );
+        assert!(long.rows.len() > 1 && long.rows.len() <= CHIP_MAX_LINES);
+        assert!(chip_width(&long, measure) <= CHIP_MAX_WIDTH);
+        assert!(
+            chip_half_height(&long) > chip_half_height(&short),
+            "taller for its lines"
+        );
+    }
 
     /// Pointing at a chip lights the way it was reached: its line, and every line back to the
     /// root through the chips it hangs off, at the pointed tone; a sibling's line stays as it
