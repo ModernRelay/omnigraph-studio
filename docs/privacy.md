@@ -75,10 +75,12 @@ under your account with them. Studio runs no agent until you choose one.
 
 ## The builds that sent reports
 
-Three builds of Studio sent reports to us: version 0.4.5, released on 13 November 2026, and the
-pre-release ("edge") builds of 13 and 14 November 2026. No version before or after them sends
-any. None of them sent anything while the `DO_NOT_TRACK` or `OMNIGRAPH_STUDIO_TELEMETRY=0`
-environment variable was set.
+Three builds of Studio sent reports to us: version 0.4.5, released on 13 November 2026, and two
+pre-release ("edge") builds, the one of 13 November 2026 and the earlier of the two made on
+14 November 2026. No version before or after them sends any. The later edge build of
+14 November, offered since 21:44 UTC that day, is version 0.4.7 and sends none. None of the
+three sent anything while the `DO_NOT_TRACK` or `OMNIGRAPH_STUDIO_TELEMETRY=0` environment
+variable was set.
 
 **Usage data.** It included the features you used (for example, "a query ran" or "a write
 finished") and their outcomes, durations and sizes. Numbers were rounded into ranges, so a
@@ -87,10 +89,10 @@ times, the peak memory range, and how many times Studio crashed. Every report al
 Studio's version, your operating system and its major version, and your processor architecture.
 
 Version 0.4.5 and the edge build of 13 November sent usage data from their first start unless
-you turned it off. They said so in the status bar, and did not wait for your answer. The edge
-build of 14 November asked first and sent none until you agreed. The edition of this notice
-dated 13 November 2026 said usage data was sent only if you agreed. That described the edge
-build of 14 November, and not version 0.4.5.
+you turned it off. They said so in the status bar, and did not wait for your answer. The earlier
+edge build of 14 November asked first and sent none until you agreed. The edition of this notice
+dated 13 November 2026 said usage data was sent only if you agreed. That described the earlier
+edge build of 14 November, and not version 0.4.5.
 
 Each run of Studio used a new random ID that was never saved. As a result, we cannot connect one
 run to the next, and we cannot tell which reports came from you.
