@@ -1516,6 +1516,9 @@ pub struct Exploration {
     /// The commit the walk is held at (spec 020); none for one that reads the branch head.
     held: Option<String>,
     pin: Option<String>,
+    /// Refresh asked for the branch head itself: until an answer pins the walk, it reads with
+    /// no commit rather than at the head the session holds, which may be behind.
+    at_tip: bool,
     newer_available: bool,
     generation: u64,
     /// The schema what is shown was read under, which it is flattened and read under: the
@@ -1696,6 +1699,7 @@ impl Exploration {
             state: Flattened::default(),
             held: None,
             pin: None,
+            at_tip: false,
             newer_available: false,
             generation: 0,
             schema,
@@ -2142,6 +2146,7 @@ impl Exploration {
     /// change.
     fn forget_at_head(&mut self, cx: &mut Context<Self>) {
         self.reset_reads(cx);
+        self.at_tip = true;
         self.state.clear_loaded();
         if self.held.is_none() {
             self.state.forget_set_total();
@@ -2190,6 +2195,7 @@ impl Exploration {
         self.prune_at = KEPT_READS;
         self.carried.clear();
         self.pin = self.held.clone();
+        self.at_tip = false;
         self.newer_available = false;
         self.schema = self.session.read(cx).schema_model();
         let scope = &self.scope;
@@ -2289,6 +2295,7 @@ impl Exploration {
             }
             LoadTarget::Count(key) => {
                 let snapshot = self.pin.clone();
+                let asked = self.read_commit(cx);
                 let scope = &self.scope;
                 let count = self.session.update(cx, |session, cx| {
                     session.degree_in(
@@ -2296,7 +2303,7 @@ impl Exploration {
                         &key.node.type_name,
                         &key.group,
                         &key.node.id,
-                        snapshot.clone(),
+                        asked,
                         cx,
                     )
                 });
@@ -2403,8 +2410,8 @@ impl Exploration {
         without: Option<BuiltQuery>,
         cx: &mut Context<Self>,
     ) {
-        let snapshot = self.pin.clone();
-        let sent_at = snapshot.clone();
+        let sent_at = self.pin.clone();
+        let snapshot = self.read_commit(cx);
         let generation = self.generation;
         let scope = &self.scope;
         let read = self.session.update(cx, |session, cx| {
@@ -2478,6 +2485,19 @@ impl Exploration {
             .ok();
         });
         self.tasks.insert(target, (ticket, task));
+    }
+
+    /// The commit a read is sent at: the pin, or before the first answer pins the walk, the
+    /// branch head the session holds, as a table's first read goes (spec 015). A walk opened
+    /// again at that head is answered from what the session keeps there, with no request; the
+    /// answer still pins the walk ([`Self::pinned_at`]), and a head the session sees move while
+    /// it is out is compared once it lands. After Refresh it is none: the branch head itself.
+    fn read_commit(&self, cx: &App) -> Option<String> {
+        if self.pin.is_some() || self.at_tip {
+            return self.pin.clone();
+        }
+        let session = self.session.read(cx);
+        session.head(&session.branch).map(str::to_owned)
     }
 
     /// A number for a read about to start, which its entry in `tasks` is kept under.
@@ -3656,7 +3676,9 @@ mod tests {
         release.send(()).ok();
         cx.run_until_parked();
         let pin = exploration.read_with(cx, |exploration, _| exploration.pin().map(str::to_owned));
-        assert_eq!(pin.as_deref(), Some("c2"), "the root's answer");
+        // The root went to c1, the head the session holds, as a branch read; the branch answered
+        // at c2, so it was read again at c1 itself, which pins the walk there (spec 015).
+        assert_eq!(pin.as_deref(), Some("c1"), "the head the root was sent to");
         let after = taken();
         assert!(
             after.iter().any(|(name, _)| name == "studio_neighbours"),
@@ -3665,7 +3687,7 @@ mod tests {
         assert!(
             after
                 .iter()
-                .all(|(_, commit)| commit.as_deref() == Some("c2")),
+                .all(|(_, commit)| commit.as_deref() == Some("c1")),
             "{after:?}"
         );
 
@@ -3692,7 +3714,7 @@ mod tests {
         assert_eq!(list(cx), (PageStatus::Idle, 0), "at the pin");
         assert!(taken().is_empty());
         let taken_now = exploration.update(cx, |exploration, cx| {
-            exploration.apply(&page, Ok(elsewhere()), Some("c2"), cx)
+            exploration.apply(&page, Ok(elsewhere()), Some("c1"), cx)
         });
         assert!(taken_now);
         assert!(matches!(list(cx), (PageStatus::Failed(_), 0)));
@@ -3716,9 +3738,9 @@ mod tests {
             Some(Loadable::Loaded(2)),
             "read again at the pin"
         );
-        assert!(taken().iter().all(|(_, at)| at.as_deref() == Some("c2")));
+        assert!(taken().iter().all(|(_, at)| at.as_deref() == Some("c1")));
         exploration.update(cx, |exploration, cx| {
-            exploration.spawn_count(key.clone(), at_c3(), Some("c2".into()), cx)
+            exploration.spawn_count(key.clone(), at_c3(), Some("c1".into()), cx)
         });
         cx.run_until_parked();
         assert!(matches!(counted(cx), Some(Loadable::Failed(_))));
@@ -4412,6 +4434,50 @@ mod tests {
             held.read_with(cx, |held, _| held.pin().map(str::to_owned))
                 .as_deref(),
             Some("c0")
+        );
+    }
+
+    /// A walk opened again at the head the session holds reads nothing: its first read goes to
+    /// that head, as a table's does, so what the session kept there answers it. Before, the
+    /// root was read at the branch head with no commit, which the session always sends.
+    #[gpui::test]
+    async fn a_walk_opened_again_at_the_same_head_sends_nothing(cx: &mut gpui::TestAppContext) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let sent = Arc::new(AtomicUsize::new(0));
+        let counted = sent.clone();
+        let (session, _served) = crate::test_server::followed_session(
+            SCHEMA,
+            move |asked| {
+                if asked["name"] != "studio_head" {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                }
+                json!([{ "id": "ada", "label": "Ada", "n": 1 }])
+            },
+            cx,
+        );
+        cx.run_until_parked();
+        let ada = person("ada");
+        let first = cx.update(|cx| Exploration::for_walk(&session, ada.clone(), None, cx));
+        cx.run_until_parked();
+        first.read_with(cx, |first, _| {
+            assert_eq!(first.state().root_status, Loadable::Loaded(()));
+            assert_eq!(first.pin(), Some("c1"));
+        });
+        assert!(sent.load(Ordering::SeqCst) > 0, "the first open reads");
+        drop(first);
+        cx.run_until_parked();
+
+        sent.store(0, Ordering::SeqCst);
+        let again = cx.update(|cx| Exploration::for_walk(&session, ada.clone(), None, cx));
+        cx.run_until_parked();
+        again.read_with(cx, |again, _| {
+            assert_eq!(again.state().root_status, Loadable::Loaded(()));
+            assert_eq!(again.pin(), Some("c1"));
+        });
+        assert_eq!(
+            sent.load(Ordering::SeqCst),
+            0,
+            "answered from what the session kept"
         );
     }
 
