@@ -322,7 +322,7 @@ fn pin_key(id: &SceneId) -> Option<String> {
             key.node.id,
             gq_language::builder::relationship_key(&key.group)
         )),
-        SceneId::More(_) => None,
+        SceneId::More(_) | SceneId::Note(_) => None,
     }
 }
 
@@ -988,8 +988,9 @@ impl GraphCanvas {
                 parent: node.parent,
                 kind: match node.kind {
                     SceneKind::Hub { .. } => LayoutKind::Hub,
-                    SceneKind::More { .. } => LayoutKind::More,
-                    _ => LayoutKind::Node,
+                    // A note ends its node's column, as "+K more" ends a relationship's.
+                    SceneKind::More { .. } | SceneKind::Note { .. } => LayoutKind::More,
+                    SceneKind::Node { .. } => LayoutKind::Node,
                 },
                 space: *width,
                 // "+K more" stands for what is not drawn yet: it moves to the end of
@@ -1553,8 +1554,27 @@ impl GraphCanvas {
                     }
                 }
             }
+            // A read that failed is read again; otherwise "+K more" shows more.
+            SceneKind::More {
+                note: Some(model::Note::Failed(targets)),
+                ..
+            }
+            | SceneKind::Note {
+                note: model::Note::Failed(targets),
+                ..
+            } => self.retry(&targets, cx),
             SceneKind::More { key, .. } => self.show_more(key, cx),
+            SceneKind::Note { .. } => {}
         }
+    }
+
+    /// Reads `targets` again, as a failed chip's Retry does.
+    fn retry(&mut self, targets: &[graph_store::LoadTarget], cx: &mut Context<Self>) {
+        self.exploration.update(cx, |exploration, cx| {
+            for target in targets {
+                exploration.retry(target, cx);
+            }
+        });
     }
 
     /// On a schema canvas: a type expands, or closes; a pill expands the type it leads to;
@@ -1577,6 +1597,8 @@ impl GraphCanvas {
             SceneKind::More { key, .. } => {
                 *self.hub_limits.entry(key).or_insert(HUB_STEP) += HUB_STEP;
             }
+            // A schema canvas reads nothing, so it notes nothing.
+            SceneKind::Note { .. } => {}
         }
         self.rebuild(cx);
     }
@@ -1595,6 +1617,7 @@ impl GraphCanvas {
                 let ty = match id {
                     SceneId::Node(node) => &node.type_name,
                     SceneId::Hub(key) | SceneId::More(key) => &key.node.type_name,
+                    SceneId::Note(node) => &node.type_name,
                 };
                 walk.collapse(ty);
             }
@@ -1924,7 +1947,7 @@ impl GraphCanvas {
         match self.scene.nodes[index].kind {
             // A click opens a relationship or closes it, and shows more; a double click is
             // that one click, not an open and a close.
-            SceneKind::Hub { .. } | SceneKind::More { .. } => {
+            SceneKind::Hub { .. } | SceneKind::More { .. } | SceneKind::Note { .. } => {
                 if event.click_count < 2 {
                     self.activate(index, false, window, cx);
                 }
@@ -1960,7 +1983,7 @@ impl GraphCanvas {
             return;
         }
         let node = match &self.scene.nodes[index].kind {
-            SceneKind::Node { node, .. } => node.clone(),
+            SceneKind::Node { node, .. } | SceneKind::Note { node, .. } => node.clone(),
             SceneKind::Hub { key, .. } | SceneKind::More { key, .. } => key.node.clone(),
         };
         window.dispatch_action(
@@ -2338,6 +2361,21 @@ impl GraphCanvas {
                         }),
                     );
                 }
+                SceneKind::More {
+                    note: Some(model::Note::Failed(targets)),
+                    ..
+                }
+                | SceneKind::Note {
+                    note: model::Note::Failed(targets),
+                    ..
+                } => {
+                    let targets = targets.clone();
+                    menu = menu.entry(
+                        "Retry",
+                        None,
+                        Self::on_menu(&this, move |canvas, _, cx| canvas.retry(&targets, cx)),
+                    );
+                }
                 SceneKind::More { key, .. } => {
                     let key = key.clone();
                     menu = menu.entry(
@@ -2348,6 +2386,7 @@ impl GraphCanvas {
                         }),
                     );
                 }
+                SceneKind::Note { .. } => {}
             }
             if pinned {
                 let id = node.id.clone();
@@ -2785,6 +2824,7 @@ impl GraphCanvas {
         let palette = paint::Palette {
             text: Color::Default.color(cx),
             muted: Color::Muted.color(cx),
+            error: Color::Error.color(cx),
             // Chips are white cards in the light theme, with interfaces.dev's shadow.
             card: studio_ui::ds::surface::solid(cx),
             shadow: studio_ui::ds::elevation::layers(studio_ui::ds::elevation::Lift::Rest, cx),
@@ -3264,6 +3304,16 @@ impl Render for GraphCanvas {
                 studio_ui::ds::error_state("The schema could not be read", message)
                     .into_any_element(),
             ),
+            // A root that could not be read is drawn as no chip; the banner above says why.
+            Loadable::Loaded(_)
+                if self.mode() == Mode::Explore
+                    && matches!(
+                        self.exploration.read(cx).state().root_status,
+                        Loadable::Failed(_)
+                    ) =>
+            {
+                None
+            }
             Loadable::Loaded(_) if self.scene.nodes.is_empty() => Some(
                 match self.mode() {
                     Mode::Explore | Mode::Schema => studio_ui::ds::loading_state("Laying out…"),
