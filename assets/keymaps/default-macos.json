@@ -388,6 +388,13 @@
     }
   },
   {
+    "context": "Confirm",
+    "bindings": {
+      "enter": "menu::Confirm",
+      "escape": "menu::Cancel"
+    }
+  },
+  {
     "context": "QueryResults",
     "bindings": {
       "cmd-c": "studio_query::CopyCell",
