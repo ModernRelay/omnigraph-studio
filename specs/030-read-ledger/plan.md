@@ -440,6 +440,7 @@ The research (2026-11-12) is summarized here; a claim not checked in a primary s
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-11-14 | The runner measures a dense graph's Expand all, and finds the main thread, not the server, slow | `script/measure-expand-all` (the snapshot example's `reads:` steps) against `script/dense-server`, main at `5c5c8ad` and this branch; spec 006's validation log | The server answered the 58 `studio_page_degrees` and 10 `studio_neighbours` of 1,763 counts within about 0.6 s, but main showed the first answer at 12.1 to 12.4 s: each count's answer flattened the whole walk. Taken a batch at a time, the first and last answer land at about 0.6 s. Counts were the same in every run |
 | 2026-11-12 | Restoring a table sends 55 requests on the personal graph | A temporary counter in `graph_client::send_now`, Studio debug build, not committed | As in "What exists today" |
 | 2026-11-12 | Where a read with a commit is decided, and the origin of what is kept | `session.rs` `read` (seeded, then `carried`, which inserts into `pinned_reads`, then `share`, then `read_at_commit`), `degree_kept` | As in "What exists today". Spec 030 first said a `Kept` answer was the server's own; a carried answer is kept too, hence `Origin` |
 | 2026-11-12 | Which views read through a scope | Calls of `read_in`, `read_scoped`, `degree_in`, `blob_meta_in` and `note_in` outside `graph_store`, and inside it | Only `type_table` (`table.rs`, `peek.rs`) and `exploration.rs`. Spec 030 first said every view did; hence `Asker` |
