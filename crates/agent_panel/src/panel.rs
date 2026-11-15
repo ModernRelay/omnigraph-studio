@@ -23,7 +23,7 @@ use graph_client::api::CommitKind;
 use graph_store::{GraphSession, OutcomeKind};
 use serde_json::Value;
 use studio_actions::agent::{Allow, AllowAlways, ClearQueue, Reject, Restart, Send, SendNow, Stop};
-use studio_actions::graph::ReviewBranch;
+use studio_actions::graph::OpenBranch;
 use studio_settings::{AgentSettings, StudioSettings};
 use studio_ui::ds;
 use studio_ui::ds::Tipped;
@@ -828,8 +828,6 @@ pub struct AgentPanel {
     /// Whether the tab last said it holds unsaved work ([`AgentPanel::holds_work`]): the tab
     /// is told when that changes, not at every change.
     dirty: bool,
-    /// When the turn under way began and how many tools it called, for telemetry (spec 018).
-    turn: Option<(std::time::Instant, u64)>,
     /// The agent's replies as rendered markdown, by entry index, with how much of the text each
     /// has taken in; a streaming reply appends its new tail.
     markdown: std::collections::HashMap<usize, (Entity<Markdown>, usize)>,
@@ -1069,7 +1067,6 @@ impl AgentPanel {
             workspace,
             sessions,
             dirty: false,
-            turn: None,
             focus_handle,
             composer,
             has_draft: false,
@@ -1646,17 +1643,6 @@ impl AgentPanel {
                 }));
             }
             HostEvent::TurnEnded { stop } => {
-                if let Some((started, calls)) = self.turn.take() {
-                    studio_telemetry::record(studio_telemetry::Event::AgentTurnFinished {
-                        outcome: match &stop {
-                            Ok(StopReason::Cancelled) => studio_telemetry::TurnOutcome::Stopped,
-                            Ok(_) => studio_telemetry::TurnOutcome::Done,
-                            Err(_) => studio_telemetry::TurnOutcome::Failed,
-                        },
-                        duration: studio_telemetry::DurationBucket::of(started.elapsed()),
-                        tool_calls: studio_telemetry::CountBucket::of(calls),
-                    });
-                }
                 // A tool still shown running when the turn ends is not running: the turn
                 // finished it, or stopping, failing or leaving cut it short. Either way its
                 // spinner stops, so an idle thread never animates.
@@ -1779,9 +1765,6 @@ impl AgentPanel {
                 }
             }
             SessionUpdate::ToolCall(call) => {
-                if let Some((_, calls)) = self.turn.as_mut() {
-                    *calls += 1;
-                }
                 self.entries.push(Entry::Tool {
                     id: call.tool_call_id.to_string(),
                     title: call.title,
@@ -2006,7 +1989,6 @@ impl AgentPanel {
                 });
             }
             self.entries.push(Entry::User(text));
-            self.turn = Some((std::time::Instant::now(), 0));
             self.state = State::Prompting { agent };
             self.thread.scroll_to_end();
             cx.notify();
@@ -2414,14 +2396,20 @@ impl AgentPanel {
         cx.notify();
     }
 
+    /// Opens the agent's branch as its review against main. The window stays on the branch it
+    /// reads: looking at what the agent changed is not a move to its branch, so the person's
+    /// next edit goes where the top bar says, as before the press.
     fn review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(branch) = self.branch.as_ref().filter(|b| b.offers_review()) else {
             return;
         };
-        let name = branch.name.clone();
-        self.session
-            .update(cx, |session, cx| session.set_branch(name, cx));
-        window.dispatch_action(Box::new(ReviewBranch), cx);
+        window.dispatch_action(
+            Box::new(OpenBranch {
+                branch: branch.name.clone(),
+                preview: false,
+            }),
+            cx,
+        );
     }
 
     fn use_command(&mut self, command: Vec<String>, cx: &mut Context<Self>) {
@@ -4574,6 +4562,64 @@ mod tests {
                 .count();
             assert_eq!(notices, 1);
         });
+    }
+
+    /// Review opens the agent's branch as its review and leaves the window on the branch it
+    /// reads: a look at what the agent changed is not a move to its branch. Before, Review
+    /// moved the window to the agent's branch first, so the person's next edit went there.
+    #[gpui::test]
+    async fn review_opens_the_agents_branch_and_leaves_the_window_where_it_is(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::{cell::RefCell, rc::Rc};
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, _) = graph_store::test_server::followed_session(
+            "node Person {\n  slug: String @key\n}\n",
+            |_| serde_json::json!([]),
+            cx,
+        );
+        cx.run_until_parked();
+        let opened: Rc<RefCell<Vec<OpenBranch>>> = Rc::default();
+        cx.update(|cx| {
+            let opened = opened.clone();
+            cx.on_action(move |action: &OpenBranch, _| opened.borrow_mut().push(action.clone()));
+        });
+        let (_root, cx) = cx.add_window_view(|_, _| gpui::EmptyView);
+        let panel = cx.update(|window, cx| {
+            let session = session.clone();
+            cx.new(|cx| AgentPanel::new(session, WeakEntity::new_invalid(), None, window, cx))
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                // No branch yet, so nothing to review.
+                panel.review(window, cx);
+                panel.branch = Some(AgentBranch {
+                    name: "agent/one".into(),
+                    base: "main".into(),
+                    created: true,
+                    changes: 2,
+                });
+                panel.review(window, cx);
+            })
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            *opened.borrow(),
+            [OpenBranch {
+                branch: "agent/one".into(),
+                preview: false,
+            }]
+        );
+        assert_eq!(
+            session.read_with(cx, |session, _| session.branch.clone()),
+            "main",
+            "the window stays on the branch it reads"
+        );
     }
 
     /// Starting a conversation nothing was sent in again (Restart, or Start again after a slow

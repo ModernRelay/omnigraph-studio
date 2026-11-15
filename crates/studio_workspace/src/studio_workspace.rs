@@ -7,6 +7,7 @@
 //! Studio rather than forked: Studio has no projects, collaboration or Zed database. Feature
 //! crates attach to it with `cx.observe_new::<Workspace>` and `Workspace::register_action`.
 
+mod confirm;
 mod item;
 pub mod models;
 mod open_failure;
@@ -33,7 +34,7 @@ use graph_store::{
 };
 use studio_actions::graph::{
     OpenAsCanvas, OpenAsHistory, OpenAsMap, OpenAsPage, OpenAsReview, OpenAsSource, OpenAsTable,
-    OpenAsTree, OpenCommit, OpenHistory,
+    OpenAsTree, OpenBranchHistory, OpenCommit,
 };
 use studio_actions::workspace::OpenViewAt;
 use studio_actions::workspace::{
@@ -48,9 +49,11 @@ use studio_settings::{BottomDockLayout, ServerEnvironment, StudioSettings};
 use studio_ui::ds::IconButton;
 use studio_ui::ds::Tipped;
 use studio_ui::menu::{ContextMenu, ContextMenuEntry, ContextMenuItem};
+use studio_ui::window_buttons::{self, WindowButtons};
 use ui::prelude::*;
 use ui::{ButtonLike, PopoverMenu, right_click_menu};
 
+pub use confirm::{Confirm, confirm};
 use item::ItemHandle;
 pub use item::{
     Inspected, InspectedNode, Item, ItemEvent, ItemStatus, KeyHint, NodeInspector,
@@ -222,9 +225,11 @@ struct FollowUp {
     label: SharedString,
     action: Box<dyn Action>,
     /// The write's graph and branch, which the action acts on whatever the window shows when
-    /// it is run; `None` for one that acts where the window is ("Open settings").
+    /// it is run; `None` for one that acts where the window is ("Open settings"). The graph is
+    /// shown first; it moves to the branch only for a follow-up that writes there (`undoes`).
     on: Option<WrittenTo>,
-    /// It puts back what a write took (Undo), which nothing but this toast offers.
+    /// It puts back what a write took (Undo), which nothing but this toast offers. It writes,
+    /// so the graph moves to the write's branch before it runs.
     undoes: bool,
 }
 
@@ -397,6 +402,12 @@ pub struct Workspace {
     /// Whether the window shows traffic lights the top-left strips make room for, read each
     /// frame: on macOS, and not in full screen, where they hide with the menu bar.
     lights_shown: bool,
+    /// Who draws the window's minimize, maximize and close buttons, read each frame: Studio
+    /// where the system draws none, in the top bar (spec 002, "The window's buttons").
+    window_buttons: WindowButtons,
+    /// The buttons to draw whatever the platform, for a test or a picture of them made where
+    /// the platform draws its own ([`Self::draw_window_buttons_as`]).
+    window_buttons_as: Option<WindowButtons>,
     /// The settings file problem last shown, so a toast appears once per problem.
     settings_error: Option<String>,
     /// The registry's notices about the servers ([`ConnectionRegistry::notices`]), as last
@@ -406,8 +417,8 @@ pub struct Workspace {
     /// Studio's memory and CPU for the status bar while `studio.show_performance` is on (the
     /// default), read every two seconds while the window is in front.
     performance: Option<Performance>,
-    /// A view of the window's own at the right of the status bar: the updater's (spec 017).
-    /// The window's own items, in the order added (the updater's, telemetry's consent).
+    /// The window's own views at the right of the status bar, in the order added: the
+    /// updater's (spec 017).
     status_items: Vec<StatusItem>,
     /// Whether this window is in front, which the memory and CPU reading waits for.
     window_active: bool,
@@ -636,30 +647,8 @@ impl Workspace {
         // tabs asks first.
         let this = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
-            this.update(cx, |workspace, cx| match workspace.running_write(cx) {
-                None => {
-                    let unsaved = workspace.unsaved_tabs(cx);
-                    if !unsaved.is_empty() {
-                        workspace.confirm_close(Closing::Window, unsaved, window, cx);
-                        return false;
-                    }
-                    // Closing drops the save waiting for its delay: written now, in turn on
-                    // the write thread; only a quit waits for the disk.
-                    workspace.flush_saves(cx);
-                    true
-                }
-                Some(graph) => {
-                    workspace.show_toast(
-                        ToastKind::Error,
-                        format!(
-                            "A write to {graph} is still running. Close the window when it finishes."
-                        ),
-                        cx,
-                    );
-                    false
-                }
-            })
-            .unwrap_or(true)
+            this.update(cx, |workspace, cx| workspace.may_close(window, cx))
+                .unwrap_or(true)
         });
         let bounds_subscription = cx.observe_window_bounds(window, move |this, window, cx| {
             let bounds = window.bounds();
@@ -739,6 +728,8 @@ impl Workspace {
             drag_pending: false,
             traffic_lights: None,
             lights_shown: cfg!(target_os = "macos"),
+            window_buttons: WindowButtons::System,
+            window_buttons_as: None,
             settings_error: None,
             server_notices: Vec::new(),
             _settings_subscription: settings_subscription,
@@ -818,9 +809,6 @@ impl Workspace {
                         return;
                     }
                     let sample = process_stats::Sample::now();
-                    if let Some((bytes, _)) = sample.memory {
-                        studio_telemetry::note_memory(bytes);
-                    }
                     this.performance = Some(Performance::next(this.performance.as_ref(), sample));
                     cx.notify();
                 });
@@ -1569,11 +1557,15 @@ impl Workspace {
                 let (label, action) = committed_follow_up(latest, commit);
                 (ToastKind::Success, label.into(), action)
             }
-            // The write may or may not have landed: the branch's history says which.
+            // The write may or may not have landed: the branch's history says which. It opens
+            // by the branch's name, so the window stays on the branch it reads.
             OutcomeKind::Unknown { .. } => (
                 ToastKind::Error,
                 "Open history".into(),
-                Box::new(OpenHistory),
+                Box::new(OpenBranchHistory {
+                    branch: latest.branch.clone(),
+                    preview: false,
+                }),
             ),
             OutcomeKind::Refused { .. } => {
                 let graph = Some(written_to.graph_at());
@@ -1592,17 +1584,25 @@ impl Workspace {
         self.push_toast(kind, text.into(), Some(follow_up), graph, cx);
     }
 
-    /// Runs a toast's follow-up. One about a write acts on the graph and branch written to,
-    /// shown first (the graph brought back if parked), so "Open history" never opens another
-    /// graph's or branch's history, nor Undo puts rows back elsewhere. A graph closed since is
-    /// named, and nothing runs.
+    /// Runs a toast's follow-up. One about a write acts on the graph written to, shown first
+    /// (brought back if parked), so "Open history" never opens another graph's history. One
+    /// that only looks (a branch's history, a commit) names what it opens and leaves the graph
+    /// on the branch it reads: looking at a branch is not a move to it. Undo writes, so the
+    /// graph moves to the branch written to first and the rows go back where they were, with
+    /// the top bar saying so. A graph closed since is named, and nothing runs.
     fn run_follow_up(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((action, on)) = self
+        let Some((action, on, writes)) = self
             .toasts
             .iter()
             .find(|toast| toast.id == id)
             .and_then(|toast| toast.action.as_ref())
-            .map(|follow_up| (follow_up.action.boxed_clone(), follow_up.on.clone()))
+            .map(|follow_up| {
+                (
+                    follow_up.action.boxed_clone(),
+                    follow_up.on.clone(),
+                    follow_up.undoes,
+                )
+            })
         else {
             return;
         };
@@ -1622,7 +1622,7 @@ impl Workspace {
                 return;
             };
             switched = self.session.as_ref() != Some(&session);
-            if let Some(branch) = on.branch {
+            if let Some(branch) = on.branch.filter(|_| writes) {
                 session.update(cx, |session, cx| session.set_branch(branch, cx));
             }
             self.show_graph(session.entity_id(), window, cx);
@@ -3058,6 +3058,53 @@ impl Workspace {
         });
     }
 
+    // ---- the window ----
+
+    /// Whether the window may close now, as its close button asks: one with a write still
+    /// running stays open until the write ends and says so, and one with unsaved tabs asks
+    /// about them first and closes from the answer.
+    fn may_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        match self.running_write(cx) {
+            None => {
+                let unsaved = self.unsaved_tabs(cx);
+                if !unsaved.is_empty() {
+                    self.confirm_close(Closing::Window, unsaved, window, cx);
+                    return false;
+                }
+                // Closing drops the save waiting for its delay: written now, in turn on the
+                // write thread; only a quit waits for the disk.
+                self.flush_saves(cx);
+                true
+            }
+            Some(graph) => {
+                self.show_toast(
+                    ToastKind::Error,
+                    format!(
+                        "A write to {graph} is still running. Close the window when it finishes."
+                    ),
+                    cx,
+                );
+                false
+            }
+        }
+    }
+
+    /// Closes the window from a close button Studio draws itself, where the desktop leaves
+    /// the frame to the window: asked what the system's own close is asked ([`Self::may_close`]).
+    fn close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.may_close(window, cx) {
+            window.remove_window();
+        }
+    }
+
+    /// Draws the window's buttons as `buttons` whatever the platform, so a test or a picture
+    /// can show Windows' or a Linux desktop's where the platform draws its own.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn draw_window_buttons_as(&mut self, buttons: WindowButtons, cx: &mut Context<Self>) {
+        self.window_buttons_as = Some(buttons);
+        cx.notify();
+    }
+
     // ---- rendering ----
 
     /// A column's header strip (spec 002, after Delta): fixed height, and a place
@@ -3097,9 +3144,22 @@ impl Workspace {
                     window.start_window_move();
                 }
             }))
-            .on_click(|event, window, _| {
-                if event.click_count() == 2 {
-                    window.titlebar_double_click();
+            .on_click({
+                // Where Studio draws the window's frame, a double click on a strip is its own
+                // to act on, as a title bar's: the window fills the screen, or comes back.
+                // macOS has its own call, and Windows acts on the drag area itself.
+                let frames_itself = self.window_buttons.frames_itself();
+                move |event, window, _| {
+                    if event.click_count() != 2 {
+                        return;
+                    }
+                    if frames_itself {
+                        if window.window_controls().maximize && window.is_resizable() {
+                            window.zoom_window();
+                        }
+                    } else {
+                        window.titlebar_double_click();
+                    }
                 }
             })
     }
@@ -3163,15 +3223,34 @@ impl Workspace {
 
     /// The top bar (spec 020): which server, graph and branch the window reads, always in the
     /// same place, with what shows and hides the frame's docks. It takes the window's title bar
-    /// band, so the traffic lights sit in it.
+    /// band, so the traffic lights sit in it, and where the system draws no buttons for the
+    /// window, Studio's do (spec 002, "The window's buttons"): at the right end, to the
+    /// window's corner, or at the end a Linux desktop's layout names.
     fn render_top_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let shown = self.session.is_some();
         let hairline = studio_ui::ds::surface::rule(cx);
         let inspector_lit = self.inspector_shown();
         let environment = self.server_environment(cx);
+        let buttons = self.window_buttons;
+        let close = |cx: &mut Context<Self>| {
+            let this = cx.entity().downgrade();
+            move |window: &mut Window, cx: &mut App| {
+                this.update(cx, |this, cx| this.close_window(window, cx))
+                    .ok();
+            }
+        };
+        let left = buttons
+            .left()
+            .map(|left| window_buttons::frame_buttons("window-buttons-left", left, close(cx)));
+        let right = buttons
+            .right()
+            .map(|right| window_buttons::frame_buttons("window-buttons", right, close(cx)));
         self.strip("top-bar", HEADER_HEIGHT, cx)
             .debug_selector(|| "top-bar".into())
-            .pr(px(studio_ui::ds::space::SM))
+            // Buttons at the right end reach the window's edge, as a title bar's do.
+            .when(!buttons.at_right(), |strip| {
+                strip.pr(px(studio_ui::ds::space::SM))
+            })
             .gap(px(studio_ui::ds::space::XS))
             .bg(studio_ui::ds::surface::status_bar(cx))
             // Production is marked twice, by this line and the chip: a mode needs both to be seen.
@@ -3181,9 +3260,10 @@ impl Workspace {
                     .border_color(studio_ui::ds::surface::error_border(cx)),
                 _ => strip.border_b_1().border_color(hairline),
             })
-            .map(|strip| match lights_room(self.lights_shown) {
-                Some(room) => strip.child(div().w(px(room)).flex_none()),
-                None => strip.pl(px(studio_ui::ds::space::SM)),
+            .map(|strip| match (left, lights_room(self.lights_shown)) {
+                (Some(left), _) => strip.child(left),
+                (None, Some(room)) => strip.child(div().w(px(room)).flex_none()),
+                (None, None) => strip.pl(px(studio_ui::ds::space::SM)),
             })
             .child(self.render_graph_switcher(cx))
             .children(self.render_branch(cx))
@@ -3210,6 +3290,10 @@ impl Workspace {
                             }),
                     )
             })
+            .when(buttons == WindowButtons::Windows, |bar| {
+                bar.child(window_buttons::caption_buttons())
+            })
+            .children(right)
     }
 
     /// What the shown graph's server is, by its address; none without a graph.
@@ -5194,6 +5278,9 @@ impl Render for Workspace {
         let live =
             self.server_ready(cx) && window.is_window_active() && studio_ui::motion::enabled(cx);
         self.count_beats(live, cx);
+        self.window_buttons = self
+            .window_buttons_as
+            .unwrap_or_else(|| WindowButtons::of(window, cx));
         if self._save_check.is_none() {
             self._save_check = Some(cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(SAVE_CHECK).await;
@@ -6333,6 +6420,58 @@ mod tests {
 
     impl ModalView for Other {}
 
+    /// A question runs its action only once the person agrees, with ↵ or its button; Esc
+    /// closes it and runs nothing (spec 006, "Expand all").
+    #[gpui::test]
+    fn a_question_runs_its_action_only_once_agreed(cx: &mut gpui::TestAppContext) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            cx.set_global(StudioSettings::default());
+        });
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        let ran = std::sync::Arc::new(AtomicUsize::new(0));
+        let ask = |cx: &mut gpui::VisualTestContext| {
+            let ran = ran.clone();
+            cx.update(|window, cx| {
+                confirm(
+                    window,
+                    cx,
+                    "Expand 140 nodes?",
+                    "It reads 2,800 counts.",
+                    "Expand",
+                    move |_, _| {
+                        ran.fetch_add(1, Ordering::SeqCst);
+                    },
+                )
+            });
+            cx.run_until_parked();
+            workspace.read_with(cx, |workspace, _| {
+                workspace
+                    .modal
+                    .as_ref()
+                    .and_then(|modal| modal.view.clone().downcast::<Confirm>().ok())
+                    .expect("asked")
+            })
+        };
+        let open = |cx: &mut gpui::VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| workspace.modal.is_some())
+        };
+
+        ask(cx);
+        assert_eq!(ran.load(Ordering::SeqCst), 0, "not before an answer");
+        cx.dispatch_action(menu::Cancel);
+        cx.run_until_parked();
+        assert!(!open(cx));
+        assert_eq!(ran.load(Ordering::SeqCst), 0, "Esc runs nothing");
+
+        ask(cx);
+        cx.dispatch_action(menu::Confirm);
+        cx.run_until_parked();
+        assert!(!open(cx));
+        assert_eq!(ran.load(Ordering::SeqCst), 1, "agreed: run once");
+    }
+
     #[gpui::test]
     fn a_busy_modal_stays_open_until_it_agrees(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
@@ -6513,6 +6652,123 @@ mod tests {
         workspace.read_with(cx, |workspace, _| {
             assert!(workspace.session().is_none(), "closed once confirmed");
         });
+    }
+
+    /// Where the system draws no buttons for the window, the top bar does (spec 002, "The
+    /// window's buttons"). Windows' three are at the bar's right end, side by side, as tall as
+    /// the bar and to the window's corner; where the system draws its own, Studio draws none.
+    /// Before, the window had no minimize, maximize or close button on Windows: its top bar
+    /// takes the title bar's place there, and drew only a place to drag from.
+    #[gpui::test]
+    fn the_top_bar_draws_the_windows_buttons_where_the_system_draws_none(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+        });
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        let draw_as = |buttons: WindowButtons, cx: &mut gpui::VisualTestContext| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.draw_window_buttons_as(buttons, cx)
+            });
+            cx.run_until_parked();
+        };
+        draw_as(WindowButtons::System, cx);
+        for name in [
+            "window-button-minimize",
+            "window-button-maximize",
+            "window-button-close",
+        ] {
+            assert!(cx.debug_bounds(name).is_none(), "{name} is the system's");
+        }
+
+        draw_as(WindowButtons::Windows, cx);
+        let bar = cx.debug_bounds("top-bar").expect("the top bar");
+        let [minimize, maximize, close] = [
+            "window-button-minimize",
+            "window-button-maximize",
+            "window-button-close",
+        ]
+        .map(|name| {
+            cx.debug_bounds(name)
+                .unwrap_or_else(|| panic!("{name} is drawn"))
+        });
+        assert_eq!(close.right(), bar.right(), "to the window's corner");
+        assert_eq!(close.top(), bar.top(), "from the window's top");
+        assert_eq!(minimize.right(), maximize.left());
+        assert_eq!(maximize.right(), close.left());
+        assert_eq!(minimize.size, close.size, "each as large as the next");
+        assert!(
+            close.size.height >= bar.size.height - px(1.),
+            "as tall as the bar, less its hairline: {close:?} in {bar:?}"
+        );
+    }
+
+    /// On a Linux desktop that leaves the frame to the window, the bar draws the buttons the
+    /// desktop's layout names, each side's at that end. Close asks what the system's close
+    /// asks: a window with unsaved work stays and asks about it, and closes once that is
+    /// confirmed.
+    #[gpui::test]
+    fn a_window_that_frames_itself_has_its_desktops_buttons(cx: &mut gpui::TestAppContext) {
+        use gpui::{WindowButton, WindowButtonLayout};
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+        });
+        let session = idle_session("http://a.test", "notes", cx);
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        let close_left = WindowButtonLayout {
+            left: [Some(WindowButton::Close), None, None],
+            right: [
+                Some(WindowButton::Minimize),
+                Some(WindowButton::Maximize),
+                None,
+            ],
+        };
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.graph_order.push(session.entity_id());
+            workspace.subscribe_session(session.clone(), cx);
+            workspace.open_item("draft".to_owned(), window, cx, |_, cx| Unsaved {
+                focus_handle: cx.focus_handle(),
+            });
+            workspace.draw_window_buttons_as(WindowButtons::Linux(close_left), cx);
+        });
+        cx.run_until_parked();
+        let bar = cx.debug_bounds("top-bar").expect("the top bar");
+        let [minimize, maximize, close] = [
+            "window-button-minimize",
+            "window-button-maximize",
+            "window-button-close",
+        ]
+        .map(|name| {
+            cx.debug_bounds(name)
+                .unwrap_or_else(|| panic!("{name} is drawn"))
+        });
+        assert!(close.right() < bar.center().x, "close at the left end");
+        assert!(
+            bar.center().x < minimize.left() && minimize.right() <= maximize.left(),
+            "the others at the right, in the layout's order"
+        );
+        assert!(maximize.right() <= bar.right());
+
+        cx.simulate_click(close.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        let dialog = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .modal
+                .as_ref()
+                .and_then(|modal| modal.view.clone().downcast::<ConfirmClose>().ok())
+                .expect("the window asks about its unsaved tab")
+        });
+        assert!(matches!(
+            dialog.read_with(cx, |dialog, _| dialog.closing),
+            Closing::Window
+        ));
+        assert_eq!(cx.windows().len(), 1, "still open");
+        dialog.update_in(cx, |dialog, window, cx| dialog.close(window, cx));
+        cx.run_until_parked();
+        assert!(cx.windows().is_empty(), "closed once confirmed");
     }
 
     /// A tab that draws `name`, reading the window's graph or not.
@@ -8434,9 +8690,13 @@ mod tests {
     }
 
     /// A write's toast acts on the graph and branch written to, whatever the window shows when
-    /// its button is pressed: "Open history" after moving to another graph shows the written
-    /// graph again, on its branch; after moving to another branch, the branch written to; Undo
-    /// from a parked graph undoes there. A graph closed since is named, and nothing runs.
+    /// its button is pressed. "Open history" after moving to another graph shows the written
+    /// graph again and opens the history of the branch written to; after the graph moved to
+    /// another branch, it opens that history still and the graph stays where it is, since
+    /// looking at a branch is not a move to it. Undo writes: from a parked graph on another
+    /// branch it shows the graph, moves it to the delete's branch and undoes there. A graph
+    /// closed since is named, and nothing runs. Before, "Open history" moved the graph to the
+    /// write's branch too, so the next edit went to a branch the person had only looked at.
     #[gpui::test]
     fn a_toasts_follow_up_acts_on_the_graph_and_branch_written_to(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
@@ -8446,7 +8706,7 @@ mod tests {
         let notes = idle_session("http://a.test", "notes", cx);
         let people = idle_session("http://b.test", "people", cx);
         let (workspace, cx) = cx.add_window_view(Workspace::new);
-        // Where each follow-up ran: the action, the graph shown and its branch.
+        // Where each follow-up ran: the action, the graph shown and the branch it acts on.
         type Ran = Vec<(&'static str, String, String)>;
         let ran: Rc<RefCell<Ran>> = Rc::default();
         workspace.update(cx, |workspace, cx| {
@@ -8455,9 +8715,18 @@ mod tests {
                 (session.graph_id.clone(), session.branch.clone())
             };
             let history = ran.clone();
-            workspace.register_action(move |workspace, _: &OpenHistory, _, cx| {
-                let (graph, branch) = shown(workspace, cx);
-                history.borrow_mut().push(("history", graph, branch));
+            workspace.register_action(move |workspace, action: &OpenBranchHistory, _, cx| {
+                let (graph, _) = shown(workspace, cx);
+                history
+                    .borrow_mut()
+                    .push(("history", graph, action.branch.clone()));
+            });
+            let commit = ran.clone();
+            workspace.register_action(move |workspace, action: &OpenCommit, _, cx| {
+                let (graph, _) = shown(workspace, cx);
+                commit
+                    .borrow_mut()
+                    .push(("commit", graph, action.commit_id.clone()));
             });
             let undo = ran.clone();
             workspace.register_action(
@@ -8540,17 +8809,37 @@ mod tests {
         };
         assert!(focused(&notes_tab, cx), "the graph's tab has the keyboard");
 
-        // Another, then notes moved to main.
+        // Another, then notes moved to main: fix's history opens, and notes stays on main.
         let toast = log(&notes, "Edit Person grace", unknown(), None, cx);
         notes.update(cx, |session, cx| session.set_branch("main".into(), cx));
         follow(toast, cx);
-        assert_eq!(shown(cx), ("notes".into(), "fix".into()), "back on fix");
+        assert_eq!(
+            shown(cx),
+            ("notes".into(), "main".into()),
+            "looking at fix's history leaves the graph on main"
+        );
         assert_eq!(
             ran.borrow_mut().pop(),
             Some(("history", "notes".into(), "fix".into()))
         );
 
-        // A delete in people while notes is shown: its Undo runs in people.
+        // A commit on fix, then notes moved to main: View commit opens it from main.
+        notes.update(cx, |session, cx| session.set_branch("fix".into(), cx));
+        let committed = OutcomeKind::Committed {
+            commit: Some("c9".into()),
+        };
+        let toast = log(&notes, "Edit Person lin", committed, None, cx);
+        notes.update(cx, |session, cx| session.set_branch("main".into(), cx));
+        follow(toast, cx);
+        assert_eq!(shown(cx), ("notes".into(), "main".into()));
+        assert_eq!(
+            ran.borrow_mut().pop(),
+            Some(("commit", "notes".into(), "c9".into()))
+        );
+
+        // A delete in people on fix, then people moved to main, while notes is shown: its Undo
+        // runs in people, moved to fix, where the rows were.
+        people.update(cx, |session, cx| session.set_branch("fix".into(), cx));
         let toast = log(
             &people,
             "Delete Person ada",
@@ -8564,11 +8853,16 @@ mod tests {
             workspace.toasts.last().unwrap().message.clone()
         });
         assert!(message.starts_with("people: "), "{message}");
+        people.update(cx, |session, cx| session.set_branch("main".into(), cx));
         follow(toast, cx);
-        assert_eq!(shown(cx), ("people".into(), "main".into()));
+        assert_eq!(
+            shown(cx),
+            ("people".into(), "fix".into()),
+            "an undo writes, so the graph moves to the delete's branch"
+        );
         assert_eq!(
             ran.borrow_mut().pop(),
-            Some(("undo", "people".into(), "main".into()))
+            Some(("undo", "people".into(), "fix".into()))
         );
         assert!(
             focused(&people_tab, cx),
@@ -8581,7 +8875,7 @@ mod tests {
             workspace.close_graph_asking(false, window, cx)
         });
         follow(toast, cx);
-        assert_eq!(shown(cx), ("notes".into(), "fix".into()));
+        assert_eq!(shown(cx), ("notes".into(), "main".into()));
         assert!(ran.borrow().is_empty(), "nothing ran");
         let message = workspace.read_with(cx, |workspace, _| {
             workspace.toasts.last().unwrap().message.clone()
@@ -9239,6 +9533,13 @@ mod tests {
                 );
                 let follow_up = toast.action.as_ref().unwrap();
                 assert_eq!(follow_up.label.as_ref(), "Open history");
+                assert!(
+                    follow_up.action.partial_eq(&OpenBranchHistory {
+                        branch: branch.into(),
+                        preview: false,
+                    }),
+                    "it opens {branch}'s history by name, wherever the window is"
+                );
                 let on = follow_up.on.as_ref().unwrap();
                 assert_eq!(
                     (on.graph.as_str(), on.branch.as_deref()),

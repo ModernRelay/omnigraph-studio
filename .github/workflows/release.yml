@@ -38,10 +38,6 @@ name: Release
 #
 #   STUDIO_UPDATER_KEY           the private key `cargo packager signer generate` writes
 #   STUDIO_UPDATER_KEY_PASSWORD  its password
-#
-# Telemetry (spec 018) sends to the PostHog project whose token the repository variable
-# OMNIGRAPH_STUDIO_POSTHOG_TOKEN holds; it is compiled in. PostHog's project tokens are public,
-# so it is a variable, not a secret. Without it a release sends nothing.
 
 on:
   push:
@@ -134,7 +130,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       SIGNED: ${{ secrets.APPLE_CERTIFICATE_P12 != '' }}
-      OMNIGRAPH_STUDIO_POSTHOG_TOKEN: ${{ vars.OMNIGRAPH_STUDIO_POSTHOG_TOKEN }}
     steps:
       # Zed's checkout has paths past Windows's 260-character limit; git fetches it.
       - name: Long paths

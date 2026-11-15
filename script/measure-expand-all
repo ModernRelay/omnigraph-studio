@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Expand all on ~146 canvas nodes of the dense graph: ~1,800 relationship counts land at once.
+#
+#   script/measure-expand-all <snapshot-binary> <out.json>
+#
+# Build the binary with `cargo build --profile release-fast -p studio --example snapshot`.
+#
+# Needs script/dense-server serving `dense` on 127.0.0.1:8788 (token dev-token).
+# Steps: open a canvas at Topic topic-00325 (its 4 relationship hubs show), then three rounds of
+# ctrl-a (mark every chip), f (centre the selected root), right-click the root, "Expand all":
+#   round 1 opens the root's 4 hubs            -> 7 hop-1 nodes
+#   round 2 expands the 7 hop-1 nodes          -> their counts, ~50 hubs
+#   round 3 opens those hubs (8 per hub)       -> 146 nodes drawn, 207 chips
+#   round 4 (the measured one) expands all 138 unexpanded nodes -> ~1,763 counts in ~58
+#           studio_page_degrees reads; Studio asks first, and its button agrees.
+#           The step that asked the most of the last two (the click, or the confirmation).
+# Coordinates are window pixels of the default 1440x900 window: the canvas centres the root at
+# (852,467); the marked-chips menu opens there and "Expand all" is at (896,507).
+# Prints the measured step, the wall time from the menu click until the step settled (the
+# reads runner adds its 1 s quiet window to that), and writes <out.json> plus <out>.png.
+set -euo pipefail
+BIN=${1:?usage: measure-expand-all <snapshot-binary> <out.json>}
+OUT=${2:?usage: measure-expand-all <snapshot-binary> <out.json>}
+BIN=$(realpath "$BIN")
+OUT=$(realpath -m "$OUT")
+
+if ! curl -sf -o /dev/null http://127.0.0.1:8788/healthz; then
+  echo "no server at http://127.0.0.1:8788; start script/dense-server first" >&2
+  exit 1
+fi
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+# An empty operator home, so no CLI target of the person's adds toasts or reads (as measure-frames).
+mkdir -p "$work/omnigraph-home"
+export OMNIGRAPH_HOME="$work/omnigraph-home"
+export OMNIGRAPH_STUDIO_DATA="$work/studio-data"
+export OMNIGRAPH_STUDIO_SERVER=http://127.0.0.1:8788
+export OMNIGRAPH_STUDIO_TOKEN=dev-token
+export OMNIGRAPH_STUDIO_GRAPH=dense
+export SNAPSHOT_WAIT_MS=${SNAPSHOT_WAIT_MS:-2500}
+unset STUDIO_READS_LATENCY_MS
+
+ROOT='studio_graph::ShowNodeOnCanvas={"type_name":"Topic","id":"topic-00325"}'
+MARK=(key:ctrl-a key:f click:852,467,right)
+EXPAND=click:896,507
+# The question's "Expand N nodes" button, in a build that asks (spec 006).
+CONFIRM=click:857,319
+clock() { echo "run:date +%s.%N > $work/$1"; }
+
+start=$(date +%s.%N)
+"$BIN" "${OUT%.json}.png" "reads:$OUT" "$ROOT" \
+  "${MARK[@]}" "$EXPAND" \
+  "${MARK[@]}" "$EXPAND" \
+  "${MARK[@]}" "$EXPAND" \
+  "${MARK[@]}" "$(clock t0)" "$EXPAND" "$CONFIRM" "$(clock t1)" \
+  2>&1 | grep -v '^snapshot data\|\.png$' > "$work/log"
+end=$(date +%s.%N)
+
+python3 - "$OUT" "$work" "$start" "$end" <<'EOF'
+import json, sys
+out, work, start, end = sys.argv[1], sys.argv[2], float(sys.argv[3]), float(sys.argv[4])
+t0 = float(open(f"{work}/t0").read()); t1 = float(open(f"{work}/t1").read())
+steps = json.load(open(out))["steps"]
+# Studio asks before an Expand all of this size (spec 006): the click opens the question and
+# its button expands; a build that does not ask expands on the click.
+step = max(steps[-2:], key=lambda step: step["asked"])
+print(f"Expand all: {step['asked']} asked, {step['sent']} sent | first answer "
+      f"{step['first_ms']:.0f} ms, last answer {step['settled_ms']:.0f} ms"
+      f"{' (not settled)' if step['timed_out'] else ''}")
+for read in step["reads"]:
+    print(f"  {read['count']:5d}  {read['what']:<22} {read['asker']:<18} {read['answered']}")
+print(f"wall, menu click until settled: {t1 - t0:.2f} s (includes the 1 s quiet window)")
+print(f"whole run: {end - start:.1f} s")
+EOF
