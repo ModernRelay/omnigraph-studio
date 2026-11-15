@@ -153,6 +153,13 @@ Every interaction answers four questions, and each answer has one home.
 A tab can also hold an earlier commit. That's part of the tab's read context, shown on the tab, and
 not a change to the window's scope.
 
+**Looking at a branch is not a move to it.** A branch's Review and History, and a commit, open by
+name and leave the window on the branch it reads, wherever they are opened from: the Branches list,
+a toast, the activity log, the agent's Review. The window's branch changes only where the person
+says so: the top bar, Switch in the Branches list, ⌘K's branch row, a new branch, a link that names
+a branch, and Undo, which writes to the branch its delete was on (since 2026-11-14; specs 002 and
+011 have what changed).
+
 ### The regions
 
 | Region | Job | Never |

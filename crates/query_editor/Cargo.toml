@@ -31,7 +31,6 @@ tree-sitter-pg = { workspace = true }
 # The same revision `language` builds; it turns the grammar into a `tree_sitter::Language`.
 tree-sitter = { git = "https://github.com/tree-sitter/tree-sitter", rev = "803c6ebaac27d69e1808b45058482e868d073ceb" }
 studio_settings = { workspace = true }
-studio_telemetry = { workspace = true }
 anyhow = { workspace = true }
 futures = { workspace = true }
 serde_json = { workspace = true }

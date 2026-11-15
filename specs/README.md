@@ -48,7 +48,7 @@ Add tasks, contracts or data-model files only for large features.
 | 015 | [One read model](015-read-model/plan.md) | draft |
 | 016 | [Studio as an OAuth client](016-oauth-client/plan.md) | draft |
 | 017 | [Studio updates itself](017-auto-update/plan.md) | built; installing waits on signing |
-| 018 | [Telemetry, with consent](018-telemetry/plan.md) | step 1 built |
+| 018 | [Telemetry, with consent](018-telemetry/plan.md) | superseded: removed 2026-11-14 |
 | 019 | [Model calls through OpenRouter](019-model-calls/plan.md) | built; live check with a key pending |
 | 020 | [UI/UX unification](020-ui-unification/plan.md) | in progress |
 | 021 | [Studio speaks to the managed control plane](021-control-plane/plan.md) | draft; waits on the control plane |

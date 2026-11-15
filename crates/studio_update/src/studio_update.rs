@@ -493,16 +493,6 @@ impl Updater {
 
     fn set(&mut self, state: UpdateState, cx: &mut Context<Self>) {
         if self.state != state {
-            let step = match &state {
-                UpdateState::Available { .. } => Some(studio_telemetry::UpdateStep::Found),
-                UpdateState::Installing { .. } => Some(studio_telemetry::UpdateStep::Downloaded),
-                UpdateState::Ready { .. } => Some(studio_telemetry::UpdateStep::Installed),
-                UpdateState::Failed { .. } => Some(studio_telemetry::UpdateStep::Failed),
-                _ => None,
-            };
-            if let Some(step) = step {
-                studio_telemetry::record(studio_telemetry::Event::Update { step });
-            }
             self.clear = None;
             self.state = state;
             cx.notify();

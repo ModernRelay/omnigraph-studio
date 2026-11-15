@@ -22,14 +22,16 @@ is for every later one.
 
 - I: one client owns every request. The crate is a third kind of request, to OpenRouter, not to
   an Omnigraph server. This plan amends I's "in practice" line to name `model` beside
-  `studio_update` and (spec 018) `studio_telemetry` (a patch).
+  `studio_update` (a patch). It also named spec 018's `studio_telemetry`, until telemetry was
+  removed on 2026-11-14.
 - II: a call takes its input from the view's snapshot and answers into the view; it never reads
   the graph itself.
 - III and IV: a model never writes. An answer is a proposal shown in the view's own controls
   (filter pills, a summary card, cells marked as suggested), and the person's accept is the
   write, on the branch the view has, as any edit of theirs.
 - VI: every control explains itself. Each use says what leaves the machine before the first
-  call, and the setting names the model and what each task sends.
+  call, and the setting names the model and what each task sends. `docs/privacy.md` says the
+  same of each task and of the model list (since 2026-11-14); a new task adds its line there.
 - VII: loudness matches cost. A call shows as the control's own busy state, never a dialog;
   a failure is one line in place, not a toast.
 - VIII: each use is an action with a default binding.
