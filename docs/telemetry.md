@@ -2,7 +2,7 @@
 
 Nothing. From version 0.4.7, Studio sends no usage data, no crash reports and no ID of you, your computer or your installation. The code that made and sent those reports is removed, and so are its settings. Starting 0.4.7 or later also deletes what an earlier version kept on your computer: the reports not yet sent, the list of those sent and its crash reports. An install ID, if you chose one, stays in its file so that you can still quote it to us; the [privacy notice](privacy.md) says where it is.
 
-Studio still makes the requests its work needs: to the Omnigraph servers you connect it to, and to GitHub to check for a newer version of itself. The privacy notice covers those too.
+Studio still makes the requests its work needs: to the Omnigraph servers you connect it to, to GitHub to check for a newer version of itself, and to OpenRouter for the list of AI models. An AI feature sends its input to OpenRouter once you store your own key, and the agent panel runs an agent once you choose one. The privacy notice covers each of these.
 
 ## The builds that sent reports
 
@@ -12,9 +12,9 @@ Three builds of Studio had telemetry, all made between 12 and 14 November 2026. 
 |---|---|---|
 | 0.4.5, released 13 November 2026 | Sent from the first start, unless turned off. The status bar said "Anonymous usage data is on" and did not wait for an answer | Shown to you, and sent only when you chose Send or Always send |
 | The edge build of 13 November 2026 | As 0.4.5 | As 0.4.5 |
-| The edge build of 14 November 2026 | Asked first, and sent none until you answered | As 0.4.5 |
+| The earlier edge build of 14 November 2026 | Asked first, and sent none until you answered | As 0.4.5 |
 
-No other version, before or after, sends any of this. Nothing was sent from a development build, or while `DO_NOT_TRACK` or `OMNIGRAPH_STUDIO_TELEMETRY=0` was set.
+No other version, before or after, sends any of this. Every edge build downloaded from 21:45 UTC on 14 November 2026 is version 0.4.7 or later and has no telemetry. One of the three builds can be told by the Privacy section in its Settings, which no other build has. Nothing was sent from a development build, or while `DO_NOT_TRACK` or `OMNIGRAPH_STUDIO_TELEMETRY=0` was set.
 
 If you run one of these builds, update to 0.4.7 or later. To stop its reports without updating, open the status bar's notice and turn usage data off, or set usage data to off and crash reports to never under Settings, Privacy.
 

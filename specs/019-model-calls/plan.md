@@ -30,7 +30,8 @@ is for every later one.
   (filter pills, a summary card, cells marked as suggested), and the person's accept is the
   write, on the branch the view has, as any edit of theirs.
 - VI: every control explains itself. Each use says what leaves the machine before the first
-  call, and the setting names the model and what each task sends.
+  call, and the setting names the model and what each task sends. `docs/privacy.md` says the
+  same of each task and of the model list (since 2026-11-14); a new task adds its line there.
 - VII: loudness matches cost. A call shows as the control's own busy state, never a dialog;
   a failure is one line in place, not a toast.
 - VIII: each use is an action with a default binding.
