@@ -47,7 +47,7 @@ use studio_ui::ds::space;
 use studio_ui::menu::{ContextMenu, ContextMenuEntry};
 use studio_ui::plural;
 use studio_ui::{ColumnDrag, ColumnResize, GridPlace, ROW_HEIGHT, columns_in_view, grid_places};
-use studio_workspace::models::{Error as ModelError, Models, Request as ModelRequest};
+use studio_workspace::models::{self, Error as ModelError, Models, Request as ModelRequest};
 use studio_workspace::{
     Inspected, Item, ItemEvent, ItemStatus, KeyHint, SavedItem, ToastKind, Workspace,
 };
@@ -584,6 +584,16 @@ const COMPACT_TOOLBAR_BELOW: f32 = 1000.;
 /// The least the toolbar's sentence field is squeezed to before the chips after it are cut.
 const WORDS_FIELD_MIN: f32 = 140.;
 
+/// What the sentence field shows while it is empty: its name, or, while no OpenRouter key is
+/// stored, that it needs one, so nobody types a sentence to learn it (spec 019).
+fn words_placeholder(needs_key: bool) -> &'static str {
+    if needs_key {
+        models::WORDS_NEED_KEY
+    } else {
+        "Filter in words…"
+    }
+}
+
 use studio_workspace::property_icon;
 
 /// One row's neighbours through one relationship: how many, and the first few by id (as many
@@ -1094,6 +1104,9 @@ pub struct TypeTable {
     words_editor: Entity<Editor>,
     words: WordsState,
     words_made: Vec<Filter>,
+    /// No OpenRouter key is stored: the sentence field and the fill say so before they are
+    /// used, and follow the key when one is stored or removed.
+    needs_key: bool,
     /// Fill a column (spec 019): the instruction field and the fill under way, in the bulk bar.
     fill_editor: Entity<Editor>,
     fill: Option<FillState>,
@@ -1414,9 +1427,10 @@ impl TypeTable {
             editor.set_text_style_refinement(studio_ui::ds::field_text(cx));
             editor
         });
+        let needs_key = Models::needs_key(cx);
         let words_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text("Filter in words…", window, cx);
+            editor.set_placeholder_text(words_placeholder(needs_key), window, cx);
             editor.set_text_style_refinement(studio_ui::ds::field_text(cx));
             editor
         });
@@ -1437,7 +1451,7 @@ impl TypeTable {
             editor
         });
         let grid = TableGrid::new(cx);
-        let subscriptions = vec![
+        let mut subscriptions = vec![
             // The inspector shows the row under the cursor (spec 020): the workspace is told
             // when that is another row, however the cursor or the rows came to change.
             cx.observe_self(|this, cx| this.report_selection(cx)),
@@ -1473,6 +1487,12 @@ impl TypeTable {
                 },
             ),
         ];
+        // The sentence field says whether a key is stored, and follows the key.
+        if let Some(models) = Models::try_global(cx) {
+            subscriptions.push(cx.observe_in(&models, window, |this, _, window, cx| {
+                this.key_changed(window, cx)
+            }));
+        }
         let branch = session.read(cx).branch.clone();
         let table_state = cx.new(|cx| TableInteractionState::new(cx));
         let scope = at_commit.is_none().then(|| new_scope(&session, cx));
@@ -1528,6 +1548,7 @@ impl TypeTable {
             filter_editor,
             words_editor,
             words: WordsState::Typing(None),
+            needs_key,
             words_made: Vec::new(),
             fill_editor,
             fill: None,
@@ -3023,12 +3044,16 @@ impl TypeTable {
                         format!("Fill {}", studio_ui::plural(count, "row", "rows")),
                     )
                     .style(ButtonStyle::Tinted(TintColor::Accent))
-                    .tip(studio_ui::ds::tooltip(format!(
-                        "{} go to {}. Each answer lands as the cell's draft; save the drafts \
-                         to write them",
-                        fill::TASK.sends,
-                        Models::model_for(fill::TASK.tier, cx)
-                    )))
+                    .tip(studio_ui::ds::tooltip(if self.needs_key {
+                        models::needs_key_tip("Fill with a model")
+                    } else {
+                        format!(
+                            "{} go to {}. Each answer lands as the cell's draft; save the \
+                             drafts to write them",
+                            fill::TASK.sends,
+                            Models::model_for(fill::TASK.tier, cx)
+                        )
+                    }))
                     .on_click(cx.listener(|this, _, _, cx| this.run_fill(cx))),
                 );
             }
@@ -9093,20 +9118,42 @@ impl TypeTable {
         cx.notify();
     }
 
-    /// The toolbar's sentence field (spec 019): a search field with the model's mark, its
-    /// spinner while the call is out, and the field's red line when the call failed; the
-    /// answer's filters are the bar's pills. ↵ asks, Esc leaves.
-    fn render_words_field(&self, cx: &mut Context<Self>) -> AnyElement {
-        let running = matches!(self.words, WordsState::Running { .. });
-        let failed = matches!(self.words, WordsState::Failed(_));
-        let about = match &self.words {
+    /// A key was stored or removed, or the keychain answered: the sentence field says whether
+    /// it can be used, and the table draws again only when that changed.
+    fn key_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let needs_key = Models::needs_key(cx);
+        if needs_key == self.needs_key {
+            return;
+        }
+        self.needs_key = needs_key;
+        self.words_editor.update(cx, |editor, cx| {
+            editor.set_placeholder_text(words_placeholder(needs_key), window, cx)
+        });
+        cx.notify();
+    }
+
+    /// What the sentence field's tooltip says: why the last call failed, else that the field
+    /// needs a key while none is stored, else what a sentence sends and to which model.
+    fn words_about(&self, cx: &App) -> String {
+        match &self.words {
             WordsState::Failed(why) => why.clone(),
+            _ if self.needs_key => models::needs_key_tip("Filter in words"),
             _ => format!(
                 "Filter in words (↵): {} go to {}",
                 words::TASK.sends,
                 Models::model_for(words::TASK.tier, cx)
             ),
-        };
+        }
+    }
+
+    /// The toolbar's sentence field (spec 019): a search field with the model's mark, its
+    /// spinner while the call is out, and the field's red line when the call failed; the
+    /// answer's filters are the bar's pills. ↵ asks, Esc leaves. Without a key it says so,
+    /// empty, and in its tooltip, before a sentence is typed.
+    fn render_words_field(&self, cx: &mut Context<Self>) -> AnyElement {
+        let running = matches!(self.words, WordsState::Running { .. });
+        let failed = matches!(self.words, WordsState::Failed(_));
+        let about = self.words_about(cx);
         studio_ui::ds::pill_field("filter-words", failed, cx)
             .key_context("FilterWords")
             // As wide as a search field where there is room, and the first to give way where
@@ -13277,6 +13324,72 @@ mod tests {
             assert_eq!(table.paging.pinned.as_deref(), Some("c2"));
             assert!(table.editing.is_some(), "the edit stays");
         });
+    }
+
+    /// Without an OpenRouter key the sentence field says so before a sentence is typed: in the
+    /// empty field and in its tooltip. It follows the key when one is stored or removed.
+    /// Before, it read "Filter in words…" and named what a sentence sends, and said it needed
+    /// a key only once a sentence had been typed and sent.
+    #[gpui::test]
+    async fn the_sentence_field_says_it_needs_a_key_before_a_sentence_is_typed(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+            studio_settings::init_test(cx);
+            studio_settings::keep_changes_in_memory(cx);
+        });
+        // A model service nothing reaches: no call is made here.
+        let models = cx.update(|cx| {
+            Models::init_for_tests(Arc::new(http_client::BlockedHttpClient), None, cx)
+        });
+        let schema = "node Person {\n  slug: String @key\n  name: String\n}\n";
+        let session = session(schema, cx);
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session,
+                "Person".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let says = |cx: &mut VisualTestContext| {
+            table.update(cx, |table, cx| {
+                let empty = table
+                    .words_editor
+                    .update(cx, |editor, cx| editor.placeholder_text(cx));
+                (empty.unwrap_or_default(), table.words_about(cx))
+            })
+        };
+        let needs = (
+            "OpenRouter key needed · Filter in words".to_owned(),
+            "Filter in words needs an OpenRouter key. Add one in Settings, under Models."
+                .to_owned(),
+        );
+        assert_eq!(says(cx), needs, "no key is stored");
+
+        models
+            .update(cx, |models, cx| models.set_key("sk-or-test".into(), cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        let (empty, about) = says(cx);
+        assert_eq!(empty, "Filter in words…", "a key is stored");
+        assert!(
+            about.starts_with("Filter in words (↵): ") && about.contains(" go to "),
+            "{about}"
+        );
+
+        models
+            .update(cx, |models, cx| models.set_key(String::new(), cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(says(cx), needs, "the key is removed");
     }
 
     /// A sentence's order, grouping and columns are taken as a saved view's are: the columns it

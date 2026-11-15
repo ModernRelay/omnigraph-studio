@@ -19,6 +19,18 @@ pub struct Probe {
     pub ok: bool,
 }
 
+/// What a sentence field shows, empty, while no key is stored: it cannot work, and says so
+/// before a sentence is typed (constitution VI). What is needed comes first, since a table's
+/// field is cut short in a narrow tab: it shows about 37 characters in a window of the default
+/// size and about 16 at its narrowest.
+pub const WORDS_NEED_KEY: &str = "OpenRouter key needed · Filter in words";
+
+/// What a control that asks a model says in its tooltip while no key is stored, in place of
+/// what its task sends: `what` names the control, as "Filter in words".
+pub fn needs_key_tip(what: &str) -> String {
+    format!("{what} needs an OpenRouter key. Add one in Settings, under Models.")
+}
+
 /// The keychain item the key is kept under (spec 016's mechanism).
 const KEYCHAIN_KEY: &str = "https://openrouter.ai";
 const KEYCHAIN_USER: &str = "studio";
@@ -158,6 +170,13 @@ impl Models {
 
     pub fn key_state(&self) -> KeyState {
         self.key_state.clone()
+    }
+
+    /// Whether a model call would be refused for want of a key: none is stored, or the models
+    /// were never set up (a view's test). False while the keychain is still being read, so a
+    /// control does not say it needs a key in the first frames of a run that holds one.
+    pub fn needs_key(cx: &App) -> bool {
+        Self::try_global(cx).is_none_or(|models| models.read(cx).key_state == KeyState::None)
     }
 
     /// The settings mirror whether a key is held, so the row shows it; the key itself never
@@ -428,6 +447,31 @@ mod tests {
         });
         cx.run_until_parked();
         assert_eq!(reads.load(Ordering::SeqCst), 1, "a list read today is kept");
+    }
+
+    /// A control learns that a key is wanting from one place: none set up, none stored, and
+    /// not while the keychain is still being read.
+    #[gpui::test]
+    async fn a_key_is_wanting_when_none_is_stored(cx: &mut TestAppContext) {
+        assert!(cx.update(|cx| Models::needs_key(cx)), "no models set up");
+        let reads = Arc::new(AtomicUsize::new(0));
+        let models = models(None, &reads, cx);
+        cx.update(|cx| {
+            cx.set_global(GlobalModels(models.clone()));
+            assert!(!Models::needs_key(cx), "the keychain has not answered yet");
+        });
+        cx.run_until_parked();
+        assert!(cx.update(|cx| Models::needs_key(cx)), "it holds no key");
+
+        models
+            .update(cx, |models, cx| models.set_key("sk-or-test".into(), cx))
+            .await
+            .unwrap();
+        assert!(!cx.update(|cx| Models::needs_key(cx)), "a key is stored");
+        assert_eq!(
+            needs_key_tip("Filter in words"),
+            "Filter in words needs an OpenRouter key. Add one in Settings, under Models."
+        );
     }
 
     /// Storing a key is what reads the list, and once the key is removed it is not read again,
