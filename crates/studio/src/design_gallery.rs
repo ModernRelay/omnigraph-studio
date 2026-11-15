@@ -834,9 +834,9 @@ impl Render for DesignGallery {
         let menu = ds::menu_surface(v_flex().w(px(size::STATE_ACTIONS)).p(px(space::XS)), cx)
             .child(ds::menu_header("Row".into()))
             .child(
-                ds::MenuRow::new("g-menu-peek")
+                ds::MenuRow::new("g-menu-open")
                     .toggle_state(true)
-                    .child(text::plain("Peek")),
+                    .child(text::plain("Open page")),
             )
             .child(ds::MenuRow::new("g-menu-edit").child(text::plain("Edit cell")))
             .child(

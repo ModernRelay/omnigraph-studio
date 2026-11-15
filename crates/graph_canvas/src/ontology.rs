@@ -20,7 +20,7 @@ use studio_actions::ontology::{Back, Open, SelectNext, SelectPrevious, ShowDomai
 use studio_actions::{ViewKind, ViewLink};
 use studio_ui::ds::Tipped;
 use studio_ui::ds::{self, size, space};
-use studio_workspace::{Item, ItemEvent, SavedItem};
+use studio_workspace::{Inspected, Item, ItemEvent, SavedItem};
 use ui::prelude::*;
 
 use crate::domains::{self, Domains};
@@ -70,7 +70,89 @@ pub(crate) struct OntologyPage {
     /// The schema's types on the canvas, walked from one (spec 006, "Ontology on the
     /// canvas"); made with the first schema read, and following the session after.
     canvas: Option<Entity<GraphCanvas>>,
+    /// The type selected on the canvas as the workspace was last told of it
+    /// ([`ItemEvent::Selected`]), and the inspector's view of it, for the schema it was made of.
+    selected: Option<String>,
+    note: Option<Entity<TypeNote>>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// A type as the inspector shows it while its chip is selected on the map (spec 020): what the
+/// schema says of it. A second click opens it between the types it relates to.
+struct TypeNote {
+    session: Entity<GraphSession>,
+    schema: Arc<SchemaModel>,
+    name: String,
+}
+
+impl Render for TypeNote {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let name = self.name.clone();
+        let Some(node) = self.schema.node(&name) else {
+            return ds::sidebar_note("The schema no longer has this type.").into_any_element();
+        };
+        let count = self
+            .session
+            .read(cx)
+            .count_of(EntityKind::Node, &name)
+            .map(studio_ui::group_count);
+        // A relationship reads from this type to the one at its other end, or the other way.
+        let line = |text: String| {
+            h_flex()
+                .h(px(size::SIDEBAR_ROW))
+                .child(ds::text::body(text).single_line().truncate())
+        };
+        let reaches: Vec<_> = self
+            .schema
+            .edges
+            .iter()
+            .filter(|edge| edge.from == name)
+            .map(|edge| line(format!("{} → {}", edge.name, edge.to)))
+            .collect();
+        let reached: Vec<_> = self
+            .schema
+            .edges
+            .iter()
+            .filter(|edge| edge.to == name && edge.from != name)
+            .map(|edge| line(format!("{} ← {}", edge.name, edge.from)))
+            .collect();
+        v_flex()
+            .px(px(space::LG))
+            .pt(px(space::XL))
+            .pb(px(space::LG))
+            .gap(px(space::MD))
+            .child(
+                h_flex()
+                    .gap(px(space::SM))
+                    .child(ds::type_dot(&name))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(ds::text::heading(name.clone()).single_line().truncate()),
+                    )
+                    .children(count.map(|count| ds::text::meta(format!("{count} nodes")))),
+            )
+            .children(node.about.clone().map(ds::text::muted))
+            .when(!node.properties.is_empty(), |note| {
+                note.child(
+                    v_flex()
+                        .child(ds::text::meta("Properties"))
+                        .children(node.properties.iter().map(render_property)),
+                )
+            })
+            .when(!reaches.is_empty(), |note| {
+                note.child(
+                    v_flex()
+                        .child(ds::text::meta("It reaches"))
+                        .children(reaches),
+                )
+            })
+            .when(!reached.is_empty(), |note| {
+                note.child(v_flex().child(ds::text::meta("Reach it")).children(reached))
+            })
+            .into_any_element()
+    }
 }
 
 /// The two sides of the focus view for one type.
@@ -234,14 +316,15 @@ enum Entry {
 
 impl OntologyPage {
     pub(crate) fn new(session: Entity<GraphSession>, cx: &mut Context<Self>) -> Self {
-        let subscriptions =
-            vec![
-                cx.subscribe(&session, |this, _, event: &SessionEvent, cx| match event {
-                    SessionEvent::SchemaChanged | SessionEvent::SchemaMoved => this.read_schema(cx),
-                    SessionEvent::CountsChanged => cx.notify(),
-                    _ => {}
-                }),
-            ];
+        let subscriptions = vec![
+            // The inspector shows the type selected on the canvas (spec 020).
+            cx.observe_self(|this, cx| this.report_selection(cx)),
+            cx.subscribe(&session, |this, _, event: &SessionEvent, cx| match event {
+                SessionEvent::SchemaChanged | SessionEvent::SchemaMoved => this.read_schema(cx),
+                SessionEvent::CountsChanged => cx.notify(),
+                _ => {}
+            }),
+        ];
         let mut page = Self {
             session,
             focus_handle: cx.focus_handle(),
@@ -254,10 +337,33 @@ impl OntologyPage {
             sides: None,
             about_open: None,
             canvas: None,
+            selected: None,
+            note: None,
             _subscriptions: subscriptions,
         };
         page.read_schema(cx);
         page
+    }
+
+    /// The type the inspector shows: the one selected on the canvas. A type in focus is the
+    /// page's own subject, described in the page.
+    fn selected_type(&self, cx: &App) -> Option<String> {
+        if self.focus.is_some() {
+            return None;
+        }
+        let canvas = self.canvas.as_ref()?.read(cx);
+        canvas.selected_type().map(str::to_owned)
+    }
+
+    /// Tells the workspace when the type selected on the canvas is another one, or none:
+    /// called whenever the page or its canvas notifies. The inspector then asks for the type
+    /// ([`Item::inspected`]) if it is shown.
+    fn report_selection(&mut self, cx: &mut Context<Self>) {
+        let selected = self.selected_type(cx);
+        if selected != self.selected {
+            self.selected = selected;
+            cx.emit(ItemEvent::Selected);
+        }
     }
 
     fn read_schema(&mut self, cx: &mut Context<Self>) {
@@ -284,6 +390,8 @@ impl OntologyPage {
                         TypeEvent::Details(name) => this.focus_on(name, cx),
                     },
                 ));
+                self._subscriptions
+                    .push(cx.observe(&canvas, |this, _, cx| this.report_selection(cx)));
                 self.canvas = Some(canvas);
             }
             // A type the schema no longer has (dropped, or renamed by another writer) leaves
@@ -918,6 +1026,34 @@ impl Item for OntologyPage {
         Some(studio_actions::Thing::Schema)
     }
 
+    /// The type selected on the canvas, as the schema describes it: the same view while the
+    /// same type of the same schema is selected.
+    fn inspected(&mut self, cx: &mut Context<Self>) -> Option<Inspected> {
+        let name = self.selected_type(cx)?;
+        let schema = self.view.as_ref()?.schema.clone();
+        let held = self.note.as_ref().filter(|note| {
+            let note = note.read(cx);
+            note.name == name && Arc::ptr_eq(&note.schema, &schema)
+        });
+        let note = match held {
+            Some(note) => note.clone(),
+            None => {
+                let session = self.session.clone();
+                let note = cx.new(|_| TypeNote {
+                    session,
+                    schema,
+                    name,
+                });
+                self.note = Some(note.clone());
+                note
+            }
+        };
+        Some(Inspected::View {
+            view: note.into(),
+            scrolls_itself: false,
+        })
+    }
+
     fn views(&self, _cx: &App) -> Vec<ViewLink> {
         vec![
             ViewLink::current(ViewKind::Map),
@@ -1146,5 +1282,53 @@ edge Owns: Person -> Project
         page.read_with(cx, |page, _| {
             assert_eq!(page.focus.as_deref(), Some("Task"))
         });
+    }
+
+    /// The type selected on the map is what the inspector shows (spec 020): the page says when
+    /// another type is selected, and hands over the same view while the same type stays
+    /// selected. A type in focus is the page's own subject, so nothing is selected then.
+    #[gpui::test]
+    async fn the_inspector_shows_the_type_selected_on_the_map(cx: &mut gpui::TestAppContext) {
+        cx.update(studio_theme::init_test);
+        let (session, _served) =
+            graph_store::test_server::followed_session(SCHEMA, |_| serde_json::json!([]), cx);
+        cx.run_until_parked();
+        let page = cx.new(|cx| OntologyPage::new(session, cx));
+        cx.run_until_parked();
+        let told = Rc::new(Cell::new(0));
+        let heard = told.clone();
+        let _hearing = cx.update(|cx| {
+            cx.subscribe(&page, move |_, event: &ItemEvent, _| {
+                if matches!(event, ItemEvent::Selected) {
+                    heard.set(heard.get() + 1);
+                }
+            })
+        });
+        let canvas = page.read_with(cx, |page, _| page.canvas.clone().expect("a schema canvas"));
+        let inspected = |cx: &mut gpui::TestAppContext| {
+            page.update(cx, |page, cx| match Item::inspected(page, cx) {
+                Some(Inspected::View { view, .. }) => Some(view.entity_id()),
+                Some(Inspected::Node(_)) => panic!("a type is no node"),
+                None => None,
+            })
+        };
+        canvas.update(cx, |canvas, cx| canvas.show_type("Task", cx));
+        cx.run_until_parked();
+        let before = told.get();
+        let task = inspected(cx);
+        assert!(task.is_some());
+        assert_eq!(inspected(cx), task, "the same type keeps its view");
+
+        canvas.update(cx, |canvas, cx| canvas.show_type("Project", cx));
+        cx.run_until_parked();
+        assert_eq!(told.get(), before + 1);
+        let project = inspected(cx);
+        assert!(project.is_some() && project != task);
+
+        // In focus the type is the page's subject: nothing is selected, and the page says so.
+        page.update(cx, |page, cx| page.focus_on("Project", cx));
+        cx.run_until_parked();
+        assert_eq!(told.get(), before + 2);
+        assert_eq!(inspected(cx), None);
     }
 }
