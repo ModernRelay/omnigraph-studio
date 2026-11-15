@@ -469,6 +469,14 @@ struct Follow {
     group: gq_language::RelationshipGroup,
     field: ExplorePath,
     hops: usize,
+    /// The walk's root it started from: another root ends it.
+    root: Option<NodeRef>,
+    /// The walk's open paths as the follow's own opening left them: the walk opened or closed
+    /// by anything else (a click, ⌫, a collapse of an ancestor) ends it.
+    expected: HashSet<ExplorePath>,
+    /// The view centres on each node reached until the person moves it (a scroll, a pinch, a
+    /// pan, a zoom or a fit); the follow then goes on walking and leaves the view where it is.
+    recentre: bool,
 }
 
 /// Whether `node`'s type has `group` too, so a follow of it goes on from `node`: the same
@@ -684,6 +692,7 @@ impl GraphCanvas {
                     this._loaded = None;
                     cx.emit(ItemEvent::UpdateTab);
                     this.owe_layout(cx);
+                    this.follow_still_wanted(cx);
                     this.advance_follow(cx);
                 }
                 // Reads that finish together (a node's counts) are laid out in one go.
@@ -1978,6 +1987,7 @@ impl GraphCanvas {
                     None if drag.pans() => {
                         self.center = drag.center - delta;
                         self.camera_touched = true;
+                        self.view_moved_by_hand();
                     }
                     None => {}
                 }
@@ -2650,6 +2660,11 @@ impl GraphCanvas {
     }
 
     fn clear_selection(&mut self, _: &ClearSelection, _: &mut Window, cx: &mut Context<Self>) {
+        // Esc ends a follow under way first: it stops where it got to.
+        if self.follow.take().is_some() {
+            cx.notify();
+            return;
+        }
         if self.marked.is_empty() {
             cx.propagate();
             return;
@@ -2661,6 +2676,7 @@ impl GraphCanvas {
     fn scroll(&mut self, event: &ScrollEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.settle_camera();
         self.camera_touched = true;
+        self.view_moved_by_hand();
         let delta = event.delta.pixel_delta(window.line_height());
         let factor = (-f32::from(delta.y) * 0.004).exp();
         self.zoom_around(factor, Some(event.position), window);
@@ -2670,6 +2686,7 @@ impl GraphCanvas {
     fn pinch(&mut self, event: &PinchEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.settle_camera();
         self.camera_touched = true;
+        self.view_moved_by_hand();
         self.zoom_around(1. + event.delta, Some(event.position), window);
         cx.notify();
     }
@@ -2696,6 +2713,7 @@ impl GraphCanvas {
         self.fit(viewport);
         // Fitted on request: a resize fits again until the view is moved by hand.
         self.camera_touched = false;
+        self.view_moved_by_hand();
         self.glide_from(from, cx);
         cx.notify();
     }
@@ -2704,6 +2722,7 @@ impl GraphCanvas {
         let from = self.camera_now(Instant::now());
         self.zoom_around(ZOOM_STEP, None, window);
         self.camera_touched = true;
+        self.view_moved_by_hand();
         self.glide_from(from, cx);
         cx.notify();
     }
@@ -2712,6 +2731,7 @@ impl GraphCanvas {
         let from = self.camera_now(Instant::now());
         self.zoom_around(1. / ZOOM_STEP, None, window);
         self.camera_touched = true;
+        self.view_moved_by_hand();
         self.glide_from(from, cx);
         cx.notify();
     }
@@ -2858,10 +2878,46 @@ impl GraphCanvas {
             group,
             field,
             hops: 0,
+            root: self.exploration.read(cx).root().cloned(),
+            expected: HashSet::new(),
+            recentre: true,
         });
-        self.exploration
-            .update(cx, |exploration, cx| exploration.set_open(&opens, true, cx));
+        self.open_for_follow(&opens, cx);
         self.advance_follow(cx);
+    }
+
+    /// Opens `paths` for the follow under way, and records the walk's open paths it leaves, so
+    /// an opening or closing by anything else is seen ([`Self::follow_still_wanted`]).
+    fn open_for_follow(&mut self, paths: &[ExplorePath], cx: &mut Context<Self>) {
+        self.exploration
+            .update(cx, |exploration, cx| exploration.set_open(paths, true, cx));
+        let open = self.exploration.read(cx).state().expanded.clone();
+        if let Some(follow) = self.follow.as_mut() {
+            follow.expected = open;
+        }
+    }
+
+    /// Ends the follow under way when the walk changed under it: another root, or a path
+    /// opened or closed by anything but the follow (a click, ⌫, an ancestor collapsed, Expand
+    /// all). A follow is the person's one action; anything else they do takes over.
+    fn follow_still_wanted(&mut self, cx: &mut Context<Self>) {
+        let Some(follow) = self.follow.as_ref() else {
+            return;
+        };
+        let exploration = self.exploration.read(cx);
+        if exploration.root() != follow.root.as_ref()
+            || exploration.state().expanded != follow.expected
+        {
+            self.follow = None;
+        }
+    }
+
+    /// The person moved the view: a follow under way stops centring it on each node it
+    /// reaches, and goes on walking.
+    fn view_moved_by_hand(&mut self) {
+        if let Some(follow) = self.follow.as_mut() {
+            follow.recentre = false;
+        }
     }
 
     /// Takes the next hop of the relationship being followed once its field's target is read:
@@ -2901,7 +2957,10 @@ impl GraphCanvas {
         let cycle = entries
             .iter()
             .any(|entry| entry.path == node_path && matches!(entry.kind, EntryKind::Cycle { .. }));
-        self.center_on = Some(SceneId::Node(target.node.clone()));
+        let id = SceneId::Node(target.node.clone());
+        if follow.recentre {
+            self.center_on = Some(id);
+        }
         // A relationship that reaches another type (a person's employer) ends at its target,
         // which has no such relationship to go on along.
         let goes_on = self
@@ -2919,9 +2978,7 @@ impl GraphCanvas {
             hops: follow.hops + 1,
             ..follow
         });
-        self.exploration.update(cx, |exploration, cx| {
-            exploration.set_open(&[node_path, next], true, cx)
-        });
+        self.open_for_follow(&[node_path, next], cx);
     }
 
     fn move_selection(&mut self, direction: Vec2, cx: &mut Context<Self>) {
@@ -4331,8 +4388,20 @@ mod tests {
         name: fn(usize) -> String,
         cx: &mut gpui::TestAppContext,
     ) -> Entity<GraphSession> {
+        served_chain_session(length, name, cx).0
+    }
+
+    /// [`named_chain_session`], with the fake server, to hold its reads.
+    pub(super) fn served_chain_session(
+        length: usize,
+        name: fn(usize) -> String,
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        Entity<GraphSession>,
+        std::sync::Arc<std::sync::Mutex<graph_store::test_server::Served>>,
+    ) {
         cx.update(studio_theme::init_test);
-        let (session, _served) = graph_store::test_server::followed_session(
+        let (session, served) = graph_store::test_server::followed_session(
             CHAIN_SCHEMA,
             move |asked| {
                 let id = asked["params"]["id"].as_str().unwrap_or("p1").to_owned();
@@ -4349,7 +4418,7 @@ mod tests {
             cx,
         );
         cx.run_until_parked();
-        session
+        (session, served)
     }
 
     /// Settles a canvas's reads and layouts.
@@ -4625,6 +4694,109 @@ mod tests {
                     .is_some(),
                 "the company is drawn"
             );
+        });
+    }
+
+    /// A follow p1's manager pill started, on a canvas of a chain of `length`, with the server
+    /// holding every read once it has started, so the follow waits on its next hop.
+    fn waiting_follow(
+        length: usize,
+        cx: &mut gpui::TestAppContext,
+    ) -> (Entity<GraphCanvas>, &mut gpui::VisualTestContext) {
+        let (session, served) = served_chain_session(length, |n| format!("Person {n}"), cx);
+        let (canvas, cx) = cx.add_window_view(|_, cx| {
+            GraphCanvas::new(session, NodeRef::new("Person", "p1"), None, cx)
+        });
+        cx.update(|window, cx| window.focus(&canvas.focus_handle(cx), cx));
+        settle(cx);
+        served.lock().unwrap().hold = Box::new(|_| true);
+        canvas.update_in(cx, |canvas, _, cx| {
+            let hub = canvas
+                .scene
+                .nodes
+                .iter()
+                .position(|node| matches!(node.kind, SceneKind::Hub { .. }))
+                .expect("p1's manager pill");
+            canvas.start_follow(hub, cx);
+        });
+        settle(cx);
+        assert!(
+            canvas.read_with(cx, |canvas, _| canvas.follow.is_some()),
+            "waiting"
+        );
+        (canvas, cx)
+    }
+
+    /// A follow is the person's one action, and anything else they do takes over: it ends when
+    /// the walk is closed under it (here its root collapsed). Before, it ended only by itself:
+    /// a collapse of its ancestor left it waiting, and it went on, expanding and centring the
+    /// view, when the walk was opened again.
+    #[gpui::test]
+    async fn a_follow_ends_when_its_ancestor_is_collapsed(cx: &mut gpui::TestAppContext) {
+        // The root collapsed: the follow's paths below it are left open, and it ends.
+        let (canvas, cx) = waiting_follow(41, cx);
+        let exploration = canvas.read_with(cx, |canvas, _| canvas.exploration.clone());
+        exploration.update(cx, |e, cx| e.set_open(&[ExplorePath::root()], false, cx));
+        settle(cx);
+        assert!(
+            canvas.read_with(cx, |canvas, _| canvas.follow.is_none()),
+            "collapsed"
+        );
+        // Opened again, nothing goes on by itself.
+        exploration.update(cx, |e, cx| e.set_open(&[ExplorePath::root()], true, cx));
+        settle(cx);
+        assert!(
+            canvas.read_with(cx, |canvas, _| canvas.follow.is_none()),
+            "stays ended"
+        );
+    }
+
+    /// Esc ends a follow under way, where it got to.
+    #[gpui::test]
+    async fn escape_ends_a_follow(cx: &mut gpui::TestAppContext) {
+        let (canvas, cx) = waiting_follow(41, cx);
+        cx.dispatch_action(ClearSelection);
+        assert!(canvas.read_with(cx, |canvas, _| canvas.follow.is_none()));
+    }
+
+    /// Another chip opened by the person (here the manager reached so far, closed with ⌫)
+    /// ends a follow under way.
+    #[gpui::test]
+    async fn opening_or_closing_by_hand_ends_a_follow(cx: &mut gpui::TestAppContext) {
+        let (canvas, cx) = waiting_follow(41, cx);
+        let exploration = canvas.read_with(cx, |canvas, _| canvas.exploration.clone());
+        let other = exploration.read_with(cx, |exploration, _| {
+            let state = exploration.state();
+            state
+                .expanded
+                .iter()
+                .find(|path| !path.is_root() && path.ends_at_node())
+                .cloned()
+                .expect("a node the follow opened")
+        });
+        exploration.update(cx, |e, cx| e.collapse(&other, cx));
+        settle(cx);
+        assert!(canvas.read_with(cx, |canvas, _| canvas.follow.is_none()));
+    }
+
+    /// Scrolling (a zoom) during a follow leaves the view where the person put it: the follow
+    /// goes on walking and stops centring the view on each node it reaches.
+    #[gpui::test]
+    async fn a_view_moved_by_hand_is_left_alone_by_a_follow(cx: &mut gpui::TestAppContext) {
+        let (canvas, cx) = waiting_follow(41, cx);
+        canvas.update_in(cx, |canvas, window, cx| {
+            let event = ScrollEvent {
+                delta: gpui::ScrollDelta::Pixels(point(px(0.), px(40.))),
+                ..Default::default()
+            };
+            canvas.scroll(&event, window, cx);
+            assert!(
+                canvas
+                    .follow
+                    .as_ref()
+                    .is_some_and(|follow| !follow.recentre)
+            );
+            assert!(canvas.center_on.is_none());
         });
     }
 
