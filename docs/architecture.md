@@ -17,7 +17,6 @@ other: what two features share moves down a layer.
 | 2 | `control_client` | Every request to a managed control plane (spec 021): the organization's clusters, a cluster's detail and status, and a cluster's data token, with a control-plane token and never a graph token. DTOs checked against the control plane's pinned OpenAPI document. **No `gpui`** | Zed `http_client`, serde |
 | 2 | `oauth_client` | Studio as an OAuth public client (spec 016): a server's sign-in details, its sign-in service's metadata, PKCE, the loopback callback, the token endpoint. **No `gpui`** | Zed `http_client`, `smol`, `sha2` |
 | 2 | `model` | Model calls through OpenRouter (spec 019): a task's input and schema in, a typed answer out; the only crate that calls OpenRouter. Holds no key and reads no setting. **No `gpui`** | Zed `http_client`, `smol`, `schemars` |
-| 2 | `studio_telemetry` | Telemetry with consent (spec 018): the closed catalog of reports, the bounded queue every crate records into, the pending file, crash reports and the uploader to PostHog; the only requests for telemetry | `gpui`, `studio_settings`, `http_client`, `schemars` |
 | 2 | `gq_language` | Schema and query intelligence on `omnigraph-compiler`: parse, diagnostics, completion items, hover text, result-column types. **No `gpui`** | `omnigraph-compiler` |
 | 2 | `studio_ui` | Studio components on Zed's `ui`: the design system (`ds`: buttons, modals, the context menu forked from Zed's), state chips, write-outcome banners, empty and error states, text read as markdown | `ui`, `menu`, `theme`, `studio_theme`, `pulldown-cmark` |
 | 3 | `graph_store` | GPUI entities: connections, graph sessions, schema model, snapshot pins, exploration, drafts | `gpui`, `graph_client`, `gq_language`, Zed's `reqwest_client` and the `reqwest` it pins |
@@ -102,7 +101,11 @@ write that matched nothing, or a 412, reopens the draft.
   and the Activity and inspector toggles.
 - Each column's header is its panel's own (title and buttons).
 - Left dock: Data (the schema, node types and edge types with counts), Queries, Branches,
-  Conversations. Right dock: the inspector, one per tab. Bottom dock: Activity.
+  Conversations. Right dock: the inspector, which shows what the tab in front has selected
+  (spec 020). A tab says its selection changed (`ItemEvent::Selected`) and the workspace asks it
+  what is selected (`Item::inspected`) while the inspector is shown; it keeps one view per tab.
+  A new window shows the inspector, and only its toggle, ⌘⌥B or Space hides it. Bottom dock:
+  Activity.
 - Center: panes of tabs, each one view of one thing (type table, page, tree, canvas, map, source,
   query editor, review, history, commit), with a view strip to its thing's other views. Each pane's
   tab strip starts with its own Back and Forward.

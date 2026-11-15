@@ -30,7 +30,7 @@ const MOST_PROBLEMS: usize = 100;
 /// Settings Studio once had, by their keys from the document's root, and all that is under them.
 /// A person's file may still name them, and nothing they could do there is worth an error at
 /// every start, so they are not reported. Their text stays, as any other key's.
-const RETIRED: [&[&str]; 8] = [
+const RETIRED: [&[&str]; 9] = [
     &["agent", "command"],
     &["agent", "env"],
     &["agent", "ask_before_writes"],
@@ -39,6 +39,8 @@ const RETIRED: [&[&str]; 8] = [
     &["studio", "window_style"],
     &["studio", "corner_radius"],
     &["studio", "bottom_dock_layout"],
+    // 0.4.5's two telemetry choices (spec 018), which the status bar and Settings wrote here.
+    &["studio", "telemetry"],
 ];
 
 /// Whether a key that does nothing is, or is under, a setting Studio once had.
@@ -756,6 +758,22 @@ mod tests {
         }
     }
 
+    /// What 0.4.5 wrote when a person answered its usage notice or chose Always send (spec
+    /// 018) names settings Studio no longer has: no problem at start, and the text stays.
+    #[test]
+    fn the_telemetry_choices_an_earlier_studio_wrote_are_not_a_problem() {
+        let text = "{\n  \"studio\": {\n    \"telemetry\": {\"usage\": \"off\", \
+                    \"crash_reports\": \"always\"},\n    \"tree_page_size\": 60\n  }\n}";
+        let reading = read(text).unwrap();
+        assert!(reading.problems.is_empty(), "{:?}", reading.problems);
+        assert_eq!(reading.settings.studio.tree_page_size, 60);
+        let written = edited(text, |settings| settings.ui_font_size = 17.);
+        assert!(
+            written.contains("\"telemetry\": {\"usage\": \"off\", \"crash_reports\": \"always\"}"),
+            "{written}"
+        );
+    }
+
     #[test]
     fn a_retired_setting_is_matched_whole_from_the_root() {
         let keys = |keys: &[&str]| -> Vec<Step> {
@@ -764,6 +782,8 @@ mod tests {
         assert!(is_retired(&keys(&["studio", "window_style"])));
         assert!(is_retired(&keys(&["models", "fast"])));
         assert!(is_retired(&keys(&["agent", "env", "PATH"])));
+        assert!(is_retired(&keys(&["studio", "telemetry"])));
+        assert!(is_retired(&keys(&["studio", "telemetry", "usage"])));
         assert!(!is_retired(&keys(&["studio"])));
         assert!(!is_retired(&keys(&["studio", "window_styles"])));
         assert!(!is_retired(&keys(&["agent", "omnigraph_cli"])));

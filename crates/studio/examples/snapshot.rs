@@ -9,7 +9,7 @@
 //! the previous one settles. `type:<text>` types text into the focused editor (`\n` is a new
 //! line); it is `editor::HandleInput` with the text. `click:<x>,<y>` clicks at a point in
 //! window pixels (half the PNG's, which is drawn at 2x), with `,cmd` or `,shift` held when
-//! added and `,right` for the secondary button; `hover:<x>,<y>` moves the pointer there and rests; `key:<keystroke>` presses keys as the keymap sees them (`key:tab`, `key:cmd-4`);
+//! added, `,right` for the secondary button and `,double` for a double click; `hover:<x>,<y>` moves the pointer there and rests; `key:<keystroke>` presses keys as the keymap sees them (`key:tab`, `key:cmd-4`);
 //! `drag:<x1>,<y1>,<x2>,<y2>` presses at
 //! the first point, moves to the second in steps, and releases (`,shift` or `,cmd` held); `wait:<ms>` lets that long pass
 //! (for a write from outside to land between steps); `shot:<path>` saves the window as it
@@ -38,7 +38,10 @@
 //! as JSON. `run:<command>` runs a command and waits for it (another writer's commit);
 //! `head:<ms>` waits, at most that long, for the session's branch head to move. `SNAPSHOT_WAIT_MS` (default
 //! 1500) is how long to let each step's network work finish; `SNAPSHOT_SIZE` is
-//! `WIDTHxHEIGHT` (default 1440x900). Remembered tabs are not restored unless `OMNIGRAPH_STUDIO_NO_RESTORE=0`. The run
+//! `WIDTHxHEIGHT` (default 1440x900). `SNAPSHOT_WINDOW_BUTTONS` draws the window's own buttons
+//! as another platform's, which this one would leave to the system: `windows`, `linux` (all
+//! three at the right) or `linux-left` (close at the left, as some desktops lay them out).
+//! Remembered tabs are not restored unless `OMNIGRAPH_STUDIO_NO_RESTORE=0`. The run
 //! keeps its state in a fresh temporary directory unless `OMNIGRAPH_STUDIO_DATA` names one, so
 //! it neither reads nor writes the app's settings, tabs or conversations.
 
@@ -185,34 +188,36 @@ fn drag(
     }
 }
 
-/// A left click at `position`, as the platform delivers one: move, press, release.
+/// `clicks` clicks at `position`, as the platform delivers them: move, then a press and a
+/// release for each, the second of a double click counted as the second.
 fn click(
     cx: &mut HeadlessAppContext,
     handle: AnyWindowHandle,
     position: gpui::Point<gpui::Pixels>,
     modifiers: Modifiers,
     button: MouseButton,
+    clicks: usize,
 ) {
-    let events = [
-        PlatformInput::MouseMove(MouseMoveEvent {
-            position,
-            pressed_button: None,
-            modifiers: Modifiers::default(),
-        }),
-        PlatformInput::MouseDown(MouseDownEvent {
+    let mut events = vec![PlatformInput::MouseMove(MouseMoveEvent {
+        position,
+        pressed_button: None,
+        modifiers: Modifiers::default(),
+    })];
+    for click_count in 1..=clicks {
+        events.push(PlatformInput::MouseDown(MouseDownEvent {
             button,
             position,
             modifiers,
-            click_count: 1,
+            click_count,
             first_mouse: false,
-        }),
-        PlatformInput::MouseUp(MouseUpEvent {
+        }));
+        events.push(PlatformInput::MouseUp(MouseUpEvent {
             button,
             position,
             modifiers,
-            click_count: 1,
-        }),
-    ];
+            click_count,
+        }));
+    }
     for event in events {
         cx.update_window(handle, |_, window, cx| {
             window.dispatch_event(event, cx);
@@ -655,6 +660,31 @@ fn main() {
     // while a window is active (the branch-head poll) run.
     cx.update_window(handle, |_, window, _| window.activate_window())
         .expect("activate the snapshot window");
+    if let Ok(platform) = std::env::var("SNAPSHOT_WINDOW_BUTTONS") {
+        use gpui::{WindowButton, WindowButtonLayout};
+        use studio_ui::window_buttons::{RIGHT_SIDE, WindowButtons};
+        let buttons = match platform.as_str() {
+            "windows" => WindowButtons::Windows,
+            "linux" => WindowButtons::Linux(RIGHT_SIDE),
+            "linux-left" => WindowButtons::Linux(WindowButtonLayout {
+                left: [Some(WindowButton::Close), None, None],
+                right: [
+                    Some(WindowButton::Minimize),
+                    Some(WindowButton::Maximize),
+                    None,
+                ],
+            }),
+            other => panic!("SNAPSHOT_WINDOW_BUTTONS is windows, linux or linux-left: {other}"),
+        };
+        cx.update_window(handle, |_, window, cx| {
+            if let Some(workspace) = studio_workspace::workspace_for(window) {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.draw_window_buttons_as(buttons, cx)
+                });
+            }
+        })
+        .expect("draw the window's buttons");
+    }
     // `reads:<path>` measures the whole run, the start (until the schema is read) among it.
     let mut reads = actions
         .iter()
@@ -1008,14 +1038,29 @@ fn main() {
             } else {
                 MouseButton::Left
             };
+            let clicks = if parts.contains(&"double") { 2 } else { 1 };
             match reads.as_mut() {
                 Some(reads) if recorder.is_none() => {
                     let start = Reads::begin(&mut cx, handle);
-                    click(&mut cx, handle, point(px(x), px(y)), modifiers, button);
+                    click(
+                        &mut cx,
+                        handle,
+                        point(px(x), px(y)),
+                        modifiers,
+                        button,
+                        clicks,
+                    );
                     reads.step("click", start, &mut cx, handle, READS_CAP, |_| true);
                 }
                 _ => {
-                    click(&mut cx, handle, point(px(x), px(y)), modifiers, button);
+                    click(
+                        &mut cx,
+                        handle,
+                        point(px(x), px(y)),
+                        modifiers,
+                        button,
+                        clicks,
+                    );
                     rest(&mut cx, handle, &mut recorder, step_wait);
                 }
             }

@@ -867,7 +867,7 @@ impl CommitView {
 /// off every branch, what it is; it names the branch it was written on, which it is not on. A
 /// commit still being read (`pending`) says nothing yet, since its kind decides; one that could
 /// not be read is placed by its changes' cause, which names its authored branch.
-fn branch_fact(
+pub(crate) fn branch_fact(
     commit: Option<&CommitOutput>,
     cause: Option<&ChangeCauseOutput>,
     pending: bool,

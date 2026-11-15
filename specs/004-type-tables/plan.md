@@ -393,9 +393,11 @@ its open section.
 ### Editing
 
 - A cell cursor, as a spreadsheet's: a click puts it on a cell and the arrows move it, ringed
-  in the accent green with the scale's row corners (`ds::cell_cursor`). A click on a name also
-  peeks its row, as one on a value nobody may edit there does; a second click, or ↵, opens the
-  cell: a value's edit, a relationship's related rows. One overlay editor; Esc cancels, Tab
+  in the accent green with the scale's row corners (`ds::cell_cursor`). A click opens nothing,
+  in any column: the inspector shows the cursor's row while it is shown (spec 020; before
+  2026-11-13 a click on a name, or on a value nobody may edit there, peeked its row and opened
+  the inspector). A second click, or ↵, opens the cell: a value's edit, a node's page from its
+  key, a relationship's related rows. One overlay editor; Esc cancels, Tab
   moves to the next cell. (Before 2026-11-02 one click edited a value and opened a
   relationship, so the arrows had no cell to move from.)
 - A text that reads as markdown ends in ⤢ under the pointer, on the cursor's cell and in its

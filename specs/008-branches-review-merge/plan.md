@@ -117,7 +117,9 @@ place), X (designed on 0.13; the better routes are deferred).
     label, each entity a row with a dot of its kind, muted with a check once reviewed), and
     on the right the selected one as a record: the type and kind, the name as a heading, its
     id, the actions, then its property rows and relationships (which say what changed), ending in
-    "Reviewed, next" (⌘Y). J and K step through the list.
+    "Reviewed, next" (⌘Y). J and K step through the list. The inspector shows the node whose
+    card holds the selected change (spec 020, since 2026-11-14), read at the reviewed head, or
+    at the fork for a node the branch removes.
 - A property row is its name in a column, then its body (`studio_ui::property_row`,
   `TextFolds`): a short change reads before → after on one line (the old value struck
   through, muted); a text (over 72 characters, or with line breaks) reads line by line, a

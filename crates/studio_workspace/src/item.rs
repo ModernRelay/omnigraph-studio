@@ -15,6 +15,50 @@ pub enum ItemEvent {
     UpdateTab,
     /// The item asks to be closed.
     Close,
+    /// What the tab has selected changed, or nothing is selected now: the inspector follows
+    /// ([`Item::inspected`], spec 020).
+    Selected,
+}
+
+/// What a tab has selected, as the inspector shows it (spec 020).
+pub enum Inspected {
+    /// A view the tab made of what is selected: a table's row, with the values it holds. The
+    /// tab hands the same view back while the same thing is selected, so what is being edited
+    /// in it stays. `scrolls_itself` is true for a list that draws only what is in view.
+    View { view: AnyView, scrolls_itself: bool },
+    /// A node. Whoever shows nodes makes its view ([`crate::register_node_inspector`]), so a
+    /// tab of another crate needs only name it.
+    Node(InspectedNode),
+}
+
+/// Makes the inspector's view of a node a tab has selected, in the window's graph.
+pub type NodeInspector =
+    fn(&InspectedNode, &Entity<graph_store::GraphSession>, &mut App) -> AnyView;
+
+struct NodeInspectors(NodeInspector);
+
+impl gpui::Global for NodeInspectors {}
+
+/// Lets tabs name a node as their selection ([`Inspected::Node`]): `make` builds its view. The
+/// crate that shows nodes registers it once, so the tabs of other crates need not depend on it.
+pub fn register_node_inspector(cx: &mut App, make: NodeInspector) {
+    cx.set_global(NodeInspectors(make));
+}
+
+pub(crate) fn node_inspector(cx: &App) -> Option<NodeInspector> {
+    cx.try_global::<NodeInspectors>().map(|made| made.0)
+}
+
+/// A node a tab has selected: where it is read is the tab's own read context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InspectedNode {
+    pub type_name: String,
+    pub id: String,
+    /// The commit the tab is held at, which the inspector is held at too.
+    pub at_commit: Option<String>,
+    /// The commit the tab shows while it follows the head: the inspector reads there, as the
+    /// tab does, and offers Refresh when the branch has moved past it.
+    pub snapshot: Option<String>,
 }
 
 /// What a tab adds to the status bar (spec 002): a few facts after the graph and branch, as
@@ -83,6 +127,14 @@ pub trait Item: Render + Focusable + EventEmitter<ItemEvent> {
         None
     }
 
+    /// What the tab has selected, which the inspector shows (spec 020): `None` when nothing is.
+    /// Asked while the inspector is shown, when the tab says its selection changed
+    /// ([`ItemEvent::Selected`]) and when the tab comes to the front, so a hidden inspector
+    /// costs a tab nothing. It must not reach for the workspace, which is asking.
+    fn inspected(&mut self, _cx: &mut Context<Self>) -> Option<Inspected> {
+        None
+    }
+
     /// The item has unsaved work; closing asks first.
     fn is_dirty(&self, _cx: &App) -> bool {
         false
@@ -133,6 +185,7 @@ pub trait ItemHandle: 'static {
     fn thing(&self, cx: &App) -> Option<studio_actions::Thing>;
     fn views(&self, cx: &App) -> Vec<studio_actions::ViewLink>;
     fn view_action(&self, kind: studio_actions::ViewKind, cx: &App) -> Option<Box<dyn Action>>;
+    fn inspected(&self, cx: &mut App) -> Option<Inspected>;
     fn is_dirty(&self, cx: &App) -> bool;
     fn is_stale(&self, cx: &App) -> bool;
     fn focus_handle(&self, cx: &App) -> FocusHandle;
@@ -174,6 +227,10 @@ impl<T: Item> ItemHandle for Entity<T> {
 
     fn view_action(&self, kind: studio_actions::ViewKind, cx: &App) -> Option<Box<dyn Action>> {
         self.read(cx).view_action(kind, cx)
+    }
+
+    fn inspected(&self, cx: &mut App) -> Option<Inspected> {
+        self.update(cx, |item, cx| item.inspected(cx))
     }
 
     fn is_dirty(&self, cx: &App) -> bool {
