@@ -1056,13 +1056,22 @@ impl Connection {
         &self.client
     }
 
+    /// The graph ids the server itself named, in its listing or by discovery; `None` when it
+    /// said nothing of its graphs. It holds no id Studio only remembers, so what is said to be
+    /// on a server is what the server said.
+    pub fn listed_graph_ids(&self) -> Option<Vec<String>> {
+        match &self.graphs {
+            GraphListing::Listed(graphs) => {
+                Some(graphs.iter().map(|g| g.graph_id.clone()).collect())
+            }
+            GraphListing::Discovered(ids) => Some(ids.clone()),
+            GraphListing::Unknown | GraphListing::NotAllowed | GraphListing::Failed(_) => None,
+        }
+    }
+
     /// Graph ids to offer: the listed or discovered graphs, then known ids the listing lacks.
     pub fn graph_ids(&self) -> Vec<String> {
-        let mut ids: Vec<String> = match &self.graphs {
-            GraphListing::Listed(graphs) => graphs.iter().map(|g| g.graph_id.clone()).collect(),
-            GraphListing::Discovered(ids) => ids.clone(),
-            _ => Vec::new(),
-        };
+        let mut ids = self.listed_graph_ids().unwrap_or_default();
         for id in &self.server.known_graphs {
             if !ids.contains(id) {
                 ids.push(id.clone());
@@ -2470,6 +2479,36 @@ mod tests {
                 }
             });
         }
+    }
+
+    /// What a server is said to have is what it listed. A graph Studio only remembers, as one
+    /// asked for and not found, is still offered for opening, but is not named as the
+    /// server's. Before, the page for a missing graph listed that graph under "It has:".
+    #[gpui::test]
+    fn a_remembered_graph_is_offered_but_not_listed(cx: &mut TestAppContext) {
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: vec!["knowlege".into()],
+        };
+        let http = FakeHttpClient::with_404_response();
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        connection.update(cx, |connection, _| {
+            assert_eq!(connection.listed_graph_ids(), None, "nothing said yet");
+            assert_eq!(connection.graph_ids(), ["knowlege"]);
+
+            connection.graphs = GraphListing::Discovered(vec!["knowledge".into(), "notes".into()]);
+            assert_eq!(
+                connection.listed_graph_ids(),
+                Some(vec!["knowledge".to_owned(), "notes".to_owned()])
+            );
+            assert_eq!(connection.graph_ids(), ["knowledge", "notes", "knowlege"]);
+
+            connection.graphs = GraphListing::NotAllowed;
+            assert_eq!(connection.listed_graph_ids(), None);
+            assert_eq!(connection.graph_ids(), ["knowlege"]);
+        });
     }
 
     /// The answer of a token source the connection no longer takes its token from is not taken:
