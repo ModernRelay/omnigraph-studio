@@ -474,6 +474,9 @@ struct Follow {
     /// The walk's open paths as the follow's own opening left them: the walk opened or closed
     /// by anything else (a click, ⌫, a collapse of an ancestor) ends it.
     expected: HashSet<ExplorePath>,
+    /// The last node it reached (or started from), drawn: where it ends when the next would not
+    /// be drawn.
+    last: NodeRef,
     /// The view centres on each node reached until the person moves it (a scroll, a pinch, a
     /// pan, a zoom or a fit); the follow then goes on walking and leaves the view where it is.
     recentre: bool,
@@ -2841,8 +2844,8 @@ impl GraphCanvas {
         let Some(schema) = self.exploration.read(cx).schema() else {
             return;
         };
-        // The relationship, its field's path, and the node it starts from.
-        let (group, field, owner) = match (&node.kind, &node.path) {
+        // The relationship, its field's path, the node it starts from and that node's path.
+        let (group, field, last, owner) = match (&node.kind, &node.path) {
             (SceneKind::Hub { key, .. }, Some(path))
                 if graph_store::is_field(&schema, &key.group) =>
             {
@@ -2850,7 +2853,7 @@ impl GraphCanvas {
                     .parent
                     .and_then(|parent| self.scene.nodes.get(parent))
                     .and_then(|parent| parent.path.clone());
-                (key.group.clone(), path.clone(), owner)
+                (key.group.clone(), path.clone(), key.node.clone(), owner)
             }
             // A node reached through a single-target relationship goes on along it, when its
             // type has that relationship too (a manager's manager, not a person's employer's).
@@ -2867,7 +2870,12 @@ impl GraphCanvas {
                 ] if graph_store::is_field(&schema, group)
                     && continues(&schema, group, graph_node) =>
                 {
-                    (group.clone(), path.child_group(group), Some(path.clone()))
+                    (
+                        group.clone(),
+                        path.child_group(group),
+                        graph_node.clone(),
+                        Some(path.clone()),
+                    )
                 }
                 _ => return,
             },
@@ -2880,6 +2888,7 @@ impl GraphCanvas {
             hops: 0,
             root: self.exploration.read(cx).root().cloned(),
             expected: HashSet::new(),
+            last,
             recentre: true,
         });
         self.open_for_follow(&opens, cx);
@@ -2957,7 +2966,23 @@ impl GraphCanvas {
         let cycle = entries
             .iter()
             .any(|entry| entry.path == node_path && matches!(entry.kind, EntryKind::Cycle { .. }));
+        // The walk is read uncapped and drawn capped (`canvas_max_nodes`): a target the
+        // scene would leave out is not followed to. The follow ends at the last node drawn,
+        // and the cap's banner says what is not drawn.
         let id = SceneId::Node(target.node.clone());
+        let (drawn, full) = self.explore_scene(cx).map_or((false, true), |scene| {
+            (
+                scene.nodes.iter().any(|node| node.id == id),
+                scene.nodes.len() >= scene.cap,
+            )
+        });
+        if !drawn {
+            if follow.recentre {
+                self.center_on = Some(SceneId::Node(follow.last.clone()));
+            }
+            self.follow = None;
+            return;
+        }
         if follow.recentre {
             self.center_on = Some(id);
         }
@@ -2968,7 +2993,7 @@ impl GraphCanvas {
             .read(cx)
             .schema()
             .is_some_and(|schema| continues(&schema, &follow.group, &target.node));
-        if cycle || !goes_on || follow.hops + 1 >= FOLLOW_MAX {
+        if cycle || !goes_on || full || follow.hops + 1 >= FOLLOW_MAX {
             self.follow = None;
             return;
         }
@@ -2976,6 +3001,7 @@ impl GraphCanvas {
         self.follow = Some(Follow {
             field: next.clone(),
             hops: follow.hops + 1,
+            last: target.node.clone(),
             ..follow
         });
         self.open_for_follow(&[node_path, next], cx);
@@ -4797,6 +4823,66 @@ mod tests {
                     .is_some_and(|follow| !follow.recentre)
             );
             assert!(canvas.center_on.is_none());
+        });
+    }
+
+    /// A follow reads no further than the canvas draws: with the node cap at 12, it ends at the
+    /// last person drawn, and opens nobody the scene leaves out. Before, it checked its hops
+    /// against the walk, which is read uncapped, and went on through all 41 people.
+    #[gpui::test]
+    async fn a_follow_ends_at_the_last_node_the_cap_draws(cx: &mut gpui::TestAppContext) {
+        let session = chain_session(41, cx);
+        cx.update(|cx| {
+            let mut settings = StudioSettings::default();
+            settings.studio.canvas_max_nodes = 12;
+            cx.set_global(settings);
+        });
+        let (canvas, cx) = cx.add_window_view(|_, cx| {
+            GraphCanvas::new(session, NodeRef::new("Person", "p1"), None, cx)
+        });
+        settle(cx);
+        canvas.update_in(cx, |canvas, _, cx| {
+            let hub = canvas
+                .scene
+                .nodes
+                .iter()
+                .position(|node| matches!(node.kind, SceneKind::Hub { .. }))
+                .expect("p1's manager pill");
+            canvas.start_follow(hub, cx);
+        });
+        for _ in 0..60 {
+            settle(cx);
+            if canvas.read_with(cx, |canvas, _| canvas.follow.is_none()) {
+                break;
+            }
+        }
+        canvas.update_in(cx, |canvas, _, cx| canvas.lay_out_owed(cx));
+        settle(cx);
+        canvas.read_with(cx, |canvas, cx| {
+            assert!(canvas.follow.is_none(), "the follow ended");
+            let drawn: HashSet<NodeRef> = canvas
+                .scene
+                .nodes
+                .iter()
+                .filter_map(|node| match &node.kind {
+                    SceneKind::Node { node, .. } => Some(node.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert!(canvas.scene.nodes.len() <= 12, "under the cap");
+            let opened: Vec<NodeRef> = canvas
+                .exploration
+                .read(cx)
+                .state()
+                .expanded
+                .iter()
+                .filter(|path| path.ends_at_node() && !path.is_root())
+                .filter_map(|path| path.nodes().last().cloned())
+                .collect();
+            assert!(!opened.is_empty(), "it walked");
+            for node in &opened {
+                assert!(drawn.contains(node), "{node:?} was opened, not drawn");
+            }
         });
     }
 
