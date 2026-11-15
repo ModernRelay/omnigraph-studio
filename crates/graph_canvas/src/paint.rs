@@ -68,7 +68,7 @@ fn line_height(text_size: f32) -> f32 {
     text_size * 1.4
 }
 /// A chip's padding above and below its lines, at zoom 1.
-const PILL_PAD_Y: f32 = 4.;
+const PILL_PAD_Y: f32 = studio_ui::ds::space::XS;
 /// The widest an opened chip grows at zoom 1 before its name wraps: an email or an id of 40
 /// characters stays on one line.
 const OPEN_CHIP_MAX_WIDTH: f32 = 320.;
@@ -1118,7 +1118,7 @@ fn open_chip_layout(
     let (gap, pad_x, mark_size) = (PILL_GAP * s, PILL_PAD_X * s, PILL_MARK * s);
     let line_height = text_size * 1.4;
     // The pill's padding above and below its one line.
-    let pad_y = 4. * s;
+    let pad_y = PILL_PAD_Y * s;
     let widest = OPEN_CHIP_MAX_WIDTH * s - pad_x * 2. - mark_size - gap;
     let run = TextRun {
         len: label.len(),
@@ -1180,7 +1180,7 @@ fn paint_open_chip(
     let s = text_size / CHIP_TEXT;
     let (gap, pad_x, mark_size) = (PILL_GAP * s, PILL_PAD_X * s, PILL_MARK * s);
     let line_height = text_size * 1.4;
-    let pad_y = 4. * s;
+    let pad_y = PILL_PAD_Y * s;
     let radius = studio_ui::ds::radii(cx).sm * s;
     paint_chip_body(rect, radius, &style, window);
     // The mark stays where the chip had it, beside the first line.
