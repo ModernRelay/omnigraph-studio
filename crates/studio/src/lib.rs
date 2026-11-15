@@ -14,7 +14,6 @@ mod menus;
 mod open_graph;
 mod organizations;
 mod settings_view;
-mod telemetry_status;
 mod update_status;
 
 use std::collections::HashSet;
@@ -47,10 +46,7 @@ pub fn init(cx: &mut App) {
     studio_workspace::models::Models::init(cx);
     // After `graph_store`, whose HTTP client it sends through (spec 017).
     studio_update::init(cx);
-    // After `graph_store`, whose HTTP client it sends through, and before any window, so a
-    // crash report the last run left is offered at once (spec 018).
-    studio_telemetry::init(cx);
-    init_telemetry_actions(cx);
+    forget_telemetry(cx);
     keymaps::load(cx);
 
     command_palette::init(cx);
@@ -192,21 +188,6 @@ pub fn init(cx: &mut App) {
                 cx,
             );
         }
-        if let Some(telemetry) = studio_telemetry::Telemetry::global(cx) {
-            let crash = cx.new(|cx| telemetry_status::CrashStatus::new(telemetry.clone(), cx));
-            let asked = telemetry.clone();
-            workspace.add_status_item(
-                crash.into(),
-                move |cx| telemetry_status::offers_a_crash_report(&asked, cx),
-                cx,
-            );
-            let usage = cx.new(|cx| telemetry_status::UsageStatus::new(telemetry.clone(), cx));
-            workspace.add_status_item(
-                usage.into(),
-                move |cx| telemetry_status::asks_about_usage(&telemetry, cx),
-                cx,
-            );
-        }
         // GPUI's frame-time overlay exists only with its `profiler` feature, which the `perf`
         // feature turns on: frame times, then their distribution, then hidden again. Another
         // build offers no such action, in the palette or on its key.
@@ -309,117 +290,71 @@ pub fn window_options(bounds: Option<gpui::Bounds<gpui::Pixels>>, cx: &App) -> W
 /// plane's token when the sign-in is held.
 const KEPT_SIGN_IN_PATIENCE: Duration = Duration::from_secs(5);
 
+/// Deletes what telemetry kept on this machine while Studio had it (0.4.5, spec 018): the
+/// reports waiting to be sent, the list of those sent and its crash reports. Studio sends none
+/// of it now, so nothing would ever read it. Off the main thread, and at every start: an older
+/// Studio run again writes them again.
+fn forget_telemetry(cx: &App) {
+    let data = studio_settings::data_dir();
+    cx.background_spawn(async move { remove_telemetry_files(&data) })
+        .detach();
+}
+
+/// The one file of the `telemetry` folder that stays: the install ID of a person who chose to
+/// be counted across runs. The reports already sent under it are found by it alone, so it is
+/// theirs to quote when they ask for those reports or their deletion (`docs/privacy.md`).
+/// Studio no longer reads it.
+const INSTALL_ID_FILE: &str = "install-id";
+
+/// Removes all that is in the `telemetry` folder of Studio's data folder but
+/// [`INSTALL_ID_FILE`], then the folder when it is empty, and nothing beside it. No folder is
+/// not a failure; what cannot be removed is logged, since Studio uses none of it.
+fn remove_telemetry_files(data_dir: &std::path::Path) {
+    let dir = data_dir.join("telemetry");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        if entry.file_name() == INSTALL_ID_FILE {
+            continue;
+        }
+        let path = entry.path();
+        // A link is removed as a file, never followed.
+        let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
+        let result = if is_dir {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        match result {
+            Ok(()) => removed += 1,
+            Err(error) => log::warn!("{} could not be removed: {error}", path.display()),
+        }
+    }
+    // Gone when nothing is left in it; with an install ID in it, it stays.
+    std::fs::remove_dir(&dir).ok();
+    if removed > 0 {
+        log::info!("removed the telemetry files an earlier Studio kept");
+    }
+}
+
 /// Opens Studio's windows: one for `OMNIGRAPH_STUDIO_GRAPH` when it is set, else every window
 /// the last run had open with a graph on a target the CLI still lists at its address, or on a
 /// managed cluster of a control plane Studio holds, each where it was, else one window asking
 /// for a graph. The CLI's targets are listed off the main thread
 /// ([`ConnectionRegistry::when_listed`]), so the saved windows open at once, where they were,
 /// and take their graphs once the targets are listed.
-/// Records Studio's start, with how many windows it restored, while usage is shared.
-fn record_start(windows_restored: usize, cx: &App) {
-    let first_start_of_version = studio_telemetry::Telemetry::global(cx)
-        .is_some_and(|telemetry| telemetry.read(cx).first_start_of_version());
-    studio_telemetry::record(studio_telemetry::Event::AppStarted {
-        first_start_of_version,
-        windows_restored: studio_telemetry::CountBucket::of(windows_restored as u64),
-    });
-}
-
-/// The palette's telemetry actions (spec 018): app-wide, as Settings and the status bar offer
-/// the same choices.
-fn init_telemetry_actions(cx: &mut App) {
-    use studio_actions::telemetry::{
-        ChooseUsageSharing, ResetTelemetryId, SendCrashReport, ViewTelemetryLog, WhatStudioSends,
-    };
-    cx.on_action(|_: &WhatStudioSends, cx| cx.open_url(telemetry_status::WHAT_STUDIO_SENDS));
-    // Choosing from the palette opens Settings at the choice; the status bar asks in place.
-    cx.on_action(|_: &ChooseUsageSharing, cx| {
-        cx.defer(|cx| {
-            if let Some(handle) = link_window(cx).and_then(|w| w.downcast::<Workspace>()) {
-                handle
-                    .update(cx, |workspace, window, cx| {
-                        open_settings(workspace, window, cx)
-                    })
-                    .ok();
-            }
-        });
-    });
-    cx.on_action(|_: &SendCrashReport, cx| {
-        if let Some(telemetry) = studio_telemetry::Telemetry::global(cx) {
-            telemetry.update(cx, |telemetry, cx| telemetry.send_crashes(cx));
-        }
-    });
-    cx.on_action(|_: &ResetTelemetryId, cx| {
-        if let Some(telemetry) = studio_telemetry::Telemetry::global(cx) {
-            telemetry.update(cx, |telemetry, cx| telemetry.reset_id(cx));
-        }
-    });
-    // The log as JSON in a file, opened in the system's viewer: every report held and every one
-    // sent in the last 7 days. Written off the main thread.
-    cx.on_action(|_: &ViewTelemetryLog, cx| {
-        let Some(telemetry) = studio_telemetry::Telemetry::global(cx) else {
-            return;
-        };
-        let telemetry = telemetry.read(cx);
-        let log = telemetry.log();
-        let file = telemetry.store().dir().join("log.json");
-        cx.spawn(async move |cx| {
-            let written = cx
-                .background_spawn({
-                    let file = file.clone();
-                    async move {
-                        if let Some(dir) = file.parent() {
-                            std::fs::create_dir_all(dir)?;
-                        }
-                        let text =
-                            serde_json::to_vec_pretty(&log).map_err(std::io::Error::other)?;
-                        studio_settings::write_atomic(
-                            &file,
-                            &text,
-                            studio_settings::Access::Private,
-                        )
-                    }
-                })
-                .await;
-            cx.update(|cx| match written {
-                Ok(()) => cx.open_with_system(&file),
-                Err(error) => tell(
-                    cx,
-                    ToastKind::Error,
-                    format!("The telemetry log could not be written: {error}"),
-                ),
-            });
-        })
-        .detach();
-    });
-    studio_actions::offered::when::<SendCrashReport>(
-        |cx| {
-            studio_telemetry::Telemetry::global(cx)
-                .is_some_and(|telemetry| !telemetry.read(cx).waiting_crashes().is_empty())
-        },
-        cx,
-    );
-    studio_actions::offered::when::<ResetTelemetryId>(
-        |cx| {
-            studio_telemetry::Telemetry::global(cx)
-                .is_some_and(|telemetry| telemetry.read(cx).store().has_install_id())
-        },
-        cx,
-    );
-}
-
 pub fn open_windows(cx: &mut App) {
     if environment_graph(cx).is_some() {
         // A run for the environment's graph opens that alone, and keeps the windows the last
         // ordinary run saved for the next one.
         studio_workspace::keep_saved_windows(cx);
-        record_start(0, cx);
         cx.open_window(window_options(None, cx), build_workspace)
             .ok();
         return;
     }
     let saved = studio_workspace::load_windows();
-    record_start(saved.len(), cx);
     if saved.is_empty() {
         cx.open_window(window_options(None, cx), build_workspace)
             .ok();
@@ -1890,6 +1825,69 @@ mod tests {
             "{said}"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// What 0.4.5's telemetry kept is removed (spec 018, removed): its queue, its list of
+    /// reports sent, its markers and a crash report, and the folder with them. What is beside
+    /// the folder stays, and a data folder that never had one is left as it is.
+    #[test]
+    fn the_telemetry_files_an_earlier_studio_kept_are_removed() {
+        let data = std::env::temp_dir().join(format!("studio-no-telemetry-{}", std::process::id()));
+        std::fs::remove_dir_all(&data).ok();
+        let telemetry = data.join("telemetry");
+        std::fs::create_dir_all(telemetry.join("crashes")).unwrap();
+        for file in [
+            "pending.jsonl",
+            "sent.jsonl",
+            "last-start",
+            "crashes/one.json",
+        ] {
+            std::fs::write(telemetry.join(file), "{}").unwrap();
+        }
+        std::fs::write(data.join("settings.json"), "{}").unwrap();
+
+        remove_telemetry_files(&data);
+        assert!(!telemetry.exists(), "the folder and all in it");
+        assert!(data.join("settings.json").is_file(), "nothing beside it");
+
+        // Again, with no folder: nothing to do, and nothing made.
+        remove_telemetry_files(&data);
+        assert!(!telemetry.exists());
+        std::fs::remove_dir_all(&data).ok();
+    }
+
+    /// An install ID is the one thing that stays, with its folder: the person chose it, and it
+    /// is what finds the reports sent under it, should they ask for them.
+    #[test]
+    fn an_install_id_stays_where_the_person_can_find_it() {
+        let data = std::env::temp_dir().join(format!("studio-install-id-{}", std::process::id()));
+        std::fs::remove_dir_all(&data).ok();
+        let telemetry = data.join("telemetry");
+        std::fs::create_dir_all(telemetry.join("crashes")).unwrap();
+        let id = "0b9f6c1e-3f0a-4c58-9d0e-1c2b3a4d5e6f";
+        std::fs::write(telemetry.join(INSTALL_ID_FILE), id).unwrap();
+        for file in [
+            "pending.jsonl",
+            "sent.jsonl",
+            "log.json",
+            "crashes/one.json",
+        ] {
+            std::fs::write(telemetry.join(file), "{}").unwrap();
+        }
+
+        remove_telemetry_files(&data);
+        let left: Vec<_> = std::fs::read_dir(&telemetry)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(left, [INSTALL_ID_FILE], "the ID alone");
+        assert_eq!(
+            std::fs::read_to_string(telemetry.join(INSTALL_ID_FILE)).unwrap(),
+            id,
+            "as it was written"
+        );
+        std::fs::remove_dir_all(&data).ok();
     }
 
     /// Studio's header strips are where a title bar would be, and the workspace moves the window

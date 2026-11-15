@@ -171,7 +171,10 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
   frame. Chip widths come from character widths kept per canvas (GPUI's app-level
   `layout_width` shapes each character anew). Reads that finish together (a node's counts)
   arrive as one `ExplorationEvent::Loaded` within 8 ms and are laid out once; answers for
-  closed relationships (read ahead on hover) lay out nothing.
+  closed relationships (read ahead on hover) lay out nothing. The exploration takes the
+  answers that landed together in one update, and flattens the walk once for them, not once
+  an answer (since 2026-11-14; before, Expand all on 143 nodes of a dense graph flattened it
+  for each of about 2,000 counts, and froze Studio for 15 s).
 - **Reading ahead:** when the pointer rests on a closed node or relationship pill for 120 ms,
   what opening it will show is read without opening it (`Exploration::prefetch`): a node's
   relationship counts and single-target fields, a relationship's first neighbours, or its
@@ -196,6 +199,16 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
   A chip placed by hand adds "Let the layout place it". A right click on a marked chip, with
   several marked, acts on all of them: Expand all, Collapse all, Keep where they are, Let the
   layout place them, Clear selection. On empty space: Fit to window, Select all, Reset layout.
+- **Expand all asks past a size** (since 2026-11-14). An Expand all that opens more than 50
+  nodes, or asks more than 500 reads not held already (`EXPAND_NODES_WITHOUT_ASKING`,
+  `EXPAND_READS_WITHOUT_ASKING`, measured by `Exploration::opening`), asks first: "Expand 143
+  nodes?", what it asks of the server, and the action's own button; ↵ expands, Esc does not
+  (`studio_workspace::confirm`, constitution VII). The tree's Expand all asks by the same
+  measure, which one node rarely reaches. A canvas of hundreds of open nodes is a hairball,
+  and each node opened is a count of each of its relationships.
+- **A new node name** (Show as, or Settings' Node names) renames the chips in place: every
+  chip, mark and place stays, and one read per type names the nodes held (spec 002, "Node
+  names"; since 2026-11-14).
 
 ## Deferred
 
@@ -206,6 +219,10 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
 ## Validation log
 
 | Date | Claim | Check | Result |
+|---|---|---|---|
+| 2026-11-14 | Expand all on many nodes no longer freezes Studio: answers that land together are taken in one update, the walk flattened once for them | `graph_store` `counts_landing_together_are_taken_in_one_walk` (140 nodes opened, 2,800 counts in 40 reads; walks counted in `Flattened::entries`), failing with the change undone; then `script/measure-expand-all` against `script/dense-server` (17,000 nodes, 119,516 edges, 5 node types, 30 edge types): a canvas at Topic `topic-00325`, three rounds of ⌘A and Expand all to 146 nodes, then Expand all on the 137 not open, timed by the read ledger (spec 030). Linux 4.19 under gVisor (`nproc` 2), lavapipe, `release-fast`; a debug `omnigraph-server` 0.15.1 on the same box, no added latency | Test: 2,801 walks and 2,800 `Loaded` events before, 3 and 2 after; 55.8 s to 9.3 s in a debug build. The scenario, main at `5c5c8ad` (three runs): 1,833 asked, 70 sent, the first answer shown at 12,407, 12,327 and 12,123 ms, the last at 12,919, 12,970 and 12,576 ms. This branch (two runs, from the question's Expand button): 1,831 asked, 68 sent (the two head reads fell in the click's step), first and last answer at 595 and 592 ms. The requests are the same; the 12 s were the main thread flattening the walk once for each of 1,763 counts. Each answer's check of whether it shows asks an index of what is open, made once a batch, not every expanded path |
+| 2026-11-14 | An Expand all past 50 nodes or 500 reads asks first | `graph_store` `expanding_many_nodes_is_asked_first` (140 nodes: 2,800 reads, asked, "Expand 140 nodes?"; 10 nodes: 200, not; one node and every relationship: 40; the open root: none); `studio_workspace` `a_question_runs_its_action_only_once_agreed` (Esc runs nothing, ↵ runs it once); the dense scenario's frame of the question | Pass. On the dense graph's 137 nodes it asks "Expand 137 nodes?" for 1,773 reads; the tree's Expand all on one node reaches neither bound (a Person of the personal graph, 92 groups, is at most 184 reads) |
+| 2026-11-14 | A new node name renames the canvas in place | Offscreen frames every 200 ms through `script/latency-proxy.py` (700 ms a request) on the dense graph: the canvas at `topic-00325` opened two rounds (8 nodes, some marked), then `graphs.<key>.labels` set to `{"Topic": "category"}` in the settings file; main against this branch | Before: at +0.4 s the canvas was one chip, the root named by its key ("1 node", a read running); at +1.0 s 7 nodes in another layout, marks gone and the view moved; 8 nodes at +1.6 s, settled at 2.6 s. After: the 8 chips, their marks and places stay; one read runs at +0.2 s and at +0.8 s the topics are named by category in place ("Branch Retrieval" reads "method"; the root, whose category is empty, by its key). Only chips whose name changed width move |
 | 2026-11-01 | A hub appears only once counted and non-empty | `graph_canvas` `model` tests (`a_single_target_hub_reached_twice_is_open_by_either_path` with counts, `the_cap_counts_relationships_and_each_node_once` counting only drawn hubs) | Pass. Ragnor's call: hubs that appeared and then went as their counts came in empty were noise |
 |---|---|---|---|
 | 2026-11-01 | A canvas walks from one node; a set goes to a tree | `graph_canvas` tests; an offscreen snapshot of a walk opened from a selected tree row | Spec 020 removes drawing a table's rows, which was a grid of unconnected chips. A query's picture is Graph, and only when its result links |

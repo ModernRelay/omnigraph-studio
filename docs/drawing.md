@@ -69,6 +69,7 @@ the interaction and asserts the count:
 | `query_editor` `a_wide_result_draws_only_the_columns_in_view` | A 60-column result draws the columns in view and one gap for the rest, as wide as they are; scrolled to the end, the last |
 | `query_editor` `typing_in_the_query_leaves_the_results_as_they_were` | The result area follows the tab's `notify`; typing in the query does not draw it |
 | `query_editor` `typing_leaves_the_problems_as_they_were` | The problems strip is a cached view of its own; typing that leaves the problems unchanged does not draw it |
+| `graph_store` `counts_landing_together_are_taken_in_one_walk` | Expand all on 140 nodes asks 2,800 counts in 40 reads; the walk is flattened at most once a read and views hear at most one `Loaded` a read (3 walks and 2 events measured; 2,801 and 2,800 before) |
 | `studio_workspace` `a_tab_that_caches_its_parts_keeps_them_while_a_field_changes` | A tab that caches its parts keeps them while a field changes; a cached tab draws them again, which is the GPUI behavior the opt-out exists for |
 
 Draw counts are exact, so they run in CI. Times are not: the machine's load moves them several

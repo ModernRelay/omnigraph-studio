@@ -323,6 +323,19 @@ impl SchemaModel {
                 .eq(other.nodes.iter().map(NodeType::label_property))
     }
 
+    /// The node types this schema names by another property than `was` does (spec 002, "Node
+    /// names"): the types whose nodes' names a view built under `was` shows wrongly here. For
+    /// two schemas of the same text; a type `was` lacks counts as named otherwise.
+    pub fn renamed_since(&self, was: &SchemaModel) -> std::collections::BTreeSet<String> {
+        self.nodes
+            .iter()
+            .filter(|node| {
+                was.node(&node.name).map(NodeType::label_property) != Some(node.label_property())
+            })
+            .map(|node| node.name.clone())
+            .collect()
+    }
+
     /// [`Self::same_as`] for two schemas a view may hold, either absent: none is the same as
     /// none, and the same model is the same without comparing it.
     pub fn same_held(a: Option<&std::sync::Arc<Self>>, b: Option<&std::sync::Arc<Self>>) -> bool {
