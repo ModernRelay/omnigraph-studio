@@ -374,33 +374,10 @@ pub struct Opening {
 }
 
 impl Opening {
-    /// Whether it is past what is opened without asking.
+    /// Whether it is past what is opened without asking. The view words the question
+    /// (`studio_workspace::confirm_expand`).
     pub fn asks(&self) -> bool {
         self.nodes > EXPAND_NODES_WITHOUT_ASKING || self.reads > EXPAND_READS_WITHOUT_ASKING
-    }
-
-    /// What a view asks before it opens this: a title, what it costs, and the action's label.
-    pub fn question(&self) -> (String, String, String) {
-        let reads = match self.reads {
-            1 => "1 read".to_owned(),
-            n => format!("{} reads", studio_ui::group_digits(n)),
-        };
-        if self.nodes == 0 {
-            return (
-                "Open these relationships?".to_owned(),
-                format!("Opening them asks the server for {reads}, and shows what they hold."),
-                "Open".to_owned(),
-            );
-        }
-        let nodes = studio_ui::group_digits(self.nodes);
-        (
-            format!("Expand {nodes} nodes?"),
-            format!(
-                "Each node shows its relationships: that asks the server for {reads}, and \
-                 draws a hub for every relationship with neighbours."
-            ),
-            format!("Expand {nodes} nodes"),
-        )
     }
 }
 
@@ -5439,16 +5416,6 @@ mod tests {
                 }
             );
             assert!(all.asks());
-            assert_eq!(
-                all.question(),
-                (
-                    "Expand 140 nodes?".to_owned(),
-                    "Each node shows its relationships: that asks the server for 2,800 reads, \
-                     and draws a hub for every relationship with neighbours."
-                        .to_owned(),
-                    "Expand 140 nodes".to_owned(),
-                )
-            );
             let few = exploration.opening(&people[..10], false);
             assert_eq!(
                 few,

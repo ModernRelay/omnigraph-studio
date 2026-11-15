@@ -53,7 +53,7 @@ use studio_ui::window_buttons::{self, WindowButtons};
 use ui::prelude::*;
 use ui::{ButtonLike, PopoverMenu, right_click_menu};
 
-pub use confirm::{Confirm, confirm};
+pub use confirm::{Confirm, confirm, confirm_expand};
 use item::ItemHandle;
 pub use item::{
     Inspected, InspectedNode, Item, ItemEvent, ItemStatus, KeyHint, NodeInspector,
