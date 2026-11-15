@@ -441,8 +441,6 @@ mod tests {
                 "studio.health_check_seconds",
                 "studio.show_performance",
                 "studio.auto_update",
-                "studio.telemetry.crash_reports",
-                "studio.telemetry.usage",
                 "omnigraph_cli",
                 "omnigraph_cloud",
                 "agent.command",
@@ -460,7 +458,6 @@ mod tests {
                 "Browsing",
                 "Connection",
                 "Updates",
-                "Privacy",
                 "Omnigraph Cloud",
                 "Agent",
                 "Models"

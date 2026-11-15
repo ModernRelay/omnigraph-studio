@@ -1,0 +1,86 @@
+// A dense knowledge graph for measuring Studio on many relationship groups at once
+// (script/dense-graph.py writes its rows, script/dense-server serves it as `dense`).
+// Five node types and thirty edge types: Topic and Artifact have 14 relationship groups each,
+// Mention and Person 11, Org 10. Every edge is many-to-many except FoundIn and SpokenBy, which
+// a Mention has at most one of.
+
+node Topic {
+  slug: String @key
+  name: String
+  summary: String?
+  category: String?
+}
+
+node Artifact {
+  slug: String @key
+  title: String
+  summary: String?
+  url: String?
+}
+
+node Mention {
+  slug: String @key
+  title: String
+  quote: String?
+  context: String?
+}
+
+node Person {
+  slug: String @key
+  name: String
+  headline: String?
+  bio: String?
+}
+
+node Org {
+  slug: String @key
+  name: String
+  domain: String?
+  description: String?
+}
+
+// Topic -> Topic
+edge Broader: Topic -> Topic @card(0..)
+edge RelatedTo: Topic -> Topic @card(0..)
+edge Contrasts: Topic -> Topic @card(0..)
+
+// Artifact -> Topic
+edge AboutTopic: Artifact -> Topic @card(0..)
+edge IntroducesTopic: Artifact -> Topic @card(0..)
+edge CritiquesTopic: Artifact -> Topic @card(0..)
+
+// Artifact -> Artifact
+edge Cites: Artifact -> Artifact @card(0..)
+edge Extends: Artifact -> Artifact @card(0..)
+edge RespondsTo: Artifact -> Artifact @card(0..)
+
+// Artifact -> Person, Org
+edge AuthoredBy: Artifact -> Person @card(0..)
+edge EditedBy: Artifact -> Person @card(0..)
+edge PublishedBy: Artifact -> Org @card(0..)
+
+// Mention -> Artifact
+edge FoundIn: Mention -> Artifact @card(0..1)
+edge QuotesArtifact: Mention -> Artifact @card(0..)
+
+// Mention -> Topic, Person, Org, Mention
+edge MentionsTopic: Mention -> Topic @card(0..)
+edge SupportsTopic: Mention -> Topic @card(0..)
+edge MentionsPerson: Mention -> Person @card(0..)
+edge SpokenBy: Mention -> Person @card(0..1)
+edge MentionsOrg: Mention -> Org @card(0..)
+edge Echoes: Mention -> Mention @card(0..)
+edge Contradicts: Mention -> Mention @card(0..)
+
+// Person -> Org, Person, Topic
+edge WorksAt: Person -> Org @card(0..)
+edge AdvisesOrg: Person -> Org @card(0..)
+edge FoundedOrg: Person -> Org @card(0..)
+edge Knows: Person -> Person @card(0..)
+edge ExpertIn: Person -> Topic @card(0..)
+edge FollowsTopic: Person -> Topic @card(0..)
+
+// Org -> Org, Topic
+edge SubsidiaryOf: Org -> Org @card(0..)
+edge PartnersWith: Org -> Org @card(0..)
+edge FocusesOn: Org -> Topic @card(0..)
