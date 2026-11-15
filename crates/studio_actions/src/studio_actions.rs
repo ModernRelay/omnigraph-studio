@@ -161,6 +161,14 @@ pub mod workspace {
             /// Read the open graph's schema, branches and counts again, and the view in
             /// focus.
             Refresh,
+            /// Make text one size larger, in the interface and the query editor, and keep it:
+            /// zoom in. Rows, columns and panels keep their size.
+            IncreaseFontSize,
+            /// Make text one size smaller, in the interface and the query editor, and keep
+            /// it: zoom out. Rows, columns and panels keep their size.
+            DecreaseFontSize,
+            /// Put the interface's and the query editor's text back at their default sizes.
+            ResetFontSize,
         ]
     );
 
@@ -962,25 +970,6 @@ pub mod update {
             DownloadUpdate,
             /// Open the release notes of the update, or of this version.
             ViewReleaseNotes,
-        ]
-    );
-}
-pub mod telemetry {
-    use gpui::actions;
-
-    actions!(
-        studio_telemetry,
-        [
-            /// Show every telemetry report Studio holds, and every one sent in the last 7 days.
-            ViewTelemetryLog,
-            /// Choose whether to share anonymous usage data.
-            ChooseUsageSharing,
-            /// Show the report of the crash Studio had, to send it or not.
-            SendCrashReport,
-            /// Replace the random ID Studio sends with usage data by a new one.
-            ResetTelemetryId,
-            /// Open the list of everything Studio may send.
-            WhatStudioSends,
         ]
     );
 }

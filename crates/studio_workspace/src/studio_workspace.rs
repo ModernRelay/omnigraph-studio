@@ -7,6 +7,7 @@
 //! Studio rather than forked: Studio has no projects, collaboration or Zed database. Feature
 //! crates attach to it with `cx.observe_new::<Workspace>` and `Workspace::register_action`.
 
+mod confirm;
 mod item;
 pub mod models;
 mod open_failure;
@@ -33,7 +34,7 @@ use graph_store::{
 };
 use studio_actions::graph::{
     OpenAsCanvas, OpenAsHistory, OpenAsMap, OpenAsPage, OpenAsReview, OpenAsSource, OpenAsTable,
-    OpenAsTree, OpenCommit, OpenHistory,
+    OpenAsTree, OpenBranchHistory, OpenCommit,
 };
 use studio_actions::workspace::OpenViewAt;
 use studio_actions::workspace::{
@@ -52,6 +53,7 @@ use studio_ui::window_buttons::{self, WindowButtons};
 use ui::prelude::*;
 use ui::{ButtonLike, PopoverMenu, right_click_menu};
 
+pub use confirm::{Confirm, confirm};
 use item::ItemHandle;
 pub use item::{Item, ItemEvent, ItemStatus, KeyHint};
 pub use open_failure::open_failure;
@@ -220,9 +222,11 @@ struct FollowUp {
     label: SharedString,
     action: Box<dyn Action>,
     /// The write's graph and branch, which the action acts on whatever the window shows when
-    /// it is run; `None` for one that acts where the window is ("Open settings").
+    /// it is run; `None` for one that acts where the window is ("Open settings"). The graph is
+    /// shown first; it moves to the branch only for a follow-up that writes there (`undoes`).
     on: Option<WrittenTo>,
-    /// It puts back what a write took (Undo), which nothing but this toast offers.
+    /// It puts back what a write took (Undo), which nothing but this toast offers. It writes,
+    /// so the graph moves to the write's branch before it runs.
     undoes: bool,
 }
 
@@ -404,8 +408,8 @@ pub struct Workspace {
     /// Studio's memory and CPU for the status bar while `studio.show_performance` is on (the
     /// default), read every two seconds while the window is in front.
     performance: Option<Performance>,
-    /// A view of the window's own at the right of the status bar: the updater's (spec 017).
-    /// The window's own items, in the order added (the updater's, telemetry's consent).
+    /// The window's own views at the right of the status bar, in the order added: the
+    /// updater's (spec 017).
     status_items: Vec<StatusItem>,
     /// Whether this window is in front, which the memory and CPU reading waits for.
     window_active: bool,
@@ -777,9 +781,6 @@ impl Workspace {
                         return;
                     }
                     let sample = process_stats::Sample::now();
-                    if let Some((bytes, _)) = sample.memory {
-                        studio_telemetry::note_memory(bytes);
-                    }
                     this.performance = Some(Performance::next(this.performance.as_ref(), sample));
                     cx.notify();
                 });
@@ -1528,11 +1529,15 @@ impl Workspace {
                 let (label, action) = committed_follow_up(latest, commit);
                 (ToastKind::Success, label.into(), action)
             }
-            // The write may or may not have landed: the branch's history says which.
+            // The write may or may not have landed: the branch's history says which. It opens
+            // by the branch's name, so the window stays on the branch it reads.
             OutcomeKind::Unknown { .. } => (
                 ToastKind::Error,
                 "Open history".into(),
-                Box::new(OpenHistory),
+                Box::new(OpenBranchHistory {
+                    branch: latest.branch.clone(),
+                    preview: false,
+                }),
             ),
             OutcomeKind::Refused { .. } => {
                 let graph = Some(written_to.graph_at());
@@ -1551,17 +1556,25 @@ impl Workspace {
         self.push_toast(kind, text.into(), Some(follow_up), graph, cx);
     }
 
-    /// Runs a toast's follow-up. One about a write acts on the graph and branch written to,
-    /// shown first (the graph brought back if parked), so "Open history" never opens another
-    /// graph's or branch's history, nor Undo puts rows back elsewhere. A graph closed since is
-    /// named, and nothing runs.
+    /// Runs a toast's follow-up. One about a write acts on the graph written to, shown first
+    /// (brought back if parked), so "Open history" never opens another graph's history. One
+    /// that only looks (a branch's history, a commit) names what it opens and leaves the graph
+    /// on the branch it reads: looking at a branch is not a move to it. Undo writes, so the
+    /// graph moves to the branch written to first and the rows go back where they were, with
+    /// the top bar saying so. A graph closed since is named, and nothing runs.
     fn run_follow_up(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((action, on)) = self
+        let Some((action, on, writes)) = self
             .toasts
             .iter()
             .find(|toast| toast.id == id)
             .and_then(|toast| toast.action.as_ref())
-            .map(|follow_up| (follow_up.action.boxed_clone(), follow_up.on.clone()))
+            .map(|follow_up| {
+                (
+                    follow_up.action.boxed_clone(),
+                    follow_up.on.clone(),
+                    follow_up.undoes,
+                )
+            })
         else {
             return;
         };
@@ -1581,7 +1594,7 @@ impl Workspace {
                 return;
             };
             switched = self.session.as_ref() != Some(&session);
-            if let Some(branch) = on.branch {
+            if let Some(branch) = on.branch.filter(|_| writes) {
                 session.update(cx, |session, cx| session.set_branch(branch, cx));
             }
             self.show_graph(session.entity_id(), window, cx);
@@ -6314,6 +6327,58 @@ mod tests {
 
     impl ModalView for Other {}
 
+    /// A question runs its action only once the person agrees, with ↵ or its button; Esc
+    /// closes it and runs nothing (spec 006, "Expand all").
+    #[gpui::test]
+    fn a_question_runs_its_action_only_once_agreed(cx: &mut gpui::TestAppContext) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            cx.set_global(StudioSettings::default());
+        });
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        let ran = std::sync::Arc::new(AtomicUsize::new(0));
+        let ask = |cx: &mut gpui::VisualTestContext| {
+            let ran = ran.clone();
+            cx.update(|window, cx| {
+                confirm(
+                    window,
+                    cx,
+                    "Expand 140 nodes?",
+                    "It reads 2,800 counts.",
+                    "Expand",
+                    move |_, _| {
+                        ran.fetch_add(1, Ordering::SeqCst);
+                    },
+                )
+            });
+            cx.run_until_parked();
+            workspace.read_with(cx, |workspace, _| {
+                workspace
+                    .modal
+                    .as_ref()
+                    .and_then(|modal| modal.view.clone().downcast::<Confirm>().ok())
+                    .expect("asked")
+            })
+        };
+        let open = |cx: &mut gpui::VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| workspace.modal.is_some())
+        };
+
+        ask(cx);
+        assert_eq!(ran.load(Ordering::SeqCst), 0, "not before an answer");
+        cx.dispatch_action(menu::Cancel);
+        cx.run_until_parked();
+        assert!(!open(cx));
+        assert_eq!(ran.load(Ordering::SeqCst), 0, "Esc runs nothing");
+
+        ask(cx);
+        cx.dispatch_action(menu::Confirm);
+        cx.run_until_parked();
+        assert!(!open(cx));
+        assert_eq!(ran.load(Ordering::SeqCst), 1, "agreed: run once");
+    }
+
     #[gpui::test]
     fn a_busy_modal_stays_open_until_it_agrees(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
@@ -8389,9 +8454,13 @@ mod tests {
     }
 
     /// A write's toast acts on the graph and branch written to, whatever the window shows when
-    /// its button is pressed: "Open history" after moving to another graph shows the written
-    /// graph again, on its branch; after moving to another branch, the branch written to; Undo
-    /// from a parked graph undoes there. A graph closed since is named, and nothing runs.
+    /// its button is pressed. "Open history" after moving to another graph shows the written
+    /// graph again and opens the history of the branch written to; after the graph moved to
+    /// another branch, it opens that history still and the graph stays where it is, since
+    /// looking at a branch is not a move to it. Undo writes: from a parked graph on another
+    /// branch it shows the graph, moves it to the delete's branch and undoes there. A graph
+    /// closed since is named, and nothing runs. Before, "Open history" moved the graph to the
+    /// write's branch too, so the next edit went to a branch the person had only looked at.
     #[gpui::test]
     fn a_toasts_follow_up_acts_on_the_graph_and_branch_written_to(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
@@ -8401,7 +8470,7 @@ mod tests {
         let notes = idle_session("http://a.test", "notes", cx);
         let people = idle_session("http://b.test", "people", cx);
         let (workspace, cx) = cx.add_window_view(Workspace::new);
-        // Where each follow-up ran: the action, the graph shown and its branch.
+        // Where each follow-up ran: the action, the graph shown and the branch it acts on.
         type Ran = Vec<(&'static str, String, String)>;
         let ran: Rc<RefCell<Ran>> = Rc::default();
         workspace.update(cx, |workspace, cx| {
@@ -8410,9 +8479,18 @@ mod tests {
                 (session.graph_id.clone(), session.branch.clone())
             };
             let history = ran.clone();
-            workspace.register_action(move |workspace, _: &OpenHistory, _, cx| {
-                let (graph, branch) = shown(workspace, cx);
-                history.borrow_mut().push(("history", graph, branch));
+            workspace.register_action(move |workspace, action: &OpenBranchHistory, _, cx| {
+                let (graph, _) = shown(workspace, cx);
+                history
+                    .borrow_mut()
+                    .push(("history", graph, action.branch.clone()));
+            });
+            let commit = ran.clone();
+            workspace.register_action(move |workspace, action: &OpenCommit, _, cx| {
+                let (graph, _) = shown(workspace, cx);
+                commit
+                    .borrow_mut()
+                    .push(("commit", graph, action.commit_id.clone()));
             });
             let undo = ran.clone();
             workspace.register_action(
@@ -8495,17 +8573,37 @@ mod tests {
         };
         assert!(focused(&notes_tab, cx), "the graph's tab has the keyboard");
 
-        // Another, then notes moved to main.
+        // Another, then notes moved to main: fix's history opens, and notes stays on main.
         let toast = log(&notes, "Edit Person grace", unknown(), None, cx);
         notes.update(cx, |session, cx| session.set_branch("main".into(), cx));
         follow(toast, cx);
-        assert_eq!(shown(cx), ("notes".into(), "fix".into()), "back on fix");
+        assert_eq!(
+            shown(cx),
+            ("notes".into(), "main".into()),
+            "looking at fix's history leaves the graph on main"
+        );
         assert_eq!(
             ran.borrow_mut().pop(),
             Some(("history", "notes".into(), "fix".into()))
         );
 
-        // A delete in people while notes is shown: its Undo runs in people.
+        // A commit on fix, then notes moved to main: View commit opens it from main.
+        notes.update(cx, |session, cx| session.set_branch("fix".into(), cx));
+        let committed = OutcomeKind::Committed {
+            commit: Some("c9".into()),
+        };
+        let toast = log(&notes, "Edit Person lin", committed, None, cx);
+        notes.update(cx, |session, cx| session.set_branch("main".into(), cx));
+        follow(toast, cx);
+        assert_eq!(shown(cx), ("notes".into(), "main".into()));
+        assert_eq!(
+            ran.borrow_mut().pop(),
+            Some(("commit", "notes".into(), "c9".into()))
+        );
+
+        // A delete in people on fix, then people moved to main, while notes is shown: its Undo
+        // runs in people, moved to fix, where the rows were.
+        people.update(cx, |session, cx| session.set_branch("fix".into(), cx));
         let toast = log(
             &people,
             "Delete Person ada",
@@ -8519,11 +8617,16 @@ mod tests {
             workspace.toasts.last().unwrap().message.clone()
         });
         assert!(message.starts_with("people: "), "{message}");
+        people.update(cx, |session, cx| session.set_branch("main".into(), cx));
         follow(toast, cx);
-        assert_eq!(shown(cx), ("people".into(), "main".into()));
+        assert_eq!(
+            shown(cx),
+            ("people".into(), "fix".into()),
+            "an undo writes, so the graph moves to the delete's branch"
+        );
         assert_eq!(
             ran.borrow_mut().pop(),
-            Some(("undo", "people".into(), "main".into()))
+            Some(("undo", "people".into(), "fix".into()))
         );
         assert!(
             focused(&people_tab, cx),
@@ -8536,7 +8639,7 @@ mod tests {
             workspace.close_graph_asking(false, window, cx)
         });
         follow(toast, cx);
-        assert_eq!(shown(cx), ("notes".into(), "fix".into()));
+        assert_eq!(shown(cx), ("notes".into(), "main".into()));
         assert!(ran.borrow().is_empty(), "nothing ran");
         let message = workspace.read_with(cx, |workspace, _| {
             workspace.toasts.last().unwrap().message.clone()
@@ -9194,6 +9297,13 @@ mod tests {
                 );
                 let follow_up = toast.action.as_ref().unwrap();
                 assert_eq!(follow_up.label.as_ref(), "Open history");
+                assert!(
+                    follow_up.action.partial_eq(&OpenBranchHistory {
+                        branch: branch.into(),
+                        preview: false,
+                    }),
+                    "it opens {branch}'s history by name, wherever the window is"
+                );
                 let on = follow_up.on.as_ref().unwrap();
                 assert_eq!(
                     (on.graph.as_str(), on.branch.as_deref()),

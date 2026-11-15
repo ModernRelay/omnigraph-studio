@@ -2802,6 +2802,19 @@ impl GroupBy {
         .collect()
     }
 
+    /// For a grouping by the neighbours' relationship, the node type its values are, whose
+    /// label names them ([`neighbour_values`]); none for a grouping by a property.
+    pub fn value_type<'a>(
+        &self,
+        schema: &'a SchemaModel,
+        group: &RelationshipGroup,
+    ) -> Option<&'a NodeType> {
+        (self.on == GroupOn::Relationship)
+            .then(|| self.hop(schema, group).ok())
+            .flatten()
+            .map(|(other, _)| other)
+    }
+
     /// For a grouping by the neighbours' relationship: the type at its other end, and the hop
     /// from a neighbour `$m` to a value `$v`.
     fn hop<'a>(

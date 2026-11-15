@@ -321,8 +321,8 @@ const COMMIT_CHANGE_BYTES: usize = 32 * 1024 * 1024;
 /// Ids per read of [`GraphSession::node_names`], and the most nodes one call names: a review
 /// of 20,000 changes asks a bounded number of small reads, and an end past the limit keeps its
 /// id.
-const NAME_BATCH: usize = 500;
-const NAME_LIMIT: usize = 5_000;
+pub(crate) const NAME_BATCH: usize = 500;
+pub const NAME_LIMIT: usize = 5_000;
 
 /// What a read answers when the connection's token changed while it was out
 /// ([`GraphSession::counted_read`]): the server's answer was the old token's, so none of it is
@@ -947,16 +947,6 @@ impl GraphSession {
         cx: &mut Context<Self>,
     ) -> Self {
         let server_key = connection.read(cx).server.saved_key();
-        {
-            let connection = connection.read(cx);
-            studio_telemetry::record(studio_telemetry::Event::GraphOpened {
-                server: crate::server_class(&connection.server),
-                contract_matches: !matches!(
-                    connection.state,
-                    crate::ConnectionState::ContractMismatch { .. }
-                ),
-            });
-        }
         let mut session = Self {
             connection,
             graph_id,
@@ -1521,9 +1511,7 @@ impl GraphSession {
         self.run_write(
             send,
             |output: &ChangeOutput| output.commit.as_ref(),
-            move |_, _, _| {
-                WriteLog::new(branch, description).of_kind(studio_telemetry::WriteKind::StoredQuery)
-            },
+            move |_, _, _| WriteLog::new(branch, description),
             |_, _, _| {},
             cx,
         )
@@ -2327,6 +2315,21 @@ impl GraphSession {
             }
             result
         })
+    }
+
+    /// [`GraphSession::read`] asked by `scope`'s view, adding nothing to what the scope holds:
+    /// for an answer about nodes the view already shows, whose changes the scope already
+    /// counts, such as their names under another choice of property (spec 002, "Node
+    /// names"). [`Self::read_in`] would add the answer's own dependencies, which for names by
+    /// id are their whole type.
+    pub(crate) fn read_as(
+        &mut self,
+        scope: &ReadScope,
+        query: &BuiltQuery,
+        snapshot: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<ReadOutput, ReadError>> {
+        self.asked_by(scope.id, |this| this.read(query, snapshot, cx))
     }
 
     /// Reads `query` through `scope` while the view follows the branch ([`Self::read_in`]),
@@ -4215,9 +4218,7 @@ impl GraphSession {
         self.run_write(
             request,
             |output: &graph_client::api::BlobWriteOutput| output.commit.as_ref(),
-            move |_, _, _| {
-                WriteLog::new(branch, description).of_kind(studio_telemetry::WriteKind::Blob)
-            },
+            move |_, _, _| WriteLog::new(branch, description),
             |_, _, _| {},
             cx,
         )
@@ -4391,17 +4392,7 @@ impl GraphSession {
             follow_up,
             merge,
             wrote: _,
-            kind,
         } = log;
-        studio_telemetry::record(studio_telemetry::Event::WriteFinished {
-            kind,
-            outcome: match &outcome {
-                OutcomeKind::Committed { .. } => studio_telemetry::WriteOutcome::Published,
-                OutcomeKind::Held { .. } => studio_telemetry::WriteOutcome::Held,
-                OutcomeKind::Refused { .. } => studio_telemetry::WriteOutcome::Refused,
-                OutcomeKind::Unknown { .. } => studio_telemetry::WriteOutcome::Unknown,
-            },
-        });
         self.outcomes.push(OutcomeEntry {
             at: SystemTime::now(),
             branch,
@@ -4558,7 +4549,7 @@ impl GraphSession {
                         studio_ui::short_commit_id(commit)
                     ),
                 };
-                WriteLog::new(name, description).of_kind(studio_telemetry::WriteKind::Branch)
+                WriteLog::new(name, description)
             },
             move |this, outcome, cx| {
                 // The receipt names the new branch's head: the commit it starts at.
@@ -4600,7 +4591,7 @@ impl GraphSession {
                     this.drop_drafts_of(&name, cx);
                 }
                 let description = format!("Delete branch {name}");
-                WriteLog::new(name, description).of_kind(studio_telemetry::WriteKind::Branch)
+                WriteLog::new(name, description)
             },
             move |this, _, cx| this.read_branches(Some(deleted), cx),
             cx,
@@ -4664,7 +4655,7 @@ impl GraphSession {
                         sent,
                         settled: None,
                     }),
-                    ..WriteLog::new(target, description).of_kind(studio_telemetry::WriteKind::Merge)
+                    ..WriteLog::new(target, description)
                 }
             },
             move |this, outcome, cx| {
@@ -4740,8 +4731,6 @@ struct WriteLog {
     merge: Option<MergeEntry>,
     /// The properties a write set, which views are told of once it commits.
     wrote: Option<Wrote>,
-    /// What kind of write it was, for telemetry (spec 018).
-    kind: studio_telemetry::WriteKind,
 }
 
 impl WriteLog {
@@ -4752,13 +4741,7 @@ impl WriteLog {
             follow_up: None,
             merge: None,
             wrote: None,
-            kind: studio_telemetry::WriteKind::Mutation,
         }
-    }
-
-    fn of_kind(mut self, kind: studio_telemetry::WriteKind) -> Self {
-        self.kind = kind;
-        self
     }
 }
 

@@ -475,6 +475,14 @@ Its action is not registered, so the palette and the keyboard button's list leav
     ("Name rows by") and the settings tab's "Node names" section, which the tab offers with a
     graph open: a row per type, its automatic choice described, a dropdown of the properties
     that can name it, and Reset.
+    A view keeps what it shows through a new choice and renames it in place (since
+    2026-11-14): the tree and canvas, a table's relationship cells, a node page and a peek keep
+    every row, count, chip, open group and place, and read the names of the nodes they hold of
+    the types named otherwise at the commit they show, a read per type of at most 500 ids
+    (`studio_node_labels`), none for a type now named by its key (`SchemaModel::renamed_since`).
+    Before, each let go of what names neighbours and read it again: the tree and canvas
+    emptied to their root, a table's chips gave way to bare counts, and a page's groups closed
+    and showed as loading.
 - `studio_theme` implements `theme::ThemeSettingsProvider` from these settings: UI font,
   buffer font, sizes, density.
 - **Gray tones** (since 2026-10-20). The default themes are Studio Light and Studio Dark
@@ -569,10 +577,17 @@ and a 97 % fill let the text behind show through.
   delete's Undo among it, below the window's edge).
 - A write's follow-up (View commit, Undo, Open history) names the graph written to, by its
   server's address and id as tabs identify it, and the branch, and acts there whatever the
-  window shows when it is pressed: the window shows that graph on that branch first, bringing
-  it back if it is parked. A graph closed since is named, and nothing runs (since 2026-10-20;
-  before, it acted on the graph and branch shown, so "Open history" for an unknown outcome on
-  `fix` could show another graph's or main's history).
+  window shows when it is pressed: the window shows that graph first, bringing it back if it
+  is parked. A graph closed since is named, and nothing runs (since 2026-10-20; before, it
+  acted on the graph and branch shown, so "Open history" for an unknown outcome on `fix` could
+  show another graph's or main's history).
+- Looking at a branch is not a move to it (spec 020, "The four questions"). Open history, on
+  a toast and on the activity log's row, opens the history of the branch written to by its
+  name, and View commit opens the commit; the graph stays on the branch it reads, so the next
+  edit goes where the top bar says, as before the press (since 2026-11-14; before, the graph
+  moved to the write's branch first, and an edit made after reading an agent's or another
+  branch's history went to that branch). Undo writes: the graph moves to the delete's branch
+  first, and the rows go back where they were.
 - Every write's outcome is toasted once, by its place in the graph's outcome log, never by its
   text: two deletes described alike are two toasts, each undoing its own commit (since
   2026-10-21; before, a toast whose text one on screen already had was dropped, so the first
@@ -924,6 +939,19 @@ than styling one-off elements.
   roles too (`canvas_label`, `canvas_hub`). The interface font is Inter by default (Tower's face; Inter 4.1, OFL-1.1, the
   regular, italic, medium, semibold and bold static files in `assets/fonts/inter/`, loaded
   with Zed's fonts); IBM Plex Sans and every installed font stay selectable.
+- **Text-size keys.** ⌘= (or ⌘+), ⌘− and ⌘0, with Ctrl on Linux and Windows, make text one
+  size larger, one smaller, or the default again (`studio::IncreaseFontSize`,
+  `DecreaseFontSize`, `ResetFontSize`; View has them as Make Text Bigger, Make Text Smaller and
+  Default Text Size). This is Zed's zoom. A step moves `ui_font_size` and `buffer_font_size`
+  by 1 px together, so the editor's text stays as much smaller than the interface's as it
+  was, and writes both to `settings.json`: the size stays, and every window follows. Neither
+  leaves the 10 to 24 px the settings page offers (`FONT_SIZES`); a step that would changes
+  nothing. Only what is sized from the rem scales: text, and `ui`'s icons and controls. Rows,
+  columns, panels and bars are sized in px and keep their size, so a value is cut sooner at a
+  larger size and no more rows show at a smaller one; scaling them is not built. The keys
+  mean one thing everywhere: an image and the canvas zoom on `=`, `+`, `-` and `0` alone, and
+  an image no longer takes ⌘=, ⌘− and ⌘0 (since 2026-11-14; before, the size was changed in
+  Settings only, and those keys did nothing outside an image).
 - **Toolbars.** A document's toolbar and every header or notice strip (a table's, a query's,
   history's and its commit pane's, the review's, storage's, the inspector's header, the text
   editor's, a newer-data notice) holds `ds::button`s and `ds::icon_button`s;
@@ -1050,6 +1078,9 @@ opens a link from inside Studio.
 ## Validation log
 
 | Date | Claim | Check | Result |
+| 2026-11-14 | A new node name renames what views show in place ("Node names") | `type_table` `naming_nodes_otherwise_renames_them_in_place` (a Person table and Ada's page, Company named by `code`: at once every cell and group as it was, then renamed; 2 reads, one a view, nothing else), failing with the old reading again (the table's cell gone at once); `graph_store` tests in spec 005's log; offscreen frames on the dense graph through a 700 ms proxy, Topic named by category, of an Artifact table and Topic `topic-00325`'s page | Before: the table's topic chips gave way to bare counts with 4 reads running, back renamed at +2.2 s; the page's relationship list grew from 4 groups to 9 as empty ones came back unread, Broader closed, 6 reads running. After: the chips and groups stay; one read each, the names changing in place, and the page's title at once from the values held |
+| 2026-11-14 | Open history leaves the graph on the branch it reads, on a toast and in the activity log; Undo moves it to the delete's branch | `studio_workspace` `a_toasts_follow_up_acts_on_the_graph_and_branch_written_to` (an unknown outcome on `fix`, then the graph moved to main: the press opens `OpenBranchHistory` for `fix` and the graph is still on main; a commit on `fix` opened from main by View commit, the graph still on main; a delete on `fix`, then the graph moved to main and another graph shown: Undo shows the graph, on `fix`) and `outcomes_described_alike_are_toasted_each_with_its_own_follow_up` (the toast's action names the branch); `studio` `activity::tests::an_unknown_outcome_opens_its_branchs_history` (the row's press opens `fix`'s history with the window on main) | Passed. Before, each press called `set_branch` first; the tests said so and were rewritten |
+| 2026-11-14 | The text-size keys move the interface's and the editor's sizes together within the settings page's range, keep them, and act app-wide | `studio_settings` `text_sizes_step_together_and_stop_at_the_limits` (a step each way, the top and the bottom limit, and `FONT_SIZES` held to the two settings' ranges) and `the_text_size_steps_change_the_settings_in_effect` (two steps up, one down, a reset, and forty steps stopping at 24 with the two sizes as far apart); `studio` `tests/keymaps.rs` (the three actions bound on every platform); offscreen on `script/dev-server`, with a `settings.json` holding a comment: ⌘= twice wrote 17 and 16 and drew larger text over rows of the same height, ⌘− three times wrote 14 and 13, ⌘0 took both keys out again, and the comment stayed each time | Passed. Not run on Linux or Windows, and the View menu's three items were not pressed |
 | 2026-11-14 | The top bar draws the window's buttons where the system draws none | Read GPUI at the pin: `gpui_windows/src/window.rs:478` (`hide_title_bar` is `appears_transparent`) and `events.rs:968-976`, `1128-1150` (a marked area answers `HTCLOSE`, `HTMAXBUTTON` or `HTMINBUTTON`, and a press released on it closes, maximizes or restores, or minimizes); `gpui/src/window.rs:1703` and `gpui_linux/src/linux/wayland/window.rs:2176` (decorations asked of the server, the window's own where the desktop has none). `studio_workspace` `the_top_bar_draws_the_windows_buttons_where_the_system_draws_none` (none drawn for the system's; Windows' three side by side, as tall as the bar, to its corner) and `a_window_that_frames_itself_has_its_desktops_buttons` (close at the left and the others at the right for such a layout; a click on close asks about an unsaved tab, and the window closes once confirmed); `studio_ui` `window_buttons::tests::each_side_of_the_bar_gets_its_buttons`. Offscreen on macOS with `SNAPSHOT_WINDOW_BUTTONS`: Windows' bar at rest and with minimize and close under the pointer, and a Linux bar with all three at the right and with close at the left | Passed, and the pictures read as each platform's buttons. **Not run on Windows or on Linux**: that Windows shows no buttons today, and that these act there, is read from GPUI and from Zed's own bar at the same pin, not seen |
 | 2026-11-05 | Focus mode shows the active tab alone, full screen, and the markdown editor writes in a centred column | `studio_workspace` `focus_mode_shows_the_active_tab_alone_full_screen` (⌃⌘↵ in, the tab told, the window full screen, no tab strip; another tab activated takes its place; Escape out of full screen; a window already full screen stays so; closing the last tab ends it), `type_table` `focus_mode_hides_the_toolbar_until_something_needs_the_person`; offscreen snapshots of Keyset paging's body against the sample graph: ⌘⇧↵, a line typed, Escape | All pass. The first snapshot caught ⌘⇧↵ bound under `TextEditor` alone: Zed's editor took it as Newline Above, so it is bound under `TextEditor > Editor` too. A split editor alone on the screen still showed the preview, so Split shows the text only while in focus mode |
 | 2026-11-01 | Memory and CPU show by default again | `studio_settings` tests (`default.json` against the struct) | Ragnor asked for the readout back; the setting stays under Appearance for turning it off |
