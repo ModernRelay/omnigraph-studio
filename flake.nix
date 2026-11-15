@@ -28,17 +28,39 @@
         libxkbcommon
         libxcb
 
+        lld
         glfw
         wayland-utils
         wayland.dev
         wayland-protocols
       ];
+
+# build = pkgs.callPackage ./build.nix {
+#   crane = inputs.crane.mkLib pkgs;
+#   rustToolchain = rustBin.fromRustupToolchainFile ../rust-toolchain.toml;
+#   commitSha = inputs.self.rev or null;
+# };
     in
     {
-      devShells = forAllSystems (system: pkgs: {
+      devShells = forAllSystems (system: pkgs: let
+        lib = pkgs.lib;
+        stdenv' = pkgs.stdenv;
+      in {
         default = pkgs.mkShell {
           packages = bundle pkgs;
         };
+
+        # included from zed-industries/zed:nix/build.nix
+        shellHook = ''
+          export LD_LIBRARY_PATH=${pkgs.wayland}/lib:$LD_LIBRARY_PATH
+        '';
+        NIX_LDFLAGS = lib.optionalString stdenv'.hostPlatform.isLinux "-rpath ${
+          with pkgs; lib.makeLibraryPath [
+            gpu-lib
+            wayland
+            libva
+          ]
+        }";
       });
 
       packages = forAllSystems (system: pkgs:
