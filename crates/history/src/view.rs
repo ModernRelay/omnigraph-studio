@@ -22,10 +22,11 @@ use studio_actions::{ViewKind, ViewLink};
 use studio_ui::ds::Tipped;
 use studio_ui::menu::ContextMenu;
 use studio_ui::{change_counts, group_digits, now_micros, relative_time, short_commit_id};
-use studio_workspace::{Item, ItemEvent, SavedItem};
+use studio_workspace::{Inspected, Item, ItemEvent, SavedItem};
 use ui::prelude::*;
 use ui::right_click_menu;
 
+use crate::commit_note::CommitNote;
 use crate::commit_view::{branch_start, new_branch_at, open_listed};
 use crate::lanes::{Graph, GraphCommit, assign_lanes};
 use crate::merged::{Absent, Drawn, HistoryRead, branch_heads};
@@ -341,6 +342,12 @@ pub struct HistoryView {
     commit_texts: Vec<CommitText>,
     graph: Graph,
     selected: Option<usize>,
+    /// The selected commit as the workspace was last told of it ([`ItemEvent::Selected`]), by
+    /// its id: the inspector shows it.
+    inspected: Option<String>,
+    /// The inspector's view of the selected commit, made when the inspector asks and kept
+    /// while that commit stays selected.
+    commit_note: Option<Entity<CommitNote>>,
     /// The commit list, drawn cached on its own: the commit beside it scrolls and reads
     /// without the list drawing again.
     rows: Entity<HistoryRows>,
@@ -357,6 +364,8 @@ pub struct HistoryView {
     _task: Option<Task<()>>,
     _search_subscription: Subscription,
     _session_subscription: Subscription,
+    /// The inspector shows the selected commit (spec 020).
+    _selection_subscription: Subscription,
     /// Its branch asked after while it is open, so another writer's commits to it arrive.
     _head_watch: HeadWatch,
     /// The other branches whose heads the history shows as tags: a commit to one moves its
@@ -387,6 +396,25 @@ impl Item for HistoryView {
     /// The commit list is drawn cached on its own (`HistoryRows`).
     fn caches_its_parts(&self) -> bool {
         true
+    }
+
+    /// The selected commit (spec 020): what its row says, in full.
+    fn inspected(&mut self, cx: &mut Context<Self>) -> Option<Inspected> {
+        let commit = self.commits.get(self.selected?)?;
+        let note = match &self.commit_note {
+            Some(note) => note.clone(),
+            None => {
+                let (heads, counts) = self.learnt_of(&commit.graph_commit_id);
+                let note = CommitNote::new(commit.clone(), heads.to_vec(), counts);
+                let note = cx.new(|_| note);
+                self.commit_note = Some(note.clone());
+                note
+            }
+        };
+        Some(Inspected::View {
+            view: note.into(),
+            scrolls_itself: false,
+        })
     }
 
     fn tab_title(&self, _cx: &App) -> SharedString {
@@ -526,6 +554,7 @@ impl HistoryView {
             _search_task: None,
             _search_subscription: search_subscription,
             _session_subscription: session_subscription,
+            _selection_subscription: cx.observe_self(|this, cx| this.report_selection(cx)),
             _head_watch: head_watch,
             others: Vec::new(),
             other_heads: HashMap::new(),
@@ -551,6 +580,8 @@ impl HistoryView {
             commit_texts: Vec::new(),
             graph: Graph::default(),
             selected: None,
+            inspected: None,
+            commit_note: None,
             rows: HistoryRows::new(cx),
             counts: Default::default(),
             drawn_rows: None,
@@ -1340,6 +1371,36 @@ impl HistoryView {
         };
         self.match_at = Some(at);
         self.select(self.matches[at], cx);
+    }
+
+    /// What History holds of a commit beside its listing: the branches whose head it is, and
+    /// its changes counted, once its row was drawn and they were read.
+    fn learnt_of(&self, id: &str) -> (&[String], Option<(crate::counts::Counts, bool)>) {
+        let heads = self.heads.get(id).map_or(&[][..], Vec::as_slice);
+        (heads, self.counts.of(id))
+    }
+
+    /// Tells the workspace when another commit is selected, or none: called whenever the view
+    /// notifies, so every way the selection and the list move is seen (a click, a key, a
+    /// search, commits read again). While the same commit stays selected, what is learnt of it
+    /// since reaches the inspector's view of it: its counts, and a branch's head moving.
+    fn report_selection(&mut self, cx: &mut Context<Self>) {
+        let selected = self
+            .selected
+            .and_then(|ix| self.commits.get(ix))
+            .map(|commit| commit.graph_commit_id.as_str());
+        if selected != self.inspected.as_deref() {
+            self.inspected = selected.map(str::to_owned);
+            self.commit_note = None;
+            cx.emit(ItemEvent::Selected);
+        } else if let (Some(note), Some(id)) = (&self.commit_note, selected) {
+            let (heads, counts) = self.learnt_of(id);
+            note.update(cx, |note, cx| {
+                if note.learn(heads, counts) {
+                    cx.notify();
+                }
+            });
+        }
     }
 
     /// Selects a commit; opening it is what shows its changes.
@@ -3428,6 +3489,81 @@ mod tests {
                 "branch=fix&limit=1",
             ]
         );
+    }
+
+    /// The inspector shows the selected commit (spec 020), from the start, since History opens
+    /// with its newest selected: the commit and the branches whose head it is, in the same
+    /// view while it stays selected, which takes its counts once they are read, and in another
+    /// view when another commit is selected. Before, the inspector read "Nothing selected"
+    /// beside a selected commit.
+    #[gpui::test]
+    async fn the_inspector_shows_the_selected_commit(cx: &mut TestAppContext) {
+        use std::{cell::Cell, rc::Rc};
+        let (session, _served) = serve(
+            Served {
+                branches: vec![(
+                    "main".into(),
+                    vec![
+                        commit("m2", 20, Some("m1"), None),
+                        commit("m1", 10, None, None),
+                    ],
+                )],
+                ..Default::default()
+            },
+            cx,
+        );
+        let (view, cx) = open(&session, cx);
+        let told = Rc::new(Cell::new(0));
+        let _subscription = cx.update(|_, cx| {
+            let told = told.clone();
+            cx.subscribe(&view, move |_, event: &ItemEvent, _| {
+                if matches!(event, ItemEvent::Selected) {
+                    told.set(told.get() + 1);
+                }
+            })
+        });
+        let note = |cx: &mut gpui::VisualTestContext| {
+            view.update(cx, |view, cx| match Item::inspected(view, cx) {
+                Some(Inspected::View { view, .. }) => Some(
+                    view.downcast::<CommitNote>()
+                        .unwrap_or_else(|_| panic!("a commit's note")),
+                ),
+                _ => None,
+            })
+        };
+        let select = |ix: usize, cx: &mut gpui::VisualTestContext| {
+            view.update(cx, |view, cx| view.select(ix, cx));
+            cx.run_until_parked();
+        };
+        // History opens with its newest commit selected, so the inspector has it from the
+        // start.
+        let newest = note(cx).expect("the newest commit, selected as History opens");
+        newest.read_with(cx, |note, _| {
+            let (id, heads, _) = note.read();
+            assert_eq!((id, heads), ("m2", &["main".to_owned()][..]));
+        });
+        select(0, cx);
+        assert_eq!(told.get(), 0, "the same commit says nothing");
+        assert_eq!(note(cx).unwrap().entity_id(), newest.entity_id());
+
+        select(1, cx);
+        assert_eq!(told.get(), 1);
+        let first = note(cx).expect("the other commit");
+        assert_ne!(first.entity_id(), newest.entity_id());
+        first.read_with(cx, |note, _| {
+            let (id, heads, counts) = note.read();
+            assert_eq!((id, heads.len(), counts), ("m1", 0, None));
+        });
+        // Its counts are read later, for the rows drawn: the view shown takes them.
+        view.update(cx, |view, cx| {
+            view.counts.counts.insert("m1".into(), (1, 2, 3));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(told.get(), 1, "the same commit still");
+        first.read_with(cx, |note, _| {
+            assert_eq!(note.read().2, Some(((1, 2, 3), false)));
+        });
     }
 
     /// A History tab opened before the branch list was read reads the other branches' heads

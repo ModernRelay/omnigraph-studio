@@ -59,7 +59,9 @@ from Zed with notices).
   are never asked for, its row reads "first commit" in the changes column, and its detail says
   it is the graph's first commit. History opens the commits it lists in their own tabs with
   the commit as listed (a click in the panel, a double click, ↵, the row menu's "Open in a
-  tab"), which is not read again. A commit named by its id alone (a restored tab, a toast's
+  tab"), which is not read again. The inspector shows the selected commit (spec 020, since
+  2026-11-14): who wrote it, when, on which branch, its parents as links, the branches whose
+  head it is, and its counts once read. A commit named by its id alone (a restored tab, a toast's
   "View commit", a parent link) asks for its changes beside its own read, not after it, and
   the server's `parentless_commit` refusal shows it as the first (since 2026-10-21; before, it
   waited for its own read, a round trip more on every commit tab). A commit tab's "Load more

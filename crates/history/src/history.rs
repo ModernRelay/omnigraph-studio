@@ -2,6 +2,7 @@
 //!
 //! Layer 5 (`docs/architecture.md`). Plan: `specs/009-history/plan.md`.
 
+mod commit_note;
 mod commit_view;
 mod commits_panel;
 mod counts;
