@@ -69,8 +69,9 @@ impl Models {
             .map(|global| global.0.clone())
     }
 
-    /// Sets up the client over Studio's HTTP client, reads the key from the keychain, and
-    /// reads the model list when the cached one is a day old.
+    /// Sets up the client over Studio's HTTP client and reads the key from the keychain. The
+    /// model list is read once a key is held, when the one kept is a day old: without a key
+    /// nothing goes to OpenRouter (spec 019).
     pub fn init(cx: &mut App) {
         let http = cx.http_client();
         let keychain = PlatformKeychain::start(cx);
@@ -104,6 +105,20 @@ impl Models {
     }
 
     fn new(client: model::Client, keychain: Arc<dyn Keychain>, cx: &mut Context<Self>) -> Self {
+        let (read_at, choices) = read_cached_list()
+            .map(|list| (list.read_at, list.models))
+            .unwrap_or_default();
+        Self::with_list(client, keychain, read_at, choices, cx)
+    }
+
+    /// [`Self::new`], with the model list as it was last kept: `choices`, read at `read_at`.
+    fn with_list(
+        client: model::Client,
+        keychain: Arc<dyn Keychain>,
+        read_at: u64,
+        choices: Vec<ModelChoice>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let read = keychain.read(KEYCHAIN_KEY.to_owned());
         cx.spawn(async move |this, cx| {
             let key = match read.await {
@@ -122,15 +137,15 @@ impl Models {
                 };
                 this.key = key;
                 this.sync_key_stored(cx);
+                // Only now, and only with a key: the list is not read for a person who
+                // stored none.
+                this.refresh_list_if_stale(cx);
                 cx.notify();
             })
             .ok();
         })
         .detach();
-        let (read_at, choices) = read_cached_list()
-            .map(|list| (list.read_at, list.models))
-            .unwrap_or_default();
-        let mut this = Self {
+        Self {
             client,
             keychain,
             key: None,
@@ -138,9 +153,7 @@ impl Models {
             choices,
             read_at,
             _refreshing: None,
-        };
-        this.refresh_list_if_stale(cx);
-        this
+        }
     }
 
     pub fn key_state(&self) -> KeyState {
@@ -261,7 +274,14 @@ impl Models {
         self.choices.clone()
     }
 
+    /// Reads the model list again when the one held is a day old, for a person who holds a
+    /// key. Without one nothing is sent to OpenRouter, this request included (spec 019): the
+    /// picker then offers the list last read, or the two defaults. The request itself carries
+    /// no key.
     fn refresh_list_if_stale(&mut self, cx: &mut Context<Self>) {
+        if self.key.is_none() {
+            return;
+        }
         let fresh = now_secs().saturating_sub(self.read_at) < LIST_AGE.as_secs();
         if (fresh && !self.choices.is_empty()) || self._refreshing.is_some() {
             return;
@@ -315,4 +335,133 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use gpui::TestAppContext;
+    use graph_store::sign_in::MemoryKeychain;
+    use http_client::{AsyncBody, FakeHttpClient, Response};
+
+    use super::*;
+
+    const LIST: &str = r#"{"data":[
+      {"id":"anthropic/claude-haiku-5.5","name":"Anthropic: Claude Haiku 5.5","pricing":{"prompt":"0.0000001","completion":"0.0000005"},"supported_parameters":["structured_outputs"]}
+    ]}"#;
+
+    /// A model service that lists one model and counts how often its list is asked for. It is
+    /// asked for nothing else here, and never with the key.
+    fn service(reads: Arc<AtomicUsize>) -> model::Client {
+        let http = FakeHttpClient::create(move |request| {
+            let reads = reads.clone();
+            async move {
+                assert_eq!(request.uri().to_string(), model::MODELS_ENDPOINT);
+                assert!(
+                    request.headers().get("Authorization").is_none(),
+                    "the list is read without the key"
+                );
+                reads.fetch_add(1, Ordering::SeqCst);
+                Ok(Response::builder()
+                    .status(200)
+                    .body(AsyncBody::from(LIST.to_owned()))
+                    .unwrap())
+            }
+        });
+        model::Client::new(http)
+    }
+
+    /// The models of a person whose keychain holds `key`, with no list kept from before.
+    fn models(
+        key: Option<&str>,
+        reads: &Arc<AtomicUsize>,
+        cx: &mut TestAppContext,
+    ) -> Entity<Models> {
+        let keychain = MemoryKeychain::default();
+        if let Some(key) = key {
+            keychain.items.lock().unwrap().insert(
+                KEYCHAIN_KEY.to_owned(),
+                (KEYCHAIN_USER.to_owned(), key.as_bytes().to_vec()),
+            );
+        }
+        let keychain: Arc<dyn Keychain> = Arc::new(keychain);
+        cx.update(|cx| {
+            studio_settings::init_test(cx);
+            studio_settings::keep_changes_in_memory(cx);
+            cx.new(|cx| Models::with_list(service(reads.clone()), keychain, 0, Vec::new(), cx))
+        })
+    }
+
+    /// Nothing goes to OpenRouter for a person who stored no key, the model list included.
+    /// Before, Studio asked for the list at every start whose kept copy was a day old, key or
+    /// not, while its settings said "Nothing is sent without a key."
+    #[gpui::test]
+    async fn without_a_key_the_model_list_is_not_read(cx: &mut TestAppContext) {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let models = models(None, &reads, cx);
+        cx.run_until_parked();
+        models.read_with(cx, |models, _| {
+            assert_eq!(models.key_state(), KeyState::None);
+            assert_eq!(
+                models.choices().len(),
+                2,
+                "the picker offers the two defaults"
+            );
+        });
+        assert_eq!(reads.load(Ordering::SeqCst), 0, "no key, no request");
+    }
+
+    /// A key held at start reads the list once, and a list read today is not read again.
+    #[gpui::test]
+    async fn a_key_held_at_start_reads_the_list_once(cx: &mut TestAppContext) {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let models = models(Some("sk-or-test"), &reads, cx);
+        cx.run_until_parked();
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        models.update(cx, |models, cx| {
+            assert_eq!(models.key_state(), KeyState::Stored);
+            let offered = models.choices();
+            assert_eq!(offered.len(), 1);
+            assert_eq!(offered[0].id, "anthropic/claude-haiku-5.5");
+            models.refresh_list_if_stale(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(reads.load(Ordering::SeqCst), 1, "a list read today is kept");
+    }
+
+    /// Storing a key is what reads the list, and once the key is removed it is not read again,
+    /// however old the one kept grows.
+    #[gpui::test]
+    async fn storing_a_key_reads_the_list_and_removing_it_reads_no_more(cx: &mut TestAppContext) {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let models = models(None, &reads, cx);
+        cx.run_until_parked();
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+
+        models
+            .update(cx, |models, cx| models.set_key("sk-or-test".into(), cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(reads.load(Ordering::SeqCst), 1, "storing the key reads it");
+
+        models
+            .update(cx, |models, cx| models.set_key(String::new(), cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        models.update(cx, |models, cx| {
+            assert_eq!(models.key_state(), KeyState::None);
+            models.read_at = 0;
+            models.refresh_list_if_stale(cx);
+            assert_eq!(
+                models.choices().len(),
+                1,
+                "the list last read is still offered"
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(reads.load(Ordering::SeqCst), 1, "no key, no request");
+    }
 }

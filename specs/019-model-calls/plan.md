@@ -215,8 +215,9 @@ your OpenRouter workspace, is used for that provider's models and billed to that
 and a **Provider keys…** button opens `https://openrouter.ai/settings/integrations`. Studio
 holds no provider key: OpenRouter is the one place they live, and a request never carries one.
 The model picker lists `GET /api/v1/models` filtered to `structured_outputs`, as "name · $in/$out
-per million", read once a day and kept in the data directory; without a key or network it holds
-the two defaults. The section's description: "Studio sends a task's input to OpenRouter and the
+per million", read at most once a day while a key is stored and kept in the data directory.
+Without a key the list is not read (`Models::refresh_list_if_stale`): the picker holds the list
+last kept or, with none, the two defaults, as it does without a network. The section's description: "Studio sends a task's input to OpenRouter and the
 model it names. Each task says what it sends before its first call. Nothing is sent without a
 key."
 
@@ -308,7 +309,8 @@ name to the settings description's list. It never calls OpenRouter itself.
 | In flight per control | 1 | 1 |
 | Rows per fill | 500, 8 at a time | — |
 
-A call is never retried. The model list is read at most once a day.
+A call is never retried. The model list is read at most once a day, and only while a key is
+stored.
 
 ## Decisions
 
@@ -342,6 +344,7 @@ A call is never retried. The model list is read at most once a day.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-11-15 | Without a key nothing goes to OpenRouter, the model list included | `studio_workspace` `models::tests::without_a_key_the_model_list_is_not_read`, `a_key_held_at_start_reads_the_list_once`, `storing_a_key_reads_the_list_and_removing_it_reads_no_more` (a keychain in memory and a model service that counts the reads of its list and refuses a request that carries a key). The two no-key tests fail with the guard taken out of `refresh_list_if_stale` (checked) | Fixed. Versions 0.3.0 to 0.4.7 asked for the list at every start whose kept copy was a day old, key or not: found on 2026-11-14 by listing the sockets of the built 0.4.7 app, whose one connection at start went to `openrouter.ai` (spec 018's log). The list is now read when the keychain answers with a key and when one is stored; `docs/privacy.md` says which versions did what |
 | 2026-11-01 | A sentence also sets the order, the grouping and the columns | `type_table` `words::tests::an_answer_sets_the_order_grouping_and_columns_the_table_offers` (taken where offered, refused and named otherwise, none keeps the table's; the schema offers each the table has choices for), `table::tests::a_sentence_sets_the_order_grouping_and_columns` (the pinned key stays, the rest in the order named, what is not said stays). Each fails with its check undone (checked); the uncommitted instrument over the personal graph's schema measured the input | Pass. With these lines Artifact's input is 33,104 B, so the cap rises from 32 to 48 KiB, still under the Careful tier's 64 |
 | 2026-11-01 | A predicate names an incoming relationship in its own direction | `gq_language` `a_condition_is_spliced_in_and_judged_by_the_compiler` (extended: `out:Knows` is `$n knows $r`, `in:Knows` `$r knows $n`, a reserved-word edge quoted, and an incoming block compiles), `type_table` `words::tests` (the input shows the oriented GQ). The builder test fails with every key oriented outgoing (checked); the throwaway instrument over the personal graph's schema measured the input after the merge with the condition filter | Fixed. The input gave `$n <traversal> $r` for every relationship. The compiler orients a traversal by its ends' types, so that read right between two types, but on an edge from a type to itself it always reads outgoing: a predicate on an incoming same-type relationship matched the other way round. The edge was also not quoted where its name is a reserved word. Each relationship line now shows its GQ and the related type in place of the label, which keeps Artifact at 32,647 B and Person at 26,706 B, under the 32 KiB cap |
 | 2026-10-31 | The sentence filter's input fits the cap on the personal graph's widest types | `type_table` `the_input_says_each_related_type_once_and_fits_the_cap` (a related type reached twice is described once; 400 relationships leave the related types' properties out, say so, and stay within the cap); an uncommitted instrument over the personal graph's schema (100 node types, 549 edge types) | Before: Person 50,383 B and Artifact 48,303 B, over the 32 KiB cap, so the call was refused on both. After: 25,452 B and 31,393 B, every type within the cap and none leaving related properties out. Each relationship repeated the relationship operators and the related type's properties; both are now said once |
@@ -353,4 +356,8 @@ A call is never retried. The model list is read at most once a day.
 
 ## Corrections
 
-None yet.
+- 2026-11-15: "Nothing is sent without a key", the Models section's own description, did not
+  hold for the model list: `Models::new` asked OpenRouter for it at start whatever the keychain
+  held, where this plan said the picker "holds the two defaults" without a key. The request
+  carried no key and no data, but it told OpenRouter the IP address of every person who started
+  Studio. The list now waits for a key.
