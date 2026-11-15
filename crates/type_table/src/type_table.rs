@@ -421,6 +421,7 @@ fn open_saved_view(
             Box::new(studio_actions::graph::OpenQueryFile {
                 path: Some(query.file.clone()),
                 view: Some(view.key()),
+                preview: false,
             }),
             cx,
         );

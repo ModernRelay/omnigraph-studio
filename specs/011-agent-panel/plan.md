@@ -316,6 +316,9 @@ and Delta's sidebar.
   only what the conversation is doing: a turning circle while it runs, a warning mark while a
   change or tool waits for the person, a red cross when the agent stopped with an error, an
   accent dot when it finished while its tab was not shown (cleared when the tab gains focus).
+  One click on a row opens the conversation as the pane's preview tab, which the next preview
+  replaces unless something was written in it, and a double click opens it to stay (spec 020;
+  since 2026-11-15, before which every click opened a tab that stayed).
   When the person last wrote ("just now", "5m ago", "12 Oct") is in the tooltip with the title
   and the agent, not on the row, as Delta's rows carry no times. Rows sort by the person's last
   message, as Zed's sort by the last interaction, so a conversation finishing in the

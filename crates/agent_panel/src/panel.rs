@@ -213,7 +213,7 @@ pub fn open(
         .latest(&graph, &agent)
         .map(|record| record.session.clone());
     match latest {
-        Some(id) => open_session(workspace, id, window, cx),
+        Some(id) => open_session(workspace, id, false, window, cx),
         None => new_conversation(workspace, window, cx),
     }
 }
@@ -224,9 +224,13 @@ pub fn open(
 /// A conversation has one tab, in whichever pane it is, also while a split or a restore fills
 /// a pane with copies: a second tab would load the session again and take the first one's
 /// replies, permission prompts and CLI credentials.
+///
+/// With `preview` the tab is the pane's preview tab, which the next preview replaces unless
+/// the person wrote in it; opened again without, a preview tab holding it is kept (spec 020).
 pub fn open_session(
     workspace: &mut Workspace,
     id: String,
+    preview: bool,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Option<Entity<AgentPanel>> {
@@ -236,11 +240,15 @@ pub fn open_session(
     });
     if let Some(panel) = open {
         workspace.activate_item_by_id(panel.entity_id(), window, cx);
+        if !preview {
+            workspace.keep_tab(panel.entity_id());
+        }
         return Some(panel);
     }
     let session = workspace.session()?.clone();
     let handle = cx.entity().downgrade();
-    let panel = workspace.open_item(format!("agent:{id}"), window, cx, move |window, cx| {
+    let key = format!("agent:{id}");
+    let panel = workspace.open_item_with(key, preview, window, cx, move |window, cx| {
         AgentPanel::new(session, handle, Some(id), window, cx)
     })?;
     panel.update(cx, |panel, cx| panel.start_when_shown(cx));
@@ -4620,6 +4628,67 @@ mod tests {
             "main",
             "the window stays on the branch it reads"
         );
+    }
+
+    /// A draft typed in a conversation tells the workspace the tab holds work, once, and a
+    /// draft cleared tells it the tab no longer does. A conversation opened by one click is
+    /// the pane's preview tab (spec 020), and this is what keeps it once it is written in:
+    /// the workspace keeps a preview tab that says it holds work, so the next conversation
+    /// looked at does not take its place.
+    #[gpui::test]
+    async fn a_draft_typed_in_a_conversation_tells_the_workspace(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, _) = graph_store::test_server::followed_session(
+            "node Person {\n  slug: String @key\n}\n",
+            |_| serde_json::json!([]),
+            cx,
+        );
+        cx.run_until_parked();
+        let (_root, cx) = cx.add_window_view(|_, _| gpui::EmptyView);
+        let panel = cx.update(|window, cx| {
+            cx.new(|cx| {
+                AgentPanel::new(
+                    session,
+                    WeakEntity::new_invalid(),
+                    Some("s1".into()),
+                    window,
+                    cx,
+                )
+            })
+        });
+        cx.run_until_parked();
+        // Each time the tab says its state changed: whether it holds work then.
+        let told: Rc<std::cell::RefCell<Vec<bool>>> = Rc::default();
+        let _subscription = cx.update(|_, cx| {
+            let told = told.clone();
+            cx.subscribe(&panel, move |panel, event: &ItemEvent, cx| {
+                if matches!(event, ItemEvent::UpdateTab) {
+                    told.borrow_mut().push(panel.read(cx).is_dirty(cx));
+                }
+            })
+        });
+        let composer = panel.read_with(cx, |panel, _| panel.composer.clone());
+        let write = |text: &str, cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| {
+                composer.update(cx, |editor, cx| editor.set_text(text, window, cx))
+            });
+            cx.run_until_parked();
+        };
+
+        write("How many people are there?", cx);
+        assert_eq!(*told.borrow(), [true], "a draft: the tab holds work");
+        write("How many people are there in Berlin?", cx);
+        assert_eq!(
+            *told.borrow(),
+            [true],
+            "more of the same draft says nothing new"
+        );
+        write("", cx);
+        assert_eq!(*told.borrow(), [true, false], "the draft is gone");
     }
 
     /// Starting a conversation nothing was sent in again (Restart, or Start again after a slow

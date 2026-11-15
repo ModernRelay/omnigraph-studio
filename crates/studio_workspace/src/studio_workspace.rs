@@ -1835,6 +1835,16 @@ impl Workspace {
             .map(|item| item.as_ref())
     }
 
+    /// Keeps a tab that is its pane's preview, wherever it is: it was opened again to stay, or
+    /// the person did work in it that the tab cannot say with its dirty state.
+    pub fn keep_tab(&mut self, id: EntityId) {
+        if let Some((pane, _)) = self.find_item(id)
+            && let Some(pane) = self.pane_mut(pane)
+        {
+            pane.keep(id);
+        }
+    }
+
     /// Keeps the active tab if it is the pane's preview: a view opened from it must not take its
     /// place (spec 020).
     pub fn keep_active_tab(&mut self, _cx: &mut Context<Self>) {
@@ -7445,6 +7455,46 @@ mod tests {
                 Some(source),
                 "Back returns to it"
             );
+        });
+    }
+
+    /// A preview tab kept by name stays when the next preview opens, which goes beside it; one
+    /// nobody kept gives its place up. A tab is kept so when it is opened again to stay, or
+    /// when the person worked in it in a way its dirty state does not say (`keep_tab`).
+    #[gpui::test]
+    fn a_tab_kept_by_name_is_not_replaced_by_the_next_preview(cx: &mut gpui::TestAppContext) {
+        fn preview(
+            key: &'static str,
+            workspace: &mut Workspace,
+            window: &mut Window,
+            cx: &mut Context<Workspace>,
+        ) -> EntityId {
+            workspace
+                .open_item_with(key.to_owned(), true, window, cx, |_, cx| Viewed {
+                    focus_handle: cx.focus_handle(),
+                    key,
+                    disabled: None,
+                })
+                .expect("opened")
+                .entity_id()
+        }
+        let (workspace, cx, source) = views_workspace(cx, None);
+        workspace.update_in(cx, |workspace, window, cx| {
+            // Not kept: the next preview takes the place of the one before.
+            let second = preview("second", workspace, window, cx);
+            let pane = workspace.pane(workspace.active_pane).expect("the pane");
+            assert_eq!(pane.items.len(), 1);
+            assert_eq!(pane.items[0].item_id(), second);
+            assert!(workspace.find_item(source).is_none(), "the first is gone");
+
+            // Kept: the next preview opens beside it.
+            workspace.keep_tab(second);
+            let third = preview("third", workspace, window, cx);
+            let pane = workspace.pane(workspace.active_pane).expect("the pane");
+            let tabs: Vec<EntityId> = pane.items.iter().map(|item| item.item_id()).collect();
+            assert_eq!(tabs, [second, third]);
+            assert!(!pane.is_preview(0), "the kept tab stays");
+            assert!(pane.is_preview(1), "the new one is the preview");
         });
     }
 
