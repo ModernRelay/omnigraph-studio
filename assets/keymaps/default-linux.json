@@ -17,7 +17,11 @@
       "alt-left": "studio::GoBack",
       "alt-right": "studio::GoForward",
       "ctrl-q": "studio::Quit",
-      "ctrl-alt-shift-f": "studio::ToggleFrameOverlay"
+      "ctrl-alt-shift-f": "studio::ToggleFrameOverlay",
+      "ctrl-=": "studio::IncreaseFontSize",
+      "ctrl-+": "studio::IncreaseFontSize",
+      "ctrl--": "studio::DecreaseFontSize",
+      "ctrl-0": "studio::ResetFontSize"
     }
   },
   {
@@ -82,10 +86,7 @@
       "1": "studio_canvas::ActualSize",
       "=": "studio_canvas::ZoomIn",
       "+": "studio_canvas::ZoomIn",
-      "-": "studio_canvas::ZoomOut",
-      "ctrl-0": "studio_canvas::FitToWindow",
-      "ctrl-=": "studio_canvas::ZoomIn",
-      "ctrl--": "studio_canvas::ZoomOut"
+      "-": "studio_canvas::ZoomOut"
     }
   },
   {
