@@ -2918,16 +2918,19 @@ impl Exploration {
         self.next_task
     }
 
-    /// The read numbered `ticket` for `target` finished: its entry goes, unless a read of the
-    /// same target started since holds it.
-    fn finished(&mut self, target: &LoadTarget, ticket: u64) {
-        if self
+    /// The read numbered `ticket` for `target` landed: whether it is still the read held for
+    /// its target, whose entry then goes. One dropped since, or started again under another
+    /// search, order, filter or grouping, is not: its answer stands for nothing, as when
+    /// dropping its task stopped it before answers waited in a queue.
+    fn finished(&mut self, target: &LoadTarget, ticket: u64) -> bool {
+        let held = self
             .tasks
             .get(target)
-            .is_some_and(|(held, _)| *held == ticket)
-        {
+            .is_some_and(|(held, _)| *held == ticket);
+        if held {
             self.tasks.remove(target);
         }
+        held
     }
 
     /// Waits for a count the session reads together with the others asked for this turn, read
@@ -3046,10 +3049,9 @@ impl Exploration {
                 answer,
             } in landed
             {
-                if generation != this.generation {
+                if generation != this.generation || !this.finished(&target, ticket) {
                     continue;
                 }
-                this.finished(&target, ticket);
                 let taken = match answer {
                     Answer::Read(result) => this.apply(&target, result, sent_at.as_deref(), cx),
                     Answer::Count(group, count) => {
@@ -5522,6 +5524,80 @@ mod tests {
                 exploration.state().labels
             );
             assert!(exploration.naming.is_empty(), "the landed read let go of");
+        });
+    }
+
+    /// An answer queued for a read started again since (a new search) is not taken: before
+    /// answers waited in a queue, dropping the read's task stopped its answer, and taken, the
+    /// old search's page was appended to the new one's list, which then showed both searches'
+    /// rows and was marked read while the new search was still out.
+    #[gpui::test]
+    async fn an_answer_queued_for_a_read_started_again_is_not_taken(cx: &mut gpui::TestAppContext) {
+        use crate::test_server::followed_session;
+        const KNOWING: &str = "node Person {\n  slug: String @key\n  name: String\n}\nedge Knows: Person -> Person @card(0..)\n";
+        // Each search's page: two rows named after the text searched.
+        let (session, _served) = followed_session(
+            KNOWING,
+            |asked| {
+                let params = asked["params"].as_object().cloned().unwrap_or_default();
+                let searched = ["ann", "bo"]
+                    .into_iter()
+                    .find(|text| params.values().any(|value| value == text));
+                match (asked["name"].as_str(), searched) {
+                    (Some("studio_node"), _) => json!([{ "id": "p0", "label": "Zed" }]),
+                    (Some("studio_page_degrees"), _) => json!([{ "id": "p0", "n": 300 }]),
+                    (Some("studio_neighbours"), Some(text)) => json!([
+                        { "id": format!("{text}-1"), "edge_id": format!("e-{text}-1"), "label": text },
+                        { "id": format!("{text}-2"), "edge_id": format!("e-{text}-2"), "label": text },
+                    ]),
+                    _ => json!([]),
+                }
+            },
+            cx,
+        );
+        cx.run_until_parked();
+        let schema = SchemaModel::parse(KNOWING).unwrap();
+        let knows = group(&schema, "Person", "Knows", Direction::Outgoing);
+        let key = GroupKey::new(NodeRef::new("Person", "p0"), knows.clone());
+        let exploration = cx.update(|cx| Exploration::for_session(&session, cx));
+        exploration.update(cx, |exploration, cx| {
+            exploration.root_at(NodeRef::new("Person", "p0"), cx);
+        });
+        cx.run_until_parked();
+        exploration.update(cx, |exploration, cx| {
+            exploration.expand(&ExplorePath::root().child_group(&knows), cx);
+        });
+        cx.run_until_parked();
+
+        // The first search's page lands and waits in the queue, not taken yet.
+        exploration.update(cx, |exploration, cx| {
+            exploration.search_group(&key, "ann", cx)
+        });
+        let queued = |cx: &mut gpui::TestAppContext| {
+            exploration.read_with(cx, |exploration, _| {
+                exploration
+                    .landed
+                    .iter()
+                    .any(|landed| landed.target == LoadTarget::Page(key.clone()))
+            })
+        };
+        for _ in 0..10_000 {
+            if queued(cx) {
+                break;
+            }
+            cx.executor().tick();
+        }
+        assert!(queued(cx), "the first search's page is queued");
+        // A keystroke later the search is another.
+        exploration.update(cx, |exploration, cx| {
+            exploration.search_group(&key, "bo", cx)
+        });
+        cx.run_until_parked();
+        exploration.read_with(cx, |exploration, _| {
+            let list = &exploration.state().neighbours[&key];
+            let ids: Vec<&str> = list.rows.iter().map(|row| row.node.id.as_str()).collect();
+            assert_eq!(ids, ["bo-1", "bo-2"], "the second search's rows alone");
+            assert_eq!(list.status, PageStatus::Idle);
         });
     }
 }
