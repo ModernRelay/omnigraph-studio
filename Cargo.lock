@@ -9537,6 +9537,7 @@ dependencies = [
  "theme",
  "type_table",
  "ui",
+ "ui_tool_server",
  "url",
  "zlog",
 ]
