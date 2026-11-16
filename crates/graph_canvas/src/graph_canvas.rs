@@ -1944,8 +1944,10 @@ impl GraphCanvas {
                     SceneKind::Hub { .. } => {
                         pin_key(&node.id).is_none_or(|key| !self.pinned.contains_key(&key))
                     }
-                    SceneKind::More { .. } => true,
-                    _ => false,
+                    // What hangs off it as text, not a chip of its own: "+K more" and the
+                    // note of what its reads have come to.
+                    SceneKind::More { .. } | SceneKind::Note { .. } => true,
+                    SceneKind::Node { .. } => false,
                 };
                 if follows
                     && taken.insert(child)
@@ -4883,6 +4885,42 @@ mod tests {
             for node in &opened {
                 assert!(drawn.contains(node), "{node:?} was opened, not drawn");
             }
+        });
+    }
+
+    /// A dragged node takes its note with it ("No relationships", Retry), as it takes its
+    /// pills and "+K more": the note is laid out as its child, so one left behind would jump
+    /// back at the next layout. Found by Cursor Bugbot on #110.
+    #[gpui::test]
+    async fn a_dragged_node_takes_its_note(cx: &mut gpui::TestAppContext) {
+        let (canvas, _, ada) = canvas_of_ada(cx);
+        canvas.update(cx, |canvas, cx| {
+            let mut scene = scene_of(&["Ada"]);
+            scene.nodes.push(crate::model::SceneNode {
+                id: SceneId::Note(ada.clone()),
+                kind: SceneKind::Note {
+                    node: ada.clone(),
+                    note: crate::model::Note::Empty,
+                },
+                label: "No relationships".into(),
+                color_key: "Person".into(),
+                parent: Some(0),
+                path: None,
+            });
+            let texts = vec![texts_of(&["Ada"]).remove(0), texts_of(&["x"]).remove(0)];
+            canvas.apply_layout(
+                scene,
+                texts,
+                vec![10.; 2],
+                vec![Vec2::default(), Vec2::new(60., 0.)],
+                cx,
+            );
+            let followers: Vec<usize> = canvas
+                .followers(&[0])
+                .into_iter()
+                .map(|(index, _)| index)
+                .collect();
+            assert_eq!(followers, [1], "the note goes with its node");
         });
     }
 
