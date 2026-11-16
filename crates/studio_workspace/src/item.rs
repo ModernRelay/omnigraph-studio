@@ -61,6 +61,19 @@ pub struct InspectedNode {
     pub snapshot: Option<String>,
 }
 
+/// What a tab has selected, as identifiers only (spec 032): what `studio_selection` answers an
+/// agent. It never holds a property value or a row.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SelectedIds {
+    /// The type of the nodes selected, when they share one.
+    pub type_name: Option<String>,
+    /// The nodes selected, by id: a table's marked rows or the row under its cursor, a canvas's
+    /// marked chips or its selected one, a tree's selected row, a page's node.
+    pub ids: Vec<String>,
+    /// The node a canvas or a tree walks from.
+    pub root: Option<(String, String)>,
+}
+
 /// What a tab adds to the status bar (spec 002): a few facts after the graph and branch, as
 /// Zed's status items, and the keys it answers, which the bar lists in a panel behind one
 /// button rather than spelling them out. A tab's controls belong in the tab.
@@ -127,6 +140,25 @@ pub trait Item: Render + Focusable + EventEmitter<ItemEvent> {
         None
     }
 
+    /// The commit the tab is held at, read-only (spec 009); `None` follows its branch's head.
+    fn held_at(&self, _cx: &App) -> Option<String> {
+        None
+    }
+
+    /// What the tab has selected, as identifiers only, for an agent (spec 032): `None` when
+    /// nothing is or the tab has no selection to name. Read without making anything.
+    fn selected_ids(&self, _cx: &App) -> Option<SelectedIds> {
+        None
+    }
+
+    /// The view this tab is (spec 020): by default the current entry of its view strip.
+    fn view_kind(&self, cx: &App) -> Option<studio_actions::ViewKind> {
+        self.views(cx)
+            .into_iter()
+            .find(|link| link.current)
+            .map(|link| link.kind)
+    }
+
     /// What the tab has selected, which the inspector shows (spec 020): `None` when nothing is.
     /// Asked while the inspector is shown, when the tab says its selection changed
     /// ([`ItemEvent::Selected`]) and when the tab comes to the front, so a hidden inspector
@@ -185,6 +217,9 @@ pub trait ItemHandle: 'static {
     fn thing(&self, cx: &App) -> Option<studio_actions::Thing>;
     fn views(&self, cx: &App) -> Vec<studio_actions::ViewLink>;
     fn view_action(&self, kind: studio_actions::ViewKind, cx: &App) -> Option<Box<dyn Action>>;
+    fn held_at(&self, cx: &App) -> Option<String>;
+    fn selected_ids(&self, cx: &App) -> Option<SelectedIds>;
+    fn view_kind(&self, cx: &App) -> Option<studio_actions::ViewKind>;
     fn inspected(&self, cx: &mut App) -> Option<Inspected>;
     fn is_dirty(&self, cx: &App) -> bool;
     fn is_stale(&self, cx: &App) -> bool;
@@ -227,6 +262,18 @@ impl<T: Item> ItemHandle for Entity<T> {
 
     fn view_action(&self, kind: studio_actions::ViewKind, cx: &App) -> Option<Box<dyn Action>> {
         self.read(cx).view_action(kind, cx)
+    }
+
+    fn held_at(&self, cx: &App) -> Option<String> {
+        self.read(cx).held_at(cx)
+    }
+
+    fn selected_ids(&self, cx: &App) -> Option<SelectedIds> {
+        self.read(cx).selected_ids(cx)
+    }
+
+    fn view_kind(&self, cx: &App) -> Option<studio_actions::ViewKind> {
+        self.read(cx).view_kind(cx)
     }
 
     fn inspected(&self, cx: &mut App) -> Option<Inspected> {

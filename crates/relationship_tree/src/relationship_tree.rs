@@ -333,6 +333,27 @@ impl Item for RelationshipTree {
         })
     }
 
+    fn held_at(&self, _cx: &App) -> Option<String> {
+        self.at_commit.clone()
+    }
+
+    /// The selected row's node and the node the tree walks from (spec 032).
+    fn selected_ids(&self, _cx: &App) -> Option<studio_workspace::SelectedIds> {
+        let selected = self.selected_node();
+        let root = match &self.subject {
+            Subject::Node(root) => Some((root.type_name.clone(), root.id.clone())),
+            Subject::Set(_) => None,
+        };
+        if selected.is_none() && root.is_none() {
+            return None;
+        }
+        Some(studio_workspace::SelectedIds {
+            type_name: selected.as_ref().map(|node| node.type_name.clone()),
+            ids: selected.map(|node| node.id).into_iter().collect(),
+            root,
+        })
+    }
+
     fn thing(&self, _cx: &App) -> Option<studio_actions::Thing> {
         match &self.subject {
             Subject::Node(root) => Some(studio_actions::Thing::Node {

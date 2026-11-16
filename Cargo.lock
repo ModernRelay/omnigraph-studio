@@ -9634,6 +9634,7 @@ dependencies = [
  "log",
  "menu",
  "model",
+ "schemars 1.0.4",
  "serde",
  "serde_json",
  "studio_actions",

@@ -135,6 +135,9 @@ pub mod workspace {
             About,
             /// Open Studio's settings.
             OpenSettings,
+            /// Open Studio's settings at Agent: the agent the panel runs, and whether agents
+            /// outside Studio may show things in Studio.
+            OpenAgentSettings,
             /// Switch the window's graph to another branch.
             SwitchBranch,
             /// Open a new window.
@@ -422,7 +425,7 @@ pub mod graph {
         pub held: bool,
     }
 
-    /// Open one node in the inspector and the Explore panel.
+    /// Open one node as a page in its own tab, read at the branch head.
     #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
     #[action(namespace = studio_graph)]
     pub struct OpenNode {

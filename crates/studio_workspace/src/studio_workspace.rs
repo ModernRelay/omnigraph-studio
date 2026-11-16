@@ -16,6 +16,7 @@ mod panels;
 mod persistence;
 mod process_stats;
 mod sign_in_prompt;
+pub mod ui_tools;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -56,7 +57,7 @@ use ui::{ButtonLike, PopoverMenu, right_click_menu};
 pub use confirm::{Confirm, confirm, confirm_expand};
 use item::ItemHandle;
 pub use item::{
-    Inspected, InspectedNode, Item, ItemEvent, ItemStatus, KeyHint, NodeInspector,
+    Inspected, InspectedNode, Item, ItemEvent, ItemStatus, KeyHint, NodeInspector, SelectedIds,
     register_node_inspector,
 };
 pub use open_failure::open_failure;
@@ -447,6 +448,10 @@ pub struct Workspace {
     /// toasted or passed over.
     outcomes_toasted: HashMap<EntityId, u64>,
     _item_subscriptions: Vec<(gpui::EntityId, Subscription)>,
+    /// The agent whose tool call last opened or showed something here (spec 032), shown in the
+    /// status bar as "Opened by <agent>" for [`ui_tools::OPENED_BY_FOR`].
+    opened_by: Option<SharedString>,
+    _opened_by: Option<Task<()>>,
 }
 
 /// How often, at most, the workspace's state is compared with what was last written.
@@ -735,6 +740,8 @@ impl Workspace {
             _settings_subscription: settings_subscription,
             performance: None,
             status_items: Vec::new(),
+            opened_by: None,
+            _opened_by: None,
             window_active: window.is_window_active(),
             _performance: None,
             _performance_subscription: performance_subscription,
@@ -2414,6 +2421,67 @@ impl Workspace {
             }
         }
         cx.notify();
+    }
+
+    /// The panels shown now: each open dock's panel in front.
+    pub fn shown_panels(&self) -> Vec<SharedString> {
+        [&self.left, &self.right, &self.bottom]
+            .into_iter()
+            .filter(|dock| dock.open)
+            .filter_map(|dock| dock.active_id())
+            .collect()
+    }
+
+    /// Whether the window has a panel by this id, in any dock.
+    pub fn has_panel(&self, id: &str) -> bool {
+        self.dock_of(id).is_some()
+    }
+
+    /// Every panel's id, dock by dock.
+    pub fn panel_ids(&self) -> Vec<SharedString> {
+        [&self.left, &self.right, &self.bottom]
+            .into_iter()
+            .flat_map(|dock| dock.panels.iter().map(|panel| panel.id.clone()))
+            .collect()
+    }
+
+    /// A panel's title, as its header says it.
+    pub fn panel_title(&self, id: &str) -> Option<SharedString> {
+        [&self.left, &self.right, &self.bottom]
+            .into_iter()
+            .flat_map(|dock| dock.panels.iter())
+            .find(|panel| panel.id.as_ref() == id)
+            .map(|panel| panel.title.clone())
+    }
+
+    /// Says in the status bar that an agent's tool call opened or showed something here (spec
+    /// 032, Focus): "Opened by <agent>", for [`ui_tools::OPENED_BY_FOR`]. Another call
+    /// meanwhile starts the time again.
+    pub fn show_opened_by(
+        &mut self,
+        agent: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.opened_by.as_ref() != Some(&agent) {
+            self.opened_by = Some(agent);
+            cx.notify();
+        }
+        self._opened_by = Some(cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor()
+                .timer(ui_tools::OPENED_BY_FOR)
+                .await;
+            this.update(cx, |this, cx| {
+                this.opened_by = None;
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// The agent the status bar says opened something, while it says so.
+    pub fn opened_by(&self) -> Option<&SharedString> {
+        self.opened_by.as_ref()
     }
 
     /// Whether the inspector is shown: its dock open, with the inspector in front. Zoom and
@@ -4568,6 +4636,16 @@ impl Workspace {
                     .flex_none()
                     .child(studio_ui::ds::spinner())
                     .child(studio_ui::ds::text::meta(text).single_line())
+            }))
+            .children(self.opened_by.clone().map(|agent| {
+                // Rare, and a sign something moved: it comes in with a short fade (VII).
+                studio_ui::ds::chip(format!("Opened by {agent}"), cx)
+                    .id("opened-by")
+                    .with_animation(
+                        "opened-by-arrives",
+                        studio_ui::motion::arrival(studio_ui::motion::ENTER),
+                        |chip, delta| chip.opacity(delta),
+                    )
             }))
             .children(status.end)
             // The tab's keys, behind one button: the bar names facts, not shortcuts.
