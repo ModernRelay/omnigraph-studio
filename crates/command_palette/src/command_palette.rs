@@ -435,8 +435,10 @@ pub(crate) struct CommandPalette {
     type_order: Vec<String>,
     /// What each type answered for the text.
     answered: HashMap<String, TypeAnswer>,
-    /// Types the person asked to see more of ("More in <Type>…").
+    /// Types the person asked to see more of ("More in <Type>…"), and the one whose first new
+    /// row the highlight moves to once its answer lands.
     expanded: HashSet<String>,
+    reveal: Option<String>,
     /// One search per node type for the text. Dropped, and so stopped, when it changes.
     node_reads: Vec<Task<()>>,
     /// Of those, the searches not yet answered.
@@ -580,6 +582,7 @@ impl CommandPalette {
             type_order: Vec::new(),
             answered: HashMap::new(),
             expanded: HashSet::new(),
+            reveal: None,
             node_reads: Vec::new(),
             pending_reads: 0,
             arrived: Vec::new(),
@@ -682,6 +685,7 @@ impl CommandPalette {
         self.landing = None;
         self.answered.clear();
         self.expanded.clear();
+        self.reveal = None;
         self.searching = false;
         if text.is_empty() {
             self.nodes.clear();
@@ -825,18 +829,31 @@ impl CommandPalette {
             }
         }
         batch.sort_by_key(|row| (row.0, row.1, row.2, row.3));
+        // A type the person asked for more of shows them whatever the list holds: its own
+        // limit bounds it.
+        let mut revealed = None;
         for (_, _, _, _, type_name, hit) in batch {
-            if self.nodes.len() < NODES_SHOWN {
+            let asked = self.expanded.contains(&type_name);
+            if asked || self.nodes.len() < NODES_SHOWN {
+                if asked && revealed.is_none() && self.reveal.as_ref() == Some(&type_name) {
+                    revealed = Some(node_key(&type_name, &hit.id));
+                }
                 self.nodes.push((type_name, hit));
             }
         }
         self.show_nodes(cx);
+        // "More in <Type>…" goes once run: the highlight moves to the first row it brought.
+        if let Some(key) = revealed {
+            self.reveal = None;
+            self.select_key(Some(key), cx);
+        }
     }
 
     /// "More in <Type>…": the type's best [`NODES_EXPANDED`] for the text. The palette stays
     /// open, on this row.
     fn show_more(&mut self, type_name: String, cx: &mut Context<Self>) {
         self.expanded.insert(type_name.clone());
+        self.reveal = Some(type_name.clone());
         let text = self.nodes_for.clone();
         self.find_type(self.search, &text, type_name, cx);
         self.show_nodes(cx);
@@ -917,6 +934,8 @@ impl CommandPalette {
     }
 
     /// Highlights the row with candidate key `key` again, where it is ranked now.
+    /// A row no longer listed (a "More in <Type>…" that was run) leaves the highlight on a row
+    /// that is, never past the end.
     fn select_key(&mut self, key: Option<String>, cx: &mut Context<Self>) {
         if let Some(index) = key.and_then(|key| {
             self.matches
@@ -924,6 +943,8 @@ impl CommandPalette {
                 .position(|ranked| self.candidates[ranked.index].key == key)
         }) {
             self.select(index, cx);
+        } else if self.selected >= self.matches.len() {
+            self.select(self.matches.len().saturating_sub(1), cx);
         }
     }
 
@@ -2253,6 +2274,54 @@ mod tests {
         assert!(!shown.contains(&more));
         // The rows shown first kept their place.
         assert_eq!(shown[0], "node:Person:p00");
+    }
+
+    /// With the list full (twelve types, five each), "More in <Type>…" still shows that type's
+    /// 25, and the highlight moves to the first of them: ↵ then opens a node.
+    #[gpui::test]
+    async fn more_in_a_type_shows_more_when_the_list_is_full(cx: &mut TestAppContext) {
+        let mut schema = String::new();
+        for n in 0..TWELVE_TYPES {
+            schema.push_str(&format!(
+                "node Named{n:02} {{\n  slug: String @key\n  name: String\n}}\n"
+            ));
+        }
+        let find: Find = Box::new(|_, asked| {
+            let ty = searched_type(asked);
+            let rows = Value::Array(
+                (0..40)
+                    .map(|n| json!({"id": format!("{ty}-{n:02}"), "p0": format!("Ada {n}")}))
+                    .collect(),
+            );
+            (rows, Duration::ZERO)
+        });
+        let (session, searches) = served(&schema, json!([]), find, cx);
+        let (palette, cx) = palette(Scope::Nodes, session, cx);
+        searches.on.store(true, Ordering::SeqCst);
+        type_text(&palette, "ada", cx);
+        cx.executor().advance_clock(NODE_SEARCH_DELAY);
+        cx.run_until_parked();
+        let results = |cx: &mut VisualTestContext| palette.read_with(cx, |p, _| p.result_count());
+        assert_eq!(results(cx), NODES_SHOWN, "the list is full");
+        let more = format!("{MORE_IN}Named03");
+        palette.update_in(cx, |palette, window, cx| {
+            let at = palette
+                .matches
+                .iter()
+                .position(|ranked| palette.candidates[ranked.index].key == more)
+                .unwrap();
+            palette.select(at, cx);
+            palette.run_selected(window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(results(cx), NODES_SHOWN + NODES_EXPANDED - NODES_PER_TYPE);
+        palette.read_with(cx, |palette, _| {
+            assert_eq!(
+                palette.selected_key().as_deref(),
+                Some("node:Named03:Named03-05"),
+                "on the first row it brought"
+            );
+        });
     }
 
     /// A type whose search fails shows as failed, with Retry, and never as "No node matches";

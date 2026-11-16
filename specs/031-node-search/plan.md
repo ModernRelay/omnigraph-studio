@@ -115,7 +115,8 @@ the id.
   other (`LANDING_DELAY`), or at once when the last type answers; rows already shown keep their
   place.
 - Each type shows its best `NODES_PER_TYPE` = 5; one with more offers "More in <Type>…", which
-  shows up to `NODES_EXPANDED` = 25 and keeps the palette open. At most `NODES_SHOWN` = 60 rows.
+  shows up to `NODES_EXPANDED` = 25 and keeps the palette open, the highlight on the first row it
+  brought. At most `NODES_SHOWN` = 60 rows, besides those of a type the person asked more of.
 - A row matched on a property other than the name ends with "<Type> · <property>", and the
   footer says "Matched <property>: <text>".
 - While open, the palette holds a read scope (`ReadView::Search`), so the change feed is asked
@@ -137,7 +138,8 @@ the id.
 
 ### The AI filter's "related to"
 
-A name names a node only when one matches, or one alone is it exactly (`suggest::named`). When
+A name names a node only when one matches, or one alone is it exactly by its id or name, not by
+an email or handle that happens to equal it (`suggest::named`). When
 several match, nothing is filtered by it: its filter opens as a draft with the name in its
 value field and the matches offered, and the sentence's note says "N Org nodes match "Acme":
 pick one in the filter." When none match, the note says so.
