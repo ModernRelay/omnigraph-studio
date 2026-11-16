@@ -1498,24 +1498,28 @@ impl RelationshipTree {
                 .pt(px(space::SM))
                 .pb(px(space::SM))
                 .gap(px(space::XS))
+                // In a row of its own, so the column does not stretch the button across the
+                // view; the same button as the table's and the query's.
                 .when(newer, |d| {
                     d.child(
-                        studio_ui::ds::row_button("newer", "Newer data · Refresh")
-                            .style(ButtonStyle::Tinted(ui::TintColor::Accent))
-                            .tip_fn({
-                                let focus = self.focus_handle.clone();
-                                move |_, cx| {
-                                    studio_ui::ds::tooltip_for_action_in_view(
-                                        "The branch moved since this tree was read. Refresh reads it again.",
-                                        &Refresh,
-                                        &focus,
-                                        cx,
-                                    )
-                                }
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.with_exploration(cx, |e, cx| e.refresh(cx));
-                            })),
+                        h_flex().child(
+                            studio_ui::ds::button("newer", "Newer data · Refresh")
+                                .style(ButtonStyle::Tinted(ui::TintColor::Accent))
+                                .tip_fn({
+                                    let focus = self.focus_handle.clone();
+                                    move |_, cx| {
+                                        studio_ui::ds::tooltip_for_action_in_view(
+                                            "The branch moved since this tree was read. Refresh reads it again.",
+                                            &Refresh,
+                                            &focus,
+                                            cx,
+                                        )
+                                    }
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.with_exploration(cx, |e, cx| e.refresh(cx));
+                                })),
+                        ),
                     )
                 })
                 // What is typed filters the rows; it reads as a field so it is not taken for
