@@ -1454,12 +1454,35 @@ impl RelationshipTree {
         )
     }
 
-    /// The tab's toolbar: hide relationships with none, and close everything below the root.
+    /// The tab's toolbar: the views, Refresh when the branch moved, hide relationships with
+    /// none, and close everything below the root.
     fn render_toolbar(&self, cx: &mut Context<Self>) -> gpui::Div {
         let hide_empty = self.hide_empty;
+        let newer = self.exploration.read(cx).newer_available();
         let strip = studio_workspace::view_strip(Item::views(self, cx), cx);
         studio_ui::ds::toolbar(cx)
             .children(strip)
+            // Beside the views, as the table and the query put it.
+            .when(newer, |d| {
+                d.child(
+                    studio_ui::ds::button("newer", "Newer data · Refresh")
+                        .style(ButtonStyle::Tinted(ui::TintColor::Accent))
+                        .tip_fn({
+                            let focus = self.focus_handle.clone();
+                            move |_, cx| {
+                                studio_ui::ds::tooltip_for_action_in_view(
+                                    "The branch moved since this tree was read. Refresh reads it again.",
+                                    &Refresh,
+                                    &focus,
+                                    cx,
+                                )
+                            }
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.with_exploration(cx, |e, cx| e.refresh(cx));
+                        })),
+                )
+            })
             .child(div().flex_1())
             .child(
                 studio_ui::ds::toolbar_actions()
@@ -1481,11 +1504,10 @@ impl RelationshipTree {
             )
     }
 
+    /// What is typed to filter the rows, under the toolbar while there is any.
     fn render_header(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let e = self.exploration.read(cx);
-        let newer = e.newer_available();
         let filter = self.filter.clone();
-        if !newer && filter.is_empty() {
+        if filter.is_empty() {
             return None;
         }
         let field = studio_ui::ds::surface::sunken(cx);
@@ -1498,30 +1520,6 @@ impl RelationshipTree {
                 .pt(px(space::SM))
                 .pb(px(space::SM))
                 .gap(px(space::XS))
-                // In a row of its own, so the column does not stretch the button across the
-                // view; the same button as the table's and the query's.
-                .when(newer, |d| {
-                    d.child(
-                        h_flex().child(
-                            studio_ui::ds::button("newer", "Newer data · Refresh")
-                                .style(ButtonStyle::Tinted(ui::TintColor::Accent))
-                                .tip_fn({
-                                    let focus = self.focus_handle.clone();
-                                    move |_, cx| {
-                                        studio_ui::ds::tooltip_for_action_in_view(
-                                            "The branch moved since this tree was read. Refresh reads it again.",
-                                            &Refresh,
-                                            &focus,
-                                            cx,
-                                        )
-                                    }
-                                })
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.with_exploration(cx, |e, cx| e.refresh(cx));
-                                })),
-                        ),
-                    )
-                })
                 // What is typed filters the rows; it reads as a field so it is not taken for
                 // a row.
                 .when(!filter.is_empty(), |d| {
@@ -1532,19 +1530,14 @@ impl RelationshipTree {
                             .gap(px(space::SM))
                             .rounded(px(studio_ui::ds::radii(cx).sm))
                             .bg(field)
-                            .child(
-                                studio_ui::ds::icon::meta(IconName::MagnifyingGlass),
-                            )
+                            .child(studio_ui::ds::icon::meta(IconName::MagnifyingGlass))
                             .child(
                                 div()
                                     .min_w_0()
                                     .flex_1()
                                     .child(studio_ui::ds::text::body(filter).truncate()),
                             )
-                            .child(
-                                studio_ui::ds::text::meta("esc")
-                                    .color(Color::Disabled),
-                            ),
+                            .child(studio_ui::ds::text::meta("esc").color(Color::Disabled)),
                     )
                 })
                 .into_any_element(),
