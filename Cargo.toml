@@ -21,6 +21,7 @@ members = [
     "crates/review",
     "crates/history",
     "crates/agent_panel",
+    "crates/ui_tool_server",
     "crates/studio_update",
     "crates/oauth_client",
     "crates/model",
@@ -53,6 +54,7 @@ studio_settings = { path = "crates/studio_settings" }
 studio_theme = { path = "crates/studio_theme" }
 studio_ui = { path = "crates/studio_ui" }
 studio_workspace = { path = "crates/studio_workspace" }
+ui_tool_server = { path = "crates/ui_tool_server" }
 change_cards = { path = "crates/change_cards" }
 filter_words = { path = "crates/filter_words" }
 graph_client = { path = "crates/graph_client" }

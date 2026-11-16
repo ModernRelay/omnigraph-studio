@@ -445,6 +445,7 @@ mod tests {
                 "omnigraph_cloud",
                 "agent.command",
                 "agent.ask_before_writes",
+                "agent.outside_agents",
                 "models.fast",
                 "models.careful",
                 "models.key_stored",

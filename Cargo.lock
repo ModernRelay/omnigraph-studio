@@ -10673,6 +10673,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ui_tool_server"
+version = "0.4.7"
+dependencies = [
+ "futures",
+ "getrandom 0.3.4",
+ "gpui",
+ "httparse",
+ "log",
+ "serde_json",
+ "smol",
+ "studio_actions",
+ "studio_settings",
+ "studio_workspace",
+]
+
+[[package]]
 name = "ulid"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

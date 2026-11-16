@@ -450,6 +450,12 @@ pub struct AgentSettings {
     /// go through, each shown as a card.
     #[schemars(title = "Ask before writes")]
     pub ask_before_writes: bool,
+    // Spec 032.
+    /// Claude Code, Codex and other agents on this computer may open tables, pages, canvases
+    /// and queries in Studio's windows, and read which tabs are open, through Studio's tool
+    /// server. They never write. The address and token change each time Studio starts.
+    #[schemars(title = "Let agents outside Studio show things in Studio")]
+    pub outside_agents: bool,
 }
 
 /// Model calls through OpenRouter (spec 019): the model each kind of task runs on, whether a
