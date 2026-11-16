@@ -62,6 +62,7 @@ Add tasks, contracts or data-model files only for large features.
 | 029 | [The first run](029-first-run/plan.md) | implemented |
 | 030 | [The read ledger](030-read-ledger/plan.md) | draft |
 | 031 | [Finding a node by what people call it](031-node-search/plan.md) | built 2026-11-16 |
+| 032 | [Agents drive Studio's window](032-ui-tools/plan.md) | draft |
 
 Each plan's first line holds its full status. 012 is not scheduled: it records every Omnigraph change Studio would use, what Studio does
 without it, and which plan waits on it. Each feature plan's Deferred section names its IDs.
