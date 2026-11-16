@@ -2621,8 +2621,7 @@ impl GraphCanvas {
             exploration.update(cx, |e, cx| e.set_open(&paths, true, cx));
         };
         if opening.asks() {
-            let (title, description, action) = opening.question();
-            studio_workspace::confirm(window, cx, title, description, action, expand);
+            studio_workspace::confirm_expand(window, cx, opening.nodes, opening.reads, expand);
         } else {
             expand(window, cx);
         }

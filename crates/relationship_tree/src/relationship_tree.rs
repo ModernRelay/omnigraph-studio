@@ -751,8 +751,13 @@ impl RelationshipTree {
                     exploration.update(cx, |e, cx| e.expand_all(&path, cx));
                 };
                 if opening.asks() {
-                    let (title, description, action) = opening.question();
-                    studio_workspace::confirm(window, cx, title, description, action, expand);
+                    studio_workspace::confirm_expand(
+                        window,
+                        cx,
+                        opening.nodes,
+                        opening.reads,
+                        expand,
+                    );
                 } else {
                     expand(window, cx);
                 }

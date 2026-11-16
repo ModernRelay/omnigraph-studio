@@ -15860,6 +15860,79 @@ mod tests {
         });
     }
 
+    /// A page's group still being read when its neighbours' type is named otherwise lands
+    /// named by the new choice: the names are read again as it lands, as a table's cells are.
+    /// Before, it kept the names its read was built with for good (review of #111).
+    #[gpui::test]
+    async fn a_group_read_out_when_nodes_are_named_otherwise_lands_renamed(
+        cx: &mut TestAppContext,
+    ) {
+        const CODED: &str = "node Person {\n  slug: String @key\n  name: String\n}\nnode Company {\n  slug: String @key\n  name: String\n  code: String?\n}\nedge WorksAt: Person -> Company\nedge Founded: Person -> Company\nedge Knows: Person -> Person\nedge Likes: Person -> Person\n";
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+            cx.set_global(studio_settings::StudioSettings::default());
+        });
+        let graph = std::sync::Arc::new(circle());
+        let (session, _writer, served) = crate::test_support::session_served(
+            CODED,
+            move |read| {
+                match read["name"].as_str() {
+                Some("studio_node_labels") => serde_json::Value::Array(
+                    read["params"]["ids"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|id| serde_json::json!({ "id": id, "label": format!("Code {}", id.as_str().unwrap()) }))
+                        .collect(),
+                ),
+                _ => graph.answer(read),
+            }
+            },
+            cx,
+        );
+        // Ada's companies are read, and held until the choice has changed.
+        let release = served.hold(|read| {
+            read["name"] == "studio_neighbours"
+                && read["query"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("worksAt")
+        });
+        let page_session = session.clone();
+        let (page, cx) = cx.add_window_view(move |_, cx| {
+            crate::peek::NodePeek::page(page_session, "Person".into(), "p1".into(), None, cx)
+        });
+        cx.run_until_parked();
+        let company = |page: &crate::peek::NodePeek| {
+            page.groups_shown()
+                .into_iter()
+                .find(|(key, ..)| key == "out:WorksAt")
+                .unwrap()
+                .3
+        };
+        assert_eq!(
+            page.read_with(cx, |page, _| company(page)),
+            None,
+            "still out"
+        );
+
+        let key = session.read_with(cx, |session, _| session.overrides_key());
+        cx.update(|_, cx| {
+            cx.update_global::<studio_settings::StudioSettings, _>(|settings, _| {
+                settings.set_label(&key, "Company", Some("code".into()))
+            })
+        });
+        cx.run_until_parked();
+        release.send(()).ok();
+        cx.run_until_parked();
+        assert_eq!(
+            page.read_with(cx, |page, _| company(page)),
+            Some(vec![Some("Code c1".to_owned())]),
+            "named by the new choice"
+        );
+    }
+
     /// The ledger's measure of opening a table, a row's page and then the row's peek (spec
     /// 030, part 5, "Seeding before prefetch"). The page reads only the groups the table did not
     /// count empty: before, it sent one `studio_neighbours` for each of Ada's six groups; now

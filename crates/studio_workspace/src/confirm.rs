@@ -98,3 +98,70 @@ pub fn confirm(
         });
     });
 }
+
+/// Asks before an Expand all that opens `nodes` nodes and asks the server for `reads` reads
+/// (spec 006, "Expand all"), and runs `expand` when the person agrees. The canvas and the tree
+/// ask with it, so both word it alike.
+pub fn confirm_expand(
+    window: &mut Window,
+    cx: &mut App,
+    nodes: usize,
+    reads: usize,
+    expand: impl FnOnce(&mut Window, &mut App) + 'static,
+) {
+    let (title, description, action) = expand_question(nodes, reads);
+    confirm(window, cx, title, description, action, expand);
+}
+
+/// The words of [`confirm_expand`]: a title, what it costs, and the action's label.
+fn expand_question(nodes: usize, reads: usize) -> (String, String, String) {
+    let reads = match reads {
+        1 => "1 read".to_owned(),
+        n => format!("{} reads", studio_ui::group_digits(n)),
+    };
+    if nodes == 0 {
+        return (
+            "Open these relationships?".to_owned(),
+            format!("Opening them asks the server for {reads}, and shows what they hold."),
+            "Open".to_owned(),
+        );
+    }
+    let nodes = studio_ui::group_digits(nodes);
+    (
+        format!("Expand {nodes} nodes?"),
+        format!(
+            "Each node shows its relationships: that asks the server for {reads}, and draws \
+             a hub for every relationship with neighbours."
+        ),
+        format!("Expand {nodes} nodes"),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The question before a large Expand all names the nodes and the reads, digits grouped;
+    /// opening only relationships names the reads alone (spec 006).
+    #[test]
+    fn the_expand_question_names_its_nodes_and_reads() {
+        assert_eq!(
+            expand_question(1_763, 2_800),
+            (
+                "Expand 1,763 nodes?".to_owned(),
+                "Each node shows its relationships: that asks the server for 2,800 reads, and \
+                 draws a hub for every relationship with neighbours."
+                    .to_owned(),
+                "Expand 1,763 nodes".to_owned(),
+            )
+        );
+        assert_eq!(
+            expand_question(0, 1),
+            (
+                "Open these relationships?".to_owned(),
+                "Opening them asks the server for 1 read, and shows what they hold.".to_owned(),
+                "Open".to_owned(),
+            )
+        );
+    }
+}
