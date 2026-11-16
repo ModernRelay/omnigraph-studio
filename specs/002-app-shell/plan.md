@@ -301,26 +301,17 @@ what was last saved at most every 250 ms rather than serializing every tab on ev
   panel does (`studio_graph::OpenStoredQuery`). Tab
   (bound under `CommandPalette > Editor`, so it outranks the editor's) dismisses the palette
   and sends `studio_agent::Ask`; with no agent chosen, the agent tab says the question waits.
-  Node search tries the text as typed, lowercase and capitalized, because `contains` is
-  exact on 0.13 ("ada" finds "Ada Turing"). GQ has no node alternatives, so a search is one
-  read per node type, five rows each. A pause reads at most eight types
-  (`TYPES_PER_SEARCH`, as many as a connection has on the wire at once, so the reads go out
-  together rather than 120 of them queueing behind every other view's on a graph of 120
-  types): those a property names first, since a name is what a person types, then those
-  found by id alone, types the counts say are empty last, each in schema order. When types
-  are left, a last row "Search N more types" reads the next eight and keeps the palette open.
-  Each type's rows show as it answers, below the rows already shown, which keep their place
-  whichever type answers first (constitution V); in All they follow the ranked rows instead
-  of being ranked among them, so a node that lands never pushes down the row under the
-  cursor. New text stops the reads for the old. Typing on is mostly free: when a type's
-  answer came back under five rows and the new text only narrows the old (each spelling of
-  the new text starts with one of the old, `gq_language::builder::search_narrows`), its rows
-  are filtered in the palette by the query's own predicate (`search_matches`); text typed
-  back to after a backspace shows its answer again. Earlier node rows the new text's
-  predicate refuses go at once; the others stay until their type answers. From the keystroke
-  until every type read has answered, a turning circle (`ds::spinner`) sits at the end of the
-  search field in All and Nodes, an empty list reads "Searching nodes…" instead of "No node
-  matches", and the footer leaves out its count until something has come back.
+  ~~Node search tries the text as typed, lowercase and capitalized, … reads at most eight
+  types (`TYPES_PER_SEARCH`) … "Search N more types" … narrowed in the palette by
+  `search_narrows` …~~ Since 2026-11-16 node search is spec 031's: every type is searched, a
+  type of at most 5,000 nodes is matched in memory from its name index (read once per commit),
+  regardless of case, accents and word order, and ranked exact, prefix, word start, anywhere; a
+  larger type is searched on the server. Each type shows its best five, with "More in <Type>…"
+  for more, and a type whose search failed shows with Retry. Rows already shown keep their place
+  as answers land (constitution V); in All they follow the ranked rows. From the keystroke until
+  every type has answered, a turning circle (`ds::spinner`) sits at the end of the search field
+  in All and Nodes, an empty list reads "Searching nodes…" instead of "No node matches", and
+  the footer leaves out its count until something has come back.
 - Opens in one frame with no animation (constitution VII).
 - Landed 2026-10-12: ⌘K and ⌘⇧P (Ctrl elsewhere), bound by the default keymaps, so a person's
   keymap can unbind them. Rows are humanized action names (`studio_graph::OpenType` → "Graph:

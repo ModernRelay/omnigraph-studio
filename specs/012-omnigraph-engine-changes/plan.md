@@ -475,6 +475,44 @@ type). [#1397](https://github.com/ModernRelay/omnigraph/issues/1397).
 unbound; the write path's `@card` recount refuses one that would leave a dependent behind, and
 a row changed elsewhere since it was read may still be deleted.
 
+### Finding nodes (spec 031)
+
+Measured on 2026-11-16 against the ModernRelay operating graph (read-only) and three local
+graphs; the numbers are in spec 031's validation log.
+
+**E49. A substring test that ignores case and accents.** GQ's `contains` and `starts_with` are
+exact and case-sensitive (`references/queries.md`, "Filter Operators"), and neither 0.14, 0.15
+nor main (`query.pest` at `4f7c2076`) has `lower()`, `icontains` or `ilike`. A search for
+"openai" therefore misses "OpenAI" unless the client guesses its spelling. Add
+`icontains`/`istarts_with` (Unicode case folding, and a variant that also folds accents), or
+`lower()` and `fold()` usable in filters, which E40's string functions would cover. Engine rule:
+folding is the same on every platform and every server, and is documented with its Unicode
+version. *Waits:* 031. *Today:* a type of at most 5,000 nodes is matched in Studio's memory,
+from a name index read once per commit; a larger type is searched on the server with each word
+in four spellings (as typed, lowercase, Capitalized, UPPERCASE), so "mcKinsey" still misses
+"McKinsey" there.
+
+**E50. One request that finds nodes across types.** A node search reads each node type on its
+own, one request per type: 36 on the ModernRelay operating graph for a first search, then one
+per type whenever its nodes change. A route (or a GQ form) that takes a text and returns ranked
+matches per type, with a limit per type and the property each matched, would make a search one
+request, and let the server rank across types. Engine rule: the same read permission as a query
+of each type; a type the caller may not read is left out, not refused. *Waits:* 031. *Today:*
+one index read per type and commit, at most 8 at once (`READ_CONCURRENCY`), and the ranking is
+Studio's.
+
+**E51. Full-text search without declaring an index, and inside words.** `search`, `fuzzy`,
+`match_text` and `bm25` fold case and stem words, but only on a String with a one-column
+`@index` or `@key` (`T27` otherwise): on the ModernRelay operating graph `Org.name`,
+`Person.name`, `Opportunity.title` and `Meeting.title` have none, so the engine's search cannot
+be used for what people most often type. Full-text also matches whole words only: "insey" never
+finds "McKinsey". Let the label-like properties be searchable without a declaration per
+property (a schema-level default, or a scan with the same analyzer when no index exists), and
+add an n-gram analyzer or a substring mode so one call finds a word's middle too. Engine rule:
+results of a scan and of an index are the same. *Waits:* 031. *Today:* Studio runs the engine's
+search only on properties that declare an index, merges its hits after its own matches, and
+leaves out a property whose search fails.
+
 ### In 0.14, not in 0.13.0
 
 Studio's minimum server serves these, so it uses them without asking the server's OpenAPI
@@ -511,6 +549,8 @@ Then engine changes still open:
 8. E12, E13, E14, E17, E18, E19 as the matching Studio work starts.
 9. E35 to E38, which make a large graph's review take seconds rather than a minute; E37 is the
    smallest.
+10. E49 to E51, which would make finding a node one request and right on every type, however
+    large; E49 is the smallest.
 
 ## Decisions
 

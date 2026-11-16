@@ -43,6 +43,9 @@ it goes through Omnigraph's own RFC process.
 | E46 | The CLI keeps a token for a loopback `http://` server | 029 | Adds the server as an anonymous target and keeps the token in memory until Studio quits |
 | E47 | `GET /graphs` on an `--unauthenticated` server without a cluster policy | 029 | Add server takes an optional graph id; a 404 page says the server does not list its graphs |
 | E48 | A mutation precondition scoped to what the write touches, not the graph head; a mutation dry run that returns its changes and `@card` violations ([#1397](https://github.com/ModernRelay/omnigraph/issues/1397)) | 004 | Plans a delete at the branch head it last saw and sends it unbound, relying on the write path's `@card` check |
+| E49 | A substring test that ignores case and accents (`icontains`/`istarts_with`, or `lower()`/`fold()` in filters; see E40) | 031 | Types of at most 5,000 nodes are matched in Studio's memory from a name index read once per commit; larger types are searched on the server with each word in four spellings |
+| E50 | One request that finds nodes across types, ranked, with a limit per type and the property each matched | 031 | One name-index read per type and commit, at most 8 at once; Studio ranks across types |
+| E51 | Full-text search on label-like properties without a per-property `@index`, and a substring (n-gram) mode that finds a word's middle | 031 | Runs `search`/`bm25` only where an index is declared, merges its hits after its own matches, and leaves out a property whose search fails |
 
 Every server Studio supports serves these (checked against `v0.14.0`'s OpenAPI document, 2026-10-24):
 
@@ -60,7 +63,7 @@ Every server Studio supports serves these (checked against `v0.14.0`'s OpenAPI d
 | R1 | Blob writes | `blobPut`, `blobClear` | 004 | Choose File, a file dropped from Finder, and Clear, each bound to the value read |
 | R2 | Unpublished commits: `as_commit` on writes and merges, publish, drop, `GET /commits?listing=unpublished` | `commitPublish`, `commitDrop` | 004, 008 | A commit a write answers with is a branch's head only when its `kind` is `published`; Studio writes none itself, and the agent's gateway forwards none |
 | — | `Omnigraph-If-Actor`: the actor a request expects its credential to resolve to (#1074) | every graph route | 013 | Studio's own requests do not send it; the agent's gateway passes the CLI's `--as` on |
-| — | A full-text call on an unindexed property is `T27`; a missing index part is a 409 `full_text_index_required` (#1066) | `POST /query` | 007 | The query editor's check reports `T27`; the 409 is a generic failure |
+| — | A full-text call on an unindexed property is `T27`; a missing index part is a 409 `full_text_index_required` (#1066) | `POST /query` | 007, 031 | The query editor's check reports `T27`; the 409 is a generic failure. Node search (031) calls `search` only on properties that declare an index and leaves out one whose call fails |
 | — | Execution reports and explain pipelines: `ChangeOutput.executed`, `explain_version` 7 (#1099) | `POST /mutate`, `explain` | 007 | Explain trees without pipelines |
 
 Also served: unattached snapshots (`as unattached branch`; `CommitOutput.kind`,
