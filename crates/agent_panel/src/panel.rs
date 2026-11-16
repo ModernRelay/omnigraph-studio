@@ -912,6 +912,82 @@ pub struct AgentPanel {
     /// The fold count the thread's blocks were last measured with: a fold changes what every
     /// block of it shows.
     synced_folds: Option<u64>,
+    /// The window the tab is in: the one its agent's UI tools act in (spec 032).
+    window_id: u64,
+    /// The running agent's way to Studio's UI tools; its token stops working when the agent
+    /// stops ([`Self::stop_host`]).
+    ui_tools: Option<studio_workspace::ui_tools::UiToolEntry>,
+}
+
+/// What a call to Studio's UI tools is titled until its result says what it did.
+const STUDIO_CALL: &str = "Studio · ";
+
+/// A tool call's title as the thread shows it: a call to Studio's own UI tools, which the
+/// adapters title `mcp__studio__<tool>` or `mcp.studio.<tool>`, as "Studio · <tool>".
+fn shown_title(title: String) -> String {
+    match studio_workspace::ui_tools::studio_call(&title) {
+        Some(tool) => format!("{STUDIO_CALL}{tool}"),
+        None => title,
+    }
+}
+
+/// Whether the thread's title is a call to Studio's UI tools still waiting for its words.
+fn is_studio_call(title: &str) -> bool {
+    title.starts_with(STUDIO_CALL) || studio_workspace::ui_tools::studio_call(title).is_some()
+}
+
+/// The words a UI tool's result opens with ("Opened Project · Table"): the first text of its
+/// content that is not its JSON, as the adapters pass it on, in `content` or in `rawOutput`.
+fn studio_words(
+    content: Option<&Vec<agent_client_protocol::schema::v1::ToolCallContent>>,
+    raw_output: Option<&Value>,
+) -> Option<String> {
+    use agent_client_protocol::schema::v1::ToolCallContent;
+    let words = |text: &str| {
+        let text = text.trim();
+        (!text.is_empty() && !text.starts_with('{') && !text.starts_with('['))
+            .then(|| studio_ui::text::cut(text.lines().next().unwrap_or(text), 120))
+    };
+    let from_content = content.into_iter().flatten().find_map(|item| match item {
+        ToolCallContent::Content(content) => match &content.content {
+            ContentBlock::Text(text) => words(&text.text),
+            _ => None,
+        },
+        _ => None,
+    });
+    from_content.or_else(|| {
+        let raw = raw_output?;
+        match raw {
+            Value::String(text) => words(text),
+            Value::Array(items) => items
+                .iter()
+                .find_map(|item| item.get("text").and_then(Value::as_str).and_then(words)),
+            Value::Object(object) => object
+                .get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .find_map(|item| item.get("text").and_then(Value::as_str).and_then(words))
+                .or_else(|| object.get("says").and_then(Value::as_str).and_then(words)),
+            _ => None,
+        }
+    })
+}
+
+/// The option that allows one call: Studio's UI tools are allowed call by call, never for the
+/// rest of the session.
+fn allow_once(
+    options: &[PermissionOption],
+) -> Option<agent_client_protocol::schema::v1::PermissionOptionId> {
+    options
+        .iter()
+        .find(|option| option.kind == PermissionOptionKind::AllowOnce)
+        .or_else(|| {
+            options
+                .iter()
+                .find(|option| option.kind == PermissionOptionKind::AllowAlways)
+        })
+        .map(|option| option.option_id.clone())
 }
 
 impl EventEmitter<ItemEvent> for AgentPanel {}
@@ -1109,6 +1185,8 @@ impl AgentPanel {
             gateway_cards: std::collections::HashMap::new(),
             next_card: 0,
             synced_folds: None,
+            window_id: window.window_handle().window_id().as_u64(),
+            ui_tools: None,
         };
         panel.sync_setup_state(cx);
         panel
@@ -1245,9 +1323,16 @@ impl AgentPanel {
             );
         }
         self.cwd = Some(cwd.clone());
+        // Studio's UI tools (spec 032), with a token of this conversation's, bound to its
+        // window: the agent shows things only here.
+        let ui_tools = studio_workspace::ui_tools::UiToolEndpoint::entry_for(self.window_id, cx);
         let launch = SessionLaunch {
             cwd,
             resume: self.session_id.clone(),
+            ui_tools: ui_tools.as_ref().map(|entry| crate::host::UiToolAccess {
+                url: entry.url.clone(),
+                token: entry.token.clone(),
+            }),
         };
         let (events_tx, mut events_rx) = mpsc::unbounded();
         let (commands_tx, commands_rx) = mpsc::unbounded();
@@ -1316,6 +1401,7 @@ impl AgentPanel {
             _cli_home: cli_home,
             _tasks: tasks,
         });
+        self.ui_tools = ui_tools;
         self.enter_starting(cx);
         cx.notify();
     }
@@ -1371,6 +1457,7 @@ impl AgentPanel {
 
     fn stop_host(&mut self) {
         self.host = None;
+        self.ui_tools = None;
         self.preparing = None;
         // Options can only be set on a running session.
         self.config_options.clear();
@@ -1630,6 +1717,25 @@ impl AgentPanel {
                 });
             }
             HostEvent::Permission { request, reply } => {
+                // A call to Studio's own UI tools is allowed without asking: none writes, and
+                // the call shows in the thread (spec 032).
+                let title = request
+                    .tool_call
+                    .fields
+                    .title
+                    .as_deref()
+                    .unwrap_or_default();
+                let ours = self.ui_tools.is_some()
+                    && studio_workspace::ui_tools::studio_call(title).is_some();
+                if ours && let Some(allow) = allow_once(&request.options) {
+                    reply
+                        .send(RequestPermissionOutcome::Selected(
+                            SelectedPermissionOutcome::new(allow),
+                        ))
+                        .ok();
+                    cx.notify();
+                    return;
+                }
                 self.entries.push(Entry::Permission(PermissionCard {
                     title: request
                         .tool_call
@@ -1765,9 +1871,13 @@ impl AgentPanel {
                 }
             }
             SessionUpdate::ToolCall(call) => {
+                let title = match studio_words(Some(&call.content), call.raw_output.as_ref()) {
+                    Some(words) if is_studio_call(&call.title) => words,
+                    _ => shown_title(call.title),
+                };
                 self.entries.push(Entry::Tool {
                     id: call.tool_call_id.to_string(),
-                    title: call.title,
+                    title,
                     status: call.status,
                 });
             }
@@ -1780,7 +1890,17 @@ impl AgentPanel {
                     at.and_then(|at| self.entries.get_mut(at))
                 {
                     if let Some(new_title) = update.fields.title {
-                        *title = new_title;
+                        *title = shown_title(new_title);
+                    }
+                    // A call to Studio's UI tools shows what it did, in the result's words
+                    // (spec 032): "Opened Project · Table".
+                    if is_studio_call(title)
+                        && let Some(words) = studio_words(
+                            update.fields.content.as_ref(),
+                            update.fields.raw_output.as_ref(),
+                        )
+                    {
+                        *title = words;
                     }
                     if let Some(new_status) = update.fields.status {
                         *status = new_status;
@@ -4519,6 +4639,136 @@ mod tests {
     /// Messages sent before an agent is chosen wait for one, with "Choose an agent" said once.
     /// The same message sent again while it waits (the person trying again) is held once, so
     /// it does not show both in the thread and in the queue; a different one queues behind it.
+    /// A permission request for a call to Studio's own UI tools is allowed at once, with no
+    /// card, while the conversation has them; another tool's still asks. The thread titles a
+    /// call to them by the tool, then by the result's words, from Claude's content or Codex's
+    /// raw output.
+    #[gpui::test]
+    async fn studio_ui_tool_calls_are_allowed_and_titled_by_their_result(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use agent_client_protocol::schema::v1::{
+            PermissionOption, PermissionOptionKind, RequestPermissionRequest, TextContent,
+            ToolCall, ToolCallContent, ToolCallUpdate, ToolCallUpdateFields,
+        };
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, _) = graph_store::test_server::followed_session(
+            "node Person {\n  slug: String @key\n}\n",
+            |_| serde_json::json!([]),
+            cx,
+        );
+        cx.run_until_parked();
+        let (_root, cx) = cx.add_window_view(|_, _| gpui::EmptyView);
+        let panel = cx.update(|window, cx| {
+            cx.new(|cx| AgentPanel::new(session, WeakEntity::new_invalid(), None, window, cx))
+        });
+        let ask = |title: &str| {
+            let (reply, answer) = futures::channel::oneshot::channel();
+            let request = RequestPermissionRequest::new(
+                "s1",
+                ToolCallUpdate::new("t1", ToolCallUpdateFields::new().title(title.to_owned())),
+                vec![
+                    PermissionOption::new("always", "Always", PermissionOptionKind::AllowAlways),
+                    PermissionOption::new("once", "Allow", PermissionOptionKind::AllowOnce),
+                    PermissionOption::new("no", "Reject", PermissionOptionKind::RejectOnce),
+                ],
+            );
+            (HostEvent::Permission { request, reply }, answer)
+        };
+        let cards = |panel: &AgentPanel| {
+            panel
+                .entries
+                .iter()
+                .filter(|entry| matches!(entry, Entry::Permission(_)))
+                .count()
+        };
+
+        // Without the tools, Studio's name in a title is only a name: the person is asked.
+        let (event, _answer) = ask("mcp__studio__graph_open_type");
+        panel.update(cx, |panel, cx| panel.apply_event(event, cx));
+        panel.read_with(cx, |panel, _| assert_eq!(cards(panel), 1));
+
+        panel.update(cx, |panel, _| {
+            panel.ui_tools = Some(studio_workspace::ui_tools::UiToolEntry::new(
+                "http://127.0.0.1:1/mcp".into(),
+                "t".into(),
+                || {},
+            ))
+        });
+        for title in ["mcp__studio__graph_open_type", "mcp.studio.studio_windows"] {
+            let (event, mut answer) = ask(title);
+            panel.update(cx, |panel, cx| panel.apply_event(event, cx));
+            match answer.try_recv() {
+                Ok(Some(RequestPermissionOutcome::Selected(selected))) => {
+                    assert_eq!(selected.option_id.to_string(), "once", "{title}")
+                }
+                other => panic!("{title}: {other:?}"),
+            }
+        }
+        let (event, _other) = ask("mcp__studio__run_query");
+        panel.update(cx, |panel, cx| panel.apply_event(event, cx));
+        panel.read_with(cx, |panel, _| assert_eq!(cards(panel), 2, "not a UI tool"));
+
+        let titles = |panel: &AgentPanel| -> Vec<String> {
+            panel
+                .entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    Entry::Tool { title, .. } => Some(title.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        panel.update(cx, |panel, cx| {
+            for (id, title) in [
+                ("c1", "mcp__studio__graph_open_type"),
+                ("c2", "mcp.studio.graph_open_map"),
+            ] {
+                panel.apply_update(SessionUpdate::ToolCall(ToolCall::new(id, title)), cx);
+            }
+        });
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                titles(panel),
+                ["Studio · graph_open_type", "Studio · graph_open_map"]
+            );
+        });
+        panel.update(cx, |panel, cx| {
+            let text = |text: &str| {
+                ToolCallContent::from(ContentBlock::Text(TextContent::new(text.to_owned())))
+            };
+            panel.apply_update(
+                SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                    "c1",
+                    ToolCallUpdateFields::new().content(vec![
+                        text("Opened Project · Table"),
+                        text(r#"{"outcome":"opened"}"#),
+                    ]),
+                )),
+                cx,
+            );
+            panel.apply_update(
+                SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                    "c2",
+                    ToolCallUpdateFields::new().raw_output(serde_json::json!({
+                        "content": [
+                            { "type": "text", "text": "Opened Map" },
+                            { "type": "text", "text": "{}" },
+                        ],
+                    })),
+                )),
+                cx,
+            );
+        });
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(titles(panel), ["Opened Project · Table", "Opened Map"]);
+        });
+    }
+
     #[gpui::test]
     async fn a_message_sent_again_while_it_waits_is_held_once(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {

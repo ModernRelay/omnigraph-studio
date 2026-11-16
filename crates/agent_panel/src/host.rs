@@ -17,12 +17,12 @@ use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     AuthMethod, AuthenticateRequest, BooleanConfigOptionCapabilities, CancelNotification,
     ClientCapabilities, ClientSessionCapabilities, CloseSessionRequest, ContentBlock,
-    DeleteSessionRequest, Implementation, InitializeRequest, ListSessionsRequest,
-    LoadSessionRequest, NewSessionRequest, PromptRequest, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, ResumeSessionRequest, SessionConfigId,
-    SessionConfigOption, SessionConfigOptionValue, SessionConfigOptionsCapabilities, SessionId,
-    SessionInfo, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, StopReason,
-    TextContent,
+    DeleteSessionRequest, HttpHeader, Implementation, InitializeRequest, ListSessionsRequest,
+    LoadSessionRequest, McpServer, McpServerHttp, NewSessionRequest, PromptRequest,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    ResumeSessionRequest, SessionConfigId, SessionConfigOption, SessionConfigOptionValue,
+    SessionConfigOptionsCapabilities, SessionId, SessionInfo, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, StopReason, TextContent,
 };
 use agent_client_protocol::{
     AcpAgent, AcpAgentConfig, Agent, ConnectionTo, LineDirection, SentRequest,
@@ -79,6 +79,41 @@ pub struct SessionLaunch {
     pub cwd: PathBuf,
     /// A session to come back to, when the agent can load or resume one.
     pub resume: Option<String>,
+    /// Studio's UI tool server for this conversation (spec 032), passed to an agent that
+    /// takes MCP over HTTP.
+    pub ui_tools: Option<UiToolAccess>,
+}
+
+/// The UI tool server's address and the conversation's token for it.
+#[derive(Clone)]
+pub struct UiToolAccess {
+    pub url: String,
+    pub token: String,
+}
+
+impl std::fmt::Debug for UiToolAccess {
+    /// The token is never written out.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UiToolAccess")
+            .field("url", &self.url)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The MCP servers a conversation's session is opened with: Studio's UI tool server, named
+/// `studio`, when the agent takes MCP over HTTP (`mcpCapabilities.http`); none otherwise, and
+/// that agent has no UI tools (spec 032, The panel's agent).
+pub fn mcp_servers(launch: &SessionLaunch, http: bool) -> Vec<McpServer> {
+    match (&launch.ui_tools, http) {
+        (Some(access), true) => vec![McpServer::Http(
+            McpServerHttp::new(studio_workspace::ui_tools::SERVER_NAME, access.url.clone())
+                .headers(vec![HttpHeader::new(
+                    "Authorization",
+                    format!("Bearer {}", access.token),
+                )]),
+        )],
+        _ => Vec::new(),
+    }
 }
 
 /// What the agent said about itself when it started.
@@ -596,6 +631,7 @@ async fn connect(
                 load: capabilities.load_session,
                 resume: sessions.resume.is_some(),
                 close: sessions.close.is_some(),
+                http_mcp: capabilities.mcp_capabilities.http,
             };
             let methods = auth_choices(&initialized.auth_methods);
 
@@ -690,6 +726,8 @@ struct Can {
     load: bool,
     resume: bool,
     close: bool,
+    /// The agent takes MCP servers over HTTP (`mcpCapabilities.http`).
+    http_mcp: bool,
 }
 
 /// Opens one conversation and serves it until its panel lets go. A panel can let go while the
@@ -741,16 +779,20 @@ async fn open_session(
             return Ok(());
         }
         if can.load {
-            let request =
-                connection.send_request(LoadSessionRequest::new(id.clone(), launch.cwd.clone()));
+            let request = connection.send_request(
+                LoadSessionRequest::new(id.clone(), launch.cwd.clone())
+                    .mcp_servers(mcp_servers(&launch, can.http_mcp)),
+            );
             let loaded = open_request(&connection, request, &events, &mut commands, &mut held);
             if let Ok(loaded) = loaded.await {
                 opened = Some((id.clone(), Opened::Loaded));
                 config_options = loaded.config_options.unwrap_or_default();
             }
         } else {
-            let request =
-                connection.send_request(ResumeSessionRequest::new(id.clone(), launch.cwd.clone()));
+            let request = connection.send_request(
+                ResumeSessionRequest::new(id.clone(), launch.cwd.clone())
+                    .mcp_servers(mcp_servers(&launch, can.http_mcp)),
+            );
             let resumed = open_request(&connection, request, &events, &mut commands, &mut held);
             if let Ok(resumed) = resumed.await {
                 opened = Some((id.clone(), Opened::Resumed));
@@ -772,7 +814,10 @@ async fn open_session(
     let (session_id, opened) = match opened {
         Some(opened) => opened,
         None => {
-            let request = connection.send_request(NewSessionRequest::new(launch.cwd.clone()));
+            let request = connection.send_request(
+                NewSessionRequest::new(launch.cwd.clone())
+                    .mcp_servers(mcp_servers(&launch, can.http_mcp)),
+            );
             let created = open_request(&connection, request, &events, &mut commands, &mut held);
             match created.await {
                 Ok(created) => {
@@ -1186,6 +1231,41 @@ async fn list_sessions(
 
 #[cfg(test)]
 mod tests {
+
+    /// A conversation's session gets Studio's UI tool server, named `studio`, with its token
+    /// in a bearer header, only from an agent that takes MCP over HTTP (spec 032).
+    #[test]
+    fn the_ui_tool_server_goes_to_an_agent_that_takes_http() {
+        let launch = SessionLaunch {
+            cwd: std::env::temp_dir(),
+            resume: None,
+            ui_tools: Some(UiToolAccess {
+                url: "http://127.0.0.1:4100/mcp".into(),
+                token: "secret".into(),
+            }),
+        };
+        let servers = mcp_servers(&launch, true);
+        assert_eq!(
+            serde_json::to_value(&servers).unwrap(),
+            serde_json::json!([{
+                "type": "http",
+                "name": "studio",
+                "url": "http://127.0.0.1:4100/mcp",
+                "headers": [{ "name": "Authorization", "value": "Bearer secret" }],
+            }])
+        );
+        assert!(mcp_servers(&launch, false).is_empty(), "stdio only");
+        let without = SessionLaunch {
+            ui_tools: None,
+            ..launch.clone()
+        };
+        assert!(mcp_servers(&without, true).is_empty());
+        assert!(
+            !format!("{launch:?}").contains("secret"),
+            "never written out"
+        );
+    }
+
     use super::*;
     use agent_client_protocol::schema::v1::{ContentChunk, TextContent};
 
@@ -1254,6 +1334,7 @@ mod tests {
                 launch: SessionLaunch {
                     cwd: std::env::temp_dir(),
                     resume: None,
+                    ui_tools: None,
                 },
                 events,
                 commands: host_commands,

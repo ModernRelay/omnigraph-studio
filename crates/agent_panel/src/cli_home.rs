@@ -233,7 +233,15 @@ fn agents_md(graph: &str, branch: &str, base: &str, windows: bool, network: bool
          - `effects: unknown` on a write Studio sent means the server's answer was lost. Check \
          `commit list --branch {branch}` before trying again; never repeat a write blindly.\n\
          - When `{command}` says Studio has no CLI for this conversation, tell the person what \
-         it says.\n"
+         it says.\n\n\
+         ## Studio's window\n\n\
+         When you have the `studio` tools (`studio_windows`, `graph_open_type`, \
+         `graph_show_node_on_canvas` and the others), use them to show the person what you \
+         found: they open a type's table, a node's page, a canvas or a tree, a branch, a commit \
+         or a query tab in this conversation's Studio window, and `studio_tabs` and \
+         `studio_selection` say what it shows, as ids. They only show things: they never write, \
+         never run a query and never return values. Read and write the graph with \
+         `{command}`.\n"
     )
 }
 
@@ -1078,6 +1086,14 @@ mod tests {
             assert!(text.contains(part), "{part}\n{text}");
         }
         assert!(!text.contains("batch file") && !text.contains("MCP") && !text.contains("_run"));
+        // The UI tools (spec 032): they only show things, and writes stay on the CLI.
+        for part in [
+            "the `studio` tools",
+            "They only show things: they never write",
+            "Read and write the graph with `./omnigraph`.",
+        ] {
+            assert!(text.contains(part), "{part}\n{text}");
+        }
         let windows = agents_md("knowledge", "agent/x", "main", true, false);
         assert!(windows.contains(".\\omnigraph.cmd") && windows.contains("batch file"));
         assert!(!windows.contains("network folder"));
