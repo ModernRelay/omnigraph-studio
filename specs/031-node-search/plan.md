@@ -27,9 +27,9 @@ Smithson.
 
 ## Principles
 
-- I: the server stays the authority. A type's name index is an answer read at a commit, kept
-  and carried by the read memo like any other (spec 015), never treated as true at another
-  commit.
+- I: the server stays the authority. A type's name index is made of an answer read at a
+  commit, and stands at another only when the change log says no node of its type changed
+  between them (spec 015's carry); with no head known, for one head poll at most.
 - II: a search reads the branch's head, or the commit of the view that asks (a picker).
 - V: rows found later come below those shown; a batch of answers lands ranked in one draw.
 - VII: a failed type says so, with Retry; nothing is retried by itself.
@@ -84,12 +84,21 @@ the id.
 
 - **A type of at most `INDEX_MAX_NODES` = 5,000 nodes** is matched in memory against its name
   index: every node's id and searched properties, read with `builder::node_index`
-  (`studio_search_index`, `limit 5001`) at the commit searched. The read goes through the read
-  memo, so it is shared, kept at its commit and carried to a later commit that changed none of
-  the type's nodes. Parsed indexes are held by type and commit, at most `INDEX_BUDGET_BYTES` =
-  32 MiB in all (ids and texts, each kept as read and folded, plus 128 bytes a node), the least
-  recently used index first out; each text keeps `INDEX_TEXT_CHARS` = 1,000 characters, so a
-  long title still matches whole. A new token or schema forgets them with the memo.
+  (`studio_search_index`, `limit 5001`) at the commit searched. The rows are read fresh
+  (`GraphSession::read_fresh`, through the search scope) and kept nowhere but in the index made
+  of them: not also in the read memo. Reads of one index at one commit are shared while out. An
+  index held at one commit stands for another when the branch's change log says no node of its
+  type changed between them. With no head known, the commit a head read answered at stands for
+  the head for `HEAD_UNKNOWN_HOLD` = 30 s, one head poll, so pauses meanwhile read nothing.
+- **The budget.** Indexes are held by type and commit, at most `INDEX_BUDGET_BYTES` = 32 MiB in
+  all (ids and texts, each kept as read and folded, plus 128 bytes a node; an index several
+  commits share counts once), the least recently used first out. An index that alone would
+  exceed the budget is never held: its type is searched on the server. A type found too large
+  holds a marker that counts 256 bytes, so markers are bounded with the indexes. Each text keeps
+  `INDEX_TEXT_CHARS` = 1,000 characters, so a long title still matches whole.
+- **Forgetting.** A new token or schema forgets every index and every index read still out
+  (a generation they carry moves): a read that lands after it changes nothing. The session
+  already answers a read sent under another token with `stale_credential`.
 - **A larger type** (by its count, or an index read answering more than 5,000 rows) is searched
   on the server with `builder::node_search` (`studio_find`): each word, in any of four spellings
   (as typed, lowercase, Capitalized, UPPERCASE), in the id or a searched property; 25 rows by
@@ -142,14 +151,19 @@ A name names a node only when one matches, or one alone is it exactly by its id 
 an email or handle that happens to equal it (`suggest::named`). When
 several match, nothing is filtered by it: its filter opens as a draft with the name in its
 value field and the matches offered, and the sentence's note says "N Org nodes match "Acme":
-pick one in the filter." When none match, the note says so.
+pick one in the filter." When no draft can open (a key the filter bar cannot test "related to"
+on, one reached through a relationship's group), the note names the choices, by name and id,
+and says to name one exactly or add the filter by hand (`suggest::pick_note`). A node only
+full-text search found is never taken alone; it is offered as a choice. When none match, or the
+search fails, the note says so.
 
 ## Decisions
 
 | Decision | Rejected alternatives | Why |
 |---|---|---|
 | Match in memory, per type, from an index read once per commit | Wait for E49 or E51; more spellings | The engine has no case-insensitive test; every ModernRelay type is under 5,000 nodes; one read per type and commit costs less than a read per type per pause did |
-| Read the index through the read memo | A cache of its own | Carrying, sharing, credential and schema changes already work there; the index is never stale across commits |
+| ~~Read the index through the read memo~~ Read it fresh and carry it by the change log (review of #124) | The read memo, which also kept the rows | The memo held every index's rows beside the index made of them, outside the index budget; the change log answers the same question the memo's carry asked |
+| Hold the head read's commit for one head poll when no head is known | Read every pause; serve the last index whatever its age | Every view goes as long without asking; a pause's reads were otherwise all sent again |
 | A scope while the palette is open | A session-wide scope | A session-wide scope would ask the feed about every type on every head move; the palette's lasts only while it is open |
 | Full-text after the ranked matches | Interleaved by score | `bm25` scores do not compare with the folding ranks; the folded matches are what the person typed |
 | Full-text only where an index is declared | Call it everywhere and catch `T27` | A refused call costs a read for nothing |
@@ -179,6 +193,11 @@ pick one in the filter." When none match, the note says so.
 | 2026-11-16 | Full-text ranks what `contains` misses | 25 random ActionItem titles on the operating graph, `search` + `bm25`, top 5 | Lowercase title 25/25 (contains 7); words reversed 24/24 (0); four letters inside a word 0/22 (15) |
 | 2026-11-16 | Every operating-graph type fits an index | `count($n)` per type, read-only | Largest: Span 2,625, ExternalID 1,378, Source 1,030 |
 | 2026-11-16 | The new search works in the app | The scenario runner against the CRM-shaped graph, first pause, no click | "bluequill": BlueQuill first; "acme": ACME Corp first, then the Acme companies, and "More in Org…"; "acme corp", "mcallister", "garcia jose", "bluequill partner", "smith" (both Smiths before Smithson): each found; "anna.woehler@example.com": Anna Wöhler, "Person · email"; a 503 on Org's index: "Org could not be searched · Retry" among the other types' rows |
+| 2026-11-16 | Names in this plan | — | The companies, people and addresses named in the problem and the log are fictional stand-ins for the fixture's, with the same case, accents, punctuation and word order |
+| 2026-11-16 | Review of #124: an index read out when the token changes is kept | `counted_read` (`session.rs`) answers a read sent under another token with `stale_credential`, so its rows were never kept; `node_search` `an_index_read_out_when_the_token_changes_lands_nowhere` | The finding's kept rows could not happen; its landing did remove the new token's read of the same index from those marked out, so the next pause read it again. Fixed with a generation; the test fails without it |
+| 2026-11-16 | Review of #124: with no head known, every pause read every index | `with_no_head_known_a_pause_after_reads_nothing` (two pauses, one read; past the hold, a second) | Confirmed and fixed |
+| 2026-11-16 | Review of #124: the budget was not strict | `an_index_over_the_budget_is_searched_on_the_server`, `markers_count_against_the_budget`, `an_index_is_held_once_not_also_in_the_read_memo` | Confirmed: an index over budget was kept, markers counted nothing, and the memo kept each index's rows too. Fixed; the carry test `an_index_is_read_once_a_commit_and_carried_past_other_types` passes through the change log |
+| 2026-11-16 | Review of #124: the note said "pick one" with no draft open; a full-text-only match was taken | `type_table` `a_name_that_names_several_nodes_asks_which` (a key with no "related to" opens none), `suggest` `a_note_names_the_choices_when_no_filter_opens`, `a_name_names_one_node_only_when_one_matches` | Fixed |
 | 2026-11-16 | Before and after on four graphs | A harness outside the repository: each type's `studio_search_index` rows read once, the old predicate applied to them, and a temporary test running `NodeIndex::find` and the palette's ordering over the same rows | See "Before and after" |
 
 ### Before and after
