@@ -1,6 +1,7 @@
 # 019: Model calls through OpenRouter
 
-Status: built 2026-10-30; the three uses wait for a live check with a key
+Status: built 2026-10-30; the filter's request was run live from a prototype on 2026-11-15 and
+2026-11-16, and the three uses still wait for a live check from the app with a key
 
 ## Problem
 
@@ -38,7 +39,9 @@ is for every later one.
 - IX: work is bounded. Each task caps its input, its output and its time; one call runs per
   control at a time, and a newer request cancels the older.
 - XII: evidence over assumption. The latencies, costs and the answers' correctness below were
-  measured on this machine on 2026-10-29 against the personal graph.
+  measured on this machine on 2026-10-29 against the personal graph and, for the filter's
+  model and for Jev, on 2026-11-15 and 2026-11-16 against labelled sentences on the
+  development graph.
 - The logging rule (`crates/studio/src/logging.rs`): a prompt holds schema names and row data,
   so no prompt, answer or key is logged; a failure logs the task name and the HTTP status only.
 
@@ -107,6 +110,54 @@ is for every later one.
   cancelled trips" and ≤ 0.04 for the reads. The 100-way Choice was right on 4 of 6 and unsure
   where it was right ("dinners in the last month": Event 0.37, Activity 0.32); "flights this
   week" went to Reservation over Event.
+
+- Measured 2026-11-15 and 2026-11-16, the filter on a labelled set: 87 sentences written and
+  labelled by hand for the development graph's Person, Company and Project, each sent as the
+  table's own request (the instructions, input and schema `filter_words` wrote at `ab19cfd`,
+  the body `model` sends) through OpenRouter. 73 have a label an answer is graded by: 70 that
+  plain filters, an order or a grouping say, and 3 that are not about the table. 14 have none:
+  9 need a count, a further hop, an edge's own property or columns, and 5 ask for a change.
+  The program, its labels and every recorded reply are kept outside the repo (a prototype,
+  `jev-filter`), so a run replays without a key.
+
+  | Model | Right of 73, two runs | With a grouped name read | Median | 9 in 10 within | Slowest | 1,000 filters |
+  |---|---|---|---|---|---|---|
+  | `anthropic/claude-haiku-5.5`, reasoning off | 58, 58 | 63, 61 | 1.3 s | 2.3 s | 3.5 s | $0.35 |
+  | `anthropic/claude-haiku-5.5`, effort `low` | 59 | 63 | 1.4 s | 3.2 s | 5.0 s | $0.39 |
+  | `anthropic/claude-sonnet-5.5`, effort `low` | 66, 67 | 68, 69 | 1.8 s | 2.4 s | 4.9 s | $7.04 |
+  | `google/gemini-3.8-flash`, effort `low` | 70, 71 | 70, 71 | 2.6 s | 5.7 s, 8.0 s | 13.6 s, 14.1 s | $2.33 |
+
+  "With a grouped name read" counts a group's test named with its relationship, which Studio
+  dropped until 2026-11-16 (Validation log). The price is the list price on the tokens used:
+  about 3,100 in and 80 out a sentence for the Claude models, 2,300 and 110 for Gemini. Sonnet
+  and Gemini refuse `reasoning: {"enabled": false}` and ran at their least effort, `low`:
+  Sonnet reasoned for 99 tokens over 87 sentences, Gemini for none on 173 calls and 957 on one,
+  which was cut off at the cap. Haiku's misses: a date's bound ("after 2020" as after
+  2020-01-01, "since 2000" as after 2000), a lost "except", a relationship's test dropped or
+  misnamed. Sonnet's, in both runs: "founders" alone answered with no filter (it reads "When
+  the request names nothing the table has" by the letter), "people Radia Knuth knows" the
+  wrong way round, a record's name shortened. Of the 9 harder sentences, read by hand, Gemini's
+  answer is right on 8, Sonnet's on 7, Haiku's on 3. No model has a rule for a change: "delete
+  the analysts" became a filter on analysts for all three.
+
+  Jev on the same set (`typesafe/jev-1.14-20261014`). Its vendor's documentation, read
+  2026-11-16: "Every answer is constrained to the options you supplied. The model returns a
+  probability distribution over your options or levels, never a value outside them." So it was
+  tried in the two places it can stand:
+
+  - Before a chat model: questions built from the table's keys (is each property restricted,
+    which relationship, how is each tested, which of the sentence's own words is the value), a
+    converter in code, and a last question whether the built filter says what the sentence
+    asks; up to three requests, 0.9 s at the median. On the 70 plain sentences it answered 26
+    with none wrong when that check had to reach 0.70, 38 with 1 wrong at 0.35, 44 with 4
+    wrong with no check, and handed the rest on. It routed all 14 others as labelled, the 5
+    changes among them. With Haiku behind it, 62 to 65 of 73 came out right, against 58 for
+    Haiku alone. With every question answered rightly the questions reach 67 of the 70.
+  - After one, checking Haiku's filter: at 0.70 it kept 27, 26 of them right, and held back
+    46, 37 of them right; at 0.35 it kept 51, 4 of them wrong. It took "after 2020" written
+    as after 2020-01-01 for right, at 0.76. With Sonnet asked for what it held back, 65 to 67
+    came out right at 2.2 to 3.1 s, against 68 at 1.8 s for Sonnet alone; with Gemini, 67 to
+    69 at 2.3 to 4.0 s, against 70 at 2.6 s alone (each with a grouped name read).
 
   BYOK (OpenRouter's "bring your own key"): a provider's key (Anthropic, OpenAI, Google …) is
   stored in the OpenRouter workspace, on its integrations page or through its management API
@@ -347,7 +398,7 @@ stored.
 | OpenRouter is the one provider | Anthropic and OpenAI directly; a provider per key; the agent's login | One key, one request shape and one model picker cover every vendor; routing options give the data policy per call. Direct Anthropic was 0.7 s faster for the same model, not enough for two code paths. The agents' logins cannot make API calls |
 | A provider's own key goes through OpenRouter's BYOK, set in its workspace | Provider keys in Studio's settings, sent per request; Studio registering them through the management API | BYOK is not per request, so Studio holding a provider key would gain nothing; registering keys needs a management key and makes Studio a key manager. One link to the integrations page does it, and the provider's own data policies still apply |
 | Named models by tier, not a router | `openrouter/auto`; `typesafe/jev-router` | Auto was right on every filter but 3–5 s against Haiku's 1.5–2.8 s, and neither router says what it will cost or which model will see the data before the call; a named model is what the settings row and the tooltips name |
-| Jev for yes-or-no gates, later, not for the first uses | Jev as the filter or summary engine; Jev picking the table for a sentence | Jev answers typed questions with probabilities, not generated structures: it cannot write a filter or a summary. It was certain and right on read-versus-write, but unsure across 100 types. A gate such as "does this sentence ask for a change" before a filter, or routing a sentence to filter versus query, is its shape, under $0.0001 a call |
+| No Jev (2026-11-16; until then, "Jev for yes-or-no gates, later") | Jev as the filter or summary engine; Jev picking the table for a sentence; Jev before a chat model, answering what it can; Jev after one, checking its filter; a Jev gate before the filter call | Jev answers typed questions with probabilities and chooses among the options it is given: it cannot write a filter or a summary, and it was unsure across 100 types. Tried on 87 labelled sentences in the two places it can stand (under "What exists today"), it did not earn its request: before a chat model it answered 26 to 44 of 70 plain sentences and handed the rest on after 0.9 s; after one it held back 37 right filters to catch 9 wrong, or let 4 wrong through. Either way a stronger chat model alone was right more often: Gemini 3.8 Flash on 70 of 73 at 2.6 s, against 67 to 69 at 2.3 to 4.0 s with Haiku first and Jev's check deciding when to ask Gemini. What Jev was sure of, read versus write (6 of 6 and 5 of 5), is one rule in the filter's own instructions and needs no second request (Deferred) |
 | A schema on every call, parsed in Studio | Prompt for JSON and parse; the agent panel | Without `response_format` both agents misnamed fields every time; with it, every answer parsed. The parse in Studio covers providers that only hint |
 | No headless-CLI fallback | `claude -p --json-schema` or `codex exec --output-schema` without a key | Both are 4–6 s a call and `claude -p` costs 2.6¢ each; a feature that is sometimes five times slower is a worse feature than one that asks for a key |
 | The key lives in the keychain | A `0600` file as the CLI's tokens; settings.json | Spec 016 already keeps its secret there with GPUI's credentials calls; a file would be the first secret file of Studio's own |
@@ -358,8 +409,11 @@ stored.
 
 ## Deferred
 
-- A Jev gate in the filter field: a Noul "asks for a change" that turns "delete the cancelled
-  trips" into a filter plus a note that the table does not delete, before the filter call.
+- A sentence that asks for a change. "Delete the analysts" and "archive the done projects"
+  become a filter on those rows with nothing said, and "add a person named Ada" a filter or
+  nothing, by model (2026-11-16). A rule in the filter's instructions and a field in its
+  answer would give the filter and a note that the table changes no record, in the one call.
+  Not written or measured. Until 2026-11-16 this item was a Jev gate before the filter call.
 - Streaming a summary as it arrives (OpenRouter supports `stream: true` with a schema).
 - A model per graph, for graphs whose data may not leave a region: `provider.zdr` and `only`
   per graph.
@@ -372,6 +426,7 @@ stored.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-11-16 | A stronger model than Haiku writes more right filters, Gemini 3.8 Flash the most; Jev before or after a chat model does not beat a stronger chat model alone | The prototype's `models` (Studio's request, one model after another, graded by label), `run --engine jev` and `check` (Jev's questions and converter; Jev confirming Haiku's filters, with a second model behind), on the 87 labelled sentences, two runs for each chat model; OpenRouter's model list and reasoning guide, and TypeSafe's question types, read that day | As in the table and the two Jev items under "What exists today". One person wrote and labelled the sentences, and Jev's questions were revised three times against them: a first reading, not a benchmark |
 | 2026-11-16 | A filter goes to the filter's own model, with room for its answer | `studio_workspace` `models::tests::a_filter_goes_to_the_filters_model` (Gemini 3.8 Flash by default, 2,000 tokens, its least effort before the list is read; changing the fast model leaves it, changing the filter model moves it), `studio_settings` `fields::tests::every_setting_is_a_row_in_declaration_order` | Pass. Not run from the app: no key is stored in it |
 | 2026-11-16 | A model that cannot turn reasoning off is asked for its least effort | `model` `a_model_that_cannot_stop_reasoning_is_asked_for_its_least` (off, an effort, on; a careful task always on), `the_model_list_says_how_little_each_model_reasons` (six shapes of OpenRouter's list of that day; a list kept from before still parses); `studio_workspace` `models::tests::a_call_asks_for_the_least_reasoning_its_model_takes`, `a_list_kept_by_an_earlier_build_is_read_again`. Live, from the prototype, with this crate's body at the 1,000 tokens the filter had then: 174 calls to Gemini 3.8 Flash and 174 to Sonnet 5.5 with `{"effort": "low"}` answered; the same body with `{"enabled": false}` was refused by both | Fixed. Every fast call said `{"enabled": false}`, and OpenRouter answered "400: Reasoning is mandatory for this endpoint and cannot be disabled" for both models: 90 of the 304 models the picker listed could not turn it off, so picking one broke every fast task |
 | 2026-11-16 | A group's test named with its relationship is read | `filter_words` `a_groups_test_named_with_its_relationship_is_read` (a property, the edge's own, and one a hop further, each under its group's key; another relationship's name is still refused). It fails with the prefix left on: the group comes out with no test (checked) | Fixed. `out:Owns.status` in a group on `out:Owns` was looked up whole on the related type, not found and dropped, and the group kept: "companies that own a paused project" showed companies that own any project, with a note. Haiku 5.5 wrote 5 of 73 answers this way and Sonnet 5.5 2 |
@@ -388,6 +443,12 @@ stored.
 
 ## Corrections
 
+- 2026-11-16: "Haiku was right on every filter" stood in this plan and in the fast model's
+  description in Settings as the reason for the default. It came from eight requests on one
+  type. On 73 labelled sentences Haiku was right on 58. The filter has its own model now, and
+  the descriptions say what was measured.
+- 2026-11-16: this plan gave the filter 300 tokens and 10 s, where `filter_words::TASK` had
+  had 1,000 and 20 s. The plan now gives the filter tier's own caps.
 - 2026-11-15: "Nothing is sent without a key", the Models section's own description, did not
   hold for the model list: `Models::new` asked OpenRouter for it at start whatever the keychain
   held, where this plan said the picker "holds the two defaults" without a key. The request
