@@ -781,6 +781,8 @@ pub struct GraphSession {
     /// query at the same commit can mean something else after a rename, a drop or an addition;
     /// every answer kept is kept under its epoch, and nothing crosses one.
     schema_epoch: u64,
+    /// The name indexes node searches match in memory, by type and commit (spec 031).
+    pub(crate) node_indexes: crate::node_search::NodeIndexes,
     schema_text: Option<Arc<str>>,
     /// Branches' newest commits, read alone for a list of branches, and kept until a commit
     /// lands on the branch.
@@ -979,6 +981,7 @@ impl GraphSession {
             seeded_commits: HashMap::new(),
             degree_commits: HashMap::new(),
             schema_epoch: 0,
+            node_indexes: Default::default(),
             schema_text: None,
             head_commits: Memo::new(HEAD_COMMITS),
             commit_change_pages: Memo::weighed(
@@ -1186,6 +1189,7 @@ impl GraphSession {
     /// and a log only carries an answer forward, from those read since with the new token.
     fn forget_reads(&mut self) {
         self.pinned_reads.clear();
+        self.node_indexes = Default::default();
         self.seeded_reads.clear();
         self.pinned_blobs.clear();
         self.degree_counts.clear();
@@ -1665,6 +1669,7 @@ impl GraphSession {
         self.schema_epoch += 1;
         self.schema_text = Some(model.source.clone());
         self.pinned_reads.clear();
+        self.node_indexes = Default::default();
         self.seeded_reads.clear();
         self.pinned_blobs.clear();
         // A change names its type as the schema does now.
@@ -2211,6 +2216,11 @@ impl GraphSession {
 
     pub fn ledger_mut(&mut self) -> &mut ReadLedger {
         &mut self.ledger
+    }
+
+    /// The schema epoch reads are kept under: a new schema text starts another.
+    pub(crate) fn schema_epoch(&self) -> u64 {
+        self.schema_epoch
     }
 
     /// Runs `read` asked for by `scope`'s view, so the ledger names who asked.

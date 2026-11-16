@@ -18,6 +18,7 @@ mod exploration;
 pub mod fixes;
 pub mod ledger;
 mod memo;
+pub mod node_search;
 mod refusal;
 mod registry;
 pub mod scope;
