@@ -70,7 +70,8 @@ pub enum Named {
 
 /// The node `hits` (a search for a name) name, when it is one: never the first of several. Only
 /// a node whose id or name is the name exactly counts as being it: an email or handle that
-/// happens to equal it does not.
+/// happens to equal it does not. A node only the engine's full-text search found (a stemmed
+/// word, a long text) is never taken alone: it is offered as a choice.
 pub fn named(hits: &TypeHits) -> Named {
     let exact: Vec<&NodeHit> = hits
         .hits
@@ -86,9 +87,37 @@ pub fn named(hits: &TypeHits) -> Named {
     match (exact.as_slice(), hits.hits.as_slice()) {
         ([hit], _) => one(hit),
         (_, []) => Named::None,
-        (_, [hit]) if !hits.more => one(hit),
+        (_, [hit]) if !hits.more && hit.rank != MatchRank::FullText => one(hit),
         _ => Named::Several(from_hits(hits)),
     }
+}
+
+/// How many choices a note names before "and N more".
+const NOTE_CHOICES: usize = 3;
+
+/// What the sentence's note says of a name several nodes match: to pick one in the filter
+/// when its draft `opened`, else the choices themselves, by name and id, and to name one
+/// exactly.
+pub fn pick_note(opened: bool, other: &str, name: &str, offers: &[Suggestion]) -> String {
+    let count = offers.len();
+    if opened {
+        return format!("{count} {other} nodes match \"{name}\": pick one in the filter.");
+    }
+    let mut named: Vec<String> = offers
+        .iter()
+        .take(NOTE_CHOICES)
+        .map(|offer| match &offer.label {
+            Some(label) if *label != offer.value => format!("{label} ({})", offer.value),
+            _ => offer.value.clone(),
+        })
+        .collect();
+    if count > NOTE_CHOICES {
+        named.push(format!("{} more", count - NOTE_CHOICES));
+    }
+    format!(
+        "{count} {other} nodes match \"{name}\" ({}): name one exactly, or add the filter by hand.",
+        named.join(", ")
+    )
 }
 
 /// Whether suggestions complete the field: always, but for a list typed as JSON (a list pasted
@@ -317,6 +346,33 @@ mod tests {
             false,
         );
         assert!(matches!(named(&by_handle), Named::Several(_)));
+        // Found only by full-text search (a stemmed word): offered, never taken alone.
+        let stemmed = hits(
+            vec![hit("o-4", "Acme Holdings", MatchRank::FullText)],
+            false,
+        );
+        assert!(matches!(named(&stemmed), Named::Several(_)));
+    }
+
+    /// When the filter cannot open as a draft, the note names the choices instead of asking
+    /// for a pick nobody can make.
+    #[test]
+    fn a_note_names_the_choices_when_no_filter_opens() {
+        let offers: Vec<Suggestion> = (1..=5)
+            .map(|n| Suggestion {
+                value: format!("o-{n}"),
+                label: Some(format!("Acme {n}")),
+            })
+            .collect();
+        assert_eq!(
+            pick_note(true, "Org", "Acme", &offers),
+            "5 Org nodes match \"Acme\": pick one in the filter."
+        );
+        assert_eq!(
+            pick_note(false, "Org", "Acme", &offers),
+            "5 Org nodes match \"Acme\" (Acme 1 (o-1), Acme 2 (o-2), Acme 3 (o-3), 2 more): \
+             name one exactly, or add the filter by hand."
+        );
     }
 
     #[test]

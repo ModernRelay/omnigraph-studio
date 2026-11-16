@@ -9056,7 +9056,7 @@ impl TypeTable {
                         to_pick = Some((filter.property.clone(), name.clone(), other, offers));
                     }
                     Ok(suggest::Named::Several(offers)) => {
-                        refused.push(format!("{} {other} nodes match \"{name}\"", offers.len()));
+                        refused.push(suggest::pick_note(false, &other, &name, &offers));
                     }
                     Err(error) => {
                         refused.push(format!("{other} could not be searched ({error})"));
@@ -9095,15 +9095,14 @@ impl TypeTable {
                 let mut note =
                     (!refused.is_empty()).then(|| format!("Could not use: {}", refused.join("; ")));
                 if let Some((key, name, other, offers)) = to_pick {
-                    let ask = format!(
-                        "{} {other} nodes match \"{name}\": pick one in the filter.",
-                        offers.len()
-                    );
+                    // The note says what the person sees: the choices in the filter when it
+                    // opened, else the choices themselves and what to do instead.
+                    let opened = this.ask_to_pick(key, name.clone(), offers.clone(), window, cx);
+                    let ask = suggest::pick_note(opened, &other, &name, &offers);
                     note = Some(match note {
                         Some(note) => format!("{ask} {note}"),
                         None => ask,
                     });
-                    this.ask_to_pick(key, name, offers, window, cx);
                 }
                 this.words = WordsState::Typing(note);
                 this.reload(true, cx);
@@ -9117,7 +9116,9 @@ impl TypeTable {
 
     /// A sentence's "related to" named several nodes (spec 031): its filter opens as a draft,
     /// the name in its value field and the nodes it names offered, best first, for the person
-    /// to pick one. Nothing is filtered by it until they do.
+    /// to pick one. Nothing is filtered by it until they do. Whether the draft opened: a key
+    /// the filter bar cannot test "related to" on (one reached through a relationship's
+    /// group) opens none, and the caller says so.
     fn ask_to_pick(
         &mut self,
         key: String,
@@ -9125,8 +9126,18 @@ impl TypeTable {
         offers: Vec<suggest::Suggestion>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        self.set_draft_property(key, window, cx);
+    ) -> bool {
+        if !self.ops_for(&key).contains(&FilterOp::RelatedTo) {
+            return false;
+        }
+        self.set_draft_property(key.clone(), window, cx);
+        if self
+            .filter_draft
+            .as_ref()
+            .is_none_or(|draft| draft.property != key)
+        {
+            return false;
+        }
         self.filter_editor.update(cx, |editor, cx| {
             editor.set_text(name.clone(), window, cx);
             editor.set_placeholder_text(filter_placeholder(FilterOp::RelatedTo), window, cx);
@@ -9138,6 +9149,7 @@ impl TypeTable {
         }
         self.redraw_offers(cx);
         cx.notify();
+        true
     }
 
     /// The toolbar's sentence field (spec 019): a search field with the model's mark, its
@@ -13438,9 +13450,10 @@ mod tests {
                 label: Some("Acme Labs".into()),
             },
         ];
-        table.update_in(cx, |table, window, cx| {
+        let opened = table.update_in(cx, |table, window, cx| {
             table.ask_to_pick(key.clone(), "Acme".into(), offers.clone(), window, cx)
         });
+        assert!(opened);
         table.read_with(cx, |table, cx| {
             let draft = table.filter_draft.as_ref().expect("the filter is a draft");
             assert_eq!(draft.property, key);
@@ -13448,6 +13461,14 @@ mod tests {
             assert_eq!(draft.offers.len(), 2);
             assert_eq!(table.filter_editor.read(cx).text(cx), "Acme");
             assert!(table.filters.is_empty(), "nothing filtered until a pick");
+        });
+
+        // A key the bar cannot test "related to" on opens no draft, and says so: the caller's
+        // note then lists the choices instead (`suggest::pick_note`).
+        table.update_in(cx, |table, window, cx| {
+            table.cancel_filter_draft(window, cx);
+            assert!(!table.ask_to_pick("name".into(), "Acme".into(), offers.clone(), window, cx));
+            assert!(table.filter_draft.is_none());
         });
     }
 
