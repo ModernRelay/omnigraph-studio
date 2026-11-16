@@ -2218,6 +2218,56 @@ impl GraphSession {
         &mut self.ledger
     }
 
+    /// `query` read at `snapshot` (the branch's head when `None`) and kept nowhere: neither in
+    /// the read memo nor carried, so a caller that turns the answer into something smaller
+    /// does not hold its rows twice (spec 031, the name index). Through `scope` when one is
+    /// given, so the change feed is asked about what it depends on, as [`Self::read_in`] does.
+    pub(crate) fn read_fresh(
+        &mut self,
+        scope: Option<&ReadScope>,
+        query: &BuiltQuery,
+        snapshot: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<ReadOutput, ReadError>> {
+        let request = QueryRequest {
+            query: query.text.clone(),
+            name: Some(query.name.clone()),
+            params: query.params_value(),
+            branch: snapshot.is_none().then(|| self.branch.clone()),
+            snapshot,
+        };
+        let Some(scope) = scope else {
+            return self.read_request(request, cx);
+        };
+        let id = scope.id;
+        let entry = self
+            .scopes
+            .get_mut(&id)
+            .map(|scope| scope.add(query.depends.clone()));
+        let read = self.asked_by(id, |this| this.read_request(request, cx));
+        cx.spawn(async move |this, cx| {
+            let result = read.await;
+            if let Some((entry, _token)) = entry {
+                this.update(cx, |this, _| {
+                    if let Some(scope) = this.scopes.get_mut(&id) {
+                        match &result {
+                            Ok(output) => scope.answered(entry, &output.rows),
+                            Err(_) => scope.failed(entry),
+                        }
+                    }
+                })
+                .ok();
+            }
+            result
+        })
+    }
+
+    /// How many answers the read memo keeps, for tests.
+    #[cfg(test)]
+    pub(crate) fn kept_reads(&self) -> usize {
+        self.pinned_reads.len()
+    }
+
     /// Forgets the branch heads the session knows, for tests of what happens without one.
     #[cfg(test)]
     pub(crate) fn forget_heads(&mut self) {

@@ -28,6 +28,7 @@ use serde_json::Value;
 use unicode_normalization::UnicodeNormalization as _;
 use unicode_normalization::char::is_combining_mark;
 
+use crate::carry::TypeRef;
 use crate::scope::ReadScope;
 use crate::{EntityKind, GraphSession};
 
@@ -393,9 +394,14 @@ fn merge_full_text(
 #[derive(Clone)]
 enum Loaded {
     Index(Arc<NodeIndex>),
-    /// More nodes than [`INDEX_MAX_NODES`]: searched on the server.
+    /// More nodes than [`INDEX_MAX_NODES`], or more text than the indexes may hold together:
+    /// searched on the server.
     TooLarge,
 }
+
+/// What a type found too large to hold counts against [`INDEX_BUDGET_BYTES`], so the markers
+/// are bounded with the indexes.
+const MARKER_BYTES: usize = 256;
 
 /// How long the commit a type's index was read at stands for the branch's head while the
 /// session knows no head: one head poll, as long as any view goes without asking (spec 031).
@@ -404,7 +410,6 @@ pub const HEAD_UNKNOWN_HOLD: std::time::Duration = std::time::Duration::from_sec
 type Loading = Shared<Task<Result<(Option<String>, Loaded), SharedString>>>;
 
 /// The name indexes a session holds, by type and commit, within [`INDEX_BUDGET_BYTES`].
-#[derive(Default)]
 pub(crate) struct NodeIndexes {
     held: HashMap<(String, String), (Loaded, u64)>,
     /// Indexes being read, by type and the commit asked for (`None`: the branch's head).
@@ -416,6 +421,20 @@ pub(crate) struct NodeIndexes {
     /// Moves when the indexes are forgotten (a new token, a new schema), so a read still out
     /// from before lands nowhere.
     generation: u64,
+    budget: usize,
+}
+
+impl Default for NodeIndexes {
+    fn default() -> Self {
+        Self {
+            held: HashMap::new(),
+            loading: HashMap::new(),
+            at_head: HashMap::new(),
+            used: 0,
+            generation: 0,
+            budget: INDEX_BUDGET_BYTES,
+        }
+    }
 }
 
 impl NodeIndexes {
@@ -425,12 +444,6 @@ impl NodeIndexes {
         self.loading.clear();
         self.at_head.clear();
         self.generation += 1;
-    }
-
-    /// The commit `type_name`'s index was read at as the head's, while that stands.
-    fn at_head(&self, type_name: &str, now: std::time::Instant) -> Option<String> {
-        let (commit, at) = self.at_head.get(type_name)?;
-        (now.saturating_duration_since(*at) < HEAD_UNKNOWN_HOLD).then(|| commit.clone())
     }
 
     fn get(&mut self, type_name: &str, commit: &str, node: &NodeType) -> Option<Loaded> {
@@ -448,16 +461,47 @@ impl NodeIndexes {
         Some(loaded.clone())
     }
 
+    /// The commits `type_name`'s indexes are held at that read what a search of `node` reads,
+    /// most recently used first.
+    fn held_at(&self, type_name: &str, node: &NodeType) -> Vec<(String, Arc<NodeIndex>)> {
+        let mut held: Vec<(u64, String, Arc<NodeIndex>)> = self
+            .held
+            .iter()
+            .filter(|((held, _), _)| held == type_name)
+            .filter_map(|((_, commit), (loaded, used))| match loaded {
+                Loaded::Index(index) if index.reads(node) => {
+                    Some((*used, commit.clone(), index.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        held.sort_by_key(|(used, _, _)| std::cmp::Reverse(*used));
+        held.into_iter()
+            .map(|(_, commit, index)| (commit, index))
+            .collect()
+    }
+
+    /// What the indexes hold, each index once however many commits share it.
+    fn total(&self) -> usize {
+        let mut seen = HashSet::new();
+        self.held
+            .values()
+            .map(|(loaded, _)| match loaded {
+                Loaded::Index(index) if seen.insert(Arc::as_ptr(index)) => index.bytes,
+                Loaded::Index(_) => 0,
+                Loaded::TooLarge => MARKER_BYTES,
+            })
+            .sum()
+    }
+
+    /// Holds `loaded` for `type_name` at `commit`, then lets the least recently used go until
+    /// the indexes are within the budget. An index is never larger than the budget alone
+    /// ([`GraphSession::node_index`] makes such a type `TooLarge`).
     fn insert(&mut self, type_name: &str, commit: String, loaded: Loaded) {
         self.used += 1;
         let key = (type_name.to_owned(), commit);
         self.held.insert(key.clone(), (loaded, self.used));
-        let size = |loaded: &Loaded| match loaded {
-            Loaded::Index(index) => index.bytes,
-            Loaded::TooLarge => 0,
-        };
-        let mut total: usize = self.held.values().map(|(loaded, _)| size(loaded)).sum();
-        while total > INDEX_BUDGET_BYTES {
+        while self.total() > self.budget {
             let Some(oldest) = self
                 .held
                 .iter()
@@ -467,22 +511,20 @@ impl NodeIndexes {
             else {
                 break;
             };
-            if let Some((loaded, _)) = self.held.remove(&oldest) {
-                total -= size(&loaded);
-            }
+            self.held.remove(&oldest);
         }
+    }
+
+    /// The commit `type_name`'s index was read at as the head's, while that stands.
+    fn at_head(&self, type_name: &str, now: std::time::Instant) -> Option<String> {
+        let (commit, at) = self.at_head.get(type_name)?;
+        (now.saturating_duration_since(*at) < HEAD_UNKNOWN_HOLD).then(|| commit.clone())
     }
 
     /// What the indexes hold in all, as [`INDEX_BUDGET_BYTES`] counts it.
     #[cfg(test)]
     pub(crate) fn bytes(&self) -> usize {
-        self.held
-            .values()
-            .map(|(loaded, _)| match loaded {
-                Loaded::Index(index) => index.bytes,
-                Loaded::TooLarge => 0,
-            })
-            .sum()
+        self.total()
     }
 }
 
@@ -577,8 +619,10 @@ impl GraphSession {
     }
 
     /// `node`'s name index at `commit` (the branch's head when `None`), held or read, and the
-    /// commit it is of. With no head known, the commit a head read last answered at stands for
-    /// [`HEAD_UNKNOWN_HOLD`].
+    /// commit it is of. An index held at another commit stands for this one when the branch's
+    /// change log says no node of the type changed between them. With no head known, the
+    /// commit a head read last answered at stands for [`HEAD_UNKNOWN_HOLD`]. The rows are read
+    /// fresh, kept nowhere but in the index made of them.
     fn node_index(
         &mut self,
         schema: &Arc<SchemaModel>,
@@ -591,10 +635,16 @@ impl GraphSession {
             .commit
             .clone()
             .or_else(|| self.node_indexes.at_head(&node.name, now));
-        if let Some(commit) = &commit
-            && let Some(loaded) = self.node_indexes.get(&node.name, commit, node)
-        {
-            return Task::ready(Ok((Some(commit.clone()), loaded)));
+        if let Some(commit) = &commit {
+            if let Some(loaded) = self.node_indexes.get(&node.name, commit, node) {
+                return Task::ready(Ok((Some(commit.clone()), loaded)));
+            }
+            if let Some(index) = self.carried_index(node, commit) {
+                let loaded = Loaded::Index(index);
+                self.node_indexes
+                    .insert(&node.name, commit.clone(), loaded.clone());
+                return Task::ready(Ok((Some(commit.clone()), loaded)));
+            }
         }
         let key = (node.name.clone(), commit.clone());
         if let Some(loading) = self.node_indexes.loading.get(&key) {
@@ -605,28 +655,26 @@ impl GraphSession {
             Ok(query) => query,
             Err(error) => return Task::ready(Err(message(error))),
         };
-        // At the commit the head stood at, when that is what stands for it.
-        let reading = ReadAt {
-            commit: commit.clone(),
-            scope: at.scope.clone(),
-        };
-        let read = self.read_through(&reading, &query, cx);
+        let read = self.read_fresh(at.scope.as_ref(), &query, commit.clone(), cx);
         let (node, type_name) = (node.clone(), node.name.clone());
-        let generation = self.node_indexes.generation;
+        let (generation, budget) = (self.node_indexes.generation, self.node_indexes.budget);
         let asked_head = commit.is_none();
         let task = cx.spawn(async move |this, cx| {
             let result = read.await;
             let finished = match result {
                 Ok(output) => {
                     let at = output.graph_commit_id.clone().or(commit.clone());
-                    let rows = output.rows.clone();
+                    // The answer's rows go once the index is made of them.
+                    let rows = output.rows;
                     let loaded = cx
                         .background_spawn(async move {
-                            match rows.as_array().map_or(0, Vec::len) > INDEX_MAX_NODES {
+                            if rows.as_array().map_or(0, Vec::len) > INDEX_MAX_NODES {
+                                return Loaded::TooLarge;
+                            }
+                            let index = NodeIndex::from_rows(&node, &rows);
+                            match index.bytes > budget {
                                 true => Loaded::TooLarge,
-                                false => {
-                                    Loaded::Index(Arc::new(NodeIndex::from_rows(&node, &rows)))
-                                }
+                                false => Loaded::Index(Arc::new(index)),
                             }
                         })
                         .await;
@@ -659,6 +707,22 @@ impl GraphSession {
         let shared = task.shared();
         self.node_indexes.loading.insert(key, shared.clone());
         cx.background_spawn(shared)
+    }
+
+    /// An index of `node` held at another commit that stands at `commit`: the branch's change
+    /// log says no node of the type changed between them.
+    fn carried_index(&self, node: &NodeType, commit: &str) -> Option<Arc<NodeIndex>> {
+        let ty = TypeRef::Node(node.name.clone());
+        self.node_indexes
+            .held_at(&node.name, node)
+            .into_iter()
+            .find(|(held, _)| {
+                matches!(
+                    self.changes_since(&self.branch, held, commit),
+                    crate::carry::Since::Known(since) if !since.type_changed(&ty)
+                )
+            })
+            .map(|(_, index)| index)
     }
 
     /// [`GraphSession::read_in`] `scope` when there is one, else [`GraphSession::read`].
@@ -1071,8 +1135,8 @@ mod tests {
         assert_eq!(reads.lock().unwrap().get("studio_find").copied(), Some(1));
         assert_eq!(
             session.read_with(cx, |session, _| session.node_indexes.bytes()),
-            0,
-            "nothing held of it"
+            MARKER_BYTES,
+            "nothing held of it but its marker"
         );
     }
 
@@ -1095,6 +1159,15 @@ mod tests {
             Some(1),
             "one word asks no phrase"
         );
+    }
+
+    fn index_reads(reads: &Reads) -> usize {
+        reads
+            .lock()
+            .unwrap()
+            .get("studio_search_index")
+            .copied()
+            .unwrap_or(0)
     }
 
     /// A new token forgets the indexes and every read still out. The old token's index read
@@ -1171,15 +1244,6 @@ mod tests {
         assert_eq!(sent.load(Ordering::SeqCst), 2);
     }
 
-    fn index_reads(reads: &Reads) -> usize {
-        reads
-            .lock()
-            .unwrap()
-            .get("studio_search_index")
-            .copied()
-            .unwrap_or(0)
-    }
-
     /// With no head known, the commit a type's index was read at stands for the head for a
     /// while: the next pause matches in memory, and a later one reads again (review of #124).
     #[gpui::test]
@@ -1201,5 +1265,52 @@ mod tests {
         no_head(cx);
         assert_eq!(find(&session, None, "ada", cx).hits.len(), 1);
         assert_eq!(index_reads(&reads), 2, "read again once the hold is over");
+    }
+
+    /// The read memo keeps no copy of an index's rows: the index is all that is held.
+    #[gpui::test]
+    async fn an_index_is_held_once_not_also_in_the_read_memo(cx: &mut gpui::TestAppContext) {
+        let (session, _served, _reads) = served_people(50, cx);
+        cx.run_until_parked();
+        let before = session.read_with(cx, |session, _| session.kept_reads());
+        assert_eq!(find(&session, None, "ada", cx).hits.len(), 1);
+        session.read_with(cx, |session, _| {
+            assert_eq!(session.kept_reads(), before, "no rows kept in the memo");
+            assert!(session.node_indexes.bytes() > 0, "the index is held");
+        });
+    }
+
+    /// An index larger than the budget is never held: its type is searched on the server.
+    #[gpui::test]
+    async fn an_index_over_the_budget_is_searched_on_the_server(cx: &mut gpui::TestAppContext) {
+        let (session, _served, reads) = served_people(50, cx);
+        cx.run_until_parked();
+        session.update(cx, |session, _| session.node_indexes.budget = 1_000);
+        let found = find(&session, None, "ada", cx);
+        assert!(!found.held);
+        assert_eq!(found.hits[0].id, "zz-ada");
+        assert_eq!(reads.lock().unwrap().get("studio_find").copied(), Some(1));
+        assert!(session.read_with(cx, |s, _| s.node_indexes.bytes()) <= 1_000);
+    }
+
+    /// The budget holds whatever is held: markers of types too large count against it, and
+    /// the least recently used goes first.
+    #[test]
+    fn markers_count_against_the_budget() {
+        let node = org();
+        let mut indexes = NodeIndexes {
+            budget: 10 * MARKER_BYTES,
+            ..NodeIndexes::default()
+        };
+        for n in 0..100 {
+            indexes.insert(&format!("T{n}"), "c1".into(), Loaded::TooLarge);
+            assert!(indexes.bytes() <= indexes.budget);
+        }
+        assert_eq!(indexes.held.len(), 10);
+        assert!(
+            indexes.get("T99", "c1", &node).is_some(),
+            "the newest stays"
+        );
+        assert!(indexes.get("T0", "c1", &node).is_none(), "the oldest went");
     }
 }
