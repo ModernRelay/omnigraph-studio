@@ -68,12 +68,14 @@ pub enum Named {
     Several(Vec<Suggestion>),
 }
 
-/// The node `hits` (a search for a name) name, when it is one: never the first of several.
+/// The node `hits` (a search for a name) name, when it is one: never the first of several. Only
+/// a node whose id or name is the name exactly counts as being it: an email or handle that
+/// happens to equal it does not.
 pub fn named(hits: &TypeHits) -> Named {
     let exact: Vec<&NodeHit> = hits
         .hits
         .iter()
-        .filter(|hit| hit.rank == MatchRank::Exact)
+        .filter(|hit| hit.rank == MatchRank::Exact && hit.matched.is_none())
         .collect();
     let one = |hit: &NodeHit| {
         Named::One(Suggestion {
@@ -304,6 +306,17 @@ mod tests {
             "Smith names two people"
         );
         assert_eq!(named(&hits(Vec::new(), false)), Named::None);
+        // A handle that is the name is not the name: two people named Acme-something, one
+        // whose handle is "acme", still ask which.
+        let handle = NodeHit {
+            matched: Some(("handle".into(), "acme".into())),
+            ..hit("o-3", "Acme Robotics", MatchRank::Exact)
+        };
+        let by_handle = hits(
+            vec![handle, hit("o-1", "Acme Analytics", MatchRank::Prefix)],
+            false,
+        );
+        assert!(matches!(named(&by_handle), Named::Several(_)));
     }
 
     #[test]
