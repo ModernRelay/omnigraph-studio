@@ -835,7 +835,14 @@ fn build_group(
         .map(|(_, items)| items.as_slice())
         .unwrap_or_default();
     for filter in mine {
+        // A model often names a group's test as it names a filter outside a group, with the
+        // relationship first (`out:WorksAt.city` in a group on `out:WorksAt`). It means the
+        // related record's property, which is what the group tests.
         let name = filter.property.trim();
+        let name = name
+            .strip_prefix(key)
+            .and_then(|own| own.strip_prefix('.'))
+            .unwrap_or(name);
         let op = FilterOp::from_key(&filter.op);
         if name == builder::ID_FILTER {
             match (op, filter.value.first()) {
@@ -1174,6 +1181,58 @@ mod tests {
         );
         assert!(made.is_empty());
         assert_eq!(refused.len(), 1);
+    }
+
+    /// A test in a group that is named with the group's relationship, as a filter outside a
+    /// group is, tests the related record's property. Before, the whole name was looked up on
+    /// the related type and not found, so the test was dropped and the group kept: "works at
+    /// a company in Berlin" came out as "works at some company", with a note. On 2026-11-16
+    /// Claude Haiku 5.5 named its grouped tests this way in 5 of 73 sentences (spec 019).
+    #[test]
+    fn a_groups_test_named_with_its_relationship_is_read() {
+        let model = gq_language::SchemaModel::parse(HOPS).unwrap();
+        let reach = Reach {
+            schema: &model,
+            type_name: "Person",
+        };
+        let (made, refused) = filters_with(
+            Answer {
+                filters: vec![
+                    in_group("g1", "out:WorksAt.city", "eq", "Berlin"),
+                    in_group("g1", "out:WorksAt.@role", "eq", "CTO"),
+                    in_group("g2", "out:LocatedIn.country", "eq", "Germany"),
+                    // Another relationship's name is no property of the company.
+                    in_group("g1", "out:LocatedIn.country", "eq", "France"),
+                ],
+                groups: vec![
+                    group_item("g1", "", "out:WorksAt", "any"),
+                    group_item("g2", "g1", "out:LocatedIn", ""),
+                ],
+                predicate: None,
+                sort: Vec::new(),
+                group_by: Vec::new(),
+                columns: Vec::new(),
+            },
+            &[],
+            Some(reach),
+        );
+        assert_eq!(made.len(), 1, "{made:?} {refused:?}");
+        let (key, group) = builder::as_group(&made[0]).unwrap();
+        assert_eq!(key, "out:WorksAt");
+        let tested: Vec<(&str, &Value)> = group
+            .tests
+            .iter()
+            .map(|test| (test.property.as_str(), &test.value))
+            .collect();
+        assert_eq!(
+            tested,
+            [
+                ("city", &json!("Berlin")),
+                ("@role", &json!("CTO")),
+                ("out:LocatedIn.country", &json!("Germany")),
+            ]
+        );
+        assert_eq!(refused, ["Company has no property out:LocatedIn.country"]);
     }
 
     /// The schema allows only the keys and operators offered, and the answer's filters are
