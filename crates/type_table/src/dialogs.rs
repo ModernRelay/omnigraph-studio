@@ -747,7 +747,6 @@ impl InsertEdgeModal {
 
     /// Searches the endpoint's type for its text once typing pauses.
     fn search(&mut self, end: End, cx: &mut Context<Self>) {
-        let schema = self.schema.clone();
         let session = self.session.clone();
         let snapshot = self.snapshot.clone();
         let endpoint = self.endpoint_mut(end);
@@ -762,8 +761,7 @@ impl InsertEdgeModal {
             return;
         }
         endpoint.picked = None;
-        let search =
-            suggest::search_nodes(&session, &schema, &endpoint.type_name, &text, snapshot, cx);
+        let search = suggest::search_nodes(&session, &endpoint.type_name, &text, snapshot, cx);
         endpoint.search = Some(cx.spawn(async move |this, cx| {
             let result = search.await;
             this.update(cx, |this, cx| {
@@ -773,7 +771,7 @@ impl InsertEdgeModal {
                 }
                 // A failed search offers nothing, not what an earlier one found.
                 match result {
-                    Ok(rows) => endpoint.offers.set(suggest::from_node_rows(&rows), true),
+                    Ok(hits) => endpoint.offers.set(suggest::from_hits(&hits), true),
                     Err(_) => endpoint.offers.clear(),
                 }
                 endpoint.answers = Some(text);
@@ -1595,17 +1593,24 @@ mod tests {
     use graph_store::{Connection, ServerEntry, ServerSource};
     use http_client::{AsyncBody, FakeHttpClient, Response};
 
-    /// A server for the dev graph that finds two people for any node search.
+    /// A server for the dev graph whose every type's name index holds two people.
     fn session(cx: &mut TestAppContext) -> Entity<GraphSession> {
         let http = FakeHttpClient::create(|request| async move {
-            let body = if request.uri().path().ends_with("/query") {
-                r#"{"query_name":"studio_find","target":{"branch":"main","snapshot":null},
-                    "row_count":2,"columns":["id","label"],
-                    "rows":[{"id":"person-000000","label":"Radia Knuth"},
-                            {"id":"person-000004","label":"Radia Lamarr"}],
+            let schema = serde_json::json!({
+                "schema_source": include_str!("../../../dev/cluster/knowledge.pg")
+            })
+            .to_string();
+            let body = if request.uri().path().ends_with("/schema") {
+                schema
+            } else if request.uri().path().ends_with("/query") {
+                r#"{"query_name":"studio_search_index","target":{"branch":"main","snapshot":null},
+                    "row_count":2,"columns":["id","p0"],
+                    "rows":[{"id":"person-000000","p0":"Radia Knuth"},
+                            {"id":"person-000004","p0":"Radia Lamarr"}],
                     "graph_commit_id":"c1"}"#
+                    .to_owned()
             } else {
-                r#"{"branches":["main"]}"#
+                r#"{"branches":["main"]}"#.to_owned()
             };
             Ok(Response::builder()
                 .status(200)

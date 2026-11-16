@@ -6736,7 +6736,7 @@ impl TypeTable {
 
     fn confirm_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.words_editor.focus_handle(cx).is_focused(window) {
-            self.run_words(cx);
+            self.run_words(window, cx);
             return;
         }
         if self.fill.is_some() && self.fill_editor.focus_handle(cx).is_focused(window) {
@@ -8609,14 +8609,13 @@ impl TypeTable {
                 draft._suggest_task = None;
             }
             Some(SuggestSource::Nodes(type_name)) => {
-                let Some(schema) = schema else {
+                if schema.is_none() {
                     draft.offers.clear();
                     draft.answers = Some(text);
                     return;
-                };
+                }
                 let needle = suggest::needle(&text, list);
-                let search =
-                    suggest::search_nodes(&session, &schema, &type_name, &needle, snapshot, cx);
+                let search = suggest::search_nodes(&session, &type_name, &needle, snapshot, cx);
                 draft._suggest_task = Some(cx.spawn(async move |this, cx| {
                     let result = search.await;
                     this.update(cx, |this, cx| {
@@ -8628,7 +8627,7 @@ impl TypeTable {
                         }
                         // A failed search offers nothing, not what an earlier one found.
                         match result {
-                            Ok(rows) => draft.offers.set(suggest::from_node_rows(&rows), typed),
+                            Ok(hits) => draft.offers.set(suggest::from_hits(&hits), typed),
                             Err(_) => draft.offers.clear(),
                         }
                         draft.answers = Some(text);
@@ -8943,7 +8942,7 @@ impl TypeTable {
     }
 
     /// ↵ in the sentence field: the sentence goes to the model, once the task is allowed.
-    fn run_words(&mut self, cx: &mut Context<Self>) {
+    fn run_words(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let sentence = self.words_editor.read(cx).text(cx).trim().to_owned();
         if sentence.is_empty() || matches!(self.words, WordsState::Running { .. }) {
             return;
@@ -8953,10 +8952,16 @@ impl TypeTable {
             cx.notify();
             return;
         };
-        self.start_words(models, sentence, cx);
+        self.start_words(models, sentence, window, cx);
     }
 
-    fn start_words(&mut self, models: Entity<Models>, sentence: String, cx: &mut Context<Self>) {
+    fn start_words(
+        &mut self,
+        models: Entity<Models>,
+        sentence: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let choices = self.words_choices();
         let offered = self.view_choices();
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
@@ -8982,7 +8987,7 @@ impl TypeTable {
             schema: words::schema_with(&choices, &offered, reach),
         };
         let call = models.read(cx).call::<words::Answer>(request, cx);
-        let task = cx.spawn(async move |this, cx| {
+        let task = cx.spawn_in(window, async move |this, cx| {
             let answer = match call.await {
                 Ok(answer) => answer,
                 Err(error) => {
@@ -9017,10 +9022,9 @@ impl TypeTable {
                     .and_then(|choice| choice.other_type.clone());
                 let search = this
                     .read_with(cx, |this, cx| {
-                        let (other, schema) = (other.as_deref()?, this.schema.clone()?);
+                        let other = other.as_deref()?;
                         Some(suggest::search_nodes(
                             &this.session,
-                            &schema,
                             other,
                             &name,
                             this.paging.pinned.clone(),
@@ -9033,7 +9037,7 @@ impl TypeTable {
                     Some(search) => search
                         .await
                         .ok()
-                        .and_then(|rows| suggest::from_node_rows(&rows).into_iter().next()),
+                        .and_then(|hits| suggest::from_hits(&hits).into_iter().next()),
                     None => None,
                 };
                 match found {
@@ -9071,7 +9075,7 @@ impl TypeTable {
                 }
             }
             let filters = judged;
-            this.update(cx, |this, cx| {
+            this.update_in(cx, |this, window, cx| {
                 this.node_labels.extend(labels);
                 // The last sentence's filters go; ones added by hand stay.
                 let made = std::mem::take(&mut this.words_made);

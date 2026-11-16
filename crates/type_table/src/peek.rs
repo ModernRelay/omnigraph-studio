@@ -3520,9 +3520,9 @@ impl NodePeek {
 
     /// Reads the other type's nodes matching what is typed, eight at a time, after a pause.
     fn search(&mut self, cx: &mut Context<Self>) {
-        let Some(schema) = self.schema.clone() else {
+        if self.schema.is_none() {
             return;
-        };
+        }
         let Some(adding) = self.adding.as_mut() else {
             return;
         };
@@ -3531,15 +3531,15 @@ impl NodePeek {
         };
         let text = adding.editor.read(cx).text(cx).trim().to_owned();
         let other = &group.group.other_type;
-        let search = suggest::search_nodes(&self.session, &schema, other, &text, None, cx);
+        let search = suggest::search_nodes(&self.session, other, &text, None, cx);
         adding._search = Some(cx.spawn(async move |this, cx| {
             let result = search.await;
             this.update(cx, |this, cx| {
                 if let Some(adding) = this.adding.as_mut() {
                     // A failed search offers nothing, not what an earlier one found.
                     match result {
-                        Ok(rows) => {
-                            adding.offers.set(suggest::from_node_rows(&rows), true);
+                        Ok(hits) => {
+                            adding.offers.set(suggest::from_hits(&hits), true);
                             adding.found = Loadable::Loaded(());
                         }
                         Err(error) => {
