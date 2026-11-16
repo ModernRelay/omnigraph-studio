@@ -2218,6 +2218,12 @@ impl GraphSession {
         &mut self.ledger
     }
 
+    /// Forgets the branch heads the session knows, for tests of what happens without one.
+    #[cfg(test)]
+    pub(crate) fn forget_heads(&mut self) {
+        self.heads.clear();
+    }
+
     /// Runs `read` asked for by `scope`'s view, so the ledger names who asked.
     fn asked_by<T>(&mut self, scope: u64, read: impl FnOnce(&mut Self) -> T) -> T {
         let asker = self

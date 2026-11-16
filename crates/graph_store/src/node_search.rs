@@ -397,6 +397,10 @@ enum Loaded {
     TooLarge,
 }
 
+/// How long the commit a type's index was read at stands for the branch's head while the
+/// session knows no head: one head poll, as long as any view goes without asking (spec 031).
+pub const HEAD_UNKNOWN_HOLD: std::time::Duration = std::time::Duration::from_secs(30);
+
 type Loading = Shared<Task<Result<(Option<String>, Loaded), SharedString>>>;
 
 /// The name indexes a session holds, by type and commit, within [`INDEX_BUDGET_BYTES`].
@@ -405,6 +409,9 @@ pub(crate) struct NodeIndexes {
     held: HashMap<(String, String), (Loaded, u64)>,
     /// Indexes being read, by type and the commit asked for (`None`: the branch's head).
     loading: HashMap<(String, Option<String>), Loading>,
+    /// While no head is known: the commit each type's index was last read at as the head's,
+    /// and when.
+    at_head: HashMap<String, (String, std::time::Instant)>,
     used: u64,
     /// Moves when the indexes are forgotten (a new token, a new schema), so a read still out
     /// from before lands nowhere.
@@ -416,7 +423,14 @@ impl NodeIndexes {
     pub(crate) fn reset(&mut self) {
         self.held.clear();
         self.loading.clear();
+        self.at_head.clear();
         self.generation += 1;
+    }
+
+    /// The commit `type_name`'s index was read at as the head's, while that stands.
+    fn at_head(&self, type_name: &str, now: std::time::Instant) -> Option<String> {
+        let (commit, at) = self.at_head.get(type_name)?;
+        (now.saturating_duration_since(*at) < HEAD_UNKNOWN_HOLD).then(|| commit.clone())
     }
 
     fn get(&mut self, type_name: &str, commit: &str, node: &NodeType) -> Option<Loaded> {
@@ -563,7 +577,8 @@ impl GraphSession {
     }
 
     /// `node`'s name index at `commit` (the branch's head when `None`), held or read, and the
-    /// commit it is of.
+    /// commit it is of. With no head known, the commit a head read last answered at stands for
+    /// [`HEAD_UNKNOWN_HOLD`].
     fn node_index(
         &mut self,
         schema: &Arc<SchemaModel>,
@@ -571,7 +586,11 @@ impl GraphSession {
         at: &ReadAt,
         cx: &mut Context<Self>,
     ) -> Task<Result<(Option<String>, Loaded), SharedString>> {
-        let commit = at.commit.clone();
+        let now = cx.background_executor().now();
+        let commit = at
+            .commit
+            .clone()
+            .or_else(|| self.node_indexes.at_head(&node.name, now));
         if let Some(commit) = &commit
             && let Some(loaded) = self.node_indexes.get(&node.name, commit, node)
         {
@@ -586,9 +605,15 @@ impl GraphSession {
             Ok(query) => query,
             Err(error) => return Task::ready(Err(message(error))),
         };
-        let read = self.read_through(at, &query, cx);
+        // At the commit the head stood at, when that is what stands for it.
+        let reading = ReadAt {
+            commit: commit.clone(),
+            scope: at.scope.clone(),
+        };
+        let read = self.read_through(&reading, &query, cx);
         let (node, type_name) = (node.clone(), node.name.clone());
         let generation = self.node_indexes.generation;
+        let asked_head = commit.is_none();
         let task = cx.spawn(async move |this, cx| {
             let result = read.await;
             let finished = match result {
@@ -609,6 +634,7 @@ impl GraphSession {
                 }
                 Err(error) => Err(message(error)),
             };
+            let now = cx.background_executor().now();
             this.update(cx, |this, _| {
                 // Forgotten while it was out (a new token, a new schema): it lands nowhere.
                 if this.node_indexes.generation != generation {
@@ -620,6 +646,11 @@ impl GraphSession {
                 if let Ok((Some(at), loaded)) = &finished {
                     this.node_indexes
                         .insert(&type_name, at.clone(), loaded.clone());
+                    if asked_head {
+                        this.node_indexes
+                            .at_head
+                            .insert(type_name.clone(), (at.clone(), now));
+                    }
                 }
             })
             .ok();
@@ -1138,5 +1169,37 @@ mod tests {
             );
         }
         assert_eq!(sent.load(Ordering::SeqCst), 2);
+    }
+
+    fn index_reads(reads: &Reads) -> usize {
+        reads
+            .lock()
+            .unwrap()
+            .get("studio_search_index")
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// With no head known, the commit a type's index was read at stands for the head for a
+    /// while: the next pause matches in memory, and a later one reads again (review of #124).
+    #[gpui::test]
+    async fn with_no_head_known_a_pause_after_reads_nothing(cx: &mut gpui::TestAppContext) {
+        let (session, _served, reads) = served_people(3, cx);
+        cx.run_until_parked();
+        let no_head = |cx: &mut gpui::TestAppContext| {
+            session.update(cx, |session, _| session.forget_heads());
+            let head = session.read_with(cx, |s, _| s.head("main").map(str::to_owned));
+            assert_eq!(head, None);
+        };
+        no_head(cx);
+        assert_eq!(find(&session, None, "ada", cx).hits.len(), 1);
+        no_head(cx);
+        assert_eq!(find(&session, None, "person", cx).hits.len(), 3);
+        assert_eq!(index_reads(&reads), 1, "one read for both pauses");
+        cx.executor().advance_clock(HEAD_UNKNOWN_HOLD);
+        cx.run_until_parked();
+        no_head(cx);
+        assert_eq!(find(&session, None, "ada", cx).hits.len(), 1);
+        assert_eq!(index_reads(&reads), 2, "read again once the hold is over");
     }
 }
