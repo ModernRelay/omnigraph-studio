@@ -1,13 +1,13 @@
 //! Values a filter's value field offers while it is typed (spec 004, filters): an enum's
 //! values or `true`/`false` from the schema, and for "related to" the other type's nodes,
-//! searched on the server by id or label.
+//! found by id or name (spec 031).
 
 use std::time::Duration;
 
 use gpui::{App, Entity, Task};
 use gq_language::input::{edit_text, list_items};
-use gq_language::{SchemaModel, builder};
 use graph_store::GraphSession;
+use graph_store::node_search::{MatchRank, NodeHit, TypeHits};
 use serde_json::Value;
 
 /// One offered value: what goes in the field, and a label shown beside it.
@@ -17,54 +17,107 @@ pub struct Suggestion {
     pub label: Option<String>,
 }
 
-/// How many nodes a "related to" search offers.
-pub const NODE_SUGGESTIONS: u32 = 8;
+/// How many nodes a field that names a node offers.
+pub const NODE_SUGGESTIONS: usize = 8;
 
 /// The pause in typing a field that names a node waits for before it searches.
 pub const NODE_SEARCH_DELAY: Duration = Duration::from_millis(120);
 
-/// The rows of `type_name`'s nodes that `text` names (`builder::node_search`), read at
-/// `snapshot` once typing pauses: what a field that names a node offers. The search is built at
-/// once, so one that cannot be built fails without the wait.
+/// The nodes of `type_name` that `text` names, best first (`GraphSession::find_nodes`, spec
+/// 031), at `snapshot` once typing pauses: what a field that names a node offers.
 pub fn search_nodes(
     session: &Entity<GraphSession>,
-    schema: &SchemaModel,
     type_name: &str,
     text: &str,
     snapshot: Option<String>,
     cx: &App,
-) -> Task<Result<std::sync::Arc<serde_json::Value>, String>> {
-    let query = match builder::node_search(schema, type_name, text, NODE_SUGGESTIONS) {
-        Ok(query) => query,
-        Err(error) => return Task::ready(Err(error.to_string())),
-    };
+) -> Task<Result<TypeHits, String>> {
     let session = session.downgrade();
+    let (type_name, text) = (type_name.to_owned(), text.to_owned());
     cx.spawn(async move |cx| {
         cx.background_executor().timer(NODE_SEARCH_DELAY).await;
-        let read = session
-            .update(cx, |session, cx| session.read(&query, snapshot, cx))
+        let find = session
+            .update(cx, |session, cx| {
+                session.find_nodes(&type_name, &text, snapshot, None, NODE_SUGGESTIONS, cx)
+            })
             .map_err(|_| "The graph was closed.".to_owned())?;
-        read.await
-            .map(|output| output.rows)
-            .map_err(|error| error.to_string())
+        find.await.map_err(|error| error.to_string())
     })
 }
 
-/// A node search's rows (`builder::node_search`) as offers: the id goes in the field, the label
-/// beside it.
-pub fn from_node_rows(rows: &serde_json::Value) -> Vec<Suggestion> {
-    rows.as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|row| {
-            let id = row.get("id")?.as_str()?.to_owned();
-            let label = row
-                .get("label")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned);
-            Some(Suggestion { value: id, label })
+/// A node search's hits as offers, best first: the id goes in the field, the name beside it.
+pub fn from_hits(hits: &TypeHits) -> Vec<Suggestion> {
+    hits.hits
+        .iter()
+        .map(|hit| Suggestion {
+            value: hit.id.clone(),
+            label: hit.label.clone(),
         })
         .collect()
+}
+
+/// What a name given in words (spec 019, a sentence's "related to") names among a search's
+/// hits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Named {
+    /// One node: the only match, or the only one whose id or name is the name itself.
+    One(Suggestion),
+    /// No node matches.
+    None,
+    /// Several match and none alone exactly: the person picks.
+    Several(Vec<Suggestion>),
+}
+
+/// The node `hits` (a search for a name) name, when it is one: never the first of several. Only
+/// a node whose id or name is the name exactly counts as being it: an email or handle that
+/// happens to equal it does not. A node only the engine's full-text search found (a stemmed
+/// word, a long text) is never taken alone: it is offered as a choice.
+pub fn named(hits: &TypeHits) -> Named {
+    let exact: Vec<&NodeHit> = hits
+        .hits
+        .iter()
+        .filter(|hit| hit.rank == MatchRank::Exact && hit.matched.is_none())
+        .collect();
+    let one = |hit: &NodeHit| {
+        Named::One(Suggestion {
+            value: hit.id.clone(),
+            label: hit.label.clone(),
+        })
+    };
+    match (exact.as_slice(), hits.hits.as_slice()) {
+        ([hit], _) => one(hit),
+        (_, []) => Named::None,
+        (_, [hit]) if !hits.more && hit.rank != MatchRank::FullText => one(hit),
+        _ => Named::Several(from_hits(hits)),
+    }
+}
+
+/// How many choices a note names before "and N more".
+const NOTE_CHOICES: usize = 3;
+
+/// What the sentence's note says of a name several nodes match: to pick one in the filter
+/// when its draft `opened`, else the choices themselves, by name and id, and to name one
+/// exactly.
+pub fn pick_note(opened: bool, other: &str, name: &str, offers: &[Suggestion]) -> String {
+    let count = offers.len();
+    if opened {
+        return format!("{count} {other} nodes match \"{name}\": pick one in the filter.");
+    }
+    let mut named: Vec<String> = offers
+        .iter()
+        .take(NOTE_CHOICES)
+        .map(|offer| match &offer.label {
+            Some(label) if *label != offer.value => format!("{label} ({})", offer.value),
+            _ => offer.value.clone(),
+        })
+        .collect();
+    if count > NOTE_CHOICES {
+        named.push(format!("{} more", count - NOTE_CHOICES));
+    }
+    format!(
+        "{count} {other} nodes match \"{name}\" ({}): name one exactly, or add the filter by hand.",
+        named.join(", ")
+    )
 }
 
 /// Whether suggestions complete the field: always, but for a list typed as JSON (a list pasted
@@ -203,27 +256,123 @@ mod tests {
         suggestions.iter().map(|s| s.value.as_str()).collect()
     }
 
+    fn hit(id: &str, label: &str, rank: MatchRank) -> NodeHit {
+        NodeHit {
+            id: id.into(),
+            label: Some(label.into()),
+            matched: None,
+            rank,
+        }
+    }
+
+    fn hits(hits: Vec<NodeHit>, more: bool) -> TypeHits {
+        TypeHits {
+            hits,
+            more,
+            held: true,
+        }
+    }
+
     #[test]
-    fn a_node_search_offers_ids_with_their_labels() {
-        let rows = serde_json::json!([
-            {"id": "person-000000", "label": "Radia Knuth"},
-            {"id": "person-000004"},
-            {"label": "no id"},
-        ]);
+    fn a_node_search_offers_ids_with_their_names_best_first() {
+        let found = hits(
+            vec![
+                hit("o-2", "Acme", MatchRank::Exact),
+                hit("o-1", "Acme Analytics", MatchRank::Prefix),
+            ],
+            false,
+        );
         assert_eq!(
-            from_node_rows(&rows),
+            from_hits(&found),
             [
                 Suggestion {
-                    value: "person-000000".into(),
-                    label: Some("Radia Knuth".into()),
+                    value: "o-2".into(),
+                    label: Some("Acme".into()),
                 },
                 Suggestion {
-                    value: "person-000004".into(),
-                    label: None,
+                    value: "o-1".into(),
+                    label: Some("Acme Analytics".into()),
                 },
             ]
         );
-        assert!(from_node_rows(&serde_json::Value::Null).is_empty());
+    }
+
+    /// A name given in words names a node only when one matches it, or one alone is it;
+    /// otherwise the person picks, and never the first by id (spec 031).
+    #[test]
+    fn a_name_names_one_node_only_when_one_matches() {
+        let one = |id: &str| {
+            Named::One(Suggestion {
+                value: id.into(),
+                label: Some(match id {
+                    "o-2" => "Acme".into(),
+                    _ => "Acme Analytics".into(),
+                }),
+            })
+        };
+        let exact_and_prefix = hits(
+            vec![
+                hit("o-2", "Acme", MatchRank::Exact),
+                hit("o-1", "Acme Analytics", MatchRank::Prefix),
+            ],
+            false,
+        );
+        assert_eq!(named(&exact_and_prefix), one("o-2"));
+        let only = hits(vec![hit("o-1", "Acme Analytics", MatchRank::Prefix)], false);
+        assert_eq!(named(&only), one("o-1"));
+        let only_shown = hits(vec![hit("o-1", "Acme Analytics", MatchRank::Prefix)], true);
+        assert!(matches!(named(&only_shown), Named::Several(_)));
+        let several = hits(
+            vec![
+                hit("adam-smithson", "Adam Smithson", MatchRank::WordStart),
+                hit("john-smith", "John Smith", MatchRank::WordStart),
+            ],
+            false,
+        );
+        assert_eq!(
+            named(&several),
+            Named::Several(from_hits(&several)),
+            "Smith names two people"
+        );
+        assert_eq!(named(&hits(Vec::new(), false)), Named::None);
+        // A handle that is the name is not the name: two people named Acme-something, one
+        // whose handle is "acme", still ask which.
+        let handle = NodeHit {
+            matched: Some(("handle".into(), "acme".into())),
+            ..hit("o-3", "Acme Robotics", MatchRank::Exact)
+        };
+        let by_handle = hits(
+            vec![handle, hit("o-1", "Acme Analytics", MatchRank::Prefix)],
+            false,
+        );
+        assert!(matches!(named(&by_handle), Named::Several(_)));
+        // Found only by full-text search (a stemmed word): offered, never taken alone.
+        let stemmed = hits(
+            vec![hit("o-4", "Acme Holdings", MatchRank::FullText)],
+            false,
+        );
+        assert!(matches!(named(&stemmed), Named::Several(_)));
+    }
+
+    /// When the filter cannot open as a draft, the note names the choices instead of asking
+    /// for a pick nobody can make.
+    #[test]
+    fn a_note_names_the_choices_when_no_filter_opens() {
+        let offers: Vec<Suggestion> = (1..=5)
+            .map(|n| Suggestion {
+                value: format!("o-{n}"),
+                label: Some(format!("Acme {n}")),
+            })
+            .collect();
+        assert_eq!(
+            pick_note(true, "Org", "Acme", &offers),
+            "5 Org nodes match \"Acme\": pick one in the filter."
+        );
+        assert_eq!(
+            pick_note(false, "Org", "Acme", &offers),
+            "5 Org nodes match \"Acme\" (Acme 1 (o-1), Acme 2 (o-2), Acme 3 (o-3), 2 more): \
+             name one exactly, or add the filter by hand."
+        );
     }
 
     #[test]

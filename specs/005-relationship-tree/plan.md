@@ -268,7 +268,9 @@ one measure, and a schema of very many relationships still asks.
   type's table filtered to "related to" this node (spec 004's relationship filter); the eye
   toggle (or `h`) shows groups with none, hidden by default (decided 2026-11-01); with text typed, a
   group not read in full offers "Find “text” among N", which reads that group again on the
-  server narrowed to ids starting with or labels containing the text (Esc clears both).
+  server narrowed to ids starting with or labels containing the text (Esc clears both). Since
+  2026-11-16 (spec 031) each word is matched on its own, in four spellings, in the id or any
+  searched property (the name, the name chosen in Settings, an email or website).
   `OpenNode` from the table, palette or canvas now reaches the tree: the table's handler
   propagates, so Explore shows and the tree reveals the node. A node row's hover card shows
   its label, type and key, then under the relationship that led to it (`→ WorksAt`) every

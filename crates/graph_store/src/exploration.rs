@@ -2154,8 +2154,9 @@ impl Exploration {
         }
     }
 
-    /// Reads a group's neighbours again, narrowed to ids starting with or labels containing
-    /// `text` (spec 005: the filter for groups over one page); empty text reads them all.
+    /// Reads a group's neighbours again, narrowed to those whose id or searched properties hold
+    /// every word of `text` (spec 005: the filter for groups over one page; spec 031: each
+    /// word on its own, in four spellings); empty text reads them all.
     pub fn search_group(&mut self, key: &GroupKey, text: &str, cx: &mut Context<Self>) {
         let text = text.trim();
         let current = self

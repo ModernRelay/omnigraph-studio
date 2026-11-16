@@ -23,6 +23,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+futures = { workspace = true }
 gpui = { workspace = true, features = ["test-support"] }
 graph_client = { workspace = true }
 http_client = { workspace = true }

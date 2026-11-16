@@ -6736,7 +6736,7 @@ impl TypeTable {
 
     fn confirm_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.words_editor.focus_handle(cx).is_focused(window) {
-            self.run_words(cx);
+            self.run_words(window, cx);
             return;
         }
         if self.fill.is_some() && self.fill_editor.focus_handle(cx).is_focused(window) {
@@ -8609,14 +8609,13 @@ impl TypeTable {
                 draft._suggest_task = None;
             }
             Some(SuggestSource::Nodes(type_name)) => {
-                let Some(schema) = schema else {
+                if schema.is_none() {
                     draft.offers.clear();
                     draft.answers = Some(text);
                     return;
-                };
+                }
                 let needle = suggest::needle(&text, list);
-                let search =
-                    suggest::search_nodes(&session, &schema, &type_name, &needle, snapshot, cx);
+                let search = suggest::search_nodes(&session, &type_name, &needle, snapshot, cx);
                 draft._suggest_task = Some(cx.spawn(async move |this, cx| {
                     let result = search.await;
                     this.update(cx, |this, cx| {
@@ -8628,7 +8627,7 @@ impl TypeTable {
                         }
                         // A failed search offers nothing, not what an earlier one found.
                         match result {
-                            Ok(rows) => draft.offers.set(suggest::from_node_rows(&rows), typed),
+                            Ok(hits) => draft.offers.set(suggest::from_hits(&hits), typed),
                             Err(_) => draft.offers.clear(),
                         }
                         draft.answers = Some(text);
@@ -8943,7 +8942,7 @@ impl TypeTable {
     }
 
     /// ↵ in the sentence field: the sentence goes to the model, once the task is allowed.
-    fn run_words(&mut self, cx: &mut Context<Self>) {
+    fn run_words(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let sentence = self.words_editor.read(cx).text(cx).trim().to_owned();
         if sentence.is_empty() || matches!(self.words, WordsState::Running { .. }) {
             return;
@@ -8953,10 +8952,16 @@ impl TypeTable {
             cx.notify();
             return;
         };
-        self.start_words(models, sentence, cx);
+        self.start_words(models, sentence, window, cx);
     }
 
-    fn start_words(&mut self, models: Entity<Models>, sentence: String, cx: &mut Context<Self>) {
+    fn start_words(
+        &mut self,
+        models: Entity<Models>,
+        sentence: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let choices = self.words_choices();
         let offered = self.view_choices();
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
@@ -8982,7 +8987,7 @@ impl TypeTable {
             schema: words::schema_with(&choices, &offered, reach),
         };
         let call = models.read(cx).call::<words::Answer>(request, cx);
-        let task = cx.spawn(async move |this, cx| {
+        let task = cx.spawn_in(window, async move |this, cx| {
             let answer = match call.await {
                 Ok(answer) => answer,
                 Err(error) => {
@@ -9002,8 +9007,11 @@ impl TypeTable {
             let (mut filters, filters_refused) = words::filters_with(answer.value, &choices, reach);
             refused.extend(filters_refused);
             // A `related_to` names a record; the name becomes its id through the node search
-            // the filter's own value field uses, the first match taken, and the pill shows it.
+            // the filter's own value field uses, only when one node is named (spec 031): the
+            // only match, or the only one the name is exactly. When several are, the person
+            // picks among them in the filter's value field; when none, the sentence says so.
             let mut labels: Vec<(String, String)> = Vec::new();
+            let mut to_pick: Option<(String, String, String, Vec<suggest::Suggestion>)> = None;
             for filter in &mut filters {
                 if filter.op != FilterOp::RelatedTo {
                     continue;
@@ -9017,10 +9025,9 @@ impl TypeTable {
                     .and_then(|choice| choice.other_type.clone());
                 let search = this
                     .read_with(cx, |this, cx| {
-                        let (other, schema) = (other.as_deref()?, this.schema.clone()?);
+                        let other = other.as_deref()?;
                         Some(suggest::search_nodes(
                             &this.session,
-                            &schema,
                             other,
                             &name,
                             this.paging.pinned.clone(),
@@ -9029,26 +9036,30 @@ impl TypeTable {
                     })
                     .ok()
                     .flatten();
-                let found = match search {
-                    Some(search) => search
-                        .await
-                        .ok()
-                        .and_then(|rows| suggest::from_node_rows(&rows).into_iter().next()),
-                    None => None,
+                let other = other.unwrap_or_default();
+                let named = match search {
+                    Some(search) => search.await.map(|hits| suggest::named(&hits)),
+                    None => Ok(suggest::Named::None),
                 };
-                match found {
-                    Some(node) => {
+                filter.value = Value::Null;
+                match named {
+                    Ok(suggest::Named::One(node)) => {
                         if let Some(label) = node.label {
                             labels.push((node.value.clone(), label));
                         }
                         filter.value = Value::String(node.value);
                     }
-                    None => {
-                        refused.push(format!(
-                            "no {} matching \"{name}\"",
-                            other.unwrap_or_default()
-                        ));
-                        filter.value = Value::Null;
+                    Ok(suggest::Named::None) => {
+                        refused.push(format!("no {other} matching \"{name}\""));
+                    }
+                    Ok(suggest::Named::Several(offers)) if to_pick.is_none() => {
+                        to_pick = Some((filter.property.clone(), name.clone(), other, offers));
+                    }
+                    Ok(suggest::Named::Several(offers)) => {
+                        refused.push(suggest::pick_note(false, &other, &name, &offers));
+                    }
+                    Err(error) => {
+                        refused.push(format!("{other} could not be searched ({error})"));
                     }
                 }
             }
@@ -9071,7 +9082,7 @@ impl TypeTable {
                 }
             }
             let filters = judged;
-            this.update(cx, |this, cx| {
+            this.update_in(cx, |this, window, cx| {
                 this.node_labels.extend(labels);
                 // The last sentence's filters go; ones added by hand stay.
                 let made = std::mem::take(&mut this.words_made);
@@ -9081,8 +9092,18 @@ impl TypeTable {
                 // What the sentence says of the order, the grouping and the columns replaces
                 // the table's; what it does not say stays as it is.
                 this.apply_words_view(view, cx);
-                let note =
+                let mut note =
                     (!refused.is_empty()).then(|| format!("Could not use: {}", refused.join("; ")));
+                if let Some((key, name, other, offers)) = to_pick {
+                    // The note says what the person sees: the choices in the filter when it
+                    // opened, else the choices themselves and what to do instead.
+                    let opened = this.ask_to_pick(key, name.clone(), offers.clone(), window, cx);
+                    let ask = suggest::pick_note(opened, &other, &name, &offers);
+                    note = Some(match note {
+                        Some(note) => format!("{ask} {note}"),
+                        None => ask,
+                    });
+                }
                 this.words = WordsState::Typing(note);
                 this.reload(true, cx);
                 cx.notify();
@@ -9091,6 +9112,44 @@ impl TypeTable {
         });
         self.words = WordsState::Running { _call: task };
         cx.notify();
+    }
+
+    /// A sentence's "related to" named several nodes (spec 031): its filter opens as a draft,
+    /// the name in its value field and the nodes it names offered, best first, for the person
+    /// to pick one. Nothing is filtered by it until they do. Whether the draft opened: a key
+    /// the filter bar cannot test "related to" on (one reached through a relationship's
+    /// group) opens none, and the caller says so.
+    fn ask_to_pick(
+        &mut self,
+        key: String,
+        name: String,
+        offers: Vec<suggest::Suggestion>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.ops_for(&key).contains(&FilterOp::RelatedTo) {
+            return false;
+        }
+        self.set_draft_property(key.clone(), window, cx);
+        if self
+            .filter_draft
+            .as_ref()
+            .is_none_or(|draft| draft.property != key)
+        {
+            return false;
+        }
+        self.filter_editor.update(cx, |editor, cx| {
+            editor.set_text(name.clone(), window, cx);
+            editor.set_placeholder_text(filter_placeholder(FilterOp::RelatedTo), window, cx);
+        });
+        if let Some(draft) = &mut self.filter_draft {
+            draft.op = FilterOp::RelatedTo;
+            draft.offers.set(offers, true);
+            draft.answers = Some(name);
+        }
+        self.redraw_offers(cx);
+        cx.notify();
+        true
     }
 
     /// The toolbar's sentence field (spec 019): a search field with the model's mark, its
@@ -13344,6 +13403,72 @@ mod tests {
                 "in the order named"
             );
             assert_eq!(table.sort, Some(by_name), "an order not said stays");
+        });
+    }
+
+    /// A sentence whose "related to" names several nodes filters by none of them: the filter
+    /// opens as a draft, the name in its value field and the nodes offered, best first, for
+    /// the person to pick one (spec 031).
+    #[gpui::test]
+    async fn a_name_that_names_several_nodes_asks_which(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let schema = "node Person {\n  slug: String @key\n  name: String\n}\n\
+            node Org {\n  slug: String @key\n  name: String\n}\n\
+            edge WorksAt: Person -> Org\n";
+        let session = session(schema, cx);
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session,
+                "Person".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let key = table.read_with(cx, |table, _| {
+            let schema = table.schema.clone().unwrap();
+            let group = schema
+                .relationships_of("Person")
+                .iter()
+                .find(|group| group.other_type == "Org")
+                .cloned()
+                .unwrap();
+            builder::relationship_key(&group)
+        });
+        let offers = vec![
+            suggest::Suggestion {
+                value: "acme.com".into(),
+                label: Some("ACME Corp".into()),
+            },
+            suggest::Suggestion {
+                value: "acme-labs.ai".into(),
+                label: Some("Acme Labs".into()),
+            },
+        ];
+        let opened = table.update_in(cx, |table, window, cx| {
+            table.ask_to_pick(key.clone(), "Acme".into(), offers.clone(), window, cx)
+        });
+        assert!(opened);
+        table.read_with(cx, |table, cx| {
+            let draft = table.filter_draft.as_ref().expect("the filter is a draft");
+            assert_eq!(draft.property, key);
+            assert_eq!(draft.op, FilterOp::RelatedTo);
+            assert_eq!(draft.offers.len(), 2);
+            assert_eq!(table.filter_editor.read(cx).text(cx), "Acme");
+            assert!(table.filters.is_empty(), "nothing filtered until a pick");
+        });
+
+        // A key the bar cannot test "related to" on opens no draft, and says so: the caller's
+        // note then lists the choices instead (`suggest::pick_note`).
+        table.update_in(cx, |table, window, cx| {
+            table.cancel_filter_draft(window, cx);
+            assert!(!table.ask_to_pick("name".into(), "Acme".into(), offers.clone(), window, cx));
+            assert!(table.filter_draft.is_none());
         });
     }
 

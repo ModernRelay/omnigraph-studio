@@ -781,6 +781,8 @@ pub struct GraphSession {
     /// query at the same commit can mean something else after a rename, a drop or an addition;
     /// every answer kept is kept under its epoch, and nothing crosses one.
     schema_epoch: u64,
+    /// The name indexes node searches match in memory, by type and commit (spec 031).
+    pub(crate) node_indexes: crate::node_search::NodeIndexes,
     schema_text: Option<Arc<str>>,
     /// Branches' newest commits, read alone for a list of branches, and kept until a commit
     /// lands on the branch.
@@ -979,6 +981,7 @@ impl GraphSession {
             seeded_commits: HashMap::new(),
             degree_commits: HashMap::new(),
             schema_epoch: 0,
+            node_indexes: Default::default(),
             schema_text: None,
             head_commits: Memo::new(HEAD_COMMITS),
             commit_change_pages: Memo::weighed(
@@ -1186,6 +1189,7 @@ impl GraphSession {
     /// and a log only carries an answer forward, from those read since with the new token.
     fn forget_reads(&mut self) {
         self.pinned_reads.clear();
+        self.node_indexes.reset();
         self.seeded_reads.clear();
         self.pinned_blobs.clear();
         self.degree_counts.clear();
@@ -1665,6 +1669,7 @@ impl GraphSession {
         self.schema_epoch += 1;
         self.schema_text = Some(model.source.clone());
         self.pinned_reads.clear();
+        self.node_indexes.reset();
         self.seeded_reads.clear();
         self.pinned_blobs.clear();
         // A change names its type as the schema does now.
@@ -2211,6 +2216,62 @@ impl GraphSession {
 
     pub fn ledger_mut(&mut self) -> &mut ReadLedger {
         &mut self.ledger
+    }
+
+    /// `query` read at `snapshot` (the branch's head when `None`) and kept nowhere: neither in
+    /// the read memo nor carried, so a caller that turns the answer into something smaller
+    /// does not hold its rows twice (spec 031, the name index). Through `scope` when one is
+    /// given, so the change feed is asked about what it depends on, as [`Self::read_in`] does.
+    pub(crate) fn read_fresh(
+        &mut self,
+        scope: Option<&ReadScope>,
+        query: &BuiltQuery,
+        snapshot: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<ReadOutput, ReadError>> {
+        let request = QueryRequest {
+            query: query.text.clone(),
+            name: Some(query.name.clone()),
+            params: query.params_value(),
+            branch: snapshot.is_none().then(|| self.branch.clone()),
+            snapshot,
+        };
+        let Some(scope) = scope else {
+            return self.read_request(request, cx);
+        };
+        let id = scope.id;
+        let entry = self
+            .scopes
+            .get_mut(&id)
+            .map(|scope| scope.add(query.depends.clone()));
+        let read = self.asked_by(id, |this| this.read_request(request, cx));
+        cx.spawn(async move |this, cx| {
+            let result = read.await;
+            if let Some((entry, _token)) = entry {
+                this.update(cx, |this, _| {
+                    if let Some(scope) = this.scopes.get_mut(&id) {
+                        match &result {
+                            Ok(output) => scope.answered(entry, &output.rows),
+                            Err(_) => scope.failed(entry),
+                        }
+                    }
+                })
+                .ok();
+            }
+            result
+        })
+    }
+
+    /// How many answers the read memo keeps, for tests.
+    #[cfg(test)]
+    pub(crate) fn kept_reads(&self) -> usize {
+        self.pinned_reads.len()
+    }
+
+    /// Forgets the branch heads the session knows, for tests of what happens without one.
+    #[cfg(test)]
+    pub(crate) fn forget_heads(&mut self) {
+        self.heads.clear();
     }
 
     /// Runs `read` asked for by `scope`'s view, so the ledger names who asked.

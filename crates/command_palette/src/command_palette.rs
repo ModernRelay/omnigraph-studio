@@ -1,6 +1,7 @@
 //! The command palette (spec 002): every action available where the person is, with its
 //! binding, fuzzy filtered and ranked by recent use, plus the graph's types, nodes found by id
-//! or name, queries (open tabs, saved files and stored queries) and branches.
+//! or name in every type (spec 031), queries (open tabs, saved files and stored queries) and
+//! branches.
 //! Scope tabs narrow it (All ⌘1, Types ⌘2, Nodes ⌘3, Queries ⌘4, Branches ⌘5, Commands ⌘6);
 //! Tab hands the text to the agent. ⌘K opens All, ⌘P Nodes, ⌘⇧B Branches, and in an open
 //! palette ⌘P and ⌘⇧B change the scope and keep the text; `?` opens the keyboard shortcuts
@@ -13,10 +14,10 @@
 // restores that focus, then dispatches. Studio does not depend on Zed's `picker`, which needs
 // `project` and `workspace`; the list, matching and persistence are Studio's own.
 
-mod found;
 mod matching;
 mod recent;
 
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use editor::{Editor, EditorEvent};
@@ -26,7 +27,9 @@ use gpui::{
     Window, uniform_list,
 };
 use gq_language::SchemaModel;
-use gq_language::builder::{node_search, search_matches};
+use graph_store::ledger::ReadView;
+use graph_store::node_search::{MatchRank, NodeHit, TypeHits, hit_matches};
+use graph_store::scope::ReadScope;
 use graph_store::{EntityKind, GraphSession, Loadable, SessionEvent};
 use serde_json::Value;
 use studio_actions::agent::Ask;
@@ -39,7 +42,6 @@ use studio_workspace::{ToastKind, Workspace};
 use ui::HighlightedLabel;
 use ui::prelude::*;
 
-use found::{Answers, Found, node_key};
 use matching::humanize_action_name;
 use matching::{Candidate, Group, Pattern, Ranked, normalize_query, rank};
 use studio_workspace::{ModalPlacement, ModalView};
@@ -238,16 +240,32 @@ impl Mode {
 
 /// How long typing must pause before ⌘P looks for nodes.
 const NODE_SEARCH_DELAY: Duration = Duration::from_millis(150);
-/// Nodes found per type, and in all.
-const NODES_PER_TYPE: u32 = 5;
-const NODES_SHOWN: usize = 30;
-/// Node types read for one text before the palette waits to be asked: a graph of 120 types
-/// would otherwise send 120 reads at every pause. Eight is as many as a connection reads at
-/// once (`graph_client::READ_CONCURRENCY`), so a pause's reads go out together; "Search more
-/// types" reads the next eight.
-const TYPES_PER_SEARCH: usize = 8;
-/// The key of the "Search more types" row.
-const MORE_TYPES: &str = "node-search:more";
+/// How long the answers of a search's types wait for each other before they are shown, so
+/// those that come in together land ranked in one draw.
+const LANDING_DELAY: Duration = Duration::from_millis(30);
+/// Nodes shown per type, and per type once the person asks for more of it ("More in
+/// <Type>…").
+const NODES_PER_TYPE: usize = 5;
+const NODES_EXPANDED: usize = 25;
+/// Nodes listed in all.
+const NODES_SHOWN: usize = 60;
+/// What the keys of the "More in <Type>…" and failed types' rows start with.
+const MORE_IN: &str = "node-search:more:";
+const RETRY: &str = "node-search:retry:";
+/// What a found node's row key starts with: `node:<type>:<id>`.
+const NODE_KEY: &str = "node:";
+
+/// The key of the row for node `id` of `type_name`.
+fn node_key(type_name: &str, id: &str) -> String {
+    format!("{NODE_KEY}{type_name}:{id}")
+}
+
+/// What one type answered for the text.
+enum TypeAnswer {
+    Hits(TypeHits),
+    /// Its search failed, and why: shown with Retry, never as "No node matches".
+    Failed(SharedString),
+}
 
 /// What a row does when run.
 enum Row {
@@ -263,6 +281,8 @@ enum Row {
     Node {
         action: Box<dyn Action>,
         type_name: String,
+        /// The property the text matched, with its text, when not the id or the name.
+        matched: Option<(String, String)>,
     },
     Branch {
         name: String,
@@ -290,10 +310,22 @@ enum Row {
         mutation: bool,
         description: Option<String>,
     },
-    /// The node types not yet read for the text: running it reads the next ones.
-    MoreTypes {
-        count: usize,
+    /// A type with more matches than it shows: running it shows more of them.
+    MoreIn {
+        type_name: String,
     },
+    /// A type whose search failed: running it searches it again.
+    Retry {
+        type_name: String,
+        error: SharedString,
+    },
+}
+
+impl Row {
+    /// Whether the row is a way on (more of a type, Retry) rather than a result.
+    fn is_way_on(&self) -> bool {
+        matches!(self, Row::MoreIn { .. } | Row::Retry { .. })
+    }
 }
 
 impl Row {
@@ -305,7 +337,7 @@ impl Row {
             | Row::Saved { action }
             | Row::View { action, .. }
             | Row::Stored { action, .. } => Some(action.as_ref()),
-            Row::Branch { .. } | Row::Tab { .. } | Row::MoreTypes { .. } => None,
+            Row::Branch { .. } | Row::Tab { .. } | Row::MoreIn { .. } | Row::Retry { .. } => None,
         }
     }
 
@@ -316,7 +348,7 @@ impl Row {
     fn remembered(&self) -> bool {
         !matches!(
             self,
-            Row::Tab { .. } | Row::Node { .. } | Row::MoreTypes { .. }
+            Row::Tab { .. } | Row::Node { .. } | Row::MoreIn { .. } | Row::Retry { .. }
         )
     }
 }
@@ -396,23 +428,39 @@ pub(crate) struct CommandPalette {
     nodes_for: String,
     /// Counts the texts searched: an answer for an earlier one is dropped.
     search: u64,
-    /// The nodes found for the text, in the order they came: a type that answers later adds
+    /// The nodes found for the text, in the order they landed: a type that answers later adds
     /// rows below those shown and moves none of them (constitution V).
-    nodes: Vec<(String, Found)>,
-    /// The node types not yet read for the text, in the order they would be: what "Search
-    /// more types" reads next.
-    unread_types: Vec<String>,
-    /// One read per node type asked for the text. Dropped, and so stopped, when it changes.
+    nodes: Vec<(String, NodeHit)>,
+    /// The node types searched for the text, in [`search_order`].
+    type_order: Vec<String>,
+    /// What each type answered for the text.
+    answered: HashMap<String, TypeAnswer>,
+    /// Types the person asked to see more of ("More in <Type>…"), and the one whose first new
+    /// row the highlight moves to once its answer lands.
+    expanded: HashSet<String>,
+    reveal: Option<String>,
+    /// One search per node type for the text. Dropped, and so stopped, when it changes.
     node_reads: Vec<Task<()>>,
-    /// Of those, the reads not yet answered.
+    /// Of those, the searches not yet answered.
     pending_reads: usize,
+    /// Answers in but not shown yet, and the wait that shows them together.
+    arrived: Vec<(String, Result<TypeHits, SharedString>)>,
+    landing: Option<Task<()>>,
+    /// The node search's read scope while the palette is open (spec 031): the change feed is
+    /// asked about the types searched, so a type's name index is carried to a commit that
+    /// changed none of its nodes.
+    search_scope: Option<ReadScope>,
+    /// How many times the palette was drawn, and answers landed, for the drawing guards
+    /// (`docs/drawing.md`).
+    #[cfg(test)]
+    renders: usize,
+    #[cfg(test)]
+    landings: usize,
     /// The graph's saved query files, being read.
     _saved: Option<Task<()>>,
     /// Nodes are being looked up for the current text: from the keystroke, through the pause,
     /// until every type read has answered.
     searching: bool,
-    /// What each node type answered, shown again or narrowed without a read.
-    answers: Answers,
     _subscription: Subscription,
     /// The graph's stored-query catalog, which the graph reads when a view first wants it:
     /// heard while it is being read, so its queries are listed when it lands.
@@ -505,6 +553,15 @@ impl CommandPalette {
             }
         });
         let fixed = rows.len();
+        let search_scope = session
+            .as_ref()
+            .filter(|_| matches!(mode, Mode::Picker(_)))
+            .map(|session| {
+                session.update(cx, |session, _| {
+                    let branch = session.branch.clone();
+                    session.read_scope(&branch, ReadView::Search)
+                })
+            });
         let mut palette = Self {
             mode,
             session,
@@ -522,11 +579,20 @@ impl CommandPalette {
             nodes_for: String::new(),
             search: 0,
             nodes: Vec::new(),
-            unread_types: Vec::new(),
+            type_order: Vec::new(),
+            answered: HashMap::new(),
+            expanded: HashSet::new(),
+            reveal: None,
             node_reads: Vec::new(),
             pending_reads: 0,
+            arrived: Vec::new(),
+            landing: None,
+            search_scope,
+            #[cfg(test)]
+            renders: 0,
+            #[cfg(test)]
+            landings: 0,
             searching: false,
-            answers: Answers::default(),
             _saved: None,
             _subscription: subscription,
             _catalog: catalog,
@@ -600,12 +666,10 @@ impl CommandPalette {
         self.insert_fixed(rows, candidates, cx);
     }
 
-    /// After a pause in typing, looks up nodes whose id starts with, or label contains, the
-    /// text: one read per node type, at most [`TYPES_PER_SEARCH`] of them, in
-    /// [`search_order`]; the rest wait for "Search more types". Each type's rows show as it
-    /// answers. Rows found for the earlier text that the server would not return for this one
-    /// go at once; the others stay until their type answers. A type whose earlier answer holds
-    /// every match is narrowed without a read; when every type is, the rows change at once.
+    /// After a pause in typing, looks for nodes the text names in every node type
+    /// (`GraphSession::find_nodes`, spec 031), in [`search_order`]: a type held in memory
+    /// answers without a read once its name index is in, a larger one asks the server. Rows
+    /// found for the earlier text that still match stay; the others go at once.
     fn schedule_node_search(&mut self, cx: &mut Context<Self>) {
         let text = self.query.read(cx).text(cx).trim().to_owned();
         let Some(session) = self.session.clone() else {
@@ -617,16 +681,19 @@ impl CommandPalette {
         self.node_search = None;
         self.node_reads.clear();
         self.pending_reads = 0;
-        self.unread_types.clear();
+        self.arrived.clear();
+        self.landing = None;
+        self.answered.clear();
+        self.expanded.clear();
+        self.reveal = None;
         self.searching = false;
-        if text.chars().count() < 2 {
+        if text.is_empty() {
             self.nodes.clear();
             self.show_nodes(cx);
             return;
         }
-        self.nodes
-            .retain(|(_, found)| search_matches(&found.id, found.label.as_deref(), &text));
-        let types = {
+        self.nodes.retain(|(_, hit)| hit_matches(hit, &text));
+        self.type_order = {
             let session = session.read(cx);
             session
                 .schema_model()
@@ -635,155 +702,240 @@ impl CommandPalette {
                 })
                 .unwrap_or_default()
         };
-        let mut unread = Vec::new();
-        for type_name in types {
-            match self.answers.known(&type_name, &text) {
-                Some(rows) => self.landed(&type_name, rows),
-                None => unread.push(type_name),
-            }
-        }
-        self.unread_types = unread.split_off(unread.len().min(TYPES_PER_SEARCH));
-        if !unread.is_empty() {
+        if !self.type_order.is_empty() {
             self.searching = true;
             let search = self.search;
             self.node_search = Some(cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(NODE_SEARCH_DELAY).await;
-                this.update(cx, |this, cx| this.read_types(search, text, unread, cx))
-                    .ok();
+                this.update(cx, |this, cx| {
+                    for type_name in this.type_order.clone() {
+                        this.find_type(search, &text, type_name, cx);
+                    }
+                })
+                .ok();
             }));
         }
         self.show_nodes(cx);
     }
 
-    /// Sends one read per type of `types` for `text`, each shown as it answers.
-    fn read_types(
-        &mut self,
-        search: u64,
-        text: String,
-        types: Vec<String>,
-        cx: &mut Context<Self>,
-    ) {
+    /// Asks the session for `type_name`'s nodes for `text`: [`NODES_PER_TYPE`] of them, or
+    /// [`NODES_EXPANDED`] once the person asked for more of the type.
+    fn find_type(&mut self, search: u64, text: &str, type_name: String, cx: &mut Context<Self>) {
         let Some(session) = self.session.clone() else {
             return;
         };
-        let schema = session.read(cx).schema_model();
-        for type_name in types {
-            let Some(query) = schema
-                .as_ref()
-                .and_then(|schema| node_search(schema, &type_name, &text, NODES_PER_TYPE).ok())
-            else {
-                continue;
-            };
-            let read = session.update(cx, |session, cx| session.read(&query, None, cx));
-            let text = text.clone();
-            self.pending_reads += 1;
-            self.node_reads.push(cx.spawn(async move |this, cx| {
-                // A type that fails to answer simply has no rows; the others still show.
-                let rows = read.await.ok().and_then(|output| found_rows(&output.rows));
-                this.update(cx, |this, cx| {
-                    this.type_answered(search, type_name, text, rows, cx)
-                })
-                .ok();
-            }));
-        }
-        self.searching = self.pending_reads > 0;
-        cx.notify();
+        let limit = match self.expanded.contains(&type_name) {
+            true => NODES_EXPANDED,
+            false => NODES_PER_TYPE,
+        };
+        let scope = self.search_scope.clone();
+        let find = session.update(cx, |session, cx| {
+            session.find_nodes(&type_name, text, None, scope.as_ref(), limit, cx)
+        });
+        self.pending_reads += 1;
+        self.searching = true;
+        self.node_reads.push(cx.spawn(async move |this, cx| {
+            let answer = find.await;
+            this.update(cx, |this, cx| {
+                this.type_answered(search, type_name, answer, cx)
+            })
+            .ok();
+        }));
     }
 
-    /// One type's answer for the text of search `search`, `None` when it failed.
+    /// One type's answer for the text of search `search`. Answers that come in together land
+    /// together, ranked, in one draw: once every type asked has answered, or
+    /// [`LANDING_DELAY`] after the first of them.
     fn type_answered(
         &mut self,
         search: u64,
         type_name: String,
-        text: String,
-        rows: Option<Vec<Found>>,
+        answer: Result<TypeHits, SharedString>,
         cx: &mut Context<Self>,
     ) {
         if search != self.search {
             return;
         }
         self.pending_reads = self.pending_reads.saturating_sub(1);
-        self.searching = self.pending_reads > 0;
-        if let Some(rows) = &rows {
-            let limit = NODES_PER_TYPE as usize;
-            self.answers
-                .keep(type_name.clone(), text, rows.clone(), limit);
+        self.arrived.push((type_name, answer));
+        if self.pending_reads == 0 {
+            self.land(cx);
+        } else if self.landing.is_none() {
+            self.landing = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(LANDING_DELAY).await;
+                this.update(cx, |this, cx| {
+                    if this.search == search {
+                        this.land(cx)
+                    }
+                })
+                .ok();
+            }));
         }
-        self.landed(&type_name, rows.unwrap_or_default());
-        self.show_nodes(cx);
     }
 
-    /// "Search more types": reads the next [`TYPES_PER_SEARCH`] node types for the text. The
-    /// palette stays open, on this row while types are left.
-    fn search_more(&mut self, cx: &mut Context<Self>) {
-        let next = self.unread_types.len().min(TYPES_PER_SEARCH);
-        let types: Vec<String> = self.unread_types.drain(..next).collect();
-        self.read_types(self.search, self.nodes_for.clone(), types, cx);
-        self.show_nodes(cx);
-    }
-
-    /// Takes `type_name`'s answer for the text: its rows shown that the answer no longer holds
-    /// go, a label that changed changes in place, and rows not shown yet are added below every
-    /// row shown, up to [`NODES_SHOWN`].
-    fn landed(&mut self, type_name: &str, rows: Vec<Found>) {
-        self.nodes.retain(|(shown, found)| {
-            shown != type_name || rows.iter().any(|row| row.id == found.id)
-        });
-        for row in rows {
-            let at = self
-                .nodes
+    /// Takes the answers in: each type's rows shown that its answer no longer holds go, a name
+    /// that changed changes in place, and new rows come below every row shown (constitution
+    /// V), the best first (by rank, then the shorter name, whatever its type), up to
+    /// [`NODES_SHOWN`].
+    fn land(&mut self, cx: &mut Context<Self>) {
+        #[cfg(test)]
+        {
+            self.landings += 1;
+        }
+        self.landing = None;
+        self.searching = self.pending_reads > 0;
+        // (rank, the length of what names it, its type's place, its place in its type's answer)
+        let mut batch: Vec<(MatchRank, usize, usize, usize, String, NodeHit)> = Vec::new();
+        for (type_name, answer) in std::mem::take(&mut self.arrived) {
+            let order = self
+                .type_order
                 .iter()
-                .position(|(shown, found)| shown == type_name && found.id == row.id);
-            match at {
-                Some(at) => self.nodes[at].1 = row,
-                None if self.nodes.len() < NODES_SHOWN => {
-                    self.nodes.push((type_name.to_owned(), row))
+                .position(|name| *name == type_name)
+                .unwrap_or(usize::MAX);
+            match answer {
+                Ok(hits) => {
+                    let shown = match self.expanded.contains(&type_name) {
+                        true => NODES_EXPANDED,
+                        false => NODES_PER_TYPE,
+                    };
+                    self.nodes.retain(|(shown_type, found)| {
+                        *shown_type != type_name || hits.hits.iter().any(|hit| hit.id == found.id)
+                    });
+                    for (place, hit) in hits.hits.iter().take(shown).enumerate() {
+                        match self.nodes.iter_mut().find(|(shown_type, found)| {
+                            *shown_type == type_name && found.id == hit.id
+                        }) {
+                            Some((_, found)) => *found = hit.clone(),
+                            None => {
+                                let named = hit.label.as_deref().unwrap_or(&hit.id).chars().count();
+                                batch.push((
+                                    hit.rank,
+                                    named,
+                                    order,
+                                    place,
+                                    type_name.clone(),
+                                    hit.clone(),
+                                ))
+                            }
+                        }
+                    }
+                    self.answered.insert(type_name, TypeAnswer::Hits(hits));
                 }
-                None => {}
+                Err(error) => {
+                    self.nodes
+                        .retain(|(shown_type, _)| *shown_type != type_name);
+                    self.answered.insert(type_name, TypeAnswer::Failed(error));
+                }
             }
         }
+        batch.sort_by_key(|row| (row.0, row.1, row.2, row.3));
+        // A type the person asked for more of shows them whatever the list holds: its own
+        // limit bounds it.
+        let mut revealed = None;
+        for (_, _, _, _, type_name, hit) in batch {
+            let asked = self.expanded.contains(&type_name);
+            if asked || self.nodes.len() < NODES_SHOWN {
+                if asked && revealed.is_none() && self.reveal.as_ref() == Some(&type_name) {
+                    revealed = Some(node_key(&type_name, &hit.id));
+                }
+                self.nodes.push((type_name, hit));
+            }
+        }
+        self.show_nodes(cx);
+        // "More in <Type>…" goes once run: the highlight moves to the first row it brought.
+        if let Some(key) = revealed {
+            self.reveal = None;
+            self.select_key(Some(key), cx);
+        }
     }
 
-    /// Lists the nodes found after the fixed rows, then "Search more types" while types are
-    /// left. The row the person moved to stays theirs when nodes come in: ↵ runs it, not the
-    /// first row of the new list.
+    /// "More in <Type>…": the type's best [`NODES_EXPANDED`] for the text. The palette stays
+    /// open, on this row.
+    fn show_more(&mut self, type_name: String, cx: &mut Context<Self>) {
+        self.expanded.insert(type_name.clone());
+        self.reveal = Some(type_name.clone());
+        let text = self.nodes_for.clone();
+        self.find_type(self.search, &text, type_name, cx);
+        self.show_nodes(cx);
+    }
+
+    /// Retry on a type whose search failed: it is searched again (a read; nothing is written).
+    fn retry_type(&mut self, type_name: String, cx: &mut Context<Self>) {
+        self.answered.remove(&type_name);
+        let text = self.nodes_for.clone();
+        self.find_type(self.search, &text, type_name, cx);
+        self.show_nodes(cx);
+    }
+
+    /// Lists the nodes found after the fixed rows, then "More in <Type>…" for each type with
+    /// more matches than it shows, then each type whose search failed, with Retry. The row the
+    /// person moved to stays theirs when nodes come in: ↵ runs it, not the first row of the
+    /// new list.
     fn show_nodes(&mut self, cx: &mut Context<Self>) {
         let selected = self.selected_key();
         self.rows.truncate(self.fixed);
         self.candidates.truncate(self.fixed);
-        for (type_name, Found { id, label }) in &self.nodes {
-            let shown = match label {
-                Some(label) if label != id => format!("{label} · {id}"),
-                _ => id.clone(),
+        for (type_name, hit) in &self.nodes {
+            let shown = match &hit.label {
+                Some(label) if *label != hit.id => format!("{label} · {}", hit.id),
+                _ => hit.id.clone(),
             };
             self.candidates.push(Candidate {
                 label: shown,
-                key: node_key(type_name, id),
+                key: node_key(type_name, &hit.id),
                 group: Group::Node,
             });
             self.rows.push(Row::Node {
                 action: Box::new(OpenNode {
                     type_name: type_name.clone(),
-                    id: id.clone(),
+                    id: hit.id.clone(),
                 }),
+                type_name: type_name.clone(),
+                matched: hit.matched.clone(),
+            });
+        }
+        for type_name in &self.type_order {
+            let Some(TypeAnswer::Hits(hits)) = self.answered.get(type_name) else {
+                continue;
+            };
+            let shown = self
+                .nodes
+                .iter()
+                .filter(|(shown, _)| shown == type_name)
+                .count();
+            if self.expanded.contains(type_name) || (shown >= hits.hits.len() && !hits.more) {
+                continue;
+            }
+            self.candidates.push(Candidate {
+                label: format!("More in {type_name}…"),
+                key: format!("{MORE_IN}{type_name}"),
+                group: Group::Node,
+            });
+            self.rows.push(Row::MoreIn {
                 type_name: type_name.clone(),
             });
         }
-        let count = self.unread_types.len();
-        if count > 0 {
-            let noun = ["types", "type"][(count == 1) as usize];
+        for type_name in &self.type_order {
+            let Some(TypeAnswer::Failed(error)) = self.answered.get(type_name) else {
+                continue;
+            };
             self.candidates.push(Candidate {
-                label: format!("Search {count} more {noun}"),
-                key: MORE_TYPES.into(),
+                label: format!("{type_name} could not be searched"),
+                key: format!("{RETRY}{type_name}"),
                 group: Group::Node,
             });
-            self.rows.push(Row::MoreTypes { count });
+            self.rows.push(Row::Retry {
+                type_name: type_name.clone(),
+                error: error.clone(),
+            });
         }
         self.update_matches(cx);
         self.select_key(selected, cx);
     }
 
     /// Highlights the row with candidate key `key` again, where it is ranked now.
+    /// A row no longer listed (a "More in <Type>…" that was run) leaves the highlight on a row
+    /// that is, never past the end.
     fn select_key(&mut self, key: Option<String>, cx: &mut Context<Self>) {
         if let Some(index) = key.and_then(|key| {
             self.matches
@@ -791,6 +943,8 @@ impl CommandPalette {
                 .position(|ranked| self.candidates[ranked.index].key == key)
         }) {
             self.select(index, cx);
+        } else if self.selected >= self.matches.len() {
+            self.select(self.matches.len().saturating_sub(1), cx);
         }
     }
 
@@ -937,11 +1091,12 @@ impl CommandPalette {
         self.searching && self.mode.scope().is_some_and(Scope::searches_nodes)
     }
 
-    /// The matches that are results; "Search more types" is a way on, not one.
+    /// The matches that are results; "More in <Type>…" and a failed type's Retry are ways
+    /// on, not results.
     fn result_count(&self) -> usize {
         self.matches
             .iter()
-            .filter(|ranked| !matches!(self.rows[ranked.index], Row::MoreTypes { .. }))
+            .filter(|ranked| !self.rows[ranked.index].is_way_on())
             .count()
     }
 
@@ -1039,9 +1194,18 @@ impl CommandPalette {
             return;
         };
         let row = &self.rows[ranked.index];
-        if let Row::MoreTypes { .. } = row {
-            self.search_more(cx);
-            return;
+        match row {
+            Row::MoreIn { type_name } => {
+                let type_name = type_name.clone();
+                self.show_more(type_name, cx);
+                return;
+            }
+            Row::Retry { type_name, .. } => {
+                let type_name = type_name.clone();
+                self.retry_type(type_name, cx);
+                return;
+            }
+            _ => {}
         }
         let action = row.action().map(|action| action.boxed_clone());
         let branch = match row {
@@ -1120,6 +1284,11 @@ impl CommandPalette {
                 Some(count) => format!("{kind} · {count} rows"),
                 None => (*kind).to_owned(),
             }),
+            Row::Node {
+                type_name,
+                matched: Some((property, _)),
+                ..
+            } => muted(format!("{type_name} · {property}")),
             Row::Node { type_name, .. } => muted(type_name.clone()),
             Row::Branch { current, .. } => muted(if *current {
                 "current".into()
@@ -1137,7 +1306,8 @@ impl CommandPalette {
             } else {
                 "stored".into()
             }),
-            Row::MoreTypes { count } => muted(format!("next {}", (*count).min(TYPES_PER_SEARCH))),
+            Row::MoreIn { .. } => muted(format!("up to {NODES_EXPANDED}")),
+            Row::Retry { .. } => muted("Retry".into()),
         };
         let icon_tile = |glyph| studio_ui::ds::icon_tile(glyph, cx);
         // A type's colour is data, so it stays, as its dot in the tile: the row names the type
@@ -1157,7 +1327,8 @@ impl CommandPalette {
             Row::View { query: Some(_), .. } => icon_tile(IconName::Server),
             Row::View { .. } => icon_tile(IconName::Table),
             Row::Stored { .. } => icon_tile(IconName::Server),
-            Row::MoreTypes { .. } => icon_tile(IconName::MagnifyingGlass),
+            Row::MoreIn { .. } => icon_tile(IconName::MagnifyingGlass),
+            Row::Retry { .. } => icon_tile(IconName::Warning),
             Row::Action { .. } => icon_tile(command_icon(&candidate.key)),
         };
         Some(
@@ -1197,6 +1368,15 @@ impl CommandPalette {
         match &self.rows[ranked.index] {
             Row::Action { description, .. } => description.map(|d| SharedString::new(d.trim())),
             Row::Type { kind, .. } => Some(format!("Open this {kind} type's table.").into()),
+            Row::Node {
+                matched: Some((property, text)),
+                ..
+            } => Some(
+                format!(
+                    "Matched {property}: {text}. Show this node in the inspector and the tree."
+                )
+                .into(),
+            ),
             Row::Node { .. } => Some("Show this node in the inspector and the tree.".into()),
             Row::Branch {
                 name,
@@ -1223,14 +1403,16 @@ impl CommandPalette {
             Row::Stored { .. } => {
                 Some("Open this stored query in a tab, to run on the server.".into())
             }
-            Row::MoreTypes { count } => Some(
+            Row::MoreIn { type_name } => Some(
                 format!(
-                    "Look for “{}” in the next {} node types. A search reads {TYPES_PER_SEARCH} \
-                     at a time, the types with a name first.",
-                    self.nodes_for,
-                    (*count).min(TYPES_PER_SEARCH)
+                    "Show up to {NODES_EXPANDED} {type_name} nodes for “{}”, the best first.",
+                    self.nodes_for
                 )
                 .into(),
+            ),
+            Row::Retry { type_name, error } => Some(
+                format!("{type_name} could not be searched: {error} Retry searches it again.")
+                    .into(),
             ),
         }
     }
@@ -1349,39 +1531,24 @@ fn add_stored_rows(
     }
 }
 
-/// The node types a search reads, in order: those a property names (a name is what a person
-/// types) before those found by id alone, and types known to hold no rows last; each in
-/// schema order.
+/// The node types a search reads, every one but those known to hold no rows, in the order
+/// their equally good matches are listed: those a property names (a name is what a person
+/// types) before those found by id alone; each in schema order.
 fn search_order(schema: &SchemaModel, count: impl Fn(&str) -> Option<i64>) -> Vec<String> {
     let mut types: Vec<_> = schema
         .nodes
         .iter()
         .enumerate()
+        .filter(|(_, node)| count(&node.name) != Some(0))
         .map(|(at, node)| {
             let named = node
                 .label_property()
                 .is_some_and(|label| Some(label) != node.key.as_deref());
-            let empty = count(&node.name) == Some(0);
-            ((empty, !named, at), node.name.clone())
+            ((!named, at), node.name.clone())
         })
         .collect();
     types.sort();
     types.into_iter().map(|(_, name)| name).collect()
-}
-
-/// The nodes a `node_search` read answered: each row's id, and its label when the type has one.
-fn found_rows(rows: &Value) -> Option<Vec<Found>> {
-    let rows = rows.as_array()?;
-    Some(
-        rows.iter()
-            .filter_map(|row| {
-                Some(Found {
-                    id: row.get("id")?.as_str()?.to_owned(),
-                    label: row.get("label").and_then(Value::as_str).map(str::to_owned),
-                })
-            })
-            .collect(),
-    )
 }
 
 /// Quick-open rows for the session's node and edge types, when opening a type is available
@@ -1466,6 +1633,10 @@ fn add_type_rows(
 
 impl Render for CommandPalette {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        {
+            self.renders += 1;
+        }
         let count = self.matches.len();
         // Only a scope that shows nodes waits on them.
         let searching = self.searching_shown();
@@ -1639,8 +1810,29 @@ mod tests {
 
     const PEOPLE: &str = "node Person {\n  slug: String @key\n  name: String\n}\n";
 
-    /// What a fake server answers the n-th node search with: its rows, and how long it takes.
-    type Find = Box<dyn Fn(usize) -> (Value, Duration) + Send + Sync>;
+    /// What a fake server answers the n-th node search with, given the request: its rows, and
+    /// how long it takes.
+    type Find = Box<dyn Fn(usize, &Value) -> (Value, Duration) + Send + Sync>;
+
+    /// A name index's rows (`builder::node_index`): each node's id and name.
+    fn index_rows(nodes: &[(&str, &str)]) -> Value {
+        Value::Array(
+            nodes
+                .iter()
+                .map(|(id, name)| json!({"id": id, "p0": name}))
+                .collect(),
+        )
+    }
+
+    /// The node type a node search's request reads.
+    fn searched_type(asked: &Value) -> String {
+        asked["query"]
+            .as_str()
+            .and_then(|text| text.split("$n: ").nth(1))
+            .and_then(|rest| rest.split_whitespace().next())
+            .unwrap_or_default()
+            .to_owned()
+    }
 
     /// The node searches a fake server was sent. Until `on`, every query answers at once with
     /// no rows: the session's own reads of its head.
@@ -1671,10 +1863,29 @@ mod tests {
                 } else if path.ends_with("/queries") {
                     json!({ "queries": catalog })
                 } else if path.ends_with("/query") {
-                    let rows = if searches.on.load(Ordering::SeqCst) {
+                    let asked: Value = {
+                        use futures::AsyncReadExt as _;
+                        let mut bytes = Vec::new();
+                        let mut body = request.into_body();
+                        body.read_to_end(&mut bytes).await.ok();
+                        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+                    };
+                    let searching = asked["name"].as_str().is_some_and(|name| {
+                        name.starts_with("studio_find") || name == "studio_search_index"
+                    });
+                    let rows = if searches.on.load(Ordering::SeqCst) && searching {
                         let n = searches.sent.fetch_add(1, Ordering::SeqCst);
-                        let (rows, takes) = (find.as_ref())(n);
+                        let (rows, takes) = (find.as_ref())(n, &asked);
                         executor.timer(takes).await;
+                        if rows.get("refused").is_some() {
+                            return Ok(Response::builder()
+                                .status(503)
+                                .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                                .body(AsyncBody::from(
+                                    r#"{"error":"upstream timeout","code":"internal","disposition":{"effects":"none","action":"retry"}}"#,
+                                ))
+                                .unwrap());
+                        }
                         rows
                     } else {
                         json!([])
@@ -1709,10 +1920,10 @@ mod tests {
         (session, searches)
     }
 
-    /// A server whose graph has people; every read finds Ada.
+    /// A server whose graph has people: Ada.
     fn session(cx: &mut TestAppContext) -> Entity<GraphSession> {
-        let ada = json!([{"id": "ada", "label": "Ada Lovelace"}]);
-        let find: Find = Box::new(move |_| (ada.clone(), Duration::ZERO));
+        let ada = index_rows(&[("ada", "Ada Lovelace")]);
+        let find: Find = Box::new(move |_, _| (ada.clone(), Duration::ZERO));
         let (session, searches) = served(PEOPLE, json!([]), find, cx);
         searches.on.store(true, Ordering::SeqCst);
         session
@@ -1807,24 +2018,36 @@ mod tests {
         // Nodes that come in after the person moved keep the row they moved to, and are added
         // below the rows shown.
         palette.update(cx, |palette, cx| {
-            let found = |ids: &[&str]| -> Vec<Found> {
-                ids.iter()
-                    .map(|id| Found {
-                        id: (*id).to_owned(),
-                        label: Some(format!("Ada {id}")),
-                    })
-                    .collect()
+            let found = |ids: &[&str]| -> Result<TypeHits, SharedString> {
+                Ok(TypeHits {
+                    hits: ids
+                        .iter()
+                        .map(|id| NodeHit {
+                            id: (*id).to_owned(),
+                            label: Some(format!("Ada {id}")),
+                            matched: None,
+                            rank: MatchRank::Prefix,
+                        })
+                        .collect(),
+                    more: false,
+                    held: true,
+                })
             };
-            palette.landed("Person", found(&["p1", "p2"]));
-            palette.show_nodes(cx);
+            palette.nodes.clear();
+            palette
+                .arrived
+                .push(("Person".into(), found(&["p1", "p2"])));
+            palette.land(cx);
             let p2 = palette
                 .matches
                 .iter()
                 .position(|ranked| palette.candidates[ranked.index].key == "node:Person:p2")
                 .unwrap();
             palette.select(p2, cx);
-            palette.landed("Person", found(&["p0", "p1", "p2"]));
-            palette.show_nodes(cx);
+            palette
+                .arrived
+                .push(("Person".into(), found(&["p0", "p1", "p2"])));
+            palette.land(cx);
             assert_eq!(palette.selected_key().as_deref(), Some("node:Person:p2"));
             // So do saved queries that are listed later.
             palette.add_saved(vec!["/queries/people.gq".to_owned()], cx);
@@ -1858,8 +2081,8 @@ mod tests {
     /// place as later types come in. The server answers the first search sent last.
     #[gpui::test]
     async fn node_types_show_as_they_answer_and_keep_their_place(cx: &mut TestAppContext) {
-        let find: Find = Box::new(|n| {
-            let rows = json!([{"id": format!("n{n}"), "label": format!("Ada {n}")}]);
+        let find: Find = Box::new(|n, _| {
+            let rows = index_rows(&[(&format!("n{n}"), &format!("Ada {n}"))]);
             (rows, Duration::from_millis(100 * (3 - n as u64)))
         });
         let (session, searches) = served(THREE_TYPES, json!([]), find, cx);
@@ -1874,7 +2097,8 @@ mod tests {
         let mut shown = Vec::new();
         for answered in ["n2", "n1", "n0"] {
             assert!(palette.read_with(cx, |palette, _| palette.searching));
-            cx.executor().advance_clock(Duration::from_millis(100));
+            cx.executor()
+                .advance_clock(Duration::from_millis(100) + LANDING_DELAY);
             cx.run_until_parked();
             shown.push(answered.to_owned());
             let listed: Vec<String> = listed(&palette, cx).iter().map(node).collect();
@@ -1883,82 +2107,313 @@ mod tests {
         assert!(!palette.read_with(cx, |palette, _| palette.searching));
     }
 
-    /// New text stops the reads for the old: they leave the session's count of reads under
-    /// way, and their answers never show.
+    /// New text joins the name indexes being read for the old: no read is sent again, and only
+    /// the new text's matches show once they are in.
     #[gpui::test]
-    async fn new_text_stops_the_reads_for_the_old(cx: &mut TestAppContext) {
-        let find: Find = Box::new(|n| {
-            let rows = json!([{"id": format!("n{n}"), "label": format!("Ada {n}")}]);
+    async fn new_text_joins_the_indexes_being_read(cx: &mut TestAppContext) {
+        let find: Find = Box::new(|n, _| {
+            let rows = index_rows(&[(&format!("n{n}"), &format!("Ada {n}")), ("g", "Grace")]);
             (rows, Duration::from_secs(1))
         });
         let (session, searches) = served(THREE_TYPES, json!([]), find, cx);
         let (palette, cx) = palette(Scope::Nodes, session.clone(), cx);
         searches.on.store(true, Ordering::SeqCst);
-        type_text(&palette, "Ad", cx);
+        type_text(&palette, "Gr", cx);
         cx.executor().advance_clock(NODE_SEARCH_DELAY);
         cx.run_until_parked();
-        let in_flight =
-            |cx: &mut VisualTestContext| session.read_with(cx, |s, _| s.reads_in_flight);
-        assert_eq!(in_flight(cx), 3);
+        assert_eq!(searches.sent.load(Ordering::SeqCst), 3);
 
         type_text(&palette, "Ada", cx);
-        assert_eq!(in_flight(cx), 0, "the old reads stopped");
         cx.executor().advance_clock(NODE_SEARCH_DELAY);
         cx.run_until_parked();
-        assert_eq!(in_flight(cx), 3);
+        assert_eq!(
+            searches.sent.load(Ordering::SeqCst),
+            3,
+            "joined, not sent again"
+        );
         cx.executor().advance_clock(Duration::from_secs(1));
         cx.run_until_parked();
         let listed = listed(&palette, cx);
         assert_eq!(listed.len(), 3, "only the new text's answers: {listed:?}");
-        let new = |key: &String| ["n3", "n4", "n5"].iter().any(|n| key.ends_with(n));
-        assert!(listed.iter().all(new));
+        assert!(listed.iter().all(|key| !key.ends_with(":g")));
     }
 
-    /// A pause reads at most `TYPES_PER_SEARCH` types, those with a name first; "Search more
-    /// types" reads the next ones and leaves the palette open.
+    const TWELVE_TYPES: usize = 12;
+
+    /// Every type is searched, without asking: each type's name index is read once, and every
+    /// text after is matched in memory without a read (spec 031, the request budget).
     #[gpui::test]
-    async fn a_search_reads_a_bounded_number_of_types_and_offers_the_rest(cx: &mut TestAppContext) {
+    async fn every_type_is_searched_and_its_index_read_once(cx: &mut TestAppContext) {
         let mut schema = String::new();
         for n in 0..2 {
             schema.push_str(&format!("node Code{n} {{\n  slug: String @key\n}}\n"));
         }
-        for n in 0..10 {
+        for n in 0..TWELVE_TYPES - 2 {
             schema.push_str(&format!(
                 "node Named{n} {{\n  slug: String @key\n  name: String\n}}\n"
             ));
         }
-        let find: Find = Box::new(|_| (json!([]), Duration::ZERO));
+        let find: Find = Box::new(|_, asked| {
+            assert_eq!(asked["name"], "studio_search_index", "only index reads");
+            let ty = searched_type(asked);
+            let rows = index_rows(&[(&format!("{ty}-1"), &format!("Ada of {ty}"))]);
+            (rows, Duration::ZERO)
+        });
         let (session, searches) = served(&schema, json!([]), find, cx);
         let (palette, cx) = palette(Scope::Nodes, session, cx);
         searches.on.store(true, Ordering::SeqCst);
-        type_text(&palette, "Ad", cx);
+        type_text(&palette, "ada", cx);
         cx.executor().advance_clock(NODE_SEARCH_DELAY);
         cx.run_until_parked();
-        assert_eq!(searches.sent.load(Ordering::SeqCst), TYPES_PER_SEARCH);
-        palette.read_with(cx, |palette, _| {
-            assert_eq!(palette.unread_types, ["Named8", "Named9", "Code0", "Code1"]);
-            assert_eq!(palette.selected_key().as_deref(), Some(MORE_TYPES));
-            assert_eq!(
-                palette.candidates.last().map(|c| c.label.as_str()),
-                Some("Search 4 more types")
-            );
+        assert_eq!(searches.sent.load(Ordering::SeqCst), TWELVE_TYPES);
+        // The ten named types matched by name, the two others by id.
+        assert_eq!(listed(&palette, cx).len(), TWELVE_TYPES - 2);
+        assert!(
+            !listed(&palette, cx)
+                .iter()
+                .any(|key| key.starts_with(MORE_IN))
+        );
+
+        for text in ["ada of", "ADA OF NAMED1", "code0"] {
+            type_text(&palette, text, cx);
+            cx.executor().advance_clock(NODE_SEARCH_DELAY);
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            searches.sent.load(Ordering::SeqCst),
+            TWELVE_TYPES,
+            "no read after"
+        );
+        assert_eq!(listed(&palette, cx), ["node:Code0:Code0-1"]);
+    }
+
+    /// The best matches lead, whatever type they are of: an exact name before a prefix, a
+    /// shorter name before a longer whichever type each is of, and a prefix before a match
+    /// inside a word; ids sort nothing.
+    #[gpui::test]
+    async fn the_best_matches_lead_across_types(cx: &mut TestAppContext) {
+        let find: Find = Box::new(|_, asked| {
+            let rows = match searched_type(asked).as_str() {
+                "Person" => index_rows(&[("a-1", "Acme Analytics"), ("a-2", "Acme Bank")]),
+                "Company" => index_rows(&[("z-9", "ACME")]),
+                _ => index_rows(&[("t-1", "Diacmetics"), ("t-2", "Acme Co")]),
+            };
+            (rows, Duration::ZERO)
         });
+        let (session, searches) = served(THREE_TYPES, json!([]), find, cx);
+        let (palette, cx) = palette(Scope::Nodes, session, cx);
+        searches.on.store(true, Ordering::SeqCst);
+        type_text(&palette, "acme", cx);
+        cx.executor().advance_clock(NODE_SEARCH_DELAY);
+        cx.run_until_parked();
+        assert_eq!(
+            listed(&palette, cx),
+            [
+                "node:Company:z-9",
+                "node:Topic:t-2",
+                "node:Person:a-2",
+                "node:Person:a-1",
+                "node:Topic:t-1"
+            ]
+        );
+    }
+
+    /// A type with more matches than it shows offers "More in <Type>…", which shows up to
+    /// `NODES_EXPANDED` of them without a read and leaves the palette open.
+    #[gpui::test]
+    async fn more_in_a_type_shows_more_of_its_matches(cx: &mut TestAppContext) {
+        let find: Find = Box::new(|_, asked| {
+            let rows = match searched_type(asked).as_str() {
+                "Person" => Value::Array(
+                    (0..40)
+                        .map(|n| json!({"id": format!("p{n:02}"), "p0": format!("Ada {n}")}))
+                        .collect(),
+                ),
+                _ => json!([]),
+            };
+            (rows, Duration::ZERO)
+        });
+        let (session, searches) = served(THREE_TYPES, json!([]), find, cx);
+        let (palette, cx) = palette(Scope::Nodes, session, cx);
+        searches.on.store(true, Ordering::SeqCst);
+        type_text(&palette, "ada", cx);
+        cx.executor().advance_clock(NODE_SEARCH_DELAY);
+        cx.run_until_parked();
+        let more = format!("{MORE_IN}Person");
+        let shown = listed(&palette, cx);
+        assert_eq!(shown.len(), NODES_PER_TYPE + 1, "{shown:?}");
+        assert_eq!(shown.last(), Some(&more));
+        palette.read_with(cx, |palette, _| {
+            assert_eq!(palette.result_count(), NODES_PER_TYPE)
+        });
+        let sent = searches.sent.load(Ordering::SeqCst);
 
         let dismissed = Rc::new(Cell::new(false));
         let _dismissed = cx.update(|_, cx| {
             let dismissed = dismissed.clone();
             cx.subscribe(&palette, move |_, _: &DismissEvent, _| dismissed.set(true))
         });
+        palette.update_in(cx, |palette, window, cx| {
+            let at = palette
+                .matches
+                .iter()
+                .position(|ranked| palette.candidates[ranked.index].key == more)
+                .unwrap();
+            palette.select(at, cx);
+            palette.run_selected(window, cx);
+        });
+        cx.run_until_parked();
+        assert!(!dismissed.get(), "the palette stays open");
+        assert_eq!(
+            searches.sent.load(Ordering::SeqCst),
+            sent,
+            "matched in memory"
+        );
+        let shown = listed(&palette, cx);
+        assert_eq!(shown.len(), NODES_EXPANDED, "{shown:?}");
+        assert!(!shown.contains(&more));
+        // The rows shown first kept their place.
+        assert_eq!(shown[0], "node:Person:p00");
+    }
+
+    /// With the list full (twelve types, five each), "More in <Type>…" still shows that type's
+    /// 25, and the highlight moves to the first of them: ↵ then opens a node.
+    #[gpui::test]
+    async fn more_in_a_type_shows_more_when_the_list_is_full(cx: &mut TestAppContext) {
+        let mut schema = String::new();
+        for n in 0..TWELVE_TYPES {
+            schema.push_str(&format!(
+                "node Named{n:02} {{\n  slug: String @key\n  name: String\n}}\n"
+            ));
+        }
+        let find: Find = Box::new(|_, asked| {
+            let ty = searched_type(asked);
+            let rows = Value::Array(
+                (0..40)
+                    .map(|n| json!({"id": format!("{ty}-{n:02}"), "p0": format!("Ada {n}")}))
+                    .collect(),
+            );
+            (rows, Duration::ZERO)
+        });
+        let (session, searches) = served(&schema, json!([]), find, cx);
+        let (palette, cx) = palette(Scope::Nodes, session, cx);
+        searches.on.store(true, Ordering::SeqCst);
+        type_text(&palette, "ada", cx);
+        cx.executor().advance_clock(NODE_SEARCH_DELAY);
+        cx.run_until_parked();
+        let results = |cx: &mut VisualTestContext| palette.read_with(cx, |p, _| p.result_count());
+        assert_eq!(results(cx), NODES_SHOWN, "the list is full");
+        let more = format!("{MORE_IN}Named03");
+        palette.update_in(cx, |palette, window, cx| {
+            let at = palette
+                .matches
+                .iter()
+                .position(|ranked| palette.candidates[ranked.index].key == more)
+                .unwrap();
+            palette.select(at, cx);
+            palette.run_selected(window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(results(cx), NODES_SHOWN + NODES_EXPANDED - NODES_PER_TYPE);
+        palette.read_with(cx, |palette, _| {
+            assert_eq!(
+                palette.selected_key().as_deref(),
+                Some("node:Named03:Named03-05"),
+                "on the first row it brought"
+            );
+        });
+    }
+
+    /// A type whose search fails shows as failed, with Retry, and never as "No node matches";
+    /// Retry searches it again, a read.
+    #[gpui::test]
+    async fn a_failed_type_shows_with_retry(cx: &mut TestAppContext) {
+        let fail = Arc::new(AtomicBool::new(true));
+        let failing = fail.clone();
+        let find: Find = Box::new(move |_, asked| {
+            let rows = match searched_type(asked).as_str() {
+                "Company" if failing.load(Ordering::SeqCst) => json!({"refused": true}),
+                "Company" => index_rows(&[("bluequill.example", "BlueQuill")]),
+                _ => json!([]),
+            };
+            (rows, Duration::ZERO)
+        });
+        let (session, searches) = served(THREE_TYPES, json!([]), find, cx);
+        let (palette, cx) = palette(Scope::Nodes, session, cx);
+        searches.on.store(true, Ordering::SeqCst);
+        type_text(&palette, "bluequill", cx);
+        cx.executor().advance_clock(NODE_SEARCH_DELAY);
+        cx.run_until_parked();
+        let retry = format!("{RETRY}Company");
+        assert_eq!(listed(&palette, cx), std::slice::from_ref(&retry));
+        palette.read_with(cx, |palette, _| {
+            assert_eq!(palette.result_count(), 0);
+            assert_eq!(palette.selected_key().as_deref(), Some(retry.as_str()));
+            let description = palette.selected_description().unwrap();
+            assert!(
+                description.starts_with("Company could not be searched"),
+                "{description}"
+            );
+        });
+        assert!(
+            cx.debug_bounds("palette-count").is_some(),
+            "rows, not an empty state"
+        );
+
+        fail.store(false, Ordering::SeqCst);
+        let sent = searches.sent.load(Ordering::SeqCst);
         palette.update_in(cx, |palette, window, cx| palette.run_selected(window, cx));
         cx.run_until_parked();
-        assert_eq!(searches.sent.load(Ordering::SeqCst), TYPES_PER_SEARCH + 4);
-        assert!(!dismissed.get(), "the palette stays open");
-        assert!(palette.read_with(cx, |palette, _| palette.unread_types.is_empty()));
-        assert!(!listed(&palette, cx).iter().any(|key| key == MORE_TYPES));
+        assert_eq!(searches.sent.load(Ordering::SeqCst), sent + 1, "read again");
+        assert_eq!(listed(&palette, cx), ["node:Company:bluequill.example"]);
+    }
+
+    /// The answers of every type land together, in one draw, however many types answer; and
+    /// moving through the rows draws the palette once a key (`docs/drawing.md`).
+    #[gpui::test]
+    async fn answers_land_in_one_draw_whatever_the_types(cx: &mut TestAppContext) {
+        let mut schema = String::new();
+        for n in 0..TWELVE_TYPES {
+            schema.push_str(&format!(
+                "node Named{n} {{\n  slug: String @key\n  name: String\n}}\n"
+            ));
+        }
+        let find: Find = Box::new(|_, asked| {
+            let ty = searched_type(asked);
+            let rows = index_rows(&[(&format!("{ty}-1"), "Ada"), (&format!("{ty}-2"), "Adam")]);
+            (rows, Duration::ZERO)
+        });
+        let (session, searches) = served(&schema, json!([]), find, cx);
+        let (palette, cx) = palette(Scope::Nodes, session, cx);
+        searches.on.store(true, Ordering::SeqCst);
+        let landings = |cx: &mut VisualTestContext| palette.read_with(cx, |p, _| p.landings);
+        for text in ["ad", "ada"] {
+            let before = landings(cx);
+            type_text(&palette, text, cx);
+            cx.executor().advance_clock(NODE_SEARCH_DELAY);
+            cx.run_until_parked();
+            assert_eq!(
+                landings(cx) - before,
+                1,
+                "{text}: twelve types, one landing"
+            );
+        }
+        assert_eq!(listed(&palette, cx).len(), 2 * TWELVE_TYPES);
+        assert!(!palette.read_with(cx, |palette, _| palette.searching));
+
+        let renders = |cx: &mut VisualTestContext| palette.read_with(cx, |p, _| p.renders);
+        let before = renders(cx);
+        for _ in 0..3 {
+            palette.update_in(cx, |palette, window, cx| {
+                palette.select_next(&menu::SelectNext, window, cx)
+            });
+            cx.run_until_parked();
+        }
+        assert_eq!(renders(cx) - before, 3, "one draw a key");
     }
 
     #[test]
-    fn named_types_are_searched_first_and_empty_ones_last() {
+    fn named_types_are_searched_first_and_empty_ones_not_at_all() {
         let schema = SchemaModel::parse(
             "node Code {\n  slug: String @key\n}\n\
              node Empty {\n  slug: String @key\n  name: String\n}\n\
@@ -1967,10 +2422,8 @@ mod tests {
         )
         .unwrap();
         let count = |name: &str| (name == "Empty").then_some(0);
-        assert_eq!(
-            search_order(&schema, count),
-            ["Note", "Person", "Code", "Empty"]
-        );
+        // The schema model lists types by name.
+        assert_eq!(search_order(&schema, count), ["Note", "Person", "Code"]);
     }
 
     /// The graph's saved views are listed in the Types scope, each opening its tab (spec 024).
@@ -2020,7 +2473,7 @@ mod tests {
             {"name": "people_titled", "description": "People with a title"},
             {"name": "set_title", "mutation": true},
         ]);
-        let find: Find = Box::new(|_| (json!([]), Duration::ZERO));
+        let find: Find = Box::new(|_, _| (json!([]), Duration::ZERO));
         let (session, _) = served(PEOPLE, catalog, find, cx);
         cx.run_until_parked();
         session.read_with(cx, |session, _| {
