@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use gpui::{App, AppContext as _, Context, Entity, Global, Task};
 use graph_store::sign_in::{Keychain, PlatformKeychain};
+use model::Reasoning;
 use serde::de::DeserializeOwned;
 use studio_settings::StudioSettings;
 
@@ -66,9 +67,18 @@ pub struct Models {
 /// The cached model list: when it was read, and what.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CachedList {
+    /// What a list of this build holds about each model ([`LIST_VERSION`]); 0 in a file from
+    /// before the field.
+    #[serde(default)]
+    version: u32,
     read_at: u64,
     models: Vec<ModelChoice>,
 }
+
+/// 2: each model says how little it can reason. A list kept by an earlier build says nothing
+/// of it, which would read as "can be turned off" for every model, so it is not used and the
+/// list is read again.
+const LIST_VERSION: u32 = 2;
 
 impl Models {
     pub fn global(cx: &App) -> Entity<Self> {
@@ -273,8 +283,22 @@ impl Models {
             return Task::ready(Err(Error::NoKey));
         };
         let model = Self::model_for(request.task.tier, cx);
+        let reasoning = self.reasoning_of(&model);
         let client = self.client.clone();
-        cx.background_spawn(async move { client.call(&model, &key, request).await })
+        cx.background_spawn(async move { client.call(&model, &reasoning, &key, request).await })
+    }
+
+    /// How little `model` can be made to reason: what the list says of it, or of a tier's
+    /// default before the list is read. A model the list does not hold is taken to turn it off.
+    fn reasoning_of(&self, model: &str) -> Reasoning {
+        if let Some(listed) = self.choices.iter().find(|choice| choice.id == model) {
+            return listed.reasoning.clone();
+        }
+        [Tier::Fast, Tier::Careful]
+            .into_iter()
+            .find(|tier| tier.default_model() == model)
+            .map(Tier::default_reasoning)
+            .unwrap_or_default()
     }
 
     /// The models the picker offers, by name; the two defaults when none were read.
@@ -287,6 +311,7 @@ impl Models {
                     name: tier.default_model().to_owned(),
                     prompt_per_million: 0.0,
                     completion_per_million: 0.0,
+                    reasoning: tier.default_reasoning(),
                 })
                 .collect();
         }
@@ -313,6 +338,7 @@ impl Models {
             match models {
                 Ok(models) => {
                     let cached = CachedList {
+                        version: LIST_VERSION,
                         read_at: now_secs(),
                         models: models.clone(),
                     };
@@ -346,7 +372,14 @@ fn list_path() -> std::path::PathBuf {
 
 fn read_cached_list() -> Option<CachedList> {
     let text = std::fs::read(list_path()).ok()?;
-    serde_json::from_slice(&text).ok()
+    kept_list(&text)
+}
+
+/// A kept list, when this build wrote it or one that holds the same about each model.
+fn kept_list(text: &[u8]) -> Option<CachedList> {
+    serde_json::from_slice::<CachedList>(text)
+        .ok()
+        .filter(|list| list.version == LIST_VERSION)
 }
 
 fn now_secs() -> u64 {
@@ -358,8 +391,10 @@ fn now_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use futures::AsyncReadExt as _;
     use gpui::TestAppContext;
     use graph_store::sign_in::MemoryKeychain;
     use http_client::{AsyncBody, FakeHttpClient, Response};
@@ -397,6 +432,14 @@ mod tests {
         reads: &Arc<AtomicUsize>,
         cx: &mut TestAppContext,
     ) -> Entity<Models> {
+        models_over(service(reads.clone()), key, cx)
+    }
+
+    fn models_over(
+        client: model::Client,
+        key: Option<&str>,
+        cx: &mut TestAppContext,
+    ) -> Entity<Models> {
         let keychain = MemoryKeychain::default();
         if let Some(key) = key {
             keychain.items.lock().unwrap().insert(
@@ -408,8 +451,87 @@ mod tests {
         cx.update(|cx| {
             studio_settings::init_test(cx);
             studio_settings::keep_changes_in_memory(cx);
-            cx.new(|cx| Models::with_list(service(reads.clone()), keychain, 0, Vec::new(), cx))
+            cx.new(|cx| Models::with_list(client, keychain, 0, Vec::new(), cx))
         })
+    }
+
+    /// A service that lists one model that can turn reasoning off and one that cannot, answers
+    /// every call, and keeps each call's body.
+    fn answering(bodies: Arc<Mutex<Vec<serde_json::Value>>>) -> model::Client {
+        const LIST: &str = r#"{"data":[
+          {"id":"anthropic/claude-haiku-5.5","name":"Anthropic: Claude Haiku 5.5","pricing":{},"supported_parameters":["structured_outputs"],"reasoning":{"mandatory":false,"supported_efforts":["high","medium","low","none"]}},
+          {"id":"google/gemini-3.8-flash","name":"Google: Gemini 3.8 Flash","pricing":{},"supported_parameters":["structured_outputs"],"reasoning":{"mandatory":true,"supported_efforts":["high","medium","low"]}}
+        ]}"#;
+        let http = FakeHttpClient::create(move |request| {
+            let bodies = bodies.clone();
+            async move {
+                if *request.uri() == model::MODELS_ENDPOINT {
+                    return Ok(Response::builder()
+                        .status(200)
+                        .body(AsyncBody::from(LIST.to_owned()))
+                        .unwrap());
+                }
+                let mut sent = String::new();
+                request.into_body().read_to_string(&mut sent).await.unwrap();
+                bodies
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_str(&sent).unwrap());
+                Ok(Response::builder()
+                    .status(200)
+                    .body(AsyncBody::from(
+                        r#"{"choices":[{"message":{"content":"{\"ok\":true}"}}]}"#.to_owned(),
+                    ))
+                    .unwrap())
+            }
+        });
+        model::Client::new(http)
+    }
+
+    /// A short call to a model that cannot turn reasoning off asks for the least effort the
+    /// list names for it; one that can is told to. Before, both were told to turn it off, and
+    /// OpenRouter refused the first (spec 019, 2026-11-16).
+    #[gpui::test]
+    async fn a_call_asks_for_the_least_reasoning_its_model_takes(cx: &mut TestAppContext) {
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let models = models_over(answering(bodies.clone()), Some("sk-or-test"), cx);
+        cx.run_until_parked();
+        for (model, reasoning) in [
+            (
+                "google/gemini-3.8-flash",
+                serde_json::json!({"effort": "low"}),
+            ),
+            (
+                "anthropic/claude-haiku-5.5",
+                serde_json::json!({"enabled": false}),
+            ),
+            // One the list does not hold is taken to turn it off, as before.
+            ("some/other", serde_json::json!({"enabled": false})),
+        ] {
+            cx.update(|cx| {
+                studio_settings::update(cx, move |settings| settings.models.fast = model.into())
+            });
+            cx.run_until_parked();
+            let answer = cx
+                .update(|cx| models.read(cx).test_connection(cx))
+                .await
+                .unwrap();
+            assert!(answer.value.ok);
+            let body = bodies.lock().unwrap().pop().unwrap();
+            assert_eq!(body["model"], model);
+            assert_eq!(body["reasoning"], reasoning, "{model}");
+        }
+    }
+
+    /// A list kept by a build that did not read how little each model reasons is not used: it
+    /// would say every model can turn reasoning off.
+    #[test]
+    fn a_list_kept_by_an_earlier_build_is_read_again() {
+        let models = r#""models":[{"id":"google/gemini-3.8-flash","name":"G","prompt_per_million":0.8,"completion_per_million":4.1}]"#;
+        assert!(kept_list(format!(r#"{{"read_at":5,{models}}}"#).as_bytes()).is_none());
+        assert!(kept_list(format!(r#"{{"version":1,"read_at":5,{models}}}"#).as_bytes()).is_none());
+        let kept = kept_list(format!(r#"{{"version":2,"read_at":5,{models}}}"#).as_bytes());
+        assert_eq!(kept.map(|list| list.read_at), Some(5));
     }
 
     /// Nothing goes to OpenRouter for a person who stored no key, the model list included.

@@ -9623,6 +9623,7 @@ dependencies = [
 name = "studio_workspace"
 version = "0.4.7"
 dependencies = [
+ "futures",
  "gpui",
  "gq_language",
  "graph_client",

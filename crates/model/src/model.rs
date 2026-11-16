@@ -43,6 +43,15 @@ impl Tier {
         }
     }
 
+    /// How little the tier's default model can reason, for a call made before the model list
+    /// was read: what OpenRouter's list said of each on 2026-11-16.
+    pub fn default_reasoning(self) -> Reasoning {
+        match self {
+            Tier::Fast => Reasoning::Optional,
+            Tier::Careful => Reasoning::AtLeast("low".into()),
+        }
+    }
+
     /// The caps a task of this tier has unless it names its own.
     pub const fn limits(self) -> Limits {
         match self {
@@ -138,13 +147,70 @@ impl std::fmt::Display for Error {
     }
 }
 
-/// A model the picker offers: its id, name, and prices per million tokens.
+/// How little a model can be made to reason, as OpenRouter's model list says
+/// (`reasoning.mandatory` and `reasoning.supported_efforts`). A short answer wants none, and
+/// some models cannot turn it off: asked to, OpenRouter answers 400, "Reasoning is mandatory
+/// for this endpoint and cannot be disabled". Of the 304 models the picker listed on
+/// 2026-11-16, 90 could not, Claude Sonnet 5.5 and Gemini 3.8 Flash among them.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Reasoning {
+    /// It can be turned off.
+    #[default]
+    Optional,
+    /// It cannot: this is the least effort the model takes (`low`, `minimal`).
+    AtLeast(String),
+    /// It cannot, and the list names no effort to ask for.
+    Always,
+}
+
+/// OpenRouter's efforts from the least, to pick a model's least by: a list is said to come
+/// highest first, which is not relied on.
+const EFFORTS: [&str; 6] = ["minimal", "low", "medium", "high", "xhigh", "max"];
+
+impl Reasoning {
+    /// What the list says of a model: whether reasoning is mandatory, and the efforts it takes.
+    fn listed(mandatory: bool, efforts: &[String]) -> Self {
+        if !mandatory {
+            return Reasoning::Optional;
+        }
+        // `none` is turning it off, which a mandatory model refuses. An effort this does not
+        // know ranks last, so a known one is preferred.
+        let least = efforts
+            .iter()
+            .filter(|effort| *effort != "none")
+            .min_by_key(|effort| {
+                EFFORTS
+                    .iter()
+                    .position(|known| known == effort)
+                    .unwrap_or(EFFORTS.len())
+            });
+        match least {
+            Some(effort) => Reasoning::AtLeast(effort.clone()),
+            None => Reasoning::Always,
+        }
+    }
+
+    /// The request's `reasoning` for the least the model allows.
+    fn least(&self) -> Value {
+        match self {
+            Reasoning::Optional => json!({"enabled": false}),
+            Reasoning::AtLeast(effort) => json!({"effort": effort}),
+            Reasoning::Always => json!({"enabled": true}),
+        }
+    }
+}
+
+/// A model the picker offers: its id, name, prices per million tokens, and how little it can
+/// be made to reason.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, Deserialize)]
 pub struct ModelChoice {
     pub id: String,
     pub name: String,
     pub prompt_per_million: f64,
     pub completion_per_million: f64,
+    #[serde(default)]
+    pub reasoning: Reasoning,
 }
 
 impl ModelChoice {
@@ -174,12 +240,14 @@ impl Client {
         }
     }
 
-    /// Asks `model` for `request`'s answer with `key`. Dropping the future ends the call. The
+    /// Asks `model` for `request`'s answer with `key`. `reasoning` is how little the model
+    /// can be made to reason, from the model list. Dropping the future ends the call. The
     /// answer is parsed as `T`; a body that is not JSON in the schema is [`Error::NotInSchema`],
     /// since OpenRouter says schema enforcement varies by provider.
     pub async fn call<T: DeserializeOwned>(
         &self,
         model: &str,
+        reasoning: &Reasoning,
         key: &str,
         request: Request<'_>,
     ) -> Result<Answer<T>, Error> {
@@ -203,8 +271,12 @@ impl Client {
             "max_tokens": task.limits.output_tokens,
             "provider": {"require_parameters": true, "data_collection": "deny"},
             // A fast task's answer is a few lines: reasoning would spend its token cap before
-            // the answer (Haiku reasons by default, and the thinking counts).
-            "reasoning": {"enabled": matches!(task.tier, Tier::Careful)},
+            // the answer (Haiku reasons by default, and the thinking counts). So it is turned
+            // off, or down to the least a model takes when it cannot be turned off.
+            "reasoning": match task.tier {
+                Tier::Fast => reasoning.least(),
+                Tier::Careful => json!({"enabled": true}),
+            },
         });
         let http_request = HttpRequest::post(self.endpoint.as_ref())
             .header("Authorization", format!("Bearer {key}"))
@@ -336,6 +408,15 @@ impl Client {
             })
             .filter(|model| !model.id.ends_with(":batch") && !model.id.ends_with(":free"))
             .map(|model| ModelChoice {
+                reasoning: model
+                    .reasoning
+                    .map(|listed| {
+                        Reasoning::listed(
+                            listed.mandatory,
+                            &listed.supported_efforts.unwrap_or_default(),
+                        )
+                    })
+                    .unwrap_or_default(),
                 id: model.id,
                 name: model.name,
                 prompt_per_million: per_million(&model.pricing.prompt),
@@ -412,6 +493,18 @@ struct ListedModel {
     pricing: Pricing,
     #[serde(default)]
     supported_parameters: Vec<String>,
+    /// Absent for a model that does not reason.
+    #[serde(default)]
+    reasoning: Option<ListedReasoning>,
+}
+
+#[derive(Deserialize)]
+struct ListedReasoning {
+    #[serde(default)]
+    mandatory: bool,
+    /// Absent or null when the model takes no effort by name.
+    #[serde(default)]
+    supported_efforts: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -488,9 +581,13 @@ mod tests {
             200,
             r#"{"model":"anthropic/claude-haiku-5.5","choices":[{"message":{"content":"{\"filters\":[{\"property\":\"kind\",\"op\":\"eq\"}]}"}}],"usage":{"cost":0.0004}}"#,
         );
-        let answer: Answer<Filters> =
-            smol::block_on(client.call("anthropic/claude-haiku-5.5", "sk-or-test", request()))
-                .unwrap();
+        let answer: Answer<Filters> = smol::block_on(client.call(
+            "anthropic/claude-haiku-5.5",
+            &Reasoning::Optional,
+            "sk-or-test",
+            request(),
+        ))
+        .unwrap();
         assert_eq!(
             answer.value,
             Filters {
@@ -519,6 +616,39 @@ mod tests {
         assert_eq!(body["messages"][1]["content"], "dinners last month");
     }
 
+    /// A short answer is asked for with reasoning off, or at the least effort of a model that
+    /// cannot turn it off; a careful one with it on. Before, every fast call said "off", and
+    /// OpenRouter refused it for such a model: "400: Reasoning is mandatory for this endpoint
+    /// and cannot be disabled" (Claude Sonnet 5.5 and Gemini 3.8 Flash, 2026-11-16).
+    #[test]
+    fn a_model_that_cannot_stop_reasoning_is_asked_for_its_least() {
+        const ANSWER: &str = r#"{"choices":[{"message":{"content":"{\"filters\":[]}"}}]}"#;
+        let sent = |task: &'static Task, reasoning: Reasoning| -> Value {
+            let (client, seen) = client_with(200, ANSWER);
+            let mut asked = request();
+            asked.task = task;
+            let _: Answer<Filters> =
+                smol::block_on(client.call("m", &reasoning, "k", asked)).unwrap();
+            let body: Value = serde_json::from_str(&seen.lock().unwrap()[1]).unwrap();
+            body["reasoning"].clone()
+        };
+        const CAREFUL: Task = Task {
+            name: "branch-summary",
+            sends: "the changed records' titles",
+            tier: Tier::Careful,
+            limits: Tier::Careful.limits(),
+        };
+        assert_eq!(sent(&TASK, Reasoning::Optional), json!({"enabled": false}));
+        assert_eq!(
+            sent(&TASK, Reasoning::AtLeast("low".into())),
+            json!({"effort": "low"})
+        );
+        assert_eq!(sent(&TASK, Reasoning::Always), json!({"enabled": true}));
+        for reasoning in [Reasoning::Optional, Reasoning::AtLeast("low".into())] {
+            assert_eq!(sent(&CAREFUL, reasoning), json!({"enabled": true}));
+        }
+    }
+
     /// An answer that is not in the schema, a refusal, a missing key and an input over the cap
     /// are each their own error, and nothing is sent for the last two.
     #[test]
@@ -528,7 +658,7 @@ mod tests {
             r#"{"choices":[{"message":{"content":"Here are your filters: kind = dinner"}}]}"#,
         );
         let answer: Result<Answer<Filters>, Error> =
-            smol::block_on(client.call("m", "k", request()));
+            smol::block_on(client.call("m", &Reasoning::Optional, "k", request()));
         assert!(matches!(answer, Err(Error::NotInSchema(text)) if text.starts_with("Here are")));
 
         let (client, _) = client_with(
@@ -536,7 +666,7 @@ mod tests {
             r#"{"error":{"message":"No auth credentials found","code":401}}"#,
         );
         let answer: Result<Answer<Filters>, Error> =
-            smol::block_on(client.call("m", "k", request()));
+            smol::block_on(client.call("m", &Reasoning::Optional, "k", request()));
         assert_eq!(
             answer.unwrap_err(),
             Error::Refused(401, "No auth credentials found".into())
@@ -544,11 +674,12 @@ mod tests {
 
         let (client, seen) = client_with(200, "{}");
         let answer: Result<Answer<Filters>, Error> =
-            smol::block_on(client.call("m", "", request()));
+            smol::block_on(client.call("m", &Reasoning::Optional, "", request()));
         assert_eq!(answer.unwrap_err(), Error::NoKey);
         let mut large = request();
         large.input = "x".repeat(TASK.limits.input_bytes + 1);
-        let answer: Result<Answer<Filters>, Error> = smol::block_on(client.call("m", "k", large));
+        let answer: Result<Answer<Filters>, Error> =
+            smol::block_on(client.call("m", &Reasoning::Optional, "k", large));
         assert_eq!(answer.unwrap_err(), Error::TooLarge);
         assert!(seen.lock().unwrap().is_empty(), "nothing sent");
     }
@@ -611,5 +742,49 @@ mod tests {
             models[0].label(),
             "Anthropic: Claude Haiku 5.5 · $0.10/$0.50 per million"
         );
+        assert_eq!(models[0].reasoning, Reasoning::Optional, "none is said");
+    }
+
+    /// The list says which models cannot turn reasoning off and the efforts each takes; the
+    /// least of them is kept, wherever it stands in the list. The lines are OpenRouter's of
+    /// 2026-11-16, cut to what is read.
+    #[test]
+    fn the_model_list_says_how_little_each_model_reasons() {
+        let (client, _) = client_with(
+            200,
+            r#"{"data":[
+              {"id":"a/haiku","name":"A","pricing":{},"supported_parameters":["structured_outputs"],"reasoning":{"mandatory":false,"supported_efforts":["max","xhigh","high","medium","low","none"],"default_effort":"medium"}},
+              {"id":"b/gemini-flash","name":"B","pricing":{},"supported_parameters":["structured_outputs"],"reasoning":{"mandatory":true,"default_enabled":true,"supported_efforts":["high","medium","low"],"default_effort":"medium"}},
+              {"id":"c/flash-lite","name":"C","pricing":{},"supported_parameters":["structured_outputs"],"reasoning":{"mandatory":true,"supported_efforts":["minimal","low","medium","high"]}},
+              {"id":"d/thinking","name":"D","pricing":{},"supported_parameters":["structured_outputs"],"reasoning":{"mandatory":true}},
+              {"id":"e/null","name":"E","pricing":{},"supported_parameters":["structured_outputs"],"reasoning":{"mandatory":true,"supported_efforts":null}},
+              {"id":"f/odd","name":"F","pricing":{},"supported_parameters":["structured_outputs"],"reasoning":{"mandatory":true,"supported_efforts":["turbo","high","none"]}}
+            ]}"#,
+        );
+        let models = smol::block_on(client.list_models()).unwrap();
+        let said: Vec<(&str, &Reasoning)> = models
+            .iter()
+            .map(|model| (model.id.as_str(), &model.reasoning))
+            .collect();
+        assert_eq!(
+            said,
+            [
+                ("a/haiku", &Reasoning::Optional),
+                ("b/gemini-flash", &Reasoning::AtLeast("low".into())),
+                ("c/flash-lite", &Reasoning::AtLeast("minimal".into())),
+                ("d/thinking", &Reasoning::Always),
+                ("e/null", &Reasoning::Always),
+                ("f/odd", &Reasoning::AtLeast("high".into())),
+            ]
+        );
+        // A list kept from before this was read still parses: its models say nothing.
+        let kept: ModelChoice = serde_json::from_str(
+            r#"{"id":"a/haiku","name":"A","prompt_per_million":0.1,"completion_per_million":0.5}"#,
+        )
+        .unwrap();
+        assert_eq!(kept.reasoning, Reasoning::Optional);
+        let round: ModelChoice =
+            serde_json::from_str(&serde_json::to_string(&models[1]).unwrap()).unwrap();
+        assert_eq!(round, models[1]);
     }
 }
