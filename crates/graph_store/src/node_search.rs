@@ -279,6 +279,37 @@ impl NodeIndex {
         }
     }
 
+    /// For a node whose texts hold the words typed only between them: the property other than
+    /// the name holding the most of the words the id and name do not, so the hit names it and
+    /// a row kept for the next text is checked against it too (`hit_matches`); the name when
+    /// the id and name hold them all.
+    fn across_property(&self, entry: &Entry, wanted: &Wanted) -> Option<usize> {
+        let named = |word: &String| {
+            entry.id_folded.contains(word.as_str())
+                || self
+                    .label
+                    .and_then(|at| entry.texts[at].as_ref())
+                    .is_some_and(|(_, folded)| folded.contains(word.as_str()))
+        };
+        let left: Vec<&String> = wanted.words.iter().filter(|word| !named(word)).collect();
+        entry
+            .texts
+            .iter()
+            .enumerate()
+            .filter(|(at, _)| Some(*at) != self.label)
+            .filter_map(|(at, text)| {
+                let (_, folded) = text.as_ref()?;
+                let held = left
+                    .iter()
+                    .filter(|word| folded.contains(word.as_str()))
+                    .count();
+                (held > 0).then_some((held, at))
+            })
+            .max_by_key(|(held, at)| (*held, std::cmp::Reverse(*at)))
+            .map(|(_, at)| at)
+            .or(self.label)
+    }
+
     /// The best `limit` nodes for `text`, ranked; with no text, the first `limit` by id.
     fn find(&self, text: &str, limit: usize) -> TypeHits {
         let wanted = Wanted::new(text);
@@ -330,7 +361,12 @@ impl NodeIndex {
                             .any(|(_, folded)| folded.contains(word.as_str()))
                 });
                 if across {
-                    best = Some((MatchRank::Substring, true, usize::MAX, self.label));
+                    best = Some((
+                        MatchRank::Substring,
+                        true,
+                        usize::MAX,
+                        self.across_property(entry, &wanted),
+                    ));
                 }
             }
             if let Some((rank, other, length, at)) = best {
@@ -963,6 +999,28 @@ mod tests {
             ..hit
         };
         assert!(!hit_matches(&full_text, "bluequill"));
+    }
+
+    /// Words found only between the name and another property name that property, so a row
+    /// kept for the next text still matches it (review of #124).
+    #[test]
+    fn a_match_across_the_name_and_another_property_names_it() {
+        let found = acme().find("bluequill example", 5);
+        assert_eq!(found.hits[0].id, "bluequill.example");
+        let index = index(json!([
+            {"id": "o-1", "p0": "Northwind", "p1": "https://winds.example"},
+        ]));
+        let hit = index.find("northwind winds", 5).hits.remove(0);
+        assert_eq!(hit.rank, MatchRank::Substring);
+        assert_eq!(
+            hit.matched,
+            Some(("website".into(), "https://winds.example".into()))
+        );
+        assert!(hit_matches(&hit, "northwind winds"));
+        assert!(
+            hit_matches(&hit, "northwind winds.ex"),
+            "kept as the text grows"
+        );
     }
 
     #[test]
