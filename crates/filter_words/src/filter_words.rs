@@ -11,24 +11,17 @@ use gq_language::builder::{
 };
 use gq_language::input::parse_scalar;
 use gq_language::schema::Property;
-use model::{Limits, Task as ModelTask, Tier};
+use model::{Task as ModelTask, Tier};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 pub static TASK: ModelTask = ModelTask {
     name: "table-filter",
     sends: "The type's property names, its enum values and your sentence",
-    tier: Tier::Fast,
-    // A wide type with many relationships describes itself in more than the tier's cap; the
-    // call is still one short answer. The personal graph's widest type, Artifact, with its
-    // order, grouping and columns, comes to about 33 KB. The answer names the filters, the
-    // order, the grouping and the columns shown, which for a wide type ("every column but the
-    // notes") runs past the tier's 300 tokens: cut off, the whole answer would be lost.
-    limits: Limits {
-        input_bytes: 48 * 1024,
-        output_tokens: 1000,
-        time: std::time::Duration::from_secs(20),
-    },
+    // The filter has a tier and a model setting of its own: on 73 labelled sentences a
+    // stronger model than the fast tier's was right far more often (spec 019, 2026-11-16).
+    tier: Tier::Filter,
+    limits: Tier::Filter.limits(),
 };
 
 pub const INSTRUCTIONS: &str = "Turn the request into filters on a table of rows of one type. \

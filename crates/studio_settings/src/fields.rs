@@ -446,6 +446,7 @@ mod tests {
                 "agent.command",
                 "agent.ask_before_writes",
                 "models.fast",
+                "models.filter",
                 "models.careful",
                 "models.key_stored",
             ],

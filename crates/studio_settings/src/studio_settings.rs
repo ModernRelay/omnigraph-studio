@@ -457,10 +457,15 @@ pub struct AgentSettings {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct ModelSettings {
-    /// The model for quick answers of a line or two: a table filter from a sentence, a cell's
-    /// value. Claude Haiku 5.5 was right on every filter tried in 1.5 to 2.8 s.
+    /// The model for quick answers of a line or two: a cell's value when a column is filled,
+    /// and the key's test. Claude Haiku 5.5 answers in one to three seconds.
     #[schemars(title = "Fast model", extend("x-control" = "model"))]
     pub fast: String,
+    /// The model that reads a sentence as a table filter. Of 73 sentences tried, Gemini 3.8
+    /// Flash was right on 70, Claude Sonnet 5.5 on 68 and Claude Haiku 5.5 on 63. It takes about
+    /// 3 s and now and then 6 s or more, where the other two take 1 to 2 s.
+    #[schemars(title = "Filter model", extend("x-control" = "model"))]
+    pub filter: String,
     /// The model for careful answers: a branch summary. Claude Sonnet 5.5 wrote the best one
     /// tried, in about 10 s.
     #[schemars(title = "Careful model", extend("x-control" = "model"))]
@@ -480,6 +485,7 @@ impl Default for ModelSettings {
     fn default() -> Self {
         Self {
             fast: "anthropic/claude-haiku-5.5".into(),
+            filter: "google/gemini-3.8-flash".into(),
             careful: "anthropic/claude-sonnet-5.5".into(),
             key_stored: false,
         }

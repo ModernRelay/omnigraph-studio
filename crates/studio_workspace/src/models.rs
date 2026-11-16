@@ -266,6 +266,7 @@ impl Models {
             .try_global::<StudioSettings>()
             .map(|settings| match tier {
                 Tier::Fast => settings.models.fast.clone(),
+                Tier::Filter => settings.models.filter.clone(),
                 Tier::Careful => settings.models.careful.clone(),
             })
             .filter(|named| !named.trim().is_empty());
@@ -294,17 +295,17 @@ impl Models {
         if let Some(listed) = self.choices.iter().find(|choice| choice.id == model) {
             return listed.reasoning.clone();
         }
-        [Tier::Fast, Tier::Careful]
+        Tier::ALL
             .into_iter()
             .find(|tier| tier.default_model() == model)
             .map(Tier::default_reasoning)
             .unwrap_or_default()
     }
 
-    /// The models the picker offers, by name; the two defaults when none were read.
+    /// The models the picker offers, by name; the tiers' defaults when none were read.
     pub fn choices(&self) -> Vec<ModelChoice> {
         if self.choices.is_empty() {
-            return [Tier::Fast, Tier::Careful]
+            return Tier::ALL
                 .into_iter()
                 .map(|tier| ModelChoice {
                     id: tier.default_model().to_owned(),
@@ -320,8 +321,8 @@ impl Models {
 
     /// Reads the model list again when the one held is a day old, for a person who holds a
     /// key. Without one nothing is sent to OpenRouter, this request included (spec 019): the
-    /// picker then offers the list last read, or the two defaults. The request itself carries
-    /// no key.
+    /// picker then offers the list last read, or the tiers' defaults. The request itself
+    /// carries no key.
     fn refresh_list_if_stale(&mut self, cx: &mut Context<Self>) {
         if self.key.is_none() {
             return;
@@ -523,6 +524,73 @@ mod tests {
         }
     }
 
+    /// A sentence filter goes to the filter's own model, Gemini 3.8 Flash unless the settings
+    /// name another, with room for an answer after what the model reasons. Before the list is
+    /// read it is asked as the list said of it: it cannot turn reasoning off.
+    #[gpui::test]
+    async fn a_filter_goes_to_the_filters_model(cx: &mut TestAppContext) {
+        static FILTER: ModelTask = ModelTask {
+            name: "table-filter",
+            sends: "the type's property names and your sentence",
+            tier: Tier::Filter,
+            limits: Tier::Filter.limits(),
+        };
+        let ask = |models: &Entity<Models>, cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                models.read(cx).call::<Probe>(
+                    Request {
+                        task: &FILTER,
+                        instructions: "Answer with the JSON object only.",
+                        input: "founders".into(),
+                        schema: serde_json::json!({"type": "object"}),
+                    },
+                    cx,
+                )
+            })
+        };
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let models = models_over(answering(bodies.clone()), Some("sk-or-test"), cx);
+        // The keychain has answered and the list has not been asked for yet.
+        models.update(cx, |models, _| {
+            models.key = Some("sk-or-test".into());
+            assert!(models.choices.is_empty());
+            assert_eq!(
+                models.reasoning_of("google/gemini-3.8-flash"),
+                Reasoning::AtLeast("low".into())
+            );
+            assert_eq!(
+                models.reasoning_of("anthropic/claude-haiku-5.5"),
+                Reasoning::Optional
+            );
+        });
+        ask(&models, cx).await.unwrap();
+        let body = bodies.lock().unwrap().pop().unwrap();
+        assert_eq!(body["model"], "google/gemini-3.8-flash");
+        assert_eq!(body["reasoning"], serde_json::json!({"effort": "low"}));
+        assert_eq!(body["max_tokens"], 2000);
+
+        // The fast model is another setting: changing it leaves the filter's alone.
+        cx.update(|cx| {
+            studio_settings::update(cx, |settings| settings.models.fast = "some/other".into())
+        });
+        cx.run_until_parked();
+        ask(&models, cx).await.unwrap();
+        assert_eq!(
+            bodies.lock().unwrap().pop().unwrap()["model"],
+            "google/gemini-3.8-flash"
+        );
+        cx.update(|cx| {
+            studio_settings::update(cx, |settings| {
+                settings.models.filter = "anthropic/claude-haiku-5.5".into()
+            })
+        });
+        cx.run_until_parked();
+        ask(&models, cx).await.unwrap();
+        let body = bodies.lock().unwrap().pop().unwrap();
+        assert_eq!(body["model"], "anthropic/claude-haiku-5.5");
+        assert_eq!(body["reasoning"], serde_json::json!({"enabled": false}));
+    }
+
     /// A list kept by a build that did not read how little each model reasons is not used: it
     /// would say every model can turn reasoning off.
     #[test]
@@ -546,8 +614,8 @@ mod tests {
             assert_eq!(models.key_state(), KeyState::None);
             assert_eq!(
                 models.choices().len(),
-                2,
-                "the picker offers the two defaults"
+                3,
+                "the picker offers the three tiers' defaults"
             );
         });
         assert_eq!(reads.load(Ordering::SeqCst), 0, "no key, no request");

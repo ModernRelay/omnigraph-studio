@@ -27,18 +27,25 @@ const MAX_ANSWER_BYTES: usize = 256 * 1024;
 const MAX_LIST_BYTES: usize = 16 * 1024 * 1024;
 const LIST_TIME: Duration = Duration::from_secs(30);
 
-/// Which model setting a task uses: fast answers of a line or two, or careful ones.
+/// Which model setting a task uses: fast answers of a line or two, a sentence turned into a
+/// filter, or careful answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
     Fast,
+    /// A sentence read as a filter: a short answer, where a wrong one shows the wrong rows.
+    Filter,
     Careful,
 }
 
 impl Tier {
-    /// The default model of the tier: the ones measured on 2026-10-29 (spec 019).
+    pub const ALL: [Tier; 3] = [Tier::Fast, Tier::Filter, Tier::Careful];
+
+    /// The default model of the tier: the ones measured on 2026-10-29 and, for the filter, on
+    /// 2026-11-16 (spec 019).
     pub fn default_model(self) -> &'static str {
         match self {
             Tier::Fast => "anthropic/claude-haiku-5.5",
+            Tier::Filter => "google/gemini-3.8-flash",
             Tier::Careful => "anthropic/claude-sonnet-5.5",
         }
     }
@@ -48,7 +55,7 @@ impl Tier {
     pub fn default_reasoning(self) -> Reasoning {
         match self {
             Tier::Fast => Reasoning::Optional,
-            Tier::Careful => Reasoning::AtLeast("low".into()),
+            Tier::Filter | Tier::Careful => Reasoning::AtLeast("low".into()),
         }
     }
 
@@ -59,6 +66,18 @@ impl Tier {
                 input_bytes: 8 * 1024,
                 output_tokens: 300,
                 time: Duration::from_secs(10),
+            },
+            // A wide type with many relationships describes itself in tens of kilobytes (the
+            // personal graph's widest, Artifact, in about 33 KB), and the answer names the
+            // filters, the order, the grouping and the columns shown, which for a wide type
+            // runs to hundreds of tokens: cut off, the whole answer is lost. The tier's default
+            // model cannot turn reasoning off, and what it reasons counts against the answer:
+            // on 2026-11-16 Gemini 3.8 Flash reasoned for 957 tokens on one sentence in 174 and
+            // was cut off at the 1,000 the filter had then.
+            Tier::Filter => Limits {
+                input_bytes: 48 * 1024,
+                output_tokens: 2000,
+                time: Duration::from_secs(20),
             },
             Tier::Careful => Limits {
                 input_bytes: 64 * 1024,
@@ -270,11 +289,11 @@ impl Client {
             },
             "max_tokens": task.limits.output_tokens,
             "provider": {"require_parameters": true, "data_collection": "deny"},
-            // A fast task's answer is a few lines: reasoning would spend its token cap before
-            // the answer (Haiku reasons by default, and the thinking counts). So it is turned
-            // off, or down to the least a model takes when it cannot be turned off.
+            // A fast task's answer and a filter are a few lines: reasoning would spend the
+            // token cap before the answer (Haiku reasons by default, and the thinking counts).
+            // So it is turned off, or down to the least a model takes when it cannot be.
             "reasoning": match task.tier {
-                Tier::Fast => reasoning.least(),
+                Tier::Fast | Tier::Filter => reasoning.least(),
                 Tier::Careful => json!({"enabled": true}),
             },
         });
@@ -644,6 +663,17 @@ mod tests {
             json!({"effort": "low"})
         );
         assert_eq!(sent(&TASK, Reasoning::Always), json!({"enabled": true}));
+        const FILTER: Task = Task {
+            name: "table-filter",
+            sends: "the type's property names and your request",
+            tier: Tier::Filter,
+            limits: Tier::Filter.limits(),
+        };
+        assert_eq!(
+            sent(&FILTER, Tier::Filter.default_reasoning()),
+            json!({"effort": "low"}),
+            "the filter's default model, before the list is read"
+        );
         for reasoning in [Reasoning::Optional, Reasoning::AtLeast("low".into())] {
             assert_eq!(sent(&CAREFUL, reasoning), json!({"enabled": true}));
         }

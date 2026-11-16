@@ -142,8 +142,12 @@ pub struct Task {
     pub limits: Limits,
 }
 
-/// Which model setting a task uses: fast answers of a line or two, or careful ones.
-pub enum Tier { Fast, Careful }
+/// Which model setting a task uses: fast answers of a line or two, a sentence read as a
+/// filter, or careful answers.
+pub enum Tier { Fast, Filter, Careful }
+
+/// How little a model can be made to reason, from the model list.
+pub enum Reasoning { Optional, AtLeast(String), Always }
 
 pub struct Request<'a> {
     pub task: &'a Task,
@@ -166,7 +170,7 @@ pub enum Error { NoKey, Refused(u16, String), NotInSchema(String), TooLarge, Tim
 
 impl Client {
     /// Dropping the future ends the call.
-    pub async fn call<T: DeserializeOwned>(&self, model: &str, key: &str, request: Request<'_>) -> Result<Answer<T>, Error>;
+    pub async fn call<T: DeserializeOwned>(&self, model: &str, reasoning: &Reasoning, key: &str, request: Request<'_>) -> Result<Answer<T>, Error>;
     pub async fn list_models(&self) -> Result<Vec<ModelChoice>, Error>;
 }
 ```
@@ -182,6 +186,15 @@ graph's schema, not a Rust type).
   limits, `provider: {require_parameters: true, data_collection: "deny"}`, and the model the
   settings name for the task's tier. It sends `HTTP-Referer: https://omnigraph.dev/studio` and
   `X-Title: Omnigraph Studio`, which OpenRouter shows in its usage page.
+- `reasoning` is on for a careful task. A fast task and a filter want a short answer, and what
+  a model reasons counts against `max_tokens`, so theirs is the least the model allows: off
+  (`{"enabled": false}`) where it can be turned off, the least effort the model takes
+  (`{"effort": "low"}`) where it cannot, on where the list names no effort. The model list says
+  which (`reasoning.mandatory`, `reasoning.supported_efforts`; `ModelChoice::reasoning`), and
+  `Models` gives it with the model. Before the list is read, a tier's default model is asked as
+  the list said of it on 2026-11-16 (`Tier::default_reasoning`); a model the list does not hold
+  is taken to turn it off. The kept list carries a version, so one kept by a build that did not
+  read this is read again.
 - The answer is parsed as `T`. A body that is not JSON, or JSON that does not deserialize, is
   `NotInSchema` with the first 200 characters: the docs say enforcement varies by provider, so
   the crate trusts no answer it did not parse. A feature checks the parsed value against its
@@ -202,6 +215,7 @@ A **Models** section:
 | Key | Default | Control |
 |---|---|---|
 | `models.fast` | `anthropic/claude-haiku-5.5` | model picker |
+| `models.filter` | `google/gemini-3.8-flash` | model picker |
 | `models.careful` | `anthropic/claude-sonnet-5.5` | model picker |
 | `models.key_stored` | `false` | **OpenRouter key**: whether the keychain holds one; a masked field, Store, Test, Remove |
 
@@ -217,12 +231,17 @@ holds no provider key: OpenRouter is the one place they live, and a request neve
 The model picker lists `GET /api/v1/models` filtered to `structured_outputs`, as "name · $in/$out
 per million", read at most once a day while a key is stored and kept in the data directory.
 Without a key the list is not read (`Models::refresh_list_if_stale`): the picker holds the list
-last kept or, with none, the two defaults, as it does without a network. The section's description: "Studio sends a task's input to OpenRouter and the
+last kept or, with none, the three defaults, as it does without a network. The section's description: "Studio sends a task's input to OpenRouter and the
 model it names. Each task says what it sends before its first call. Nothing is sent without a
 key."
 
-The defaults are the measured ones: Haiku was right on every filter at 1.5–2.8 s, Sonnet wrote
-the best summary. Gemini Flash Lite is a cheaper fast choice the picker offers.
+The defaults are the measured ones. Sonnet wrote the best summary. For the filter, on 73
+labelled sentences on 2026-11-16, Gemini 3.8 Flash was right on 70 and 71 in two runs, Sonnet
+5.5 on 66 and 67 and Haiku 5.5 on 58 and 58 (the table under "What exists today"); it is the
+slowest of the three, 2.6 s at the median and over 5 s one time in eight, which was taken for
+the fewest wrong filters. Haiku stays the fast model for a column fill, hundreds of calls where
+the price and the time count, and for the key's test; it was not measured against the others
+there. Gemini Flash Lite is a cheaper fast choice the picker offers.
 
 ### What is sent is said once, in Settings
 
@@ -243,7 +262,7 @@ filter box, since the key is the person's own and the settings row already says 
 "Filter in words…", always shown, before the control chips: a pill on the chips' height
 (`ds::pill_field`) with the model's mark where the search field has its glass, its spinner while a call is out,
 and its red line when one failed, with why in its tooltip (`studio_table::FilterInWords`,
-⌘⇧F, puts the cursor in it). Enter calls `table-filter` (Fast; 48 KB in, since a wide type with many relationships describes itself in more than 8 KB, the personal graph's Artifact in about 33 KB; 300 tokens out, 10 s; each related type's properties are said once, and left out, with a line saying so, when they would pass the cap) with the type's property names and
+⌘⇧F, puts the cursor in it). Enter calls `table-filter` (Filter; 48 KB in, since a wide type with many relationships describes itself in more than 8 KB, the personal graph's Artifact in about 33 KB; 2,000 tokens out, 20 s; each related type's properties are said once, and left out, with a line saying so, when they would pass the cap) with the type's property names and
 value types, its enums' values, its relationship keys (`relationship_key`), what each operator
 takes, today's date, and the sentence. The schema is built per
 type: `property` an enum of the type's keys, `op` an enum of the operators, `value` a list of
@@ -306,13 +325,17 @@ name to the settings description's list. It never calls OpenRouter itself.
 
 ### Limits
 
-| | Fast | Careful |
-|---|---|---|
-| Input | ≤ 8 KB (`table-filter` 48 KB, `column-fill` 4 KB) | ≤ 64 KB |
-| Output | ≤ 300 tokens (`column-fill` 200) | ≤ 1,200 tokens |
-| Time | 10 s | 60 s |
-| In flight per control | 1 | 1 |
-| Rows per fill | 500, 8 at a time | — |
+| | Fast | Filter | Careful |
+|---|---|---|---|
+| Input | ≤ 8 KB (`column-fill` 4 KB) | ≤ 48 KB | ≤ 64 KB |
+| Output | ≤ 300 tokens (`column-fill` 200) | ≤ 2,000 tokens | ≤ 1,200 tokens |
+| Time | 10 s | 20 s | 60 s |
+| In flight per control | 1 | 1 | 1 |
+| Rows per fill | 500, 8 at a time | — | — |
+
+The filter's 2,000 tokens leave room for an answer after what its model reasons: Gemini 3.8
+Flash cannot turn reasoning off, and on 2026-11-16 it reasoned for 957 tokens on one sentence
+in 174 ("everyone except managers") and was cut off at the 1,000 the filter had then.
 
 A call is never retried. The model list is read at most once a day, and only while a key is
 stored.
@@ -329,7 +352,7 @@ stored.
 | No headless-CLI fallback | `claude -p --json-schema` or `codex exec --output-schema` without a key | Both are 4–6 s a call and `claude -p` costs 2.6¢ each; a feature that is sometimes five times slower is a worse feature than one that asks for a key |
 | The key lives in the keychain | A `0600` file as the CLI's tokens; settings.json | Spec 016 already keeps its secret there with GPUI's credentials calls; a file would be the first secret file of Studio's own |
 | No confirmation before a call; the settings row and each control's tooltip say what is sent | A confirmation once per task, kept in a setting (the first draft); a dialog per call | A confirmation in a filter box is a step in the way of every first use, and storing the key is already the person's choice; VI is met by saying what each task sends where the key is set and on each control |
-| Models per tier, not per task | A model per task | Two choices are explainable; a task names its tier and the picker names the price |
+| Models per tier, not per task; the filter is a tier of its own | A model per task; the filter on the fast model; the filter on the careful model | A few choices are explainable; a task names its tier and the picker names the price. The filter left the fast tier on 2026-11-16: a stronger model was right on 70 of 73 sentences where Haiku was right on 58, and making that model the fast one would also put it on a column fill's hundreds of calls, at about eight times the price a token and twice the time, unmeasured. The careful model reasons at length for a summary, which a filter cannot wait for |
 | Answers are proposals in the view's own controls | Apply filters silently; write filled cells at once | III: the person's accept is the write; a filter pill can be removed, a suggested cell discarded |
 | Titles but no values in a summary | Whole changes; ids only | Ids alone gave no summary worth reading; titles gave Sonnet enough to name the invoice amounts and the duplicates |
 
@@ -349,6 +372,9 @@ stored.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-11-16 | A filter goes to the filter's own model, with room for its answer | `studio_workspace` `models::tests::a_filter_goes_to_the_filters_model` (Gemini 3.8 Flash by default, 2,000 tokens, its least effort before the list is read; changing the fast model leaves it, changing the filter model moves it), `studio_settings` `fields::tests::every_setting_is_a_row_in_declaration_order` | Pass. Not run from the app: no key is stored in it |
+| 2026-11-16 | A model that cannot turn reasoning off is asked for its least effort | `model` `a_model_that_cannot_stop_reasoning_is_asked_for_its_least` (off, an effort, on; a careful task always on), `the_model_list_says_how_little_each_model_reasons` (six shapes of OpenRouter's list of that day; a list kept from before still parses); `studio_workspace` `models::tests::a_call_asks_for_the_least_reasoning_its_model_takes`, `a_list_kept_by_an_earlier_build_is_read_again`. Live, from the prototype, with this crate's body at the 1,000 tokens the filter had then: 174 calls to Gemini 3.8 Flash and 174 to Sonnet 5.5 with `{"effort": "low"}` answered; the same body with `{"enabled": false}` was refused by both | Fixed. Every fast call said `{"enabled": false}`, and OpenRouter answered "400: Reasoning is mandatory for this endpoint and cannot be disabled" for both models: 90 of the 304 models the picker listed could not turn it off, so picking one broke every fast task |
+| 2026-11-16 | A group's test named with its relationship is read | `filter_words` `a_groups_test_named_with_its_relationship_is_read` (a property, the edge's own, and one a hop further, each under its group's key; another relationship's name is still refused). It fails with the prefix left on: the group comes out with no test (checked) | Fixed. `out:Owns.status` in a group on `out:Owns` was looked up whole on the related type, not found and dropped, and the group kept: "companies that own a paused project" showed companies that own any project, with a note. Haiku 5.5 wrote 5 of 73 answers this way and Sonnet 5.5 2 |
 | 2026-11-15 | A control that asks a model says it needs a key before it is used | `studio_workspace` `models::tests::a_key_is_wanting_when_none_is_stored` (wanting with no models set up and with none stored, not while the keychain is read, not once one is stored); `type_table` `table::tests::the_sentence_field_says_it_needs_a_key_before_a_sentence_is_typed` (the empty field's text and the tooltip with no key, with one stored, with it removed). The table test fails at "a key is stored" with the table no longer following the key (checked). Offscreen (`crates/studio/examples/snapshot.rs` on the sample server, a Person table, no key): the field as drawn at 1440 × 900 and, at its narrowest, at 1100 × 800 | Fixed. The sentence field read "Filter in words…" and named what a sentence sends whether or not a key was stored; "No OpenRouter key is stored" came only after a sentence was typed and ↵ pressed. Drawn, the field shows "OpenRouter key needed · Filter in wor" at the default size and "OpenRouter key nee" at its narrowest; a first wording, "Filter in words needs an OpenRouter key", lost its last word at the default size, so what is needed now comes first. The tree's sentence field and the Fill and Summarize tooltips take the same two helpers and have no test of their own, and were not drawn |
 | 2026-11-15 | Without a key nothing goes to OpenRouter, the model list included | `studio_workspace` `models::tests::without_a_key_the_model_list_is_not_read`, `a_key_held_at_start_reads_the_list_once`, `storing_a_key_reads_the_list_and_removing_it_reads_no_more` (a keychain in memory and a model service that counts the reads of its list and refuses a request that carries a key). The two no-key tests fail with the guard taken out of `refresh_list_if_stale` (checked) | Fixed. Versions 0.3.0 to 0.4.7 asked for the list at every start whose kept copy was a day old, key or not: found on 2026-11-14 by listing the sockets of the built 0.4.7 app, whose one connection at start went to `openrouter.ai` (spec 018's log). The list is now read when the keychain answers with a key and when one is stored; `docs/privacy.md` says which versions did what |
 | 2026-11-01 | A sentence also sets the order, the grouping and the columns | `type_table` `words::tests::an_answer_sets_the_order_grouping_and_columns_the_table_offers` (taken where offered, refused and named otherwise, none keeps the table's; the schema offers each the table has choices for), `table::tests::a_sentence_sets_the_order_grouping_and_columns` (the pinned key stays, the rest in the order named, what is not said stays). Each fails with its check undone (checked); the uncommitted instrument over the personal graph's schema measured the input | Pass. With these lines Artifact's input is 33,104 B, so the cap rises from 32 to 48 KiB, still under the Careful tier's 64 |
