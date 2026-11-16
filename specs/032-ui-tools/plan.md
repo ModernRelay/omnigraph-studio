@@ -1,6 +1,6 @@
 # 032: Agents drive Studio's window
 
-Status: draft · 2026-11-16
+Status: draft · 2026-11-16 · every claim checked the same day (Validation log)
 
 ## Problem
 
@@ -79,16 +79,30 @@ Zed (`v1.27.0`, `c84af5b99cbc`, `crates/gpui/src`):
   `Window::is_action_available` and `Window::available_actions` say what the focused element
   handles (`window.rs:3390`, `:6813`).
 
-Agents (spec 013's checks, 2026-10-13):
+Agents, run live on 2026-11-16 against a stub Streamable HTTP server that logged every request
+(Validation log):
 
-- ACP `session/new` takes `McpServer::Stdio { name, command, args, env }`, which every agent
-  supports. HTTP and SSE servers are capability-gated (`agent-client-protocol` 2.2.0, schema
-  1.9.1).
-- claude-agent-acp drops an `mcpServers` entry written with `"type": "stdio"`. It passes on
-  server instructions, cut at 2,048 characters. Every MCP tool call asks the client for
-  permission unless the tool is pre-allowed.
-- Codex runs stdio MCP servers outside its seatbelt sandbox, where they can reach loopback, and
-  its MCP tool timeout is 300 seconds.
+- **In the panel.** A minimal ACP client passed
+  `{"type": "http", "name": "studio", "url": …, "headers": [{"name": "Authorization", …}]}` in
+  `session/new`, and each adapter called the tool and finished the turn:
+  - claude-agent-acp 0.107.3 advertises `mcpCapabilities: {http: true, sse: true}`. Its Claude
+    Code (2.1.325) asked the client for no permission, and titled the call
+    `mcp__studio__studio_windows`.
+  - codex-acp 2.7.0 advertises `{http: true, sse: false, acp: false}` at run time. The `false`
+    in its source (`dist/index.js:24613`) is only a fallback. It turns an HTTP entry into Codex's
+    `url` plus `http_headers` config (`dist/index.js:41190`, `:41210`). With
+    `INITIAL_AGENT_MODE=agent-full-access`, as Studio starts it (spec 013), it asked no
+    permission, and titled the call `mcp.studio.studio_windows`.
+- **Outside Studio.** Claude Code 2.1.267 (`claude -p --mcp-config`, `"type": "http"` with a
+  `headers` entry) and Codex 0.167.2 (`mcp_servers.<name>.url` with `bearer_token_env_var`) both
+  connected over plain HTTP to `127.0.0.1` and called the tool. Codex asks before every MCP call
+  unless the tool has `approval_mode = "approve"` (`mcp_servers.<name>.tools.<tool>`); with
+  `approval_policy = "never"` and no such entry, the call is refused.
+- **What they send.** Claude Code first POSTs `server/discover` (`MCP-Protocol-Version:
+  2026-07-28`). When that is answered "method not found", it falls back to `initialize` with
+  protocol `2025-11-25`, then opens a `GET /mcp` for a server stream and carries on when that is
+  answered 405. Codex sends `initialize` with `2025-06-18` and no GET. Neither client sends an
+  `Origin` header. Every POST carries the bearer token.
 
 ## Design
 
@@ -104,19 +118,29 @@ Agents (spec 013's checks, 2026-10-13):
 
 ### What a tool is
 
-A tool is a Studio action plus three things the action alone lacks:
+A tool is a Studio action plus four things the action alone lacks:
 
 1. **An allow-list entry.** Only actions in `ui_tools::ALLOWED` are tools. The set is opt-in, so
    a new action is not a tool until someone adds it here.
 2. **A target.** Every call names a `window` (from `studio_windows`), and the server gives that
    window's workspace focus before it dispatches, as the snapshot runner does. A call to a
    window that has closed is refused with `window_closed`.
-3. **A result.** `dispatch_action` returns nothing, so each tool also defines how to tell what
-   happened. After the dispatch, on the next frame, the server reads the window's state and
-   answers with the active tab's `thing`, `view` and `title`. If the active tab did not change
-   and the action was not available on the focused element (`is_action_available` was false
-   before the dispatch), it answers `not_available` and says which action and window it was. If no frame comes within 2 seconds, it
-   answers `timeout`. A timeout means the effect is unknown; the call is not sent again.
+3. **A precondition.** Being available does not mean an action will do anything. With no graph
+   session, `NewQueryWithText` is available on the workspace, and its handler returns without
+   doing anything (`query_editor.rs:371-374`; Validation log). So each tool states what it
+   needs (a session, a type the schema has, a branch that exists), and the server checks that
+   before it dispatches. If the check fails, the answer is `not_available` with the reason in
+   words ("No graph is open in this window"). `is_action_available` is also checked, for
+   actions registered with `register_action_when`.
+4. **A result.** `dispatch_action` returns nothing and runs in `cx.defer`, so the action takes
+   effect when the effects of the update that dispatched it are flushed, not inside it. No
+   frame needs to be drawn (Validation log). The server dispatches in one `update_window` and
+   reads the window in the next one. It answers with what changed: the tab that opened or came
+   to the front (`thing`, `view`, `title`), or the panel that was shown. If nothing changed, it
+   answers `no_change`. A handler that starts a read answers as soon as its tab exists. The tab
+   loads its data afterwards, as it does when the person opens it. No timeout is needed, because
+   nothing waits on a frame. If the window closed between the two updates, the answer is
+   `window_closed`.
 
 The tool's name is the action's name with `::` replaced by `_` and the `studio`
 namespaces shortened (`studio_graph::OpenType` becomes `graph_open_type`). Its description is the
@@ -185,21 +209,23 @@ bar, "Opened by <agent>", for 4 seconds; the chip uses the motion rules in VII.
 When a conversation starts, `agent_panel` asks the `UiToolEndpoint` global (set by `studio` when
 the server is listening) for an entry for the conversation, and passes it in `session/new`:
 
-- If the agent advertises MCP over HTTP in `initialize`, the entry is
-  `McpServer::Http { url: "http://127.0.0.1:<port>/mcp", headers: [Authorization: Bearer
-  <token>] }`.
-- Otherwise there is no entry. The panel's agent then has no UI tools; nothing else changes.
-  (Open: whether claude-agent-acp and codex-acp advertise HTTP. If neither does, step 2 brings
-  back a stdio proxy. See Deferred.)
+- If the agent advertises `mcpCapabilities.http` in `initialize`, as both adapters Studio
+  offers do, the entry is `McpServer::Http { name: "studio", url:
+  "http://127.0.0.1:<port>/mcp", headers: [Authorization: Bearer <token>] }`.
+- Otherwise there is no entry. That agent then has no UI tools, and nothing else changes. No
+  stdio relay is needed for the agents Studio offers.
 
 Each conversation has its own token, and that token is bound to the conversation's window, so
 `window` is fixed and the agent cannot drive another graph's window. `AGENTS.md` in the
 conversation's folder gets one paragraph: the UI tools exist, they only show things, and writes
 still go through `./omnigraph`.
 
-Every UI tool is pre-allowed in the agent's permission request handling: each call already shows
-in the thread by its title, and none of them writes. A call shows as "Opened Project · Table",
-the result's title.
+Every UI tool is pre-allowed: Studio answers a permission request for a call to its own server
+with Allow, without asking the person. No tool writes, and each call already shows in the
+thread. Neither adapter asked in the live runs, but Codex in a sandboxed mode may ask, and so
+may Claude in a stricter permission mode. The adapters choose the tool's title
+(`mcp__studio__graph_open_type`, `mcp.studio.graph_open_type`). The thread recognizes either
+form for the `studio` server, and shows the result's words instead: "Opened Project · Table".
 
 ### Outside agents
 
@@ -210,7 +236,9 @@ Off by default. The switch is in Settings, under Agents:
   `url` and `token`. The token is 32 random bytes, encoded as base64url, and it changes each
   time Studio starts. The row below the switch shows the command that adds Studio to Claude Code,
   `claude mcp add --transport http omnigraph-studio <url> --header "Authorization: Bearer $(…)"`,
-  with a Copy button that reads the token from the file instead of showing it.
+  with a Copy button that reads the token from the file instead of showing it. For Codex it
+  shows the `config.toml` entry: `url`, `bearer_token_env_var`, and an `approval_mode =
+  "approve"` line per tool, since Codex otherwise asks before each call.
 - When off, the server is not listening and the file is deleted.
 
 An outside agent can call every tool in any window. The first call from a token in a Studio run
@@ -219,8 +247,15 @@ action, Turn off, which opens the setting. The toast follows VII and appears onc
 
 ### The server
 
-- MCP 2025-06-18 over Streamable HTTP, `POST /mcp` only: `initialize`, `tools/list`,
-  `tools/call`, `ping`. No SSE stream, no resources, no prompts.
+- MCP over Streamable HTTP, `POST /mcp` with plain JSON answers: `initialize`,
+  `notifications/initialized` (answered 202), `tools/list`, `tools/call` and `ping`. No SSE
+  stream, no resources, no prompts.
+- Protocol versions `2025-06-18` (Codex) and `2025-11-25` (Claude Code). `initialize` echoes the
+  client's version when it is one of these, and otherwise offers `2025-11-25`. Any other method,
+  `server/discover` included, gets JSON-RPC error -32601, which is what makes Claude Code fall
+  back to `initialize`.
+- `GET /mcp` and `DELETE /mcp` get 405 with `Allow: POST`. The server keeps no session, so it
+  sends no `Mcp-Session-Id`.
 - It binds to `127.0.0.1` on a port the operating system chooses. Plain HTTP: the token is the
   only proof, as for every loopback MCP server that Claude Code and Codex connect to, and the
   certificate the gateway uses would not be trusted by an outside client.
@@ -242,10 +277,11 @@ records the tool's name, the window id and the outcome.
 ### Steps
 
 1. The registry, the read tools and the server, with the outside-agent switch. Tests:
-   `#[gpui::test]` with `add_window_view` for each tool's result, `not_available` and
-   `window_closed`; the allow-list test; the server's 401, 403, size and `busy` refusals.
-2. The panel's agent: an HTTP entry where the agent advertises it, and `AGENTS.md`. If neither
-   agent advertises HTTP, bring back the `mcp-proxy` stdio relay to the same server.
+   `#[gpui::test]` with `add_window_view` for each tool's result, `not_available`, `no_change`
+   and `window_closed`; the allow-list test; the server's 401, 403, 405, -32601, size and
+   `busy` refusals; and `initialize` answering both protocol versions.
+2. The panel's agent: an HTTP entry, the permission auto-answer, the thread's titles, and
+   `AGENTS.md`.
 3. More tools as people ask for them, each with its own row in this plan.
 
 ## Decisions
@@ -255,15 +291,15 @@ records the tool's name, the window id and the outcome.
 | UI tools only; the graph stays on the CLI | Graph tools in the same server (query, mutate) | Spec 013 removed MCP graph tools so that writes would have one way and one card list. UI tools do not write, so serving them brings that problem back for none |
 | An allow-list of actions | Every registered action, minus a deny-list | A new action would become a tool without review. Allow and Reject would be one mistake away from an agent approving its own writes |
 | Read tools return identifiers, never values | Return the table's rows as the person sees them | An agent would read the graph with the person's token, without Cedar seeing the agent. With identifiers alone, the data is read under the agent's own credential |
-| A result read on the next frame | Return as soon as the action is dispatched | `dispatch_action` is deferred and says nothing. Without a result, the agent cannot tell an opened tab from an action that was not available |
-| Streamable HTTP on loopback with a bearer token | A Unix socket; stdio through `omnigraph-studio mcp-proxy`; the gateway's HTTPS | Claude Code and Codex connect to HTTP MCP servers directly. A socket needs a relay. A stdio relay starts the 490 MB executable once per client. The gateway's self-signed certificate would not be trusted |
+| Check each tool's precondition, then report what changed | Rely on `is_action_available`; return as soon as the action is dispatched; wait for a frame | An available action can still do nothing (no session), and a dispatch says nothing. What changed is known as soon as the deferred dispatch has run, with no frame, so a frame wait would only add a timeout to handle |
+| Streamable HTTP on loopback with a bearer token, for both kinds of agent | A Unix socket; stdio through `omnigraph-studio mcp-proxy`; the gateway's HTTPS | Both adapters and both CLIs connected over plain HTTP in live runs. A socket needs a relay. A stdio relay starts the 490 MB executable once per client. The gateway's self-signed certificate would not be trusted |
+| Plain JSON answers, no server stream | SSE answers and a GET stream | Both clients take JSON, and Claude Code goes on when GET gets 405. A stream would only matter for progress on long calls, and no tool is long |
 | Off by default for outside agents, with a token per run | Always on; a token that never changes | Any local process that can read the data dir could drive the window. The switch makes this the person's choice, and a token per run limits how long a copied token works |
 | A new layer-5 crate, wired by a global | The server in `agent_panel`; the server in `studio` | Outside agents do not need the agent panel. `studio` is the binary and should stay thin. A global keeps feature crates independent |
 | Preview tabs, never closing or refiltering | Tools that close tabs or change open filters | V: nothing moves under the person. An agent may add to the window, but it may not take anything away |
 
 ## Deferred
 
-- A stdio relay for agents that cannot reach HTTP MCP (step 2, only if needed).
 - Read-only query runs as a tool, once Studio can tell a read from a mutation with `gq_language`
   before sending it, and the run is capped as IX requires.
 - Tools that change an open tab (filters, sort, a canvas layout). Each needs an Undo, as IV asks
@@ -281,8 +317,12 @@ records the tool's name, the window id and the outcome.
 | 2026-11-16 | The candidate actions take their arguments as JSON with schemas | Read `crates/studio_actions/src/studio_actions.rs` | 34 actions derive `Deserialize` and `JsonSchema`. `NewQueryWithText` says "It is not run" |
 | 2026-11-16 | Studio's earlier MCP code can be reused | `git show 0591de9c --stat` | `mcp.rs` 258 lines, `socket.rs` 784, `tools.rs` 230 |
 | 2026-11-16 | Feature crates cannot reach each other, so the agent panel needs a global | `docs/architecture.md`, "Crate layers" | Confirmed |
-| open | claude-agent-acp and codex-acp advertise MCP over HTTP in `initialize` | Run both with a stub ACP client and read `agentCapabilities.mcpCapabilities` | Not yet run |
-| open | Claude Code and Codex, as outside agents, connect to a plain-HTTP loopback MCP server with a bearer header | `claude mcp add --transport http`; Codex's `mcp_servers` config with an HTTP URL | Not yet run |
-| open | A tool's result is ready on the next frame for every tool in the first set | One `#[gpui::test]` per tool | Not yet written |
+| 2026-11-16 | Both adapters take an HTTP MCP server in `session/new` and call its tool | A Node ACP client (initialize, `session/new` with one HTTP entry and a bearer header, one prompt; it answers any permission request with the first allow option) driving `npx -y @agentclientprotocol/claude-agent-acp@0.107.3` and `@agentclientprotocol/codex-acp@2.7.0` (with `INITIAL_AGENT_MODE=agent-full-access`), against a Python stub that logged each request without the token | Both advertised `http: true` and called the tool, and the turn ended `end_turn`. Neither asked for permission. Titles: `mcp__studio__studio_windows` and `mcp.studio.studio_windows` |
+| 2026-11-16 | codex-acp's source says `http: false` | `grep mcpCapabilities` in the 2.7.0 package | Source fallback `false` (`dist/index.js:24613`); HTTP converted to `url` plus `http_headers` (`:41190`, `:41210`); it reports `true` at run time |
+| 2026-11-16 | Claude Code and Codex connect from outside to plain HTTP on loopback with a bearer token | `claude -p --strict-mcp-config --mcp-config <file>` (2.1.267); `codex exec -c mcp_servers.studio.url=… -c mcp_servers.studio.bearer_token_env_var=…` (0.167.2) | Both called the tool. Codex refused the call until `mcp_servers.studio.tools.studio_windows.approval_mode="approve"` was set |
+| 2026-11-16 | What the clients send | The stub's log | Claude Code: `server/discover` first (`2026-07-28`); after -32601, `initialize` `2025-11-25`; then `GET /mcp`, and goes on after a 405. Codex: `initialize` `2025-06-18`, no GET. No `Origin` from either. Every POST carried the token |
+| 2026-11-16 | An action built by name takes effect when the dispatching update's effects flush, with no frame | A temporary `#[gpui::test]` in `query_editor` (removed after the run): a `Workspace` window, `cx.build_action("studio_graph::NewQueryWithText", {text})`, `window.dispatch_action`, the active tab read inside the same update and right after it | Inside the update: no tab. After it: "Query 1". A second dispatch with no draw in between opened "Query 2" |
+| 2026-11-16 | `is_action_available` says whether the action will do anything | The same test, before `set_session` | Available `true`, and no tab opened: the handler returns when there is no session (`query_editor.rs:371-374`). So the design checks a precondition per tool |
+| 2026-11-16 | The first set's handlers are on the workspace, and most can open a preview tab | `grep register_action` per action; `preview` fields in `studio_actions.rs` | All use `workspace.register_action`, except `ActivatePanel`, an `on_action` on the workspace's root element (`studio_workspace.rs:5447`). Every one but `NewQueryWithText` and `ActivatePanel` has `preview` |
 
 ## Corrections
