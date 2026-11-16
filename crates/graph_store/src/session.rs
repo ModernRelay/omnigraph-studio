@@ -1189,7 +1189,7 @@ impl GraphSession {
     /// and a log only carries an answer forward, from those read since with the new token.
     fn forget_reads(&mut self) {
         self.pinned_reads.clear();
-        self.node_indexes = Default::default();
+        self.node_indexes.reset();
         self.seeded_reads.clear();
         self.pinned_blobs.clear();
         self.degree_counts.clear();
@@ -1669,7 +1669,7 @@ impl GraphSession {
         self.schema_epoch += 1;
         self.schema_text = Some(model.source.clone());
         self.pinned_reads.clear();
-        self.node_indexes = Default::default();
+        self.node_indexes.reset();
         self.seeded_reads.clear();
         self.pinned_blobs.clear();
         // A change names its type as the schema does now.
@@ -2216,11 +2216,6 @@ impl GraphSession {
 
     pub fn ledger_mut(&mut self) -> &mut ReadLedger {
         &mut self.ledger
-    }
-
-    /// The schema epoch reads are kept under: a new schema text starts another.
-    pub(crate) fn schema_epoch(&self) -> u64 {
-        self.schema_epoch
     }
 
     /// Runs `read` asked for by `scope`'s view, so the ledger names who asked.

@@ -406,9 +406,19 @@ pub(crate) struct NodeIndexes {
     /// Indexes being read, by type and the commit asked for (`None`: the branch's head).
     loading: HashMap<(String, Option<String>), Loading>,
     used: u64,
+    /// Moves when the indexes are forgotten (a new token, a new schema), so a read still out
+    /// from before lands nowhere.
+    generation: u64,
 }
 
 impl NodeIndexes {
+    /// Forgets every index, and every read still out: their answers land nowhere.
+    pub(crate) fn reset(&mut self) {
+        self.held.clear();
+        self.loading.clear();
+        self.generation += 1;
+    }
+
     fn get(&mut self, type_name: &str, commit: &str, node: &NodeType) -> Option<Loaded> {
         self.used += 1;
         let used = self.used;
@@ -577,7 +587,8 @@ impl GraphSession {
             Err(error) => return Task::ready(Err(message(error))),
         };
         let read = self.read_through(at, &query, cx);
-        let (node, type_name, epoch) = (node.clone(), node.name.clone(), self.schema_epoch());
+        let (node, type_name) = (node.clone(), node.name.clone());
+        let generation = self.node_indexes.generation;
         let task = cx.spawn(async move |this, cx| {
             let result = read.await;
             let finished = match result {
@@ -599,12 +610,14 @@ impl GraphSession {
                 Err(error) => Err(message(error)),
             };
             this.update(cx, |this, _| {
+                // Forgotten while it was out (a new token, a new schema): it lands nowhere.
+                if this.node_indexes.generation != generation {
+                    return;
+                }
                 this.node_indexes
                     .loading
                     .remove(&(type_name.clone(), commit));
-                if let Ok((Some(at), loaded)) = &finished
-                    && this.schema_epoch() == epoch
-                {
+                if let Ok((Some(at), loaded)) = &finished {
                     this.node_indexes
                         .insert(&type_name, at.clone(), loaded.clone());
                 }
@@ -1051,5 +1064,79 @@ mod tests {
             Some(1),
             "one word asks no phrase"
         );
+    }
+
+    /// A new token forgets the indexes and every read still out. The old token's index read
+    /// answers nothing (the session refuses an answer read under another token), and its end
+    /// leaves the new token's read of the same index alone: a pause meanwhile joins it rather
+    /// than sending a third (review of #124).
+    #[gpui::test]
+    async fn an_index_read_out_when_the_token_changes_lands_nowhere(cx: &mut gpui::TestAppContext) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        let (session, served, _reads) = served_people(3, cx);
+        cx.run_until_parked();
+        // Index reads sent, counted as the server receives them.
+        let sent = Arc::new(AtomicUsize::new(0));
+        let wait = |served: &Served, secs: u64| {
+            let sent = sent.clone();
+            served.lock().unwrap().wait =
+                Box::new(move |asked| match asked["name"] == "studio_search_index" {
+                    true => {
+                        sent.fetch_add(1, Ordering::SeqCst);
+                        Duration::from_secs(secs)
+                    }
+                    false => Duration::ZERO,
+                });
+        };
+        let search = |cx: &mut gpui::TestAppContext| {
+            session.update(cx, |session, cx| {
+                session.find_nodes("Person", "ada", None, None, 5, cx)
+            })
+        };
+        wait(&served, 10);
+        let old = search(cx);
+        cx.run_until_parked();
+        let connection = session.read_with(cx, |session, _| session.connection.clone());
+        connection.update(cx, |connection, cx| {
+            connection.set_token(Some("another".into()), cx)
+        });
+        cx.run_until_parked();
+        wait(&served, 20);
+        let new = search(cx);
+        cx.run_until_parked();
+        assert_eq!(
+            sent.load(Ordering::SeqCst),
+            2,
+            "the new token reads it again"
+        );
+
+        // The old token's read ends: it answers nothing, and is held nowhere.
+        cx.executor().advance_clock(Duration::from_secs(10));
+        cx.run_until_parked();
+        assert!(futures::executor::block_on(old).is_err());
+        assert_eq!(session.read_with(cx, |s, _| s.node_indexes.bytes()), 0);
+        assert_eq!(
+            session.read_with(cx, |s, _| s.node_indexes.loading.len()),
+            1,
+            "the new token's read is still known to be out"
+        );
+        let joined = search(cx);
+        cx.run_until_parked();
+        assert_eq!(
+            sent.load(Ordering::SeqCst),
+            2,
+            "joined the new token's read"
+        );
+
+        cx.executor().advance_clock(Duration::from_secs(10));
+        cx.run_until_parked();
+        for found in [new, joined] {
+            assert_eq!(
+                futures::executor::block_on(found).unwrap().hits[0].id,
+                "zz-ada"
+            );
+        }
+        assert_eq!(sent.load(Ordering::SeqCst), 2);
     }
 }
