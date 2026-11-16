@@ -9007,8 +9007,11 @@ impl TypeTable {
             let (mut filters, filters_refused) = words::filters_with(answer.value, &choices, reach);
             refused.extend(filters_refused);
             // A `related_to` names a record; the name becomes its id through the node search
-            // the filter's own value field uses, the first match taken, and the pill shows it.
+            // the filter's own value field uses, only when one node is named (spec 031): the
+            // only match, or the only one the name is exactly. When several are, the person
+            // picks among them in the filter's value field; when none, the sentence says so.
             let mut labels: Vec<(String, String)> = Vec::new();
+            let mut to_pick: Option<(String, String, String, Vec<suggest::Suggestion>)> = None;
             for filter in &mut filters {
                 if filter.op != FilterOp::RelatedTo {
                     continue;
@@ -9033,26 +9036,30 @@ impl TypeTable {
                     })
                     .ok()
                     .flatten();
-                let found = match search {
-                    Some(search) => search
-                        .await
-                        .ok()
-                        .and_then(|hits| suggest::from_hits(&hits).into_iter().next()),
-                    None => None,
+                let other = other.unwrap_or_default();
+                let named = match search {
+                    Some(search) => search.await.map(|hits| suggest::named(&hits)),
+                    None => Ok(suggest::Named::None),
                 };
-                match found {
-                    Some(node) => {
+                filter.value = Value::Null;
+                match named {
+                    Ok(suggest::Named::One(node)) => {
                         if let Some(label) = node.label {
                             labels.push((node.value.clone(), label));
                         }
                         filter.value = Value::String(node.value);
                     }
-                    None => {
-                        refused.push(format!(
-                            "no {} matching \"{name}\"",
-                            other.unwrap_or_default()
-                        ));
-                        filter.value = Value::Null;
+                    Ok(suggest::Named::None) => {
+                        refused.push(format!("no {other} matching \"{name}\""));
+                    }
+                    Ok(suggest::Named::Several(offers)) if to_pick.is_none() => {
+                        to_pick = Some((filter.property.clone(), name.clone(), other, offers));
+                    }
+                    Ok(suggest::Named::Several(offers)) => {
+                        refused.push(format!("{} {other} nodes match \"{name}\"", offers.len()));
+                    }
+                    Err(error) => {
+                        refused.push(format!("{other} could not be searched ({error})"));
                     }
                 }
             }
@@ -9085,8 +9092,19 @@ impl TypeTable {
                 // What the sentence says of the order, the grouping and the columns replaces
                 // the table's; what it does not say stays as it is.
                 this.apply_words_view(view, cx);
-                let note =
+                let mut note =
                     (!refused.is_empty()).then(|| format!("Could not use: {}", refused.join("; ")));
+                if let Some((key, name, other, offers)) = to_pick {
+                    let ask = format!(
+                        "{} {other} nodes match \"{name}\": pick one in the filter.",
+                        offers.len()
+                    );
+                    note = Some(match note {
+                        Some(note) => format!("{ask} {note}"),
+                        None => ask,
+                    });
+                    this.ask_to_pick(key, name, offers, window, cx);
+                }
                 this.words = WordsState::Typing(note);
                 this.reload(true, cx);
                 cx.notify();
@@ -9094,6 +9112,31 @@ impl TypeTable {
             .ok();
         });
         self.words = WordsState::Running { _call: task };
+        cx.notify();
+    }
+
+    /// A sentence's "related to" named several nodes (spec 031): its filter opens as a draft,
+    /// the name in its value field and the nodes it names offered, best first, for the person
+    /// to pick one. Nothing is filtered by it until they do.
+    fn ask_to_pick(
+        &mut self,
+        key: String,
+        name: String,
+        offers: Vec<suggest::Suggestion>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_draft_property(key, window, cx);
+        self.filter_editor.update(cx, |editor, cx| {
+            editor.set_text(name.clone(), window, cx);
+            editor.set_placeholder_text(filter_placeholder(FilterOp::RelatedTo), window, cx);
+        });
+        if let Some(draft) = &mut self.filter_draft {
+            draft.op = FilterOp::RelatedTo;
+            draft.offers.set(offers, true);
+            draft.answers = Some(name);
+        }
+        self.redraw_offers(cx);
         cx.notify();
     }
 
@@ -13348,6 +13391,63 @@ mod tests {
                 "in the order named"
             );
             assert_eq!(table.sort, Some(by_name), "an order not said stays");
+        });
+    }
+
+    /// A sentence whose "related to" names several nodes filters by none of them: the filter
+    /// opens as a draft, the name in its value field and the nodes offered, best first, for
+    /// the person to pick one (spec 031).
+    #[gpui::test]
+    async fn a_name_that_names_several_nodes_asks_which(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let schema = "node Person {\n  slug: String @key\n  name: String\n}\n\
+            node Org {\n  slug: String @key\n  name: String\n}\n\
+            edge WorksAt: Person -> Org\n";
+        let session = session(schema, cx);
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session,
+                "Person".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let key = table.read_with(cx, |table, _| {
+            let schema = table.schema.clone().unwrap();
+            let group = schema
+                .relationships_of("Person")
+                .iter()
+                .find(|group| group.other_type == "Org")
+                .cloned()
+                .unwrap();
+            builder::relationship_key(&group)
+        });
+        let offers = vec![
+            suggest::Suggestion {
+                value: "acme.com".into(),
+                label: Some("ACME Corp".into()),
+            },
+            suggest::Suggestion {
+                value: "acme-labs.ai".into(),
+                label: Some("Acme Labs".into()),
+            },
+        ];
+        table.update_in(cx, |table, window, cx| {
+            table.ask_to_pick(key.clone(), "Acme".into(), offers.clone(), window, cx)
+        });
+        table.read_with(cx, |table, cx| {
+            let draft = table.filter_draft.as_ref().expect("the filter is a draft");
+            assert_eq!(draft.property, key);
+            assert_eq!(draft.op, FilterOp::RelatedTo);
+            assert_eq!(draft.offers.len(), 2);
+            assert_eq!(table.filter_editor.read(cx).text(cx), "Acme");
+            assert!(table.filters.is_empty(), "nothing filtered until a pick");
         });
     }
 

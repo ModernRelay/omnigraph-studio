@@ -7,7 +7,7 @@ use std::time::Duration;
 use gpui::{App, Entity, Task};
 use gq_language::input::{edit_text, list_items};
 use graph_store::GraphSession;
-use graph_store::node_search::TypeHits;
+use graph_store::node_search::{MatchRank, NodeHit, TypeHits};
 use serde_json::Value;
 
 /// One offered value: what goes in the field, and a label shown beside it.
@@ -54,6 +54,39 @@ pub fn from_hits(hits: &TypeHits) -> Vec<Suggestion> {
             label: hit.label.clone(),
         })
         .collect()
+}
+
+/// What a name given in words (spec 019, a sentence's "related to") names among a search's
+/// hits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Named {
+    /// One node: the only match, or the only one whose id or name is the name itself.
+    One(Suggestion),
+    /// No node matches.
+    None,
+    /// Several match and none alone exactly: the person picks.
+    Several(Vec<Suggestion>),
+}
+
+/// The node `hits` (a search for a name) name, when it is one: never the first of several.
+pub fn named(hits: &TypeHits) -> Named {
+    let exact: Vec<&NodeHit> = hits
+        .hits
+        .iter()
+        .filter(|hit| hit.rank == MatchRank::Exact)
+        .collect();
+    let one = |hit: &NodeHit| {
+        Named::One(Suggestion {
+            value: hit.id.clone(),
+            label: hit.label.clone(),
+        })
+    };
+    match (exact.as_slice(), hits.hits.as_slice()) {
+        ([hit], _) => one(hit),
+        (_, []) => Named::None,
+        (_, [hit]) if !hits.more => one(hit),
+        _ => Named::Several(from_hits(hits)),
+    }
 }
 
 /// Whether suggestions complete the field: always, but for a list typed as JSON (a list pasted
@@ -181,7 +214,6 @@ pub fn already_typed(text: &str, value: &str, list: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use graph_store::node_search::{MatchRank, NodeHit};
 
     fn values() -> Vec<String> {
         ["active", "paused", "done", "inactive"]
@@ -232,6 +264,46 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// A name given in words names a node only when one matches it, or one alone is it;
+    /// otherwise the person picks, and never the first by id (spec 031).
+    #[test]
+    fn a_name_names_one_node_only_when_one_matches() {
+        let one = |id: &str| {
+            Named::One(Suggestion {
+                value: id.into(),
+                label: Some(match id {
+                    "o-2" => "Acme".into(),
+                    _ => "Acme Analytics".into(),
+                }),
+            })
+        };
+        let exact_and_prefix = hits(
+            vec![
+                hit("o-2", "Acme", MatchRank::Exact),
+                hit("o-1", "Acme Analytics", MatchRank::Prefix),
+            ],
+            false,
+        );
+        assert_eq!(named(&exact_and_prefix), one("o-2"));
+        let only = hits(vec![hit("o-1", "Acme Analytics", MatchRank::Prefix)], false);
+        assert_eq!(named(&only), one("o-1"));
+        let only_shown = hits(vec![hit("o-1", "Acme Analytics", MatchRank::Prefix)], true);
+        assert!(matches!(named(&only_shown), Named::Several(_)));
+        let several = hits(
+            vec![
+                hit("adam-smithson", "Adam Smithson", MatchRank::WordStart),
+                hit("john-smith", "John Smith", MatchRank::WordStart),
+            ],
+            false,
+        );
+        assert_eq!(
+            named(&several),
+            Named::Several(from_hits(&several)),
+            "Smith names two people"
+        );
+        assert_eq!(named(&hits(Vec::new(), false)), Named::None);
     }
 
     #[test]
