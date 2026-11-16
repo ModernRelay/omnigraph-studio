@@ -89,7 +89,7 @@ pub struct TypeHits {
 
 /// Text for matching: decomposed and stripped of accents, lowercase, apostrophes dropped
 /// ("O'Brien" → "obrien") and every other run of non-letters one space ("jean-luc" → "jean
-/// luc", "anna.mueller@db.com" → "anna mueller db com").
+/// luc", "anna.woehler@example.com" → "anna woehler example com").
 pub fn fold(text: &str) -> String {
     let mut folded = String::with_capacity(text.len());
     let mut after_space = true;
@@ -877,10 +877,10 @@ mod tests {
 
     #[test]
     fn folding_drops_case_accents_and_punctuation() {
-        assert_eq!(fold("Société Générale"), "societe generale");
+        assert_eq!(fold("Société Lumière"), "societe lumiere");
         assert_eq!(fold("Seán O'Brien"), "sean obrien");
-        assert_eq!(fold("JPMorgan Chase & Co."), "jpmorgan chase co");
-        assert_eq!(fold("anna.mueller@db.com"), "anna mueller db com");
+        assert_eq!(fold("JPHollis Trust & Co."), "jphollis trust co");
+        assert_eq!(fold("anna.woehler@example.com"), "anna woehler example com");
         assert_eq!(fold("  Zürich  "), "zurich");
         assert_eq!(fold("McDonald's"), "mcdonalds");
     }
@@ -906,9 +906,9 @@ mod tests {
         for name in ["Analytics", "Bank", "Cloud", "Health", "Labs", "Robotics"] {
             rows.push(json!({"id": format!("acme-{}.io", name.to_lowercase()), "p0": format!("Acme {name}")}));
         }
-        rows.push(json!({"id": "openai.com", "p0": "OpenAI", "p1": "https://openai.com"}));
-        rows.push(json!({"id": "mckinsey.com", "p0": "McKinsey & Company"}));
-        rows.push(json!({"id": "db.com", "p0": "Deutsche Bank AG"}));
+        rows.push(json!({"id": "bluequill.example", "p0": "BlueQuill", "p1": "https://bluequill.example"}));
+        rows.push(json!({"id": "mcallister.example", "p0": "McAllister & Partners"}));
+        rows.push(json!({"id": "nordhafen.example", "p0": "Nordhafen Bank AG"}));
         index(Value::Array(rows))
     }
 
@@ -917,12 +917,12 @@ mod tests {
     #[test]
     fn matches_are_found_whatever_the_case_and_ranked_exact_first() {
         let index = acme();
-        assert_eq!(ids(&index.find("openai", 5)), ["openai.com"]);
-        assert_eq!(index.find("openai", 5).hits[0].rank, MatchRank::Exact);
-        assert_eq!(ids(&index.find("mckinsey", 5)), ["mckinsey.com"]);
-        assert_eq!(ids(&index.find("bank deutsche", 5)), ["db.com"]);
+        assert_eq!(ids(&index.find("bluequill", 5)), ["bluequill.example"]);
+        assert_eq!(index.find("bluequill", 5).hits[0].rank, MatchRank::Exact);
+        assert_eq!(ids(&index.find("mcallister", 5)), ["mcallister.example"]);
+        assert_eq!(ids(&index.find("bank nordhafen", 5)), ["nordhafen.example"]);
         assert_eq!(
-            index.find("bank deutsche", 5).hits[0].rank,
+            index.find("bank nordhafen", 5).hits[0].rank,
             MatchRank::WordStart
         );
         let acme = index.find("acme corp", 5);
@@ -935,34 +935,34 @@ mod tests {
         assert_eq!(all.hits[0].id, "acme.com", "{:?}", ids(&all));
         assert_eq!(all.hits[0].label.as_deref(), Some("ACME Corp"));
         // Inside a word, last.
-        assert_eq!(ids(&index.find("insey", 5)), ["mckinsey.com"]);
-        assert_eq!(index.find("insey", 5).hits[0].rank, MatchRank::Substring);
+        assert_eq!(ids(&index.find("liste", 5)), ["mcallister.example"]);
+        assert_eq!(index.find("liste", 5).hits[0].rank, MatchRank::Substring);
     }
 
     /// A match on a property other than the name says which, with its text.
     #[test]
     fn a_match_off_the_name_names_its_property() {
-        let found = acme().find("https://openai", 5);
-        assert_eq!(found.hits[0].id, "openai.com");
+        let found = acme().find("https://bluequill", 5);
+        assert_eq!(found.hits[0].id, "bluequill.example");
         assert_eq!(
             found.hits[0].matched,
-            Some(("website".into(), "https://openai.com".into()))
+            Some(("website".into(), "https://bluequill.example".into()))
         );
-        assert_eq!(found.hits[0].label.as_deref(), Some("OpenAI"));
-        assert_eq!(acme().find("openai", 5).hits[0].matched, None);
+        assert_eq!(found.hits[0].label.as_deref(), Some("BlueQuill"));
+        assert_eq!(acme().find("bluequill", 5).hits[0].matched, None);
     }
 
     #[test]
     fn a_hit_kept_for_new_text_still_matches_it() {
-        let hit = acme().find("open", 5).hits.remove(0);
-        assert!(hit_matches(&hit, "openai"));
-        assert!(hit_matches(&hit, "OPENAI.COM"));
-        assert!(!hit_matches(&hit, "openaix"));
+        let hit = acme().find("blue", 5).hits.remove(0);
+        assert!(hit_matches(&hit, "bluequill"));
+        assert!(hit_matches(&hit, "BLUEQUILL.EXAMPLE"));
+        assert!(!hit_matches(&hit, "bluequillx"));
         let full_text = NodeHit {
             rank: MatchRank::FullText,
             ..hit
         };
-        assert!(!hit_matches(&full_text, "openai"));
+        assert!(!hit_matches(&full_text, "bluequill"));
     }
 
     #[test]
@@ -977,18 +977,18 @@ mod tests {
     #[test]
     fn full_text_hits_follow_the_matches_once_each() {
         let node = org();
-        let mut hits = acme().find("openai", 5);
+        let mut hits = acme().find("bluequill", 5);
         let answers = vec![(
             "slug".to_owned(),
             Arc::new(json!([
-                {"id": "openai.com", "p0": "OpenAI", "matched": "openai.com"},
-                {"id": "db.com", "p0": "Deutsche Bank AG", "matched": "db.com"},
+                {"id": "bluequill.example", "p0": "BlueQuill", "matched": "bluequill.example"},
+                {"id": "nordhafen.example", "p0": "Nordhafen Bank AG", "matched": "nordhafen.example"},
             ])),
         )];
         merge_full_text(&node, &mut hits, &answers, 5);
-        assert_eq!(ids(&hits), ["openai.com", "db.com"]);
+        assert_eq!(ids(&hits), ["bluequill.example", "nordhafen.example"]);
         assert_eq!(hits.hits[1].rank, MatchRank::FullText);
-        assert_eq!(hits.hits[1].label.as_deref(), Some("Deutsche Bank AG"));
+        assert_eq!(hits.hits[1].label.as_deref(), Some("Nordhafen Bank AG"));
     }
 
     /// The indexes hold at most the budget: the least recently used type goes first.

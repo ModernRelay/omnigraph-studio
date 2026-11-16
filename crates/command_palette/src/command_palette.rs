@@ -2333,7 +2333,7 @@ mod tests {
         let find: Find = Box::new(move |_, asked| {
             let rows = match searched_type(asked).as_str() {
                 "Company" if failing.load(Ordering::SeqCst) => json!({"refused": true}),
-                "Company" => index_rows(&[("openai.com", "OpenAI")]),
+                "Company" => index_rows(&[("bluequill.example", "BlueQuill")]),
                 _ => json!([]),
             };
             (rows, Duration::ZERO)
@@ -2341,7 +2341,7 @@ mod tests {
         let (session, searches) = served(THREE_TYPES, json!([]), find, cx);
         let (palette, cx) = palette(Scope::Nodes, session, cx);
         searches.on.store(true, Ordering::SeqCst);
-        type_text(&palette, "openai", cx);
+        type_text(&palette, "bluequill", cx);
         cx.executor().advance_clock(NODE_SEARCH_DELAY);
         cx.run_until_parked();
         let retry = format!("{RETRY}Company");
@@ -2365,7 +2365,7 @@ mod tests {
         palette.update_in(cx, |palette, window, cx| palette.run_selected(window, cx));
         cx.run_until_parked();
         assert_eq!(searches.sent.load(Ordering::SeqCst), sent + 1, "read again");
-        assert_eq!(listed(&palette, cx), ["node:Company:openai.com"]);
+        assert_eq!(listed(&palette, cx), ["node:Company:bluequill.example"]);
     }
 
     /// The answers of every type land together, in one draw, however many types answer; and

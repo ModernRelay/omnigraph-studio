@@ -3529,7 +3529,7 @@ fn spellings(word: &str) -> Vec<String> {
 }
 
 /// Every word of `text`, in any of its [`spellings`], in `$var`'s id or one of `properties`:
-/// the words in any order, each anywhere ("bank deutsche" finds "Deutsche Bank AG").
+/// the words in any order, each anywhere ("bank nordhafen" finds "Nordhafen Bank AG").
 fn text_match(var: &str, properties: &[&str], text: &str, params: &mut Params) -> String {
     let words: Vec<&str> = text.split_whitespace().collect();
     words_match(var, properties, &words, params)
@@ -4374,7 +4374,7 @@ mod tests {
             "node Decision {\n  slug: String @key\n  statement: String @index\n  note: String?\n}\n",
         )
         .unwrap();
-        let query = node_text_search(&schema, "Decision", "statement", "product hunt", 25).unwrap();
+        let query = node_text_search(&schema, "Decision", "statement", "launch week", 25).unwrap();
         assert_compiles_in(&schema, &query);
         assert!(
             query.text.contains("search($n.statement, $q)"),

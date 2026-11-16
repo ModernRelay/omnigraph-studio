@@ -483,14 +483,14 @@ graphs; the numbers are in spec 031's validation log.
 **E49. A substring test that ignores case and accents.** GQ's `contains` and `starts_with` are
 exact and case-sensitive (`references/queries.md`, "Filter Operators"), and neither 0.14, 0.15
 nor main (`query.pest` at `4f7c2076`) has `lower()`, `icontains` or `ilike`. A search for
-"openai" therefore misses "OpenAI" unless the client guesses its spelling. Add
+"bluequill" therefore misses "BlueQuill" unless the client guesses its spelling. Add
 `icontains`/`istarts_with` (Unicode case folding, and a variant that also folds accents), or
 `lower()` and `fold()` usable in filters, which E40's string functions would cover. Engine rule:
 folding is the same on every platform and every server, and is documented with its Unicode
 version. *Waits:* 031. *Today:* a type of at most 5,000 nodes is matched in Studio's memory,
 from a name index read once per commit; a larger type is searched on the server with each word
-in four spellings (as typed, lowercase, Capitalized, UPPERCASE), so "mcKinsey" still misses
-"McKinsey" there.
+in four spellings (as typed, lowercase, Capitalized, UPPERCASE), so "mcAllister" still misses
+"McAllister" there.
 
 **E50. One request that finds nodes across types.** A node search reads each node type on its
 own, one request per type: 36 on the ModernRelay operating graph for a first search, then one
@@ -505,8 +505,8 @@ Studio's.
 `match_text` and `bm25` fold case and stem words, but only on a String with a one-column
 `@index` or `@key` (`T27` otherwise): on the ModernRelay operating graph `Org.name`,
 `Person.name`, `Opportunity.title` and `Meeting.title` have none, so the engine's search cannot
-be used for what people most often type. Full-text also matches whole words only: "insey" never
-finds "McKinsey". Let the label-like properties be searchable without a declaration per
+be used for what people most often type. Full-text also matches whole words only: "llist" never
+finds "McAllister". Let the label-like properties be searchable without a declaration per
 property (a schema-level default, or a scan with the same analyzer when no index exists), and
 add an n-gram analyzer or a substring mode so one call finds a word's middle too. Engine rule:
 results of a scan and of an index are the same. *Waits:* 031. *Today:* Studio runs the engine's

@@ -14,7 +14,7 @@ runner, real HTTP):
    ActionItem to File, and Org and Person came in the third batch, two clicks away: 0 of 183
    Org and Person names typed exactly as stored were found at the first pause.
 2. Matching was case-sensitive (`contains` with four spellings of the whole text) and needed
-   the words in order: "openai" missed "OpenAI", "mckinnon" "McKinnon", "acme corp" "ACME
+   the words in order: "bluequill" missed "BlueQuill", "mcallister" "McAllister", "acme corp" "ACME
    Corp", "garcia jose" "José García".
 3. Five rows per type ordered by `@id`, with no ranking: "acme" never showed ACME Corp, whose id
    sorts after six `acme-*` ids.
@@ -174,11 +174,11 @@ pick one in the filter." When none match, the note says so.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
-| 2026-11-16 | The five causes above happen in the app | The scenario runner (`crates/studio/examples/snapshot.rs`, `studio::GoTo`, `type:`, `key:enter`) against a CRM-shaped graph served by `omnigraph-server` (main `4f7c2076`, contract 0.14); a proxy answering 503 to one type's search | "openai": "0 nodes · Search 7 more types", OpenAI only after the click; "acme": five `acme-*` organisations and no ACME Corp; "acme corp", "mckinnon", "jose garcia", "openai-partner": No node matches; Person named by email: "Sam Altman" No node matches; the 503: No node matches |
+| 2026-11-16 | The five causes above happen in the app | The scenario runner (`crates/studio/examples/snapshot.rs`, `studio::GoTo`, `type:`, `key:enter`) against a CRM-shaped graph served by `omnigraph-server` (main `4f7c2076`, contract 0.14); a proxy answering 503 to one type's search | "bluequill": "0 nodes · Search 7 more types", BlueQuill only after the click; "acme": five `acme-*` organisations and no ACME Corp; "acme corp", "mcallister", "jose garcia", "bluequill-partner": No node matches; Person named by email: "Sam Okafor" No node matches; the 503: No node matches |
 | 2026-11-16 | Findability before and after, per type | Every node's id and name read once (read-only on the operating graph), each searched for in eight ways; before: a port of `builder::node_search` checked against the server's own answers (14 of 14 the same); after: `graph_store::node_search` itself over the same rows | See "Before and after" |
 | 2026-11-16 | Full-text ranks what `contains` misses | 25 random ActionItem titles on the operating graph, `search` + `bm25`, top 5 | Lowercase title 25/25 (contains 7); words reversed 24/24 (0); four letters inside a word 0/22 (15) |
 | 2026-11-16 | Every operating-graph type fits an index | `count($n)` per type, read-only | Largest: Span 2,625, ExternalID 1,378, Source 1,030 |
-| 2026-11-16 | The new search works in the app | The scenario runner against the CRM-shaped graph, first pause, no click | "openai": OpenAI first; "acme": ACME Corp first, then the Acme companies, and "More in Org…"; "acme corp", "mckinnon", "garcia jose", "openai partner", "smith" (both Smiths before Smithson): each found; "anna.mueller@db.com": Anna Müller, "Person · email"; a 503 on Org's index: "Org could not be searched · Retry" among the other types' rows |
+| 2026-11-16 | The new search works in the app | The scenario runner against the CRM-shaped graph, first pause, no click | "bluequill": BlueQuill first; "acme": ACME Corp first, then the Acme companies, and "More in Org…"; "acme corp", "mcallister", "garcia jose", "bluequill partner", "smith" (both Smiths before Smithson): each found; "anna.woehler@example.com": Anna Wöhler, "Person · email"; a 503 on Org's index: "Org could not be searched · Retry" among the other types' rows |
 | 2026-11-16 | Before and after on four graphs | A harness outside the repository: each type's `studio_search_index` rows read once, the old predicate applied to them, and a temporary test running `NodeIndex::find` and the palette's ordering over the same rows | See "Before and after" |
 
 ### Before and after
@@ -207,7 +207,7 @@ Meeting, Conversation, Product, Initiative):
 | domain, the key (Org) | 95/95 | 95/95 | 0/95 | 95/95 |
 | **All** | **3,290/5,261 (63%)** | **4,845/5,261 (92%)** | **1,218/5,261 (23%)** | **4,841/5,261 (92%)** |
 
-A CRM-shaped graph built for the measurement (15 types, as the operating graph has them, with 57 real-world organisation names and 30 people with accents, apostrophes and emails): in its type 588/761
+A CRM-shaped graph built for the measurement (15 types, as the operating graph has them, with 57 organisation names and 30 people with accents, apostrophes and emails): in its type 588/761
 → 756/761; palette at the first pause 36/761 (5%) → 756/761 (99%).
 
 Development graph (`script/dev-server`): 1,000/1,895 → 1,434/1,895; email 0/128 → 128/128,
