@@ -1,6 +1,6 @@
 # 032: Agents drive Studio's window
 
-Status: steps 1 and 2 built · 2026-11-16 · checked end to end with Claude Code against the dev graph (Validation log)
+Status: steps 1 and 2 built · step 3 (the canvas and the tree, the settings, the port) built 2026-11-17
 
 ## Problem
 
@@ -200,9 +200,95 @@ before it sends the query, except through `gq_language`, and a mutation must go 
 
 A tool call must not take a tab away from the person while they read it. A tool opens its tab as
 the pane's preview tab where the action supports `preview`, so the person's pinned tabs stay. A
-tool never closes a tab or changes a filter on an open tab. If the window is not in front, the
-tool opens its tab there and does not raise the window. The window shows one chip in the status
-bar, "Opened by <agent>", for 4 seconds; the chip uses the motion rules in VII.
+tool never closes a tab or changes the filters of a tab the person has open: a filtered table
+(`graph_open_type` with `filter_id`) opens as a tab of its own, which the person can close, and
+the type's open table is left as it is. If the window is not in front, the tool opens its tab
+there and does not raise the window, unless the person turned on "Bring the window to the front
+when an agent shows something". The window shows one chip in the status bar, "Opened by
+<agent>", for 4 seconds; the chip uses the motion rules in VII.
+
+The canvas and the tree are the exception, at the person's request (2026-11-16): an agent walks
+them as the person does. Their tools change the open tab they act on, the canvas or tree in
+front, and only it: they expand and collapse, show more, hide, pin, select and move the camera.
+None writes, every one is an action the person invokes too, and the walk keeps the person's own
+Back and Forward ([`WalkBack`], `]`) and Reset layout. A view tool gives the canvas or tree the
+keyboard for its dispatch, as a click would, and gives it back where the person had it after.
+
+### The canvas and the tree
+
+Every action of `studio_actions::canvas`, `studio_actions::tree` and the map
+(`studio_ontology`) is a tool, and so are those a person reached only by pointer before, now
+actions with a palette entry:
+
+| Tool | Action | What it does |
+|---|---|---|
+| `canvas_select_node` | `canvas::SelectNode` | Select a node by type and id, as a click does |
+| `canvas_expand` | `canvas::ExpandNeighbourhood` | Expand nodes' neighbourhoods: `nodes`, `relationships` (`out:WorksAt`, `in:Knows`), `depth` 1 or 2, `limit_per_relationship`, `confirm` |
+| `canvas_collapse` | `canvas::CollapseNodes` | Collapse nodes (the chip menu's Collapse all) |
+| `canvas_show_more` | `canvas::ShowMore` | "+K more" on a relationship: `node` and `relationship`, or the one selected |
+| `canvas_hide_nodes`, `canvas_show_hidden` | `canvas::HideNodes`, `canvas::ShowHidden` | Hide nodes with what hangs off them; draw them again |
+| `canvas_pin_nodes`, `canvas_unpin_nodes` | `canvas::PinNodes`, `canvas::UnpinNodes` | Keep where they are drawn; let the layout place them |
+| `canvas_reroot_here` | `canvas::RerootHere` | A walk from the node in a tab of its own (the chip menu's "Canvas from here") |
+| `canvas_expand_node`, `canvas_collapse_node` | `ExpandNode`, `CollapseNode` | Expand or collapse one node |
+| `canvas_move_left`/`right`/`up`/`down` | `MoveLeft` … | Move the selection to the nearest chip that way |
+| `canvas_open_selected_page`, `canvas_focus_selected`, `canvas_follow_relationship` | `OpenSelectedPage`, `FocusSelected`, `FollowRelationship` | A node's page; centre on it; follow a single-target relationship to its end |
+| `canvas_walk_back`, `canvas_walk_forward` | `WalkBack`, `WalkForward` | The walk's history |
+| `canvas_select_all`, `canvas_clear_selection` | `SelectAll`, `ClearSelection` | Mark every chip; unmark |
+| `canvas_fit_to_window`, `canvas_zoom_in`, `canvas_zoom_out`, `canvas_reset_layout` | `FitToWindow` … | The camera and the layout |
+| `graph_show_results_on_canvas` | `graph::ShowResultsOnCanvas` | A query's result picture |
+| `table_show_row_on_canvas` | `table::ShowRowOnCanvas` | Walk from the row under the table's cursor |
+| `map_back`, `map_show_domains`, `map_select_next`, `map_select_previous`, `map_open` | `studio_ontology::…` | The schema's map |
+| `tree_select_node`, `tree_expand`, `tree_collapse` | `tree::SelectNode`, `tree::ExpandNeighbourhood`, `tree::CollapseNodes` | As the canvas's |
+| `tree_select_next`, `tree_select_previous`, `tree_expand_row`, `tree_collapse_row`, `tree_expand_all`, `tree_collapse_all`, `tree_open_selected`, `tree_reroot_here`, `tree_show_on_canvas`, `tree_open_table`, `tree_open_page`, `tree_clear_filter`, `tree_toggle_empty_groups` | every `studio_tree` action | As its key does |
+
+Plus two reads: `studio_canvas` (the root; the nodes drawn as `[type, id, name]`, at most 500
+with `truncated`; edges as `[from, to, relationship]` by index; relationships as `[node,
+relationship, other type, count, open, shown]`; the selection, zoom, node cap, history, marked,
+pinned and hidden) and `studio_tree` (the root; the relationships shown and the nodes under each
+open one). Names are what the person already sees on the chip or row, never another property.
+`studio_selection` on a canvas or tree also counts what is drawn, so an agent knows there is
+more to read.
+
+**Targeting.** A per-node tool takes an optional `node: {type_name, id}`, which the view selects
+first by `SelectNode`, as a click does. A node not drawn answers `not_available`: "Not on this
+canvas; expand a neighbour or use graph_show_node_on_canvas" (the tree: "Not in this tree;
+expand a relationship that holds it or use graph_show_node_in_tree").
+
+**Results.** A view tool waits, at most 15 seconds of the executor's clock, for its view to have
+read and laid out what it opened, then answers with what changed: the nodes and edges drawn, the
+nodes added and removed and the edges added (at most 200 each, with `truncated`), the
+relationships left closed with their counts, the selection, the zoom, and `cap_reached`. An
+expansion answers `expanded`, `needs_confirmation` or `cap_reached`.
+
+**Expansion.** `canvas_expand` and `tree_expand` plan through the exploration
+(`Exploration::plan_expand`): each node's path and its relationships' paths, opened together by
+`set_open`, so the reads go out in the same batches as Expand all (spec 005, 006). Its cost is
+`Exploration::opening`, the same count the person's question shows. Past it
+(`Opening::asks`), the tool answers `needs_confirmation` with the nodes and reads, opens nothing,
+and opens it when called again with `confirm: true`; the person's own invocation asks
+(`confirm_expand`). Depth 2 opens the first `limit_per_relationship` neighbours of each
+relationship the first level read, once it has read them; a second level past the question
+stops, and the answer says what it would open. The node cap stays absolute: the walk is drawn
+capped, and the answer is `cap_reached` with what was drawn.
+
+**Left out**, with the reason:
+
+- `canvas::ActualSize`: the canvas has no handler; it is an image viewer's.
+- The chip menu's "Show as" (the property a type's nodes are named by): it writes the person's
+  settings for the graph, not the walk.
+- "Group by" on a relationship: it changes how a relationship reads its neighbours, with a
+  property to choose; deferred until an agent needs it.
+- "Copy key": the agent has the id already.
+- Retry on a chip whose read failed: Refresh reads the walk again; an agent sees the failure as a
+  relationship with no count.
+- Dragging a chip and panning: `canvas_pin_nodes`, `canvas_focus_selected` and the zoom tools
+  cover what an agent needs; positions in pixels mean nothing to it.
+- The tree's sentence filter on a relationship (`ask`): it sends the sentence to a model
+  (spec 019), a call the person makes with their own key.
+- The tree's per-relationship sort, filter and grouping controls: they change how a relationship
+  reads; deferred with "Group by".
+
+None of the canvas's or tree's interactions writes to the graph (survey of 2026-11-17).
 
 ### The panel's agent
 
@@ -229,7 +315,8 @@ form for the `studio` server, and shows the result's words instead: "Opened Proj
 
 ### Outside agents
 
-Off by default. The switch is in Settings, under Agents:
+On by default since 2026-11-17, at the person's request (it was off). The switches are in
+Settings, under Agent:
 
 - **Let agents outside Studio show things in Studio.** When on, Studio writes
   `<data dir>/ui-tools/endpoint.json` (mode 0600, with `studio_settings::write_atomic`) with
@@ -239,7 +326,30 @@ Off by default. The switch is in Settings, under Agents:
   with a Copy button that reads the token from the file instead of showing it. For Codex it
   shows the `config.toml` entry: `url`, `bearer_token_env_var`, and an `approval_mode =
   "approve"` line per tool, since Codex otherwise asks before each call.
-- When off, the server is not listening and the file is deleted.
+- When off, an outside token is refused and the file is deleted.
+- **Keep the same address between starts**, on by default. Studio asks for the port it used
+  last, then `agent.ui_tools_port` (24187, below) and the nine after it, passing over any another
+  process holds, and only then takes one the system chooses; the row says which port is in use
+  when it is not the one asked for, and that the command must be copied again. It never takes a
+  port from another process. The token is kept in the system keychain (item
+  `omnigraph-studio://ui-tools`, through `graph_store::sign_in::PlatformKeychain`), so a copied
+  command keeps working across restarts; `endpoint.json` and `token` are still written for the
+  copied commands. **New token** replaces it, confirmed with ↵ since nothing is lost: every agent
+  holding the old one gets 401 from then on. Off, the address and token are made per run.
+- **Let the agent in Studio show things in the window**, on by default. Off, a conversation names
+  no UI tool server, passes none in `session/new`, and `AGENTS.md` says nothing of one.
+- **Bring the window to the front when an agent shows something**, off by default.
+
+### The port
+
+24187 (`studio_settings::DEFAULT_UI_TOOLS_PORT`). It is in the registered range 10000-49151 and
+below 32768, so no system hands it out: macOS and Windows take ephemeral ports from 49152-65535
+and Linux from 32768-60999; it is also below Kubernetes' NodePorts (30000-32767). IANA lists
+24007-24241 as unassigned (the registry of 2026-11-10; Validation log), so it and the nine
+fallbacks are free there. No common development tool or database defaults to it (3000-3999, 4000,
+5000-5999, 8000-8999, 9000-9999, 5432, 6379, 11211, 27017, the MCP inspector's 6274 and 6277),
+and Studio uses none near it: the dev server's 8787, the sign-in bed's 8791, and the OAuth
+callbacks and the agent gateway, which take ports the system chooses.
 
 An outside agent can call every tool in any window. The first call from a token in a Studio run
 shows a toast in the window it targets: "An agent outside Studio is showing things here", with one
@@ -282,7 +392,13 @@ records the tool's name, the window id and the outcome.
    `busy` refusals; and `initialize` answering both protocol versions.
 2. The panel's agent: an HTTP entry, the permission auto-answer, the thread's titles, and
    `AGENTS.md`.
-3. More tools as people ask for them, each with its own row in this plan.
+3. The canvas and the tree (2026-11-17): every canvas, tree and map action as a tool, the
+   pointer's interactions as actions, `node` targeting, `studio_canvas` and `studio_tree`,
+   `canvas_expand` and `tree_expand`; the settings for outside agents, a kept address on port
+   24187, the panel's agent and bringing the window forward. Tests: a `#[gpui::test]` per tool
+   (`crates/studio/src/ui_tools_canvas_tests.rs`), and the expansion's two nodes, relationship
+   filter, `needs_confirmation` round trip, `cap_reached` and depth 2.
+4. More tools as people ask for them, each with its own row in this plan.
 
 ## Decisions
 
@@ -294,7 +410,8 @@ records the tool's name, the window id and the outcome.
 | Check each tool's precondition, then report what changed | Rely on `is_action_available`; return as soon as the action is dispatched; wait for a frame | An available action can still do nothing (no session), and a dispatch says nothing. What changed is known as soon as the deferred dispatch has run, with no frame, so a frame wait would only add a timeout to handle |
 | Streamable HTTP on loopback with a bearer token, for both kinds of agent | A Unix socket; stdio through `omnigraph-studio mcp-proxy`; the gateway's HTTPS | Both adapters and both CLIs connected over plain HTTP in live runs. A socket needs a relay. A stdio relay starts the 490 MB executable once per client. The gateway's self-signed certificate would not be trusted |
 | Plain JSON answers, no server stream | SSE answers and a GET stream | Both clients take JSON, and Claude Code goes on when GET gets 405. A stream would only matter for progress on long calls, and no tool is long |
-| Off by default for outside agents, with a token per run | Always on; a token that never changes | Any local process that can read the data dir could drive the window. The switch makes this the person's choice, and a token per run limits how long a copied token works |
+| On by default for outside agents, with a kept address and token (2026-11-17, reversed at the person's request; it was off, with a token per run) | Off by default; a token per run | The person wants an agent to reach Studio without turning anything on, and a command copied once to keep working. What protects the person: the token file is 0600 in a 0700 folder; the server listens on loopback only and refuses a non-null `Origin`; no tool writes; the first call of a run shows the notice with Turn off; New token refuses every copy of the old one |
+| The canvas and the tree change the open tab they act on | No tool changes an open tab | The person asked (2026-11-16) for an agent to walk a canvas and expand neighbourhoods as they do. Each change is the person's own action on the view in front, keeps their Back, Reset layout and Show hidden, and writes nothing; other tabs are still never changed |
 | A new layer-5 crate, wired by a global | The server in `agent_panel`; the server in `studio` | Outside agents do not need the agent panel. `studio` is the binary and should stay thin. A global keeps feature crates independent |
 | Preview tabs, never closing or refiltering | Tools that close tabs or change open filters | V: nothing moves under the person. An agent may add to the window, but it may not take anything away |
 
@@ -302,8 +419,10 @@ records the tool's name, the window id and the outcome.
 
 - Read-only query runs as a tool, once Studio can tell a read from a mutation with `gq_language`
   before sending it, and the run is capped as IX requires.
-- Tools that change an open tab (filters, sort, a canvas layout). Each needs an Undo, as IV asks
-  of what Studio can put back.
+- Tools that change an open table's filters or sort, and a relationship's grouping or filters on
+  the canvas or in the tree. The canvas and the tree are walked by tools now (above): their
+  changes are the person's own actions, with Back, Collapse, Show hidden and Reset layout to put
+  them back.
 - No engine change is needed. An agent with its own scoped credential (E20) would let an outside
   agent read the graph without a login of its own. That is a convenience; this plan does not wait
   on it.
@@ -335,6 +454,11 @@ records the tool's name, the window id and the outcome.
 | 2026-11-17 | An outside agent's first call of any kind shows the notice, once | `cargo test -p studio_workspace ui_tools` | `studio_windows`, then `graph_open_map`, then `studio_tabs`, with the notice owed until an answer says it was shown: the toast once, from `studio_windows`, in the window in front |
 | 2026-11-17 | The log, a dropped answer, a token turned on again, the copied command | `cargo test -p ui_tool_server` (14 tests) | A name that is not a tool is logged as `unknown`. A call whose reply was let go answers `cancelled` with the window it named (was `window_closed` for window 0). Off then on: the same token, its state new, the notice owed again. The settings say Claude Code keeps the token in `~/.claude.json` once its command runs |
 | 2026-11-17 | Keys in a panel the tool hides do not stay there | `cargo test -p studio --lib ui_tools_tests` (12 tests): the queries panel holds the keys, then `workspace_activate_panel` `types` in the same dock | Before: the keys went back to the hidden queries panel. After: the active tab, Person, has them; a panel that takes the keys when shown keeps them |
+| 2026-11-17 | 24187 and the nine after it are unassigned, and below every system's ephemeral range | IANA's `service-names-port-numbers.csv` and `.xml` (`<updated>2026-11-10</updated>`), fetched and searched for 10000-32767; the systems' documented ephemeral ranges | `,24007-24241,,Unassigned` (CSV line 13576): 24187-24196 inside it. macOS and Windows 49152-65535, Linux 32768-60999, Kubernetes NodePorts 30000-32767: none overlaps |
+| 2026-11-17 | The address is kept, a taken port passed over, and the token kept | `cargo test -p ui_tool_server` (16 tests): `a_taken_port_is_passed_over_never_taken`, `the_kept_token_lives_in_the_keychain` (a `MemoryKeychain`) | A free port taken; held by another listener: the next; the one used last first; all ten held: one the system chose outside them; not kept: the system's. The token read from the keychain; New token refuses the old one and is kept in its place; turned off, the kept token is deleted and the run takes its own |
+| 2026-11-17 | The four agent settings and their defaults | `cargo test -p studio_settings` (`the_agents_window_settings_default_as_the_person_asked`, `the_documented_defaults_are_the_defaults`), `-p agent_panel with_the_setting_off_the_agent_gets_no_ui_tools`, `-p studio_workspace the_window_comes_to_the_front_only_when_the_person_asked` | Outside agents, a kept address and the panel's tools on, bringing forward off, in `default.json` too. Off, the panel's agent gets no server and no `AGENTS.md` paragraph. A window behind stays behind unless bringing forward is on |
+| 2026-11-17 | Every canvas, tree and map tool, against the real views | `cargo test -p studio --lib ui_tools` (68 tests: 56 in `ui_tools_canvas_tests`), a fake server of 60 people at one company, the first six knowing the next two | `canvas_expand` on p1 and p2 (depth 1): `expanded`, p3 and p4 added with their names and edges. `relationships: ["out:WorksAt"]`: c0 alone; `out:Owns`: `not_available`. 60 nodes at once: `needs_confirmation` (60 nodes), nothing opened; with `confirm`: opened. Cap 12: `cap_reached`, at most 12 drawn. Depth 2 on `out:Knows`: p3, p4 added. A node not drawn: the words of the plan. Every other canvas and tree tool answers as its key does; `studio_canvas`, `studio_tree` and `studio_selection`'s counts read what is drawn; the canvas tab is "Canvas: Person 0" |
+| 2026-11-17 | A filtered table opens beside the type's own | `graph_open_type_opens_the_table` | With Person open, `filter_id` opened a second tab; the same call again: `no_change` |
 | open | The adapters pass the result's words to the thread as the panel reads them (Claude in `content`, Codex in `rawOutput`) | A conversation in Studio with claude-agent-acp 0.107.3 and codex-acp 2.7.0 | Not yet run; the panel reads both places and falls back to "Studio · <tool>" |
 
 ## Corrections
@@ -361,4 +485,9 @@ records the tool's name, the window id and the outcome.
 | 2026-11-17 | A call Studio could not answer is `window_closed` | It is `cancelled`, naming the window the call meant | `window_closed` for window 0 told the agent a window it never named had closed (review of #126) |
 | 2026-11-17 | The log names the tool | It names the tool only when it is one of Studio's, else "unknown" | The name is the agent's text, up to 64 KiB, which may carry a query or ids (review of #126) |
 | 2026-11-17 | Copy "never shows the token" | Copy shows none, and a line under the Claude Code command says Claude Code keeps it in `~/.claude.json` once the command runs, until Studio starts again or the switch is turned off | `$(cat …)` expands when the person runs `claude mcp add`, so the token is written to Claude Code's config in plain text (review of #126) |
+| 2026-11-17 | `graph_open_type` with `filter_id` while that type's table is open is `not_available` | It opens the filtered rows as a tab of its own (`OpenType { separate }`, a key of its own, not a preview), which the person can close; the type's open table is left as it is | Refusing stopped exploration ("the nodes related to X through R") whenever a table of the type was open, which was usually; the rule that matters, never changing the filters of a tab the person has open, holds (2026-11-16 live run) |
+| 2026-11-17 | An answer names a node's tab by its title | It adds `label`, the name the session already holds (the canvas's or tree's root, or the spec-031 search index), and a walk is named by it from the start (`Exploration::for_walk`) | The answer was read before the node was, and named "Canvas: company-00000" where `studio_tabs` later said "Canvas: Sammet Systems" |
+| 2026-11-17 | `studio_selection` names the selection | On a canvas or a tree it also counts the nodes, edges and relationships drawn | A fresh walk reported only its root, as if empty |
+| 2026-11-17 | Tool names follow their action's | `canvas_expand`, `canvas_collapse`, `tree_expand`, `tree_collapse`, `tree_expand_row`, `tree_collapse_row` and `map_*` are named for what an agent asks (`ui_tools::RENAMED`) | `tree_expand` from `tree::Expand` would have taken the expansion's name, and `studio_ontology` is the map |
+| 2026-11-17 | The server binds a port the system chooses | It asks for 24187 and the nine after it while the address is kept | A port that changes each start broke every copied command; the person asked for a non-standard fixed port |
 
