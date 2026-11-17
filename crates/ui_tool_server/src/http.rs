@@ -419,9 +419,9 @@ async fn call(shared: &Shared, token: &str, tool: String, input: Value) -> Answe
             return Answer::busy(MAX_IN_FLIGHT);
         }
         state.in_flight += 1;
-        // Owed until a window has shown the notice, so a call that named no open window (the
-        // first, `studio_windows`, among them) leaves it for the next. The main thread, which
-        // runs calls one at a time, checks again and marks it ([`announce_once`]).
+        // Owed until a window has shown the notice, which the first call of any kind does (with
+        // no window open, the next). The main thread, which runs calls one at a time, checks
+        // again and marks it ([`announce_once`]).
         let announce = state.outside && !state.announced;
         (
             state.target,

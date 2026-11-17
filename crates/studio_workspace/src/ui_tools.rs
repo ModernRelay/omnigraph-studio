@@ -381,66 +381,109 @@ pub async fn call(
     name: &str,
     input: Value,
 ) -> Answer {
+    let (mut answer, acted_in) = answer_call(cx, target, &caller, name, input).await;
+    // An outside agent's first call says so as soon as it comes, whatever it is (a list of the
+    // windows, a read, a refusal or an action): in the window it named when it named an open
+    // one, else in the window in front.
+    if caller.announce {
+        let window = match acted_in {
+            Some(window) => Some(window),
+            None => cx.update(front_workspace),
+        };
+        if let Some(window) = window {
+            let shown = window.update(cx, |workspace, _, cx| {
+                workspace.show_toast_with_action(
+                    ToastKind::Info,
+                    OUTSIDE_NOTICE,
+                    "Turn off",
+                    Box::new(studio_actions::workspace::OpenAgentSettings),
+                    cx,
+                );
+            });
+            answer.announced = shown.is_ok();
+        }
+    }
+    answer
+}
+
+/// The workspace window in front, else the first one.
+fn front_workspace(cx: &mut App) -> Option<WindowHandle<Workspace>> {
+    cx.active_window()
+        .and_then(|window| window.downcast::<Workspace>())
+        .or_else(|| {
+            cx.windows()
+                .into_iter()
+                .find_map(|window| window.downcast::<Workspace>())
+        })
+}
+
+/// A call's answer, and the open window it named, if any.
+async fn answer_call(
+    cx: &mut AsyncApp,
+    target: Target,
+    caller: &Caller,
+    name: &str,
+    input: Value,
+) -> (Answer, Option<WindowHandle<Workspace>>) {
     let input = match input {
         Value::Null => json!({}),
         Value::Object(object) => Value::Object(object),
         _ => {
-            return Answer::error(
-                "invalid_input",
-                "A tool's arguments are a JSON object.",
+            return (
+                Answer::error(
+                    "invalid_input",
+                    "A tool's arguments are a JSON object.",
+                    None,
+                ),
                 None,
             );
         }
     };
     if name == "studio_windows" {
-        return cx.update(|cx| windows(target, cx));
+        return (cx.update(|cx| windows(target, cx)), None);
     }
     let tool = tool(name);
     if tool.is_none() && !READS.contains(&name) {
-        return Answer::error(
-            "unknown_tool",
-            format!("Studio has no tool `{name}`. tools/list lists them."),
+        return (
+            Answer::error(
+                "unknown_tool",
+                format!("Studio has no tool `{name}`. tools/list lists them."),
+                None,
+            ),
             None,
         );
     }
     let asked = input.get("window").and_then(Value::as_u64);
     let id = match (target, asked) {
         (Target::Bound(own), Some(asked)) if asked != own => {
-            return Answer::error(
-                "not_available",
-                format!("This conversation shows things only in its own window, {own}."),
-                Some(asked),
+            return (
+                Answer::error(
+                    "not_available",
+                    format!("This conversation shows things only in its own window, {own}."),
+                    Some(asked),
+                ),
+                None,
             );
         }
         (Target::Bound(own), _) => own,
         (Target::Any, Some(asked)) => asked,
         (Target::Any, None) => {
-            return Answer::error(
-                "invalid_input",
-                "Name the window to act in: `window`, an id from studio_windows.",
+            return (
+                Answer::error(
+                    "invalid_input",
+                    "Name the window to act in: `window`, an id from studio_windows.",
+                    None,
+                ),
                 None,
             );
         }
     };
     let Some(handle) = cx.update(|cx| workspace_window(id, cx)) else {
-        return Answer::window_closed(id);
+        return (Answer::window_closed(id), None);
     };
-    let mut answer = target_window(cx, handle, id, tool, name, &caller, input).await;
-    // An outside agent's first call to a window says so there, whatever the call did: a read,
-    // a refusal or an action. A call that named no open window has shown nothing yet.
-    if caller.announce && answer.outcome != "window_closed" {
-        let shown = handle.update(cx, |workspace, _, cx| {
-            workspace.show_toast_with_action(
-                ToastKind::Info,
-                OUTSIDE_NOTICE,
-                "Turn off",
-                Box::new(studio_actions::workspace::OpenAgentSettings),
-                cx,
-            );
-        });
-        answer.announced = shown.is_ok();
-    }
-    answer
+    let answer = target_window(cx, handle, id, tool, name, caller, input).await;
+    let acted_in = (answer.outcome != "window_closed").then_some(handle);
+    (answer, acted_in)
 }
 
 /// A call to the open window `id`: a read, or the tool dispatched there and what changed.
@@ -1345,44 +1388,27 @@ mod tests {
         .await;
         assert_eq!(nothing.outcome, "no_change");
 
-        // An outside agent's first call to a window says so there; `studio_windows`, which
-        // names none, leaves it for the next call.
-        let outside = Caller {
-            agent: None,
-            announce: true,
-        };
-        let listed = call(
-            &mut cx.to_async(),
-            Target::Any,
-            outside.clone(),
-            "studio_windows",
-            json!({}),
-        )
-        .await;
-        cx.run_until_parked();
-        assert!(!listed.announced);
-        handle
-            .read_with(cx, |workspace, _| {
-                assert!(workspace.toast_messages().is_empty())
-            })
-            .unwrap();
-        let announced = call(
-            &mut cx.to_async(),
-            Target::Any,
-            Caller {
+        // An outside agent's first call says so at once, though it is `studio_windows`, which
+        // names no window: in the window in front. The server owes the notice until an answer
+        // says it was shown, so the dispatch after it shows nothing more.
+        let mut owed = true;
+        for (name, input) in [
+            ("studio_windows", json!({})),
+            ("graph_open_map", json!({ "window": id })),
+            ("studio_tabs", json!({ "window": id })),
+        ] {
+            let caller = Caller {
                 agent: None,
-                announce: true,
-            },
-            "graph_open_map",
-            json!({ "window": id }),
-        )
-        .await;
-        cx.run_until_parked();
-        assert_eq!(announced.outcome, "no_change");
-        assert!(announced.announced);
+                announce: owed,
+            };
+            let answer = call(&mut cx.to_async(), Target::Any, caller, name, input).await;
+            cx.run_until_parked();
+            assert_eq!(answer.announced, name == "studio_windows", "{name}");
+            owed &= !answer.announced;
+        }
         handle
             .read_with(cx, |workspace, _| {
-                assert_eq!(workspace.toast_messages(), [OUTSIDE_NOTICE]);
+                assert_eq!(workspace.toast_messages(), [OUTSIDE_NOTICE], "once");
             })
             .unwrap();
 
