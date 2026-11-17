@@ -1281,6 +1281,12 @@ impl GraphSession {
         self.client(cx)
     }
 
+    /// A node's name when the session already holds it, from a node-search index (spec 031),
+    /// without reading: an agent's answer names a tab by it (spec 032).
+    pub fn known_label(&self, type_name: &str, id: &str) -> Option<String> {
+        self.node_indexes.known_label(type_name, id)
+    }
+
     pub fn schema_model(&self) -> Option<Arc<SchemaModel>> {
         self.schema.loaded().cloned()
     }

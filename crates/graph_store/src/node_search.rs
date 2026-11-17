@@ -199,6 +199,17 @@ pub(crate) struct NodeIndex {
 }
 
 impl NodeIndex {
+    /// The name the index holds for `id`, when it holds the property that names the type.
+    fn label_of(&self, id: &str) -> Option<String> {
+        let at = self.label?;
+        self.entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .and_then(|entry| entry.texts.get(at)?.as_ref())
+            .map(|(text, _)| text.clone())
+            .filter(|text| !text.is_empty())
+    }
+
     /// The index of `node`'s rows as `builder::node_index` and `builder::node_search` return
     /// them (`id`, `p0`, `p1`, …), each text cut to [`INDEX_TEXT_CHARS`].
     fn from_rows(node: &NodeType, rows: &Value) -> Self {
@@ -474,6 +485,19 @@ impl Default for NodeIndexes {
 }
 
 impl NodeIndexes {
+    /// `id`'s name as a held index of `type_name` says it, at any commit: what an agent's
+    /// answer names a page or canvas by before the node itself is read (spec 032). Reads
+    /// nothing.
+    pub(crate) fn known_label(&self, type_name: &str, id: &str) -> Option<String> {
+        self.held
+            .iter()
+            .filter(|((held_type, _), _)| held_type == type_name)
+            .find_map(|(_, (loaded, _))| match loaded {
+                Loaded::Index(index) => index.label_of(id),
+                _ => None,
+            })
+    }
+
     /// Forgets every index, and every read still out: their answers land nowhere.
     pub(crate) fn reset(&mut self) {
         self.held.clear();
