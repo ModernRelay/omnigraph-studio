@@ -657,6 +657,7 @@ impl CommitView {
                                         via: None,
                                         preview: false,
                                         filters: None,
+                                        separate: false,
                                     }),
                                 );
                             }

@@ -1611,6 +1611,7 @@ fn add_type_rows(
         via: None,
         preview: false,
         filters: None,
+        separate: false,
     };
     // Whether a type opens where the person is does not depend on which type it is.
     if !window.is_action_available(&open(String::new()), cx) {

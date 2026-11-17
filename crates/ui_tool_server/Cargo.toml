@@ -12,6 +12,7 @@ path = "src/ui_tool_server.rs"
 futures = { workspace = true }
 getrandom = { workspace = true }
 gpui = { workspace = true }
+graph_store = { workspace = true }
 httparse = { workspace = true }
 log = { workspace = true }
 serde_json = { workspace = true }
@@ -23,6 +24,7 @@ studio_workspace = { workspace = true }
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
 studio_settings = { workspace = true, features = ["test-support"] }
+graph_store = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true

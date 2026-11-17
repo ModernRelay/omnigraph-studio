@@ -15,6 +15,8 @@ mod open_graph;
 mod organizations;
 mod settings_view;
 #[cfg(test)]
+mod ui_tools_canvas_tests;
+#[cfg(test)]
 mod ui_tools_tests;
 mod update_status;
 
@@ -196,6 +198,18 @@ pub fn init(cx: &mut App) {
             open_settings(workspace, window, cx);
         });
         workspace.register_action(
+            |_, _: &studio_actions::workspace::ToggleOutsideAgents, _, cx| {
+                studio_settings::update(cx, |settings| {
+                    settings.agent.outside_agents = !settings.agent.outside_agents
+                });
+            },
+        );
+        workspace.register_action(
+            |_, _: &studio_actions::workspace::ReplaceAgentToken, window, cx| {
+                replace_agent_token(window, cx);
+            },
+        );
+        workspace.register_action(
             |workspace, _: &studio_actions::workspace::OpenAgentSettings, window, cx| {
                 if let Some(view) = open_settings(workspace, window, cx) {
                     view.update(cx, |view, cx| view.show_section("Agent", window, cx));
@@ -251,6 +265,20 @@ fn open_design_system(workspace: &mut Workspace, window: &mut Window, cx: &mut C
         window,
         cx,
         design_gallery::DesignGallery::new,
+    );
+}
+
+/// Asks, then replaces the token agents outside Studio use (spec 032). Confirmed with ↵:
+/// nothing is lost, and each agent takes the new token when its command is copied again.
+pub(crate) fn replace_agent_token(window: &mut Window, cx: &mut App) {
+    studio_workspace::confirm(
+        window,
+        cx,
+        "Replace the agents' token?",
+        "Every agent outside Studio that holds the current token is refused from now on. Copy \
+         its command again to give it the new one.",
+        "New token",
+        |_, cx| ui_tool_server::UiToolServer::replace_token(cx),
     );
 }
 

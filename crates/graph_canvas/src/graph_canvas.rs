@@ -10,6 +10,7 @@
 //!
 //! Layer 5 (`docs/architecture.md`). Plan: `specs/006-graph-canvas/plan.md`.
 
+mod agent;
 mod domains;
 mod layout;
 mod model;
@@ -455,6 +456,9 @@ pub(crate) struct GraphCanvas {
     chips: Rc<RefCell<Vec<Bounds<Pixels>>>>,
     /// A single-target relationship being followed hop after hop ([`FollowRelationship`]).
     follow: Option<Follow>,
+    /// Nodes hidden from the canvas, with what hangs off them (spec 032, `HideNodes`), until
+    /// Show hidden.
+    hidden: HashSet<NodeRef>,
     /// How many times the canvas was drawn, for the drawing-cost guards (docs/drawing.md).
     #[cfg(test)]
     renders: Cell<usize>,
@@ -509,6 +513,31 @@ impl Focusable for GraphCanvas {
 }
 
 impl Item for GraphCanvas {
+    /// A query's result picture is a canvas too, with no view strip to say so.
+    fn view_kind(&self, _cx: &App) -> Option<ViewKind> {
+        match self.mode() {
+            Mode::Schema => None,
+            Mode::Explore | Mode::Results => Some(ViewKind::Canvas),
+        }
+    }
+
+    fn agent_view(&self, cx: &App) -> Option<studio_workspace::AgentView> {
+        self.agent_view_of(cx)
+    }
+
+    fn agent_busy(&self, cx: &App) -> bool {
+        self.agent_busy_now(cx)
+    }
+
+    fn agent_check(
+        &self,
+        tool: &str,
+        input: &serde_json::Value,
+        cx: &App,
+    ) -> Result<(), studio_workspace::AgentRefusal> {
+        self.agent_check_call(tool, input, cx)
+    }
+
     /// The selected chip's node, read as the canvas reads: held at its commit, or at the commit
     /// it shows, which may be behind the head ("Newer data").
     fn inspected(&mut self, cx: &mut Context<Self>) -> Option<Inspected> {
@@ -826,6 +855,7 @@ impl GraphCanvas {
             read_ahead: None,
             _open: None,
             _loaded: None,
+            hidden: HashSet::new(),
             scene_index: HashMap::new(),
             drawn: None,
             char_widths: CharWidths::default(),
@@ -941,11 +971,16 @@ impl GraphCanvas {
         self.session.read(cx).schema_model()?;
         let exploration = self.exploration.read(cx);
         let entries = exploration.entries();
-        Some(model::explore_scene(
-            &entries,
-            exploration.state(),
-            &self.hub_limits,
-            self.node_cap(cx),
+        // The more of what an expansion asked to be drawn of a relationship and what "+K more"
+        // drew: neither takes back what the other drew.
+        let mut limits = self.hub_limits.clone();
+        for (key, limit) in exploration.expansion_limits() {
+            let drawn = limits.entry(key.clone()).or_insert(*limit);
+            *drawn = (*drawn).max(*limit);
+        }
+        Some(model::without(
+            model::explore_scene(&entries, exploration.state(), &limits, self.node_cap(cx)),
+            &self.hidden,
         ))
     }
 
@@ -1806,7 +1841,14 @@ impl GraphCanvas {
             self.rebuild(cx);
             return;
         }
-        let limit = self.hub_limits.entry(key.clone()).or_insert(HUB_STEP);
+        // From what is drawn: an expansion's limit, or the step.
+        let drawn = self
+            .exploration
+            .read(cx)
+            .expansion_limit(&key)
+            .unwrap_or(HUB_STEP)
+            .max(HUB_STEP);
+        let limit = self.hub_limits.entry(key.clone()).or_insert(drawn);
         *limit += HUB_STEP;
         let wanted = *limit;
         let exploration = self.exploration.read(cx);
@@ -2309,6 +2351,7 @@ impl GraphCanvas {
                     via: None,
                     preview: true,
                     filters: None,
+                    separate: false,
                 }),
             )
             .entry(
@@ -2414,6 +2457,7 @@ impl GraphCanvas {
                                 via: None,
                                 preview: false,
                                 filters: None,
+                                separate: false,
                             }),
                         )
                         .when_some(names.clone(), |menu, names| {
@@ -2512,6 +2556,7 @@ impl GraphCanvas {
                             via: Some(gq_language::builder::relationship_key(&back)),
                             preview: false,
                             filters: None,
+                            separate: false,
                         }),
                     );
                 }
@@ -3404,6 +3449,7 @@ impl GraphCanvas {
                                                 via: None,
                                                 preview: false,
                                                 filters: None,
+                                                separate: false,
                                             }),
                                             cx,
                                         )
@@ -3660,6 +3706,15 @@ impl Render for GraphCanvas {
             .on_action(cx.listener(Self::follow_relationship))
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::clear_selection))
+            .on_action(cx.listener(Self::select_node))
+            .on_action(cx.listener(Self::expand_neighbourhood))
+            .on_action(cx.listener(Self::collapse_nodes))
+            .on_action(cx.listener(Self::show_more_of))
+            .on_action(cx.listener(Self::hide_nodes))
+            .on_action(cx.listener(Self::show_hidden))
+            .on_action(cx.listener(Self::pin_nodes))
+            .on_action(cx.listener(Self::unpin_nodes))
+            .on_action(cx.listener(Self::reroot_here))
             .on_action(
                 cx.listener(|this, _: &MoveLeft, _, cx| {
                     this.move_selection(Vec2::new(-1., 0.), cx)

@@ -1263,10 +1263,36 @@ fn outside_agents(field: &SettingField, values: &SettingsValues, cx: &App) -> Op
                     },
                 ))
         };
+    // The address in use, what did not go as asked (a port taken, no keychain), and New token.
+    let address = h_flex()
+        .w_full()
+        .gap(px(space::SM))
+        .child(
+            div()
+                .w(px(ds::size::FIELD_LABEL))
+                .flex_none()
+                .child(ds::text::meta("Address")),
+        )
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .child(ds::text::code(url.clone(), cx).color(Color::Muted))
+                .children(ui_tool_server::UiToolServer::note(cx).map(ds::text::meta)),
+        )
+        .child(
+            ds::row_button("new-agent-token", "New token")
+                .tip(ds::tooltip(
+                    "Replace the token: agents holding the current one are refused until their \
+                     command is copied again",
+                ))
+                .on_click(|_, window, cx| crate::replace_agent_token(window, cx)),
+        );
     Some(
         v_flex()
             .pb(px(space::MD))
             .gap(px(space::XS))
+            .child(address)
             .child(entry(
                 "copy-claude-command",
                 "Claude Code",
@@ -1277,7 +1303,9 @@ fn outside_agents(field: &SettingField, values: &SettingsValues, cx: &App) -> Op
             .child(
                 div()
                     .pl(px(ds::size::FIELD_LABEL + space::SM))
-                    .child(ds::text::meta(ui_tool_server::CLAUDE_TOKEN_NOTE)),
+                    .child(ds::text::meta(ui_tool_server::claude_token_note(
+                        ui_tool_server::keeping(cx),
+                    ))),
             )
             .child(entry(
                 "copy-codex-config",

@@ -799,8 +799,9 @@ impl Drop for Host {
 /// which it can start without.
 struct Prepared {
     gateway: std::io::Result<(Gateway, CliHome)>,
-    /// The name the agent is given Studio's UI tool server under, which `AGENTS.md` names.
-    server: String,
+    /// The name the agent is given Studio's UI tool server under, which `AGENTS.md` names;
+    /// `None` when the setting gives the panel's agent no UI tools.
+    server: Option<String>,
     /// Why `AGENTS.md` and the skill could not be written.
     rules: Option<std::io::Error>,
 }
@@ -808,20 +809,26 @@ struct Prepared {
 impl Prepared {
     /// Makes them for a conversation in `cwd` on `graph`, writing to `branch` off `base`; a
     /// start fails, with its message, when the directory cannot be made.
-    fn make(cwd: &Path, graph: &str, branch: &str, base: &str) -> Result<Self, String> {
+    fn make(
+        cwd: &Path,
+        graph: &str,
+        branch: &str,
+        base: &str,
+        ui_tools: bool,
+    ) -> Result<Self, String> {
         // The conversation's own name for Studio's server, so one of the person's config cannot
         // take it (spec 032).
         let mut random = [0u8; 6];
         getrandom::fill(&mut random)
             .map_err(|error| format!("Studio could not choose a name for its tools: {error}"))?;
-        let server = studio_workspace::ui_tools::server_name(random);
+        let server = ui_tools.then(|| studio_workspace::ui_tools::server_name(random));
         std::fs::create_dir_all(cwd)
             .map_err(|error| format!("Studio could not create {}: {error}", cwd.display()))?;
         let gateway = Gateway::bind().and_then(|gateway| {
             let home = CliHome::write(cwd, gateway.access(), graph)?;
             Ok((gateway, home))
         });
-        let rules = cli_home::write_agents_md(cwd, graph, branch, base, &server)
+        let rules = cli_home::write_agents_md(cwd, graph, branch, base, server.as_deref())
             .and_then(|()| crate::skill::write(cwd))
             .err();
         Ok(Self {
@@ -1267,7 +1274,9 @@ impl AgentPanel {
         let prepare = {
             let (cwd, graph) = (cwd.clone(), graph.clone());
             let (name, base) = (branch.name.clone(), branch.base.clone());
-            cx.background_spawn(async move { Prepared::make(&cwd, &graph, &name, &base) })
+            // The setting off, the agent is given no UI tool server (spec 032).
+            let ui_tools = settings.panel_ui_tools;
+            cx.background_spawn(async move { Prepared::make(&cwd, &graph, &name, &base, ui_tools) })
         };
         self.enter_starting(cx);
         self.preparing = Some(cx.spawn(async move |this, cx| {
@@ -1343,15 +1352,20 @@ impl AgentPanel {
         self.cwd = Some(cwd.clone());
         // Studio's UI tools (spec 032), with a token of this conversation's, bound to its
         // window: the agent shows things only here.
-        let ui_tools = studio_workspace::ui_tools::UiToolEndpoint::entry_for(self.window_id, cx);
+        let ui_tools = server.as_ref().and_then(|_| {
+            studio_workspace::ui_tools::UiToolEndpoint::entry_for(self.window_id, cx)
+        });
         let launch = SessionLaunch {
             cwd,
             resume: self.session_id.clone(),
-            ui_tools: ui_tools.as_ref().map(|entry| crate::host::UiToolAccess {
-                name: server.clone(),
-                url: entry.url.clone(),
-                token: entry.token.clone(),
-            }),
+            ui_tools: ui_tools
+                .as_ref()
+                .zip(server.as_ref())
+                .map(|(entry, server)| crate::host::UiToolAccess {
+                    name: server.clone(),
+                    url: entry.url.clone(),
+                    token: entry.token.clone(),
+                }),
         };
         let (events_tx, mut events_rx) = mpsc::unbounded();
         let (commands_tx, commands_rx) = mpsc::unbounded();
@@ -4838,6 +4852,24 @@ mod tests {
         panel.read_with(cx, |panel, _| {
             assert_eq!(titles(panel), ["Opened Project · Table", "Opened Map"]);
         });
+    }
+
+    /// "Let the agent in Studio show things in the window" off: the conversation names no UI
+    /// tool server, so none is passed, and `AGENTS.md` says nothing of one. On: it names one of
+    /// its own, which `AGENTS.md` gives.
+    #[test]
+    fn with_the_setting_off_the_agent_gets_no_ui_tools() {
+        let off = tempfile::tempdir().unwrap();
+        let prepared = Prepared::make(off.path(), "g", "agent/x", "main", false).unwrap();
+        assert_eq!(prepared.server, None);
+        let text = std::fs::read_to_string(off.path().join("AGENTS.md")).unwrap();
+        assert!(!text.contains("Studio's window"));
+        let on = tempfile::tempdir().unwrap();
+        let prepared = Prepared::make(on.path(), "g", "agent/x", "main", true).unwrap();
+        let server = prepared.server.unwrap();
+        assert!(server.starts_with("studio_") && server.len() == "studio_".len() + 6);
+        let text = std::fs::read_to_string(on.path().join("AGENTS.md")).unwrap();
+        assert!(text.contains(&format!("MCP server `{server}`")));
     }
 
     #[gpui::test]

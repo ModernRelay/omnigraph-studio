@@ -436,7 +436,7 @@ pub fn overrides_key(target: &str, graph: &str) -> String {
 
 /// The agent the agent panel runs (spec 011): a program and its arguments, and extra
 /// environment variables. Empty until the person chooses one.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct AgentSettings {
     /// The program the agent panel runs over the Agent Client Protocol.
@@ -452,10 +452,52 @@ pub struct AgentSettings {
     pub ask_before_writes: bool,
     // Spec 032.
     /// Claude Code, Codex and other agents on this computer may open tables, pages, canvases
-    /// and queries in Studio's windows, and read which tabs are open, through Studio's tool
-    /// server. They never write. The address and token change each time Studio starts.
+    /// and queries in Studio's windows, walk a canvas or a tree, and read which tabs are open,
+    /// through Studio's tool server. They never write.
     #[schemars(title = "Let agents outside Studio show things in Studio")]
     pub outside_agents: bool,
+    /// Studio asks for the same port at each start and keeps the token in the system keychain,
+    /// so a copied command keeps working across restarts. Off: a new address and token each
+    /// start.
+    #[schemars(title = "Keep the same address between starts")]
+    pub keep_address: bool,
+    /// The port Studio asks for first while it keeps its address; the nine after it are tried
+    /// when it is taken. Edited in `settings.json`.
+    #[schemars(extend("x-hidden" = true))]
+    pub ui_tools_port: u16,
+    /// The agent in Studio's panel may open and walk things in its conversation's window, as an
+    /// agent outside Studio may. Off: it has the omnigraph CLI only.
+    #[schemars(title = "Let the agent in Studio show things in the window")]
+    pub panel_ui_tools: bool,
+    /// A window an agent opens or shows something in comes to the front. Off: it changes where
+    /// it is, and says "Opened by" in its status bar.
+    #[schemars(title = "Bring the window to the front when an agent shows something")]
+    pub raise_window: bool,
+}
+
+/// The port the UI tool server asks for first while it keeps its address (spec 032, "The
+/// port"). 24187 is in the registered range 10000-49151, below Linux's ephemeral range
+/// (32768-60999), macOS's and Windows' (49152-65535) and Kubernetes' NodePorts (30000-32767),
+/// so the system never hands it out; IANA lists 24007-24241 as unassigned (registry of
+/// 2026-11-10); and no common development tool or database defaults to it or to the nine after
+/// it (3000-3999, 4000, 5000-5999, 8000-8999, 9000-9999, 5432, 6379, 11211, 27017, the MCP
+/// inspector's 6274 and 6277), nor does Studio itself (the dev server's 8787, the sign-in bed's
+/// 8791, OAuth's loopback callbacks and the agent gateway, which take system-chosen ports).
+pub const DEFAULT_UI_TOOLS_PORT: u16 = 24187;
+
+impl Default for AgentSettings {
+    fn default() -> Self {
+        Self {
+            command: Vec::new(),
+            env: BTreeMap::new(),
+            ask_before_writes: false,
+            outside_agents: true,
+            keep_address: true,
+            ui_tools_port: DEFAULT_UI_TOOLS_PORT,
+            panel_ui_tools: true,
+            raise_window: false,
+        }
+    }
 }
 
 /// Model calls through OpenRouter (spec 019): the model each kind of task runs on, whether a
@@ -1696,6 +1738,23 @@ mod tests {
         let documented: serde_json::Value = serde_json::from_str(text).unwrap();
         let actual = serde_json::to_value(StudioSettings::default()).unwrap();
         assert_eq!(documented, actual, "default.json names every setting");
+    }
+
+    /// Spec 032's settings: agents outside Studio, a kept address on the default port and the
+    /// panel's agent's tools are on; bringing the window to the front is off.
+    #[test]
+    fn the_agents_window_settings_default_as_the_person_asked() {
+        let agent = StudioSettings::default().agent;
+        assert!(agent.outside_agents && agent.keep_address && agent.panel_ui_tools);
+        assert!(!agent.raise_window);
+        assert_eq!(agent.ui_tools_port, DEFAULT_UI_TOOLS_PORT);
+        assert!(
+            (10_000..32_768).contains(&DEFAULT_UI_TOOLS_PORT),
+            "registered, not ephemeral"
+        );
+        // An older file without them takes them as defaults.
+        let read = StudioSettings::read("{ \"agent\": { \"outside_agents\": false } }").unwrap();
+        assert!(!read.settings.agent.outside_agents && read.settings.agent.keep_address);
     }
 
     #[test]

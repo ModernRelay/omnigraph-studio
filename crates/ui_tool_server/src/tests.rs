@@ -10,6 +10,7 @@ use studio_workspace::ui_tools::{Answer, Target};
 
 use super::*;
 use crate::http::{Call, MAX_BODY, MAX_IN_FLIGHT};
+use graph_store::sign_in::MemoryKeychain;
 use studio_settings::StudioSettings;
 
 const TOKEN: &str = "token-of-the-test";
@@ -301,8 +302,9 @@ fn the_token_and_the_copied_commands() {
     assert!(claude.ends_with("token')\""));
     // Once run, the command's `$(cat …)` has put the token in Claude Code's own config: the
     // settings say where, and until when it works.
-    assert!(CLAUDE_TOKEN_NOTE.contains("~/.claude.json"));
-    assert!(CLAUDE_TOKEN_NOTE.contains("stops working when Studio starts again"));
+    assert!(claude_token_note(false).contains("~/.claude.json"));
+    assert!(claude_token_note(false).contains("stops working when Studio starts again"));
+    assert!(claude_token_note(true).contains("keeps working across restarts"));
     let codex = codex_config(url);
     assert!(codex.contains("[mcp_servers.omnigraph-studio]\nurl = \"http://127.0.0.1:4100/mcp\""));
     assert!(codex.contains("bearer_token_env_var = \"OMNIGRAPH_STUDIO_TOKEN\""));
@@ -368,7 +370,12 @@ fn the_outside_token_starts_afresh_when_the_switch_comes_back(cx: &mut gpui::Tes
     };
     cx.update(studio_settings::init_test);
     set(true, cx);
-    cx.update(init);
+    cx.update(|cx| {
+        let mut settings = StudioSettings::get(cx).clone();
+        settings.agent.keep_address = false;
+        cx.set_global(settings);
+        init_with(Arc::new(MemoryKeychain::default()), cx);
+    });
     let (token, shared) = cx.update(|cx| {
         let server = cx.global::<UiToolServer>();
         (server.outside_token.clone().unwrap(), server.shared.clone())
@@ -393,4 +400,159 @@ fn the_outside_token_starts_afresh_when_the_switch_comes_back(cx: &mut gpui::Tes
             Some(token.clone())
         );
     });
+}
+
+/// While the address is kept, the server asks for the port used last, then the one set and
+/// the nine after it, passing over any another process holds, and only then takes one the
+/// system chooses. Off, the system chooses.
+#[test]
+fn a_taken_port_is_passed_over_never_taken() {
+    // Ten ports in a row the test holds itself, so no other process's port is relied on: each
+    // step lets go of the one it expects the server to take.
+    let (base, mut held) = (0..100)
+        .find_map(|_| {
+            let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).ok()?;
+            let base = probe.local_addr().ok()?.port();
+            drop(probe);
+            if base > u16::MAX - PORT_TRIES {
+                return None;
+            }
+            let held: Option<Vec<_>> = (0..PORT_TRIES)
+                .map(|step| std::net::TcpListener::bind(("127.0.0.1", base + step)).ok())
+                .collect();
+            Some((base, held?))
+        })
+        .expect("ten free ports in a row");
+    let mut free = |port: u16| {
+        held[usize::from(port - base)] = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap()
+    };
+    // Free: it is taken.
+    free(base);
+    let first = bind(true, None, base).unwrap();
+    assert_eq!(first.local_addr().unwrap().port(), base);
+    // Held (by the first): the next free one.
+    free(base + 1);
+    let second = bind(true, None, base).unwrap();
+    assert_eq!(second.local_addr().unwrap().port(), base + 1);
+    // The port used last comes before the one set.
+    free(base + 5);
+    let last = bind(true, Some(base + 5), base).unwrap();
+    assert_eq!(last.local_addr().unwrap().port(), base + 5);
+    // All ten held: the system chooses, outside them; never one of another's.
+    let chosen = bind(true, None, base).unwrap().local_addr().unwrap().port();
+    assert!(!(base..base + PORT_TRIES).contains(&chosen), "{chosen}");
+    // Not kept: the system chooses.
+    let any = bind(false, None, base)
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    assert!(!(base..base + PORT_TRIES).contains(&any), "{any}");
+    drop((first, second, last));
+}
+
+/// Kept, the token is read from the keychain, or made and kept there; New token replaces it
+/// there and refuses the old one; turned off, the kept token goes and the run takes its own.
+#[gpui::test]
+async fn the_kept_token_lives_in_the_keychain(cx: &mut gpui::TestAppContext) {
+    cx.update(studio_settings::init_test);
+    let keychain = Arc::new(MemoryKeychain::default());
+    keychain.items.lock().unwrap().insert(
+        "omnigraph-studio://ui-tools".into(),
+        ("studio".into(), b"kept-token".to_vec()),
+    );
+    let set = |change: fn(&mut studio_settings::AgentSettings), cx: &mut gpui::TestAppContext| {
+        cx.update(|cx| {
+            let mut settings = StudioSettings::get(cx).clone();
+            change(&mut settings.agent);
+            cx.set_global(settings);
+        });
+    };
+    set(
+        |agent| {
+            agent.outside_agents = true;
+            agent.keep_address = true;
+            agent.ui_tools_port = 0;
+        },
+        cx,
+    );
+    let chain: Arc<dyn graph_store::sign_in::Keychain> = keychain.clone();
+    cx.update(|cx| init_with(chain, cx));
+    cx.run_until_parked();
+    let (token, shared) = cx.update(|cx| UiToolServer::outside(cx));
+    assert_eq!(
+        token.as_deref(),
+        Some("kept-token"),
+        "read from the keychain"
+    );
+    assert!(shared.tokens.lock().unwrap().contains_key("kept-token"));
+
+    cx.update(UiToolServer::replace_token);
+    cx.run_until_parked();
+    let (new, shared) = cx.update(|cx| UiToolServer::outside(cx));
+    let new = new.unwrap();
+    assert_ne!(new, "kept-token");
+    assert!(
+        !shared.tokens.lock().unwrap().contains_key("kept-token"),
+        "refused"
+    );
+    assert!(shared.tokens.lock().unwrap().contains_key(&new));
+    let kept = keychain.items.lock().unwrap()["omnigraph-studio://ui-tools"]
+        .1
+        .clone();
+    assert_eq!(kept, new.as_bytes(), "kept in its place");
+
+    set(|agent| agent.keep_address = false, cx);
+    cx.run_until_parked();
+    let (run, shared) = cx.update(|cx| UiToolServer::outside(cx));
+    let run = run.unwrap();
+    assert_ne!(run, new, "a token for the run");
+    assert!(!shared.tokens.lock().unwrap().contains_key(&new));
+    assert!(
+        !keychain
+            .items
+            .lock()
+            .unwrap()
+            .contains_key("omnigraph-studio://ui-tools"),
+        "no longer kept"
+    );
+}
+
+/// Turned on while the address is kept, the outside agents' first token is kept too, so the
+/// command copied now works after a restart; and the port in use is the one asked for next.
+#[gpui::test]
+async fn a_token_made_while_keeping_is_kept(cx: &mut gpui::TestAppContext) {
+    cx.update(studio_settings::init_test);
+    let keychain = Arc::new(MemoryKeychain::default());
+    let set = |change: fn(&mut studio_settings::AgentSettings), cx: &mut gpui::TestAppContext| {
+        cx.update(|cx| {
+            let mut settings = StudioSettings::get(cx).clone();
+            change(&mut settings.agent);
+            cx.set_global(settings);
+        });
+    };
+    set(
+        |agent| {
+            agent.outside_agents = false;
+            agent.keep_address = false;
+            agent.ui_tools_port = 0;
+        },
+        cx,
+    );
+    let chain: Arc<dyn graph_store::sign_in::Keychain> = keychain.clone();
+    cx.update(|cx| init_with(chain, cx));
+    cx.run_until_parked();
+    set(|agent| agent.keep_address = true, cx);
+    cx.run_until_parked();
+    set(|agent| agent.outside_agents = true, cx);
+    cx.run_until_parked();
+    let (token, _) = cx.update(|cx| UiToolServer::outside(cx));
+    let kept = keychain.items.lock().unwrap()["omnigraph-studio://ui-tools"]
+        .1
+        .clone();
+    assert_eq!(
+        Some(kept),
+        token.map(String::into_bytes),
+        "kept as it was made"
+    );
 }

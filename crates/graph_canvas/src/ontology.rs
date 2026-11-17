@@ -708,6 +708,7 @@ impl OntologyPage {
                                     via: None,
                                     preview: false,
                                     filters: None,
+                                    separate: false,
                                 }),
                                 cx,
                             )
@@ -1007,6 +1008,28 @@ impl Focusable for OntologyPage {
 }
 
 impl Item for OntologyPage {
+    /// What an agent reads of the map (spec 032): the type in focus (none: the domains), how
+    /// far Back goes, and what is pointed at. Types, not nodes, so no node is listed.
+    fn agent_view(&self, _cx: &App) -> Option<studio_workspace::AgentView> {
+        let mut facts = serde_json::Map::new();
+        facts.insert("focus".into(), serde_json::json!(self.focus));
+        facts.insert("back".into(), serde_json::json!(self.back.len()));
+        facts.insert(
+            "pointed".into(),
+            match self.pointed {
+                Some(Pointed::Type(at)) => serde_json::json!({ "type": at }),
+                Some(Pointed::Line(side, at)) => {
+                    serde_json::json!({ "relationship": at, "side": format!("{side:?}") })
+                }
+                None => serde_json::Value::Null,
+            },
+        );
+        Some(studio_workspace::AgentView {
+            facts,
+            ..Default::default()
+        })
+    }
+
     fn tab_title(&self, _cx: &App) -> SharedString {
         match &self.focus {
             Some(focus) => format!("Map · {focus}").into(),
