@@ -971,10 +971,12 @@ impl GraphCanvas {
         self.session.read(cx).schema_model()?;
         let exploration = self.exploration.read(cx);
         let entries = exploration.entries();
-        // What an expansion asked to be drawn of a relationship, unless "+K more" drew more.
+        // The more of what an expansion asked to be drawn of a relationship and what "+K more"
+        // drew: neither takes back what the other drew.
         let mut limits = self.hub_limits.clone();
         for (key, limit) in exploration.expansion_limits() {
-            limits.entry(key.clone()).or_insert(*limit);
+            let drawn = limits.entry(key.clone()).or_insert(*limit);
+            *drawn = (*drawn).max(*limit);
         }
         Some(model::without(
             model::explore_scene(&entries, exploration.state(), &limits, self.node_cap(cx)),
@@ -1839,7 +1841,14 @@ impl GraphCanvas {
             self.rebuild(cx);
             return;
         }
-        let limit = self.hub_limits.entry(key.clone()).or_insert(HUB_STEP);
+        // From what is drawn: an expansion's limit, or the step.
+        let drawn = self
+            .exploration
+            .read(cx)
+            .expansion_limit(&key)
+            .unwrap_or(HUB_STEP)
+            .max(HUB_STEP);
+        let limit = self.hub_limits.entry(key.clone()).or_insert(drawn);
         *limit += HUB_STEP;
         let wanted = *limit;
         let exploration = self.exploration.read(cx);
