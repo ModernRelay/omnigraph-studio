@@ -103,6 +103,11 @@ pub struct CommitView {
     /// The entity selected, by its group: J and K move it, Space unfolds it, ⌘↵ opens its page,
     /// and the inspector shows its node (spec 033, as a review's selection does).
     selected: Option<usize>,
+    /// The selected entity by type and id, which [`Self::selected`] is found again from when
+    /// the groups are made again: a later page or a schema groups and orders them anew.
+    selected_key: Option<(String, String)>,
+    /// The first change was selected once, as the commit opened.
+    selected_first: bool,
     /// The node the workspace was last told is selected ([`ItemEvent::Selected`]).
     inspected: Option<InspectedNode>,
     /// The large runs were folded once, when the changes were first shown ([`change_cards::FOLD_PAST`]).
@@ -220,6 +225,8 @@ impl CommitView {
             _regroup_task: None,
             _schema_subscription: schema_subscription,
             selected: None,
+            selected_key: None,
+            selected_first: false,
             inspected: None,
             folded_large: false,
             list_view: CommitRows::new(cx),
@@ -408,17 +415,16 @@ impl CommitView {
                         this.read_names(cx);
                         this.next_page_token = token;
                         this.fold_large_once();
+                        // The groups are made anew: the selection is found again by its entity.
+                        this.reselect(cx);
                         // The first change is selected and unfolded as the commit opens, as the
                         // review's is, so its values and its node show from the start.
-                        if this.selected.is_none() {
-                            this.selected = this.visible_groups().first().copied();
-                            if let Some(group) =
-                                this.selected.and_then(|ix| this.groups.groups.get(ix))
-                            {
-                                this.open
-                                    .insert((group.type_name.clone(), group.id.clone()));
+                        if !std::mem::replace(&mut this.selected_first, true) {
+                            let first = this.visible_groups().first().copied();
+                            this.select_group(first, cx);
+                            if let Some((type_name, id)) = this.selected_key.clone() {
+                                this.open.insert((type_name, id));
                             }
-                            this.report_selection(cx);
                         }
                         // Rows read further down keep the place the person scrolled to.
                         this.reset_list();
@@ -498,13 +504,14 @@ impl CommitView {
                 if !Arc::ptr_eq(&this.folded, &folded) {
                     return;
                 }
-                // Grouped again, the groups are others: the selection goes with them.
-                this.selected = None;
                 this.groups = groups;
                 this.rows = rows;
                 this.runs = runs;
                 this.row_runs = row_runs(&this.rows);
                 this.schema = made_with;
+                // Grouped again, the groups are others: the selection is found again by its
+                // entity.
+                this.reselect(cx);
                 this.card_rows = CardRows::default();
                 this.read_names(cx);
                 this.reset_list();
@@ -857,7 +864,7 @@ impl CommitView {
             Some(at) => visible[at.saturating_sub(1)],
             None => first,
         };
-        self.selected = Some(next);
+        self.select_group(Some(next), cx);
         if let Some(row) = self
             .rows
             .iter()
@@ -914,6 +921,28 @@ impl CommitView {
         })
     }
 
+    /// Selects group `ix`, by its index and its entity, and tells the inspector.
+    fn select_group(&mut self, ix: Option<usize>, cx: &mut Context<Self>) {
+        self.selected = ix;
+        self.selected_key = ix
+            .and_then(|ix| self.groups.groups.get(ix))
+            .map(|group| (group.type_name.clone(), group.id.clone()));
+        self.report_selection(cx);
+    }
+
+    /// Finds the selected entity among groups made anew, which a later page or another schema
+    /// orders otherwise; one no longer among them leaves nothing selected. The inspector is
+    /// told either way.
+    fn reselect(&mut self, cx: &mut Context<Self>) {
+        let found = self.selected_key.as_ref().and_then(|(type_name, id)| {
+            self.groups
+                .groups
+                .iter()
+                .position(|group| group.type_name == *type_name && group.id == *id)
+        });
+        self.select_group(found, cx);
+    }
+
     /// Tells the workspace when the selected entity's node is another one, or none.
     fn report_selection(&mut self, cx: &mut Context<Self>) {
         let node = self.selected_node();
@@ -928,8 +957,7 @@ impl CommitView {
         let Some((type_name, id, commit)) = self.page_of(ix) else {
             return;
         };
-        self.selected = Some(ix);
-        self.report_selection(cx);
+        self.select_group(Some(ix), cx);
         window.dispatch_action(
             Box::new(OpenNodePage {
                 type_name,
@@ -1037,11 +1065,10 @@ impl CommitView {
                     body,
                     // A click selects the entity and unfolds it, or folds it again (spec 020).
                     cx.listener(move |this, _, _, cx| {
-                        this.selected = Some(ix);
+                        this.select_group(Some(ix), cx);
                         if !this.open.remove(&card_key) {
                             this.open.insert(card_key.clone());
                         }
-                        this.report_selection(cx);
                         cx.notify();
                     }),
                     cx,
@@ -1468,6 +1495,45 @@ mod tests {
         view.update(cx, |view, cx| view.toggle_selected(cx));
         view.read_with(cx, |view, _| {
             assert!(view.open.contains(&("Person".to_owned(), "p2".to_owned())))
+        });
+    }
+
+    /// The selection follows its entity when a later page makes the groups anew and orders them
+    /// otherwise: a change that sorts before it does not move the selection onto another node.
+    #[gpui::test]
+    async fn the_selection_follows_its_entity_across_pages(cx: &mut TestAppContext) {
+        cx.update(studio_theme::init_test);
+        let session = answering(
+            || {
+                let person = |id: &str| json!({ "kind": "node", "type": { "id": "Person", "name": "Person" }, "id": id, "op": "insert", "before": null, "after": { "properties": { "slug": id } } });
+                let company = |id: &str| json!({ "kind": "node", "type": { "id": "Company", "name": "Company" }, "id": id, "op": "update", "before": { "properties": { "slug": id, "city": "Tokyo" } }, "after": { "properties": { "slug": id, "city": "Osaka" } } });
+                let cause = json!({ "graph_commit_id": "c9", "parent_commit_id": "c8", "authored_branch": "main", "authored_at": 0 });
+                (
+                    200,
+                    json!({ "cause": cause, "changes": [person("p1"), person("p2"), company("c1")] }),
+                )
+            },
+            cx,
+        );
+        let view = cx.new(|cx| CommitView::new(session, "c9".into(), None, cx));
+        cx.run_until_parked();
+        let node = |view: &CommitView| view.selected_node().map(|node| node.id);
+        view.update(cx, |view, cx| {
+            let p2 = view
+                .groups
+                .groups
+                .iter()
+                .position(|group| group.id == "p2")
+                .expect("p2");
+            view.select_group(Some(p2), cx);
+            // The groups made anew, in another order, as a later page makes them.
+            view.groups.groups.reverse();
+            view.reselect(cx);
+            assert_eq!(node(view).as_deref(), Some("p2"));
+            // An entity no longer among the groups leaves nothing selected.
+            view.groups.groups.retain(|group| group.id != "p2");
+            view.reselect(cx);
+            assert_eq!(node(view), None);
         });
     }
 
