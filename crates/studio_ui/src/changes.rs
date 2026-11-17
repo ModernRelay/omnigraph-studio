@@ -405,15 +405,10 @@ pub fn property_body(
         }
         (ChangeKind::Changed, _) if row.before.is_some() || row.after.is_some() => {
             // Both short, or the same words spaced otherwise.
-            h_flex()
+            changed_value(row.before.clone(), row.after.clone(), cx)
                 .flex_1()
                 .min_w_0()
-                .flex_wrap()
-                .items_baseline()
-                .gap(px(space::MD))
                 .pt(px(space::XXS))
-                .child(value_text(&row.before, Color::Muted).strikethrough())
-                .child(value_text(&row.after, Color::Default))
         }
         (ChangeKind::Removed, _) => plain_value(&row.before, Color::Muted, whole, toggle),
         _ => plain_value(&row.after, Color::Default, whole, toggle),
@@ -450,9 +445,25 @@ fn plain_value(
         )
 }
 
-/// A value as wrapping text.
-fn value_text(value: &Option<SharedString>, color: Color) -> Label {
-    crate::ds::text::body(value.clone().unwrap_or_else(|| "—".into())).color(color)
+/// A value a change replaced, beside the value it put in its place (spec 033): what it took
+/// away struck through on the removed colour's mark, what it brought on the added colour's, as
+/// a list's elements and a text's words read. A side with no value reads "—".
+pub fn changed_value(before: Option<SharedString>, after: Option<SharedString>, cx: &App) -> Div {
+    let side = |value: Option<SharedString>, color: Color, struck: bool| {
+        let label = crate::ds::text::body(value.unwrap_or_else(|| "—".into())).color(color);
+        div()
+            .min_w_0()
+            .px(px(space::XS))
+            .rounded(px(crate::ds::radii(cx).xs))
+            .bg(crate::ds::surface::mark(color, cx))
+            .child(if struck { label.strikethrough() } else { label })
+    };
+    h_flex()
+        .flex_wrap()
+        .items_baseline()
+        .gap(px(space::XS))
+        .child(side(before, Color::Deleted, true))
+        .child(side(after, Color::Created, false))
 }
 
 /// The quiet line that opens a row's folded text, or folds it again: a dotted lead, then
@@ -498,12 +509,7 @@ fn diff_line(line: &DiffLine, cx: &App) -> Div {
         _ => ("", None),
     };
     let body = match (&line.pieces, color) {
-        (Some(pieces), Some(_)) => h_flex()
-            .flex_1()
-            .min_w_0()
-            .flex_wrap()
-            .children(piece_words(pieces, Some(line.kind), cx))
-            .into_any_element(),
+        (Some(pieces), Some(_)) => line_words(pieces, line.kind, cx).into_any_element(),
         _ => crate::ds::text::body(line.text.clone())
             .color(color.unwrap_or(Color::Muted))
             .into_any_element(),
@@ -529,8 +535,52 @@ fn diff_line(line: &DiffLine, cx: &App) -> Div {
         .child(div().flex_1().min_w_0().child(body))
 }
 
-/// The words of `pieces` as elements: for one side of a changed line (`side`), the kept words
-/// and that side's own, its own on a tint; for a list, every piece in its colour.
+/// One side of a changed line as one text that wraps as prose does: the kept words, and that
+/// side's own on the mark of its colour. Drawn as one text, a word that changed never takes
+/// the rest of its line to a line of its own, as a row of separate words did.
+fn line_words(pieces: &[Piece], side: PieceKind, cx: &App) -> Div {
+    let color = match side {
+        PieceKind::Removed => Color::Deleted,
+        _ => Color::Created,
+    };
+    let (text, marks) = line_text(pieces, side);
+    let mark = gpui::HighlightStyle {
+        background_color: Some(crate::ds::surface::mark(color, cx)),
+        ..Default::default()
+    };
+    div()
+        .flex_1()
+        .min_w_0()
+        .text_size(crate::ds::text::body_size(cx))
+        .text_color(Color::Default.color(cx))
+        .child(
+            gpui::StyledText::new(text)
+                .with_highlights(marks.into_iter().map(|range| (range, mark))),
+        )
+}
+
+/// One side of a changed line as its text, and the byte ranges of the words that side alone
+/// has.
+fn line_text(pieces: &[Piece], side: PieceKind) -> (String, Vec<std::ops::Range<usize>>) {
+    let mut text = String::new();
+    let mut marks = Vec::new();
+    for piece in pieces {
+        if !(piece.kind == side || matches!(piece.kind, PieceKind::Same | PieceKind::Gap)) {
+            continue;
+        }
+        if piece.spaced && !text.is_empty() {
+            text.push(' ');
+        }
+        let start = text.len();
+        text.push_str(&piece.text);
+        if piece.kind == side {
+            marks.push(start..text.len());
+        }
+    }
+    (text, marks)
+}
+
+/// A list's pieces as elements: every piece in its colour, the gained and lost on a tint.
 fn piece_words(pieces: &[Piece], side: Option<PieceKind>, cx: &App) -> Vec<AnyElement> {
     let mut words = Vec::new();
     for piece in pieces {
@@ -567,143 +617,6 @@ fn piece_words(pieces: &[Piece], side: Option<PieceKind>, cx: &App) -> Vec<AnyEl
         });
     }
     words
-}
-
-/// A card for one changed entity, under its type's [`change_group_header`]: the kind's symbol,
-/// the entity's name and id, then before → after per changed property for a changed entity,
-/// the values of an added one, the last values of a removed one, struck through, and last the
-/// [`RelationshipLine`]s reviewed with it. The type is the group's, so a card does not repeat
-/// it.
-#[derive(IntoElement)]
-pub struct ChangeCard {
-    id: ElementId,
-    kind: ChangeKind,
-    entity_id: SharedString,
-    name: Option<SharedString>,
-    endpoints: Option<(SharedString, SharedString)>,
-    rows: Rc<[PropertyRow]>,
-    relationships: Vec<RelationshipLine>,
-    relationship_counts: (usize, usize, usize),
-    /// Below the relationship lines: for example a control that shows the ones left out.
-    relationships_footer: Option<AnyElement>,
-    selected: bool,
-    hollow: bool,
-    status: Option<(SharedString, Color)>,
-    actions: Vec<AnyElement>,
-    on_click: Option<ClickHandler>,
-    /// Folded to its one line: the kind, the name, the id and `summary`.
-    collapsed: bool,
-    /// What the folded line says of the change ("brief, status changed · 2 relationships").
-    summary: Option<SharedString>,
-    on_toggle: Option<ClickHandler>,
-}
-
-impl ChangeCard {
-    pub fn new(
-        id: impl Into<ElementId>,
-        kind: ChangeKind,
-        entity_id: impl Into<SharedString>,
-    ) -> Self {
-        Self {
-            id: id.into(),
-            kind,
-            entity_id: entity_id.into(),
-            name: None,
-            endpoints: None,
-            rows: Rc::from([]),
-            relationships: Vec::new(),
-            relationship_counts: (0, 0, 0),
-            relationships_footer: None,
-            selected: false,
-            hollow: false,
-            status: None,
-            actions: Vec::new(),
-            on_click: None,
-            collapsed: false,
-            summary: None,
-            on_toggle: None,
-        }
-    }
-
-    /// Folded to one line, with `summary` after the name; a click on the line unfolds it.
-    pub fn collapsed(mut self, collapsed: bool, summary: impl Into<SharedString>) -> Self {
-        self.collapsed = collapsed;
-        self.summary = Some(summary.into());
-        self
-    }
-
-    pub fn on_toggle(
-        mut self,
-        handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-    ) -> Self {
-        self.on_toggle = Some(Rc::new(handler));
-        self
-    }
-
-    /// A relationship's endpoints, shown as `from → to`.
-    pub fn endpoints(mut self, from: impl Into<SharedString>, to: impl Into<SharedString>) -> Self {
-        self.endpoints = Some((from.into(), to.into()));
-        self
-    }
-
-    pub fn rows(mut self, rows: Rc<[PropertyRow]>) -> Self {
-        self.rows = rows;
-        self
-    }
-
-    /// What a reader knows the entity by, shown before its id; `None` when it has only its id.
-    pub fn name(mut self, name: Option<impl Into<SharedString>>) -> Self {
-        self.name = name.map(Into::into);
-        self
-    }
-
-    /// The relationship changes shown with the entity, under one header with the added,
-    /// changed and removed counts of those reviewed here (mirrors are not counted).
-    pub fn relationships(
-        mut self,
-        (added, changed, removed): (usize, usize, usize),
-        lines: Vec<RelationshipLine>,
-    ) -> Self {
-        self.relationship_counts = (added, changed, removed);
-        self.relationships = lines;
-        self
-    }
-
-    /// Shown below the relationship lines.
-    pub fn relationships_footer(mut self, footer: impl IntoElement) -> Self {
-        self.relationships_footer = Some(footer.into_any_element());
-        self
-    }
-
-    pub fn selected(mut self, selected: bool) -> Self {
-        self.selected = selected;
-        self
-    }
-
-    /// A reviewed card: outlined instead of filled, and dimmed. It keeps its place.
-    pub fn hollow(mut self, hollow: bool) -> Self {
-        self.hollow = hollow;
-        self
-    }
-
-    /// A short state shown in the header, for example "Reverted".
-    pub fn status(mut self, text: impl Into<SharedString>, color: Color) -> Self {
-        self.status = Some((text.into(), color));
-        self
-    }
-
-    pub fn action(mut self, action: impl IntoElement) -> Self {
-        self.actions.push(action.into_any_element());
-        self
-    }
-
-    pub fn on_click(
-        mut self,
-        handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-    ) -> Self {
-        self.on_click = Some(Rc::new(handler));
-        self
-    }
 }
 
 /// One piece of what changed inside a value, with whether a space comes before it.
@@ -892,161 +805,7 @@ fn word_pieces(old: &[Token], new: &[Token], context: Option<usize>) -> Vec<Piec
     pieces
 }
 
-impl RenderOnce for ChangeCard {
-    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let accent = self.kind.color().color(cx);
-        let selected = self.selected;
-        let kind = self.kind;
-        let collapsed = self.collapsed;
-        let chevron = crate::ds::icon::meta(if collapsed {
-            IconName::ChevronRight
-        } else {
-            IconName::ChevronDown
-        });
-        // The actions show while the row is hovered or selected, so a list of rows is calm.
-        let actions = h_flex()
-            .flex_none()
-            .gap(px(space::WITHIN))
-            .when(!selected, |actions| {
-                actions
-                    .invisible()
-                    .group_hover(CHANGE_ROW_GROUP, |style| style.visible())
-            })
-            .children(self.actions);
-        let mut line = h_flex()
-            .id("change-head")
-            .min_h(px(crate::ds::size::HEADER))
-            .px(px(space::LG))
-            .gap(px(space::INLINE))
-            .items_center()
-            .cursor_pointer()
-            .hover(|style| style.bg(crate::ds::surface::highlight(cx)))
-            .child(chevron)
-            .child(
-                div()
-                    .id("change-kind")
-                    .tip(crate::ds::tooltip(kind.label()))
-                    .child(crate::ds::text::body(kind.symbol()).color(kind.color())),
-            );
-        line = match &self.endpoints {
-            Some((from, to)) => line.child(
-                crate::ds::text::body(format!("{from} → {to}"))
-                    .buffer_font(cx)
-                    .single_line()
-                    .truncate(),
-            ),
-            None => match &self.name {
-                Some(name) => line
-                    .child(crate::ds::text::body(name.clone()).single_line().truncate())
-                    .child(
-                        crate::ds::text::meta(self.entity_id.clone())
-                            .buffer_font(cx)
-                            .single_line()
-                            .truncate(),
-                    ),
-                None => line.child(
-                    crate::ds::text::body(self.entity_id.clone())
-                        .buffer_font(cx)
-                        .single_line()
-                        .truncate(),
-                ),
-            },
-        };
-        if collapsed && let Some(summary) = &self.summary {
-            line = line.child(
-                div().min_w_0().flex_1().child(
-                    crate::ds::text::muted(summary.clone())
-                        .single_line()
-                        .truncate(),
-                ),
-            );
-        } else {
-            line = line.child(div().flex_1());
-        }
-        line = line
-            .children(
-                self.status
-                    .clone()
-                    .map(|(text, color)| crate::ds::text::meta(text).color(color)),
-            )
-            .child(actions);
-        let (on_click, on_toggle) = (self.on_click, self.on_toggle);
-        let line = line.on_click(move |event, window, cx| {
-            if let Some(handler) = &on_click {
-                handler(event, window, cx);
-            }
-            if let Some(handler) = &on_toggle {
-                handler(event, window, cx);
-            }
-        });
-
-        let rows = self
-            .rows
-            .iter()
-            .map(|row| property_row(row, kind, None, cx));
-        let (added, changed, removed) = self.relationship_counts;
-        let footer = self.relationships_footer;
-        let relationships = (!self.relationships.is_empty()).then(|| {
-            v_flex()
-                .pt(px(space::SM))
-                .gap(px(space::WITHIN))
-                .child(
-                    h_flex()
-                        .gap(px(space::MD))
-                        .child(crate::ds::text::meta("Relationships"))
-                        .child(change_counts(added, changed, removed)),
-                )
-                .children(self.relationships)
-                .children(footer)
-        });
-        let body = (!collapsed).then(|| {
-            h_flex()
-                .items_stretch()
-                .pl(px(space::LG + crate::ds::size::ROW_ICON))
-                .pr(px(space::LG))
-                .pb(px(space::MD))
-                .gap(px(space::LG))
-                // The change's mark: a line of its colour down the body's leading edge.
-                .child(
-                    div()
-                        .w(px(crate::ds::size::ACCENT_LINE))
-                        .flex_none()
-                        .rounded_full()
-                        .when(!self.hollow && kind != ChangeKind::Unchanged, |d| {
-                            d.bg(accent)
-                        })
-                        .when(self.hollow || kind == ChangeKind::Unchanged, |d| {
-                            d.bg(crate::ds::surface::rule(cx))
-                        }),
-                )
-                .child(
-                    v_flex()
-                        .flex_1()
-                        .min_w_0()
-                        .gap(px(space::XS))
-                        .children(rows)
-                        .children(relationships),
-                )
-        });
-        v_flex()
-            .id(self.id)
-            .group(CHANGE_ROW_GROUP)
-            .w_full()
-            .border_b_1()
-            .border_color(crate::ds::surface::rule(cx))
-            .when(selected, |row| {
-                row.bg(crate::ds::surface::selected_document(cx))
-            })
-            .when(self.hollow, |row| row.opacity(crate::ds::opacity::DIMMED))
-            .child(line)
-            .children(body)
-    }
-}
-
-/// The hover group of one change's row: its actions show while it is hovered.
-const CHANGE_ROW_GROUP: &str = "change-row";
-
-/// One relationship change on a [`ChangeCard`], read from the card's entity: its symbol, the
+/// One relationship change on an entity's card, read from the card's entity: its symbol, the
 /// relationship in words, an arrow that says which way it points, and the entity at its other
 /// end. A changed relationship's property rows follow. A mirror (`kind` `None`) is a
 /// relationship reviewed on another card: muted, with no symbol, its `note` saying where.
@@ -1251,29 +1010,6 @@ pub fn change_counts(added: usize, changed: usize, removed: usize) -> Div {
         .children(part(removed, ChangeKind::Removed))
 }
 
-/// A type group's header above its cards: swatch, name, counts.
-pub fn change_group_header(
-    type_name: &str,
-    is_edge: bool,
-    added: usize,
-    changed: usize,
-    removed: usize,
-    cx: &App,
-) -> Div {
-    h_flex()
-        .gap(px(space::MD))
-        .pt(px(space::LG))
-        .pb(px(space::XS))
-        .child(crate::kind_swatch(type_name, is_edge, cx))
-        .child(crate::ds::text::body(type_name.to_owned()))
-        .child(crate::ds::text::meta(if is_edge {
-            "relationship"
-        } else {
-            "node"
-        }))
-        .child(change_counts(added, changed, removed))
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -1294,6 +1030,41 @@ mod tests {
             }
         }
         text
+    }
+
+    /// One side of a changed line is one text, the words that side alone has marked in it, so
+    /// the punctuation and words after a changed word stay on its line (spec 033; before, each
+    /// word was an element of its own and the rest of the line wrapped below the change).
+    #[test]
+    fn a_changed_line_is_one_text_with_its_words_marked() {
+        let lines = text_lines(
+            "He teaches every spring, and runs the suite in CI.\nKept as it was.",
+            "He teaches every autumn, and runs the suite in CI.\nKept as it was.",
+        )
+        .expect("the texts differ");
+        let side = |kind: PieceKind| {
+            let line = lines.iter().find(|line| line.kind == kind).expect("a line");
+            let (text, marks) = line_text(line.pieces.as_deref().expect("its words"), kind);
+            let marked: Vec<String> = marks
+                .iter()
+                .map(|range| text[range.clone()].to_owned())
+                .collect();
+            (text, marked)
+        };
+        assert_eq!(
+            side(PieceKind::Removed),
+            (
+                "He teaches every spring, and runs the suite in CI.".to_owned(),
+                vec!["spring".to_owned()]
+            )
+        );
+        assert_eq!(
+            side(PieceKind::Added),
+            (
+                "He teaches every autumn, and runs the suite in CI.".to_owned(),
+                vec!["autumn".to_owned()]
+            )
+        );
     }
 
     /// A list shows what it gained and lost and how much it kept; a reordered list keeps
