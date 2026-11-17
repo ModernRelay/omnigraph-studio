@@ -247,3 +247,29 @@ async fn workspace_activate_panel_leaves_the_keyboard_where_it_was(cx: &mut Test
     let focused = cx.update(|window, cx| window.focused(cx));
     assert_eq!(focused.as_ref(), Some(&typing), "the keyboard stayed");
 }
+
+/// Keys in a panel the tool hides do not stay there: shown in the same dock, the Data panel
+/// takes the queries panel's place, and the keyboard goes to the active tab rather than back to
+/// the queries panel nobody sees.
+#[gpui::test]
+async fn workspace_activate_panel_moves_keys_out_of_a_panel_it_hides(cx: &mut TestAppContext) {
+    let (workspace, cx, id) = studio(cx);
+    let opened = run(cx, id, "graph_open_type", json!({ "type_name": "Person" })).await;
+    assert_eq!(opened.outcome, "opened", "{opened:?}");
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.show_panel("queries", window, cx)
+    });
+    cx.update(|window, _| window.refresh());
+    cx.run_until_parked();
+    let in_queries = cx
+        .update(|window, cx| window.focused(cx))
+        .expect("the panel's keys");
+    let answer = run(cx, id, "workspace_activate_panel", json!({ "id": "types" })).await;
+    assert_eq!(answer.outcome, "panel_shown", "{answer:?}");
+    let (focused, tab) = workspace.update_in(cx, |workspace, window, cx| {
+        let tab = workspace.active_item().map(|item| item.focus_handle(cx));
+        (window.focused(cx), tab)
+    });
+    assert_ne!(focused.as_ref(), Some(&in_queries), "not the hidden panel");
+    assert_eq!(focused, tab, "the active tab");
+}

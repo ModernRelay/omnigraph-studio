@@ -3774,6 +3774,26 @@ impl Workspace {
         })
     }
 
+    /// The panel whose body or focus target holds the keyboard, as the frame drawn last says.
+    fn panel_with_focus(&self, window: &Window, cx: &App) -> Option<SharedString> {
+        [&self.left, &self.right, &self.bottom]
+            .into_iter()
+            .flat_map(|dock| dock.panels.iter())
+            .find(|panel| {
+                let in_body = self
+                    .dock_hosts
+                    .get(&panel.view.entity_id())
+                    .is_some_and(|host| host.read(cx).focus_handle.contains_focused(window, cx));
+                in_body
+                    || panel
+                        .focus
+                        .as_ref()
+                        .and_then(|focus| focus(cx))
+                        .is_some_and(|focus| focus.contains_focused(window, cx))
+            })
+            .map(|panel| panel.id.clone())
+    }
+
     /// Gives the keyboard to the active tab: the dock that had it is hidden or covered, and the
     /// keys would go on driving a panel nobody sees.
     fn focus_active_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {

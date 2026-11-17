@@ -525,12 +525,8 @@ async fn target_window(
     // The action ran as the first update's effects were flushed.
     let second = handle.update(cx, |workspace, window, cx| {
         let answer = changed(id, tool, &before, workspace, window, cx);
-        // The person keeps the keyboard where they had it.
-        if tool.keeps_focus
-            && let Some(focus) = &before.focus
-            && window.focused(cx).as_ref() != Some(focus)
-        {
-            window.focus(focus, cx);
+        if tool.keeps_focus {
+            keep_focus(&before, workspace, window, cx);
         }
         if matches!(answer.outcome, "opened" | "shown" | "panel_shown") {
             let agent = caller
@@ -558,8 +554,9 @@ fn workspace_window(id: u64, cx: &App) -> Option<WindowHandle<Workspace>> {
 /// The window's front, as a call's result compares it: the active tab, every tab, and the
 /// panels shown.
 struct Front {
-    /// What had the keyboard just before the dispatch.
+    /// What had the keyboard just before the dispatch, and the panel it was in, if any.
     focus: Option<FocusHandle>,
+    focus_panel: Option<SharedString>,
     active: Option<EntityId>,
     items: HashSet<EntityId>,
     panels: Vec<SharedString>,
@@ -568,6 +565,7 @@ struct Front {
 fn front(workspace: &Workspace, window: &Window, cx: &App) -> Front {
     Front {
         focus: window.focused(cx),
+        focus_panel: workspace.panel_with_focus(window, cx),
         active: workspace.active_item().map(|item| item.item_id()),
         items: workspace.all_items().map(|item| item.item_id()).collect(),
         panels: workspace.shown_panels(),
@@ -715,6 +713,33 @@ fn check(need: Need, input: &Value, workspace: &Workspace, cx: &App) -> Result<(
                 ))
             }
         }
+    }
+}
+
+/// After an action that gives what it shows the keyboard: the person keeps it where they had
+/// it, unless that was in a panel the action took the place of. Then the panel shown keeps it,
+/// or, when it took none, the active tab takes it, as when a dock hides: keys must not go on
+/// driving a panel nobody sees.
+fn keep_focus(
+    before: &Front,
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(focus) = &before.focus else {
+        return;
+    };
+    let now = window.focused(cx);
+    let hidden = before
+        .focus_panel
+        .as_ref()
+        .is_some_and(|panel| !workspace.shown_panels().contains(panel));
+    if !hidden {
+        if now.as_ref() != Some(focus) {
+            window.focus(focus, cx);
+        }
+    } else if now.as_ref() == Some(focus) {
+        workspace.focus_active_tab(window, cx);
     }
 }
 
