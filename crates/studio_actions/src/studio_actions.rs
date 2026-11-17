@@ -194,8 +194,8 @@ pub mod workspace {
         pub url: String,
     }
 
-    /// Show a panel in its dock and give it the keyboard: `types`, `explore`, `queries`,
-    /// `branches`, `agent-conversations`, `inspector`, `nodes`, `history`, `activity`.
+    /// Show a panel in its dock and give it the keyboard: `types`, `queries`, `branches`,
+    /// `commits`, `agent-conversations`, `inspector`, `activity`.
     #[derive(Clone, Debug, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action)]
     #[action(namespace = studio)]
     pub struct ActivatePanel {

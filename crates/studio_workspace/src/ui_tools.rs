@@ -19,7 +19,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    App, AsyncApp, Context, EntityId, Focusable as _, Global, SharedString, Window, WindowHandle,
+    App, AsyncApp, Context, EntityId, FocusHandle, Focusable as _, Global, SharedString, Window,
+    WindowHandle,
 };
 use serde_json::{Map, Value, json};
 use studio_actions::{Thing, ViewKind};
@@ -69,6 +70,9 @@ pub struct UiTool {
     /// The action it dispatches, by its registered name.
     pub action: &'static str,
     needs: &'static [Need],
+    /// The action gives what it shows the keyboard (a panel shown by its key does), which a
+    /// tool must not: focus goes back where the person had it (spec 032, Focus).
+    keeps_focus: bool,
 }
 
 /// The actions an agent may call, and nothing else: the set is opt-in, so a new action is not
@@ -84,61 +88,73 @@ pub static ALLOWED: &[UiTool] = &[
             Need::Type("type_name"),
             Need::NoRefilter("type_name"),
         ],
+        keeps_focus: false,
     },
     UiTool {
         name: "graph_open_node",
         action: "studio_graph::OpenNode",
         needs: &[Need::Session, Need::Type("type_name"), Need::Text("id")],
+        keeps_focus: false,
     },
     UiTool {
         name: "graph_open_node_page",
         action: "studio_graph::OpenNodePage",
         needs: &[Need::Session, Need::Type("type_name"), Need::Text("id")],
+        keeps_focus: false,
     },
     UiTool {
         name: "graph_show_node_on_canvas",
         action: "studio_graph::ShowNodeOnCanvas",
         needs: &[Need::Session, Need::Type("type_name"), Need::Text("id")],
+        keeps_focus: false,
     },
     UiTool {
         name: "graph_show_node_in_tree",
         action: "studio_graph::ShowNodeInTree",
         needs: &[Need::Session, Need::Type("type_name"), Need::Text("id")],
+        keeps_focus: false,
     },
     UiTool {
         name: "graph_open_map",
         action: "studio_graph::OpenMap",
         needs: &[Need::Session],
+        keeps_focus: false,
     },
     UiTool {
         name: "graph_open_source",
         action: "studio_graph::OpenSource",
         needs: &[Need::Session, Need::MaybeType("type_name")],
+        keeps_focus: false,
     },
     UiTool {
         name: "graph_open_branch",
         action: "studio_graph::OpenBranch",
         needs: &[Need::Session, Need::Branch("branch")],
+        keeps_focus: false,
     },
     UiTool {
         name: "graph_open_branch_history",
         action: "studio_graph::OpenBranchHistory",
         needs: &[Need::Session, Need::Branch("branch")],
+        keeps_focus: false,
     },
     UiTool {
         name: "graph_open_commit",
         action: "studio_graph::OpenCommit",
         needs: &[Need::Session, Need::Text("commit_id")],
+        keeps_focus: false,
     },
     UiTool {
         name: "graph_new_query_with_text",
         action: "studio_graph::NewQueryWithText",
         needs: &[Need::Session],
+        keeps_focus: false,
     },
     UiTool {
         name: "workspace_activate_panel",
         action: "studio::ActivatePanel",
         needs: &[Need::Panel("id")],
+        keeps_focus: true,
     },
 ];
 
@@ -455,7 +471,14 @@ async fn target_window(
     };
     // The action ran as the first update's effects were flushed.
     let second = handle.update(cx, |workspace, window, cx| {
-        let answer = changed(id, tool, &before, workspace, cx);
+        let answer = changed(id, tool, &before, workspace, window, cx);
+        // The person keeps the keyboard where they had it.
+        if tool.keeps_focus
+            && let Some(focus) = &before.focus
+            && window.focused(cx).as_ref() != Some(focus)
+        {
+            window.focus(focus, cx);
+        }
         if matches!(answer.outcome, "opened" | "shown" | "panel_shown") {
             let agent = caller
                 .agent
@@ -482,13 +505,16 @@ fn workspace_window(id: u64, cx: &App) -> Option<WindowHandle<Workspace>> {
 /// The window's front, as a call's result compares it: the active tab, every tab, and the
 /// panels shown.
 struct Front {
+    /// What had the keyboard just before the dispatch.
+    focus: Option<FocusHandle>,
     active: Option<EntityId>,
     items: HashSet<EntityId>,
     panels: Vec<SharedString>,
 }
 
-fn front(workspace: &Workspace) -> Front {
+fn front(workspace: &Workspace, window: &Window, cx: &App) -> Front {
     Front {
+        focus: window.focused(cx),
         active: workspace.active_item().map(|item| item.item_id()),
         items: workspace.all_items().map(|item| item.item_id()).collect(),
         panels: workspace.shown_panels(),
@@ -547,7 +573,7 @@ fn dispatch(
             tool.name
         )));
     }
-    let before = front(workspace);
+    let before = front(workspace, window, cx);
     window.dispatch_action(action, cx);
     Ok(before)
 }
@@ -640,8 +666,15 @@ fn check(need: Need, input: &Value, workspace: &Workspace, cx: &App) -> Result<(
 }
 
 /// What the dispatch changed: the tab that opened or came to the front, or the panel shown.
-fn changed(id: u64, tool: &UiTool, before: &Front, workspace: &Workspace, cx: &App) -> Answer {
-    let after = front(workspace);
+fn changed(
+    id: u64,
+    tool: &UiTool,
+    before: &Front,
+    workspace: &Workspace,
+    window: &Window,
+    cx: &App,
+) -> Answer {
+    let after = front(workspace, window, cx);
     if after.active != before.active || !after.items.is_subset(&before.items) {
         let new = after.active.is_some_and(|tab| !before.items.contains(&tab));
         if let Some(item) = workspace.active_item() {

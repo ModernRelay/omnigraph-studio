@@ -28,6 +28,15 @@ fn studio(cx: &mut TestAppContext) -> (gpui::Entity<Workspace>, &mut VisualTestC
     );
     let (workspace, cx) = cx.add_window_view(Workspace::new);
     let id = gpui::VisualContext::window_handle(cx).window_id().as_u64();
+    // The activity log's panel, as `studio::init` adds it to every window.
+    workspace.update_in(cx, |workspace, window, cx| {
+        let handle = cx.entity().downgrade();
+        let session = workspace.session().cloned();
+        let activity = gpui::AppContext::new(cx, |cx| {
+            crate::activity::ActivityLog::new(handle, session, window, cx)
+        });
+        workspace.set_activity_view(activity.into(), cx);
+    });
     workspace.update_in(cx, |workspace, window, cx| {
         workspace.set_session(session, window, cx)
     });
@@ -176,7 +185,27 @@ async fn graph_new_query_with_text_opens_a_query_it_does_not_run(cx: &mut TestAp
 
 #[gpui::test]
 async fn workspace_activate_panel_shows_a_panel(cx: &mut TestAppContext) {
-    let (_, cx, id) = studio(cx);
+    let (workspace, cx, id) = studio(cx);
+    // The action's doc comment, the tool's description, names every panel and no other.
+    let panels = workspace.read_with(cx, |workspace, _| {
+        let mut ids: Vec<String> = workspace
+            .panel_ids()
+            .iter()
+            .map(|id| id.to_string())
+            .collect();
+        ids.sort();
+        ids
+    });
+    let documented =
+        cx.update(|_, cx| cx.action_documentation()["studio::ActivatePanel"].to_owned());
+    let mut named: Vec<String> = documented
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_owned)
+        .collect();
+    named.sort();
+    assert_eq!(named, panels);
     let answer = run(
         cx,
         id,
@@ -194,4 +223,27 @@ async fn graph_open_node_opens_its_page(cx: &mut TestAppContext) {
     let input = json!({ "type_name": "Person", "id": "person-000000" });
     let answer = run(cx, id, "graph_open_node", input).await;
     assert_eq!(opened(&answer), (node("person-000000"), json!("Page")));
+}
+
+/// Showing a panel leaves the keyboard where the person had it: in the query they were typing,
+/// though the queries panel takes it when shown by its key.
+#[gpui::test]
+async fn workspace_activate_panel_leaves_the_keyboard_where_it_was(cx: &mut TestAppContext) {
+    let (_, cx, id) = studio(cx);
+    let text = "query people() { match { $p: Person } return { $p.slug } }";
+    let opened = run(cx, id, "graph_new_query_with_text", json!({ "text": text })).await;
+    assert_eq!(opened.outcome, "opened", "{opened:?}");
+    let typing = cx
+        .update(|window, cx| window.focused(cx))
+        .expect("the query has the keys");
+    let answer = run(
+        cx,
+        id,
+        "workspace_activate_panel",
+        json!({ "id": "queries" }),
+    )
+    .await;
+    assert_eq!(answer.outcome, "panel_shown", "{answer:?}");
+    let focused = cx.update(|window, cx| window.focused(cx));
+    assert_eq!(focused.as_ref(), Some(&typing), "the keyboard stayed");
 }
