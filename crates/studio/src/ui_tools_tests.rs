@@ -273,3 +273,97 @@ async fn workspace_activate_panel_moves_keys_out_of_a_panel_it_hides(cx: &mut Te
     assert_ne!(focused.as_ref(), Some(&in_queries), "not the hidden panel");
     assert_eq!(focused, tab, "the active tab");
 }
+
+/// Gives the queries panel the keyboard, as its key does, and says what holds it.
+fn typing_in_the_queries_panel(
+    workspace: &gpui::Entity<Workspace>,
+    cx: &mut VisualTestContext,
+) -> gpui::FocusHandle {
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.show_panel("queries", window, cx)
+    });
+    cx.update(|window, _| window.refresh());
+    cx.run_until_parked();
+    cx.update(|window, cx| window.focused(cx))
+        .expect("the panel's keys")
+}
+
+/// A tool that opens a tab leaves the keyboard where the person had it. Opening a tab gives
+/// the tab the keyboard, as a pick does, so what the person typed next went to the table: `j`
+/// and `k` moved its cursor, ↵ edited the cell under it, and a second ↵ saved it.
+#[gpui::test]
+async fn opening_a_tab_leaves_the_keyboard_where_it_was(cx: &mut TestAppContext) {
+    let (workspace, cx, id) = studio(cx);
+    let typing = typing_in_the_queries_panel(&workspace, cx);
+    for (tool, input) in [
+        ("graph_open_type", json!({ "type_name": "Person" })),
+        (
+            "graph_open_node_page",
+            json!({ "type_name": "Person", "id": "person-000000" }),
+        ),
+        ("graph_open_map", json!({})),
+    ] {
+        let answer = run(cx, id, tool, input).await;
+        assert_eq!(answer.outcome, "opened", "{tool}: {answer:?}");
+        let focused = cx.update(|window, cx| window.focused(cx));
+        assert_eq!(focused.as_ref(), Some(&typing), "{tool} took the keyboard");
+    }
+}
+
+/// A tab put in front of the one the person was in takes the keyboard: keys must not go on
+/// driving a tab nobody sees.
+#[gpui::test]
+async fn a_tab_put_in_front_of_the_persons_takes_the_keyboard(cx: &mut TestAppContext) {
+    let (workspace, cx, id) = studio(cx);
+    let answer = run(cx, id, "graph_open_type", json!({ "type_name": "Person" })).await;
+    assert_eq!(answer.outcome, "opened", "{answer:?}");
+    // The person works in the table.
+    let table = workspace.update_in(cx, |workspace, window, cx| {
+        let table = workspace.active_item().map(|item| item.focus_handle(cx));
+        let table = table.expect("the table is in front");
+        window.focus(&table, cx);
+        table
+    });
+    cx.update(|window, _| window.refresh());
+    cx.run_until_parked();
+    let answer = run(cx, id, "graph_open_map", json!({})).await;
+    assert_eq!(answer.outcome, "opened", "{answer:?}");
+    let (focused, front) = workspace.update_in(cx, |workspace, window, cx| {
+        let front = workspace.active_item().map(|item| item.focus_handle(cx));
+        (window.focused(cx), front.expect("the map is in front"))
+    });
+    let focused = focused.expect("something has the keyboard");
+    assert_ne!(focused, table, "not the table behind the map");
+    assert!(
+        cx.update(|window, cx| front.contains_focused(window, cx)),
+        "the map in front has the keyboard"
+    );
+}
+
+/// A canvas tool acts on the canvas and leaves the keyboard where the person has it. That the
+/// canvas never holds it, even while the call runs, is
+/// `a_view_tool_acts_on_its_tab_without_the_keyboard` in `ui_tool_server`.
+#[gpui::test]
+async fn a_view_tool_leaves_the_keyboard_where_it_was(cx: &mut TestAppContext) {
+    let (workspace, cx, id) = studio(cx);
+    let input = json!({ "type_name": "Person", "id": "person-000000" });
+    let answer = run(cx, id, "graph_show_node_on_canvas", input).await;
+    assert_eq!(answer.outcome, "opened", "{answer:?}");
+    let typing = typing_in_the_queries_panel(&workspace, cx);
+    for tool in [
+        "canvas_zoom_in",
+        "canvas_select_node",
+        "canvas_fit_to_window",
+    ] {
+        let answer = run(cx, id, tool, json!({})).await;
+        assert!(!answer.is_error, "{tool}: {answer:?}");
+        let focused = cx.update(|window, cx| window.focused(cx));
+        assert_eq!(focused.as_ref(), Some(&typing), "{tool} took the keyboard");
+    }
+    let zoomed = run(cx, id, "studio_canvas", json!({})).await;
+    assert!(
+        zoomed.json["zoom"].as_f64().is_some_and(|zoom| zoom != 1.),
+        "the canvas was driven: {:?}",
+        zoomed.json["zoom"]
+    );
+}

@@ -62,8 +62,8 @@ enum Need {
 pub enum On {
     /// The window: the workspace handles the action.
     Workspace,
-    /// The active tab, which must be this view. It takes the keyboard for the dispatch, as a
-    /// click on it would, and gives it back after (spec 032, "The canvas and the tree").
+    /// The active tab, which must be this view. The action is dispatched on the tab itself,
+    /// which need not hold the keyboard for it (spec 032, Focus).
     View(ViewKind),
 }
 
@@ -77,9 +77,6 @@ pub struct UiTool {
     /// The action it dispatches, by its registered name.
     pub action: &'static str,
     needs: &'static [Need],
-    /// The action gives what it shows the keyboard (a panel shown by its key does), which a
-    /// tool must not: focus goes back where the person had it (spec 032, Focus).
-    keeps_focus: bool,
     pub on: On,
     /// The tool takes an optional `node`, which the view selects, as a click does, before the
     /// action runs on what is selected.
@@ -97,7 +94,6 @@ const fn workspace(name: &'static str, action: &'static str, needs: &'static [Ne
         name,
         action,
         needs,
-        keeps_focus: false,
         on: On::Workspace,
         node: false,
         waits: false,
@@ -115,7 +111,6 @@ const fn view(
         name,
         action,
         needs: &[],
-        keeps_focus: true,
         on: On::View(kind),
         node,
         waits,
@@ -206,14 +201,11 @@ pub static ALLOWED: &[UiTool] = &[
         "studio_graph::NewQueryWithText",
         &[Need::Session],
     ),
-    UiTool {
-        keeps_focus: true,
-        ..workspace(
-            "workspace_activate_panel",
-            "studio::ActivatePanel",
-            &[Need::Panel("id")],
-        )
-    },
+    workspace(
+        "workspace_activate_panel",
+        "studio::ActivatePanel",
+        &[Need::Panel("id")],
+    ),
     // The canvas (spec 032, "The canvas and the tree").
     canvas(
         "canvas_select_node",
@@ -875,9 +867,8 @@ async fn target_window(
         } else {
             changed(id, tool, &before, workspace, window, cx)
         };
-        if tool.keeps_focus {
-            keep_focus(&before, workspace, window, cx);
-        }
+        // A call never takes the keyboard from where the person has it (spec 032, Focus).
+        keep_focus(&before, workspace, window, cx);
         if matches!(
             answer.outcome,
             "opened" | "shown" | "panel_shown" | "changed" | "expanded" | "cap_reached"
@@ -911,9 +902,11 @@ fn workspace_window(id: u64, cx: &App) -> Option<WindowHandle<Workspace>> {
 /// The window's front, as a call's result compares it: the active tab, every tab, and the
 /// panels shown.
 struct Front {
-    /// What had the keyboard just before the dispatch, and the panel it was in, if any.
+    /// What had the keyboard just before the dispatch, and the panel or the tab it was in, if
+    /// any.
     focus: Option<FocusHandle>,
     focus_panel: Option<SharedString>,
+    focus_tab: Option<EntityId>,
     active: Option<EntityId>,
     items: HashSet<EntityId>,
     panels: Vec<SharedString>,
@@ -925,10 +918,23 @@ struct Front {
 /// How often a call that waits looks at its view again.
 const POLL: Duration = Duration::from_millis(40);
 
+/// The tab in front of each pane: the tabs the window draws.
+fn front_tabs(workspace: &Workspace) -> impl Iterator<Item = &dyn ItemHandle> {
+    workspace.pane_tabs().into_iter().flat_map(|pane| {
+        pane.tabs
+            .into_iter()
+            .filter(|tab| tab.active)
+            .map(|tab| tab.item)
+    })
+}
+
 fn front(workspace: &Workspace, window: &Window, cx: &App) -> Front {
     Front {
         focus: window.focused(cx),
         focus_panel: workspace.panel_with_focus(window, cx),
+        focus_tab: front_tabs(workspace)
+            .find(|tab| tab.focus_handle(cx).contains_focused(window, cx))
+            .map(|tab| tab.item_id()),
         active: workspace.active_item().map(|item| item.item_id()),
         items: workspace.all_items().map(|item| item.item_id()).collect(),
         panels: workspace.shown_panels(),
@@ -1043,44 +1049,49 @@ fn dispatch(
         ));
     }
     let mut before = front(workspace, window, cx);
-    match &view_tab {
-        // The view takes the keyboard, as a click on it would; `keep_focus` gives it back.
-        Some((_, focus, _, _)) => window.focus(focus, cx),
-        // With nothing focused an action reaches only global handlers, so the workspace takes
-        // focus first, as a click in the window would. Focus the person has is left where it
-        // is.
-        None if window.focused(cx).is_none() => {
-            let focus = workspace.focus_handle(cx);
-            window.focus(&focus, cx);
-        }
-        None => {}
+    // With nothing focused an action reaches only global handlers, so the workspace takes
+    // focus first, as a click in the window would. Focus the person has is left where it is:
+    // a view's action is dispatched on its tab, which need not hold the keyboard for it.
+    if before.focus.is_none() {
+        let focus = workspace.focus_handle(cx);
+        window.focus(&focus, cx);
     }
-    if !window.is_action_available(action.as_ref(), cx) {
-        if let Some(focus) = &before.focus {
-            window.focus(focus, cx);
-        }
+    let available = match &view_tab {
+        Some((_, focus, _, _)) => window.is_action_available_in(action.as_ref(), focus),
+        None => window.is_action_available(action.as_ref(), cx),
+    };
+    if !available {
         return Err(not_available(format!(
             "{} is not available in this window now.",
             tool.name
         )));
     }
-    if let Some((item, _, view, named)) = view_tab {
-        before.view_item = Some(item);
-        before.view = view;
-        // The node named is selected first, as a click selects it.
-        if let (Some((type_name, node)), On::View(kind)) = (named, tool.on) {
+    let Some((item, focus, view, named)) = view_tab else {
+        window.dispatch_action(action, cx);
+        return Ok(before);
+    };
+    before.view_item = Some(item);
+    before.view = view;
+    // The node named is selected first, as a click selects it.
+    let select = match (named, tool.on) {
+        (Some((type_name, node)), On::View(kind)) => {
             let select = match kind {
                 ViewKind::Tree => "studio_tree::SelectNode",
                 _ => "studio_canvas::SelectNode",
             };
-            if let Ok(select) =
-                cx.build_action(select, Some(json!({ "type_name": type_name, "id": node })))
-            {
-                window.dispatch_action(select, cx);
-            }
+            cx.build_action(select, Some(json!({ "type_name": type_name, "id": node })))
+                .ok()
         }
-    }
-    window.dispatch_action(action, cx);
+        _ => None,
+    };
+    // On the tab, not on what has the keyboard, and once this update's effects are flushed,
+    // as `Window::dispatch_action` runs an action: the tab's handlers find the workspace free.
+    window.defer(cx, move |window, cx| {
+        if let Some(select) = select {
+            focus.dispatch_action(select.as_ref(), window, cx);
+        }
+        focus.dispatch_action(action.as_ref(), window, cx);
+    });
     Ok(before)
 }
 
@@ -1480,10 +1491,11 @@ fn check(need: Need, input: &Value, workspace: &Workspace, cx: &App) -> Result<(
     }
 }
 
-/// After an action that gives what it shows the keyboard: the person keeps it where they had
-/// it, unless that was in a panel the action took the place of. Then the panel shown keeps it,
-/// or, when it took none, the active tab takes it, as when a dock hides: keys must not go on
-/// driving a panel nobody sees.
+/// A call leaves the keyboard where the person had it (spec 032, Focus): an action that gives
+/// what it opens or shows the keyboard, as opening a tab and showing a panel by its key do, has
+/// it taken back. Unless the person's place is gone, a panel the action hid or a tab it put
+/// another in front of: then what took the keyboard keeps it, or the active tab takes it, since
+/// keys must not go on driving something nobody sees.
 fn keep_focus(
     before: &Front,
     workspace: &mut Workspace,
@@ -1498,7 +1510,10 @@ fn keep_focus(
         .focus_panel
         .as_ref()
         .is_some_and(|panel| !workspace.shown_panels().contains(panel));
-    if !hidden {
+    let covered = before
+        .focus_tab
+        .is_some_and(|tab| !front_tabs(workspace).any(|front| front.item_id() == tab));
+    if !hidden && !covered {
         if now.as_ref() != Some(focus) {
             window.focus(focus, cx);
         }
@@ -1760,6 +1775,8 @@ mod tests {
     };
     use graph_store::{Connection, GraphSession, ServerEntry, ServerSource};
     use http_client::{AsyncBody, FakeHttpClient, Response};
+    use std::cell::RefCell;
+    use std::rc::Rc;
     use studio_actions::ViewLink;
     use studio_settings::StudioSettings;
     use studio_workspace::{Item, ItemEvent, OPENED_BY_FOR, SelectedIds};
@@ -2228,6 +2245,81 @@ mod tests {
             })
             .unwrap();
         cx.run_until_parked();
+    }
+
+    /// A stand-in canvas whose zoom records what held the keyboard when it ran.
+    struct Walk {
+        focus_handle: FocusHandle,
+        held: Rc<RefCell<Vec<Option<FocusHandle>>>>,
+    }
+
+    impl EventEmitter<ItemEvent> for Walk {}
+
+    impl Focusable for Walk {
+        fn focus_handle(&self, _: &App) -> FocusHandle {
+            self.focus_handle.clone()
+        }
+    }
+
+    impl Render for Walk {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let held = self.held.clone();
+            div().track_focus(&self.focus_handle).on_action(
+                move |_: &studio_actions::canvas::ZoomIn, window, cx| {
+                    held.borrow_mut().push(window.focused(cx));
+                },
+            )
+        }
+    }
+
+    impl Item for Walk {
+        fn tab_title(&self, _: &App) -> SharedString {
+            "Canvas".into()
+        }
+
+        fn views(&self, _: &App) -> Vec<ViewLink> {
+            vec![ViewLink::current(ViewKind::Canvas)]
+        }
+
+        fn outline(&self, _: &App) -> Option<ViewOutline> {
+            Some(ViewOutline::default())
+        }
+    }
+
+    /// A view tool's action runs on its tab while the keyboard stays where the person has it:
+    /// the tab took the keyboard for the call, up to the 15 s a call waits, and what the
+    /// person typed meanwhile drove the canvas (`r` reset its layout, ⌫ collapsed a node).
+    #[gpui::test]
+    async fn a_view_tool_acts_on_its_tab_without_the_keyboard(cx: &mut TestAppContext) {
+        let handle = window(cx);
+        let id = handle.window_id().as_u64();
+        let held: Rc<RefCell<Vec<Option<FocusHandle>>>> = Rc::default();
+        let person = handle
+            .update(cx, |workspace, window, cx| {
+                let held = held.clone();
+                workspace.open_item("walk", window, cx, |_, cx| Walk {
+                    focus_handle: cx.focus_handle(),
+                    held,
+                });
+                // The person's keyboard is elsewhere in the window.
+                let person = workspace.focus_handle(cx);
+                window.focus(&person, cx);
+                person
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let answer = run(cx, Target::Any, "canvas_zoom_in", json!({ "window": id })).await;
+        assert!(!answer.is_error, "{answer:?}");
+        assert_eq!(
+            *held.borrow(),
+            [Some(person.clone())],
+            "the tab's handler ran once, with the keyboard where the person had it"
+        );
+        let focused = handle
+            .update(cx, |_, window, cx| window.focused(cx))
+            .unwrap();
+        assert_eq!(focused, Some(person));
     }
 
     /// A call to a window that has closed, or is another conversation's, is refused.
