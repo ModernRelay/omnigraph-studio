@@ -57,8 +57,8 @@ use ui::{ButtonLike, PopoverMenu, right_click_menu};
 pub use confirm::{Confirm, confirm, confirm_expand};
 use item::ItemHandle;
 pub use item::{
-    Inspected, InspectedNode, Item, ItemEvent, ItemStatus, KeyHint, NodeInspector, SelectedIds,
-    register_node_inspector,
+    AgentEdge, AgentGroup, AgentNode, AgentRefusal, AgentView, Inspected, InspectedNode, Item,
+    ItemEvent, ItemStatus, KeyHint, NodeInspector, SelectedIds, register_node_inspector,
 };
 pub use open_failure::open_failure;
 use pane::{Member, Pane, PaneId, SplitAxis, SplitDirection, Tab};

@@ -26,7 +26,7 @@ use serde_json::{Map, Value, json};
 use studio_actions::{Thing, ViewKind};
 use studio_settings::StudioSettings;
 
-use crate::{ToastKind, Workspace};
+use crate::{AgentEdge, AgentGroup, AgentNode, AgentView, ToastKind, Workspace};
 
 /// The most node ids `studio_selection` names.
 pub const MAX_SELECTED: usize = 200;
@@ -56,17 +56,24 @@ enum Need {
     Text(&'static str),
     /// The argument names one of the window's panels.
     Panel(&'static str),
-    /// A filter (`filter_id`) opens a new table of the type named by the argument, never
-    /// changes an open one's: the type's handler would filter a table open already (spec
-    /// 032, Focus).
-    NoRefilter(&'static str),
+}
+
+/// Where a tool's action acts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum On {
+    /// The window: the workspace handles the action.
+    Workspace,
+    /// The active tab, which must be this view. It takes the keyboard for the dispatch, as a
+    /// click on it would, and gives it back after (spec 032, "The canvas and the tree").
+    View(ViewKind),
 }
 
 /// One tool: an allowed action under its tool name.
 #[derive(Debug)]
 pub struct UiTool {
     /// The tool's name: the action's, with `::` as `_`, the `studio_` namespaces shortened, and
-    /// the workspace's own actions (namespace `studio`) under `workspace_`.
+    /// the workspace's own actions (namespace `studio`) under `workspace_`; a few are named
+    /// for what an agent asks ([`RENAMED`]).
     pub name: &'static str,
     /// The action it dispatches, by its registered name.
     pub action: &'static str,
@@ -74,93 +81,358 @@ pub struct UiTool {
     /// The action gives what it shows the keyboard (a panel shown by its key does), which a
     /// tool must not: focus goes back where the person had it (spec 032, Focus).
     keeps_focus: bool,
+    pub on: On,
+    /// The tool takes an optional `node`, which the view selects, as a click does, before the
+    /// action runs on what is selected.
+    pub node: bool,
+    /// The action reads (an expansion): the answer waits for the view to have read and drawn
+    /// it, at most [`WAIT`].
+    pub waits: bool,
 }
 
-/// The actions an agent may call, and nothing else: the set is opt-in, so a new action is not
-/// a tool until it is added here, with what it needs. Each only opens or shows something. The
-/// test `never_a_tool` fails if one that writes, answers the agent's own requests, opens a link
-/// or a setting, or moves focus is added.
-pub static ALLOWED: &[UiTool] = &[
+/// How long a tool's answer waits for what its action reads.
+pub const WAIT: Duration = Duration::from_secs(15);
+
+const fn workspace(name: &'static str, action: &'static str, needs: &'static [Need]) -> UiTool {
     UiTool {
-        name: "graph_open_type",
-        action: "studio_graph::OpenType",
-        needs: &[
-            Need::Session,
-            Need::Type("type_name"),
-            Need::NoRefilter("type_name"),
-        ],
+        name,
+        action,
+        needs,
         keeps_focus: false,
-    },
+        on: On::Workspace,
+        node: false,
+        waits: false,
+    }
+}
+
+const fn view(
+    kind: ViewKind,
+    name: &'static str,
+    action: &'static str,
+    node: bool,
+    waits: bool,
+) -> UiTool {
     UiTool {
-        name: "graph_open_node",
-        action: "studio_graph::OpenNode",
-        needs: &[Need::Session, Need::Type("type_name"), Need::Text("id")],
-        keeps_focus: false,
-    },
-    UiTool {
-        name: "graph_open_node_page",
-        action: "studio_graph::OpenNodePage",
-        needs: &[Need::Session, Need::Type("type_name"), Need::Text("id")],
-        keeps_focus: false,
-    },
-    UiTool {
-        name: "graph_show_node_on_canvas",
-        action: "studio_graph::ShowNodeOnCanvas",
-        needs: &[Need::Session, Need::Type("type_name"), Need::Text("id")],
-        keeps_focus: false,
-    },
-    UiTool {
-        name: "graph_show_node_in_tree",
-        action: "studio_graph::ShowNodeInTree",
-        needs: &[Need::Session, Need::Type("type_name"), Need::Text("id")],
-        keeps_focus: false,
-    },
-    UiTool {
-        name: "graph_open_map",
-        action: "studio_graph::OpenMap",
-        needs: &[Need::Session],
-        keeps_focus: false,
-    },
-    UiTool {
-        name: "graph_open_source",
-        action: "studio_graph::OpenSource",
-        needs: &[Need::Session, Need::MaybeType("type_name")],
-        keeps_focus: false,
-    },
-    UiTool {
-        name: "graph_open_branch",
-        action: "studio_graph::OpenBranch",
-        needs: &[Need::Session, Need::Branch("branch")],
-        keeps_focus: false,
-    },
-    UiTool {
-        name: "graph_open_branch_history",
-        action: "studio_graph::OpenBranchHistory",
-        needs: &[Need::Session, Need::Branch("branch")],
-        keeps_focus: false,
-    },
-    UiTool {
-        name: "graph_open_commit",
-        action: "studio_graph::OpenCommit",
-        needs: &[Need::Session, Need::Text("commit_id")],
-        keeps_focus: false,
-    },
-    UiTool {
-        name: "graph_new_query_with_text",
-        action: "studio_graph::NewQueryWithText",
-        needs: &[Need::Session],
-        keeps_focus: false,
-    },
-    UiTool {
-        name: "workspace_activate_panel",
-        action: "studio::ActivatePanel",
-        needs: &[Need::Panel("id")],
+        name,
+        action,
+        needs: &[],
         keeps_focus: true,
+        on: On::View(kind),
+        node,
+        waits,
+    }
+}
+
+const fn canvas(name: &'static str, action: &'static str, node: bool, waits: bool) -> UiTool {
+    view(ViewKind::Canvas, name, action, node, waits)
+}
+
+const fn tree(name: &'static str, action: &'static str, node: bool, waits: bool) -> UiTool {
+    view(ViewKind::Tree, name, action, node, waits)
+}
+
+/// The tools named for what an agent asks rather than after their action.
+pub const RENAMED: &[&str] = &[
+    "canvas_expand",
+    "canvas_collapse",
+    "tree_expand",
+    "tree_collapse",
+    "tree_expand_row",
+    "tree_collapse_row",
+    "map_back",
+    "map_show_domains",
+    "map_select_next",
+    "map_select_previous",
+    "map_open",
+];
+
+/// The actions an agent may call, and nothing else: the set is opt-in, so a new action is not
+/// a tool until it is added here, with what it needs. Each only opens, shows or walks
+/// something. The test `never_a_tool` fails if one that writes, answers the agent's own
+/// requests, opens a link or a setting, or moves focus is added.
+pub static ALLOWED: &[UiTool] = &[
+    workspace(
+        "graph_open_type",
+        "studio_graph::OpenType",
+        &[Need::Session, Need::Type("type_name")],
+    ),
+    workspace(
+        "graph_open_node",
+        "studio_graph::OpenNode",
+        &[Need::Session, Need::Type("type_name"), Need::Text("id")],
+    ),
+    workspace(
+        "graph_open_node_page",
+        "studio_graph::OpenNodePage",
+        &[Need::Session, Need::Type("type_name"), Need::Text("id")],
+    ),
+    workspace(
+        "graph_show_node_on_canvas",
+        "studio_graph::ShowNodeOnCanvas",
+        &[Need::Session, Need::Type("type_name"), Need::Text("id")],
+    ),
+    workspace(
+        "graph_show_node_in_tree",
+        "studio_graph::ShowNodeInTree",
+        &[Need::Session, Need::Type("type_name"), Need::Text("id")],
+    ),
+    workspace(
+        "graph_show_results_on_canvas",
+        "studio_graph::ShowResultsOnCanvas",
+        &[Need::Session],
+    ),
+    workspace("graph_open_map", "studio_graph::OpenMap", &[Need::Session]),
+    workspace(
+        "graph_open_source",
+        "studio_graph::OpenSource",
+        &[Need::Session, Need::MaybeType("type_name")],
+    ),
+    workspace(
+        "graph_open_branch",
+        "studio_graph::OpenBranch",
+        &[Need::Session, Need::Branch("branch")],
+    ),
+    workspace(
+        "graph_open_branch_history",
+        "studio_graph::OpenBranchHistory",
+        &[Need::Session, Need::Branch("branch")],
+    ),
+    workspace(
+        "graph_open_commit",
+        "studio_graph::OpenCommit",
+        &[Need::Session, Need::Text("commit_id")],
+    ),
+    workspace(
+        "graph_new_query_with_text",
+        "studio_graph::NewQueryWithText",
+        &[Need::Session],
+    ),
+    UiTool {
+        keeps_focus: true,
+        ..workspace(
+            "workspace_activate_panel",
+            "studio::ActivatePanel",
+            &[Need::Panel("id")],
+        )
     },
+    // The canvas (spec 032, "The canvas and the tree").
+    canvas(
+        "canvas_select_node",
+        "studio_canvas::SelectNode",
+        false,
+        false,
+    ),
+    canvas(
+        "canvas_expand",
+        "studio_canvas::ExpandNeighbourhood",
+        false,
+        true,
+    ),
+    canvas(
+        "canvas_collapse",
+        "studio_canvas::CollapseNodes",
+        false,
+        false,
+    ),
+    canvas(
+        "canvas_expand_node",
+        "studio_canvas::ExpandNode",
+        true,
+        true,
+    ),
+    canvas(
+        "canvas_collapse_node",
+        "studio_canvas::CollapseNode",
+        true,
+        false,
+    ),
+    canvas("canvas_show_more", "studio_canvas::ShowMore", false, true),
+    canvas(
+        "canvas_hide_nodes",
+        "studio_canvas::HideNodes",
+        false,
+        false,
+    ),
+    canvas(
+        "canvas_show_hidden",
+        "studio_canvas::ShowHidden",
+        false,
+        false,
+    ),
+    canvas("canvas_pin_nodes", "studio_canvas::PinNodes", false, false),
+    canvas(
+        "canvas_unpin_nodes",
+        "studio_canvas::UnpinNodes",
+        false,
+        false,
+    ),
+    canvas(
+        "canvas_reroot_here",
+        "studio_canvas::RerootHere",
+        true,
+        false,
+    ),
+    canvas("canvas_move_left", "studio_canvas::MoveLeft", true, false),
+    canvas("canvas_move_right", "studio_canvas::MoveRight", true, false),
+    canvas("canvas_move_up", "studio_canvas::MoveUp", true, false),
+    canvas("canvas_move_down", "studio_canvas::MoveDown", true, false),
+    canvas(
+        "canvas_open_selected_page",
+        "studio_canvas::OpenSelectedPage",
+        true,
+        false,
+    ),
+    canvas(
+        "canvas_focus_selected",
+        "studio_canvas::FocusSelected",
+        true,
+        false,
+    ),
+    canvas(
+        "canvas_follow_relationship",
+        "studio_canvas::FollowRelationship",
+        true,
+        true,
+    ),
+    canvas("canvas_walk_back", "studio_canvas::WalkBack", false, false),
+    canvas(
+        "canvas_walk_forward",
+        "studio_canvas::WalkForward",
+        false,
+        false,
+    ),
+    canvas(
+        "canvas_select_all",
+        "studio_canvas::SelectAll",
+        false,
+        false,
+    ),
+    canvas(
+        "canvas_clear_selection",
+        "studio_canvas::ClearSelection",
+        false,
+        false,
+    ),
+    canvas(
+        "canvas_fit_to_window",
+        "studio_canvas::FitToWindow",
+        false,
+        false,
+    ),
+    canvas("canvas_zoom_in", "studio_canvas::ZoomIn", false, false),
+    canvas("canvas_zoom_out", "studio_canvas::ZoomOut", false, false),
+    canvas(
+        "canvas_reset_layout",
+        "studio_canvas::ResetLayout",
+        false,
+        false,
+    ),
+    view(
+        ViewKind::Table,
+        "table_show_row_on_canvas",
+        "studio_table::ShowRowOnCanvas",
+        false,
+        false,
+    ),
+    // The schema's map.
+    view(
+        ViewKind::Map,
+        "map_back",
+        "studio_ontology::Back",
+        false,
+        false,
+    ),
+    view(
+        ViewKind::Map,
+        "map_show_domains",
+        "studio_ontology::ShowDomains",
+        false,
+        false,
+    ),
+    view(
+        ViewKind::Map,
+        "map_select_next",
+        "studio_ontology::SelectNext",
+        false,
+        false,
+    ),
+    view(
+        ViewKind::Map,
+        "map_select_previous",
+        "studio_ontology::SelectPrevious",
+        false,
+        false,
+    ),
+    view(
+        ViewKind::Map,
+        "map_open",
+        "studio_ontology::Open",
+        false,
+        false,
+    ),
+    // The relationship tree.
+    tree("tree_select_node", "studio_tree::SelectNode", false, false),
+    tree(
+        "tree_expand",
+        "studio_tree::ExpandNeighbourhood",
+        false,
+        true,
+    ),
+    tree("tree_collapse", "studio_tree::CollapseNodes", false, false),
+    tree("tree_select_next", "studio_tree::SelectNext", true, false),
+    tree(
+        "tree_select_previous",
+        "studio_tree::SelectPrevious",
+        true,
+        false,
+    ),
+    tree("tree_expand_row", "studio_tree::Expand", true, true),
+    tree("tree_collapse_row", "studio_tree::Collapse", true, false),
+    tree("tree_expand_all", "studio_tree::ExpandAll", true, true),
+    tree("tree_collapse_all", "studio_tree::CollapseAll", true, false),
+    tree(
+        "tree_open_selected",
+        "studio_tree::OpenSelected",
+        true,
+        true,
+    ),
+    tree("tree_reroot_here", "studio_tree::RerootHere", true, false),
+    tree(
+        "tree_show_on_canvas",
+        "studio_tree::ShowOnCanvas",
+        true,
+        false,
+    ),
+    tree("tree_open_table", "studio_tree::OpenTable", true, false),
+    tree("tree_open_page", "studio_tree::OpenPage", true, false),
+    tree(
+        "tree_clear_filter",
+        "studio_tree::ClearFilter",
+        false,
+        false,
+    ),
+    tree(
+        "tree_toggle_empty_groups",
+        "studio_tree::ToggleEmptyGroups",
+        false,
+        false,
+    ),
 ];
 
 /// The tools that only read the window.
-pub const READS: [&str; 3] = ["studio_windows", "studio_tabs", "studio_selection"];
+pub const READS: [&str; 5] = [
+    "studio_windows",
+    "studio_tabs",
+    "studio_selection",
+    "studio_canvas",
+    "studio_tree",
+];
+
+/// The most nodes `studio_canvas` and `studio_tree` name, and the most edges.
+pub const MAX_VIEW_NODES: usize = 500;
+
+/// The most nodes, edges and relationships a canvas or tree tool's answer lists as changed.
+pub const MAX_CHANGED: usize = 200;
 
 /// A tool's name from its action's: `studio_graph::OpenType` is `graph_open_type`, and
 /// `studio::ActivatePanel`, an action of the workspace, `workspace_activate_panel`.
@@ -268,7 +540,40 @@ pub fn definitions(target: Target, cx: &App) -> Vec<Value> {
             ),
             "inputSchema": with_window(Map::from_iter([("type".into(), json!("object"))])),
         }),
+        json!({
+            "name": "studio_canvas",
+            "description": format!(
+                "What the active canvas of a window draws, as identifiers and the names the \
+                 person sees: its root; its nodes as [type, id, name] (at most \
+                 {MAX_VIEW_NODES}, with `truncated`); its edges as [from, to, relationship], \
+                 indices into `nodes`; its relationships as [node, relationship, other type, \
+                 count, open, shown]; what is selected; its zoom; whether the node cap left \
+                 nodes out; and the walk's history. Never property values."
+            ),
+            "inputSchema": with_window(Map::from_iter([("type".into(), json!("object"))])),
+        }),
+        json!({
+            "name": "studio_tree",
+            "description": format!(
+                "What the active relationship tree of a window shows: its root; its \
+                 relationships as [node, relationship, other type, count, open, shown], \
+                 indices into `nodes`; the nodes shown as [type, id, name] (at most \
+                 {MAX_VIEW_NODES}, with `truncated`); and what is selected. Never property \
+                 values."
+            ),
+            "inputSchema": with_window(Map::from_iter([("type".into(), json!("object"))])),
+        }),
     ];
+    let node = json!({
+        "type": "object",
+        "description": "The node to act on, selected first as a click would: its type and id. \
+                        Without it, the view's selected node.",
+        "properties": {
+            "type_name": { "type": "string" },
+            "id": { "type": "string" },
+        },
+        "required": ["type_name", "id"],
+    });
     for tool in ALLOWED {
         let mut schema = match cx.action_schema_by_name(tool.action, &mut generator) {
             Some(Some(schema)) => schema.to_value(),
@@ -280,9 +585,20 @@ pub fn definitions(target: Target, cx: &App) -> Vec<Value> {
             object.remove("description");
             if let Some(properties) = object.get_mut("properties").and_then(Value::as_object_mut) {
                 properties.remove("preview");
+                properties.remove("separate");
             }
             if let Some(required) = object.get_mut("required").and_then(Value::as_array_mut) {
                 required.retain(|name| name != "preview");
+            }
+            if tool.node {
+                object
+                    .entry("properties")
+                    .or_insert_with(|| json!({}))
+                    .as_object_mut()
+                    .map(|properties| properties.insert("node".into(), node.clone()));
+            }
+            if !object.contains_key("type") {
+                object.insert("type".into(), json!("object"));
             }
         }
         let description = documentation
@@ -510,6 +826,8 @@ async fn target_window(
     let Some(tool) = tool else {
         let read = handle.update(cx, |workspace, window, cx| match name {
             "studio_tabs" => tabs(id, workspace, window, cx),
+            "studio_canvas" => view_read(id, ViewKind::Canvas, workspace, cx),
+            "studio_tree" => view_read(id, ViewKind::Tree, workspace, cx),
             _ => selection(id, workspace, cx),
         });
         return read.unwrap_or_else(|_| Answer::window_closed(id));
@@ -523,13 +841,42 @@ async fn target_window(
         Ok(Err(answer)) => return answer,
         Ok(Ok(before)) => before,
     };
-    // The action ran as the first update's effects were flushed.
+    // The action ran as the first update's effects were flushed. One that reads is waited for
+    // until the view has read and drawn what it opened, at most `WAIT`.
+    // A view tool waits for its view to have laid out what changed, whether or not it reads.
+    if let Some(item) = before.view_item {
+        let deadline = cx.background_executor().now() + WAIT;
+        loop {
+            // No redraw is asked for: a view that changed notifies, and is drawn (drawing.md).
+            let busy = handle.update(cx, |workspace, _, cx| {
+                workspace
+                    .all_items()
+                    .find(|tab| tab.item_id() == item)
+                    .is_some_and(|tab| tab.agent_busy(cx))
+            });
+            match busy {
+                Err(_) => return Answer::window_closed(id),
+                Ok(false) => break,
+                Ok(true) if cx.background_executor().now() >= deadline => break,
+                Ok(true) => cx.background_executor().timer(POLL).await,
+            }
+        }
+    }
     let second = handle.update(cx, |workspace, window, cx| {
-        let answer = changed(id, tool, &before, workspace, window, cx);
+        let stayed = before.view_item.is_some()
+            && workspace.active_item().map(|item| item.item_id()) == before.view_item;
+        let answer = if stayed {
+            view_changed(id, tool, &before, workspace, cx)
+        } else {
+            changed(id, tool, &before, workspace, window, cx)
+        };
         if tool.keeps_focus {
             keep_focus(&before, workspace, window, cx);
         }
-        if matches!(answer.outcome, "opened" | "shown" | "panel_shown") {
+        if matches!(
+            answer.outcome,
+            "opened" | "shown" | "panel_shown" | "changed" | "expanded" | "cap_reached"
+        ) {
             let agent = caller
                 .agent
                 .clone()
@@ -565,7 +912,13 @@ struct Front {
     active: Option<EntityId>,
     items: HashSet<EntityId>,
     panels: Vec<SharedString>,
+    /// A view tool's tab, and what an agent read of it before the call.
+    view_item: Option<EntityId>,
+    view: Option<AgentView>,
 }
+
+/// How often a call that waits looks at its view again.
+const POLL: Duration = Duration::from_millis(40);
 
 fn front(workspace: &Workspace, window: &Window, cx: &App) -> Front {
     Front {
@@ -574,6 +927,8 @@ fn front(workspace: &Workspace, window: &Window, cx: &App) -> Front {
         active: workspace.active_item().map(|item| item.item_id()),
         items: workspace.all_items().map(|item| item.item_id()).collect(),
         panels: workspace.shown_panels(),
+        view_item: None,
+        view: None,
     }
 }
 
@@ -597,17 +952,76 @@ fn dispatch(
             return Err(not_available(why));
         }
     }
+    // A view tool acts on the active tab, which must be that view, and on the node named.
+    let mut view_tab = None;
+    if let On::View(kind) = tool.on {
+        let Some(item) = workspace.active_item() else {
+            return Err(not_available(no_view(kind, None)));
+        };
+        if !shows(item, kind, cx) {
+            return Err(not_available(no_view(kind, Some(&describe(item, cx)))));
+        }
+        if let Err(refusal) = item.agent_check(tool.name, input, cx) {
+            let mut answer = Answer::new(
+                refusal.outcome,
+                refusal.says,
+                refusal.json,
+                refusal.outcome != "needs_confirmation",
+            );
+            answer.json["window"] = json!(id);
+            answer.json["action"] = json!(tool.action);
+            return Err(answer);
+        }
+        let named = tool
+            .node
+            .then(|| input.get("node").and_then(node_id))
+            .flatten();
+        if let Some((type_name, node)) = &named {
+            let shown = item.agent_view(cx).is_some_and(|view| {
+                view.nodes
+                    .iter()
+                    .any(|n| n.type_name == *type_name && n.id == *node)
+            });
+            if !shown {
+                return Err(not_available(not_shown(kind)));
+            }
+        }
+        view_tab = Some((
+            item.item_id(),
+            item.focus_handle(cx),
+            item.agent_view(cx),
+            named,
+        ));
+    }
     let mut data = input.as_object().cloned().unwrap_or_default();
     data.remove("window");
+    if tool.node {
+        data.remove("node");
+    }
     let mut generator = schemars::SchemaGenerator::default();
-    let takes_preview = cx
+    let schema = cx
         .action_schema_by_name(tool.action, &mut generator)
-        .flatten()
-        .is_some_and(|schema| schema.to_value().pointer("/properties/preview").is_some());
+        .flatten();
+    let takes_preview = schema
+        .as_ref()
+        .is_some_and(|schema| schema.as_value().pointer("/properties/preview").is_some());
     if takes_preview {
         data.insert("preview".into(), json!(true));
     }
-    let action = match cx.build_action(tool.action, Some(Value::Object(data))) {
+    // A filtered table opens as a tab of its own, which the person can close, and the type's
+    // open table is left as the person has it (spec 032, Focus).
+    if tool.name == "graph_open_type"
+        && data
+            .get("filter_id")
+            .is_some_and(|filter| !filter.is_null())
+    {
+        data.insert("separate".into(), json!(true));
+        // A preview would take the place of the type's table when that is the preview.
+        data.insert("preview".into(), json!(false));
+    }
+    // An action without arguments is built from none.
+    let data = schema.is_some().then_some(Value::Object(data));
+    let action = match cx.build_action(tool.action, data) {
         Ok(action) => action,
         Err(error) => {
             return Err(Answer::error(
@@ -617,21 +1031,304 @@ fn dispatch(
             ));
         }
     };
-    // With nothing focused an action reaches only global handlers, so the workspace takes
-    // focus first, as a click in the window would. Focus the person has is left where it is.
-    if window.focused(cx).is_none() {
-        let focus = workspace.focus_handle(cx);
-        window.focus(&focus, cx);
+    let mut before = front(workspace, window, cx);
+    match &view_tab {
+        // The view takes the keyboard, as a click on it would; `keep_focus` gives it back.
+        Some((_, focus, _, _)) => window.focus(focus, cx),
+        // With nothing focused an action reaches only global handlers, so the workspace takes
+        // focus first, as a click in the window would. Focus the person has is left where it
+        // is.
+        None if window.focused(cx).is_none() => {
+            let focus = workspace.focus_handle(cx);
+            window.focus(&focus, cx);
+        }
+        None => {}
     }
     if !window.is_action_available(action.as_ref(), cx) {
+        if let Some(focus) = &before.focus {
+            window.focus(focus, cx);
+        }
         return Err(not_available(format!(
             "{} is not available in this window now.",
             tool.name
         )));
     }
-    let before = front(workspace, window, cx);
+    if let Some((item, _, view, named)) = view_tab {
+        before.view_item = Some(item);
+        before.view = view;
+        // The node named is selected first, as a click selects it.
+        if let (Some((type_name, node)), On::View(kind)) = (named, tool.on) {
+            let select = match kind {
+                ViewKind::Tree => "studio_tree::SelectNode",
+                _ => "studio_canvas::SelectNode",
+            };
+            if let Ok(select) =
+                cx.build_action(select, Some(json!({ "type_name": type_name, "id": node })))
+            {
+                window.dispatch_action(select, cx);
+            }
+        }
+    }
     window.dispatch_action(action, cx);
     Ok(before)
+}
+
+/// A node an agent names: `{type_name, id}`.
+fn node_id(value: &Value) -> Option<(String, String)> {
+    Some((
+        value.get("type_name")?.as_str()?.to_owned(),
+        value.get("id")?.as_str()?.to_owned(),
+    ))
+}
+
+/// Whether `item` is the view `kind`: a query's result picture is a canvas too.
+fn shows(item: &dyn crate::ItemHandle, kind: ViewKind, cx: &App) -> bool {
+    match kind {
+        ViewKind::Canvas => item.agent_view(cx).is_some_and(|_| {
+            item.view_kind(cx)
+                .is_none_or(|view| view == ViewKind::Canvas)
+        }),
+        kind => item.view_kind(cx) == Some(kind),
+    }
+}
+
+/// Why a view tool has no view to act on.
+fn no_view(kind: ViewKind, tab: Option<&Value>) -> String {
+    let open = match kind {
+        ViewKind::Canvas => "graph_show_node_on_canvas",
+        ViewKind::Tree => "graph_show_node_in_tree",
+        ViewKind::Map => "graph_open_map",
+        _ => "graph_open_type",
+    };
+    let what = kind.label().to_lowercase();
+    match tab {
+        Some(tab) => format!(
+            "The active tab is {}, not a {what}. Open one with {open}, or bring one to the \
+             front with studio_tabs and the person's help",
+            tab_words(tab)
+        ),
+        None => format!("No tab is open. Open a {what} with {open}"),
+    }
+}
+
+/// Why a node named is not acted on: the view does not show it.
+fn not_shown(kind: ViewKind) -> String {
+    match kind {
+        ViewKind::Tree => "Not in this tree; expand a relationship that holds it or use \
+                           graph_show_node_in_tree"
+            .into(),
+        _ => "Not on this canvas; expand a neighbour or use graph_show_node_on_canvas".into(),
+    }
+}
+
+fn node_json(node: &AgentNode) -> Value {
+    json!({ "type_name": node.type_name, "id": node.id, "label": node.label })
+}
+
+fn pair_json((type_name, id): &(String, String)) -> Value {
+    json!({ "type_name": type_name, "id": id })
+}
+
+/// The first `MAX_CHANGED` of `items` as JSON, and whether more were left out.
+fn listed<T>(items: &[T], json: impl Fn(&T) -> Value) -> (Vec<Value>, bool) {
+    (
+        items.iter().take(MAX_CHANGED).map(json).collect(),
+        items.len() > MAX_CHANGED,
+    )
+}
+
+/// What a canvas or tree tool changed in its view: the nodes and edges drawn now and those
+/// added or removed, the relationships left closed, what is selected, and whether the node cap
+/// was reached.
+fn view_changed(id: u64, tool: &UiTool, before: &Front, workspace: &Workspace, cx: &App) -> Answer {
+    let Some(item) = workspace.active_item() else {
+        return Answer::window_closed(id);
+    };
+    let tab = describe(item, cx);
+    let old = before.view.clone().unwrap_or_default();
+    let new = item.agent_view(cx).unwrap_or_default();
+    let key = |node: &AgentNode| (node.type_name.clone(), node.id.clone());
+    let old_nodes: HashSet<(String, String)> = old.nodes.iter().map(key).collect();
+    let new_nodes: HashSet<(String, String)> = new.nodes.iter().map(key).collect();
+    let added: Vec<&AgentNode> = new
+        .nodes
+        .iter()
+        .filter(|node| !old_nodes.contains(&key(node)))
+        .collect();
+    let removed: Vec<&AgentNode> = old
+        .nodes
+        .iter()
+        .filter(|node| !new_nodes.contains(&key(node)))
+        .collect();
+    let old_edges: HashSet<&AgentEdge> = old.edges.iter().collect();
+    let edges_added: Vec<&AgentEdge> = new
+        .edges
+        .iter()
+        .filter(|edge| !old_edges.contains(edge))
+        .collect();
+    let old_groups: HashSet<(&(String, String), &String)> = old
+        .groups
+        .iter()
+        .map(|group| (&group.node, &group.relationship))
+        .collect();
+    let closed: Vec<&AgentGroup> = new
+        .groups
+        .iter()
+        .filter(|group| {
+            !group.expanded && !old_groups.contains(&(&group.node, &group.relationship))
+        })
+        .collect();
+    let (added_json, added_cut) = listed(&added, |node| node_json(node));
+    let (removed_json, removed_cut) = listed(&removed, |node| node_json(node));
+    let (edges_json, edges_cut) = listed(
+        &edges_added,
+        |edge| json!({ "from": pair_json(&edge.from), "to": pair_json(&edge.to), "relationship": edge.relationship }),
+    );
+    let (closed_json, closed_cut) = listed(
+        &closed,
+        |group| json!({ "node": pair_json(&group.node), "relationship": group.relationship, "other_type": group.other_type, "count": group.count }),
+    );
+    let still_reading = item.agent_busy(cx);
+    let expands = tool.name.ends_with("_expand");
+    let changed = !added.is_empty()
+        || !removed.is_empty()
+        || new.selected != old.selected
+        || new.facts != old.facts
+        || new.groups != old.groups;
+    let outcome = match () {
+        _ if expands && new.stopped.is_some() => "needs_confirmation",
+        _ if new.capped && (!old.capped || !added.is_empty()) => "cap_reached",
+        _ if expands && !added.is_empty() => "expanded",
+        _ if changed => "changed",
+        _ => "no_change",
+    };
+    let what = tab["view"].as_str().unwrap_or("view").to_lowercase();
+    let mut says = match outcome {
+        "no_change" => format!("{} changed nothing on the {what}", tool.name),
+        _ if !added.is_empty() || !removed.is_empty() => format!(
+            "{} added, {} removed: {} drawn",
+            studio_ui::plural(added.len(), "node", "nodes"),
+            removed.len(),
+            studio_ui::plural(new.nodes.len(), "node", "nodes"),
+        ),
+        _ => format!("{} changed the {what}", tool.name),
+    };
+    if outcome == "cap_reached" {
+        says.push_str("; the node cap was reached, so the canvas stopped there");
+    }
+    if let Some((nodes, reads)) = new.stopped {
+        says.push_str(&format!(
+            "; the second level would open {nodes} nodes with {reads} reads: call again with \
+             confirm: true to open it"
+        ));
+    }
+    if still_reading {
+        says.push_str("; still reading");
+    }
+    let mut json = json!({
+        "window": id,
+        "tab": tab,
+        "nodes_drawn": new.nodes.len(),
+        "edges_drawn": new.edges.len(),
+        "added": added_json,
+        "removed": removed_json,
+        "edges_added": edges_json,
+        "unexpanded": closed_json,
+        "truncated": added_cut || removed_cut || edges_cut || closed_cut,
+        "selected": new.selected,
+        "cap_reached": new.capped,
+        "still_reading": still_reading,
+    });
+    if let Some((nodes, reads)) = new.stopped {
+        json["needs_confirmation"] = json!({ "nodes": nodes, "reads": reads });
+    }
+    for (key, value) in &new.facts {
+        json[key] = value.clone();
+    }
+    Answer::new(outcome, says, json, false)
+}
+
+/// `studio_canvas` and `studio_tree`: what the active view draws, as compact lists: nodes as
+/// `[type, id, name]`, edges and relationships by index into the nodes.
+fn view_read(id: u64, kind: ViewKind, workspace: &Workspace, cx: &App) -> Answer {
+    let Some(item) = workspace.active_item() else {
+        return Answer::error("not_available", no_view(kind, None), Some(id));
+    };
+    if !shows(item, kind, cx) {
+        return Answer::error(
+            "not_available",
+            no_view(kind, Some(&describe(item, cx))),
+            Some(id),
+        );
+    }
+    let tab = describe(item, cx);
+    let view = item.agent_view(cx).unwrap_or_default();
+    let make = |limit: usize| {
+        let nodes: Vec<&AgentNode> = view.nodes.iter().take(limit).collect();
+        let at: std::collections::HashMap<(&str, &str), usize> = nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| ((node.type_name.as_str(), node.id.as_str()), index))
+            .collect();
+        let index = |pair: &(String, String)| at.get(&(pair.0.as_str(), pair.1.as_str())).copied();
+        let edges: Vec<Value> = view
+            .edges
+            .iter()
+            .filter_map(|edge| {
+                Some(json!([
+                    index(&edge.from)?,
+                    index(&edge.to)?,
+                    edge.relationship
+                ]))
+            })
+            .collect();
+        let groups: Vec<Value> = view
+            .groups
+            .iter()
+            .filter_map(|group| {
+                Some(json!([
+                    index(&group.node)?,
+                    group.relationship,
+                    group.other_type,
+                    group.count,
+                    group.expanded,
+                    group.shown
+                ]))
+            })
+            .collect();
+        let mut json = json!({
+            "window": id,
+            "tab": tab,
+            "root": view.root.as_ref().map(|root| json!([root.type_name, root.id, root.label])),
+            "nodes": nodes.iter().map(|node| json!([node.type_name, node.id, node.label])).collect::<Vec<_>>(),
+            "edges": edges,
+            "relationships": groups,
+            "selected": view.selected,
+            "cap_reached": view.capped,
+            "truncated": view.nodes.len() > nodes.len(),
+        });
+        for (key, value) in &view.facts {
+            json[key] = value.clone();
+        }
+        json
+    };
+    let mut limit = MAX_VIEW_NODES;
+    let mut json = make(limit);
+    while json.to_string().len() > ANSWER_BUDGET && limit > 0 {
+        limit /= 2;
+        json = make(limit);
+    }
+    let says = format!(
+        "{} {} drawn{}",
+        studio_ui::plural(view.nodes.len(), "node", "nodes"),
+        studio_ui::plural(view.edges.len(), "edge", "edges"),
+        if json["truncated"] == json!(true) {
+            format!(", the first {limit} named")
+        } else {
+            String::new()
+        }
+    );
+    Answer::new("read", says, json, false)
 }
 
 /// Whether the window meets one need, or why not in words.
@@ -684,27 +1381,6 @@ fn check(need: Need, input: &Value, workspace: &Workspace, cx: &App) -> Result<(
                     Err(format!("{branch} is not a branch of {}", session.graph_id))
                 }
                 _ => Ok(()),
-            }
-        }
-        Need::NoRefilter(key) => {
-            let filtered = input
-                .get("filter_id")
-                .is_some_and(|filter| !filter.is_null());
-            let type_name = text(key).unwrap_or_default();
-            let at_commit = input.get("at_commit").and_then(Value::as_str);
-            let open = workspace.all_items().any(|item| {
-                item.thing(cx) == Some(Thing::Type(type_name.to_owned()))
-                    && item.view_kind(cx) == Some(ViewKind::Table)
-                    && item.held_at(cx).as_deref() == at_commit
-            });
-            if filtered && open {
-                Err(format!(
-                    "A {type_name} table is open in this window, and a tool does not change an \
-                     open tab's filters. Call graph_open_type without filter_id to show it, or \
-                     graph_show_node_in_tree to walk from the node"
-                ))
-            } else {
-                Ok(())
             }
         }
         Need::Panel(key) => {
@@ -761,8 +1437,34 @@ fn changed(
     if after.active != before.active || !after.items.is_subset(&before.items) {
         let new = after.active.is_some_and(|tab| !before.items.contains(&tab));
         if let Some(item) = workspace.active_item() {
-            let tab = describe(item, cx);
-            let words = tab_words(&tab);
+            let mut tab = describe(item, cx);
+            // A node's tab is named by its id until the node is read; the name the session
+            // already holds is said with it (spec 032).
+            if let Some(Thing::Node { type_name, id }) = item.thing(cx) {
+                let label = item
+                    .agent_view(cx)
+                    .and_then(|view| view.root)
+                    .filter(|root| root.type_name == type_name && root.id == id)
+                    .and_then(|root| root.label)
+                    .or_else(|| {
+                        workspace
+                            .session()
+                            .and_then(|session| session.read(cx).known_label(&type_name, &id))
+                    });
+                if let Some(label) = label {
+                    tab["label"] = json!(label);
+                }
+            }
+            let words = match tab["label"].as_str() {
+                Some(label)
+                    if !tab["title"]
+                        .as_str()
+                        .is_some_and(|title| title.contains(label)) =>
+                {
+                    format!("{} ({label})", tab_words(&tab))
+                }
+                _ => tab_words(&tab),
+            };
             let (outcome, verb) = if new {
                 ("opened", "Opened")
             } else {
@@ -916,7 +1618,16 @@ fn selection(id: u64, workspace: &Workspace, cx: &App) -> Answer {
             false,
         );
     };
-    let tab = describe(item, cx);
+    let mut tab = describe(item, cx);
+    // On a canvas or a tree, how much more there is to read with studio_canvas or
+    // studio_tree (spec 032).
+    if let Some(view) = item.agent_view(cx) {
+        tab["drawn"] = json!({
+            "nodes": view.nodes.len(),
+            "edges": view.edges.len(),
+            "relationships": view.groups.len(),
+        });
+    }
     let Some(selected) = item.selected_ids(cx) else {
         return Answer::new(
             "read",
@@ -1162,14 +1873,18 @@ mod tests {
                 "{} is never a tool",
                 tool.action
             );
+            // A table's row shown on a canvas only opens a canvas.
             assert!(
-                !NEVER_NAMESPACES
-                    .iter()
-                    .any(|namespace| tool.action.starts_with(namespace)),
+                tool.action == "studio_table::ShowRowOnCanvas"
+                    || !NEVER_NAMESPACES
+                        .iter()
+                        .any(|namespace| tool.action.starts_with(namespace)),
                 "{} comes from a namespace no tool comes from",
                 tool.action
             );
-            assert_eq!(tool.name, tool_name(tool.action), "named after its action");
+            if !RENAMED.contains(&tool.name) {
+                assert_eq!(tool.name, tool_name(tool.action), "named after its action");
+            }
             assert!(!READS.contains(&tool.name));
         }
         for never in NEVER {

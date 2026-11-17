@@ -74,6 +74,74 @@ pub struct SelectedIds {
     pub root: Option<(String, String)>,
 }
 
+/// A node as an agent reads a canvas or a tree (spec 032): its type, its id, and the name the
+/// person sees, when known.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AgentNode {
+    pub type_name: String,
+    pub id: String,
+    pub label: Option<String>,
+}
+
+/// An edge drawn between two nodes, from the first's side: `out:WorksAt` from a person to a
+/// company. A query's result picture links nodes with no relationship named.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AgentEdge {
+    pub from: (String, String),
+    pub to: (String, String),
+    pub relationship: Option<String>,
+}
+
+/// One relationship of a node as a view shows it: open or not, how many it has when counted,
+/// and how many of them are shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentGroup {
+    pub node: (String, String),
+    pub relationship: String,
+    pub other_type: String,
+    pub count: Option<u64>,
+    pub expanded: bool,
+    pub shown: usize,
+}
+
+/// What an agent reads of a view that walks the graph (spec 032): identifiers, the names the
+/// person already sees, and how the view holds them. Never a property value beyond a name.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AgentView {
+    pub root: Option<AgentNode>,
+    pub nodes: Vec<AgentNode>,
+    pub edges: Vec<AgentEdge>,
+    pub groups: Vec<AgentGroup>,
+    /// What is selected, as JSON: a node, a relationship, or a "+K more".
+    pub selected: Option<serde_json::Value>,
+    /// The node cap left nodes out.
+    pub capped: bool,
+    /// The last expansion's second level was not opened for want of a confirmation: the nodes
+    /// and reads it would have asked about.
+    pub stopped: Option<(usize, usize)>,
+    /// What else the view says: its zoom, its history, nodes hidden.
+    pub facts: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Why a view will not take an agent's call (spec 032): the outcome by name, the words, and
+/// any JSON to add (the counts a confirmation would show).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentRefusal {
+    pub outcome: &'static str,
+    pub says: String,
+    pub json: serde_json::Value,
+}
+
+impl AgentRefusal {
+    pub fn not_available(says: impl Into<String>) -> Self {
+        Self {
+            outcome: "not_available",
+            says: says.into(),
+            json: serde_json::json!({}),
+        }
+    }
+}
+
 /// What a tab adds to the status bar (spec 002): a few facts after the graph and branch, as
 /// Zed's status items, and the keys it answers, which the bar lists in a panel behind one
 /// button rather than spelling them out. A tab's controls belong in the tab.
@@ -151,6 +219,29 @@ pub trait Item: Render + Focusable + EventEmitter<ItemEvent> {
         None
     }
 
+    /// What an agent reads of the tab, when it walks the graph (spec 032): a canvas or a tree.
+    fn agent_view(&self, _cx: &App) -> Option<AgentView> {
+        None
+    }
+
+    /// The tab is still reading or laying out what an agent's call opened: the call's answer
+    /// waits for it, at most a few seconds.
+    fn agent_busy(&self, _cx: &App) -> bool {
+        false
+    }
+
+    /// Whether the tab takes the agent's call `tool` with `input`, before it is dispatched: a
+    /// node named that the view does not show, an expansion past what is opened without
+    /// asking.
+    fn agent_check(
+        &self,
+        _tool: &str,
+        _input: &serde_json::Value,
+        _cx: &App,
+    ) -> Result<(), AgentRefusal> {
+        Ok(())
+    }
+
     /// The view this tab is (spec 020): by default the current entry of its view strip.
     fn view_kind(&self, cx: &App) -> Option<studio_actions::ViewKind> {
         self.views(cx)
@@ -220,6 +311,14 @@ pub trait ItemHandle: 'static {
     fn held_at(&self, cx: &App) -> Option<String>;
     fn selected_ids(&self, cx: &App) -> Option<SelectedIds>;
     fn view_kind(&self, cx: &App) -> Option<studio_actions::ViewKind>;
+    fn agent_view(&self, cx: &App) -> Option<AgentView>;
+    fn agent_busy(&self, cx: &App) -> bool;
+    fn agent_check(
+        &self,
+        tool: &str,
+        input: &serde_json::Value,
+        cx: &App,
+    ) -> Result<(), AgentRefusal>;
     fn inspected(&self, cx: &mut App) -> Option<Inspected>;
     fn is_dirty(&self, cx: &App) -> bool;
     fn is_stale(&self, cx: &App) -> bool;
@@ -274,6 +373,23 @@ impl<T: Item> ItemHandle for Entity<T> {
 
     fn view_kind(&self, cx: &App) -> Option<studio_actions::ViewKind> {
         self.read(cx).view_kind(cx)
+    }
+
+    fn agent_view(&self, cx: &App) -> Option<AgentView> {
+        self.read(cx).agent_view(cx)
+    }
+
+    fn agent_busy(&self, cx: &App) -> bool {
+        self.read(cx).agent_busy(cx)
+    }
+
+    fn agent_check(
+        &self,
+        tool: &str,
+        input: &serde_json::Value,
+        cx: &App,
+    ) -> Result<(), AgentRefusal> {
+        self.read(cx).agent_check(tool, input, cx)
     }
 
     fn inspected(&self, cx: &mut App) -> Option<Inspected> {
