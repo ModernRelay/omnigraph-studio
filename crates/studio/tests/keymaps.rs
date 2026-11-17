@@ -30,7 +30,7 @@ const KEYMAPS: [(&str, &str); 3] = [
 
 /// The actions without a default key, as in Zed: rare, or destructive enough that a key would
 /// be reached by accident. Each is in the command palette, and most in a menu as well.
-const PALETTE_ONLY: [&str; 30] = [
+const PALETTE_ONLY: [&str; 32] = [
     "studio_graph::OpenAsReview",
     "studio_graph::OpenAsHistory",
     "studio_graph::OpenAsTable",
@@ -65,6 +65,10 @@ const PALETTE_ONLY: [&str; 30] = [
     // command again (spec 032).
     "studio::ToggleOutsideAgents",
     "studio::ReplaceAgentToken",
+    // What a click, a chip's menu or ⌘-click does on a canvas or in a tree, as an action an
+    // agent calls too (spec 032): rare by key, each in the palette.
+    "studio_canvas::ShowHidden",
+    "studio_canvas::RerootHere",
 ];
 
 /// The platform's command modifier, as keymaps write it.

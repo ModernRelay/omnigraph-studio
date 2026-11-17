@@ -85,15 +85,15 @@ async fn graph_open_type_opens_the_table(cx: &mut TestAppContext) {
     assert_eq!(answer.says, "Opened Person · Table");
     let again = run(cx, id, "graph_open_type", json!({ "type_name": "Person" })).await;
     assert_eq!(again.outcome, "no_change");
-    // A filter would change the open table's: refused, and the table is as it was.
+    // With a table of the type open, a filtered one opens as a tab of its own, and the open
+    // table is left as the person has it; the same filter again shows that tab.
     let filtered = json!({ "type_name": "Person", "filter_id": "person-000000" });
-    let refused = run(cx, id, "graph_open_type", filtered).await;
-    assert_eq!(refused.outcome, "not_available");
-    assert!(
-        refused
-            .says
-            .starts_with("A Person table is open in this window")
-    );
+    let opened = run(cx, id, "graph_open_type", filtered.clone()).await;
+    assert_eq!(opened.outcome, "opened", "{opened:?}");
+    let tabs = run(cx, id, "studio_tabs", json!({})).await;
+    assert_eq!(tabs.json["panes"][0]["tabs"].as_array().unwrap().len(), 2);
+    let again = run(cx, id, "graph_open_type", filtered).await;
+    assert_eq!(again.outcome, "no_change", "{again:?}");
     let wrong = run(cx, id, "graph_open_type", json!({ "type_name": "Planet" })).await;
     assert_eq!(wrong.outcome, "not_available");
     assert_eq!(wrong.says, "Planet is not a node or edge type of knowledge");

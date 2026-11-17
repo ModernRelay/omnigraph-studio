@@ -15,6 +15,8 @@ mod open_graph;
 mod organizations;
 mod settings_view;
 #[cfg(test)]
+mod ui_tools_canvas_tests;
+#[cfg(test)]
 mod ui_tools_tests;
 mod update_status;
 
