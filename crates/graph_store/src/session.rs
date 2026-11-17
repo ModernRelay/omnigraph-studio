@@ -17,8 +17,8 @@ use gq_language::{BuiltQuery, RelationshipGroup, SchemaModel, builder};
 use graph_client::api::{
     AccessAction, BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchMergeOutput,
     BranchMergeRequest, ChangeFeedOutput, ChangeOutput, ChangeRequest, CommitKind, CommitOutput,
-    DiffOutput, EntityKind, InvokeStoredQueryRequest, MergeBaseOutput, QueryCatalogEntry,
-    QueryRequest, ReadOutput, ReadTargetOutput,
+    DiffOutput, EntityKind, ErrorCode, InvokeStoredQueryRequest, MergeBaseOutput,
+    QueryCatalogEntry, QueryRequest, ReadOutput, ReadTargetOutput,
 };
 use graph_client::{
     ApiErrorSummary, BlobAt, BlobCell, BlobMeta, CommitChanges, FeedAt, GraphClient, ReadError,
@@ -638,6 +638,9 @@ pub enum SchemaFailure {
     Unauthorized,
     /// A 403: the credential may not read this graph.
     Forbidden,
+    /// A 403 `not_admitted` (Omnigraph 0.15.0 and later): the server admits no principal for
+    /// the signed-in identity, so signing in again cannot help.
+    NotAdmitted,
     /// No answer from the server: refused, timed out, DNS, TLS, or a proxy's error.
     Unreachable,
     /// Anything else: an answer Studio could not read, another contract, too large.
@@ -650,6 +653,7 @@ impl SchemaFailure {
             ReadError::Refused(refusal) => match refusal.status {
                 404 => Self::NotFound,
                 401 => Self::Unauthorized,
+                403 if refusal.code == Some(ErrorCode::NotAdmitted) => Self::NotAdmitted,
                 403 => Self::Forbidden,
                 _ => Self::Other,
             },
@@ -9752,6 +9756,30 @@ mod tests {
         assert_eq!(settled(&ordinary), Duration::from_secs(8));
         assert_eq!(mean(&ordinary), Duration::from_millis(4500));
         assert_eq!(hubs, [HUB; 3]);
+    }
+
+    /// A 403 that says the sign-in is not admitted (Omnigraph 0.15.0) is told apart from a
+    /// policy's refusal, since signing in again cannot help; any other 403 is a refusal.
+    #[test]
+    fn a_sign_in_not_admitted_is_not_a_policy_refusal() {
+        let refused = |code| {
+            ReadError::Refused(ApiErrorSummary {
+                status: 403,
+                message: "refused".into(),
+                code,
+                diagnostic: None,
+                change_diff_refusal: None,
+                challenge: None,
+                unauthorized: None,
+            })
+        };
+        assert_eq!(
+            SchemaFailure::of(&refused(Some(ErrorCode::NotAdmitted))),
+            SchemaFailure::NotAdmitted
+        );
+        for code in [Some(ErrorCode::Forbidden), Some(ErrorCode::Other), None] {
+            assert_eq!(SchemaFailure::of(&refused(code)), SchemaFailure::Forbidden);
+        }
     }
 
     /// A schema read the server answers 404 is kept as a graph not found, for the window's page;

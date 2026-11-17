@@ -409,6 +409,10 @@ impl Failure {
                     (None, Some(ErrorCode::Forbidden)) => {
                         "Your token may not read this graph or branch."
                     }
+                    (None, Some(ErrorCode::NotAdmitted)) => {
+                        "The server has not admitted your sign-in, and signing in again will not \
+                         help. Ask the server's operator to admit you."
+                    }
                     (None, Some(ErrorCode::BadRequest)) => {
                         "Fix the query (the problems list shows what the compiler sees) and run it again."
                     }
