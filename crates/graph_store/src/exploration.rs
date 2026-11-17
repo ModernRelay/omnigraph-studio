@@ -1730,6 +1730,10 @@ pub struct Exploration {
     /// Why the second level of the last expansion was not opened: what it would open, past
     /// what is opened without asking, with no confirmation given.
     deeper_stopped: Option<Opening>,
+    /// The look at the second level, after the change in hand ([`Self::owe_deeper`]).
+    deeper_owed: Option<Task<()>>,
+    /// How many neighbours of each relationship an expansion asked to be drawn.
+    expansion_limits: HashMap<GroupKey, usize>,
     _subscription: Subscription,
 }
 
@@ -1932,6 +1936,8 @@ impl Exploration {
             owed: false,
             deeper: None,
             deeper_stopped: None,
+            deeper_owed: None,
+            expansion_limits: HashMap::new(),
             _subscription: subscription,
         }
     }
@@ -2662,9 +2668,7 @@ impl Exploration {
         cx.emit(ExplorationEvent::Changed);
         cx.notify();
         // The first level of an expansion read, its second opens.
-        if self.deeper.is_some() && self.tasks.is_empty() && self.landed.is_empty() {
-            self.open_deeper(cx);
-        }
+        self.owe_deeper(cx);
     }
 
     /// How many reads are out: a view an agent drives waits for them before it answers.
@@ -2741,6 +2745,9 @@ impl Exploration {
         cx: &mut Context<Self>,
     ) {
         self.deeper_stopped = None;
+        for key in &plan.groups {
+            self.expansion_limits.insert(key.clone(), limit);
+        }
         self.deeper = (depth >= 2 && !plan.groups.is_empty()).then(|| Deeper {
             groups: plan.groups.clone(),
             relationships,
@@ -2752,9 +2759,34 @@ impl Exploration {
 
     /// Opens an expansion's second level: the neighbours its first level read.
     fn open_deeper(&mut self, cx: &mut Context<Self>) {
-        let Some(deeper) = self.deeper.take() else {
+        let Some(deeper) = self.deeper.clone() else {
             return;
         };
+        // Each relationship of the first level is read as far as the limit asks first: a count
+        // of none, a list read to its end, or as many rows as the limit. A list short of it
+        // reads its next page; one not read yet (a Refresh dropped it) waits for its read.
+        let mut waiting = false;
+        let mut started = false;
+        for key in &deeper.groups {
+            if matches!(self.state.counts.get(key), Some(Loadable::Loaded(0))) {
+                continue;
+            }
+            match self.state.neighbours.get(key) {
+                Some(list) if list.rows.len() >= deeper.limit || list.exhausted => {}
+                Some(list) if list.status == PageStatus::Idle => {
+                    waiting = true;
+                    started = true;
+                    self.start(LoadTarget::Page(key.clone()), cx);
+                }
+                _ => waiting = true,
+            }
+        }
+        // Nothing out will bring what is missing (the relationship was closed meanwhile):
+        // the second level opens from what was read.
+        if waiting && (started || !self.tasks.is_empty()) {
+            return;
+        }
+        self.deeper = None;
         let mut nodes: Vec<NodeRef> = Vec::new();
         for key in &deeper.groups {
             if let Some(list) = self.state.neighbours.get(key) {
@@ -2766,6 +2798,7 @@ impl Exploration {
             }
         }
         if nodes.is_empty() {
+            cx.notify();
             return;
         }
         let plan = self.plan_expand(&nodes, deeper.relationships.as_deref());
@@ -2774,7 +2807,38 @@ impl Exploration {
             cx.notify();
             return;
         }
+        for key in &plan.groups {
+            self.expansion_limits.insert(key.clone(), deeper.limit);
+        }
         self.set_open(&plan.paths, true, cx);
+    }
+
+    /// How many of a relationship's neighbours an expansion asked to be drawn, when one did:
+    /// a canvas draws that many, as it draws more after "+K more".
+    pub fn expansion_limit(&self, key: &GroupKey) -> Option<usize> {
+        self.expansion_limits.get(key).copied()
+    }
+
+    /// Every relationship's limit an expansion asked for ([`Self::expansion_limit`]).
+    pub fn expansion_limits(&self) -> &HashMap<GroupKey, usize> {
+        &self.expansion_limits
+    }
+
+    /// Looks at an expansion's second level after the change in hand has had its effects: a
+    /// Refresh drops what was read before it reads again, and the reads it starts are seen.
+    fn owe_deeper(&mut self, cx: &mut Context<Self>) {
+        if self.deeper.is_none() || self.deeper_owed.is_some() {
+            return;
+        }
+        self.deeper_owed = Some(cx.spawn(async move |this, cx| {
+            this.update(cx, |this, cx| {
+                this.deeper_owed = None;
+                if this.tasks.is_empty() && this.landed.is_empty() {
+                    this.open_deeper(cx);
+                }
+            })
+            .ok();
+        }));
     }
 
     fn request_missing(&mut self, cx: &mut Context<Self>) {
@@ -3248,9 +3312,7 @@ impl Exploration {
             cx.notify();
         }
         // The first level of an expansion read, its second opens.
-        if self.deeper.is_some() && self.tasks.is_empty() && self.landed.is_empty() {
-            self.open_deeper(cx);
-        }
+        self.owe_deeper(cx);
     }
 
     /// Takes a count read with the others asked for in its turn, read at `sent_at` (the head

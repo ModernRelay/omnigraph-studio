@@ -971,13 +971,13 @@ impl GraphCanvas {
         self.session.read(cx).schema_model()?;
         let exploration = self.exploration.read(cx);
         let entries = exploration.entries();
+        // What an expansion asked to be drawn of a relationship, unless "+K more" drew more.
+        let mut limits = self.hub_limits.clone();
+        for (key, limit) in exploration.expansion_limits() {
+            limits.entry(key.clone()).or_insert(*limit);
+        }
         Some(model::without(
-            model::explore_scene(
-                &entries,
-                exploration.state(),
-                &self.hub_limits,
-                self.node_cap(cx),
-            ),
+            model::explore_scene(&entries, exploration.state(), &limits, self.node_cap(cx)),
             &self.hidden,
         ))
     }

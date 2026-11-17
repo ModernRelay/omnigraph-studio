@@ -96,9 +96,6 @@ impl GraphCanvas {
             .read(cx)
             .plan_expand(&nodes, expansion.relationships.as_deref());
         let limit = expansion.limit_per_relationship.unwrap_or(HUB_STEP).max(1);
-        for key in &plan.groups {
-            self.hub_limits.insert(key.clone(), limit);
-        }
         let exploration = self.exploration.clone();
         let relationships = expansion.relationships.clone();
         let (depth, confirm) = (expansion.depth.max(1), expansion.confirm);
@@ -163,6 +160,10 @@ impl GraphCanvas {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A query's result picture draws its result whole.
+        if !self.draws_exploration() {
+            return;
+        }
         let root = self.exploration.read(cx).root().cloned();
         let nodes: Vec<NodeRef> = self
             .target_nodes(&action.nodes)
@@ -315,6 +316,11 @@ impl GraphCanvas {
         });
         let mut facts = serde_json::Map::new();
         facts.insert("zoom".into(), json!((self.zoom * 100.).round() / 100.));
+        // Where the view is centred, in the layout's units: it says the camera moved.
+        facts.insert(
+            "center".into(),
+            json!([self.center.x.round(), self.center.y.round()]),
+        );
         facts.insert(
             "history".into(),
             json!({
@@ -396,10 +402,12 @@ impl GraphCanvas {
                     "Name the nodes (`nodes`), or select or mark some first",
                 ));
             }
-            "canvas_expand" if !self.draws_exploration() => {
+            "canvas_expand" | "canvas_hide_nodes" | "canvas_show_hidden"
+                if !self.draws_exploration() =>
+            {
                 return Err(AgentRefusal::not_available(
-                    "This canvas shows a query's result; expand on a walk from a node \
-                     (graph_show_node_on_canvas)",
+                    "This canvas shows a query's result whole; expand or hide on a walk from a \
+                     node (graph_show_node_on_canvas)",
                 ));
             }
             "canvas_expand" => {
