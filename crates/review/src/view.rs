@@ -152,6 +152,45 @@ impl From<MergeSettled> for Check {
     }
 }
 
+/// The conflicts a merge or its dry run stops on, and each one's place by its type and entity,
+/// made together where the conflicts are, so a drawn card finds its own in one lookup and the
+/// two never drift apart (spec 033).
+#[derive(Debug, Clone)]
+struct Conflicts {
+    list: Vec<MergeConflictOutput>,
+    by_entity: HashMap<(String, String), usize>,
+}
+
+impl Conflicts {
+    fn new(list: Vec<MergeConflictOutput>) -> Self {
+        let by_entity = list
+            .iter()
+            .enumerate()
+            .filter_map(|(ix, conflict)| {
+                Some((
+                    (conflict.type_name.clone(), conflict.entity_id.clone()?),
+                    ix,
+                ))
+            })
+            .collect();
+        Self { list, by_entity }
+    }
+
+    /// The conflict at the entity `id` of type `type_name`, if there is one.
+    fn of(&self, type_name: &str, id: &str) -> Option<&MergeConflictOutput> {
+        let &at = self.by_entity.get(&(type_name.to_owned(), id.to_owned()))?;
+        self.list.get(at)
+    }
+}
+
+impl std::ops::Deref for Conflicts {
+    type Target = [MergeConflictOutput];
+
+    fn deref(&self) -> &[MergeConflictOutput] {
+        &self.list
+    }
+}
+
 #[derive(Debug, Clone)]
 enum MergeState {
     Idle,
@@ -171,7 +210,7 @@ enum MergeState {
         /// The branch's deletion after the merge, when asked for: done, or why not.
         deleted: Option<Result<(), String>>,
     },
-    Conflicts(Vec<MergeConflictOutput>),
+    Conflicts(Conflicts),
     Refused(String),
     /// Never sent (its connection retired, the server refusing the connection, the request not
     /// made, or the branch's head not read before it): nothing was merged, and nothing is to be
@@ -380,7 +419,7 @@ enum Preview {
     Unread,
     Reading,
     Merges(BranchMergeOutcome),
-    Conflicts(Vec<MergeConflictOutput>),
+    Conflicts(Conflicts),
 }
 
 enum LoadState {
@@ -516,9 +555,6 @@ pub struct ReviewView {
     made_by: String,
     /// The large runs were folded once, when the review was first read (spec 033).
     folded_large: bool,
-    /// Each conflict's place in [`Self::conflicts`] by its type and entity, made when conflicts
-    /// land ([`Self::index_conflicts`]), so a drawn card finds its own in one lookup.
-    conflict_index: HashMap<(String, String), usize>,
     /// The changes' list, a view of its own drawn cached (`docs/drawing.md`): typing in the
     /// search, a field of this view, leaves it as it was until the search lands.
     list_view: Entity<ReviewRows>,
@@ -749,7 +785,6 @@ impl ReviewView {
             summary: String::new(),
             made_by: String::new(),
             folded_large: false,
-            conflict_index: HashMap::new(),
             list_view: ReviewRows::new(cx),
             ai_summary: SummaryState::None,
             collapsed_runs: HashSet::new(),
@@ -874,7 +909,6 @@ impl ReviewView {
                 );
                 self.branch_deleted = false;
                 self.merge = MergeState::Idle;
-                self.index_conflicts();
                 // Nothing of the deleted branch's review holds for this one: not a commit it was
                 // scoped to, which this branch may not hold, nor the marks made on its changes.
                 // Its cards stay shown while this one is read, so their marks go too, or the next
@@ -886,6 +920,9 @@ impl ReviewView {
                 self.reviewed_keys.clear();
                 self.expanded.clear();
                 self.whole_texts.clear();
+                // Its folds are the deleted branch's: this branch's long runs fold at first again.
+                self.collapsed_runs.clear();
+                self.folded_large = false;
                 self.reload(cx);
             }
             _ => return,
@@ -1059,7 +1096,6 @@ impl ReviewView {
                 self.settle_merge(cx);
             } else {
                 self.merge = MergeState::Idle;
-                self.index_conflicts();
             }
         }
         let session = self.session.clone();
@@ -1216,13 +1252,12 @@ impl ReviewView {
             let preview = match read.await {
                 Ok(graph_client::MergePreview::Merges(outcome)) => Preview::Merges(outcome),
                 Ok(graph_client::MergePreview::Conflicts(conflicts)) => {
-                    Preview::Conflicts(conflicts)
+                    Preview::Conflicts(Conflicts::new(conflicts))
                 }
                 Err(_) => Preview::Unread,
             };
             this.update(cx, |this, cx| {
                 this.preview = preview;
-                this.index_conflicts();
                 cx.notify();
             })
             .ok();
@@ -1266,7 +1301,7 @@ impl ReviewView {
     }
 
     /// The conflicts the conflicts view lists: a merge's, else a dry run's.
-    fn conflicts(&self) -> Option<&[MergeConflictOutput]> {
+    fn conflicts(&self) -> Option<&Conflicts> {
         match (&self.merge, &self.preview) {
             (MergeState::Conflicts(conflicts), _) => Some(conflicts),
             (MergeState::Idle, Preview::Conflicts(conflicts)) => Some(conflicts),
@@ -2207,7 +2242,7 @@ impl ReviewView {
             [] => commits,
             [one] => format!("{commits} by {one}"),
             [one, two] => format!("{commits} by {one} and {two}"),
-            many => format!("{commits} by {} people", many.len()),
+            many => format!("{commits} by {} actors", many.len()),
         }
     }
 
@@ -2232,39 +2267,11 @@ impl ReviewView {
         }
     }
 
-    /// Indexes the conflicts shown, by type and entity, as they land or change: a card drawn
-    /// finds its conflict in one lookup, whatever the number of conflicts (`docs/drawing.md`).
-    fn index_conflicts(&mut self) {
-        self.conflict_index = self
-            .conflicts()
-            .map(|conflicts| {
-                conflicts
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(ix, conflict)| {
-                        Some((
-                            (conflict.type_name.clone(), conflict.entity_id.clone()?),
-                            ix,
-                        ))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-    }
-
     /// The conflict a merge would stop on at the entity of `group`'s own change, by the dry
-    /// run or the merge, in words. The index is checked against the conflict it points to, so
-    /// one made for conflicts since replaced marks nothing wrongly.
+    /// run or the merge, in words: one lookup, whatever the number of conflicts.
     fn conflict_of(&self, data: &ReviewData, group: usize) -> Option<String> {
         let g = &data.groups.groups[group];
-        let conflicts = self.conflicts()?;
-        let &at = self
-            .conflict_index
-            .get(&(g.type_name.clone(), g.id.clone()))?;
-        let conflict = conflicts.get(at).filter(|conflict| {
-            conflict.type_name == g.type_name
-                && conflict.entity_id.as_deref() == Some(g.id.as_str())
-        })?;
+        let conflict = self.conflicts()?.of(&g.type_name, &g.id)?;
         let here = g.change.and_then(|own| data.folded.changes[own].net());
         Some(conflict_wording(conflict.kind, here, &self.target))
     }
@@ -2553,7 +2560,9 @@ impl ReviewView {
                     }
                 }
                 WriteOutcome::Refused(mut error) => match error.body.merge_conflicts.take() {
-                    Some(conflicts) if !conflicts.is_empty() => MergeState::Conflicts(conflicts),
+                    Some(conflicts) if !conflicts.is_empty() => {
+                        MergeState::Conflicts(Conflicts::new(conflicts))
+                    }
                     _ => MergeState::Refused(error.reason().to_owned()),
                 },
                 WriteOutcome::NotSent { reason } => MergeState::NotSent(reason),
@@ -2597,7 +2606,6 @@ impl ReviewView {
                     }
                     state => this.merge = state,
                 }
-                this.index_conflicts();
                 this.writes_settled(cx);
                 cx.emit(ItemEvent::UpdateTab);
                 cx.notify();
@@ -2628,7 +2636,7 @@ impl ReviewView {
         self.show_conflicts = !self.show_conflicts;
         if self.show_conflicts {
             self.conflict_list
-                .reset(self.conflicts().map_or(0, <[_]>::len));
+                .reset(self.conflicts().map_or(0, |conflicts| conflicts.len()));
         }
         cx.notify();
     }
@@ -3288,7 +3296,7 @@ impl ReviewView {
     }
 
     fn render_conflicts(&self, cx: &mut Context<Self>) -> AnyElement {
-        let count = self.conflicts().map_or(0, <[_]>::len);
+        let count = self.conflicts().map_or(0, |conflicts| conflicts.len());
         // A merge's own conflicts, or a dry run's read again, replace the list shown.
         if self.conflict_list.item_count() != count {
             self.conflict_list.reset(count);
@@ -4975,6 +4983,13 @@ impl Render for ReviewView {
             // the credential may merge, as their buttons and row clicks do.
             .on_action(cx.listener(|this, _: &Summarize, _, cx| this.summarize(cx)))
             .on_action(cx.listener(|this, _: &ToggleChange, _, cx| this.toggle_selected(cx)))
+            // The shared name a commit's tab answers to works here too, so one binding of it
+            // unfolds a change in both (spec 033).
+            .on_action(
+                cx.listener(|this, _: &studio_actions::changes::ToggleChange, _, cx| {
+                    this.toggle_selected(cx)
+                }),
+            )
             .when(self.selected_node().is_some(), |view| {
                 view.on_action(cx.listener(|this, _: &OpenChanged, window, cx| {
                     this.open_selected_page(window, cx)
@@ -5369,8 +5384,8 @@ pub(crate) mod tests {
         assert_eq!(renders(cx), before + 1);
     }
 
-    /// A card a merge would stop on says so, found through the conflicts' index; a list of
-    /// conflicts that replaced the one indexed marks nothing wrongly (spec 033).
+    /// A card a merge would stop on says so, found in one lookup of the conflicts; conflicts
+    /// that replaced them with none at that card mark nothing (spec 033).
     #[gpui::test]
     async fn a_card_a_merge_would_stop_on_says_so(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
@@ -5396,13 +5411,15 @@ pub(crate) mod tests {
                 entity_id: Some(id.to_owned()),
             };
             view._preview_task = None;
-            view.preview = Preview::Conflicts(vec![conflict("someone-else"), conflict(&id)]);
-            view.index_conflicts();
+            view.preview = Preview::Conflicts(Conflicts::new(vec![
+                conflict("someone-else"),
+                conflict(&id),
+            ]));
             let data = view.data.as_ref().expect("read");
             let status = view.group_status(data, 0).map(|(text, _)| text);
             assert_eq!(status.as_deref(), Some("Conflicts with main"));
-            // Conflicts that replaced those indexed, without an index of their own.
-            view.preview = Preview::Conflicts(vec![conflict("someone-else")]);
+            // Conflicts that replaced those, which hold no conflict at it.
+            view.preview = Preview::Conflicts(Conflicts::new(vec![conflict("someone-else")]));
             let data = view.data.as_ref().expect("read");
             assert!(view.conflict_of(data, 0).is_none());
         });
