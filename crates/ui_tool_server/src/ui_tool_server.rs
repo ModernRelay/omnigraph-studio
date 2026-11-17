@@ -1,6 +1,6 @@
-//! Studio's UI tool server (spec 032): MCP over Streamable HTTP on `127.0.0.1`, serving the UI
-//! tools of `studio_workspace::ui_tools` to the panel's agents and, when the person turns it on,
-//! to agents outside Studio. It makes no request to an Omnigraph server: a tool acts on a
+//! Studio's UI tools and the server that serves them (spec 032): the tools ([`tools`]) are
+//! Studio's own actions under an allow-list, and the server speaks MCP over Streamable HTTP on
+//! `127.0.0.1` to the panel's agents and, when the person turns it on, to agents outside Studio. It makes no request to an Omnigraph server: a tool acts on a
 //! window, and the views it opens read as they do when the person opens them.
 //!
 //! Each conversation gets a token of its own, bound to its window, while it runs
@@ -14,11 +14,13 @@
 //! Never logged: a token, a tool's input, node ids or tab titles. The log names the tool, the
 //! window and the outcome.
 //!
-//! Layer 5. `studio` starts it and sets `UiToolEndpoint`, so the agent panel reaches it
-//! without depending on it.
+//! Layer 5. Nothing else depends on this crate but `studio`, which starts it and hands the
+//! agent panel its entries, so the panel reaches it without depending on it; the workspace and
+//! the views know nothing of it.
 
 pub mod http;
 pub mod mcp;
+pub mod tools;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -29,9 +31,9 @@ use gpui::{App, AppContext as _, Global, Task};
 use graph_store::sign_in::{Keychain, PlatformKeychain};
 use serde_json::{Value, json};
 use studio_settings::{Access, StudioSettings};
-use studio_workspace::ui_tools::{self, Target, UiToolEntry};
 
 use crate::http::{Shared, TokenState};
+use crate::tools::{self as ui_tools, Target};
 
 /// The name an outside agent's config gives Studio's server.
 pub const OUTSIDE_NAME: &str = "omnigraph-studio";
@@ -66,6 +68,31 @@ pub struct UiToolServer {
 }
 
 impl Global for UiToolServer {}
+
+/// A conversation's way to the server: its address and a token bound to the conversation's
+/// window. The token stops working when the entry is dropped, as the conversation ends.
+pub struct Entry {
+    pub url: String,
+    pub token: String,
+    revoke: Option<Box<dyn FnOnce()>>,
+}
+
+impl std::fmt::Debug for Entry {
+    /// The token is never written out.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Entry")
+            .field("url", &self.url)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for Entry {
+    fn drop(&mut self) {
+        if let Some(revoke) = self.revoke.take() {
+            revoke();
+        }
+    }
+}
 
 /// Starts the server, with the system keychain for a kept token, and follows the settings. A
 /// server that cannot bind leaves Studio without UI tools, and says so in the log.
@@ -260,7 +287,7 @@ impl UiToolServer {
 
     /// A conversation's entry: a new token bound to its window, given up when the entry is
     /// dropped. `None` when the server is not running or no token could be made.
-    pub fn entry_for(window: u64, cx: &mut App) -> Option<UiToolEntry> {
+    pub fn entry_for(window: u64, cx: &mut App) -> Option<Entry> {
         let server = cx.try_global::<Self>()?;
         let token = new_token().ok()?;
         let shared = server.shared.clone();
@@ -270,11 +297,15 @@ impl UiToolServer {
             .ok()?
             .insert(token.clone(), TokenState::new(Target::Bound(window), false));
         let revoked = token.clone();
-        Some(UiToolEntry::new(server.url(), token, move || {
-            if let Ok(mut tokens) = shared.tokens.lock() {
-                tokens.remove(&revoked);
-            }
-        }))
+        Some(Entry {
+            url: server.url(),
+            token,
+            revoke: Some(Box::new(move || {
+                if let Ok(mut tokens) = shared.tokens.lock() {
+                    tokens.remove(&revoked);
+                }
+            })),
+        })
     }
 
     /// Whether agents outside Studio may call the tools now.

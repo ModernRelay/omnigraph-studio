@@ -25,7 +25,7 @@ other: what two features share moves down a layer.
 | 4 | `studio_workspace` | The window frame: panes, tabs, docks, panels, status bar, modal and toast layers | `gpui`, `ui`, `studio_ui`, `studio_actions`, `studio_settings` |
 | 4 | `change_cards` | The entity cards a review and a commit's view share: an entity's card, its relationship lines, a run's header, how many lines a card shows | `gpui`, `ui`, `studio_ui`, `graph_store`, `gq_language` |
 | 5 | `command_palette`, `type_table`, `relationship_tree`, `graph_canvas`, `query_editor`, `review`, `history`, `agent_panel` | One surface each | layers 0–4 |
-| 5 | `ui_tool_server` | The UI tool server (spec 032): MCP over Streamable HTTP on `127.0.0.1`, serving `studio_workspace::ui_tools` to the panel's agents and, when turned on, to agents outside Studio. Makes no request to an Omnigraph server. `studio` sets `UiToolEndpoint` from it, so `agent_panel` does not depend on it | layers 0–4, `smol`, `httparse`, `getrandom` |
+| 5 | `ui_tool_server` | Studio's UI tools and the server that serves them (spec 032): the allow-list of Studio's actions an agent may call and what each answers (`tools`), served as MCP over Streamable HTTP on `127.0.0.1` to the panel's agents and, when turned on, to agents outside Studio. Makes no request to an Omnigraph server. Only `studio` depends on it, and hands `agent_panel` its entries through `agent_panel::UiToolEndpoint`; the workspace and the views know nothing of it | layers 0–4, `smol`, `httparse`, `getrandom` |
 | 6 | `studio` | The binary: initialises every crate in order, menus, windows, single instance, URL scheme | everything |
 
 `studio_workspace` is forked and trimmed from Zed's `workspace`, without projects,

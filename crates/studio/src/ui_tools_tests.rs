@@ -4,7 +4,7 @@
 use gpui::{TestAppContext, VisualTestContext};
 use serde_json::{Value, json};
 use studio_workspace::Workspace;
-use studio_workspace::ui_tools::{self, Answer, Caller, Target};
+use ui_tool_server::tools::{self as ui_tools, Answer, Caller, Target};
 
 /// A window with every feature, showing the dev graph's schema on a fake server.
 fn studio(cx: &mut TestAppContext) -> (gpui::Entity<Workspace>, &mut VisualTestContext, u64) {

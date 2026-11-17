@@ -16,7 +16,6 @@ mod panels;
 mod persistence;
 mod process_stats;
 mod sign_in_prompt;
-pub mod ui_tools;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -55,10 +54,10 @@ use ui::prelude::*;
 use ui::{ButtonLike, PopoverMenu, right_click_menu};
 
 pub use confirm::{Confirm, confirm, confirm_expand};
-use item::ItemHandle;
 pub use item::{
     AgentEdge, AgentGroup, AgentNode, AgentRefusal, AgentView, Inspected, InspectedNode, Item,
-    ItemEvent, ItemStatus, KeyHint, NodeInspector, SelectedIds, register_node_inspector,
+    ItemEvent, ItemHandle, ItemStatus, KeyHint, NodeInspector, SelectedIds,
+    register_node_inspector,
 };
 pub use open_failure::open_failure;
 use pane::{Member, Pane, PaneId, SplitAxis, SplitDirection, Tab};
@@ -449,10 +448,30 @@ pub struct Workspace {
     outcomes_toasted: HashMap<EntityId, u64>,
     _item_subscriptions: Vec<(gpui::EntityId, Subscription)>,
     /// The agent whose tool call last opened or showed something here (spec 032), shown in the
-    /// status bar as "Opened by <agent>" for [`ui_tools::OPENED_BY_FOR`].
+    /// status bar as "Opened by <agent>" for [`OPENED_BY_FOR`].
     opened_by: Option<SharedString>,
     _opened_by: Option<Task<()>>,
 }
+
+/// One pane's tabs, as [`Workspace::pane_tabs`] lists them.
+pub struct PaneTabs<'a> {
+    /// The window's active pane.
+    pub active: bool,
+    pub tabs: Vec<PaneTab<'a>>,
+}
+
+/// One tab of a pane.
+pub struct PaneTab<'a> {
+    pub item: &'a dyn ItemHandle,
+    /// The tab in front of its pane.
+    pub active: bool,
+    /// The pane's preview tab, which the next pick takes the place of.
+    pub preview: bool,
+}
+
+/// How long the status bar says who opened or showed something in the window
+/// ([`Workspace::show_opened_by`]).
+pub const OPENED_BY_FOR: Duration = Duration::from_secs(4);
 
 /// How often, at most, the workspace's state is compared with what was last written.
 const SAVE_CHECK: Duration = Duration::from_millis(250);
@@ -1653,6 +1672,29 @@ impl Workspace {
 
     // ---- panes and items ----
 
+    /// The window's panes in layout order, each with its tabs in strip order: what a reader of
+    /// the window lists (a UI tool's `studio_tabs`, a test).
+    pub fn pane_tabs(&self) -> Vec<PaneTabs<'_>> {
+        self.center
+            .panes()
+            .into_iter()
+            .filter_map(|id| self.pane(id))
+            .map(|pane| PaneTabs {
+                active: pane.id == self.active_pane,
+                tabs: pane
+                    .items
+                    .iter()
+                    .enumerate()
+                    .map(|(index, item)| PaneTab {
+                        item: item.as_ref(),
+                        active: index == pane.active,
+                        preview: pane.is_preview(index),
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
     fn pane(&self, id: PaneId) -> Option<&Pane<Box<dyn ItemHandle>>> {
         self.panes.iter().find(|pane| pane.id == id)
     }
@@ -2455,7 +2497,7 @@ impl Workspace {
     }
 
     /// Says in the status bar that an agent's tool call opened or showed something here (spec
-    /// 032, Focus): "Opened by <agent>", for [`ui_tools::OPENED_BY_FOR`]. Another call
+    /// 032, Focus): "Opened by <agent>", for [`OPENED_BY_FOR`]. Another call
     /// meanwhile starts the time again.
     pub fn show_opened_by(
         &mut self,
@@ -2468,9 +2510,7 @@ impl Workspace {
             cx.notify();
         }
         self._opened_by = Some(cx.spawn_in(window, async move |this, cx| {
-            cx.background_executor()
-                .timer(ui_tools::OPENED_BY_FOR)
-                .await;
+            cx.background_executor().timer(OPENED_BY_FOR).await;
             this.update(cx, |this, cx| {
                 this.opened_by = None;
                 cx.notify();
@@ -3775,7 +3815,7 @@ impl Workspace {
     }
 
     /// The panel whose body or focus target holds the keyboard, as the frame drawn last says.
-    fn panel_with_focus(&self, window: &Window, cx: &App) -> Option<SharedString> {
+    pub fn panel_with_focus(&self, window: &Window, cx: &App) -> Option<SharedString> {
         [&self.left, &self.right, &self.bottom]
             .into_iter()
             .flat_map(|dock| dock.panels.iter())
@@ -3796,7 +3836,7 @@ impl Workspace {
 
     /// Gives the keyboard to the active tab: the dock that had it is hidden or covered, and the
     /// keys would go on driving a panel nobody sees.
-    fn focus_active_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn focus_active_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let index = self.pane(self.active_pane).map_or(0, |p| p.active);
         self.activate_in(self.active_pane, index, false, window, cx);
     }

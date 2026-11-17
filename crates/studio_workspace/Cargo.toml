@@ -25,7 +25,6 @@ http_client = { workspace = true }
 log = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-schemars = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

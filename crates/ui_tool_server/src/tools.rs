@@ -12,21 +12,23 @@
 //! The reads return identifiers and names only (type names, node ids, branch names, commit ids
 //! and tab titles), so an agent reads the graph's data with its own credential.
 //!
-//! Layer 4, with the workspace it reads. The server that speaks MCP is `ui_tool_server`.
+//! Layer 5, in the crate of the server that speaks MCP ([`crate::http`]). The workspace knows
+//! nothing of it: this module reads a window through what every tab and the workspace answer
+//! to anyone (`thing`, `view_kind`, `selected_ids`, `pane_tabs`), and acts through actions.
 
 use std::collections::HashSet;
-use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    App, AsyncApp, Context, EntityId, FocusHandle, Focusable as _, Global, SharedString, Window,
+    App, AsyncApp, Context, EntityId, FocusHandle, Focusable as _, SharedString, Window,
     WindowHandle,
 };
 use serde_json::{Map, Value, json};
 use studio_actions::{Thing, ViewKind};
 use studio_settings::StudioSettings;
-
-use crate::{AgentEdge, AgentGroup, AgentNode, AgentView, ToastKind, Workspace};
+use studio_workspace::{
+    AgentEdge, AgentGroup, AgentNode, AgentView, ItemHandle, ToastKind, Workspace,
+};
 
 /// The most node ids `studio_selection` names.
 pub const MAX_SELECTED: usize = 200;
@@ -35,9 +37,6 @@ pub const MAX_SELECTED: usize = 200;
 /// (spec 032, The server): the answer travels as text inside a JSON-RPC result, whose escapes
 /// can take more room than the JSON itself, so a tool's own answer keeps well inside it.
 pub const ANSWER_BUDGET: usize = 40 * 1024;
-
-/// How long the window shows "Opened by <agent>" after a tool opened or showed something.
-pub const OPENED_BY_FOR: Duration = Duration::from_secs(4);
 
 /// What a tool needs of the window before its action is dispatched: an available action can
 /// still do nothing, as `NewQueryWithText` does with no graph open (spec 032, "A
@@ -1082,7 +1081,7 @@ fn node_id(value: &Value) -> Option<(String, String)> {
 }
 
 /// Whether `item` is the view `kind`: a query's result picture is a canvas too.
-fn shows(item: &dyn crate::ItemHandle, kind: ViewKind, cx: &App) -> bool {
+fn shows(item: &dyn ItemHandle, kind: ViewKind, cx: &App) -> bool {
     match kind {
         ViewKind::Canvas => item.agent_view(cx).is_some_and(|_| {
             item.view_kind(cx)
@@ -1533,7 +1532,7 @@ fn thing_json(thing: &Thing) -> Value {
 }
 
 /// A tab as the tools describe it: what it shows, how, its title and the commit it holds.
-fn describe(item: &dyn crate::ItemHandle, cx: &App) -> Value {
+fn describe(item: &dyn ItemHandle, cx: &App) -> Value {
     json!({
         "thing": item.thing(cx).as_ref().map(thing_json),
         "view": item.view_kind(cx).map(ViewKind::label),
@@ -1585,25 +1584,21 @@ fn windows(target: Target, cx: &mut App) -> Answer {
 
 /// `studio_tabs`: the window's panes and tabs.
 fn tabs(id: u64, workspace: &Workspace, _window: &Window, cx: &App) -> Answer {
-    let active_pane = workspace.active_pane;
     let panes: Vec<Value> = workspace
-        .center
-        .panes()
+        .pane_tabs()
         .into_iter()
-        .filter_map(|pane_id| workspace.pane(pane_id))
         .map(|pane| {
             let tabs: Vec<Value> = pane
-                .items
+                .tabs
                 .iter()
-                .enumerate()
-                .map(|(index, item)| {
-                    let mut tab = describe(item.as_ref(), cx);
-                    tab["active"] = json!(index == pane.active);
-                    tab["preview"] = json!(pane.is_preview(index));
-                    tab
+                .map(|tab| {
+                    let mut described = describe(tab.item, cx);
+                    described["active"] = json!(tab.active);
+                    described["preview"] = json!(tab.preview);
+                    described
                 })
                 .collect();
-            json!({ "active": pane.id == active_pane, "tabs": tabs })
+            json!({ "active": pane.active, "tabs": tabs })
         })
         .collect();
     let count: usize = panes
@@ -1687,102 +1682,9 @@ fn selection(id: u64, workspace: &Workspace, cx: &App) -> Answer {
     Answer::new("read", says, json, false)
 }
 
-/// The tool server's address, which a conversation's agent is given (spec 032, The panel's
-/// agent): `studio` sets it when the server listens, so the agent panel reaches the server
-/// without depending on it.
-#[derive(Clone)]
-pub struct UiToolEndpoint(Rc<MakeEntry>);
-
-/// Makes a conversation's entry for its window, by the window's id.
-type MakeEntry = dyn Fn(u64, &mut App) -> Option<UiToolEntry>;
-
-impl Global for UiToolEndpoint {}
-
-impl UiToolEndpoint {
-    pub fn new(entry: impl Fn(u64, &mut App) -> Option<UiToolEntry> + 'static) -> Self {
-        Self(Rc::new(entry))
-    }
-
-    /// A new entry for a conversation in the window `window`, with a token of its own bound to
-    /// that window; `None` while no server listens.
-    pub fn entry_for(window: u64, cx: &mut App) -> Option<UiToolEntry> {
-        let endpoint = cx.try_global::<Self>()?.clone();
-        (endpoint.0)(window, cx)
-    }
-}
-
-/// A conversation's way to the tool server: its address and a token bound to its window. The
-/// token stops working when the entry is dropped, as the conversation ends.
-pub struct UiToolEntry {
-    pub url: String,
-    pub token: String,
-    revoke: Option<Box<dyn FnOnce()>>,
-}
-
-impl UiToolEntry {
-    pub fn new(url: String, token: String, revoke: impl FnOnce() + 'static) -> Self {
-        Self {
-            url,
-            token,
-            revoke: Some(Box::new(revoke)),
-        }
-    }
-}
-
-impl std::fmt::Debug for UiToolEntry {
-    /// The token is never written out.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("UiToolEntry")
-            .field("url", &self.url)
-            .finish_non_exhaustive()
-    }
-}
-
-impl Drop for UiToolEntry {
-    fn drop(&mut self) {
-        if let Some(revoke) = self.revoke.take() {
-            revoke();
-        }
-    }
-}
-
-/// What every conversation's MCP server name starts with. The rest is chosen at random per
-/// conversation ([`server_name`]), so a server of the person's own config, which the agent also
-/// loads, cannot take its name.
-pub const SERVER_PREFIX: &str = "studio_";
-
-/// A conversation's server name from six random bytes: [`SERVER_PREFIX`] and six lowercase
-/// letters or digits.
-pub fn server_name(random: [u8; 6]) -> String {
-    const ALPHABET: &[u8; 36] = b"abcdefghijklmnopqrstuvwxyz0123456789";
-    let suffix: String = random
-        .iter()
-        .map(|byte| ALPHABET[usize::from(*byte) % ALPHABET.len()] as char)
-        .collect();
-    format!("{SERVER_PREFIX}{suffix}")
-}
-
-/// The tool a call's title names when it is a call to the server named `server`: the adapters
-/// title one `mcp__<server>__<tool>` (Claude) or `mcp.<server>.<tool>` (Codex).
-pub fn studio_call<'a>(title: &'a str, server: &str) -> Option<&'a str> {
-    let tool = title
-        .strip_prefix("mcp__")
-        .and_then(|rest| rest.strip_prefix(server))
-        .and_then(|rest| rest.strip_prefix("__"))
-        .or_else(|| {
-            title
-                .strip_prefix("mcp.")
-                .and_then(|rest| rest.strip_prefix(server))
-                .and_then(|rest| rest.strip_prefix('.'))
-        })?;
-    let tool = tool.split_whitespace().next().unwrap_or(tool);
-    is_tool(tool).then_some(tool)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Item, ItemEvent, SelectedIds};
     use gpui::{
         AppContext as _, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement as _,
         IntoElement, Render, TestAppContext, div,
@@ -1791,6 +1693,7 @@ mod tests {
     use http_client::{AsyncBody, FakeHttpClient, Response};
     use studio_actions::ViewLink;
     use studio_settings::StudioSettings;
+    use studio_workspace::{Item, ItemEvent, OPENED_BY_FOR, SelectedIds};
 
     /// What the never-a-tool test refuses: actions that write, answer the agent's own
     /// requests, open a link or a setting, sign in or out, update or quit, or move focus.
@@ -2132,8 +2035,10 @@ mod tests {
         assert_eq!(answer.json["tab"]["view"], "Map");
         handle
             .read_with(cx, |workspace, _| {
-                let pane = workspace.pane(workspace.active_pane).unwrap();
-                assert!(pane.is_preview(pane.active), "opened as the preview");
+                let panes = workspace.pane_tabs();
+                let pane = panes.iter().find(|pane| pane.active).unwrap();
+                let front = pane.tabs.iter().find(|tab| tab.active).unwrap();
+                assert!(front.preview, "opened as the preview");
                 assert_eq!(
                     workspace.opened_by().map(|agent| agent.as_ref()),
                     Some("Claude Code")
@@ -2283,33 +2188,5 @@ mod tests {
         assert!(closed.is_error);
         let none = run(cx, Target::Bound(id), "studio_windows", json!({})).await;
         assert_eq!(none.json["windows"], json!([]));
-    }
-
-    #[test]
-    fn a_studio_call_is_known_by_either_title_and_its_own_name_only() {
-        let server = server_name([0, 1, 25, 26, 35, 36]);
-        assert_eq!(server, "studio_abz09a");
-        let server = server_name([7, 4, 11, 11, 14, 35]);
-        assert_eq!(server, "studio_hello9");
-        assert_eq!(
-            studio_call("mcp__studio_hello9__graph_open_type", &server),
-            Some("graph_open_type")
-        );
-        assert_eq!(
-            studio_call("mcp.studio_hello9.studio_windows", &server),
-            Some("studio_windows")
-        );
-        assert_eq!(
-            studio_call("mcp__studio_hello9__run_query", &server),
-            None,
-            "not a tool"
-        );
-        // A server of the person's own config named `studio`, or another conversation's.
-        assert_eq!(studio_call("mcp__studio__graph_open_type", &server), None);
-        assert_eq!(studio_call("mcp.studio.graph_open_type", &server), None);
-        assert_eq!(
-            studio_call("mcp__studio_hello99__graph_open_type", &server),
-            None
-        );
     }
 }

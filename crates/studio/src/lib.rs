@@ -62,12 +62,20 @@ pub fn init(cx: &mut App) {
     review::init(cx);
     history::init(cx);
     agent_panel::init(cx);
-    // The UI tool server (spec 032), which the agent panel reaches through `UiToolEndpoint`.
+    // The UI tools and their server (spec 032), which the agent panel reaches through
+    // `UiToolEndpoint`: neither crate depends on the other.
     ui_tool_server::init(cx);
     if cx.has_global::<ui_tool_server::UiToolServer>() {
-        cx.set_global(studio_workspace::ui_tools::UiToolEndpoint::new(
-            ui_tool_server::UiToolServer::entry_for,
-        ));
+        cx.set_global(agent_panel::UiToolEndpoint::new(|window, cx| {
+            let entry = ui_tool_server::UiToolServer::entry_for(window, cx)?;
+            Some(agent_panel::UiToolEntry::new(
+                entry.url.clone(),
+                entry.token.clone(),
+                ui_tool_server::tools::is_tool,
+                // The conversation's token stops working when its entry goes.
+                move || drop(entry),
+            ))
+        }));
     }
 
     #[cfg(debug_assertions)]

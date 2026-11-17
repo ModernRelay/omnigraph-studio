@@ -2,11 +2,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::tools::{Answer, Target};
 use futures::channel::mpsc;
 use futures::{AsyncReadExt as _, AsyncWriteExt as _};
 use serde_json::{Value, json};
 use smol::net::TcpStream;
-use studio_workspace::ui_tools::{Answer, Target};
 
 use super::*;
 use crate::http::{Call, MAX_BODY, MAX_IN_FLIGHT};

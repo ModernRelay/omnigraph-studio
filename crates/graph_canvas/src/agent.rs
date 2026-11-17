@@ -14,6 +14,9 @@ use studio_workspace::{AgentEdge, AgentGroup, AgentNode, AgentRefusal, AgentView
 
 use super::*;
 
+/// The most hidden nodes the canvas names to a reader.
+const MOST_HIDDEN_NAMED: usize = 200;
+
 /// What a call names a node not on the canvas with.
 const NOT_DRAWN: &str = "Not on this canvas; expand a neighbour or use graph_show_node_on_canvas";
 
@@ -335,7 +338,7 @@ impl GraphCanvas {
             .iter()
             .map(|node| json!({ "type_name": node.type_name, "id": node.id }))
             .collect();
-        hidden.truncate(studio_workspace::ui_tools::MAX_CHANGED);
+        hidden.truncate(MOST_HIDDEN_NAMED);
         facts.insert("hidden".into(), Value::Array(hidden));
         if let Some((left_out, most)) = &scene.capped {
             facts.insert(

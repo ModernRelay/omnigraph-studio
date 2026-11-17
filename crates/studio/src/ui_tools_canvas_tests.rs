@@ -10,7 +10,7 @@ use gpui::{TestAppContext, VisualTestContext};
 use serde_json::{Value, json};
 use studio_settings::StudioSettings;
 use studio_workspace::Workspace;
-use studio_workspace::ui_tools::{self, Answer, Caller, Target};
+use ui_tool_server::tools::{self as ui_tools, Answer, Caller, Target};
 
 /// People on the fake server; every one works at `c0`.
 const PEOPLE: usize = 60;
