@@ -58,6 +58,8 @@ pub struct UiToolServer {
     reading: bool,
     /// Whether the address is kept, as last followed.
     keeping: bool,
+    /// The keychain's last change of the kept token, which the next one waits for ([`keep`]).
+    keeping_writes: Option<Task<()>>,
     /// What the settings row says about the address or token, when something did not go as
     /// asked ("Port 24187 was taken…").
     note: Option<String>,
@@ -181,6 +183,7 @@ fn start(keychain: Arc<dyn Keychain>, cx: &mut App) -> std::io::Result<UiToolSer
         outside_token: None,
         reading: false,
         keeping: keep,
+        keeping_writes: None,
         note: asked.map(|asked| {
             format!(
                 "Port {asked} was taken, so Studio uses {port} this time: copy the command again."
@@ -225,25 +228,16 @@ fn read_kept_token(cx: &mut App) {
             // New token pressed while the keychain was read: the new one stands, and is the
             // one kept. Else the kept one, or one made now and kept, unless the keychain
             // cannot be reached.
+            let mut made = None;
             if server.outside_token.is_none() {
-                let made = token.is_none();
+                let kept = token.is_some();
                 server.outside_token = token.or_else(|| new_token().ok());
-                if made
-                    && note.is_none()
-                    && let Some(token) = server.outside_token.clone()
-                {
-                    let write = server.keychain.write(
-                        KEYCHAIN_KEY.to_owned(),
-                        KEYCHAIN_USER.to_owned(),
-                        token.into_bytes(),
-                    );
-                    cx.background_spawn(async move {
-                        if let Err(error) = write.await {
-                            log::warn!("the keychain did not keep the UI tools' token: {error}");
-                        }
-                    })
-                    .detach();
+                if !kept && note.is_none() {
+                    made = server.outside_token.clone();
                 }
+            }
+            if made.is_some() {
+                keep(cx, made);
             }
             follow_settings(cx);
         });
@@ -314,17 +308,7 @@ impl UiToolServer {
             tokens.remove(old);
         }
         if server.keeping {
-            let write = server.keychain.write(
-                KEYCHAIN_KEY.to_owned(),
-                KEYCHAIN_USER.to_owned(),
-                token.clone().into_bytes(),
-            );
-            cx.background_spawn(async move {
-                if let Err(error) = write.await {
-                    log::warn!("the keychain did not keep the UI tools' token: {error}");
-                }
-            })
-            .detach();
+            keep(cx, Some(token.clone()));
         }
         cx.global_mut::<Self>().outside_token = Some(token);
         follow_settings(cx);
@@ -338,6 +322,36 @@ impl UiToolServer {
     }
 }
 
+/// Keeps `token` in the keychain, or deletes the kept one (`None`), after every change of it
+/// asked for before: two writes out at once could land in either order and leave a token kept
+/// that was replaced.
+fn keep(cx: &mut App, token: Option<String>) {
+    let server = cx.global_mut::<UiToolServer>();
+    let keychain = server.keychain.clone();
+    let before = server.keeping_writes.take();
+    let write = cx.background_spawn(async move {
+        if let Some(before) = before {
+            before.await;
+        }
+        let done = match token {
+            Some(token) => {
+                keychain
+                    .write(
+                        KEYCHAIN_KEY.to_owned(),
+                        KEYCHAIN_USER.to_owned(),
+                        token.into_bytes(),
+                    )
+                    .await
+            }
+            None => keychain.delete(KEYCHAIN_KEY.to_owned()).await,
+        };
+        if let Err(error) = done {
+            log::warn!("the keychain did not keep the UI tools' token: {error}");
+        }
+    });
+    cx.global_mut::<UiToolServer>().keeping_writes = Some(write);
+}
+
 /// Follows the settings: the outside agents' token and its file on or off, and whether the
 /// token is kept. A port asked for applies at the next start.
 fn follow_settings(cx: &mut App) {
@@ -349,7 +363,6 @@ fn follow_settings(cx: &mut App) {
         return;
     }
     if settings.keep_address != server.keeping {
-        let keychain = server.keychain.clone();
         if settings.keep_address {
             // Kept from now: the port in use is the one the next start asks for first.
             studio_settings::write_atomic_in_turn(
@@ -359,24 +372,12 @@ fn follow_settings(cx: &mut App) {
             );
             // Kept from now: the token held goes in the keychain.
             if let Some(token) = server.outside_token.clone() {
-                let write = keychain.write(
-                    KEYCHAIN_KEY.to_owned(),
-                    KEYCHAIN_USER.to_owned(),
-                    token.into_bytes(),
-                );
-                cx.background_spawn(async move {
-                    write.await.ok();
-                })
-                .detach();
+                keep(cx, Some(token));
             }
             cx.global_mut::<UiToolServer>().keeping = true;
         } else {
             // No longer kept: the kept token goes, and the run takes one of its own.
-            let delete = keychain.delete(KEYCHAIN_KEY.to_owned());
-            cx.background_spawn(async move {
-                delete.await.ok();
-            })
-            .detach();
+            keep(cx, None);
             cx.global_mut::<UiToolServer>().keeping = false;
             if cx.global::<UiToolServer>().outside_token.is_some() {
                 UiToolServer::replace_token(cx);
@@ -409,17 +410,7 @@ fn follow_settings(cx: &mut App) {
             write_endpoint(&url, &token);
             // While the address is kept, a token made now is kept too.
             if server.keeping {
-                let write = server.keychain.write(
-                    KEYCHAIN_KEY.to_owned(),
-                    KEYCHAIN_USER.to_owned(),
-                    token.clone().into_bytes(),
-                );
-                cx.background_spawn(async move {
-                    if let Err(error) = write.await {
-                        log::warn!("the keychain did not keep the UI tools' token: {error}");
-                    }
-                })
-                .detach();
+                keep(cx, Some(token.clone()));
             }
             cx.global_mut::<UiToolServer>().outside_token = Some(token);
         }
