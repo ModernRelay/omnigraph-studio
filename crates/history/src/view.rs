@@ -21,7 +21,7 @@ use studio_actions::workspace::Refresh;
 use studio_actions::{ViewKind, ViewLink};
 use studio_ui::ds::Tipped;
 use studio_ui::menu::ContextMenu;
-use studio_ui::{change_counts, group_digits, now_micros, relative_time, short_commit_id};
+use studio_ui::{group_digits, now_micros, relative_time, short_commit_id};
 use studio_workspace::{Inspected, Item, ItemEvent, SavedItem};
 use ui::prelude::*;
 use ui::right_click_menu;
@@ -1375,9 +1375,14 @@ impl HistoryView {
 
     /// What History holds of a commit beside its listing: the branches whose head it is, and
     /// its changes counted, once its row was drawn and they were read.
-    fn learnt_of(&self, id: &str) -> (&[String], Option<(crate::counts::Counts, bool)>) {
+    fn learnt_of(&self, id: &str) -> (&[String], Option<crate::counts::Learnt>) {
         let heads = self.heads.get(id).map_or(&[][..], Vec::as_slice);
-        (heads, self.counts.of(id))
+        let learnt = self
+            .commits
+            .iter()
+            .find(|commit| commit.graph_commit_id == id)
+            .and_then(|commit| self.counts.learnt(commit));
+        (heads, learnt)
     }
 
     /// Tells the workspace when another commit is selected, or none: called whenever the view
@@ -1557,17 +1562,13 @@ impl HistoryView {
                     .clone()
                     .unwrap_or_else(|| "main".to_owned());
                 let id = commit.graph_commit_id.clone();
-                let (counts, partial) = match self.counts.of(&id) {
-                    Some((counts, partial)) => (Some(counts), partial),
-                    None => (None, false),
-                };
-                let first = crate::commit_view::is_first_commit(commit);
+                let learnt = self.counts.learnt(commit).map(|learnt| learnt.counts);
                 let heads = self.heads.get(&id).cloned().unwrap_or_default();
                 let selected = self.selected == Some(ix);
                 // A commit on a merged branch's lane reads quieter than the branch's own.
                 let aside = row.color != 0;
                 let actor = commit.actor_id.clone();
-                let card = commit_card(commit, counts, partial, &heads, now);
+                let card = commit_card(commit, learnt.clone(), &heads, now);
                 let menu_commit = commit.clone();
                 let menu_session = self.session.clone();
                 let menu_focus = self.focus_handle.clone();
@@ -1608,26 +1609,10 @@ impl HistoryView {
                             .w(px(CHANGES_WIDTH))
                             .flex_none()
                             .overflow_hidden()
-                            // The first commit has nothing before it to count against.
-                            .when(first, |d| {
-                                d.child(
-                                    studio_ui::ds::text::meta("first commit")
-                                        .single_line()
-                                        .truncate(),
-                                )
-                            })
-                            .children(counts.map(|(added, changed, removed)| {
-                                if added + changed + removed == 0 {
-                                    studio_ui::ds::text::meta("no changes").into_any_element()
-                                } else {
-                                    h_flex()
-                                        .gap(px(studio_ui::ds::space::XS))
-                                        .child(change_counts(added, changed, removed))
-                                        .when(partial, |d| {
-                                            d.child(studio_ui::ds::text::meta("+ more"))
-                                        })
-                                        .into_any_element()
-                                }
+                            // What it changed, or why there is nothing to count, as every
+                            // list of commits says it (spec 033).
+                            .children(learnt.as_ref().map(|learnt| {
+                                change_cards::commit_counts(("row-counts", ix), learnt)
                             })),
                     )
                     .child(
@@ -1893,8 +1878,7 @@ fn lane_colors(cx: &App) -> Vec<Hsla> {
 /// is, and what it changed; a click opens it.
 fn commit_card(
     commit: &CommitOutput,
-    counts: Option<(usize, usize, usize)>,
-    partial: bool,
+    counts: Option<change_cards::CommitCounts>,
     heads: &[String],
     now: i64,
 ) -> studio_ui::ds::TipContent {
@@ -1922,13 +1906,8 @@ fn commit_card(
             h_flex()
                 .gap(px(studio_ui::ds::space::LG))
                 .justify_between()
-                .child(match counts {
-                    Some((added, changed, removed)) if added + changed + removed > 0 => h_flex()
-                        .gap(px(studio_ui::ds::space::XS))
-                        .child(change_counts(added, changed, removed))
-                        .when(partial, |d| d.child(studio_ui::ds::text::meta("+ more")))
-                        .into_any_element(),
-                    Some(_) => studio_ui::ds::text::meta("No changes").into_any_element(),
+                .child(match &counts {
+                    Some(counts) => change_cards::commit_counts("card-counts", counts),
                     None => studio_ui::ds::text::meta("Counting changes…").into_any_element(),
                 })
                 .child(
@@ -3554,14 +3533,26 @@ mod tests {
             let (id, heads, counts) = note.read();
             assert_eq!((id, heads.len(), counts), ("m1", 0, None));
         });
-        // Its counts are read later, for the rows drawn: the view shown takes them.
+        // The graph's first commit has nothing to count, whatever is held for it: its note
+        // says it is the first (spec 033).
         view.update(cx, |view, cx| {
             view.counts.counts.insert("m1".into(), (1, 2, 3));
             cx.notify();
         });
         cx.run_until_parked();
         assert_eq!(told.get(), 1, "the same commit still");
-        first.read_with(cx, |note, _| {
+        first.read_with(cx, |note, _| assert_eq!(note.read().2, None));
+        // Another's counts are read later, for the rows drawn: the view shown takes them.
+        select(0, cx);
+        assert_eq!(told.get(), 2);
+        let again = note(cx).expect("the newest commit again");
+        view.update(cx, |view, cx| {
+            view.counts.counts.insert("m2".into(), (1, 2, 3));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(told.get(), 2, "the same commit still");
+        again.read_with(cx, |note, _| {
             assert_eq!(note.read().2, Some(((1, 2, 3), false)));
         });
     }

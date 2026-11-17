@@ -332,10 +332,7 @@ impl CommitsPanel {
                 let actor = commit.actor_id.clone();
                 let branch = branch_of(&commit).to_owned();
                 let when = relative_time(commit.created_at, now);
-                let label = match &actor {
-                    Some(actor) => format!("{id} {actor}"),
-                    None => id.clone(),
-                };
+
                 let tip = format!(
                     "{} on {branch}, by {}, {when}",
                     commit.graph_commit_id,
@@ -343,22 +340,24 @@ impl CommitsPanel {
                 );
                 let selected = self.selected.as_deref() == Some(commit.graph_commit_id.as_str());
                 let panel = cx.entity().downgrade();
-                // What it changed, as History counts it, before where and when.
-                let counts = self.counts.of(&commit.graph_commit_id).map(
-                    |((added, changed, removed), partial)| {
-                        h_flex()
-                            .gap(px(ds::space::XS))
-                            .child(studio_ui::change_counts(added, changed, removed))
-                            .when(partial, |d| d.child(ds::text::meta("+")))
-                    },
-                );
-                ds::SidebarRow::new(("commit", ix), label)
+                // What it changed, as every list of commits says it (spec 033), before where
+                // and when.
+                let counts = self.counts.learnt(&commit).map(|learnt| {
+                    change_cards::commit_counts(("panel-counts", ix), &learnt.counts)
+                });
+                // The id whole, as History shows it, then its branch and who made it, cut
+                // first; what it changed and when stay at the end.
+                ds::SidebarRow::new(("commit", ix), id.clone())
+                    .detail(match &actor {
+                        Some(actor) => format!("{branch} · {actor}"),
+                        None => branch.clone(),
+                    })
                     .icon(IconName::GitCommit)
                     .end(
                         h_flex()
                             .gap(px(ds::space::SM))
                             .children(counts)
-                            .child(ds::sidebar_count(format!("{branch} · {when}"))),
+                            .child(ds::sidebar_count(when.clone())),
                     )
                     .selected(selected)
                     .tip(ds::tooltip(tip))
