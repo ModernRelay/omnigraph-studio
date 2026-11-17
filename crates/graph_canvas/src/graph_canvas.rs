@@ -580,6 +580,49 @@ impl Item for GraphCanvas {
         }
     }
 
+    fn held_at(&self, _cx: &App) -> Option<String> {
+        GraphCanvas::held_at(self)
+    }
+
+    /// The marked chips' nodes, or else the selected one, and the node the walk is from (spec
+    /// 032). A schema canvas selects types, not nodes.
+    fn selected_ids(&self, _cx: &App) -> Option<studio_workspace::SelectedIds> {
+        if self.schema_walk.is_some() {
+            return None;
+        }
+        let mut nodes: Vec<&NodeRef> = self
+            .marked
+            .iter()
+            .filter_map(|id| match id {
+                SceneId::Node(node) => Some(node),
+                _ => None,
+            })
+            .collect();
+        nodes.sort_by(|a, b| (&a.type_name, &a.id).cmp(&(&b.type_name, &b.id)));
+        let selected = self.inspected_node();
+        if nodes.is_empty()
+            && let Some(node) = &selected
+        {
+            nodes.push(node);
+        }
+        let root = self
+            .walk
+            .as_ref()
+            .map(|(root, _)| (root.type_name.clone(), root.id.clone()));
+        if nodes.is_empty() && root.is_none() {
+            return None;
+        }
+        let first = nodes.first().map(|node| node.type_name.clone());
+        let shared = nodes
+            .iter()
+            .all(|node| Some(&node.type_name) == first.as_ref());
+        Some(studio_workspace::SelectedIds {
+            type_name: first.filter(|_| shared),
+            ids: nodes.iter().map(|node| node.id.clone()).collect(),
+            root,
+        })
+    }
+
     fn thing(&self, _cx: &App) -> Option<studio_actions::Thing> {
         self.walk
             .as_ref()

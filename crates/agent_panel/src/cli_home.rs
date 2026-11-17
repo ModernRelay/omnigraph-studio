@@ -179,14 +179,28 @@ impl CliHome {
 /// Writes `<cwd>/AGENTS.md`, what the conversation's agent needs to work on the graph: the CLI
 /// to run, its branch and the rules. Codex reads `AGENTS.md`; Claude reads it when there is no
 /// `CLAUDE.md`.
-pub fn write_agents_md(cwd: &Path, graph: &str, branch: &str, base: &str) -> std::io::Result<()> {
-    let text = agents_md(graph, branch, base, cfg!(windows), on_network(cwd));
+/// `server` is the name the agent is given Studio's UI tool server under (spec 032).
+pub fn write_agents_md(
+    cwd: &Path,
+    graph: &str,
+    branch: &str,
+    base: &str,
+    server: &str,
+) -> std::io::Result<()> {
+    let text = agents_md(graph, branch, base, server, cfg!(windows), on_network(cwd));
     Confined::open(cwd)?.write("AGENTS.md", text.as_bytes(), 0o644)
 }
 
 /// `AGENTS.md`'s text, with the batch file's notes when `windows` (and that cmd cannot work in a
 /// network folder when the working directory is one).
-fn agents_md(graph: &str, branch: &str, base: &str, windows: bool, network: bool) -> String {
+fn agents_md(
+    graph: &str,
+    branch: &str,
+    base: &str,
+    server: &str,
+    windows: bool,
+    network: bool,
+) -> String {
     let command = if windows {
         ".\\omnigraph.cmd"
     } else {
@@ -233,7 +247,15 @@ fn agents_md(graph: &str, branch: &str, base: &str, windows: bool, network: bool
          - `effects: unknown` on a write Studio sent means the server's answer was lost. Check \
          `commit list --branch {branch}` before trying again; never repeat a write blindly.\n\
          - When `{command}` says Studio has no CLI for this conversation, tell the person what \
-         it says.\n"
+         it says.\n\n\
+         ## Studio's window\n\n\
+         When you have the tools of the MCP server `{server}` (`studio_windows`, \
+         `graph_open_type`, `graph_show_node_on_canvas` and the others), use them to show the person what you \
+         found: they open a type's table, a node's page, a canvas or a tree, a branch, a commit \
+         or a query tab in this conversation's Studio window, and `studio_tabs` and \
+         `studio_selection` say what it shows, as ids. They only show things: they never write, \
+         never run a query and never return values. Read and write the graph with \
+         `{command}`.\n"
     )
 }
 
@@ -1065,7 +1087,14 @@ mod tests {
     /// longer serves.
     #[test]
     fn agents_md_names_the_cli_the_branch_and_the_rules() {
-        let text = agents_md("knowledge", "agent/20261028-101500", "main", false, false);
+        let text = agents_md(
+            "knowledge",
+            "agent/20261028-101500",
+            "main",
+            "studio_k3x9q2",
+            false,
+            false,
+        );
         for part in [
             "graph `knowledge`",
             "on your own branch `agent/20261028-101500`",
@@ -1077,20 +1106,40 @@ mod tests {
         ] {
             assert!(text.contains(part), "{part}\n{text}");
         }
-        assert!(!text.contains("batch file") && !text.contains("MCP") && !text.contains("_run"));
-        let windows = agents_md("knowledge", "agent/x", "main", true, false);
+        // The removed `omnigraph_cli` and `omnigraph_run` tools are not named; the UI tools'
+        // server is, by the conversation's own name.
+        assert!(!text.contains("batch file") && !text.contains("_run"));
+        // The UI tools (spec 032): they only show things, and writes stay on the CLI.
+        for part in [
+            "the tools of the MCP server `studio_k3x9q2`",
+            "They only show things: they never write",
+            "Read and write the graph with `./omnigraph`.",
+        ] {
+            assert!(text.contains(part), "{part}\n{text}");
+        }
+        let windows = agents_md("knowledge", "agent/x", "main", "studio_k3x9q2", true, false);
         assert!(windows.contains(".\\omnigraph.cmd") && windows.contains("batch file"));
         assert!(!windows.contains("network folder"));
-        assert!(agents_md("knowledge", "agent/x", "main", true, true).contains("network folder"));
+        assert!(
+            agents_md("knowledge", "agent/x", "main", "studio_k3x9q2", true, true)
+                .contains("network folder")
+        );
 
         let cwd = std::env::temp_dir().join(format!("studio-agents-md-{}", std::process::id()));
         std::fs::remove_dir_all(&cwd).ok();
         std::fs::create_dir_all(&cwd).unwrap();
-        write_agents_md(&cwd, "knowledge", "agent/x", "main").unwrap();
+        write_agents_md(&cwd, "knowledge", "agent/x", "main", "studio_k3x9q2").unwrap();
         let written = std::fs::read_to_string(cwd.join("AGENTS.md")).unwrap();
         assert_eq!(
             written,
-            agents_md("knowledge", "agent/x", "main", cfg!(windows), false)
+            agents_md(
+                "knowledge",
+                "agent/x",
+                "main",
+                "studio_k3x9q2",
+                cfg!(windows),
+                false
+            )
         );
         std::fs::remove_dir_all(&cwd).ok();
     }

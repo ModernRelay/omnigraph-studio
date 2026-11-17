@@ -12,6 +12,7 @@
       "cmd-k": "studio::ToggleCommandPalette",
       "cmd-p": "studio::GoTo",
       "cmd-,": "studio::OpenSettings",
+      "cmd-alt-,": "studio::OpenAgentSettings",
       "cmd-shift-b": "studio::SwitchBranch",
       "cmd-shift-n": "studio::NewWindow",
       "cmd-[": "studio::GoBack",

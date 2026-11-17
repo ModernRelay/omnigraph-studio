@@ -135,6 +135,9 @@ pub mod workspace {
             About,
             /// Open Studio's settings.
             OpenSettings,
+            /// Open Studio's settings at Agent: the agent the panel runs, and whether agents
+            /// outside Studio may show things in Studio.
+            OpenAgentSettings,
             /// Switch the window's graph to another branch.
             SwitchBranch,
             /// Open a new window.
@@ -191,8 +194,8 @@ pub mod workspace {
         pub url: String,
     }
 
-    /// Show a panel in its dock and give it the keyboard: `types`, `explore`, `queries`,
-    /// `branches`, `agent-conversations`, `inspector`, `nodes`, `history`, `activity`.
+    /// Show a panel in its dock and give it the keyboard: `types`, `queries`, `branches`,
+    /// `commits`, `agent-conversations`, `inspector`, `activity`.
     #[derive(Clone, Debug, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action)]
     #[action(namespace = studio)]
     pub struct ActivatePanel {
@@ -422,7 +425,7 @@ pub mod graph {
         pub held: bool,
     }
 
-    /// Open one node in the inspector and the Explore panel.
+    /// Open one node as a page in its own tab, read at the branch head.
     #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
     #[action(namespace = studio_graph)]
     pub struct OpenNode {

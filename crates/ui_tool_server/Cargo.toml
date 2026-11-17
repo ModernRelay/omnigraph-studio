@@ -1,0 +1,28 @@
+[package]
+name = "ui_tool_server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/ui_tool_server.rs"
+
+[dependencies]
+futures = { workspace = true }
+getrandom = { workspace = true }
+gpui = { workspace = true }
+httparse = { workspace = true }
+log = { workspace = true }
+serde_json = { workspace = true }
+smol = { workspace = true }
+studio_actions = { workspace = true }
+studio_settings = { workspace = true }
+studio_workspace = { workspace = true }
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+studio_settings = { workspace = true, features = ["test-support"] }
+
+[lints]
+workspace = true

@@ -225,6 +225,20 @@ impl SettingsView {
         this
     }
 
+    /// Shows one section, clearing a search: what `OpenAgentSettings` opens at.
+    pub fn show_section(
+        &mut self,
+        section: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.section = Some(section);
+        self.scope = Scope::All;
+        self.search
+            .update(cx, |search, cx| search.clear(window, cx));
+        cx.notify();
+    }
+
     /// Each text field shows its setting's value in the current scope, unless it holds typing
     /// not yet written: a control pressed while a field has focus draws the values before the
     /// field hears it lost focus and writes.
@@ -1104,6 +1118,12 @@ impl Render for SettingsView {
                                 control,
                                 reset,
                             );
+                            // The outside-agent switch, when on, shows how to add Studio to
+                            // each agent (spec 032, Outside agents).
+                            let row = match outside_agents(field, values, cx) {
+                                Some(commands) => v_flex().child(row).child(commands),
+                                None => v_flex().child(row),
+                            };
                             if index + 1 < count {
                                 row.border_b_1().dotted(cx)
                             } else {
@@ -1191,6 +1211,83 @@ impl Render for SettingsView {
                     .child(body),
             )
     }
+}
+
+/// Under the outside-agent switch, while it is on: the command that adds Studio to Claude Code
+/// and Codex's config entry, each with Copy. Both read the token from its file, so neither
+/// shows it.
+fn outside_agents(field: &SettingField, values: &SettingsValues, cx: &App) -> Option<AnyElement> {
+    if field.path.join(".") != "agent.outside_agents"
+        || values.at(&field.path) != &Value::Bool(true)
+    {
+        return None;
+    }
+    let Some(url) = ui_tool_server::UiToolServer::outside_url(cx) else {
+        return Some(
+            div()
+                .pb(px(space::MD))
+                .child(ds::text::muted(
+                    "Studio's tool server is not running, so agents outside Studio cannot reach \
+                     it. The log says why.",
+                ))
+                .into_any_element(),
+        );
+    };
+    let entry =
+        |id: &'static str, agent: &'static str, text: String, tip: &'static str| {
+            let shown = text
+                .lines()
+                .find(|line| !line.starts_with('#'))
+                .unwrap_or_default()
+                .to_owned();
+            h_flex()
+                .w_full()
+                .gap(px(space::SM))
+                .child(
+                    div()
+                        .w(px(ds::size::FIELD_LABEL))
+                        .flex_none()
+                        .child(ds::text::meta(agent)),
+                )
+                .child(
+                    div().flex_1().min_w_0().overflow_hidden().child(
+                        ds::text::code(shown, cx)
+                            .color(Color::Muted)
+                            .single_line()
+                            .truncate(),
+                    ),
+                )
+                .child(ds::row_button(id, "Copy").tip(ds::tooltip(tip)).on_click(
+                    move |_, _, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()))
+                    },
+                ))
+        };
+    Some(
+        v_flex()
+            .pb(px(space::MD))
+            .gap(px(space::XS))
+            .child(entry(
+                "copy-claude-command",
+                "Claude Code",
+                ui_tool_server::claude_command(&url),
+                "Copy the command that adds Studio to Claude Code. It reads the token from its \
+                 file, so Copy shows no token.",
+            ))
+            .child(
+                div()
+                    .pl(px(ds::size::FIELD_LABEL + space::SM))
+                    .child(ds::text::meta(ui_tool_server::CLAUDE_TOKEN_NOTE)),
+            )
+            .child(entry(
+                "copy-codex-config",
+                "Codex",
+                ui_tool_server::codex_config(&url),
+                "Copy the entry for Codex's config.toml, with an approval for each tool. Export \
+                 OMNIGRAPH_STUDIO_TOKEN as its first line says before starting Codex.",
+            ))
+            .into_any_element(),
+    )
 }
 
 /// Whether the scope switch shows: where it changes something, a section with a setting a graph

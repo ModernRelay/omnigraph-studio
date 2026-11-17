@@ -14,6 +14,8 @@ mod menus;
 mod open_graph;
 mod organizations;
 mod settings_view;
+#[cfg(test)]
+mod ui_tools_tests;
 mod update_status;
 
 use std::collections::HashSet;
@@ -58,6 +60,13 @@ pub fn init(cx: &mut App) {
     review::init(cx);
     history::init(cx);
     agent_panel::init(cx);
+    // The UI tool server (spec 032), which the agent panel reaches through `UiToolEndpoint`.
+    ui_tool_server::init(cx);
+    if cx.has_global::<ui_tool_server::UiToolServer>() {
+        cx.set_global(studio_workspace::ui_tools::UiToolEndpoint::new(
+            ui_tool_server::UiToolServer::entry_for,
+        ));
+    }
 
     #[cfg(debug_assertions)]
     studio_workspace::register_item_kind(cx, "design-system", |_, workspace, window, cx| {
@@ -186,6 +195,13 @@ pub fn init(cx: &mut App) {
         workspace.register_action(|workspace, _: &OpenSettings, window, cx| {
             open_settings(workspace, window, cx);
         });
+        workspace.register_action(
+            |workspace, _: &studio_actions::workspace::OpenAgentSettings, window, cx| {
+                if let Some(view) = open_settings(workspace, window, cx) {
+                    view.update(cx, |view, cx| view.show_section("Agent", window, cx));
+                }
+            },
+        );
         if let Some(updater) = Updater::global(cx) {
             let status = cx.new(|cx| update_status::UpdateStatus::new(updater.clone(), cx));
             workspace.add_status_item(
@@ -239,7 +255,11 @@ fn open_design_system(workspace: &mut Workspace, window: &mut Window, cx: &mut C
 }
 
 /// Opens the settings tab, offering the workspace's graph as a scope.
-fn open_settings(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+fn open_settings(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Option<Entity<settings_view::SettingsView>> {
     let session = workspace.session().cloned();
     let graph = session
         .as_ref()
@@ -257,7 +277,9 @@ fn open_settings(workspace: &mut Workspace, window: &mut Window, cx: &mut Contex
             view.set_session(session.map(|session| session.downgrade()), cx);
             view.follow(&workspace, window, cx);
         });
+        return Some(view);
     }
+    None
 }
 
 /// A window's options, at `bounds` or else where the last moved window was.

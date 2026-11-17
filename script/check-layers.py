@@ -30,6 +30,7 @@ LAYERS = {
     "review": 5,
     "history": 5,
     "agent_panel": 5,
+    "ui_tool_server": 5,
     "studio": 6,
 }
 NO_GPUI = {

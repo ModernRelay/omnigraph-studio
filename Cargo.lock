@@ -9537,6 +9537,7 @@ dependencies = [
  "theme",
  "type_table",
  "ui",
+ "ui_tool_server",
  "url",
  "zlog",
 ]
@@ -9634,6 +9635,7 @@ dependencies = [
  "log",
  "menu",
  "model",
+ "schemars 1.0.4",
  "serde",
  "serde_json",
  "studio_actions",
@@ -10669,6 +10671,22 @@ source = "git+https://github.com/zed-industries/zed?tag=v1.27.0#c84af5b99cbc366d
 dependencies = [
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "ui_tool_server"
+version = "0.4.7"
+dependencies = [
+ "futures",
+ "getrandom 0.3.4",
+ "gpui",
+ "httparse",
+ "log",
+ "serde_json",
+ "smol",
+ "studio_actions",
+ "studio_settings",
+ "studio_workspace",
 ]
 
 [[package]]

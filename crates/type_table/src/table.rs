@@ -1246,6 +1246,32 @@ impl Item for TypeTable {
         Some(studio_actions::Thing::Type(self.type_name.clone()))
     }
 
+    /// An edge table, which has no view strip, is a table too.
+    fn view_kind(&self, _cx: &App) -> Option<ViewKind> {
+        Some(ViewKind::Table)
+    }
+
+    fn held_at(&self, _cx: &App) -> Option<String> {
+        self.at_commit.clone()
+    }
+
+    /// The rows picked, or else the row under the cursor, by id (spec 032).
+    fn selected_ids(&self, _cx: &App) -> Option<studio_workspace::SelectedIds> {
+        let ids: Vec<String> = if self.selection.is_empty() {
+            self.cursor_row()
+                .map(|row| row.id.clone())
+                .into_iter()
+                .collect()
+        } else {
+            self.selection.iter().cloned().collect()
+        };
+        (!ids.is_empty()).then(|| studio_workspace::SelectedIds {
+            type_name: Some(self.type_name.clone()),
+            ids,
+            root: None,
+        })
+    }
+
     /// The row under the cursor, with the values the table holds of it.
     fn inspected(&mut self, cx: &mut Context<Self>) -> Option<Inspected> {
         let peek = self.inspect_selected(cx)?;

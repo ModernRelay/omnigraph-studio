@@ -817,6 +817,11 @@ impl Item for QueryEditor {
         true
     }
 
+    /// The commit a query tab opened at a commit reads (spec 032).
+    fn held_at(&self, _cx: &App) -> Option<String> {
+        self.at_commit.clone()
+    }
+
     /// The selected cell of the result (spec 020): the node it holds, or its row.
     fn inspected(&mut self, cx: &mut Context<Self>) -> Option<Inspected> {
         match self.picked(cx)? {
