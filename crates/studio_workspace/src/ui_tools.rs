@@ -24,6 +24,7 @@ use gpui::{
 };
 use serde_json::{Map, Value, json};
 use studio_actions::{Thing, ViewKind};
+use studio_settings::StudioSettings;
 
 use crate::{ToastKind, Workspace};
 
@@ -534,6 +535,10 @@ async fn target_window(
                 .clone()
                 .unwrap_or_else(|| SharedString::from("an agent"));
             workspace.show_opened_by(agent, window, cx);
+            // The person may ask for the window to come to the front (spec 032, Focus).
+            if StudioSettings::get(cx).agent.raise_window {
+                window.activate_window();
+            }
         }
         answer
     });
@@ -1466,6 +1471,59 @@ mod tests {
         assert_eq!(selection.json["truncated"], true);
         assert_eq!(selection.json["selection"]["root"]["id"], "person-000000");
         assert!(selection.json.to_string().len() <= ANSWER_BUDGET);
+    }
+
+    /// With "Bring the window to the front" on, a window an agent shows something in comes to
+    /// the front; off, it stays behind.
+    #[gpui::test]
+    async fn the_window_comes_to_the_front_only_when_the_person_asked(cx: &mut TestAppContext) {
+        cx.update(studio_settings::init_test);
+        let behind = window(cx);
+        let front = cx.add_window(Workspace::new);
+        cx.run_until_parked();
+        let session = session(cx);
+        behind
+            .update(cx, |workspace, window, cx| {
+                workspace.set_session(session, window, cx)
+            })
+            .unwrap();
+        front
+            .update(cx, |_, window, _| window.activate_window())
+            .unwrap();
+        cx.run_until_parked();
+        let id = behind.window_id().as_u64();
+        let active = |cx: &mut TestAppContext| {
+            cx.update(|cx| cx.active_window().map(|window| window.window_id().as_u64()))
+        };
+        assert_ne!(active(cx), Some(id));
+        let answer = run(cx, Target::Any, "graph_open_map", json!({ "window": id })).await;
+        assert_eq!(answer.outcome, "opened");
+        assert_ne!(active(cx), Some(id), "off: it stays behind");
+        cx.update(|cx| {
+            let mut settings = StudioSettings::get(cx).clone();
+            settings.agent.raise_window = true;
+            cx.set_global(settings);
+        });
+        handle_reopen(cx, behind);
+        let answer = run(cx, Target::Any, "graph_open_map", json!({ "window": id })).await;
+        assert_eq!(answer.outcome, "shown", "{answer:?}");
+        assert_eq!(active(cx), Some(id), "on: it comes to the front");
+    }
+
+    /// Puts another tab in front of the map, so showing the map again changes something.
+    fn handle_reopen(cx: &mut TestAppContext, handle: WindowHandle<Workspace>) {
+        handle
+            .update(cx, |workspace, window, cx| {
+                workspace.open_item("other", window, cx, |_, cx| Stub {
+                    title: "Other",
+                    thing: Thing::Schema,
+                    view: ViewKind::Source,
+                    selected: None,
+                    focus_handle: cx.focus_handle(),
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
     }
 
     /// A call to a window that has closed, or is another conversation's, is refused.
