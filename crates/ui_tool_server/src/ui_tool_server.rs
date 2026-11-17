@@ -236,7 +236,10 @@ fn read_kept_token(cx: &mut App) {
             if cx.has_global::<UiToolServer>() {
                 let server = cx.global_mut::<UiToolServer>();
                 server.reading = false;
-                server.outside_token = token;
+                // New token pressed while the keychain was read: the new one stands.
+                if server.outside_token.is_none() {
+                    server.outside_token = token;
+                }
                 if let Some(note) = note {
                     server.note = Some(note.to_owned());
                 }
@@ -347,6 +350,12 @@ fn follow_settings(cx: &mut App) {
     if settings.keep_address != server.keeping {
         let keychain = server.keychain.clone();
         if settings.keep_address {
+            // Kept from now: the port in use is the one the next start asks for first.
+            studio_settings::write_atomic_in_turn(
+                last_port_file(),
+                server.port.to_string().into_bytes(),
+                Access::Private,
+            );
             // Kept from now: the token held goes in the keychain.
             if let Some(token) = server.outside_token.clone() {
                 let write = keychain.write(
@@ -397,6 +406,20 @@ fn follow_settings(cx: &mut App) {
             };
             accept_outside(&shared, &token);
             write_endpoint(&url, &token);
+            // While the address is kept, a token made now is kept too.
+            if server.keeping {
+                let write = server.keychain.write(
+                    KEYCHAIN_KEY.to_owned(),
+                    KEYCHAIN_USER.to_owned(),
+                    token.clone().into_bytes(),
+                );
+                cx.background_spawn(async move {
+                    if let Err(error) = write.await {
+                        log::warn!("the keychain did not keep the UI tools' token: {error}");
+                    }
+                })
+                .detach();
+            }
             cx.global_mut::<UiToolServer>().outside_token = Some(token);
         }
         (false, Some(token)) => {

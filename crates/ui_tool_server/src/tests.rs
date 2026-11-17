@@ -407,47 +407,48 @@ fn the_outside_token_starts_afresh_when_the_switch_comes_back(cx: &mut gpui::Tes
 /// system chooses. Off, the system chooses.
 #[test]
 fn a_taken_port_is_passed_over_never_taken() {
-    // A free run of ports: one the system chose, which is free now.
-    let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let preferred = probe
-        .local_addr()
-        .unwrap()
-        .port()
-        .min(u16::MAX - PORT_TRIES);
-    drop(probe);
+    // Ten ports in a row the test holds itself, so no other process's port is relied on: each
+    // step lets go of the one it expects the server to take.
+    let (base, mut held) = (0..100)
+        .find_map(|_| {
+            let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).ok()?;
+            let base = probe.local_addr().ok()?.port();
+            drop(probe);
+            if base > u16::MAX - PORT_TRIES {
+                return None;
+            }
+            let held: Option<Vec<_>> = (0..PORT_TRIES)
+                .map(|step| std::net::TcpListener::bind(("127.0.0.1", base + step)).ok())
+                .collect();
+            Some((base, held?))
+        })
+        .expect("ten free ports in a row");
+    let mut free = |port: u16| {
+        held[usize::from(port - base)] = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap()
+    };
     // Free: it is taken.
-    let first = bind(true, None, preferred).unwrap();
-    assert_eq!(first.local_addr().unwrap().port(), preferred);
-    // Held by another listener (the first): the next one.
-    let second = bind(true, None, preferred).unwrap();
-    assert_eq!(second.local_addr().unwrap().port(), preferred + 1);
+    free(base);
+    let first = bind(true, None, base).unwrap();
+    assert_eq!(first.local_addr().unwrap().port(), base);
+    // Held (by the first): the next free one.
+    free(base + 1);
+    let second = bind(true, None, base).unwrap();
+    assert_eq!(second.local_addr().unwrap().port(), base + 1);
     // The port used last comes before the one set.
-    let last = bind(true, Some(preferred + 5), preferred).unwrap();
-    assert_eq!(last.local_addr().unwrap().port(), preferred + 5);
-    // All ten held: the system chooses, outside them.
-    let mut held = vec![first, second, last];
-    for step in 0..PORT_TRIES {
-        if let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", preferred + step)) {
-            held.push(listener);
-        }
-    }
-    let chosen = bind(true, None, preferred)
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    assert!(
-        !(preferred..preferred + PORT_TRIES).contains(&chosen),
-        "{chosen}"
-    );
+    free(base + 5);
+    let last = bind(true, Some(base + 5), base).unwrap();
+    assert_eq!(last.local_addr().unwrap().port(), base + 5);
+    // All ten held: the system chooses, outside them; never one of another's.
+    let chosen = bind(true, None, base).unwrap().local_addr().unwrap().port();
+    assert!(!(base..base + PORT_TRIES).contains(&chosen), "{chosen}");
     // Not kept: the system chooses.
-    let free = bind(false, None, preferred)
+    let any = bind(false, None, base)
         .unwrap()
         .local_addr()
         .unwrap()
         .port();
-    assert!(!(preferred..preferred + PORT_TRIES).contains(&free));
-    drop(held);
+    assert!(!(base..base + PORT_TRIES).contains(&any), "{any}");
+    drop((first, second, last));
 }
 
 /// Kept, the token is read from the keychain, or made and kept there; New token replaces it
@@ -514,5 +515,44 @@ async fn the_kept_token_lives_in_the_keychain(cx: &mut gpui::TestAppContext) {
             .unwrap()
             .contains_key("omnigraph-studio://ui-tools"),
         "no longer kept"
+    );
+}
+
+/// Turned on while the address is kept, the outside agents' first token is kept too, so the
+/// command copied now works after a restart; and the port in use is the one asked for next.
+#[gpui::test]
+async fn a_token_made_while_keeping_is_kept(cx: &mut gpui::TestAppContext) {
+    cx.update(studio_settings::init_test);
+    let keychain = Arc::new(MemoryKeychain::default());
+    let set = |change: fn(&mut studio_settings::AgentSettings), cx: &mut gpui::TestAppContext| {
+        cx.update(|cx| {
+            let mut settings = StudioSettings::get(cx).clone();
+            change(&mut settings.agent);
+            cx.set_global(settings);
+        });
+    };
+    set(
+        |agent| {
+            agent.outside_agents = false;
+            agent.keep_address = false;
+            agent.ui_tools_port = 0;
+        },
+        cx,
+    );
+    let chain: Arc<dyn graph_store::sign_in::Keychain> = keychain.clone();
+    cx.update(|cx| init_with(chain, cx));
+    cx.run_until_parked();
+    set(|agent| agent.keep_address = true, cx);
+    cx.run_until_parked();
+    set(|agent| agent.outside_agents = true, cx);
+    cx.run_until_parked();
+    let (token, _) = cx.update(|cx| UiToolServer::outside(cx));
+    let kept = keychain.items.lock().unwrap()["omnigraph-studio://ui-tools"]
+        .1
+        .clone();
+    assert_eq!(
+        Some(kept),
+        token.map(String::into_bytes),
+        "kept as it was made"
     );
 }
