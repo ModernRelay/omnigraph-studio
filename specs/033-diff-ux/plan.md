@@ -150,7 +150,8 @@ The inconsistencies, by kind:
   The review opens at the reviewed head, or at the fork for a removed node; a commit at itself,
   or at its parent. A relationship of its own has no page; its ends do.
 - **Follow to the commit.** A write's result in the query editor links its commit to the
-  commit's tab (a click previews, a second keeps it), so a write is checked where it was made.
+  commit's tab (a click previews, a second keeps it, and the query's tab is kept, never
+  replaced by the preview), so a write is checked where it was made.
 - **Conflicts on their cards.** A card whose node a merge would stop on says "Conflicts with
   main" in `Color::Conflict` in the feed, and carries the conflict mark in the split's list,
   beside the conflicts list the strip opens.
@@ -216,6 +217,8 @@ whole id). Feature crates still share nothing directly.
 | 2026-11-17 | A schema change is said as one and not offered again | `history` `a_schema_change_is_said_as_one_and_not_offered_again` (a 409 `schema_boundary` at Person) | Pass: `SchemaChange(Some("Person"))`, nothing to try again |
 | 2026-11-17 | Typing in the review's search leaves the list of changes | `review` `typing_in_the_search_leaves_the_changes_as_they_were`, with reduced motion: a dry run the fake server never answers keeps a spinner turning, which draws the review a few times a second | Pass: two keys draw the list 0 times; the search landing once. Without reduced motion the spinner's frame counted as one more |
 | 2026-11-17 | The first commit's note says it is the first, whatever is held for it | `history` `the_inspector_shows_the_selected_commit`, changed: it inserted counts for the first commit, which no read makes | Pass |
+| 2026-11-17 | A commit's selection follows its entity when a later page or a schema makes the groups anew (review comment) | `history` `the_selection_follows_its_entity_across_pages` | Pass: p2 stays selected with the groups in another order; gone from them, nothing is selected and the inspector is told. Before, the selection was an index, and a page that sorted a change before it moved it onto another node |
+| 2026-11-17 | A card a merge would stop on finds its conflict in one lookup (review comment) | `review` `a_card_a_merge_would_stop_on_says_so` | Pass: "Conflicts with main" through the index; a list that replaced the one indexed marks nothing. Before, each drawn card scanned every conflict |
 | 2026-11-17 | Every screen after | The same snapshots on this branch | On the pull request |
 
 ## Corrections
