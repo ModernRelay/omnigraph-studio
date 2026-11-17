@@ -538,14 +538,22 @@ pub(crate) mod tests {
     }
 
     /// A graph admitted before a rule tightened opens: the server keeps its schema, which the
-    /// admission parser would now refuse.
+    /// admission parser would now refuse. Omnigraph 0.15 refuses `@unique` on a list or a
+    /// vector property, which 0.14 admitted, as it refused one on a Blob before.
     #[test]
     fn a_schema_admitted_before_a_rule_tightened_still_opens() {
-        let historical =
-            "node Document {\n  slug: String @key\n  payload: Blob?\n  @unique(payload)\n}\n";
-        assert!(omnigraph_compiler::schema::parser::parse_schema(historical).is_err());
-        let schema = SchemaModel::parse(historical).expect("an accepted schema opens");
-        assert!(schema.node("Document").is_some());
+        for historical in [
+            "node Document {\n  slug: String @key\n  payload: Blob?\n  @unique(payload)\n}\n",
+            "node Document {\n  slug: String @key\n  tags: [String]?\n  @unique(tags)\n}\n",
+            "node Document {\n  slug: String @key\n  v: Vector(3)?\n  @unique(v)\n}\n",
+        ] {
+            assert!(
+                omnigraph_compiler::schema::parser::parse_schema(historical).is_err(),
+                "{historical}"
+            );
+            let schema = SchemaModel::parse(historical).expect("an accepted schema opens");
+            assert!(schema.node("Document").is_some());
+        }
     }
 
     /// Every member of a composite key is a key the server will not let change; the node has
