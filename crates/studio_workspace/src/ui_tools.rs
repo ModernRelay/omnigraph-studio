@@ -286,7 +286,8 @@ pub fn definitions(target: Target, cx: &App) -> Vec<Value> {
 pub struct Caller {
     /// The agent's name, as the chip says it ("Opened by Claude Code").
     pub agent: Option<SharedString>,
-    /// The first call of an agent outside Studio this run: the window it acts in says so once.
+    /// No window has yet said this run that an agent outside Studio is there: the window this
+    /// call names says so, and the answer tells ([`Answer::announced`]).
     pub announce: bool,
 }
 
@@ -300,6 +301,8 @@ pub struct Answer {
     pub says: String,
     pub json: Value,
     pub is_error: bool,
+    /// The window it acted in was told an agent outside Studio is there ([`Caller::announce`]).
+    pub announced: bool,
 }
 
 impl Answer {
@@ -319,6 +322,7 @@ impl Answer {
             says,
             json,
             is_error,
+            announced: false,
         }
     }
 
@@ -405,6 +409,34 @@ pub async fn call(
     let Some(handle) = cx.update(|cx| workspace_window(id, cx)) else {
         return Answer::window_closed(id);
     };
+    let mut answer = target_window(cx, handle, id, tool, name, &caller, input).await;
+    // An outside agent's first call to a window says so there, whatever the call did: a read,
+    // a refusal or an action. A call that named no open window has shown nothing yet.
+    if caller.announce && answer.outcome != "window_closed" {
+        let shown = handle.update(cx, |workspace, _, cx| {
+            workspace.show_toast_with_action(
+                ToastKind::Info,
+                OUTSIDE_NOTICE,
+                "Turn off",
+                Box::new(studio_actions::workspace::OpenAgentSettings),
+                cx,
+            );
+        });
+        answer.announced = shown.is_ok();
+    }
+    answer
+}
+
+/// A call to the open window `id`: a read, or the tool dispatched there and what changed.
+async fn target_window(
+    cx: &mut AsyncApp,
+    handle: WindowHandle<Workspace>,
+    id: u64,
+    tool: Option<&'static UiTool>,
+    name: &str,
+    caller: &Caller,
+    input: Value,
+) -> Answer {
     let Some(tool) = tool else {
         let read = handle.update(cx, |workspace, window, cx| match name {
             "studio_tabs" => tabs(id, workspace, window, cx),
@@ -430,15 +462,6 @@ pub async fn call(
                 .clone()
                 .unwrap_or_else(|| SharedString::from("an agent"));
             workspace.show_opened_by(agent, window, cx);
-        }
-        if caller.announce {
-            workspace.show_toast_with_action(
-                ToastKind::Info,
-                OUTSIDE_NOTICE,
-                "Turn off",
-                Box::new(studio_actions::workspace::OpenAgentSettings),
-                cx,
-            );
         }
         answer
     });
@@ -1269,7 +1292,27 @@ mod tests {
         .await;
         assert_eq!(nothing.outcome, "no_change");
 
-        // An outside agent's first call says so in the window it acts in, once.
+        // An outside agent's first call to a window says so there; `studio_windows`, which
+        // names none, leaves it for the next call.
+        let outside = Caller {
+            agent: None,
+            announce: true,
+        };
+        let listed = call(
+            &mut cx.to_async(),
+            Target::Any,
+            outside.clone(),
+            "studio_windows",
+            json!({}),
+        )
+        .await;
+        cx.run_until_parked();
+        assert!(!listed.announced);
+        handle
+            .read_with(cx, |workspace, _| {
+                assert!(workspace.toast_messages().is_empty())
+            })
+            .unwrap();
         let announced = call(
             &mut cx.to_async(),
             Target::Any,
@@ -1283,6 +1326,7 @@ mod tests {
         .await;
         cx.run_until_parked();
         assert_eq!(announced.outcome, "no_change");
+        assert!(announced.announced);
         handle
             .read_with(cx, |workspace, _| {
                 assert_eq!(workspace.toast_messages(), [OUTSIDE_NOTICE]);

@@ -57,8 +57,10 @@ pub fn init(cx: &mut App) {
             cx.observe_global::<StudioSettings>(follow_switch).detach();
             cx.on_app_quit(|cx| {
                 // The token dies with the run, so its file goes with it.
+                // After the writes asked for before it: the token file must not come back.
                 if cx.has_global::<UiToolServer>() {
                     remove_endpoint();
+                    studio_settings::writes_done();
                 }
                 async {}
             })
@@ -204,21 +206,24 @@ pub fn token_file() -> PathBuf {
     endpoint_dir().join("token")
 }
 
+/// Writes the endpoint's files on Studio's write thread, after every write asked for before
+/// it: a sync to disk is too slow for the main thread.
 fn write_endpoint(url: &str, token: &str) {
-    let dir = endpoint_dir();
-    let written = std::fs::create_dir_all(&dir)
-        .and_then(|()| private_dir(&dir))
-        .and_then(|()| {
-            let endpoint = serde_json::to_vec_pretty(&json!({ "url": url, "token": token }))
-                .unwrap_or_default();
-            studio_settings::write_atomic(&endpoint_file(), &endpoint, Access::Private)
-        })
-        .and_then(|()| {
-            studio_settings::write_atomic(&token_file(), token.as_bytes(), Access::Private)
-        });
-    if let Err(error) = written {
-        log::warn!("Studio could not write the UI tools' endpoint file: {error}");
-    }
+    let endpoint =
+        serde_json::to_vec_pretty(&json!({ "url": url, "token": token })).unwrap_or_default();
+    let token = token.as_bytes().to_vec();
+    studio_settings::run_in_turn(move || {
+        let dir = endpoint_dir();
+        let written = std::fs::create_dir_all(&dir)
+            .and_then(|()| private_dir(&dir))
+            .and_then(|()| {
+                studio_settings::write_atomic(&endpoint_file(), &endpoint, Access::Private)
+            })
+            .and_then(|()| studio_settings::write_atomic(&token_file(), &token, Access::Private));
+        if let Err(error) = written {
+            log::warn!("Studio could not write the UI tools' endpoint file: {error}");
+        }
+    });
 }
 
 #[cfg(unix)]
@@ -232,7 +237,12 @@ fn private_dir(_dir: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Deletes the endpoint's files on the write thread, after a write of them asked for before.
 fn remove_endpoint() {
+    studio_settings::run_in_turn(remove_endpoint_now);
+}
+
+fn remove_endpoint_now() {
     for file in [endpoint_file(), token_file()] {
         match std::fs::remove_file(&file) {
             Ok(()) => {}

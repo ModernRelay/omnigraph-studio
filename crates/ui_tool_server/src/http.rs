@@ -417,8 +417,9 @@ async fn call(shared: &Shared, token: &str, tool: String, input: Value) -> Answe
             return Answer::busy(MAX_IN_FLIGHT);
         }
         state.in_flight += 1;
+        // Marked once a window has shown the notice, so a call that named no open window (the
+        // first, `studio_windows`, among them) leaves it for the next.
         let announce = state.outside && !state.announced;
-        state.announced |= announce;
         (
             state.target,
             Caller {
@@ -448,7 +449,15 @@ async fn call(shared: &Shared, token: &str, tool: String, input: Value) -> Answe
         reply,
     });
     match (sent, answered.await) {
-        (Ok(()), Ok(answer)) => answer,
+        (Ok(()), Ok(answer)) => {
+            if answer.announced
+                && let Ok(mut tokens) = shared.tokens.lock()
+                && let Some(state) = tokens.get_mut(token)
+            {
+                state.announced = true;
+            }
+            answer
+        }
         _ => Answer::window_closed(0),
     }
 }

@@ -255,13 +255,13 @@ fn a_fifth_call_in_flight_is_busy() {
             serde_json::from_str(body["result"]["content"][1]["text"].as_str().unwrap()).unwrap();
         assert_eq!(json["outcome"], "busy");
 
-        assert_eq!(
-            held.iter().filter(|call| call.caller.announce).count(),
-            1,
-            "the outside agent's first call alone is announced"
-        );
-        for call in held {
-            call.reply.send(Answer::window_closed(7)).ok();
+        // No window has shown the notice yet, so each waiting call may show it; the first
+        // that does marks it given.
+        assert!(held.iter().all(|call| call.caller.announce));
+        for (index, call) in held.into_iter().enumerate() {
+            let mut answer = Answer::window_closed(7);
+            answer.announced = index == 0;
+            call.reply.send(answer).ok();
         }
         for answered in waiting {
             assert!(answered.await.2.contains("window_closed"));
