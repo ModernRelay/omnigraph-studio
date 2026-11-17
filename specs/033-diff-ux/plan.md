@@ -106,8 +106,11 @@ The inconsistencies, by kind:
   (`studio_ui::change_counts`): runs, the summary line, History, the panel, the inspector, the
   table's toolbar. A listed commit's counts are `change_cards::commit_counts` over
   `CommitCounts`: the counts, with a muted "…" when only the first 100 changes were counted;
-  "no changes"; "first commit"; "schema change"; "cleaned up". Each says its words in its
-  tooltip ("100 added, counted from its first 100 changes; it has more").
+  "no changes"; "first commit"; "schema change"; "cleaned up"; "not comparable" (another
+  comparison the server refuses, its reason in the tooltip). Each says its words in its tooltip
+  ("100 added, counted from its first 100 changes; it has more"). One function reads a refused
+  read of a commit's changes (`history::counts::lasting`), for the commit's tab and every list
+  alike, so they cannot say two things of one commit.
 - **Summary line** (`change_cards::summary_line`). Under the heading of a review and a commit,
   and in the inspector's commit: each type with a change, its mark, name and counts, node types
   before relationship types, wrapping. Its tooltip says the counts in words. The review's facts
@@ -135,7 +138,9 @@ The inconsistencies, by kind:
   own.", "This commit changed no node or relationship against its parent."). A schema change:
   `schema_change_state` ("Schema change", the type it names, that Omnigraph does not list a
   commit's data changes across one, and that the schema as it is now is in Schema), with no
-  retry. The first commit: `first_commit_state`. A failure stays `ds::error_state` with its
+  retry. The first commit: `first_commit_state`. History cleaned up, and another comparison
+  refused ("Not comparable", with the server's reason), the same way: `lasting_state` maps every
+  lasting refusal to its state, none with a retry. A failure stays `ds::error_state` with its
   recovery.
 
 ### Affordances
@@ -154,7 +159,9 @@ The inconsistencies, by kind:
   replaced by the preview), so a write is checked where it was made.
 - **Conflicts on their cards.** A card whose node a merge would stop on says "Conflicts with
   main" in `Color::Conflict` in the feed, and carries the conflict mark in the split's list,
-  beside the conflicts list the strip opens.
+  beside the conflicts list the strip opens. The conflicts are held with their index by type and
+  entity (`Conflicts`, made where a dry run or a merge answers), so a drawn card finds its own
+  in one lookup. `studio_changes::ToggleChange` unfolds a change in the review too.
 
 ### Drawing
 
@@ -217,8 +224,10 @@ whole id). Feature crates still share nothing directly.
 | 2026-11-17 | A schema change is said as one and not offered again | `history` `a_schema_change_is_said_as_one_and_not_offered_again` (a 409 `schema_boundary` at Person) | Pass: `SchemaChange(Some("Person"))`, nothing to try again |
 | 2026-11-17 | Typing in the review's search leaves the list of changes | `review` `typing_in_the_search_leaves_the_changes_as_they_were`, with reduced motion: a dry run the fake server never answers keeps a spinner turning, which draws the review a few times a second | Pass: two keys draw the list 0 times; the search landing once. Without reduced motion the spinner's frame counted as one more |
 | 2026-11-17 | The first commit's note says it is the first, whatever is held for it | `history` `the_inspector_shows_the_selected_commit`, changed: it inserted counts for the first commit, which no read makes | Pass |
-| 2026-11-17 | A commit's selection follows its entity when a later page or a schema makes the groups anew (review comment) | `history` `the_selection_follows_its_entity_across_pages` | Pass: p2 stays selected with the groups in another order; gone from them, nothing is selected and the inspector is told. Before, the selection was an index, and a page that sorted a change before it moved it onto another node |
-| 2026-11-17 | A card a merge would stop on finds its conflict in one lookup (review comment) | `review` `a_card_a_merge_would_stop_on_says_so` | Pass: "Conflicts with main" through the index; a list that replaced the one indexed marks nothing. Before, each drawn card scanned every conflict |
+| 2026-11-17 | A commit's selection follows its entity when a later page or a schema makes the groups anew (review comment) | `history` `the_selection_follows_its_entity_across_pages`, since replaced by the test below that goes through the real read | Pass: p2 stays selected with the groups in another order; gone from them, nothing is selected and the inspector is told. Before, the selection was an index, and a page that sorted a change before it moved it onto another node |
+| 2026-11-17 | A card a merge would stop on finds its conflict in one lookup (review comment) | `review` `a_card_a_merge_would_stop_on_says_so` | Pass: "Conflicts with main" in one lookup; conflicts that replaced them with none there mark nothing. Before, each drawn card scanned every conflict; then a hand-kept index, now `Conflicts` holding list and index together |
+| 2026-11-17 | A commit's tab and its rows read a refusal alike: a cleaned-up commit (410) is a state with nothing to try again, an unknown 409 "not comparable" rather than a blank (review of #130, B1) | `history` `a_refused_comparison_says_why` (rewritten over `counts::lasting`: parentless, schema change with and without a type, another 409 with its reason, 410, a 503 that may pass), `a_cleaned_up_commit_says_so_and_offers_no_retry` | Pass. Before, the tab showed the error state with Try again for a 410, and a 409 of an unknown reason left History's cell blank for good |
+| 2026-11-17 | The selection stays on its node across a later page that sorts first, through the real read (review of #130, O3) | `history` `the_selection_stays_on_its_node_when_a_later_page_sorts_first` (5,000 Person inserts, then a Company update on page 2), the reviewer's test | Pass; it failed at `fa76ad1` (the selection moved to p00000), per the review |
 | 2026-11-17 | Every screen after | The same snapshots on this branch | On the pull request |
 
 ## Corrections
