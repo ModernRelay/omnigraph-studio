@@ -325,3 +325,26 @@ fn the_log_names_only_studios_tools() {
     );
     assert_eq!(http::logged_name("person-000042"), "unknown");
 }
+
+/// A call Studio stops before answering (the main thread let its reply go, as at quit) says so,
+/// naming the window it meant, rather than that a window 0 is not open.
+#[test]
+fn a_call_studio_never_answered_is_cancelled() {
+    smol::block_on(async {
+        let (port, mut calls, _) = server();
+        let body = rpc(
+            8,
+            "tools/call",
+            json!({ "name": "graph_open_map", "arguments": { "window": 4294967297u64 } }),
+        );
+        let answered = smol::spawn(async move { send(port, &authorized(&body)).await });
+        drop(calls.next().await.unwrap());
+        let (_, _, body) = answered.await;
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["result"]["isError"], true);
+        let json: Value =
+            serde_json::from_str(body["result"]["content"][1]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(json["outcome"], "cancelled");
+        assert_eq!(json["window"], 4294967297u64);
+    });
+}

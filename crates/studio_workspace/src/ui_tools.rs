@@ -312,7 +312,7 @@ pub struct Caller {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Answer {
     /// The outcome by name: `opened`, `shown`, `panel_shown`, `no_change`, `read`,
-    /// `not_available`, `window_closed`, `invalid_input`, `unknown_tool`, `busy`.
+    /// `not_available`, `window_closed`, `invalid_input`, `unknown_tool`, `busy`, `cancelled`.
     pub outcome: &'static str,
     pub says: String,
     pub json: Value,
@@ -356,6 +356,16 @@ impl Answer {
             "window_closed",
             format!("Window {window} is not open. studio_windows lists the windows open now."),
             Some(window),
+        )
+    }
+
+    /// Studio stopped before it answered (it is quitting): what the call did is not known.
+    pub fn cancelled(window: Option<u64>) -> Self {
+        Self::error(
+            "cancelled",
+            "Studio stopped before it answered, so what the call did is not known. studio_tabs \
+             says what a window shows.",
+            window,
         )
     }
 

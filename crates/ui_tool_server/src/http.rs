@@ -444,6 +444,11 @@ async fn call(shared: &Shared, token: &str, tool: String, input: Value) -> Answe
         }
     }
     let _in_flight = InFlight(shared, token);
+    // The window the call meant, for an answer Studio could not give.
+    let window = match target {
+        Target::Bound(own) => Some(own),
+        Target::Any => input.get("window").and_then(Value::as_u64),
+    };
     let (reply, answered) = oneshot::channel();
     let sent = shared.calls.unbounded_send(Call {
         token: token.to_owned(),
@@ -455,7 +460,7 @@ async fn call(shared: &Shared, token: &str, tool: String, input: Value) -> Answe
     });
     match (sent, answered.await) {
         (Ok(()), Ok(answer)) => answer,
-        _ => Answer::window_closed(0),
+        _ => Answer::cancelled(window),
     }
 }
 
