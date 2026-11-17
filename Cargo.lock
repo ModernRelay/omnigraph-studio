@@ -1386,6 +1386,7 @@ dependencies = [
  "gpui",
  "gq_language",
  "graph_store",
+ "studio_actions",
  "studio_ui",
  "ui",
 ]
