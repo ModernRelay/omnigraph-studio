@@ -1351,7 +1351,7 @@ impl Item for TypeTable {
     }
 
     fn dedupe_key(&self, _cx: &App) -> Option<SharedString> {
-        if let Some(key) = &self.own_key {
+        if let (Some(key), None) = (&self.own_key, &self.view_id) {
             return Some(key.clone().into());
         }
         Some(
@@ -2233,6 +2233,8 @@ impl TypeTable {
     /// Makes this tab the saved view `id`: one saved from it as a new view.
     pub(crate) fn become_view(&mut self, id: String, cx: &mut Context<Self>) {
         self.view_id = Some(id);
+        // A filtered table saved as a view is that view's tab, found by the view's key.
+        self.own_key = None;
         cx.emit(ItemEvent::UpdateTab);
         cx.notify();
     }

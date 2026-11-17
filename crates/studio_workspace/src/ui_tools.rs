@@ -1245,6 +1245,21 @@ fn view_changed(id: u64, tool: &UiTool, before: &Front, workspace: &Workspace, c
     for (key, value) in &new.facts {
         json[key] = value.clone();
     }
+    // The lists are cut, the longest first, until the answer fits what one may take: the view
+    // changed, and the agent hears that, whatever was named.
+    while json.to_string().len() > ANSWER_BUDGET {
+        let longest = ["added", "removed", "edges_added", "unexpanded"]
+            .into_iter()
+            .max_by_key(|key| json[*key].as_array().map_or(0, Vec::len));
+        let Some(list) = longest.and_then(|key| json[key].as_array_mut()) else {
+            break;
+        };
+        if list.is_empty() {
+            break;
+        }
+        list.truncate(list.len() / 2);
+        json["truncated"] = json!(true);
+    }
     Answer::new(outcome, says, json, false)
 }
 

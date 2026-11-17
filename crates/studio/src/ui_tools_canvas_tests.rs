@@ -645,6 +645,15 @@ async fn graph_show_results_on_canvas_draws_the_nodes(cx: &mut TestAppContext) {
     let read = run(cx, id, "studio_canvas", json!({})).await;
     assert_eq!(read.json["nodes"].as_array().unwrap().len(), 2, "{read:?}");
     assert_eq!(read.json["edges"].as_array().unwrap().len(), 1);
+    // A result picture is drawn whole: nothing is hidden from it.
+    let hide = run(
+        cx,
+        id,
+        "canvas_hide_nodes",
+        json!({ "nodes": [node("c0")] }),
+    )
+    .await;
+    assert_eq!(hide.outcome, "not_available", "{hide:?}");
 }
 
 /// A table's row walks on a canvas of its own.
@@ -684,6 +693,15 @@ macro_rules! map_tool {
 map_tool!(map_back_goes_back, "map_back");
 map_tool!(map_show_domains_shows_them, "map_show_domains");
 map_tool!(map_select_next_points_at_the_next_type, "map_select_next");
+
+/// A map tool that moves what is pointed at says it changed the map.
+#[gpui::test]
+async fn map_select_next_says_it_changed_the_map(cx: &mut TestAppContext) {
+    let (_, cx, id) = studio(cx, None).await;
+    run(cx, id, "graph_open_map", json!({})).await;
+    let answer = run(cx, id, "map_select_next", json!({})).await;
+    assert_eq!(answer.outcome, "changed", "{answer:?}");
+}
 map_tool!(
     map_select_previous_points_at_the_previous_type,
     "map_select_previous"
