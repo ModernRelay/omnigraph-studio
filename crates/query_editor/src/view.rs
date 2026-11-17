@@ -5225,16 +5225,32 @@ impl QueryEditor {
                         ds::meta(IconName::GitBranch, format!("from {from}")).into_any_element(),
                     );
                 }
+                // The commit is a link to its changes, so a write can be checked against what
+                // it was meant to do (spec 033): a click previews its tab, a second keeps it.
                 if let Some((commit, what)) = effect.commit() {
+                    let id = commit.to_owned();
                     facts.push(
                         div()
                             .id("write-commit")
+                            .cursor_pointer()
                             .child(ds::meta_code(
                                 IconName::GitCommit,
                                 short_commit_id(commit),
                                 cx,
                             ))
-                            .tip(studio_ui::ds::tooltip(format!("{what} {commit}")))
+                            .tip(
+                                studio_ui::ds::tooltip(format!("{what} {commit}"))
+                                    .meta("Click to see its changes"),
+                            )
+                            .on_click(move |event, window, cx| {
+                                window.dispatch_action(
+                                    Box::new(studio_actions::graph::OpenCommit {
+                                        commit_id: id.clone(),
+                                        preview: event.click_count() < 2,
+                                    }),
+                                    cx,
+                                )
+                            })
                             .into_any_element(),
                     );
                 }
