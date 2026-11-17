@@ -955,7 +955,11 @@ fn front_tabs(workspace: &Workspace) -> impl Iterator<Item = &dyn ItemHandle> {
 
 fn front(workspace: &Workspace, window: &Window, cx: &App) -> Front {
     Front {
-        focus: window.focused(cx),
+        // The bare window holding the keyboard is the keyboard nowhere in particular: what a
+        // call opens may take it, as when nothing holds it.
+        focus: window
+            .focused(cx)
+            .filter(|focus| *focus != workspace.focus_handle(cx)),
         focus_panel: workspace.panel_with_focus(window, cx),
         focus_tab: front_tabs(workspace)
             .find(|tab| tab.focus_handle(cx).contains_focused(window, cx))
@@ -2329,7 +2333,7 @@ mod tests {
                     focus_handle: cx.focus_handle(),
                     held,
                 });
-                // The person's keyboard is elsewhere in the window.
+                // The keyboard is not on the tab: here, on the window itself.
                 let person = workspace.focus_handle(cx);
                 window.focus(&person, cx);
                 person
@@ -2348,6 +2352,33 @@ mod tests {
             .update(cx, |_, window, cx| window.focused(cx))
             .unwrap();
         assert_eq!(focused, Some(person));
+    }
+
+    /// With the keyboard nowhere in particular (on the bare window, as after the last tab
+    /// closed), the tab a tool opens takes it, as a tab the person opens does.
+    #[gpui::test]
+    async fn a_tab_opened_with_the_keyboard_nowhere_takes_it(cx: &mut TestAppContext) {
+        let handle = window(cx);
+        let id = handle.window_id().as_u64();
+        let session = session(cx);
+        handle
+            .update(cx, |workspace, window, cx| {
+                workspace.set_session(session, window, cx);
+                let bare = workspace.focus_handle(cx);
+                window.focus(&bare, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let answer = run(cx, Target::Any, "graph_open_map", json!({ "window": id })).await;
+        assert_eq!(answer.outcome, "opened", "{answer:?}");
+        let (focused, tab) = handle
+            .update(cx, |workspace, window, cx| {
+                let tab = workspace.active_item().map(|item| item.focus_handle(cx));
+                (window.focused(cx), tab)
+            })
+            .unwrap();
+        assert!(tab.is_some());
+        assert_eq!(focused, tab, "the tab opened has the keyboard");
     }
 
     /// A call to a window that has closed, or is another conversation's, is refused.
