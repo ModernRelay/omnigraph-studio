@@ -97,7 +97,18 @@ pub fn init_with(keychain: Arc<dyn Keychain>, cx: &mut App) {
                     remove_endpoint();
                     studio_settings::writes_done();
                 }
-                async {}
+                // A change of the kept token still out lands before Studio goes, as far as
+                // the quit waits: dropped with the server, it would be lost.
+                let pending = cx
+                    .try_global::<UiToolServer>()
+                    .is_some()
+                    .then(|| cx.global_mut::<UiToolServer>().keeping_writes.take())
+                    .flatten();
+                async move {
+                    if let Some(pending) = pending {
+                        pending.await;
+                    }
+                }
             })
             .detach();
         }
