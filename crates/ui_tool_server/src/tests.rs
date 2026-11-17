@@ -451,6 +451,74 @@ fn a_taken_port_is_passed_over_never_taken() {
     drop((first, second, last));
 }
 
+/// Until an agent is to be served nothing runs: no server, no port, no token, and the keychain
+/// is not asked. A conversation's entry starts the server and still asks the keychain nothing;
+/// letting agents outside Studio in is what reads the kept token.
+#[gpui::test]
+async fn nothing_starts_until_an_agent_is_served(cx: &mut gpui::TestAppContext) {
+    use std::sync::atomic::Ordering;
+    cx.update(studio_settings::init_test);
+    let keychain = Arc::new(MemoryKeychain::default());
+    let set = |change: fn(&mut studio_settings::AgentSettings), cx: &mut gpui::TestAppContext| {
+        cx.update(|cx| {
+            let mut settings = StudioSettings::get(cx).clone();
+            change(&mut settings.agent);
+            cx.set_global(settings);
+        });
+    };
+    set(
+        |agent| {
+            agent.outside_agents = false;
+            agent.keep_address = true;
+            agent.ui_tools_port = 0;
+        },
+        cx,
+    );
+    let chain: Arc<dyn graph_store::sign_in::Keychain> = keychain.clone();
+    cx.update(|cx| init_with(chain, cx));
+    cx.run_until_parked();
+    let asked = |keychain: &MemoryKeychain| {
+        keychain.reads.load(Ordering::SeqCst) + keychain.writes.load(Ordering::SeqCst)
+    };
+    assert!(!cx.update(|cx| is_running(cx)), "no server");
+    assert!(cx.update(|cx| UiToolServer::outside_url(cx)).is_none());
+    assert_eq!(asked(&keychain), 0, "the keychain is not asked");
+
+    // A setting that lets no agent in starts nothing.
+    set(|agent| agent.raise_window = true, cx);
+    set(|agent| agent.keep_address = false, cx);
+    set(|agent| agent.keep_address = true, cx);
+    cx.run_until_parked();
+    assert!(!cx.update(|cx| is_running(cx)));
+    assert_eq!(asked(&keychain), 0);
+
+    // A conversation asks for its entry: the server starts for it.
+    let entry = cx
+        .update(|cx| UiToolServer::entry_for(7, cx))
+        .expect("the server starts for a conversation");
+    cx.run_until_parked();
+    assert!(cx.update(|cx| is_running(cx)));
+    assert!(entry.url.starts_with("http://127.0.0.1:"), "{}", entry.url);
+    let (outside, shared) = cx.update(|cx| UiToolServer::outside(cx));
+    assert!(outside.is_none(), "no token for agents outside Studio");
+    assert_eq!(shared.tokens.lock().unwrap().len(), 1, "the conversation's");
+    assert!(cx.update(|cx| UiToolServer::outside_url(cx)).is_none());
+    assert_eq!(asked(&keychain), 0, "a conversation's token is not kept");
+    drop(entry);
+    assert!(shared.tokens.lock().unwrap().is_empty(), "given up");
+
+    // Agents outside Studio are let in: now the kept token is read; none, so one is kept.
+    set(|agent| agent.outside_agents = true, cx);
+    cx.run_until_parked();
+    assert_eq!(keychain.reads.load(Ordering::SeqCst), 1);
+    let (outside, _) = cx.update(|cx| UiToolServer::outside(cx));
+    let kept = keychain.items.lock().unwrap()["omnigraph-studio://ui-tools"]
+        .1
+        .clone();
+    assert_eq!(Some(kept), outside.map(String::into_bytes));
+    assert!(cx.update(|cx| UiToolServer::outside_url(cx)).is_some());
+}
+
 /// Kept, the token is read from the keychain, or made and kept there; New token replaces it
 /// there and refuses the old one; turned off, the kept token goes and the run takes its own.
 #[gpui::test]

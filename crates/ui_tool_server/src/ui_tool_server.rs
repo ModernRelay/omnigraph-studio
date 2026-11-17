@@ -3,6 +3,11 @@
 //! `127.0.0.1` to the panel's agents and, when the person turns it on, to agents outside Studio. It makes no request to an Omnigraph server: a tool acts on a
 //! window, and the views it opens read as they do when the person opens them.
 //!
+//! Nothing here runs until an agent is to be served (spec 032, amended 2026-11-18). [`init`]
+//! only follows the settings: no port is bound, no token is made, the keychain is not asked and
+//! no file is written until a conversation asks for its entry ([`UiToolServer::entry_for`]) or
+//! the person lets agents outside Studio in. A person who uses neither is not touched by it.
+//!
 //! Each conversation gets a token of its own, bound to its window, while it runs
 //! ([`UiToolServer::entry_for`]). The outside-agent switch gives out one more token, written
 //! with the server's address to `<data dir>/ui-tools/endpoint.json` (mode 0600, in a 0700
@@ -58,6 +63,9 @@ pub struct UiToolServer {
     outside_token: Option<String>,
     /// The kept token is being read from the keychain; the switch waits for it.
     reading: bool,
+    /// The keychain has been asked for the kept token this run. It is asked the first time
+    /// agents outside Studio are let in while the address is kept, never before.
+    asked_keychain: bool,
     /// Whether the address is kept, as last followed.
     keeping: bool,
     /// What the settings row says about the address or token, when something did not go as
@@ -94,40 +102,85 @@ impl Drop for Entry {
     }
 }
 
-/// Starts the server, with the system keychain for a kept token, and follows the settings. A
-/// server that cannot bind leaves Studio without UI tools, and says so in the log.
+/// What the crate holds while no agent is served: which keychain a kept token would live in,
+/// and nothing else.
+struct Idle {
+    /// A test's keychain. `None` takes the system's, which is started with the server.
+    keychain: Option<Arc<dyn Keychain>>,
+    /// The server could not start: said once in the log, and not tried at every change.
+    failed: bool,
+    /// The file an earlier run may have left was removed, with the switch off.
+    swept: bool,
+}
+
+impl Global for Idle {}
+
+/// Follows the settings and waits to be needed. The server starts when a conversation asks for
+/// its entry or while agents outside Studio are let in ([`ensure_started`]); until then Studio
+/// binds no port, makes no token, asks the keychain nothing and writes no file.
 pub fn init(cx: &mut App) {
-    let keychain = PlatformKeychain::start(cx);
-    init_with(keychain, cx);
+    init_idle(None, cx);
 }
 
 /// [`init`] with the keychain given: a test's keeps its items in memory.
 pub fn init_with(keychain: Arc<dyn Keychain>, cx: &mut App) {
+    init_idle(Some(keychain), cx);
+}
+
+fn init_idle(keychain: Option<Arc<dyn Keychain>>, cx: &mut App) {
+    cx.set_global(Idle {
+        keychain,
+        failed: false,
+        swept: false,
+    });
+    follow_settings(cx);
+    cx.observe_global::<StudioSettings>(follow_settings)
+        .detach();
+    cx.on_app_quit(|cx| {
+        // A token made for the run dies with it, so its file goes with it; a kept one's
+        // stays for the copied commands. After the writes asked for before it.
+        if let Some(server) = cx.try_global::<UiToolServer>()
+            && !server.keeping
+        {
+            remove_endpoint();
+            studio_settings::writes_done();
+        }
+        async {}
+    })
+    .detach();
+}
+
+/// Whether the server runs, starting it when it does not yet: a conversation wants its entry,
+/// or agents outside Studio are let in. A server that cannot bind leaves Studio without UI
+/// tools, and says so in the log.
+fn ensure_started(cx: &mut App) -> bool {
+    if cx.has_global::<UiToolServer>() {
+        return true;
+    }
+    let Some(idle) = cx.try_global::<Idle>() else {
+        return false;
+    };
+    if idle.failed {
+        return false;
+    }
+    let keychain = idle.keychain.clone();
+    let keychain = keychain.unwrap_or_else(|| PlatformKeychain::start(cx));
     match start(keychain, cx) {
         Ok(server) => {
-            let keeping = server.keeping;
             cx.set_global(server);
-            if keeping {
-                read_kept_token(cx);
-            }
-            follow_settings(cx);
-            cx.observe_global::<StudioSettings>(follow_settings)
-                .detach();
-            cx.on_app_quit(|cx| {
-                // A token made for the run dies with it, so its file goes with it; a kept one's
-                // stays for the copied commands. After the writes asked for before it.
-                if let Some(server) = cx.try_global::<UiToolServer>()
-                    && !server.keeping
-                {
-                    remove_endpoint();
-                    studio_settings::writes_done();
-                }
-                async {}
-            })
-            .detach();
+            true
         }
-        Err(error) => log::warn!("Studio's UI tool server could not start: {error}"),
+        Err(error) => {
+            log::warn!("Studio's UI tool server could not start: {error}");
+            cx.global_mut::<Idle>().failed = true;
+            false
+        }
     }
+}
+
+/// Whether the server is running: `false` until an agent was to be served.
+pub fn is_running(cx: &App) -> bool {
+    cx.has_global::<UiToolServer>()
 }
 
 /// Binds to `127.0.0.1`. While the address is kept, the ports asked for come first, in order:
@@ -207,6 +260,7 @@ fn start(keychain: Arc<dyn Keychain>, cx: &mut App) -> std::io::Result<UiToolSer
         keychain,
         outside_token: None,
         reading: false,
+        asked_keychain: false,
         keeping: keep,
         note: asked.map(|asked| {
             format!(
@@ -222,6 +276,7 @@ fn start(keychain: Arc<dyn Keychain>, cx: &mut App) -> std::io::Result<UiToolSer
 fn read_kept_token(cx: &mut App) {
     let server = cx.global_mut::<UiToolServer>();
     server.reading = true;
+    server.asked_keychain = true;
     let keychain = server.keychain.clone();
     let read = keychain.read(KEYCHAIN_KEY.to_owned());
     cx.spawn(async move |cx| {
@@ -286,8 +341,12 @@ impl UiToolServer {
     }
 
     /// A conversation's entry: a new token bound to its window, given up when the entry is
-    /// dropped. `None` when the server is not running or no token could be made.
+    /// dropped. Asking starts the server when it does not run yet. `None` when it cannot
+    /// start or no token could be made.
     pub fn entry_for(window: u64, cx: &mut App) -> Option<Entry> {
+        if !ensure_started(cx) {
+            return None;
+        }
         let server = cx.try_global::<Self>()?;
         let token = new_token().ok()?;
         let shared = server.shared.clone();
@@ -376,6 +435,21 @@ fn keep(cx: &mut App, token: Option<String>) {
 /// token is kept. A port asked for applies at the next start.
 fn follow_settings(cx: &mut App) {
     let settings = StudioSettings::get(cx).agent.clone();
+    if !cx.has_global::<UiToolServer>() {
+        if settings.outside_agents {
+            // Agents outside Studio are let in: the server is needed from now.
+            if !ensure_started(cx) {
+                return;
+            }
+        } else {
+            // Nothing runs and nothing is asked to. A file an earlier run left goes, once.
+            if cx.try_global::<Idle>().is_some_and(|idle| !idle.swept) {
+                cx.global_mut::<Idle>().swept = true;
+                remove_endpoint();
+            }
+            return;
+        }
+    }
     let Some(server) = cx.try_global::<UiToolServer>() else {
         return;
     };
@@ -407,6 +481,13 @@ fn follow_settings(cx: &mut App) {
     }
     let server = cx.global::<UiToolServer>();
     let on = settings.outside_agents;
+    // The kept token is read the first time agents outside Studio are let in while the address
+    // is kept: a person who never lets them in is never asked for the keychain. What is read
+    // comes back here.
+    if on && server.keeping && !server.asked_keychain && server.outside_token.is_none() {
+        read_kept_token(cx);
+        return;
+    }
     let shared = server.shared.clone();
     let url = server.url();
     let held = server.outside_token.clone();

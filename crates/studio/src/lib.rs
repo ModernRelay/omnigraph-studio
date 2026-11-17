@@ -63,20 +63,20 @@ pub fn init(cx: &mut App) {
     history::init(cx);
     agent_panel::init(cx);
     // The UI tools and their server (spec 032), which the agent panel reaches through
-    // `UiToolEndpoint`: neither crate depends on the other.
+    // `UiToolEndpoint`: neither crate depends on the other. Nothing starts here: the server
+    // runs from the first conversation that asks for its entry, or while agents outside Studio
+    // are let in.
     ui_tool_server::init(cx);
-    if cx.has_global::<ui_tool_server::UiToolServer>() {
-        cx.set_global(agent_panel::UiToolEndpoint::new(|window, cx| {
-            let entry = ui_tool_server::UiToolServer::entry_for(window, cx)?;
-            Some(agent_panel::UiToolEntry::new(
-                entry.url.clone(),
-                entry.token.clone(),
-                ui_tool_server::tools::is_tool,
-                // The conversation's token stops working when its entry goes.
-                move || drop(entry),
-            ))
-        }));
-    }
+    cx.set_global(agent_panel::UiToolEndpoint::new(|window, cx| {
+        let entry = ui_tool_server::UiToolServer::entry_for(window, cx)?;
+        Some(agent_panel::UiToolEntry::new(
+            entry.url.clone(),
+            entry.token.clone(),
+            ui_tool_server::tools::is_tool,
+            // The conversation's token stops working when its entry goes.
+            move || drop(entry),
+        ))
+    }));
 
     #[cfg(debug_assertions)]
     studio_workspace::register_item_kind(cx, "design-system", |_, workspace, window, cx| {
