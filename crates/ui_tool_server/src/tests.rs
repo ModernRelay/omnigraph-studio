@@ -234,7 +234,7 @@ fn a_body_or_an_answer_past_64_kib_is_refused() {
 #[test]
 fn a_fifth_call_in_flight_is_busy() {
     smol::block_on(async {
-        let (port, mut calls, _) = server();
+        let (port, mut calls, shared) = server();
         let call = |id: u64| {
             let body = rpc(
                 id,
@@ -255,13 +255,14 @@ fn a_fifth_call_in_flight_is_busy() {
             serde_json::from_str(body["result"]["content"][1]["text"].as_str().unwrap()).unwrap();
         assert_eq!(json["outcome"], "busy");
 
-        // No window has shown the notice yet, so each waiting call may show it; the first
-        // that does marks it given.
+        // Each waiting call owed the notice when it was read; the main thread asks again just
+        // before it runs one, and the first that a window shows it for marks it given.
         assert!(held.iter().all(|call| call.caller.announce));
-        for (index, call) in held.into_iter().enumerate() {
-            let mut answer = Answer::window_closed(7);
-            answer.announced = index == 0;
-            call.reply.send(answer).ok();
+        assert!(http::still_owed(&shared, &held[0]));
+        http::announce_once(&shared, &held[0].token);
+        assert!(!http::still_owed(&shared, &held[1]), "shown once");
+        for call in held {
+            call.reply.send(Answer::window_closed(7)).ok();
         }
         for answered in waiting {
             assert!(answered.await.2.contains("window_closed"));

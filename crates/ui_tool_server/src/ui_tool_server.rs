@@ -82,13 +82,22 @@ fn start(cx: &mut App) -> std::io::Result<UiToolServer> {
         calls,
     });
     let serve = cx.background_spawn(http::serve(listener, shared.clone()));
-    // Calls run one at a time on the main thread, each in its window's two updates.
-    let calls = cx.spawn(async move |cx| {
-        while let Some(call) = incoming.next().await {
-            let answer = ui_tools::call(cx, call.target, call.caller, &call.tool, call.input).await;
-            call.reply.send(answer).ok();
-        }
-    });
+    // Calls run one at a time on the main thread, each in its window's two updates, so the
+    // outside notice is checked and marked here, once.
+    let calls = {
+        let shared = shared.clone();
+        cx.spawn(async move |cx| {
+            while let Some(mut call) = incoming.next().await {
+                call.caller.announce = http::still_owed(&shared, &call);
+                let answer =
+                    ui_tools::call(cx, call.target, call.caller, &call.tool, call.input).await;
+                if answer.announced {
+                    http::announce_once(&shared, &call.token);
+                }
+                call.reply.send(answer).ok();
+            }
+        })
+    };
     Ok(UiToolServer {
         port,
         shared,

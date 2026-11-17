@@ -41,6 +41,8 @@ const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 
 /// One call for the main thread, which runs it in its window and answers on `reply`.
 pub struct Call {
+    /// The token the call came with, by which the main thread marks the outside notice given.
+    pub token: String,
     pub target: Target,
     pub caller: Caller,
     pub tool: String,
@@ -417,8 +419,9 @@ async fn call(shared: &Shared, token: &str, tool: String, input: Value) -> Answe
             return Answer::busy(MAX_IN_FLIGHT);
         }
         state.in_flight += 1;
-        // Marked once a window has shown the notice, so a call that named no open window (the
-        // first, `studio_windows`, among them) leaves it for the next.
+        // Owed until a window has shown the notice, so a call that named no open window (the
+        // first, `studio_windows`, among them) leaves it for the next. The main thread, which
+        // runs calls one at a time, checks again and marks it ([`announce_once`]).
         let announce = state.outside && !state.announced;
         (
             state.target,
@@ -442,6 +445,7 @@ async fn call(shared: &Shared, token: &str, tool: String, input: Value) -> Answe
     let _in_flight = InFlight(shared, token);
     let (reply, answered) = oneshot::channel();
     let sent = shared.calls.unbounded_send(Call {
+        token: token.to_owned(),
         target,
         caller,
         tool,
@@ -449,15 +453,7 @@ async fn call(shared: &Shared, token: &str, tool: String, input: Value) -> Answe
         reply,
     });
     match (sent, answered.await) {
-        (Ok(()), Ok(answer)) => {
-            if answer.announced
-                && let Ok(mut tokens) = shared.tokens.lock()
-                && let Some(state) = tokens.get_mut(token)
-            {
-                state.announced = true;
-            }
-            answer
-        }
+        (Ok(()), Ok(answer)) => answer,
         _ => Answer::window_closed(0),
     }
 }
@@ -517,5 +513,27 @@ fn reason(status: u16) -> &'static str {
         413 => "Payload Too Large",
         431 => "Request Header Fields Too Large",
         _ => "Internal Server Error",
+    }
+}
+
+/// Whether `call` should show the outside notice, asked on the main thread just before it runs:
+/// calls sent together each owed it when they were read, and only the first to name a window
+/// shows it.
+pub fn still_owed(shared: &Shared, call: &Call) -> bool {
+    call.caller.announce
+        && shared
+            .tokens
+            .lock()
+            .ok()
+            .and_then(|tokens| tokens.get(&call.token).map(|state| !state.announced))
+            .unwrap_or(false)
+}
+
+/// Marks the outside notice given for `token`, once a window showed it.
+pub fn announce_once(shared: &Shared, token: &str) {
+    if let Ok(mut tokens) = shared.tokens.lock()
+        && let Some(state) = tokens.get_mut(token)
+    {
+        state.announced = true;
     }
 }
