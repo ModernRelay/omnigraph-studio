@@ -427,6 +427,7 @@
   {
     "context": "Review",
     "bindings": {
+      "cmd-enter": "studio_changes::OpenChanged",
       "cmd-y": "studio_review::AcceptAndNext",
       "alt-cmd-z": "studio_review::RevertAndNext",
       "cmd-shift-enter": "studio_review::Merge",
@@ -446,7 +447,13 @@
     "context": "CommitView",
     "bindings": {
       "b": "studio_history::NewBranchHere",
-      "cmd-alt-n": "studio_history::LoadMoreChanges"
+      "cmd-alt-n": "studio_history::LoadMoreChanges",
+      "j": "menu::SelectNext",
+      "down": "menu::SelectNext",
+      "k": "menu::SelectPrevious",
+      "up": "menu::SelectPrevious",
+      "space": "studio_changes::ToggleChange",
+      "cmd-enter": "studio_changes::OpenChanged"
     }
   },
   {
