@@ -1673,7 +1673,7 @@ impl Workspace {
     // ---- panes and items ----
 
     /// The window's panes in layout order, each with its tabs in strip order: what a reader of
-    /// the window lists (a UI tool's `studio_tabs`, a test).
+    /// the window lists (a UI tool, a test).
     pub fn pane_tabs(&self) -> Vec<PaneTabs<'_>> {
         self.center
             .panes()
