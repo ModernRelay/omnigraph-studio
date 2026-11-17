@@ -192,8 +192,8 @@ fn follow_switch(cx: &mut App) {
 
 fn accept_outside(shared: &Shared, token: &str) {
     if let Ok(mut tokens) = shared.tokens.lock() {
-        // The toast that says an outside agent is here is shown once a run, so a token that
-        // comes back keeps what it was told.
+        // Turning the switch off removes the token's state, so turned on again it starts
+        // afresh: a new grant, whose first call shows the notice again.
         tokens
             .entry(token.to_owned())
             .or_insert_with(|| TokenState::new(Target::Any, true));

@@ -10,6 +10,7 @@ use studio_workspace::ui_tools::{Answer, Target};
 
 use super::*;
 use crate::http::{Call, MAX_BODY, MAX_IN_FLIGHT};
+use studio_settings::StudioSettings;
 
 const TOKEN: &str = "token-of-the-test";
 
@@ -346,5 +347,46 @@ fn a_call_studio_never_answered_is_cancelled() {
             serde_json::from_str(body["result"]["content"][1]["text"].as_str().unwrap()).unwrap();
         assert_eq!(json["outcome"], "cancelled");
         assert_eq!(json["window"], 4294967297u64);
+    });
+}
+
+/// The outside token lasts the run, but its state goes with the switch: turned off, it is
+/// refused and its file goes; turned on again, the same token is a new grant, whose first
+/// call shows the notice again.
+#[gpui::test]
+fn the_outside_token_starts_afresh_when_the_switch_comes_back(cx: &mut gpui::TestAppContext) {
+    let set = |on: bool, cx: &mut gpui::TestAppContext| {
+        cx.update(|cx| {
+            let mut settings = StudioSettings::get(cx).clone();
+            settings.agent.outside_agents = on;
+            cx.set_global(settings);
+        });
+    };
+    cx.update(studio_settings::init_test);
+    set(true, cx);
+    cx.update(init);
+    let (token, shared) = cx.update(|cx| {
+        let server = cx.global::<UiToolServer>();
+        (server.outside_token.clone().unwrap(), server.shared.clone())
+    });
+    let state = |shared: &Shared| {
+        shared
+            .tokens
+            .lock()
+            .unwrap()
+            .get(&token)
+            .map(|state| state.announced)
+    };
+    http::announce_once(&shared, &token);
+    assert_eq!(state(&shared), Some(true));
+    set(false, cx);
+    assert_eq!(state(&shared), None, "refused while off");
+    set(true, cx);
+    assert_eq!(state(&shared), Some(false), "the notice is owed again");
+    cx.update(|cx| {
+        assert_eq!(
+            cx.global::<UiToolServer>().outside_token,
+            Some(token.clone())
+        );
     });
 }
