@@ -988,6 +988,9 @@ pub struct Opening {
     pub layout: ColumnLayout,
     /// The saved view the tab is (spec 024), by id: what it saves to and is named by.
     pub view: Option<String>,
+    /// The tab's own key, for a filtered table opened beside the type's own (spec 032): it is
+    /// not the type's table, which stays as the person has it.
+    pub own_key: Option<String>,
 }
 
 /// A relationship's direction, as filters and the Group menu show it.
@@ -1222,6 +1225,8 @@ pub struct TypeTable {
     _subscriptions: Vec<Subscription>,
     /// The saved view this tab is (spec 024), by id; `None` is the type's own table.
     view_id: Option<String>,
+    /// The key of a filtered table opened beside the type's own (spec 032).
+    own_key: Option<String>,
     /// How often the table drew, for the test that moving through the offers draws it and
     /// leaves the grid alone.
     #[cfg(test)]
@@ -1346,6 +1351,9 @@ impl Item for TypeTable {
     }
 
     fn dedupe_key(&self, _cx: &App) -> Option<SharedString> {
+        if let Some(key) = &self.own_key {
+            return Some(key.clone().into());
+        }
         Some(
             match &self.view_id {
                 Some(view) => crate::view_key(view, self.at_commit.as_deref()),
@@ -1372,6 +1380,7 @@ impl Item for TypeTable {
                 "order": self.layout.order,
                 "widths": self.layout.widths,
                 "view": self.view_id,
+                "own_key": self.own_key,
             }),
         })
     }
@@ -1615,6 +1624,7 @@ impl TypeTable {
             diff_task: None,
             _subscriptions: subscriptions,
             view_id: opening.view,
+            own_key: opening.own_key,
             #[cfg(test)]
             renders: 0,
             #[cfg(test)]
@@ -6215,6 +6225,7 @@ impl TypeTable {
                 via: Some(builder::relationship_key(&back)),
                 preview: false,
                 filters: None,
+                separate: false,
             }),
             cx,
         );

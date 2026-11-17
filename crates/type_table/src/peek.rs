@@ -5015,6 +5015,7 @@ impl NodePeek {
                             via: None,
                             preview: false,
                             filters: None,
+                            separate: false,
                         }),
                         cx,
                     );

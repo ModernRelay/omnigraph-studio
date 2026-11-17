@@ -96,6 +96,43 @@ impl ViewLink {
     }
 }
 
+/// A node by its type and id, as an action that names nodes takes it (spec 032).
+#[derive(
+    Clone, Debug, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize, schemars::JsonSchema,
+)]
+pub struct NodeId {
+    pub type_name: String,
+    pub id: String,
+}
+
+/// An expansion of several nodes' neighbourhoods (spec 032), as the canvas and the tree take it:
+/// the nodes (none: the marked nodes, else the selected one), the relationships to open
+/// (`out:WorksAt`, `in:Knows`; none: every one), how deep, and how many of each relationship's
+/// neighbours a second level opens and a canvas draws.
+#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize, schemars::JsonSchema)]
+pub struct Expansion {
+    #[serde(default)]
+    pub nodes: Vec<NodeId>,
+    /// Relationship names with their direction from the node: `out:WorksAt`, `in:Knows`.
+    #[serde(default)]
+    pub relationships: Option<Vec<String>>,
+    /// 1 opens the nodes' relationships; 2 also opens those of the neighbours they read.
+    #[serde(default = "one")]
+    pub depth: u8,
+    /// How many of each relationship's neighbours are drawn and go on to the second level;
+    /// none: the canvas's own step.
+    #[serde(default)]
+    pub limit_per_relationship: Option<usize>,
+    /// Open it though it is past what is opened without asking, as the person's answer to
+    /// the question would.
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+fn one() -> u8 {
+    1
+}
+
 pub mod workspace {
     use gpui::{Action, actions};
     use schemars::JsonSchema;
@@ -334,6 +371,10 @@ pub mod graph {
         /// is, since it may hold other work.
         #[serde(default)]
         pub filters: Option<serde_json::Value>,
+        /// With `filter_id`: open the filtered rows in a tab of their own, which can be closed,
+        /// and leave the type's open table as it is.
+        #[serde(default)]
+        pub separate: bool,
     }
 
     /// Open the schema's map: the graph's types and how they relate, one type at a time.
@@ -744,6 +785,39 @@ pub mod tree {
             ToggleEmptyGroups,
         ]
     );
+
+    /// Select a node's row in the tree by its type and id, as a click does; with none
+    /// named, the node it starts from.
+    #[derive(
+        Clone, Debug, Default, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action,
+    )]
+    #[action(namespace = studio_tree)]
+    #[serde(default)]
+    pub struct SelectNode {
+        pub type_name: String,
+        pub id: String,
+    }
+
+    /// Expand nodes' neighbourhoods in the tree: the selected node, every relationship, one
+    /// level deep; asked first when it opens many rows.
+    #[derive(
+        Clone, Debug, Default, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action,
+    )]
+    #[action(namespace = studio_tree)]
+    pub struct ExpandNeighbourhood {
+        #[serde(flatten)]
+        pub expansion: crate::Expansion,
+    }
+
+    /// Collapse nodes' rows in the tree: the selected node, or those named.
+    #[derive(
+        Clone, Debug, Default, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action,
+    )]
+    #[action(namespace = studio_tree)]
+    pub struct CollapseNodes {
+        #[serde(default)]
+        pub nodes: Vec<crate::NodeId>,
+    }
 }
 
 pub mod query {
@@ -887,8 +961,90 @@ pub mod canvas {
             ClearSelection,
             /// Let the layout place every node again, forgetting where nodes were dragged.
             ResetLayout,
+            /// Start a new canvas walk from the selected node, in a tab of its own.
+            RerootHere,
+            /// Draw again the nodes hidden from the canvas.
+            ShowHidden,
         ]
     );
+
+    /// Select a node on the canvas by its type and id, as a click does; with none
+    /// named, the node it starts from.
+    #[derive(
+        Clone, Debug, Default, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action,
+    )]
+    #[action(namespace = studio_canvas)]
+    #[serde(default)]
+    pub struct SelectNode {
+        pub type_name: String,
+        pub id: String,
+    }
+
+    /// Expand nodes' neighbourhoods: the marked nodes, or the selected one, every relationship,
+    /// one level deep; asked first when it opens more than a canvas can show well.
+    #[derive(
+        Clone, Debug, Default, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action,
+    )]
+    #[action(namespace = studio_canvas)]
+    pub struct ExpandNeighbourhood {
+        #[serde(flatten)]
+        pub expansion: crate::Expansion,
+    }
+
+    /// Collapse nodes: the marked nodes, or the selected one.
+    #[derive(
+        Clone, Debug, Default, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action,
+    )]
+    #[action(namespace = studio_canvas)]
+    pub struct CollapseNodes {
+        #[serde(default)]
+        pub nodes: Vec<crate::NodeId>,
+    }
+
+    /// Show more of a relationship's neighbours: the selected relationship or "+K more", or the
+    /// one named, of the node named.
+    #[derive(
+        Clone, Debug, Default, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action,
+    )]
+    #[action(namespace = studio_canvas)]
+    pub struct ShowMore {
+        #[serde(default)]
+        pub node: Option<crate::NodeId>,
+        /// The relationship with its direction from the node: `out:WorksAt`, `in:Knows`.
+        #[serde(default)]
+        pub relationship: Option<String>,
+    }
+
+    /// Hide nodes from the canvas, with what hangs off them: the marked nodes, or the selected
+    /// one. Show hidden draws them again.
+    #[derive(
+        Clone, Debug, Default, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action,
+    )]
+    #[action(namespace = studio_canvas)]
+    pub struct HideNodes {
+        #[serde(default)]
+        pub nodes: Vec<crate::NodeId>,
+    }
+
+    /// Keep nodes where they are drawn: the marked nodes, or the selected one.
+    #[derive(
+        Clone, Debug, Default, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action,
+    )]
+    #[action(namespace = studio_canvas)]
+    pub struct PinNodes {
+        #[serde(default)]
+        pub nodes: Vec<crate::NodeId>,
+    }
+
+    /// Let the layout place nodes again: the marked nodes, or the selected one.
+    #[derive(
+        Clone, Debug, Default, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action,
+    )]
+    #[action(namespace = studio_canvas)]
+    pub struct UnpinNodes {
+        #[serde(default)]
+        pub nodes: Vec<crate::NodeId>,
+    }
 }
 
 pub mod ontology {

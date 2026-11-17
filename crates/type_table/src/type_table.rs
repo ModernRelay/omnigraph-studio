@@ -139,8 +139,24 @@ pub fn init(cx: &mut App) {
                 .clone()
                 .and_then(|filters| serde_json::from_value(filters).ok())
                 .unwrap_or_default();
+            // A filtered table opened beside the type's own (an agent's, spec 032) has a key of
+            // its own, so the type's table, as the person has it, is left alone.
+            let own_key = (action.separate && filter.is_some()).then(|| {
+                format!(
+                    "{}#{}{}",
+                    table_key(&action.type_name, action.at_commit.as_deref()),
+                    action
+                        .via
+                        .as_deref()
+                        .map(|via| format!("{via}:"))
+                        .unwrap_or_default(),
+                    action.filter_id.as_deref().unwrap_or_default()
+                )
+            });
+            let separate = own_key.is_some();
             let opening = Opening {
                 filters: filter.clone().into_iter().chain(captured).collect(),
+                own_key,
                 ..Opening::default()
             };
             let table = open_type(
@@ -152,8 +168,9 @@ pub fn init(cx: &mut App) {
                 window,
                 cx,
             );
-            // A tab open already shows only it now; a new one opened with it.
-            if let (Some(table), Some(filter)) = (table, filter) {
+            // A tab open already shows only it now; a new one opened with it. A filtered table of
+            // its own opened with it, or is shown as it is.
+            if let (Some(table), Some(filter), false) = (table, filter, separate) {
                 table.update(cx, |table, cx| table.show_only(filter, cx));
             }
         });
@@ -207,9 +224,10 @@ fn open_type(
     }
     let handle = cx.entity().downgrade();
     let name = type_name.to_owned();
-    let key = match &opening.view {
-        Some(view) => view_key(view, at_commit.as_deref()),
-        None => table_key(type_name, at_commit.as_deref()),
+    let key = match (&opening.own_key, &opening.view) {
+        (Some(own), _) => own.clone(),
+        (None, Some(view)) => view_key(view, at_commit.as_deref()),
+        (None, None) => table_key(type_name, at_commit.as_deref()),
     };
     workspace.open_item_with::<TypeTable>(key, preview, window, cx, move |window, cx| {
         TypeTable::opening(handle, session, name, at_commit, opening, window, cx)
@@ -277,6 +295,10 @@ pub(crate) fn saved_table(data: &Value) -> Option<(String, Option<String>, Openi
         group_by,
         layout,
         view: data.get("view").and_then(Value::as_str).map(str::to_owned),
+        own_key: data
+            .get("own_key")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
     };
     Some((type_name, at_commit, opening))
 }
@@ -303,6 +325,7 @@ pub(crate) fn view_opening(view: &studio_settings::SavedView) -> Opening {
         group_by: view.group_by.clone(),
         layout: model::ColumnLayout::new(view.hidden.clone(), view.order.clone()),
         view: Some(view.key()),
+        own_key: None,
     }
 }
 

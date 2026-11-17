@@ -708,6 +708,7 @@ impl OntologyPage {
                                     via: None,
                                     preview: false,
                                     filters: None,
+                                    separate: false,
                                 }),
                                 cx,
                             )
