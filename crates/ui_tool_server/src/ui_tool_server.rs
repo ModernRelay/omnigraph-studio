@@ -288,6 +288,11 @@ fn quoted(path: &std::path::Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
 }
 
+/// What the settings say under the Claude Code command: `$(cat …)` expands when the person runs
+/// it, so Claude Code keeps the token itself, until the token stops working.
+pub const CLAUDE_TOKEN_NOTE: &str = "Claude Code keeps the token in ~/.claude.json once the \
+command runs; it stops working when Studio starts again or this is turned off.";
+
 /// The command that adds Studio to Claude Code. It reads the token from its file, so copying it
 /// never shows the token.
 pub fn claude_command(url: &str) -> String {

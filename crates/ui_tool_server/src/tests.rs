@@ -299,6 +299,10 @@ fn the_token_and_the_copied_commands() {
          \"Authorization: Bearer $(cat '"
     ));
     assert!(claude.ends_with("token')\""));
+    // Once run, the command's `$(cat …)` has put the token in Claude Code's own config: the
+    // settings say where, and until when it works.
+    assert!(CLAUDE_TOKEN_NOTE.contains("~/.claude.json"));
+    assert!(CLAUDE_TOKEN_NOTE.contains("stops working when Studio starts again"));
     let codex = codex_config(url);
     assert!(codex.contains("[mcp_servers.omnigraph-studio]\nurl = \"http://127.0.0.1:4100/mcp\""));
     assert!(codex.contains("bearer_token_env_var = \"OMNIGRAPH_STUDIO_TOKEN\""));

@@ -1227,7 +1227,8 @@ fn outside_agents(field: &SettingField, values: &SettingsValues, cx: &App) -> Op
             div()
                 .pb(px(space::MD))
                 .child(ds::text::muted(
-                    "Studio's tool server is not running, so agents outside Studio cannot reach                      it. The log says why.",
+                    "Studio's tool server is not running, so agents outside Studio cannot reach \
+                     it. The log says why.",
                 ))
                 .into_any_element(),
         );
@@ -1271,8 +1272,13 @@ fn outside_agents(field: &SettingField, values: &SettingsValues, cx: &App) -> Op
                 "Claude Code",
                 ui_tool_server::claude_command(&url),
                 "Copy the command that adds Studio to Claude Code. It reads the token from its \
-                 file, so the token is not shown.",
+                 file, so Copy shows no token.",
             ))
+            .child(
+                div()
+                    .pl(px(ds::size::FIELD_LABEL + space::SM))
+                    .child(ds::text::meta(ui_tool_server::CLAUDE_TOKEN_NOTE)),
+            )
             .child(entry(
                 "copy-codex-config",
                 "Codex",
