@@ -4,14 +4,13 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use change_cards::{CardLines, CardRows, Row};
+use change_cards::{CardLines, CardRows, CommitCounts, Row};
 use gpui::{
     AnyElement, AnyView, App, Context, Entity, EventEmitter, FocusHandle, Focusable, ListAlignment,
     ListState, Render, SharedString, StyleRefinement, Subscription, Task, WeakEntity, Window, list,
 };
 use gq_language::SchemaModel;
-use graph_client::ReadError;
-use graph_client::api::{ChangeCauseOutput, ChangeDiffRefusalReason, CommitKind, CommitOutput};
+use graph_client::api::{ChangeCauseOutput, CommitKind, CommitOutput};
 use graph_store::{
     ChangeFold, EntityGroups, FoldedChanges, GraphSession, GroupRun, GroupSection, NodeNames,
     SessionEvent, TypeCounts,
@@ -36,18 +35,16 @@ enum State {
     Loading,
     Ready,
     Failed(SharedString),
-    /// The graph's first commit: it has no parent to compare with, so its changes are not
-    /// asked for (the server refuses them, `parentless_commit`).
-    First,
-    /// A commit across a schema change, at the type the server names: Omnigraph does not list
-    /// its data changes (`schema_boundary`), and asking again gets the same answer.
-    SchemaChange(Option<String>),
+    /// Changes the server will never list, said as History's rows say them
+    /// ([`crate::counts::lasting`]): the graph's first commit, whose changes are not asked for;
+    /// a schema change; history cleaned up; another comparison refused. Asking again gets the
+    /// same answer, so nothing offers it.
+    Lasting(CommitCounts),
 }
 
 /// Why a read of a commit's changes stopped short of them.
 enum Stop {
-    First,
-    SchemaChange(Option<String>),
+    Lasting(CommitCounts),
     Failed(String),
 }
 
@@ -277,7 +274,7 @@ impl CommitView {
         self._task = None;
         self.more_error = None;
         self.next_page_token = None;
-        self.state = State::First;
+        self.state = State::Lasting(CommitCounts::First);
         true
     }
 
@@ -345,11 +342,10 @@ impl CommitView {
                             break Ok(());
                         }
                     }
-                    // The graph's first commit: it has no parent to compare with.
-                    Err(error) if is_parentless(&error) => break Err(Stop::First),
-                    Err(error) => match schema_boundary(&error) {
-                        Some(type_name) => break Err(Stop::SchemaChange(type_name)),
-                        None => break Err(Stop::Failed(describe(&error))),
+                    // One reading of a refusal, shared with History's rows.
+                    Err(error) => match crate::counts::lasting(&error) {
+                        Some(said) => break Err(Stop::Lasting(said)),
+                        None => break Err(Stop::Failed(error.to_string())),
                     },
                 }
             };
@@ -379,17 +375,17 @@ impl CommitView {
             this.update(cx, |this, cx| {
                 this.fold = fold;
                 let result = match result {
-                    Err(Stop::First) => {
-                        this.next_page_token = None;
-                        this.more_error = None;
-                        this.state = State::First;
-                        cx.notify();
-                        return;
+                    // A page after changes were shown keeps them, says why the rest cannot be
+                    // read, and offers no more, since asking again gets the same answer.
+                    Err(Stop::Lasting(said)) if read_any || !this.rows.is_empty() => {
+                        this.more_error = Some(said.words().into());
+                        token = None;
+                        Ok(())
                     }
-                    Err(Stop::SchemaChange(type_name)) => {
+                    Err(Stop::Lasting(said)) => {
                         this.next_page_token = None;
                         this.more_error = None;
-                        this.state = State::SchemaChange(type_name);
+                        this.state = State::Lasting(said);
                         cx.notify();
                         return;
                     }
@@ -1217,60 +1213,6 @@ pub(crate) fn branch_here_cli(commit_id: &str) -> String {
     format!("omnigraph branch create <name> --from-commit {commit_id}")
 }
 
-/// Whether the server refused a commit's changes because the commit has no parent: the
-/// graph's first commit.
-fn is_parentless(error: &ReadError) -> bool {
-    matches!(
-        error,
-        ReadError::Refused(summary)
-            if summary.change_diff_refusal.as_ref().map(|refusal| refusal.reason)
-                == Some(ChangeDiffRefusalReason::ParentlessCommit)
-    )
-}
-
-/// The type at the schema change a commit's comparison stopped at, when the server refused it
-/// as one (`schema_boundary`): `Some(None)` when it names no type.
-fn schema_boundary(error: &ReadError) -> Option<Option<String>> {
-    match error {
-        ReadError::Refused(summary) => summary
-            .change_diff_refusal
-            .as_ref()
-            .filter(|refusal| refusal.reason == ChangeDiffRefusalReason::SchemaBoundary)
-            .map(|refusal| refusal.type_name.clone()),
-        _ => None,
-    }
-}
-
-/// Why a commit's changes could not be read, with the server's reason as it came. A comparison
-/// the server refused says what stopped it by the refusal's reason: a schema change between the
-/// commit and its parent, naming the type at it; any other reason claims no schema change.
-fn describe(error: &ReadError) -> String {
-    match error {
-        ReadError::Refused(summary) if summary.status == 409 => {
-            let message = &summary.message;
-            match summary.change_diff_refusal.as_ref() {
-                Some(refusal) if refusal.reason == ChangeDiffRefusalReason::SchemaBoundary => {
-                    match &refusal.type_name {
-                        Some(type_name) => format!(
-                            "This commit cannot be compared with its parent across a change to \
-                             {type_name}'s schema: {message}"
-                        ),
-                        None => format!(
-                            "This commit cannot be compared with its parent across a schema \
-                             change: {message}"
-                        ),
-                    }
-                }
-                _ => format!("This commit cannot be compared with its parent: {message}"),
-            }
-        }
-        ReadError::Refused(summary) if summary.status == 410 => {
-            "The history behind this commit was cleaned up, so its changes cannot be read.".into()
-        }
-        other => other.to_string(),
-    }
-}
-
 /// The list's rows: a header for each run of one type, then its cards.
 impl Render for CommitView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1301,10 +1243,9 @@ impl Render for CommitView {
                 "This commit changed no node or relationship against its parent.",
             )
             .into_any_element(),
-            State::First => change_cards::first_commit_state().into_any_element(),
-            State::SchemaChange(type_name) => {
-                change_cards::schema_change_state(type_name.as_deref()).into_any_element()
-            }
+            State::Lasting(said) => change_cards::lasting_state(said)
+                .map(IntoElement::into_any_element)
+                .unwrap_or_else(|| gpui::Empty.into_any_element()),
             State::Loading if self.rows.is_empty() => {
                 change_cards::reading_state(None).into_any_element()
             }
@@ -1410,6 +1351,9 @@ fn run_key(run: &GroupRun, groups: &EntityGroups) -> (GroupSection, bool, String
 mod tests {
     use std::time::Duration;
 
+    use graph_client::ReadError;
+    use graph_client::api::ChangeDiffRefusalReason;
+
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1498,42 +1442,87 @@ mod tests {
         });
     }
 
-    /// The selection follows its entity when a later page makes the groups anew and orders them
-    /// otherwise: a change that sorts before it does not move the selection onto another node.
+    /// The selection stays on its node when a later page sorts a change before it: the groups
+    /// are made anew and ordered otherwise (review of #130; it failed at fa76ad1, where the
+    /// selection was an index and moved to p00000).
     #[gpui::test]
-    async fn the_selection_follows_its_entity_across_pages(cx: &mut TestAppContext) {
+    async fn the_selection_stays_on_its_node_when_a_later_page_sorts_first(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(studio_theme::init_test);
+        let http = FakeHttpClient::create(move |request| {
+            let uri = request.uri().to_string();
+            let cause = json!({ "graph_commit_id": "c9", "parent_commit_id": "c8", "authored_branch": "main", "authored_at": 0 });
+            let body = if !uri.contains("/changes") {
+                json!({})
+            } else if !uri.contains("t2") {
+                let changes: Vec<_> = (0..CAP)
+                    .map(|i| json!({ "kind": "node", "type": { "id": "Person", "name": "Person" }, "id": format!("p{i:05}"), "op": "insert", "before": null, "after": { "properties": { "slug": format!("p{i:05}") } } }))
+                    .collect();
+                json!({ "cause": cause, "changes": changes, "next_page_token": "t2" })
+            } else {
+                let company = json!({ "kind": "node", "type": { "id": "Company", "name": "Company" }, "id": "c1", "op": "update", "before": { "properties": { "slug": "c1", "city": "Tokyo" } }, "after": { "properties": { "slug": "c1", "city": "Osaka" } } });
+                json!({ "cause": cause, "changes": [company] })
+            };
+            async move {
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                    .body(AsyncBody::from(body.to_string()))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let session =
+            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+        let view = cx.new(|cx| CommitView::new(session, "c9".into(), None, cx));
+        cx.run_until_parked();
+        let node = |view: &CommitView| view.selected_node().map(|node| node.id);
+        view.update(cx, |view, cx| {
+            assert_eq!(node(view).as_deref(), Some("p00000"));
+            view.step(true, cx);
+            assert_eq!(node(view).as_deref(), Some("p00001"));
+            view.load_more(cx);
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            assert_eq!(view.groups.groups.len(), CAP + 1, "both pages read");
+            assert_eq!(node(view).as_deref(), Some("p00001"));
+            // An entity no longer among the groups leaves nothing selected.
+            view.groups.groups.retain(|group| group.id != "p00001");
+            view.reselect(cx);
+            assert_eq!(node(view), None);
+        });
+    }
+
+    /// A commit whose history was cleaned up says so, as History's rows do, and offers nothing
+    /// to try again, since asking again gets the same 410 (review of #130).
+    #[gpui::test]
+    async fn a_cleaned_up_commit_says_so_and_offers_no_retry(cx: &mut TestAppContext) {
         cx.update(studio_theme::init_test);
         let session = answering(
             || {
-                let person = |id: &str| json!({ "kind": "node", "type": { "id": "Person", "name": "Person" }, "id": id, "op": "insert", "before": null, "after": { "properties": { "slug": id } } });
-                let company = |id: &str| json!({ "kind": "node", "type": { "id": "Company", "name": "Company" }, "id": id, "op": "update", "before": { "properties": { "slug": id, "city": "Tokyo" } }, "after": { "properties": { "slug": id, "city": "Osaka" } } });
-                let cause = json!({ "graph_commit_id": "c9", "parent_commit_id": "c8", "authored_branch": "main", "authored_at": 0 });
                 (
-                    200,
-                    json!({ "cause": cause, "changes": [person("p1"), person("p2"), company("c1")] }),
+                    410,
+                    json!({ "error": "history cleaned up", "code": "gone" }),
                 )
             },
             cx,
         );
         let view = cx.new(|cx| CommitView::new(session, "c9".into(), None, cx));
         cx.run_until_parked();
-        let node = |view: &CommitView| view.selected_node().map(|node| node.id);
-        view.update(cx, |view, cx| {
-            let p2 = view
-                .groups
-                .groups
-                .iter()
-                .position(|group| group.id == "p2")
-                .expect("p2");
-            view.select_group(Some(p2), cx);
-            // The groups made anew, in another order, as a later page makes them.
-            view.groups.groups.reverse();
-            view.reselect(cx);
-            assert_eq!(node(view).as_deref(), Some("p2"));
-            // An entity no longer among the groups leaves nothing selected.
-            view.groups.groups.retain(|group| group.id != "p2");
-            view.reselect(cx);
-            assert_eq!(node(view), None);
+        view.read_with(cx, |view, _| {
+            assert!(
+                matches!(view.state, State::Lasting(CommitCounts::CleanedUp)),
+                "cleaned up, as History's row says"
+            );
+            assert!(!view.offers_more(), "no Try again, no LoadMoreChanges");
         });
     }
 
@@ -1555,7 +1544,7 @@ mod tests {
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert!(
-                matches!(&view.state, State::SchemaChange(Some(t)) if t == "Person"),
+                matches!(&view.state, State::Lasting(CommitCounts::SchemaChange(Some(t))) if t == "Person"),
                 "a schema change, at Person"
             );
             assert!(!view.offers_more(), "nothing to try again");
@@ -1569,9 +1558,9 @@ mod tests {
     fn a_refused_comparison_says_why() {
         use ChangeDiffRefusalReason::{ParentlessCommit, SchemaBoundary};
         use graph_client::api::ChangeDiffRefusalOutput;
-        let refused = |refusal: Option<(ChangeDiffRefusalReason, Option<&str>)>| {
+        let refused = |status: u16, refusal: Option<(ChangeDiffRefusalReason, Option<&str>)>| {
             ReadError::Refused(graph_client::ApiErrorSummary {
-                status: 409,
+                status,
                 message: "as the server put it".into(),
                 code: None,
                 diagnostic: None,
@@ -1586,19 +1575,31 @@ mod tests {
                 unauthorized: None,
             })
         };
-        assert!(is_parentless(&refused(Some((ParentlessCommit, None)))));
-        assert!(!is_parentless(&refused(Some((SchemaBoundary, None)))));
-        assert!(!is_parentless(&refused(None)));
-        let typed = describe(&refused(Some((SchemaBoundary, Some("Person")))));
-        assert!(typed.contains("a change to Person's schema"), "{typed}");
-        let untyped = describe(&refused(Some((SchemaBoundary, None))));
-        assert!(untyped.contains("across a schema change"), "{untyped}");
-        let other = describe(&refused(None));
-        assert!(!other.contains("schema"), "{other}");
-        // Each keeps the server's reason as it came.
-        for said in [typed, untyped, other] {
-            assert!(said.ends_with(": as the server put it"), "{said}");
-        }
+        let lasting = crate::counts::lasting;
+        assert_eq!(
+            lasting(&refused(409, Some((ParentlessCommit, None)))),
+            Some(CommitCounts::First)
+        );
+        assert_eq!(
+            lasting(&refused(409, Some((SchemaBoundary, Some("Person"))))),
+            Some(CommitCounts::SchemaChange(Some("Person".into())))
+        );
+        assert_eq!(
+            lasting(&refused(409, Some((SchemaBoundary, None)))),
+            Some(CommitCounts::SchemaChange(None))
+        );
+        // Another refused comparison, or one whose reason this build does not know, claims no
+        // schema change and keeps the server's reason as it came.
+        let other = lasting(&refused(409, None)).expect("lasting");
+        assert_eq!(
+            other,
+            CommitCounts::NotComparable("as the server put it".into())
+        );
+        assert!(other.words().ends_with(": as the server put it"));
+        assert!(!other.words().contains("schema"));
+        assert_eq!(lasting(&refused(410, None)), Some(CommitCounts::CleanedUp));
+        // A failure that may pass is not lasting: it is offered again.
+        assert_eq!(lasting(&refused(503, None)), None);
     }
 
     /// A failed read of more changes keeps those read before it, and the next press goes on
@@ -1944,7 +1945,7 @@ mod tests {
         assert_eq!(first_changes(), 1);
         for view in [listed, own] {
             view.read_with(cx, |view, _| {
-                assert!(matches!(view.state, State::First));
+                assert!(matches!(view.state, State::Lasting(CommitCounts::First)));
                 assert_eq!(view.branch_here(), Some("c0"), "a branch can start there");
             });
         }
@@ -2056,7 +2057,7 @@ mod tests {
         });
         first.read_with(cx, |view, _| {
             assert!(view.commit_pending);
-            assert!(matches!(view.state, State::First));
+            assert!(matches!(view.state, State::Lasting(CommitCounts::First)));
         });
         cx.executor().advance_clock(held);
         cx.run_until_parked();
@@ -2065,7 +2066,9 @@ mod tests {
             assert_eq!(view.branch_here(), Some("c9"));
             assert!(matches!(view.state, State::Ready));
         });
-        first.read_with(cx, |view, _| assert!(matches!(view.state, State::First)));
+        first.read_with(cx, |view, _| {
+            assert!(matches!(view.state, State::Lasting(CommitCounts::First)))
+        });
         let asked = asked.lock().unwrap();
         let times = |end: &str| asked.iter().filter(|path| path.ends_with(end)).count();
         assert_eq!(times("/commits/c0/changes"), 1);

@@ -404,7 +404,7 @@ impl Item for HistoryView {
         let note = match &self.commit_note {
             Some(note) => note.clone(),
             None => {
-                let (heads, counts) = self.learnt_of(&commit.graph_commit_id);
+                let (heads, counts) = self.learnt_of(commit);
                 let note = CommitNote::new(commit.clone(), heads.to_vec(), counts);
                 let note = cx.new(|_| note);
                 self.commit_note = Some(note.clone());
@@ -1375,14 +1375,12 @@ impl HistoryView {
 
     /// What History holds of a commit beside its listing: the branches whose head it is, and
     /// its changes counted, once its row was drawn and they were read.
-    fn learnt_of(&self, id: &str) -> (&[String], Option<crate::counts::Learnt>) {
-        let heads = self.heads.get(id).map_or(&[][..], Vec::as_slice);
-        let learnt = self
-            .commits
-            .iter()
-            .find(|commit| commit.graph_commit_id == id)
-            .and_then(|commit| self.counts.learnt(commit));
-        (heads, learnt)
+    fn learnt_of(&self, commit: &CommitOutput) -> (&[String], Option<crate::counts::Learnt>) {
+        let heads = self
+            .heads
+            .get(&commit.graph_commit_id)
+            .map_or(&[][..], Vec::as_slice);
+        (heads, self.counts.learnt(commit))
     }
 
     /// Tells the workspace when another commit is selected, or none: called whenever the view
@@ -1390,16 +1388,14 @@ impl HistoryView {
     /// search, commits read again). While the same commit stays selected, what is learnt of it
     /// since reaches the inspector's view of it: its counts, and a branch's head moving.
     fn report_selection(&mut self, cx: &mut Context<Self>) {
-        let selected = self
-            .selected
-            .and_then(|ix| self.commits.get(ix))
-            .map(|commit| commit.graph_commit_id.as_str());
+        let commit = self.selected.and_then(|ix| self.commits.get(ix));
+        let selected = commit.map(|commit| commit.graph_commit_id.as_str());
         if selected != self.inspected.as_deref() {
             self.inspected = selected.map(str::to_owned);
             self.commit_note = None;
             cx.emit(ItemEvent::Selected);
-        } else if let (Some(note), Some(id)) = (&self.commit_note, selected) {
-            let (heads, counts) = self.learnt_of(id);
+        } else if let (Some(note), Some(commit)) = (&self.commit_note, commit) {
+            let (heads, counts) = self.learnt_of(commit);
             note.update(cx, |note, cx| {
                 if note.learn(heads, counts) {
                     cx.notify();
@@ -2555,7 +2551,7 @@ mod tests {
         );
         assert!(changes("m1") > 0 && changes("m2") > 0);
         view.read_with(cx, |view, _| {
-            let counts = &view.counts.counts;
+            let counts = &view.counts.learnt;
             assert!(counts.contains_key("m1") && counts.contains_key("m2"));
             assert!(!counts.contains_key("m0"));
             assert!(crate::commit_view::is_first_commit(&view.commits[2]));
@@ -3536,7 +3532,7 @@ mod tests {
         // The graph's first commit has nothing to count, whatever is held for it: its note
         // says it is the first (spec 033).
         view.update(cx, |view, cx| {
-            view.counts.counts.insert("m1".into(), (1, 2, 3));
+            view.counts.insert_counted("m1", (1, 2, 3));
             cx.notify();
         });
         cx.run_until_parked();
@@ -3547,7 +3543,7 @@ mod tests {
         assert_eq!(told.get(), 2);
         let again = note(cx).expect("the newest commit again");
         view.update(cx, |view, cx| {
-            view.counts.counts.insert("m2".into(), (1, 2, 3));
+            view.counts.insert_counted("m2", (1, 2, 3));
             cx.notify();
         });
         cx.run_until_parked();

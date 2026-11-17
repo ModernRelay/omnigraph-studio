@@ -364,6 +364,8 @@ pub enum CommitCounts {
     SchemaChange(Option<String>),
     /// The history behind it was cleaned up.
     CleanedUp,
+    /// The server refused to compare it with its parent for another reason, as it says it.
+    NotComparable(String),
 }
 
 impl CommitCounts {
@@ -410,6 +412,9 @@ impl CommitCounts {
                 "The history behind this commit was cleaned up, so its changes cannot be read"
                     .into()
             }
+            CommitCounts::NotComparable(message) => {
+                format!("This commit cannot be compared with its parent: {message}")
+            }
         }
     }
 }
@@ -435,6 +440,9 @@ pub fn commit_counts(id: impl Into<ElementId>, counts: &CommitCounts) -> AnyElem
             studio_ui::ds::text::meta("schema change").into_any_element()
         }
         CommitCounts::CleanedUp => studio_ui::ds::text::meta("cleaned up").into_any_element(),
+        CommitCounts::NotComparable(_) => {
+            studio_ui::ds::text::meta("not comparable").into_any_element()
+        }
     };
     div()
         .id(id)
@@ -507,6 +515,32 @@ pub fn schema_change_state(type_name: Option<&str>) -> Div {
     };
     studio_ui::ds::empty_state(IconName::FileCode, "Schema change")
         .child(studio_ui::ds::state_detail(detail))
+}
+
+/// What a commit's tab shows in place of its changes when the server will never list them, the
+/// same reading History's rows give the commit ([`commit_counts`]): its first commit, a schema
+/// change, history cleaned up, another comparison refused. None for counted changes, which the
+/// tab lists. None of these offers a retry, since asking again gets the same answer.
+pub fn lasting_state(counts: &CommitCounts) -> Option<Div> {
+    Some(match counts {
+        CommitCounts::Counted { .. } => return None,
+        CommitCounts::First => first_commit_state(),
+        CommitCounts::SchemaChange(type_name) => schema_change_state(type_name.as_deref()),
+        CommitCounts::CleanedUp => {
+            studio_ui::ds::empty_state(IconName::Trash, "History cleaned up").child(
+                studio_ui::ds::state_detail(
+                    "The history behind this commit was cleaned up, so its changes cannot be read.",
+                ),
+            )
+        }
+        CommitCounts::NotComparable(message) => {
+            studio_ui::ds::empty_state(IconName::Info, "Not comparable").child(
+                studio_ui::ds::state_detail(format!(
+                    "The server does not compare this commit with its parent: {message}"
+                )),
+            )
+        }
+    })
 }
 
 /// The graph's first commit: nothing before it to compare with.
