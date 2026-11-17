@@ -138,6 +138,11 @@ pub mod workspace {
             /// Open Studio's settings at Agent: the agent the panel runs, and whether agents
             /// outside Studio may show things in Studio.
             OpenAgentSettings,
+            /// Let agents outside Studio show things in Studio, or stop letting them.
+            ToggleOutsideAgents,
+            /// Replace the token agents outside Studio use: every agent holding the old one is
+            /// refused from then on, until its command is copied again.
+            ReplaceAgentToken,
             /// Switch the window's graph to another branch.
             SwitchBranch,
             /// Open a new window.
