@@ -58,8 +58,6 @@ pub struct UiToolServer {
     reading: bool,
     /// Whether the address is kept, as last followed.
     keeping: bool,
-    /// The keychain's last change of the kept token, which the next one waits for ([`keep`]).
-    keeping_writes: Option<Task<()>>,
     /// What the settings row says about the address or token, when something did not go as
     /// asked ("Port 24187 was taken…").
     note: Option<String>,
@@ -97,18 +95,7 @@ pub fn init_with(keychain: Arc<dyn Keychain>, cx: &mut App) {
                     remove_endpoint();
                     studio_settings::writes_done();
                 }
-                // A change of the kept token still out lands before Studio goes, as far as
-                // the quit waits: dropped with the server, it would be lost.
-                let pending = cx
-                    .try_global::<UiToolServer>()
-                    .is_some()
-                    .then(|| cx.global_mut::<UiToolServer>().keeping_writes.take())
-                    .flatten();
-                async move {
-                    if let Some(pending) = pending {
-                        pending.await;
-                    }
-                }
+                async {}
             })
             .detach();
         }
@@ -194,7 +181,6 @@ fn start(keychain: Arc<dyn Keychain>, cx: &mut App) -> std::io::Result<UiToolSer
         outside_token: None,
         reading: false,
         keeping: keep,
-        keeping_writes: None,
         note: asked.map(|asked| {
             format!(
                 "Port {asked} was taken, so Studio uses {port} this time: copy the command again."
@@ -333,34 +319,26 @@ impl UiToolServer {
     }
 }
 
-/// Keeps `token` in the keychain, or deletes the kept one (`None`), after every change of it
-/// asked for before: two writes out at once could land in either order and leave a token kept
-/// that was replaced.
+/// Keeps `token` in the keychain, or deletes the kept one (`None`). The request is queued at
+/// once: the platform's keychain answers its requests one at a time in the order asked, and
+/// finishes one whose caller has gone, so a token replaced is never kept after its
+/// replacement, and nothing waits behind a task a quit would drop.
 fn keep(cx: &mut App, token: Option<String>) {
-    let server = cx.global_mut::<UiToolServer>();
-    let keychain = server.keychain.clone();
-    let before = server.keeping_writes.take();
-    let write = cx.background_spawn(async move {
-        if let Some(before) = before {
-            before.await;
-        }
-        let done = match token {
-            Some(token) => {
-                keychain
-                    .write(
-                        KEYCHAIN_KEY.to_owned(),
-                        KEYCHAIN_USER.to_owned(),
-                        token.into_bytes(),
-                    )
-                    .await
-            }
-            None => keychain.delete(KEYCHAIN_KEY.to_owned()).await,
-        };
-        if let Err(error) = done {
+    let keychain = cx.global::<UiToolServer>().keychain.clone();
+    let done = match token {
+        Some(token) => keychain.write(
+            KEYCHAIN_KEY.to_owned(),
+            KEYCHAIN_USER.to_owned(),
+            token.into_bytes(),
+        ),
+        None => keychain.delete(KEYCHAIN_KEY.to_owned()),
+    };
+    cx.background_spawn(async move {
+        if let Err(error) = done.await {
             log::warn!("the keychain did not keep the UI tools' token: {error}");
         }
-    });
-    cx.global_mut::<UiToolServer>().keeping_writes = Some(write);
+    })
+    .detach();
 }
 
 /// Follows the settings: the outside agents' token and its file on or off, and whether the
