@@ -213,35 +213,36 @@ fn read_kept_token(cx: &mut App) {
                 )
             }
         };
-        let token = match token {
-            Some(token) => Some(token),
-            None => {
-                let made = new_token().ok();
-                if let Some(made) = &made
+        cx.update(|cx| {
+            if !cx.has_global::<UiToolServer>() {
+                return;
+            }
+            let server = cx.global_mut::<UiToolServer>();
+            server.reading = false;
+            if let Some(note) = note {
+                server.note = Some(note.to_owned());
+            }
+            // New token pressed while the keychain was read: the new one stands, and is the
+            // one kept. Else the kept one, or one made now and kept, unless the keychain
+            // cannot be reached.
+            if server.outside_token.is_none() {
+                let made = token.is_none();
+                server.outside_token = token.or_else(|| new_token().ok());
+                if made
                     && note.is_none()
+                    && let Some(token) = server.outside_token.clone()
                 {
-                    let write = keychain.write(
+                    let write = server.keychain.write(
                         KEYCHAIN_KEY.to_owned(),
                         KEYCHAIN_USER.to_owned(),
-                        made.clone().into_bytes(),
+                        token.into_bytes(),
                     );
-                    if let Err(error) = write.await {
-                        log::warn!("the keychain did not keep the UI tools' token: {error}");
-                    }
-                }
-                made
-            }
-        };
-        cx.update(|cx| {
-            if cx.has_global::<UiToolServer>() {
-                let server = cx.global_mut::<UiToolServer>();
-                server.reading = false;
-                // New token pressed while the keychain was read: the new one stands.
-                if server.outside_token.is_none() {
-                    server.outside_token = token;
-                }
-                if let Some(note) = note {
-                    server.note = Some(note.to_owned());
+                    cx.background_spawn(async move {
+                        if let Err(error) = write.await {
+                            log::warn!("the keychain did not keep the UI tools' token: {error}");
+                        }
+                    })
+                    .detach();
                 }
             }
             follow_settings(cx);
