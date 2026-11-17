@@ -10,7 +10,7 @@
 //!
 //! Layer 5 (`docs/architecture.md`). Plan: `specs/006-graph-canvas/plan.md`.
 
-mod agent;
+mod by_id;
 mod domains;
 mod layout;
 mod model;
@@ -521,21 +521,25 @@ impl Item for GraphCanvas {
         }
     }
 
-    fn agent_view(&self, cx: &App) -> Option<studio_workspace::AgentView> {
-        self.agent_view_of(cx)
+    fn outline(&self, cx: &App) -> Option<studio_workspace::ViewOutline> {
+        self.outline_of(cx)
     }
 
-    fn agent_busy(&self, cx: &App) -> bool {
-        self.agent_busy_now(cx)
+    fn settling(&self, cx: &App) -> bool {
+        self.settling_now(cx)
     }
 
-    fn agent_check(
+    fn catch_up(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.catch_up_now(cx);
+    }
+
+    fn refuses(
         &self,
-        tool: &str,
-        input: &serde_json::Value,
+        action: &dyn gpui::Action,
+        _on: Option<&studio_actions::NodeId>,
         cx: &App,
-    ) -> Result<(), studio_workspace::AgentRefusal> {
-        self.agent_check_call(tool, input, cx)
+    ) -> Option<studio_workspace::Refusal> {
+        self.refusal_of(action, cx)
     }
 
     /// The selected chip's node, read as the canvas reads: held at its commit, or at the commit
@@ -4156,6 +4160,49 @@ mod tests {
         canvas.update(cx, |canvas, cx| canvas.pointer_left(cx));
         cx.run_until_parked();
         assert!(!asked(cx), "stopped, and nothing says they were asked for");
+    }
+
+    /// A canvas nobody draws (its window is minimized or covered) still answers a reader that
+    /// waits for it: asked to catch up, it lays out what it left for a draw, and has settled.
+    #[gpui::test]
+    async fn a_canvas_not_drawn_catches_up_when_asked(cx: &mut gpui::TestAppContext) {
+        cx.update(studio_theme::init_test);
+        let (session, _served) = graph_store::test_server::followed_session(
+            "node Person {\n  slug: String @key\n  name: String\n}\nedge Knows: Person -> Person\n",
+            |_| serde_json::json!([{ "id": "p1", "label": "Ada", "n": 1 }]),
+            cx,
+        );
+        cx.run_until_parked();
+        let canvas = cx.new(|cx| GraphCanvas::new(session, NodeRef::new("Person", "p1"), None, cx));
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+        let drawn = canvas.read_with(cx, |canvas, cx| {
+            assert!(
+                canvas.layout_owed,
+                "what was read is owed a layout at the next draw"
+            );
+            assert!(canvas.settling_now(cx), "so the canvas has not settled");
+            canvas.scene.nodes.len()
+        });
+        // No draw comes. The reader asks, as often as it looks.
+        for _ in 0..10 {
+            canvas.update(cx, |canvas, cx| canvas.catch_up_now(cx));
+            cx.run_until_parked();
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(40));
+            cx.run_until_parked();
+        }
+        canvas.read_with(cx, |canvas, cx| {
+            assert!(!canvas.layout_owed);
+            assert!(!canvas.settling_now(cx), "settled without a draw");
+            assert!(
+                canvas.scene.nodes.len() > drawn,
+                "what was read is laid out: {} chips, {drawn} before",
+                canvas.scene.nodes.len()
+            );
+        });
     }
 
     /// A walk's change that leaves its scene as drawn lays out nothing: the chips stay put, and

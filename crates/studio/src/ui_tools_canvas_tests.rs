@@ -371,6 +371,38 @@ async fn a_node_not_on_the_canvas_is_refused(cx: &mut TestAppContext) {
     assert_eq!(expanded.outcome, "not_available");
 }
 
+/// Arguments that do not fit the action say which one and why, in the action's own terms. The
+/// view is asked about the action as built, never about the call's raw input: read as raw
+/// input, a relationship given as text was answered "`depth` is 1 or 2".
+#[gpui::test]
+async fn arguments_that_do_not_fit_say_which(cx: &mut TestAppContext) {
+    let (cx, id) = walked(cx).await;
+    let answer = run(
+        cx,
+        id,
+        "canvas_expand",
+        json!({ "nodes": [node("p1")], "relationships": "out:Knows" }),
+    )
+    .await;
+    assert_eq!(answer.outcome, "invalid_input", "{answer:?}");
+    assert!(answer.is_error);
+    assert!(
+        answer.says.contains("out:Knows") && answer.says.contains("sequence"),
+        "{}",
+        answer.says
+    );
+    // A depth the expansion does not take is the view's to refuse, in its words.
+    let answer = run(
+        cx,
+        id,
+        "canvas_expand",
+        json!({ "nodes": [node("p1")], "depth": 3 }),
+    )
+    .await;
+    assert_eq!(answer.outcome, "not_available", "{answer:?}");
+    assert_eq!(answer.says, "`depth` is 1 or 2");
+}
+
 /// Canvas tools need a canvas in front.
 #[gpui::test]
 async fn canvas_tools_need_a_canvas_in_front(cx: &mut TestAppContext) {

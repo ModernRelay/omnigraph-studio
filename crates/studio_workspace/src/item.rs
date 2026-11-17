@@ -61,8 +61,8 @@ pub struct InspectedNode {
     pub snapshot: Option<String>,
 }
 
-/// What a tab has selected, as identifiers only (spec 032): what `studio_selection` answers an
-/// agent. It never holds a property value or a row.
+/// What a tab has selected, as identifiers only: what a reader of the window is told (a UI
+/// tool, spec 032). It never holds a property value or a row.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SelectedIds {
     /// The type of the nodes selected, when they share one.
@@ -74,10 +74,9 @@ pub struct SelectedIds {
     pub root: Option<(String, String)>,
 }
 
-/// A node as an agent reads a canvas or a tree (spec 032): its type, its id, and the name the
-/// person sees, when known.
+/// A node in a view's outline: its type, its id, and the name the person sees, when known.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct AgentNode {
+pub struct OutlineNode {
     pub type_name: String,
     pub id: String,
     pub label: Option<String>,
@@ -86,7 +85,7 @@ pub struct AgentNode {
 /// An edge drawn between two nodes, from the first's side: `out:WorksAt` from a person to a
 /// company. A query's result picture links nodes with no relationship named.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct AgentEdge {
+pub struct OutlineEdge {
     pub from: (String, String),
     pub to: (String, String),
     pub relationship: Option<String>,
@@ -95,7 +94,7 @@ pub struct AgentEdge {
 /// One relationship of a node as a view shows it: open or not, how many it has when counted,
 /// and how many of them are shown.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentGroup {
+pub struct OutlineGroup {
     pub node: (String, String),
     pub relationship: String,
     pub other_type: String,
@@ -104,14 +103,15 @@ pub struct AgentGroup {
     pub shown: usize,
 }
 
-/// What an agent reads of a view that walks the graph (spec 032): identifiers, the names the
-/// person already sees, and how the view holds them. Never a property value beyond a name.
+/// What a view that walks the graph shows, for a reader that does not draw it (a UI tool,
+/// spec 032; a test): identifiers, the names the person already sees, and how the view holds
+/// them. Never a property value beyond a name.
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct AgentView {
-    pub root: Option<AgentNode>,
-    pub nodes: Vec<AgentNode>,
-    pub edges: Vec<AgentEdge>,
-    pub groups: Vec<AgentGroup>,
+pub struct ViewOutline {
+    pub root: Option<OutlineNode>,
+    pub nodes: Vec<OutlineNode>,
+    pub edges: Vec<OutlineEdge>,
+    pub groups: Vec<OutlineGroup>,
     /// What is selected, as JSON: a node, a relationship, or a "+K more".
     pub selected: Option<serde_json::Value>,
     /// The node cap left nodes out.
@@ -123,23 +123,27 @@ pub struct AgentView {
     pub facts: serde_json::Map<String, serde_json::Value>,
 }
 
-/// Why a view will not take an agent's call (spec 032): the outcome by name, the words, and
-/// any JSON to add (the counts a confirmation would show).
-#[derive(Debug, Clone, PartialEq)]
-pub struct AgentRefusal {
-    pub outcome: &'static str,
-    pub says: String,
-    pub json: serde_json::Value,
-}
-
-impl AgentRefusal {
-    pub fn not_available(says: impl Into<String>) -> Self {
-        Self {
-            outcome: "not_available",
-            says: says.into(),
-            json: serde_json::json!({}),
-        }
-    }
+/// Why a view would not do what an action asks, as the view stands ([`Item::refuses`]). It
+/// states the fact; whoever asked words it for their reader (a UI tool for an agent, spec 032).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refusal {
+    /// In the view's own words: what the action lacks or names that the view has not.
+    Says(String),
+    /// Nodes the action names that the view does not show, as "Type id" where the view lists
+    /// them.
+    NotShown(Vec<String>),
+    /// The view shows a query's result whole: it is not a walk, so nothing in it expands or
+    /// hides.
+    NotAWalk,
+    /// The relationship the action names is not open in the view.
+    RelationshipClosed,
+    /// It would open more than the view opens without asking the person: how many nodes (a
+    /// tree's rows) and reads. `confirms` says the action can carry the person's answer.
+    AsksFirst {
+        nodes: usize,
+        reads: usize,
+        confirms: bool,
+    },
 }
 
 /// What a tab adds to the status bar (spec 002): a few facts after the graph and branch, as
@@ -213,33 +217,40 @@ pub trait Item: Render + Focusable + EventEmitter<ItemEvent> {
         None
     }
 
-    /// What the tab has selected, as identifiers only, for an agent (spec 032): `None` when
-    /// nothing is or the tab has no selection to name. Read without making anything.
+    /// What the tab has selected, as identifiers only: `None` when nothing is or the tab has no
+    /// selection to name. Read without making anything.
     fn selected_ids(&self, _cx: &App) -> Option<SelectedIds> {
         None
     }
 
-    /// What an agent reads of the tab, when it walks the graph (spec 032): a canvas or a tree.
-    fn agent_view(&self, _cx: &App) -> Option<AgentView> {
+    /// What the tab shows when it walks the graph (a canvas, a tree), for a reader that does
+    /// not draw it.
+    fn outline(&self, _cx: &App) -> Option<ViewOutline> {
         None
     }
 
-    /// The tab is still reading or laying out what an agent's call opened: the call's answer
-    /// waits for it, at most a few seconds.
-    fn agent_busy(&self, _cx: &App) -> bool {
+    /// The tab is still reading or laying out what the last action on it asked for: a reader
+    /// that wants what the action did waits while this holds.
+    fn settling(&self, _cx: &App) -> bool {
         false
     }
 
-    /// Whether the tab takes the agent's call `tool` with `input`, before it is dispatched: a
-    /// node named that the view does not show, an expansion past what is opened without
-    /// asking.
-    fn agent_check(
+    /// Does now what the tab leaves for its next draw (the reads and the layout a tab owes
+    /// while it is not drawn, `docs/drawing.md`), for a reader that waits on
+    /// [`Self::settling`] in a window the system is not drawing.
+    fn catch_up(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+
+    /// Why the tab would not do what `action` asks, as it stands, or `None` when it would: a
+    /// node the action names that the tab does not show, nothing to act on, more than is
+    /// opened without asking. `on` is the node the action is to act on, when its caller
+    /// selects one first.
+    fn refuses(
         &self,
-        _tool: &str,
-        _input: &serde_json::Value,
+        _action: &dyn Action,
+        _on: Option<&studio_actions::NodeId>,
         _cx: &App,
-    ) -> Result<(), AgentRefusal> {
-        Ok(())
+    ) -> Option<Refusal> {
+        None
     }
 
     /// The view this tab is (spec 020): by default the current entry of its view strip.
@@ -311,14 +322,15 @@ pub trait ItemHandle: 'static {
     fn held_at(&self, cx: &App) -> Option<String>;
     fn selected_ids(&self, cx: &App) -> Option<SelectedIds>;
     fn view_kind(&self, cx: &App) -> Option<studio_actions::ViewKind>;
-    fn agent_view(&self, cx: &App) -> Option<AgentView>;
-    fn agent_busy(&self, cx: &App) -> bool;
-    fn agent_check(
+    fn outline(&self, cx: &App) -> Option<ViewOutline>;
+    fn settling(&self, cx: &App) -> bool;
+    fn catch_up(&self, window: &mut Window, cx: &mut App);
+    fn refuses(
         &self,
-        tool: &str,
-        input: &serde_json::Value,
+        action: &dyn Action,
+        on: Option<&studio_actions::NodeId>,
         cx: &App,
-    ) -> Result<(), AgentRefusal>;
+    ) -> Option<Refusal>;
     fn inspected(&self, cx: &mut App) -> Option<Inspected>;
     fn is_dirty(&self, cx: &App) -> bool;
     fn is_stale(&self, cx: &App) -> bool;
@@ -375,21 +387,25 @@ impl<T: Item> ItemHandle for Entity<T> {
         self.read(cx).view_kind(cx)
     }
 
-    fn agent_view(&self, cx: &App) -> Option<AgentView> {
-        self.read(cx).agent_view(cx)
+    fn outline(&self, cx: &App) -> Option<ViewOutline> {
+        self.read(cx).outline(cx)
     }
 
-    fn agent_busy(&self, cx: &App) -> bool {
-        self.read(cx).agent_busy(cx)
+    fn settling(&self, cx: &App) -> bool {
+        self.read(cx).settling(cx)
     }
 
-    fn agent_check(
+    fn catch_up(&self, window: &mut Window, cx: &mut App) {
+        self.update(cx, |item, cx| item.catch_up(window, cx));
+    }
+
+    fn refuses(
         &self,
-        tool: &str,
-        input: &serde_json::Value,
+        action: &dyn Action,
+        on: Option<&studio_actions::NodeId>,
         cx: &App,
-    ) -> Result<(), AgentRefusal> {
-        self.read(cx).agent_check(tool, input, cx)
+    ) -> Option<Refusal> {
+        self.read(cx).refuses(action, on, cx)
     }
 
     fn inspected(&self, cx: &mut App) -> Option<Inspected> {

@@ -27,7 +27,7 @@ use serde_json::{Map, Value, json};
 use studio_actions::{Thing, ViewKind};
 use studio_settings::StudioSettings;
 use studio_workspace::{
-    AgentEdge, AgentGroup, AgentNode, AgentView, ItemHandle, ToastKind, Workspace,
+    ItemHandle, OutlineEdge, OutlineGroup, OutlineNode, Refusal, ToastKind, ViewOutline, Workspace,
 };
 
 /// The most node ids `studio_selection` names.
@@ -847,11 +847,17 @@ async fn target_window(
         let deadline = cx.background_executor().now() + WAIT;
         loop {
             // No redraw is asked for: a view that changed notifies, and is drawn (drawing.md).
-            let busy = handle.update(cx, |workspace, _, cx| {
+            // In a window the system is not drawing (minimized, covered, on another Space) the
+            // view would wait for a draw that does not come, so it is asked to do now what it
+            // leaves for one.
+            let busy = handle.update(cx, |workspace, window, cx| {
                 workspace
                     .all_items()
                     .find(|tab| tab.item_id() == item)
-                    .is_some_and(|tab| tab.agent_busy(cx))
+                    .is_some_and(|tab| {
+                        tab.catch_up(window, cx);
+                        tab.settling(cx)
+                    })
             });
             match busy {
                 Err(_) => return Answer::window_closed(id),
@@ -913,7 +919,7 @@ struct Front {
     panels: Vec<SharedString>,
     /// A view tool's tab, and what an agent read of it before the call.
     view_item: Option<EntityId>,
-    view: Option<AgentView>,
+    view: Option<ViewOutline>,
 }
 
 /// How often a call that waits looks at its view again.
@@ -951,8 +957,8 @@ fn dispatch(
             return Err(not_available(why));
         }
     }
-    // A view tool acts on the active tab, which must be that view, and on the node named.
-    let mut view_tab = None;
+    // A view tool acts on the active tab, which must be that view.
+    let mut view_item = None;
     if let On::View(kind) = tool.on {
         let Some(item) = workspace.active_item() else {
             return Err(not_available(no_view(kind, None)));
@@ -960,37 +966,7 @@ fn dispatch(
         if !shows(item, kind, cx) {
             return Err(not_available(no_view(kind, Some(&describe(item, cx)))));
         }
-        if let Err(refusal) = item.agent_check(tool.name, input, cx) {
-            let mut answer = Answer::new(
-                refusal.outcome,
-                refusal.says,
-                refusal.json,
-                refusal.outcome != "needs_confirmation",
-            );
-            answer.json["window"] = json!(id);
-            answer.json["action"] = json!(tool.action);
-            return Err(answer);
-        }
-        let named = tool
-            .node
-            .then(|| input.get("node").and_then(node_id))
-            .flatten();
-        if let Some((type_name, node)) = &named {
-            let shown = item.agent_view(cx).is_some_and(|view| {
-                view.nodes
-                    .iter()
-                    .any(|n| n.type_name == *type_name && n.id == *node)
-            });
-            if !shown {
-                return Err(not_available(not_shown(kind)));
-            }
-        }
-        view_tab = Some((
-            item.item_id(),
-            item.focus_handle(cx),
-            item.agent_view(cx),
-            named,
-        ));
+        view_item = Some((kind, item));
     }
     let mut data = input.as_object().cloned().unwrap_or_default();
     data.remove("window");
@@ -1030,6 +1006,42 @@ fn dispatch(
             ));
         }
     };
+    // The view says whether it would act on the action as built, and on the node named.
+    let mut view_tab = None;
+    if let Some((kind, item)) = view_item {
+        let named = tool
+            .node
+            .then(|| input.get("node").and_then(node_id))
+            .flatten();
+        let on = named
+            .as_ref()
+            .map(|(type_name, id)| studio_actions::NodeId {
+                type_name: type_name.clone(),
+                id: id.clone(),
+            });
+        if let Some(refusal) = item.refuses(action.as_ref(), on.as_ref(), cx) {
+            let mut answer = refused(kind, refusal);
+            answer.json["window"] = json!(id);
+            answer.json["action"] = json!(tool.action);
+            return Err(answer);
+        }
+        if let Some((type_name, node)) = &named {
+            let shown = item.outline(cx).is_some_and(|view| {
+                view.nodes
+                    .iter()
+                    .any(|n| n.type_name == *type_name && n.id == *node)
+            });
+            if !shown {
+                return Err(not_available(not_shown(kind)));
+            }
+        }
+        view_tab = Some((
+            item.item_id(),
+            item.focus_handle(cx),
+            item.outline(cx),
+            named,
+        ));
+    }
     let mut before = front(workspace, window, cx);
     match &view_tab {
         // The view takes the keyboard, as a click on it would; `keep_focus` gives it back.
@@ -1083,7 +1095,7 @@ fn node_id(value: &Value) -> Option<(String, String)> {
 /// Whether `item` is the view `kind`: a query's result picture is a canvas too.
 fn shows(item: &dyn ItemHandle, kind: ViewKind, cx: &App) -> bool {
     match kind {
-        ViewKind::Canvas => item.agent_view(cx).is_some_and(|_| {
+        ViewKind::Canvas => item.outline(cx).is_some_and(|_| {
             item.view_kind(cx)
                 .is_none_or(|view| view == ViewKind::Canvas)
         }),
@@ -1110,6 +1122,63 @@ fn no_view(kind: ViewKind, tab: Option<&Value>) -> String {
     }
 }
 
+/// A view's refusal ([`Refusal`]) as an agent reads it: the view states the fact, and the words
+/// here say how a tool gets past it. An expansion that asks first is not an error: the agent
+/// answers it by calling again.
+fn refused(kind: ViewKind, refusal: Refusal) -> Answer {
+    let tree = kind == ViewKind::Tree;
+    match refusal {
+        Refusal::Says(says) => Answer::new("not_available", says, json!({}), true),
+        Refusal::NotShown(nodes) => {
+            let mut says = not_shown(kind);
+            if !nodes.is_empty() {
+                says.push_str(": ");
+                says.push_str(&nodes.join(", "));
+            }
+            Answer::new("not_available", says, json!({}), true)
+        }
+        Refusal::NotAWalk => Answer::new(
+            "not_available",
+            "This canvas shows a query's result whole; expand or hide on a walk from a node \
+             (graph_show_node_on_canvas)",
+            json!({}),
+            true,
+        ),
+        Refusal::RelationshipClosed => Answer::new(
+            "not_available",
+            "That relationship is not open on the canvas; open it with canvas_expand and \
+             `relationships`",
+            json!({}),
+            true,
+        ),
+        Refusal::AsksFirst {
+            nodes,
+            reads,
+            confirms,
+        } => {
+            let (what, view) = if tree {
+                ("rows", "tree")
+            } else {
+                ("nodes", "canvas")
+            };
+            let again = if confirms {
+                "Call again with confirm: true to open it."
+            } else {
+                "Use tree_expand with the node and confirm: true to open it."
+            };
+            Answer::new(
+                "needs_confirmation",
+                format!(
+                    "This would open {nodes} {what} and ask for {reads} reads, past what the \
+                     {view} opens without asking the person. Nothing was opened. {again}"
+                ),
+                json!({ "needs_confirmation": { "nodes": nodes, "reads": reads } }),
+                false,
+            )
+        }
+    }
+}
+
 /// Why a node named is not acted on: the view does not show it.
 fn not_shown(kind: ViewKind) -> String {
     match kind {
@@ -1120,7 +1189,7 @@ fn not_shown(kind: ViewKind) -> String {
     }
 }
 
-fn node_json(node: &AgentNode) -> Value {
+fn node_json(node: &OutlineNode) -> Value {
     json!({ "type_name": node.type_name, "id": node.id, "label": node.label })
 }
 
@@ -1145,22 +1214,22 @@ fn view_changed(id: u64, tool: &UiTool, before: &Front, workspace: &Workspace, c
     };
     let tab = describe(item, cx);
     let old = before.view.clone().unwrap_or_default();
-    let new = item.agent_view(cx).unwrap_or_default();
-    let key = |node: &AgentNode| (node.type_name.clone(), node.id.clone());
+    let new = item.outline(cx).unwrap_or_default();
+    let key = |node: &OutlineNode| (node.type_name.clone(), node.id.clone());
     let old_nodes: HashSet<(String, String)> = old.nodes.iter().map(key).collect();
     let new_nodes: HashSet<(String, String)> = new.nodes.iter().map(key).collect();
-    let added: Vec<&AgentNode> = new
+    let added: Vec<&OutlineNode> = new
         .nodes
         .iter()
         .filter(|node| !old_nodes.contains(&key(node)))
         .collect();
-    let removed: Vec<&AgentNode> = old
+    let removed: Vec<&OutlineNode> = old
         .nodes
         .iter()
         .filter(|node| !new_nodes.contains(&key(node)))
         .collect();
-    let old_edges: HashSet<&AgentEdge> = old.edges.iter().collect();
-    let edges_added: Vec<&AgentEdge> = new
+    let old_edges: HashSet<&OutlineEdge> = old.edges.iter().collect();
+    let edges_added: Vec<&OutlineEdge> = new
         .edges
         .iter()
         .filter(|edge| !old_edges.contains(edge))
@@ -1170,7 +1239,7 @@ fn view_changed(id: u64, tool: &UiTool, before: &Front, workspace: &Workspace, c
         .iter()
         .map(|group| (&group.node, &group.relationship))
         .collect();
-    let closed: Vec<&AgentGroup> = new
+    let closed: Vec<&OutlineGroup> = new
         .groups
         .iter()
         .filter(|group| {
@@ -1187,7 +1256,7 @@ fn view_changed(id: u64, tool: &UiTool, before: &Front, workspace: &Workspace, c
         &closed,
         |group| json!({ "node": pair_json(&group.node), "relationship": group.relationship, "other_type": group.other_type, "count": group.count }),
     );
-    let still_reading = item.agent_busy(cx);
+    let still_reading = item.settling(cx);
     let expands = tool.name.ends_with("_expand");
     let changed = !added.is_empty()
         || !removed.is_empty()
@@ -1276,9 +1345,9 @@ fn view_read(id: u64, kind: ViewKind, workspace: &Workspace, cx: &App) -> Answer
         );
     }
     let tab = describe(item, cx);
-    let view = item.agent_view(cx).unwrap_or_default();
+    let view = item.outline(cx).unwrap_or_default();
     let make = |limit: usize| {
-        let nodes: Vec<&AgentNode> = view.nodes.iter().take(limit).collect();
+        let nodes: Vec<&OutlineNode> = view.nodes.iter().take(limit).collect();
         let at: std::collections::HashMap<(&str, &str), usize> = nodes
             .iter()
             .enumerate()
@@ -1456,7 +1525,7 @@ fn changed(
             // already holds is said with it (spec 032).
             if let Some(Thing::Node { type_name, id }) = item.thing(cx) {
                 let label = item
-                    .agent_view(cx)
+                    .outline(cx)
                     .and_then(|view| view.root)
                     .filter(|root| root.type_name == type_name && root.id == id)
                     .and_then(|root| root.label)
@@ -1631,7 +1700,7 @@ fn selection(id: u64, workspace: &Workspace, cx: &App) -> Answer {
     let mut tab = describe(item, cx);
     // On a canvas or a tree, how much more there is to read with studio_canvas or
     // studio_tree (spec 032).
-    if let Some(view) = item.agent_view(cx) {
+    if let Some(view) = item.outline(cx) {
         tab["drawn"] = json!({
             "nodes": view.nodes.len(),
             "edges": view.edges.len(),
