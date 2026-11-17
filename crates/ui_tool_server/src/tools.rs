@@ -84,6 +84,24 @@ pub struct UiTool {
     /// The action reads (an expansion): the answer waits for the view to have read and drawn
     /// it, at most [`WAIT`].
     pub waits: bool,
+    /// An expansion of neighbourhoods: its answer is `expanded` when nodes were added, and it
+    /// alone says that a second level asks first ([`ViewOutline::stopped`]).
+    pub expands: bool,
+    /// Called with a filter, its table opens as a tab of its own beside the type's, which is
+    /// left as the person has it (spec 032, Focus).
+    pub apart_when_filtered: bool,
+}
+
+impl UiTool {
+    const fn expanding(mut self) -> Self {
+        self.expands = true;
+        self
+    }
+
+    const fn apart_when_filtered(mut self) -> Self {
+        self.apart_when_filtered = true;
+        self
+    }
 }
 
 /// How long a tool's answer waits for what its action reads.
@@ -97,6 +115,8 @@ const fn workspace(name: &'static str, action: &'static str, needs: &'static [Ne
         on: On::Workspace,
         node: false,
         waits: false,
+        expands: false,
+        apart_when_filtered: false,
     }
 }
 
@@ -114,6 +134,8 @@ const fn view(
         on: On::View(kind),
         node,
         waits,
+        expands: false,
+        apart_when_filtered: false,
     }
 }
 
@@ -149,7 +171,8 @@ pub static ALLOWED: &[UiTool] = &[
         "graph_open_type",
         "studio_graph::OpenType",
         &[Need::Session, Need::Type("type_name")],
-    ),
+    )
+    .apart_when_filtered(),
     workspace(
         "graph_open_node",
         "studio_graph::OpenNode",
@@ -218,7 +241,8 @@ pub static ALLOWED: &[UiTool] = &[
         "studio_canvas::ExpandNeighbourhood",
         false,
         true,
-    ),
+    )
+    .expanding(),
     canvas(
         "canvas_collapse",
         "studio_canvas::CollapseNodes",
@@ -368,7 +392,8 @@ pub static ALLOWED: &[UiTool] = &[
         "studio_tree::ExpandNeighbourhood",
         false,
         true,
-    ),
+    )
+    .expanding(),
     tree("tree_collapse", "studio_tree::CollapseNodes", false, false),
     tree("tree_select_next", "studio_tree::SelectNext", true, false),
     tree(
@@ -991,7 +1016,7 @@ fn dispatch(
     }
     // A filtered table opens as a tab of its own, which the person can close, and the type's
     // open table is left as the person has it (spec 032, Focus).
-    if tool.name == "graph_open_type"
+    if tool.apart_when_filtered
         && data
             .get("filter_id")
             .is_some_and(|filter| !filter.is_null())
@@ -1268,14 +1293,17 @@ fn view_changed(id: u64, tool: &UiTool, before: &Front, workspace: &Workspace, c
         |group| json!({ "node": pair_json(&group.node), "relationship": group.relationship, "other_type": group.other_type, "count": group.count }),
     );
     let still_reading = item.settling(cx);
-    let expands = tool.name.ends_with("_expand");
+    let expands = tool.expands;
+    // A second level that asks first is the answer of the expansion that stopped at it. The
+    // walk goes on holding it until the next expansion, and no other call repeats it.
+    let stopped = new.stopped.filter(|_| expands);
     let changed = !added.is_empty()
         || !removed.is_empty()
         || new.selected != old.selected
         || new.facts != old.facts
         || new.groups != old.groups;
     let outcome = match () {
-        _ if expands && new.stopped.is_some() => "needs_confirmation",
+        _ if stopped.is_some() => "needs_confirmation",
         _ if new.capped && (!old.capped || !added.is_empty()) => "cap_reached",
         _ if expands && !added.is_empty() => "expanded",
         _ if changed => "changed",
@@ -1295,7 +1323,7 @@ fn view_changed(id: u64, tool: &UiTool, before: &Front, workspace: &Workspace, c
     if outcome == "cap_reached" {
         says.push_str("; the node cap was reached, so the canvas stopped there");
     }
-    if let Some((nodes, reads)) = new.stopped {
+    if let Some((nodes, reads)) = stopped {
         says.push_str(&format!(
             "; the second level would open {nodes} nodes with {reads} reads: call again with \
              confirm: true to open it"
@@ -1318,7 +1346,7 @@ fn view_changed(id: u64, tool: &UiTool, before: &Front, workspace: &Workspace, c
         "cap_reached": new.capped,
         "still_reading": still_reading,
     });
-    if let Some((nodes, reads)) = new.stopped {
+    if let Some((nodes, reads)) = stopped {
         json["needs_confirmation"] = json!({ "nodes": nodes, "reads": reads });
     }
     for (key, value) in &new.facts {
