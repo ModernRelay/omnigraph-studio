@@ -14,7 +14,7 @@ Studio is and how to install it: the [README](../README.md). Rules every change 
   Xcode to compile them into a release build (`script/bundle-mac`). Linux: the Wayland, X11 and
   Vulkan development packages listed in `.github/workflows/ci.yml`.
 - An Omnigraph server of `v0.14.0` or later (HTTP contract 0.14). Studio refuses a server
-  that speaks another contract, such as Omnigraph 0.13, and its query checks follow `v0.14.0`.
+  that speaks another contract, such as Omnigraph 0.13, and its query checks follow `v0.15.0`.
 - For the servers of the CLI's targets, the agent panel and the sample graph, the `omnigraph`
   CLI of `v0.14.0` or later, which Omnigraph's installer puts in `~/.local/bin`:
 

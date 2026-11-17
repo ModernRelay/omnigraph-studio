@@ -21,7 +21,7 @@ it goes through Omnigraph's own RFC process.
 | E16 | Neighbourhood counts per node | 005, 006 | One count query per edge type, concurrent, cached per pinned commit |
 | E17 | `omnigraph lsp` language server | 007 | `gq_language` calls `omnigraph-compiler` in-process |
 | E18 | Tree-sitter grammars and a Zed extension in the Omnigraph repository | E17 | Grammars in this repository under `grammars/` |
-| E19 | Publish `omnigraph-compiler` to crates.io again (stops at 0.8.0) | 001 | Git dependency on tag `v0.14.0` |
+| E19 | Publish `omnigraph-compiler` to crates.io again (stops at 0.8.0) | 001 | Git dependency on tag `v0.15.0` |
 | E20 | Delegated, branch-scoped credentials for agents, recorded in history beside the actor ([#978](https://github.com/ModernRelay/omnigraph/issues/978)) | 011, 013 | Agent commits are recorded under the person's actor, on a branch named `agent/<stamp>`; Studio's gateway keeps the agent's writes on that branch |
 | E25 | One mutation that both adds and removes (lift rule D2 for one write) | 014 | A relationship replacement saves as two ordered commits, or through a branch and a merge |
 | E26 | Edge update (T16) | 014 | An unkeyed edge's properties save as delete and insert, with a new id |
@@ -71,6 +71,10 @@ Every server Studio supports serves these (checked against `v0.14.0`'s OpenAPI d
 Also served: unattached snapshots (`as unattached branch`; `CommitOutput.kind`,
 `GET /commits?listing=unattached`) and `ReadOutput.page` for a paged `branch diff` read. The CLI
 selects a backend with `--target` and reads an operator file of `targets` in its version-1 form
-(#1090, #1115, #1126). Studio's agent CLI follows it (spec 013), from `v0.14.0` on. Since 2026-10-22 Studio reads no operator file for the
+(#1090, #1115, #1126). Studio's agent CLI follows it (spec 013), from `v0.14.0` on.
+`v0.15.0` keeps contract 0.14 and adds, all optional: a ranked read's `ReadOutput.ranking`,
+`GET /branches?detailed=true` with `BranchListOutput.details`, `AccessOutput.client_id`, and the
+403 `not_admitted` code. Studio decodes them; it says why a sign-in is not admitted and uses
+none of the rest yet. Since 2026-10-22 Studio reads no operator file for the
 person's servers: it takes them and their tokens from the CLI's own commands (`target list`,
 `target inspect`, `credentials status`, `credentials export`; spec 003).

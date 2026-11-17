@@ -13,7 +13,7 @@ other: what two features share moves down a layer.
 |---|---|---|---|
 | 0 | `studio_actions` | Every action type, with doc comments that become palette descriptions | `gpui` |
 | 1 | `studio_settings`, `studio_theme` | Typed layered settings; graph tokens over Zed's themes, set up through Zed's `theme_settings`, the themes Studio bundles, and Studio's icons in place of Zed's | `gpui`, `settings`, `theme`, `theme_settings`, `assets`, serde |
-| 2 | `graph_client` | Every request to an Omnigraph server: contract header, DTOs for the 0.14 API, write outcomes, change-feed paging. **No `gpui`** | Zed `http_client` (Apache-2.0), serde |
+| 2 | `graph_client` | Every request to an Omnigraph server: contract header, DTOs for contract 0.14 (Omnigraph `v0.15.0`'s document), write outcomes, change-feed paging. **No `gpui`** | Zed `http_client` (Apache-2.0), serde |
 | 2 | `control_client` | Every request to a managed control plane (spec 021): the organization's clusters, a cluster's detail and status, and a cluster's data token, with a control-plane token and never a graph token. DTOs checked against the control plane's pinned OpenAPI document. **No `gpui`** | Zed `http_client`, serde |
 | 2 | `oauth_client` | Studio as an OAuth public client (spec 016): a server's sign-in details, its sign-in service's metadata, PKCE, the loopback callback, the token endpoint. **No `gpui`** | Zed `http_client`, `smol`, `sha2` |
 | 2 | `model` | Model calls through OpenRouter (spec 019): a task's input and schema in, a typed answer out; the only crate that calls OpenRouter. Holds no key and reads no setting. **No `gpui`** | Zed `http_client`, `smol`, `schemars` |
@@ -138,7 +138,7 @@ write that matched nothing, or a 412, reopens the draft.
 - `#[gpui::test]` for views and entities, against `graph_client` driven by Zed's
   `FakeHttpClient` with recorded responses.
 - `graph_client` and `gq_language` have plain unit tests; they do not depend on GPUI.
-- `crates/graph_client/openapi/omnigraph-0.14.0.json` (Omnigraph `v0.14.0`) is the contract:
+- `crates/graph_client/openapi/omnigraph-0.15.0.json` (Omnigraph `v0.15.0`, contract 0.14) is the contract:
   `graph_client`'s contract tests check every DTO's fields and every enum's variants against its
   schemas, and `every_route_the_client_calls_is_in_the_contract` makes
   each of the client's calls once and checks that its method and path are one of the

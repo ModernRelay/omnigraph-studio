@@ -28,8 +28,8 @@ intelligence. See `README.md`.
 |---|---|---|
 | Zed crates | tag `v1.27.0` (`c84af5b99cbc`) | `Cargo.toml` `[workspace.dependencies]` |
 | Rust | `1.98.1`, Zed's toolchain at that tag | `rust-toolchain.toml` |
-| Omnigraph HTTP contract | `0.14` (the `v0.14.0` release) | `crates/graph_client/openapi/omnigraph-0.14.0.json` |
-| `omnigraph-compiler` | tag `v0.14.0` | `Cargo.toml` |
+| Omnigraph HTTP contract | `0.14`, as the `v0.15.0` release documents it (`v0.14.0` is the oldest server) | `crates/graph_client/openapi/omnigraph-0.15.0.json` |
+| `omnigraph-compiler` | tag `v0.15.0` | `Cargo.toml` |
 
 Bump Zed only with [the procedure](docs/zed-pin.md). Copy Zed's `[patch.crates-io]` entries
 when you bump: patches do not carry over from a dependency's workspace.
