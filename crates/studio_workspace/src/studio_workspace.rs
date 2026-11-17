@@ -3078,6 +3078,17 @@ impl Workspace {
         .detach();
     }
 
+    /// Whether the active tab is its pane's preview, which the next preview replaces: for the
+    /// tests of crates that open tabs from a tab.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn active_tab_is_preview(&self) -> bool {
+        self.pane(self.active_pane).is_some_and(|pane| {
+            pane.active_item()
+                .and_then(|item| pane.position(item.tab_id()))
+                .is_some_and(|index| pane.is_preview(index))
+        })
+    }
+
     /// The text of each toast shown, oldest first: for the tests of crates that show toasts.
     #[cfg(any(test, feature = "test-support"))]
     pub fn toast_messages(&self) -> Vec<SharedString> {
