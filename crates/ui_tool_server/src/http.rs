@@ -383,7 +383,8 @@ async fn rpc(body: &[u8], token: &str, shared: &Shared) -> Reply {
         } => {
             let answer = call(shared, token, name.clone(), arguments).await;
             log::info!(
-                "UI tool {name}: {} (window {})",
+                "UI tool {}: {} (window {})",
+                logged_name(&name),
                 answer.outcome,
                 answer.json["window"]
                     .as_u64()
@@ -535,5 +536,15 @@ pub fn announce_once(shared: &Shared, token: &str) {
         && let Some(state) = tokens.get_mut(token)
     {
         state.announced = true;
+    }
+}
+
+/// A call's tool name as the log may say it: one of Studio's tools, else "unknown". The name is
+/// the agent's text, which may hold anything, a query's text or ids among it.
+pub fn logged_name(name: &str) -> &str {
+    if studio_workspace::ui_tools::is_tool(name) {
+        name
+    } else {
+        "unknown"
     }
 }

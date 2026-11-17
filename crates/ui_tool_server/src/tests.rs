@@ -312,3 +312,16 @@ fn the_token_and_the_copied_commands() {
         );
     }
 }
+
+/// The log names a call's tool only when it is one of Studio's: anything else an agent sends as
+/// a name is its own text.
+#[test]
+fn the_log_names_only_studios_tools() {
+    assert_eq!(http::logged_name("graph_open_type"), "graph_open_type");
+    assert_eq!(http::logged_name("studio_windows"), "studio_windows");
+    assert_eq!(
+        http::logged_name("query people() { match { $p: Person } return { $p.email } }"),
+        "unknown"
+    );
+    assert_eq!(http::logged_name("person-000042"), "unknown");
+}
