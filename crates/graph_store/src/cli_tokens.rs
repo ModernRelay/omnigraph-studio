@@ -1345,13 +1345,16 @@ async fn run_once(
         .map_err(|error| Unrun::Failed(error.to_string()))?;
     // Written while the output is read and within the timeout: a token may be larger than a
     // pipe holds, and a command that reads none of it must not hold the CLI's turn for good.
-    // The pipe is closed after it, which ends the command's input.
+    // The pipe is closed after it, which ends the command's input. It is closed, not dropped:
+    // on Windows the pipe is a buffer that a background task copies to the command, and a drop
+    // cancels that copy, so the command read nothing (issue #120: Add server answered "no
+    // target JSON on stdin"). `close` waits until every byte is handed over.
     let stdin = child.stdin.take();
     let write = async move {
         if let (Some(input), Some(mut stdin)) = (input, stdin) {
             use futures::AsyncWriteExt as _;
             stdin.write_all(input).await?;
-            drop(stdin);
+            stdin.close().await?;
         }
         Ok::<_, std::io::Error>(())
     };
@@ -3430,6 +3433,49 @@ mod every_system_tests {
         .unwrap_err();
         assert!(why.contains("no `omnigraph` is on PATH"), "{why}");
         assert!(!why.contains("Unix pipe"), "{why}");
+    }
+
+    /// Set for the copy of this test binary that [`a_command_reads_all_of_its_input`] starts.
+    const STDIN_CHILD: &str = "STUDIO_TEST_STDIN_CHILD";
+
+    /// The command [`a_command_reads_all_of_its_input`] starts: this test, in a copy of the
+    /// test binary, which reads its input to the end and says how many bytes came. Run any
+    /// other way, it does nothing.
+    #[test]
+    fn stdin_child() {
+        if std::env::var_os(STDIN_CHILD).is_none() {
+            return;
+        }
+        let mut input = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::stdin(), &mut input).unwrap();
+        println!("read {} bytes", input.len());
+        std::process::exit(0);
+    }
+
+    /// A command is given all of its input, then the end of it, on every system. A real
+    /// process, not the shell-script CLI, so that it runs on Windows: there the input went
+    /// through a buffer that was dropped before it was handed over, so `target add` read 0
+    /// bytes (issue #120). The input is larger than a pipe holds.
+    #[test]
+    fn a_command_reads_all_of_its_input() {
+        let module = module_path!().split_once("::").map_or("", |(_, rest)| rest);
+        let input = vec![b'x'; 1 << 20];
+        for size in [85, input.len()] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", &format!("{module}::stdin_child"), "--nocapture"])
+                .env(STDIN_CHILD, "1");
+            let ran = smol::block_on(run_once(
+                command,
+                Some(&input[..size]),
+                Duration::from_secs(60),
+                MAX_ANSWER_BYTES,
+            ))
+            .unwrap_or_else(|_| panic!("the child did not run"));
+            let out = String::from_utf8_lossy(&ran.stdout);
+            assert!(ran.status.success(), "{out}");
+            assert!(out.contains(&format!("read {size} bytes")), "{out}");
+        }
     }
 }
 
