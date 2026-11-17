@@ -1,6 +1,6 @@
 # 032: Agents drive Studio's window
 
-Status: steps 1 and 2 built · step 3 (the canvas and the tree, the settings, the port) built 2026-11-17
+Status: steps 1 and 2 built · step 3 (the canvas and the tree, the settings, the port) built 2026-11-17 · amended 2026-11-18 (the tools in their own crate, a tab's hooks named for no caller, nothing started until an agent is served; see "Where each part lives")
 
 ## Problem
 
@@ -108,19 +108,79 @@ Agents, run live on 2026-11-16 against a stub Streamable HTTP server that logged
 
 ### Pieces
 
+As amended 2026-11-18 (the first plan put the tool list and the state reader in
+`studio_workspace`; see "Where each part lives" and Corrections):
+
 | Piece | Where | Role |
 |---|---|---|
-| `UiTool` and its registry | `studio_workspace` (layer 4), module `ui_tools` | A tool is a name, an action to build, a schema and a result. Features register theirs at init, as they register actions |
-| The state reader | `studio_workspace::ui_tools` | Lists windows, tabs, panels and the selection as identifiers, never as row values |
-| The server | new crate `ui_tool_server` (layer 5) | MCP over Streamable HTTP on `127.0.0.1`. It dispatches into the window and waits for the result |
-| The internal agent's entry | `agent_panel` | Gives each conversation the server as an MCP server, through a global that `studio` sets, so `agent_panel` does not depend on `ui_tool_server` |
-| Setting and copy | `studio` and `studio_settings` | The outside-agent switch, its address and the token file |
+| `UiTool`, the allow-list, the adapter and the state reader | `ui_tool_server` (layer 5), module `tools` | A tool is a name, an action to build, a schema and a result. The adapter checks, dispatches and says what changed; the reader lists windows, tabs, panels and the selection as identifiers, never as row values |
+| The server | `ui_tool_server`, modules `http` and `mcp` | MCP over Streamable HTTP on `127.0.0.1`, started when an agent is first to be served |
+| What a window and a tab answer any reader | `studio_workspace` (layer 4) | `Workspace::pane_tabs`; `Item::outline`, `settling`, `catch_up`, `refuses`, with `selected_ids`, `held_at` and `view_kind`. Named for no caller, and unused they cost nothing |
+| The internal agent's entry | `agent_panel` (`UiToolEndpoint`, `UiToolEntry`) | Gives each conversation the server as an MCP server, through a global that `studio` sets, so `agent_panel` does not depend on `ui_tool_server` |
+| The binary's wiring | `studio`, module `ui_tools` | The one module that names `ui_tool_server`: the start, the entries, New token and the settings' rows |
+| Setting | `studio_settings` | The outside-agent switch and the rest of `agent.*` |
+
+### Where each part lives
+
+Amended 2026-11-18, at Andrew's request: "make system modular and for people who do not want to
+use mcp not being affected by bloat at all". A review of #126 and #127 that day found the server
+isolated but what the tools mean spread through the window frame, the tab trait, both graph
+views and the store, and found that every Studio paid for the server at launch.
+
+**One command surface.** A person's key, the palette and a tool reach the same action handlers.
+The tool crate is an adapter over them and adds no second way to do anything.
+
+| Layer | Crate | What it holds of this plan |
+|---|---|---|
+| 0 | `studio_actions` | The vocabulary: the action types and their schemas, as before |
+| 3 | `graph_store` | What an expansion opens and costs (`plan_expand`, `opening`), for every caller |
+| 4 | `studio_workspace` | The seams below, and the status bar's "Opened by" chip. No tool, no tool name, no MCP |
+| 5 | the views | They implement the seams. They know no tool and no agent |
+| 5 | `agent_panel` | The conversation's entry and how a call to Studio's server is known by its title |
+| 5 | `ui_tool_server` | Everything else: the list, the adapter, the words an agent reads, MCP, HTTP, tokens |
+| 6 | `studio` | One module of wiring |
+
+The adapter sits beside the server at layer 5 because it reaches a view only through the tab
+trait. It was first a module of `studio_workspace` because the layer check forbids one layer-5
+crate from depending on another and the agent panel needed three of its names; those moved to
+the panel, with which names are tools carried by the entry `studio` hands it.
+
+**The seams.** What the workspace and a tab answer, and why each is there:
+
+| Seam | What it is | Before |
+|---|---|---|
+| `Item::refuses(action, on)` | Why the tab would not do what the action asks, as a fact (`Refusal`): a node not shown, nothing named, a result picture that is not a walk, a relationship not open, more than is opened without asking | `agent_check(tool: &str, input: &Value)`: the view matched the tool's name as a string and parsed the call's JSON again. A tool renamed in the list would have left its check off without a word |
+| `Item::outline` | What a view that walks the graph shows, as identifiers and the names drawn (`ViewOutline`) | `agent_view` |
+| `Item::settling` | The tab still reads or lays out what the last action on it asked for | `agent_busy` |
+| `Item::catch_up` | Does now what the tab leaves for its next draw (`docs/drawing.md`), for a reader in a window the system is not drawing | None: a call waited the whole 15 s on a minimized or covered window |
+| `Workspace::pane_tabs` | The window's panes and tabs in order | The adapter read the workspace's private fields |
+
+A refusal states the fact and the tool crate words it for an agent, tool names included
+(`tools::refused`). So `graph_canvas` and `relationship_tree` name no tool, and the words of
+this plan ("Not on this canvas; expand a neighbour or use graph_show_node_on_canvas") are
+written once, where the tool names live. The action is built before the view is asked, so
+arguments that do not fit answer `invalid_input` with what does not fit.
+
+**Nothing runs until an agent is served.** `ui_tool_server::init` only follows the settings.
+The server starts when a conversation asks for its entry or while agents outside Studio are let
+in. Until then Studio binds no port, makes no token, asks the keychain nothing and writes no
+file; the one thing done is removing an endpoint file an earlier run may have left, once, on
+the write thread. The kept token is read from the keychain the
+first time agents outside Studio are let in, never for a conversation. With outside agents off
+by default (below), a person who starts no conversation runs none of this plan's code but that
+one removal and a settings observer.
+
+**What keeps it so.** `script/check-layers.py`, which CI runs, fails when a crate other than
+`studio` depends on `ui_tool_server`; when code outside `crates/studio/src/ui_tools.rs` and its
+two test modules names the crate; or when a crate other than the tool crate, the binary and the
+agent panel names a UI tool (the names are read from the list). A build-time switch was
+rejected (Decisions).
 
 ### What a tool is
 
 A tool is a Studio action plus four things the action alone lacks:
 
-1. **An allow-list entry.** Only actions in `ui_tools::ALLOWED` are tools. The set is opt-in, so
+1. **An allow-list entry.** Only actions in `tools::ALLOWED` are tools. The set is opt-in, so
    a new action is not a tool until someone adds it here.
 2. **A target.** Every call names a `window` (from `studio_windows`), and the server gives that
    window's workspace focus before it dispatches, as the snapshot runner does. A call to a
@@ -211,8 +271,17 @@ The canvas and the tree are the exception, at the person's request (2026-11-16):
 them as the person does. Their tools change the open tab they act on, the canvas or tree in
 front, and only it: they expand and collapse, show more, hide, pin, select and move the camera.
 None writes, every one is an action the person invokes too, and the walk keeps the person's own
-Back and Forward ([`WalkBack`], `]`) and Reset layout. A view tool gives the canvas or tree the
-keyboard for its dispatch, as a click would, and gives it back where the person had it after.
+Back and Forward ([`WalkBack`], `]`) and Reset layout.
+
+A call never takes the keyboard (amended 2026-11-18). An action that gives what it opens or
+shows the keyboard, as opening a tab and showing a panel by its key do, has it taken back to
+where the person had it. The exception is a place the call made disappear, a panel it hid or a
+tab it put another in front of: then what took the keyboard keeps it, since keys must not go on
+driving something nobody sees. The bare window holding the keyboard, as after the last tab
+closed, is the keyboard nowhere in particular, and what a call opens takes it, as a tab the
+person opens does. A view tool's action is dispatched on its tab
+(`FocusHandle::dispatch_action`), which need not hold the keyboard for it, so a canvas or a tree
+is walked while the person types elsewhere.
 
 ### The canvas and the tree
 
@@ -315,8 +384,9 @@ form for the `studio` server, and shows the result's words instead: "Opened Proj
 
 ### Outside agents
 
-On by default since 2026-11-17, at the person's request (it was off). The switches are in
-Settings, under Agent:
+Off by default (2026-11-18): as in 0.4.8, the only release with the setting. On `main` it was
+on from 2026-11-17, which no release carries. Off, no agent outside Studio is let in, and with
+no conversation started no server runs. The switches are in Settings, under Agent:
 
 - **Let agents outside Studio show things in Studio.** When on, Studio writes
   `<data dir>/ui-tools/endpoint.json` (mode 0600, with `studio_settings::write_atomic`) with
@@ -336,8 +406,9 @@ Settings, under Agent:
   command keeps working across restarts; `endpoint.json` and `token` are still written for the
   copied commands. **New token** replaces it, confirmed with ↵ since nothing is lost: every agent
   holding the old one gets 401 from then on. Off, the address and token are made per run.
-- **Let the agent in Studio show things in the window**, on by default. Off, a conversation names
-  no UI tool server, passes none in `session/new`, and `AGENTS.md` says nothing of one.
+- **Let the agent in Studio show things in the window**, on by default. The server starts with
+  the first conversation that asks for its entry. Off, a conversation names no UI tool server,
+  passes none in `session/new`, asks for no entry, and `AGENTS.md` says nothing of one.
 - **Bring the window to the front when an agent shows something**, off by default.
 
 ### The port
@@ -410,7 +481,12 @@ records the tool's name, the window id and the outcome.
 | Check each tool's precondition, then report what changed | Rely on `is_action_available`; return as soon as the action is dispatched; wait for a frame | An available action can still do nothing (no session), and a dispatch says nothing. What changed is known as soon as the deferred dispatch has run, with no frame, so a frame wait would only add a timeout to handle |
 | Streamable HTTP on loopback with a bearer token, for both kinds of agent | A Unix socket; stdio through `omnigraph-studio mcp-proxy`; the gateway's HTTPS | Both adapters and both CLIs connected over plain HTTP in live runs. A socket needs a relay. A stdio relay starts the 490 MB executable once per client. The gateway's self-signed certificate would not be trusted |
 | Plain JSON answers, no server stream | SSE answers and a GET stream | Both clients take JSON, and Claude Code goes on when GET gets 405. A stream would only matter for progress on long calls, and no tool is long |
-| On by default for outside agents, with a kept address and token (2026-11-17, reversed at the person's request; it was off, with a token per run) | Off by default; a token per run | The person wants an agent to reach Studio without turning anything on, and a command copied once to keep working. What protects the person: the token file is 0600 in a 0700 folder; the server listens on loopback only and refuses a non-null `Origin`; no tool writes; the first call of a run shows the notice with Turn off; New token refuses every copy of the old one |
+| Off by default for outside agents, with a kept address and token once on (2026-11-18, at Andrew's request; on by default from 2026-11-17, in #127 and in no release; off in 0.4.8) | On by default | On, every Studio listened on 24187, kept a token in the keychain and wrote it to a file at each start, for people who connect no agent. Off, such a person has no listener, no keychain item and no token file. One who turns it on keeps what 2026-11-17 gave: the address and token are kept, so a command copied once keeps working. What protects them then is unchanged: the token file is 0600 in a 0700 folder; the server listens on loopback only and refuses a non-null `Origin`; no tool writes; the first call of a run shows the notice with Turn off; New token refuses every copy of the old one |
+| The tools in one crate at layer 5; the workspace and the views with seams named for no caller (2026-11-18) | The list and the adapter in `studio_workspace`; hooks named `agent_*` that take a tool's name | The window frame is under every feature, so what sits in it is everyone's. A view that matches tool names holds a second copy of the list, which nothing keeps in step |
+| A view's refusal is a fact, worded by the tool crate | The view writes the agent's words | The words name tools ("use graph_show_node_on_canvas"), and a tool's name is the tool crate's alone |
+| A view's action dispatched on its tab | Give the view the keyboard for the dispatch and put it back after | The view held the keyboard for the call's wait, up to 15 s, and the person's keys drove it |
+| The server started at first need | Started at launch | Launch paid for a port, a keychain read and a file whether or not an agent was ever used; on a debug build the keychain asked for the login password at each rebuild |
+| A check in `script/check-layers.py` keeps the tools in their crate | A Cargo feature `ui-tools` on `studio`, on by default, with a CI build without it | `script/bundle-mac` builds a release with `--no-default-features` when Xcode's Metal compiler is present, so a default feature would be dropped from the macOS bundle unless that script named it. The check costs no build and guards the same line |
 | The canvas and the tree change the open tab they act on | No tool changes an open tab | The person asked (2026-11-16) for an agent to walk a canvas and expand neighbourhoods as they do. Each change is the person's own action on the view in front, keeps their Back, Reset layout and Show hidden, and writes nothing; other tabs are still never changed |
 | A new layer-5 crate, wired by a global | The server in `agent_panel`; the server in `studio` | Outside agents do not need the agent panel. `studio` is the binary and should stay thin. A global keeps feature crates independent |
 | Preview tabs, never closing or refiltering | Tools that close tabs or change open filters | V: nothing moves under the person. An agent may add to the window, but it may not take anything away |
@@ -426,6 +502,39 @@ records the tool's name, the window id and the outcome.
 - No engine change is needed. An agent with its own scoped credential (E20) would let an outside
   agent read the graph without a login of its own. That is a convenience; this plan does not wait
   on it.
+
+Left open by the amendment of 2026-11-18, each found by the review of #126 and #127 and none
+fixed here:
+
+- **An action that answers.** A handler still returns nothing: the adapter asks `refuses`
+  first, then dispatches, then compares the outline before and after. A person's own invocation
+  that would be refused still does nothing without a word (`ExpandNeighbourhood` with nothing
+  selected). The end of this line is one `perform(action) -> outcome` per view, reached by the
+  key and the tool alike; it needs the views' `on_action` lists and a direct call to share one
+  table, so that no second list has to be kept in step.
+- **A view tool needs its tab drawn once.** The action is dispatched through the frame drawn
+  last, so a canvas opened by one call in a window that is never drawn answers `not_available`
+  to the next. `catch_up` covers the wait, not this.
+- **The outline's open JSON.** `ViewOutline::selected` and `facts` are JSON, so "never a
+  property value" holds there by convention, not by type.
+- `limit_per_relationship` has no upper bound, and depth 2 reads each first-level relationship
+  as far as it before anything is priced (IX).
+- `tree_open_table` on a relationship's row filters the type's open table, as the person's own
+  click does: the rule that a tool never changes an open tab's filters is kept only for
+  `graph_open_type` (`UiTool::apart_when_filtered`).
+- "Bring the window to the front" calls `Window::activate_window` only, which does not pass
+  another application's window on macOS.
+- The port used last is tried before `agent.ui_tools_port`, so a port set after the first start
+  is not asked for.
+- The 30 s a request may take covers its run as well as its read, while calls run one at a
+  time: a call queued behind two that each wait 15 s loses its connection and still runs.
+- The agent's name is kept per token, and every outside agent shares one token.
+- Hiding a node leaves the chips that hang off it marked; nothing on the canvas says nodes are
+  hidden.
+- `http.rs` holds a second copy of the agent gateway's loopback HTTP pieces: two layer-5 crates
+  cannot share them, and no lower crate holds them yet.
+- Four of step 3's actions are palette-only and ten that take arguments have no binding
+  (VIII).
 
 ## Validation log
 
@@ -459,6 +568,18 @@ records the tool's name, the window id and the outcome.
 | 2026-11-17 | The four agent settings and their defaults | `cargo test -p studio_settings` (`the_agents_window_settings_default_as_the_person_asked`, `the_documented_defaults_are_the_defaults`), `-p agent_panel with_the_setting_off_the_agent_gets_no_ui_tools`, `-p studio_workspace the_window_comes_to_the_front_only_when_the_person_asked` | Outside agents, a kept address and the panel's tools on, bringing forward off, in `default.json` too. Off, the panel's agent gets no server and no `AGENTS.md` paragraph. A window behind stays behind unless bringing forward is on |
 | 2026-11-17 | Every canvas, tree and map tool, against the real views | `cargo test -p studio --lib ui_tools` (68 tests: 56 in `ui_tools_canvas_tests`), a fake server of 60 people at one company, the first six knowing the next two | `canvas_expand` on p1 and p2 (depth 1): `expanded`, p3 and p4 added with their names and edges. `relationships: ["out:WorksAt"]`: c0 alone; `out:Owns`: `not_available`. 60 nodes at once: `needs_confirmation` (60 nodes), nothing opened; with `confirm`: opened. Cap 12: `cap_reached`, at most 12 drawn. Depth 2 on `out:Knows`: p3, p4 added. A node not drawn: the words of the plan. Every other canvas and tree tool answers as its key does; `studio_canvas`, `studio_tree` and `studio_selection`'s counts read what is drawn; the canvas tab is "Canvas: Person 0" |
 | 2026-11-17 | A filtered table opens beside the type's own | `graph_open_type_opens_the_table` | With Person open, `filter_id` opened a second tab; the same call again: `no_change` |
+| 2026-11-18 | The list and the adapter move out of the workspace with no change in behaviour | `cargo test -p ui_tool_server -p agent_panel -p studio_workspace -p graph_canvas -p relationship_tree` and `cargo test -p studio --lib ui_tools`, on the commit that only moves them | 285 and 69 tests pass, the tests that passed before the move. `studio_workspace` no longer depends on `schemars` |
+| 2026-11-18 | A view is asked about the action as built, and every refusal reads as it did | `cargo test -p studio --lib ui_tools` (70 tests; those that assert a refusal's words are unchanged); `arguments_that_do_not_fit_say_which` | `relationships: "out:Knows"`, a string: `invalid_input`, naming the value and "expected a sequence"; before, `not_available`, "`depth` is 1 or 2". `depth: 3`: `not_available`, "`depth` is 1 or 2", the view's own |
+| 2026-11-18 | A view that is not drawn settles when asked to catch up | `a_canvas_not_drawn_catches_up_when_asked` (`graph_canvas`), `a_tree_not_drawn_catches_up_when_asked` (`relationship_tree`): the view made and never drawn, `catch_up` called as the adapter's wait calls it | Before: a layout (the tree: its rows) owed, and settling. After ten calls 40 ms apart: laid out, with more chips than before (the rows made), and settled. A window minimized or covered on a real screen was not tried |
+| 2026-11-18 | Nothing runs until an agent is served | `nothing_starts_until_an_agent_is_served` (`ui_tool_server`), a `MemoryKeychain` that counts what is asked of it | After `init` with outside agents off, and through three setting changes that let no agent in: no server, no outside address, 0 keychain reads and writes. A conversation's entry: the server runs with one token, the conversation's, and still 0. Outside agents turned on: 1 read; a token made and kept |
+| 2026-11-18 | GPUI dispatches an action on a focus handle without moving focus | Read `crates/gpui/src/window.rs:637` (`FocusHandle::dispatch_action`), `:3399` (`Window::is_action_available_in`) and `:2654` (`Window::defer`) at `c84af5b99cbc` | Confirmed. The dispatch goes through the frame drawn last, so the tab must have been drawn (Deferred) |
+| 2026-11-18 | A call never takes the keyboard | `opening_a_tab_leaves_the_keyboard_where_it_was`, `a_tab_put_in_front_of_the_persons_takes_the_keyboard`, `a_view_tool_leaves_the_keyboard_where_it_was` (`studio`); `a_view_tool_acts_on_its_tab_without_the_keyboard`, `a_tab_opened_with_the_keyboard_nowhere_takes_it` (`ui_tool_server`) | With the dispatch as it was: `graph_open_type` moved focus from the queries panel to the table (FocusId 4 to 18), and a stand-in canvas's zoom ran while the canvas held the keyboard. Now: the panel keeps it through `graph_open_type`, `graph_open_node_page` and `graph_open_map`; the zoom ran once with the keyboard off the canvas; a tab put in front of the one the person was in takes it, and so does a tab opened with the keyboard on the bare window, which without that rule answered no key |
+| 2026-11-18 | Only the expansion that stopped says its second level asks | `only_the_expansion_says_its_second_level_asks` (`studio`): `canvas_expand` on c0, depth 2, `limit_per_relationship` 60 | The expansion: `needs_confirmation`, 60 nodes. `canvas_zoom_in` and `canvas_select_node` after it: neither the words nor the object. Before: "canvas_zoom_in changed the canvas; the second level would open 60 nodes with 480 reads: call again with confirm: true to open it" |
+| 2026-11-18 | A call is Studio's only by its whole title | `a_studio_call_is_known_by_either_title_and_its_own_name_only` (`agent_panel`) | Five titles that hold more than a tool's name, a command line after it among them: none is a call to Studio's tools. Whether an adapter can be made to title another call so was not tried with a live agent |
+| 2026-11-18 | The tools stay in their crate | `python3 script/check-layers.py` here, and its three rules run on `main` (`b2b47fa2`) | Here: "layers ok: 24 crates; 64 UI tools in their crate". On `main`: 16 lines in four files besides the list itself name a tool (`graph_canvas/src/agent.rs`, `relationship_tree/src/agent.rs`, `graph_store/src/exploration.rs`, `studio_workspace/src/item.rs`), and ten lines of `lib.rs` and `settings_view.rs` name the crate |
+| 2026-11-18 | Studio builds without the tool crate | A throwaway checkout of the amendment's code: `crates/studio/src/ui_tools.rs` and the two test modules deleted, 13 lines changed in `lib.rs`, `settings_view.rs` and `Cargo.toml`; `cargo check -p studio --all-targets`; `cargo tree -p studio` | It builds, with one warning for a variable the stub left unused, and `ui_tool_server` is not in its tree |
+| 2026-11-18 | The whole workspace after the amendment | `cargo test --workspace --no-fail-fast`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all --check`, `check-layers.py`, `check-brand.py`, `check-design-tokens.py`, `test_release_files.py`, `test_measure_expand_all.py`, `cargo deny check`, on macOS (Apple silicon) | 1,552 tests pass, none fails, 9 are ignored; ten of them are new with the amendment. Clippy and the format check are clean; every script passes ("layers ok: 24 crates; 64 UI tools in their crate"); `cargo deny check`: advisories, bans, licenses and sources ok |
+| open | The amendment with a live agent, in a window on a screen, and on Linux and Windows | Not run: no agent was started and Studio was not opened; every check of 2026-11-18 is a headless test on macOS | |
 | open | The adapters pass the result's words to the thread as the panel reads them (Claude in `content`, Codex in `rawOutput`) | A conversation in Studio with claude-agent-acp 0.107.3 and codex-acp 2.7.0 | Not yet run; the panel reads both places and falls back to "Studio · <tool>" |
 
 ## Corrections
@@ -493,4 +614,13 @@ records the tool's name, the window id and the outcome.
 | 2026-11-17 | Depth 2 opens the neighbours the first level read | It reads each relationship of the first level as far as `limit_per_relationship` first (a page at a time), waits through a Refresh for the reads again, and a canvas draws each expanded relationship's limit, at both levels (`Exploration::expansion_limit`) | A limit past one page stopped at the page; a Refresh dropped the second level unsaid; the second level drew the default eight (review of #127) |
 | 2026-11-17 | The kept token is read at start | A token made, or replaced with New token, while the keychain is read or the address is kept is the one kept; turning "Keep the same address" on records the port in use | The first token made after turning it on was not kept, a New token pressed during the read was overwritten by the old one, and the next start asked for 24187 instead of the port in use (review of #127) |
 | 2026-11-17 | A view tool's answer compares what the view says | The canvas says where it is centred; the map says its focus, Back and what is pointed at; the lists are cut to fit the answer; hiding is refused on a query's result picture, which draws its result whole; a filtered table saved as a view is found by the view's key | A camera move or a map move answered `no_change`; a large change could lose its whole answer; hiding a result node did nothing; a saved filtered view opened twice (review of #127) |
-
+| 2026-11-18 | `UiTool`, its list and the state reader are a module of `studio_workspace` (layer 4) | They are `ui_tool_server::tools` (layer 5), with their tests. The workspace keeps `pane_tabs`, `panel_with_focus` and `focus_active_tab` for any reader, and the "Opened by" chip | The window frame is under every feature crate; 1,780 lines of one feature's policy sat in it (review of #126 and #127) |
+| 2026-11-18 | `UiToolEndpoint` is a global of `studio_workspace` | `agent_panel::UiToolEndpoint`, with `UiToolEntry`, the server's name and the title of a call; the entry carries which names are tools | The panel is their only reader, and the tool list it needed for one check stays in the tool crate |
+| 2026-11-18 | Tabs answer `agent_view`, `agent_busy` and `agent_check(tool, input)` | `Item::outline`, `settling`, `catch_up` and `refuses(action, on)`; `AgentView` and its parts are `ViewOutline`, `OutlineNode`, `OutlineEdge`, `OutlineGroup`; a refusal is the enum `Refusal`, worded by `tools::refused`. The views' `agent.rs` are `by_id.rs` | A view matched tool names as strings and parsed the call's JSON a second time, which answered "`depth` is 1 or 2" for any argument that did not fit |
+| 2026-11-18 | "The server listens while Studio runs" (2026-11-16) | It listens from the first conversation that asks for its entry, or while outside agents are let in | A person who uses no agent had a listener, a keychain read and, with the switch on, a token file at every launch |
+| 2026-11-18 | "The kept token is read at start" (2026-11-17) | It is read the first time agents outside Studio are let in while the address is kept | A conversation's token is its own, so starting for a conversation need not ask the keychain |
+| 2026-11-18 | Outside agents are on by default (2026-11-17) | Off, as in 0.4.8 | At Andrew's request: a person who wants none of this is left alone. Once on, the kept address and token are as 2026-11-17 made them |
+| 2026-11-18 | "A view tool gives the canvas or tree the keyboard for its dispatch, as a click would, and gives it back where the person had it after" | Its action is dispatched on the tab, which never takes the keyboard; and every tool, not `workspace_activate_panel` alone, leaves the keyboard where the person had it. `UiTool::keeps_focus` is gone | A tab-opening tool left the keyboard in the tab it opened, where ↵ twice saves a cell; a view held it for the call's wait (review of #126 and #127) |
+| 2026-11-18 | A second level past the question stops, "and the answer says what it would open" | The answer of that expansion says it, and no later call's | The walk holds what stopped until the next expansion, so every call after it repeated "call again with confirm: true" (review of #127) |
+| 2026-11-18 | "The thread recognizes either form" of a call's title | Either form, and only when the whole title is the name | Only the title's first word was read, so a title that went on after a tool's name was allowed as that tool (review of #126) |
+| 2026-11-18 | A tool is matched by name where it differs (`graph_open_type`; a name ending `_expand`) | `UiTool::apart_when_filtered` and `UiTool::expands`, fields of the tool's row | No tool is named outside the list |

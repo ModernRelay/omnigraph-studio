@@ -32,6 +32,13 @@ other: what two features share moves down a layer.
 collaboration or Zed's database (spec 002). `command_palette` is forked from Zed's `picker` and
 `command_palette` the same way.
 
+The UI tools (spec 032) are one feature and stay in one crate. A person's key, the palette and
+a tool reach the same action handlers; what `ui_tool_server` needs of a window it reads through
+what the workspace and every tab answer any reader (`Workspace::pane_tabs`; `Item::outline`,
+`settling`, `catch_up` and `refuses`), and none of those names an agent or a tool. Only
+`crates/studio/src/ui_tools.rs` names the crate, and nothing in it runs until an agent is
+served. `script/check-layers.py` checks all but the last, which a test does.
+
 ## Data flow
 
 ```
