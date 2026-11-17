@@ -111,6 +111,59 @@ pub struct Scene {
     pub cap: usize,
 }
 
+/// `scene` without the nodes the person or an agent hid, nor what hangs off them: the chips
+/// whose chain of parents reaches a hidden node (spec 032, "Hide"). The walk's root is never
+/// hidden.
+pub fn without(scene: Scene, hidden: &HashSet<NodeRef>) -> Scene {
+    if hidden.is_empty() {
+        return scene;
+    }
+    let gone: Vec<bool> = (0..scene.nodes.len())
+        .map(|index| {
+            let mut at = Some(index);
+            while let Some(ix) = at {
+                let node = &scene.nodes[ix];
+                if let SceneKind::Node {
+                    node, root: false, ..
+                } = &node.kind
+                    && hidden.contains(node)
+                {
+                    return true;
+                }
+                at = node.parent;
+            }
+            false
+        })
+        .collect();
+    let mut kept_at = vec![None; scene.nodes.len()];
+    let mut nodes = Vec::new();
+    for (index, node) in scene.nodes.into_iter().enumerate() {
+        if !gone[index] {
+            kept_at[index] = Some(nodes.len());
+            nodes.push(node);
+        }
+    }
+    for node in &mut nodes {
+        node.parent = node.parent.and_then(|parent| kept_at[parent]);
+    }
+    let edges = scene
+        .edges
+        .into_iter()
+        .filter_map(|edge| {
+            Some(SceneEdge {
+                from: kept_at[edge.from]?,
+                to: kept_at[edge.to]?,
+            })
+        })
+        .collect();
+    Scene {
+        nodes,
+        edges,
+        capped: scene.capped,
+        cap: scene.cap,
+    }
+}
+
 impl Scene {
     #[cfg(test)]
     pub fn index_of(&self, id: &SceneId) -> Option<usize> {

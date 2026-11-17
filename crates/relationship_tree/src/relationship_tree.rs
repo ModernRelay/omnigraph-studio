@@ -4,6 +4,7 @@
 //!
 //! Layer 5 (`docs/architecture.md`). Plan: `specs/005-relationship-tree/plan.md`.
 
+mod agent;
 mod neighbour_controls;
 mod rows;
 
@@ -297,6 +298,23 @@ impl Focusable for RelationshipTree {
 impl EventEmitter<ItemEvent> for RelationshipTree {}
 
 impl Item for RelationshipTree {
+    fn agent_view(&self, cx: &App) -> Option<studio_workspace::AgentView> {
+        self.agent_view_of(cx)
+    }
+
+    fn agent_busy(&self, cx: &App) -> bool {
+        self.agent_busy_now(cx)
+    }
+
+    fn agent_check(
+        &self,
+        tool: &str,
+        input: &serde_json::Value,
+        cx: &App,
+    ) -> Result<(), studio_workspace::AgentRefusal> {
+        self.agent_check_call(tool, input, cx)
+    }
+
     /// The selected row's node, read as the tree reads: held at its commit, or at the commit
     /// it shows, which may be behind the head ("Newer data").
     fn inspected(&mut self, cx: &mut Context<Self>) -> Option<Inspected> {
@@ -427,6 +445,7 @@ impl Item for RelationshipTree {
                 via: None,
                 preview: false,
                 filters: set.filters.clone(),
+                separate: false,
             })),
             _ => None,
         }
@@ -976,6 +995,7 @@ impl RelationshipTree {
                 via: None,
                 preview: false,
                 filters: None,
+                separate: false,
             },
             Some(EntryKind::Group { key, .. } | EntryKind::Bucket { key, .. }) => {
                 // Seen from the other type, the relationship runs the other way.
@@ -987,6 +1007,7 @@ impl RelationshipTree {
                     via: Some(gq_language::builder::relationship_key(&back)),
                     preview: false,
                     filters: None,
+                    separate: false,
                 }
             }
             _ => return,
@@ -1702,6 +1723,9 @@ impl Render for RelationshipTree {
             .on_action(cx.listener(Self::open_table))
             .on_action(cx.listener(Self::open_page))
             .on_action(cx.listener(Self::toggle_empty_groups))
+            .on_action(cx.listener(Self::select_node))
+            .on_action(cx.listener(Self::expand_neighbourhood))
+            .on_action(cx.listener(Self::collapse_nodes))
             // ⌘R reads the tree again at the branch head, as its Newer data button does, and
             // goes on to the workspace, which reads the graph's schema, branches and counts.
             .on_action(cx.listener(|this, _: &Refresh, _, cx| {
@@ -2178,6 +2202,7 @@ mod tests {
                 via: None,
                 preview: false,
                 filters: person_set(None).filters,
+                separate: false,
             }));
             assert_eq!(
                 Item::thing(tree, cx),
