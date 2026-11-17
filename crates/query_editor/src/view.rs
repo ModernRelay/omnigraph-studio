@@ -5243,10 +5243,19 @@ impl QueryEditor {
                                     .meta("Click to see its changes"),
                             )
                             .on_click(move |event, window, cx| {
+                                let preview = event.click_count() < 2;
+                                // The commit takes the preview slot, not this tab's place: the
+                                // source tab is never replaced (spec 020), as History keeps it.
+                                if preview
+                                    && let Some(workspace) = studio_workspace::workspace_for(window)
+                                {
+                                    workspace
+                                        .update(cx, |workspace, cx| workspace.keep_active_tab(cx));
+                                }
                                 window.dispatch_action(
                                     Box::new(studio_actions::graph::OpenCommit {
                                         commit_id: id.clone(),
-                                        preview: event.click_count() < 2,
+                                        preview,
                                     }),
                                     cx,
                                 )
