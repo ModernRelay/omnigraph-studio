@@ -1323,6 +1323,8 @@ pub struct SidebarRow {
     start: Option<AnyElement>,
     label: SharedString,
     label_color: Color,
+    /// Muted after the label, cut before the label is ([`SidebarRow::detail`]).
+    detail: Option<SharedString>,
     end: Option<AnyElement>,
     /// Shown in place of `end` while the row is hovered: pin, archive.
     actions: Option<AnyElement>,
@@ -1343,6 +1345,7 @@ impl SidebarRow {
             start: None,
             label: label.into(),
             label_color: Color::Default,
+            detail: None,
             end: None,
             actions: None,
             selected: false,
@@ -1350,6 +1353,13 @@ impl SidebarRow {
             tooltip: None,
             on_click: None,
         }
+    }
+
+    /// Muted after the label, and cut first when the row is short of room, so a short label
+    /// (a commit's id) always shows whole beside a longer detail (who made it).
+    pub fn detail(mut self, detail: impl Into<SharedString>) -> Self {
+        self.detail = Some(detail.into());
+        self
     }
 
     /// In a panel with a margin of its own (an inspector's), the row on that margin, its start
@@ -1454,14 +1464,21 @@ impl RenderOnce for SidebarRow {
                 RowTip::Builder(build) => row.tip_fn(build),
             })
             .children(self.start.map(icon_slot))
-            .child(
-                Label::new(self.label)
+            .map(|row| {
+                let label = Label::new(self.label)
                     .size(LabelSize::Small)
                     .color(self.label_color)
-                    .single_line()
-                    .truncate(),
-            )
-            .child(div().flex_1())
+                    .single_line();
+                match self.detail {
+                    Some(detail) => row.child(div().flex_none().child(label)).child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(text::muted(detail).single_line().truncate()),
+                    ),
+                    None => row.child(label.truncate()).child(div().flex_1()),
+                }
+            })
             .map(|row| match self.actions {
                 Some(actions) => row
                     .group(SIDEBAR_ROW_GROUP)
