@@ -173,6 +173,7 @@ mod tests {
             branch: branch.map(str::to_owned),
             target_branch: None,
             actions: actions.to_vec(),
+            client_id: None,
         }
     }
 

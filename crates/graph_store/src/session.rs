@@ -525,6 +525,7 @@ fn node_answers(
                 rows: Value::Array(vec![row.clone()]).into(),
                 graph_commit_id: Some(commit.clone()),
                 page: None,
+                ranking: None,
             };
             Some((key, answer))
         })
@@ -3264,6 +3265,7 @@ impl GraphSession {
             rows: Arc::new(Value::Array(Vec::new())),
             graph_commit_id: Some(commit.to_owned()),
             page: None,
+            ranking: None,
         })
     }
 

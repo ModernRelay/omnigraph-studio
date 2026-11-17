@@ -2798,7 +2798,7 @@ mod tests {
         });
 
         let contract: Value =
-            serde_json::from_str(include_str!("../openapi/omnigraph-0.14.0.json")).unwrap();
+            serde_json::from_str(include_str!("../openapi/omnigraph-0.15.0.json")).unwrap();
         let paths = contract["paths"].as_object().expect("paths");
         let same_route = |template: &str, path: &str| {
             let (template, path) = (template.split('/'), path.split('/'));
