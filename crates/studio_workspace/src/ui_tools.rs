@@ -904,15 +904,35 @@ impl Drop for UiToolEntry {
     }
 }
 
-/// The MCP server name a conversation's agent is given the tools under. The adapters title a
-/// call `mcp__studio__<tool>` (Claude) or `mcp.studio.<tool>` (Codex).
-pub const SERVER_NAME: &str = "studio";
+/// What every conversation's MCP server name starts with. The rest is chosen at random per
+/// conversation ([`server_name`]), so a server of the person's own config, which the agent also
+/// loads, cannot take its name.
+pub const SERVER_PREFIX: &str = "studio_";
 
-/// The tool a call's title names, when it is one of Studio's on [`SERVER_NAME`].
-pub fn studio_call(title: &str) -> Option<&str> {
+/// A conversation's server name from six random bytes: [`SERVER_PREFIX`] and six lowercase
+/// letters or digits.
+pub fn server_name(random: [u8; 6]) -> String {
+    const ALPHABET: &[u8; 36] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let suffix: String = random
+        .iter()
+        .map(|byte| ALPHABET[usize::from(*byte) % ALPHABET.len()] as char)
+        .collect();
+    format!("{SERVER_PREFIX}{suffix}")
+}
+
+/// The tool a call's title names when it is a call to the server named `server`: the adapters
+/// title one `mcp__<server>__<tool>` (Claude) or `mcp.<server>.<tool>` (Codex).
+pub fn studio_call<'a>(title: &'a str, server: &str) -> Option<&'a str> {
     let tool = title
-        .strip_prefix("mcp__studio__")
-        .or_else(|| title.strip_prefix("mcp.studio."))?;
+        .strip_prefix("mcp__")
+        .and_then(|rest| rest.strip_prefix(server))
+        .and_then(|rest| rest.strip_prefix("__"))
+        .or_else(|| {
+            title
+                .strip_prefix("mcp.")
+                .and_then(|rest| rest.strip_prefix(server))
+                .and_then(|rest| rest.strip_prefix('.'))
+        })?;
     let tool = tool.split_whitespace().next().unwrap_or(tool);
     is_tool(tool).then_some(tool)
 }
@@ -1384,16 +1404,30 @@ mod tests {
     }
 
     #[test]
-    fn a_studio_call_is_known_by_either_title() {
+    fn a_studio_call_is_known_by_either_title_and_its_own_name_only() {
+        let server = server_name([0, 1, 25, 26, 35, 36]);
+        assert_eq!(server, "studio_abz09a");
+        let server = server_name([7, 4, 11, 11, 14, 35]);
+        assert_eq!(server, "studio_hello9");
         assert_eq!(
-            studio_call("mcp__studio__graph_open_type"),
+            studio_call("mcp__studio_hello9__graph_open_type", &server),
             Some("graph_open_type")
         );
         assert_eq!(
-            studio_call("mcp.studio.studio_windows"),
+            studio_call("mcp.studio_hello9.studio_windows", &server),
             Some("studio_windows")
         );
-        assert_eq!(studio_call("mcp__studio__run_query"), None, "not a tool");
-        assert_eq!(studio_call("mcp__other__graph_open_type"), None);
+        assert_eq!(
+            studio_call("mcp__studio_hello9__run_query", &server),
+            None,
+            "not a tool"
+        );
+        // A server of the person's own config named `studio`, or another conversation's.
+        assert_eq!(studio_call("mcp__studio__graph_open_type", &server), None);
+        assert_eq!(studio_call("mcp.studio.graph_open_type", &server), None);
+        assert_eq!(
+            studio_call("mcp__studio_hello99__graph_open_type", &server),
+            None
+        );
     }
 }

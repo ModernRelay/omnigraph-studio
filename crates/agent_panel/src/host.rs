@@ -84,9 +84,11 @@ pub struct SessionLaunch {
     pub ui_tools: Option<UiToolAccess>,
 }
 
-/// The UI tool server's address and the conversation's token for it.
+/// The UI tool server's address, the conversation's token for it, and the name the agent is
+/// given it under, the conversation's own ([`studio_workspace::ui_tools::server_name`]).
 #[derive(Clone)]
 pub struct UiToolAccess {
+    pub name: String,
     pub url: String,
     pub token: String,
 }
@@ -95,22 +97,21 @@ impl std::fmt::Debug for UiToolAccess {
     /// The token is never written out.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UiToolAccess")
+            .field("name", &self.name)
             .field("url", &self.url)
             .finish_non_exhaustive()
     }
 }
 
-/// The MCP servers a conversation's session is opened with: Studio's UI tool server, named
-/// `studio`, when the agent takes MCP over HTTP (`mcpCapabilities.http`); none otherwise, and
+/// The MCP servers a conversation's session is opened with: Studio's UI tool server, under the
+/// conversation's own name, when the agent takes MCP over HTTP (`mcpCapabilities.http`); none otherwise, and
 /// that agent has no UI tools (spec 032, The panel's agent).
 pub fn mcp_servers(launch: &SessionLaunch, http: bool) -> Vec<McpServer> {
     match (&launch.ui_tools, http) {
         (Some(access), true) => vec![McpServer::Http(
-            McpServerHttp::new(studio_workspace::ui_tools::SERVER_NAME, access.url.clone())
-                .headers(vec![HttpHeader::new(
-                    "Authorization",
-                    format!("Bearer {}", access.token),
-                )]),
+            McpServerHttp::new(access.name.clone(), access.url.clone()).headers(vec![
+                HttpHeader::new("Authorization", format!("Bearer {}", access.token)),
+            ]),
         )],
         _ => Vec::new(),
     }
@@ -141,6 +142,9 @@ pub enum HostEvent {
         agent: String,
         session: String,
         opened: Opened,
+        /// The name Studio's UI tool server was passed under in the session's request, when it
+        /// was: the agent takes MCP over HTTP and the conversation had an entry.
+        ui_tools: Option<String>,
     },
     Update(SessionUpdate),
     /// The agent asks to use a tool that is not Studio's. Answer through `reply`; dropping it
@@ -876,6 +880,10 @@ async fn open_session(
             agent: agent_name,
             session: session_id.0.to_string(),
             opened,
+            ui_tools: mcp_servers(&launch, can.http_mcp)
+                .first()
+                .and(launch.ui_tools.as_ref())
+                .map(|access| access.name.clone()),
         })
         .ok();
 
@@ -1232,7 +1240,7 @@ async fn list_sessions(
 #[cfg(test)]
 mod tests {
 
-    /// A conversation's session gets Studio's UI tool server, named `studio`, with its token
+    /// A conversation's session gets Studio's UI tool server, under its own name, with its token
     /// in a bearer header, only from an agent that takes MCP over HTTP (spec 032).
     #[test]
     fn the_ui_tool_server_goes_to_an_agent_that_takes_http() {
@@ -1240,6 +1248,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             resume: None,
             ui_tools: Some(UiToolAccess {
+                name: "studio_k3x9q2".into(),
                 url: "http://127.0.0.1:4100/mcp".into(),
                 token: "secret".into(),
             }),
@@ -1249,7 +1258,7 @@ mod tests {
             serde_json::to_value(&servers).unwrap(),
             serde_json::json!([{
                 "type": "http",
-                "name": "studio",
+                "name": "studio_k3x9q2",
                 "url": "http://127.0.0.1:4100/mcp",
                 "headers": [{ "name": "Authorization", "value": "Bearer secret" }],
             }])
