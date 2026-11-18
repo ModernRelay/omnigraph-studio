@@ -1382,7 +1382,13 @@ impl Connection {
     /// [`Self::refresh_token`] (the person's Refresh, or a change to the CLI) or a new source. A
     /// 401 to a graph's request (a read, a write, the agent's) has its own bound
     /// ([`Self::request_refused`]). One the server did not refuse is not asked about.
-    fn refused(&mut self, failed: Failed, token_sent: bool, cx: &mut Context<Self>) {
+    fn refused(&mut self, mut failed: Failed, token_sent: bool, cx: &mut Context<Self>) {
+        // What the server serves decides how its refusal reads, so it is kept first.
+        if let Some(health) = failed.health.take()
+            && self.set_health(*health)
+        {
+            cx.emit(ConnectionEvent::FeaturesChanged);
+        }
         // The server names the identity one it does not admit: no 401, so nothing of the
         // token's refusal, its renewal or a sign-in offer applies; a new token or Retry connects
         // again, and the operator admitting the identity lets that one through.
@@ -2239,16 +2245,17 @@ impl Connection {
             self.check_health_after(RECHECK, None, cx);
             return;
         }
-        let next = match served(health) {
-            // A server upgraded or replaced in place reports another release: what Studio may
-            // ask of it follows at once.
-            Ok(answer) if self.state == ConnectionState::Ready => {
-                if self.set_health(answer.health) {
-                    cx.emit(ConnectionEvent::FeaturesChanged);
-                    cx.notify();
-                }
-                ConnectionState::Ready
-            }
+        let served = served(health);
+        // A server upgraded or replaced in place reports another release: what Studio may ask
+        // of it, and how its refusals read, follow at once, whatever the state.
+        if let Ok(answer) = &served
+            && self.set_health(answer.health.clone())
+        {
+            cx.emit(ConnectionEvent::FeaturesChanged);
+            cx.notify();
+        }
+        let next = match served {
+            Ok(_) if self.state == ConnectionState::Ready => ConnectionState::Ready,
             // `/healthz` asks for no token, so it passes for a refused one too: probing again
             // would be refused alike, and would take the token field away while it is typed
             // in. A new token connects again; a source that could not answer is asked again,
@@ -2317,6 +2324,8 @@ struct Failed {
     challenge: Option<Box<Challenge>>,
     /// A 403 `not_admitted` (Omnigraph 0.15): the server admits no one for the identity.
     not_admitted: bool,
+    /// The health answer the probe read beside the refused graph list, when it had one.
+    health: Option<Box<HealthOutput>>,
 }
 
 impl From<ConnectionState> for Failed {
@@ -2325,6 +2334,7 @@ impl From<ConnectionState> for Failed {
             state,
             challenge: None,
             not_admitted: false,
+            health: None,
         }
     }
 }
@@ -2341,6 +2351,7 @@ fn not_admitted_failure() -> Failed {
         state: ConnectionState::Unauthorized,
         challenge: None,
         not_admitted: true,
+        health: None,
     }
 }
 
@@ -2373,7 +2384,12 @@ async fn probe(client: &GraphClient) -> Probe {
     };
     let graphs = match graphs {
         Ok(graphs) => graphs,
-        Err(failed) => return Probe::Failed(failed),
+        // The health answer read beside it still says what the server serves, which is how
+        // its refusal is read (`ServerFeature::NotAdmittedCode`).
+        Err(mut failed) => {
+            failed.health = Some(Box::new(health.health));
+            return Probe::Failed(failed);
+        }
     };
     Probe::Ready {
         health: health.health,
@@ -2392,6 +2408,7 @@ async fn list_graphs(client: &GraphClient) -> Result<GraphListing, Failed> {
                 state: ConnectionState::Unauthorized,
                 challenge: summary.challenge,
                 not_admitted: false,
+                health: None,
             });
         }
         // Not a policy's refusal of the list: the server admits no one for the identity, on
@@ -3021,6 +3038,65 @@ mod tests {
         }
     }
 
+    /// What a server serves is read from the health answer beside a connect it refuses, and from
+    /// every health check while it refuses: a 0.15 server's 401 at the first connect is the token
+    /// refused, and a server rolled back to 0.14 meanwhile reads as 0.14 at the next check.
+    #[gpui::test]
+    async fn a_refused_connect_still_reads_what_the_server_serves(cx: &mut TestAppContext) {
+        use crate::server_features::ServerFeature;
+        let version: Arc<Mutex<&'static str>> = Arc::new(Mutex::new("0.15.0"));
+        let reported = version.clone();
+        let http = FakeHttpClient::create(move |request| {
+            let health = request.uri().path().ends_with("/healthz");
+            let version = *reported.lock().unwrap();
+            async move {
+                let (status, body) = if health {
+                    (
+                        200,
+                        serde_json::json!({ "status": "ok", "version": version,
+                        "internal_schema_version": 16 }),
+                    )
+                } else {
+                    (
+                        401,
+                        serde_json::json!({ "error": "token refused", "code": "unauthorized",
+                        "disposition": { "action": "fix", "effects": "none" } }),
+                    )
+                };
+                Ok(Response::builder()
+                    .status(status)
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                    .body(AsyncBody::from(body.to_string()))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let _shown = connection.update(cx, |connection, cx| {
+            connection.connect(cx);
+            connection.watch(cx)
+        });
+        cx.run_until_parked();
+        connection.read_with(cx, |connection, _| {
+            assert_eq!(connection.state, ConnectionState::Unauthorized);
+            assert!(connection.features.has(ServerFeature::NotAdmittedCode));
+            assert_eq!(connection.held_refusal(), HeldRefusal::Refused);
+        });
+        *version.lock().unwrap() = "0.14.0";
+        cx.executor().advance_clock(FAILED_CHECK_INTERVAL);
+        cx.run_until_parked();
+        connection.read_with(cx, |connection, _| {
+            assert_eq!(connection.state, ConnectionState::Unauthorized);
+            assert!(!connection.features.has(ServerFeature::NotAdmittedCode));
+            assert_eq!(connection.held_refusal(), HeldRefusal::NotAdmitted);
+        });
+    }
+
     /// A 401 to a sign-in held: from a 0.15 server, which names an account it does not admit,
     /// it is the token refused, which a new sign-in may replace; from a 0.14 server it may be
     /// the account, as before.
@@ -3396,6 +3472,7 @@ mod tests {
                     params: vec![("error".into(), "invalid_token".into())],
                 })),
                 not_admitted: false,
+                health: None,
             };
             connection.refused(failed, true, cx);
         });
@@ -3429,6 +3506,7 @@ mod tests {
                     params: vec![("error".into(), "invalid_token".into())],
                 })),
                 not_admitted: false,
+                health: None,
             };
             connection.refused(failed, true, cx);
         });
@@ -4144,6 +4222,7 @@ mod tests {
                     params: Vec::new(),
                 })),
                 not_admitted: false,
+                health: None,
             };
             connection.refused(failed, true, cx);
         };
