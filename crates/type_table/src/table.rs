@@ -350,13 +350,14 @@ const DIFF_CHANGE_CAP: usize = graph_store::REVIEW_CHANGE_CAP;
 /// How many changes one page of the diff asks for.
 const DIFF_PAGE: usize = 8_192;
 
-/// The colour a kind of change is drawn in: green for what the branch has that the target
-/// does not (an added row, a changed cell's new value), red for what it lost. A changed row is
-/// said by its cells, old value struck in red beside the new in green, as the review's rows
-/// say it; it carries no wash of its own.
+/// The colour a kind of change is drawn in, as everywhere Studio shows a change (spec 033):
+/// added green, changed the modified colour, removed red, for the row's gutter bar and an
+/// added or removed row's wash. A changed row is said by its cells, old value struck on the red
+/// mark beside the new on the green, as the review's rows say it; it carries no wash.
 fn change_color(net: NetChange) -> Color {
     match net {
-        NetChange::Added | NetChange::Changed => Color::Created,
+        NetChange::Added => Color::Created,
+        NetChange::Changed => Color::Modified,
         NetChange::Removed => Color::Deleted,
     }
 }
@@ -483,21 +484,12 @@ impl TypeTable {
             plural(changed, "row", "rows"),
             plural(removed, "row", "rows"),
         );
-        let count = |n: usize, sign: &str, color: Color| {
-            (n > 0).then(|| {
-                studio_ui::ds::text::meta(format!("{sign}{n}"))
-                    .color(color)
-                    .into_any_element()
-            })
-        };
+        // The counts as every change's are drawn (spec 033).
         Some(
-            h_flex()
+            div()
                 .id("diff-counts")
-                .gap(px(space::SM))
                 .tip(studio_ui::ds::tooltip(tooltip))
-                .children(count(added, "+", Color::Created))
-                .children(count(changed, "~", Color::Muted))
-                .children(count(removed, "−", Color::Deleted))
+                .child(studio_ui::change_counts(added, changed, removed))
                 .into_any_element(),
         )
     }

@@ -5225,16 +5225,26 @@ impl QueryEditor {
                         ds::meta(IconName::GitBranch, format!("from {from}")).into_any_element(),
                     );
                 }
+                // The commit is a link to its changes, so a write can be checked against what
+                // it was meant to do (spec 033): a click previews its tab, a second keeps it.
                 if let Some((commit, what)) = effect.commit() {
+                    let id = commit.to_owned();
                     facts.push(
                         div()
                             .id("write-commit")
+                            .cursor_pointer()
                             .child(ds::meta_code(
                                 IconName::GitCommit,
                                 short_commit_id(commit),
                                 cx,
                             ))
-                            .tip(studio_ui::ds::tooltip(format!("{what} {commit}")))
+                            .tip(
+                                studio_ui::ds::tooltip(format!("{what} {commit}"))
+                                    .meta("Click to see its changes"),
+                            )
+                            .on_click(move |event, window, cx| {
+                                open_write_commit(id.clone(), event.click_count() < 2, window, cx)
+                            })
                             .into_any_element(),
                     );
                 }
@@ -5772,11 +5782,62 @@ fn results_set(
     }
 }
 
+/// Opens the commit a write's result names, so the write is checked against what it was meant
+/// to do (spec 033): a preview takes the pane's preview slot, not the query's place, since the
+/// source tab is never replaced (spec 020), as History keeps itself.
+fn open_write_commit(commit_id: String, preview: bool, window: &mut Window, cx: &mut App) {
+    if preview && let Some(workspace) = studio_workspace::workspace_for(window) {
+        workspace.update(cx, |workspace, cx| workspace.keep_active_tab(cx));
+    }
+    window.dispatch_action(
+        Box::new(studio_actions::graph::OpenCommit { commit_id, preview }),
+        cx,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// A write's commit, opened from the query's tab as a preview, keeps that tab: a query
+    /// previewed in the pane is not replaced by the commit (review of #130).
+    #[gpui::test]
+    async fn a_writes_commit_keeps_the_querys_tab(cx: &mut gpui::TestAppContext) {
+        struct Tab(gpui::FocusHandle);
+        impl gpui::Render for Tab {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                gpui::Empty
+            }
+        }
+        impl gpui::Focusable for Tab {
+            fn focus_handle(&self, _: &App) -> gpui::FocusHandle {
+                self.0.clone()
+            }
+        }
+        impl gpui::EventEmitter<studio_workspace::ItemEvent> for Tab {}
+        impl studio_workspace::Item for Tab {
+            fn tab_title(&self, _: &App) -> SharedString {
+                "query".into()
+            }
+        }
+        cx.update(studio_theme::init_test);
+        let (workspace, cx) = cx.add_window_view(studio_workspace::Workspace::new);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace
+                .open_item_with::<Tab>("query", true, window, cx, |_, cx| Tab(cx.focus_handle()));
+            assert!(workspace.active_tab_is_preview(), "the query is a preview");
+        });
+        cx.update(|window, cx| open_write_commit("c9".into(), true, window, cx));
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                !workspace.active_tab_is_preview(),
+                "the query's tab is kept"
+            );
+        });
+    }
 
     /// A row keeps the start of a long text that a cell shows, not the whole, which the table
     /// holds already; other values as they read.

@@ -74,3 +74,4 @@ commit's tab, a double click keeps it.
 | 2026-11-09 | History and the panel read change counts through one `RowCounts`: the drawn rows', once, never the first commit's | `history` `the_first_commits_changes_are_never_asked_for` (History's rows, through `RowCounts`) | Pass. The panel's counts not yet checked in the running app |
 
 ## Corrections
+- 2026-11-17: the row's label held the id and the actor, so the id was cut ("09V5S…") to fit, and a partial count read "+100 +". The id shows whole, then its branch and who made it, muted and cut first (`ds::SidebarRow::detail`); the counts (`change_cards::commit_counts`, as History's, spec 033) and the time stay at the row's end.

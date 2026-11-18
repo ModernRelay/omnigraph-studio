@@ -38,7 +38,7 @@ it goes through Omnigraph's own RFC process.
 | E41 | An optional traversal in `match`, so a page sorted by a neighbour's value or an aggregate over a relationship is one keyset run that keeps the nodes with no neighbour | 023 | Sorting by a lookup or rollup is not offered |
 | E42 | A per-graph view registry clients may write, so a view is shared with everyone who opens the graph; a view names a stored query or a type, never its own query text | 024 | Views are personal, in Studio's settings |
 | E43 | A stored query's result columns with the variable, type and property each comes from, in its catalog entry | 024 | Stored-query views are read-only |
-| E44 | A commit's added, changed and removed counts in `CommitOutput` | 009, 026 | One changes page per drawn commit, partial past 100 |
+| E44 | A commit's added, changed and removed counts in `CommitOutput`, and by type | 009, 026, 033 | One changes page per drawn commit, partial past 100 |
 | E45 | A direct `cluster apply` that releases its admission lock when it ends (or `--release-lock`; [#1359](https://github.com/ModernRelay/omnigraph/issues/1359)) | 029 | The local recipe releases it with `cluster status --json` piped into `cluster force-unlock` |
 | E46 | The CLI keeps a token for a loopback `http://` server | 029 | Adds the server as an anonymous target and keeps the token in memory until Studio quits |
 | E47 | `GET /graphs` on an `--unauthenticated` server without a cluster policy | 029 | Add server takes an optional graph id; a 404 page says the server does not list its graphs |
@@ -46,6 +46,8 @@ it goes through Omnigraph's own RFC process.
 | E49 | A substring test that ignores case and accents (`icontains`/`istarts_with`, or `lower()`/`fold()` in filters; see E40) | 031 | Types of at most 5,000 nodes are matched in Studio's memory from a name index read once per commit; larger types are searched on the server with each word in four spellings |
 | E50 | One request that finds nodes across types, ranked, with a limit per type and the property each matched | 031 | One name-index read per type and commit, at most 8 at once; Studio ranks across types |
 | E51 | Full-text search on label-like properties without a per-property `@index`, and a substring (n-gram) mode that finds a word's middle | 031 | Runs `search`/`bm25` only where an index is declared, merges its hits after its own matches, and leaves out a property whose search fails |
+| E52 | The schema at a commit, or a commit's schema diff | 033 | A schema change's tab says "Schema change" and the type the refusal names, with no retry |
+| E53 | A merge conflict's base, source and target images | 033 | The conflict's kind in words and the server's message, on its card and in the conflicts list |
 
 Every server Studio supports serves these (checked against `v0.14.0`'s OpenAPI document, 2026-10-24):
 

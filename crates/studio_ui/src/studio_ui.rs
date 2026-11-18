@@ -28,8 +28,8 @@ pub mod window_buttons;
 
 pub use cell_text::{CellText, cell_text, shown_part};
 pub use changes::{
-    ChangeCard, ChangeKind, PropertyRow, RelationshipLine, TextFolds, change_counts,
-    change_group_header, property_body, property_row,
+    ChangeKind, PropertyRow, RelationshipLine, TextFolds, change_counts, changed_value,
+    property_body, property_row,
 };
 pub use grid_places::{GridPlace, columns_in_view, grid_places, scrolled_within};
 pub use overlay_slot::{OverlaySlot, OverlaySlotElement};

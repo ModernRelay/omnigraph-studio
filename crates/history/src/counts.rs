@@ -3,12 +3,14 @@
 //! scrolling pauses, and kept, since a commit's changes never change.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 
+use change_cards::CommitCounts;
 use gpui::{AppContext as _, Context, Entity, Task};
 use graph_client::ReadError;
-use graph_client::api::{CommitOutput, EntityChangeOutput};
-use graph_store::{GraphSession, NetChange};
+use graph_client::api::{ChangeDiffRefusalReason, CommitOutput, EntityChangeOutput, EntityKind};
+use graph_store::{GraphSession, NetChange, TypeCounts};
 
 /// Changes read per commit for a row's counts: each comes with its before and after images, and a
 /// drawn row asks for its own. A commit with more shows its counts as partial.
@@ -18,32 +20,123 @@ pub(crate) const ROW_COUNT_PAGE: u32 = 100;
 pub(crate) const COUNTS_AFTER: Duration = Duration::from_millis(120);
 
 /// Added, changed and removed entities.
+#[cfg(test)]
 pub(crate) type Counts = (usize, usize, usize);
 
-/// The entities a page of one commit's changes adds, changes and removes. A commit's changes name
-/// each entity once, so they are counted where the session's memo holds them, with nothing
-/// copied to fold them.
-pub(crate) fn tally(changes: &[EntityChangeOutput]) -> Counts {
-    changes.iter().fold(
-        (0, 0, 0),
-        |(added, changed, removed), change| match NetChange::of(
-            change.before.as_ref(),
-            change.after.as_ref(),
-        ) {
-            Some(NetChange::Added) => (added + 1, changed, removed),
-            Some(NetChange::Changed) => (added, changed + 1, removed),
-            Some(NetChange::Removed) => (added, changed, removed + 1),
-            None => (added, changed, removed),
-        },
-    )
+/// What a view has learnt of a listed commit's changes (spec 033): its counts as every list of
+/// commits says them, and the same by type, node types first, for the inspector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Learnt {
+    pub(crate) counts: CommitCounts,
+    pub(crate) by_type: Arc<[TypeCounts]>,
+}
+
+impl Learnt {
+    /// What one page of a commit's changes says: counted by type, and in all, partial when
+    /// more pages follow it.
+    fn counted(changes: &[EntityChangeOutput], partial: bool) -> Self {
+        let by_type = tally_by_type(changes);
+        let (added, changed, removed) = by_type.iter().fold((0, 0, 0), |(a, c, r), t| {
+            (a + t.added, c + t.changed, r + t.removed)
+        });
+        Learnt {
+            counts: CommitCounts::Counted {
+                added,
+                changed,
+                removed,
+                partial,
+            },
+            by_type: by_type.into(),
+        }
+    }
+
+    /// What a lasting refusal, or the graph's first commit, says in place of counts.
+    fn said(counts: CommitCounts) -> Self {
+        Learnt {
+            counts,
+            by_type: Arc::from([]),
+        }
+    }
+
+    /// The counts, and whether they are the first page's only, when there are counts.
+    #[cfg(test)]
+    pub(crate) fn totals(&self) -> Option<(Counts, bool)> {
+        match self.counts {
+            CommitCounts::Counted {
+                added,
+                changed,
+                removed,
+                partial,
+            } => Some(((added, changed, removed), partial)),
+            _ => None,
+        }
+    }
+}
+
+/// A page's changes counted by type, in the order they come, node types before relationships'.
+pub(crate) fn tally_by_type(changes: &[EntityChangeOutput]) -> Vec<TypeCounts> {
+    let mut counts: Vec<TypeCounts> = Vec::new();
+    let mut index: HashMap<(bool, &str), usize> = HashMap::new();
+    for change in changes {
+        let is_edge = matches!(change.kind, EntityKind::Edge);
+        let ix = *index
+            .entry((is_edge, change.entity_type.id.as_str()))
+            .or_insert_with(|| {
+                counts.push(TypeCounts {
+                    is_edge,
+                    type_name: change.entity_type.name.clone(),
+                    added: 0,
+                    changed: 0,
+                    removed: 0,
+                });
+                counts.len() - 1
+            });
+        match NetChange::of(change.before.as_ref(), change.after.as_ref()) {
+            Some(NetChange::Added) => counts[ix].added += 1,
+            Some(NetChange::Changed) => counts[ix].changed += 1,
+            Some(NetChange::Removed) => counts[ix].removed += 1,
+            None => {}
+        }
+    }
+    counts.sort_by_key(|c| c.is_edge);
+    counts
+}
+
+/// What a refusal of a commit's changes says of the commit for good, the one reading of it
+/// that a commit's tab and every list of commits share (spec 033): the graph's first commit
+/// (409, `parentless_commit`); a schema change (409, `schema_boundary`, at the type it names);
+/// another comparison the server refuses, as it says it (409); history cleaned up (410).
+/// `None` for a failure that may pass (a timeout, a 5xx, a 429), which is asked again.
+pub(crate) fn lasting(error: &ReadError) -> Option<CommitCounts> {
+    let ReadError::Refused(refusal) = error else {
+        return None;
+    };
+    match refusal.status {
+        410 => Some(CommitCounts::CleanedUp),
+        409 => Some(
+            match refusal
+                .change_diff_refusal
+                .as_ref()
+                .map(|diff| (diff.reason, diff.type_name.clone()))
+            {
+                Some((ChangeDiffRefusalReason::ParentlessCommit, _)) => CommitCounts::First,
+                Some((ChangeDiffRefusalReason::SchemaBoundary, type_name)) => {
+                    CommitCounts::SchemaChange(type_name)
+                }
+                _ => CommitCounts::NotComparable(refusal.message.clone()),
+            },
+        ),
+        _ => None,
+    }
 }
 
 /// The counts read for a view's commits, and the reads under way.
 #[derive(Default)]
 pub(crate) struct RowCounts {
-    pub(crate) counts: HashMap<String, Counts>,
-    /// Commits whose counts come from a first page only, and those asked for already.
-    partial: HashSet<String>,
+    /// What is known of each commit's changes, by its id: its counts, or the lasting refusal
+    /// said in their place. One fact a commit, so a commit is never both.
+    pub(crate) learnt: HashMap<String, Learnt>,
+    /// The commits asked for already.
     asked: HashSet<String>,
     /// The reads under way, by commit; and the commits drawn they were last asked for, with
     /// the pause before they are read.
@@ -53,9 +146,28 @@ pub(crate) struct RowCounts {
 }
 
 impl RowCounts {
-    /// A commit's counts, and whether they are its first page's only.
-    pub(crate) fn of(&self, id: &str) -> Option<(Counts, bool)> {
-        Some((*self.counts.get(id)?, self.partial.contains(id)))
+    /// Takes `counts` as commit `id`'s, as a read of its first page would, for a test.
+    #[cfg(test)]
+    pub(crate) fn insert_counted(&mut self, id: &str, (added, changed, removed): Counts) {
+        self.learnt.insert(
+            id.to_owned(),
+            Learnt::said(CommitCounts::Counted {
+                added,
+                changed,
+                removed,
+                partial: false,
+            }),
+        );
+    }
+
+    /// What is known of `commit`'s changes: the graph's first commit has none to count; one
+    /// the server refused for good says why; one counted says its counts. None while it is
+    /// not read.
+    pub(crate) fn learnt(&self, commit: &CommitOutput) -> Option<Learnt> {
+        if crate::commit_view::is_first_commit(commit) {
+            return Some(Learnt::said(CommitCounts::First));
+        }
+        self.learnt.get(&commit.graph_commit_id).cloned()
     }
 
     /// The rows drawn are asked again: what is waiting for them is not dropped.
@@ -122,7 +234,7 @@ impl RowCounts {
     ) {
         let ids: Vec<String> = ids
             .into_iter()
-            .filter(|id| !self.counts.contains_key(id) && !self.asked.contains(id))
+            .filter(|id| !self.learnt.contains_key(id) && !self.asked.contains(id))
             .collect();
         for id in ids {
             self.asked.insert(id.clone());
@@ -134,18 +246,22 @@ impl RowCounts {
                 let page = match read.await {
                     Ok(page) => page,
                     Err(error) => {
-                        // A commit that cannot be compared (a schema change: 409) or is past
-                        // cleanup (410) has no count, now or later: it stays asked, so a row
-                        // scrolled back to does not ask again. Another failure may pass.
-                        let lasting = matches!(
-                            &error,
-                            ReadError::Refused(refusal) if matches!(refusal.status, 409 | 410)
-                        );
-                        this.update(cx, |this, _| {
+                        // A lasting refusal (the first commit, a schema change, another
+                        // comparison refused, history cleaned up) is said where the counts
+                        // would be, and the commit stays asked, so a row scrolled back to does
+                        // not ask again. Another failure may pass, and is asked again.
+                        let said = lasting(&error);
+                        this.update(cx, |this, cx| {
                             let counts = of(this);
                             counts.tasks.remove(&id);
-                            if !lasting {
-                                counts.asked.remove(&id);
+                            match said {
+                                Some(said) => {
+                                    counts.learnt.insert(id.clone(), Learnt::said(said));
+                                    cx.notify();
+                                }
+                                None => {
+                                    counts.asked.remove(&id);
+                                }
                             }
                         })
                         .ok();
@@ -153,16 +269,13 @@ impl RowCounts {
                     }
                 };
                 let more = page.next_page_token.is_some();
-                let folded = cx
-                    .background_spawn(async move { tally(&page.changes) })
+                let learnt = cx
+                    .background_spawn(async move { Learnt::counted(&page.changes, more) })
                     .await;
                 this.update(cx, |this, cx| {
                     let counts = of(this);
                     counts.tasks.remove(&id);
-                    counts.counts.insert(id.clone(), folded);
-                    if more {
-                        counts.partial.insert(id);
-                    }
+                    counts.learnt.insert(id.clone(), learnt);
                     cx.notify();
                 })
                 .ok();

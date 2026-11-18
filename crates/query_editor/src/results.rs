@@ -570,7 +570,11 @@ impl WriteEffect {
     /// A run line's few words: `nodes` and `edges` are a mutation's counts.
     pub fn note(&self, nodes: i64, edges: i64) -> String {
         match self {
-            WriteEffect::Committed { .. } => format!("Committed · {nodes} nodes, {edges} edges"),
+            WriteEffect::Committed { .. } => format!(
+                "Committed · {}, {}",
+                studio_ui::plural(nodes.max(0) as usize, "node", "nodes"),
+                studio_ui::plural(edges.max(0) as usize, "edge", "edges")
+            ),
             WriteEffect::Unchanged { .. } => "Nothing changed".into(),
             WriteEffect::Proposal { commit, .. } => {
                 format!("Held as commit {}", short_commit_id(commit))
@@ -1037,7 +1041,8 @@ mod tests {
         };
         let committed = WriteEffect::of(&mutation(commit("published")));
         assert_eq!(committed.title(), "Committed to main");
-        assert_eq!(committed.note(1, 0), "Committed · 1 nodes, 0 edges");
+        assert_eq!(committed.note(1, 0), "Committed · 1 node, 0 edges");
+        assert_eq!(committed.note(2, 1), "Committed · 2 nodes, 1 edge");
         assert_eq!(committed.commit(), Some(("01JCOMMITAAAA", "Graph commit")));
         let unchanged = WriteEffect::of(&mutation(Value::Null));
         assert_eq!(unchanged.title(), "Nothing changed on main");

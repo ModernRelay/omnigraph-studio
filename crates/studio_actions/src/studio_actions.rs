@@ -890,6 +890,21 @@ pub mod history {
     );
 }
 
+pub mod changes {
+    use gpui::actions;
+
+    actions!(
+        studio_changes,
+        [
+            /// Open the page of the selected change's node or relationship, as the change left
+            /// it, or as it was before a removal.
+            OpenChanged,
+            /// Unfold the selected change to what it holds, or fold it back to its line.
+            ToggleChange,
+        ]
+    );
+}
+
 pub mod review {
     use gpui::actions;
 

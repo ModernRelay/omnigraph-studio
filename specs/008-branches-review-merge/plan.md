@@ -373,3 +373,4 @@ place), X (designed on 0.13; the better routes are deferred).
 - 2026-10-22: "Branches" did not say when a row's head is read, which `26129fd` changed: the
   list read the first 20 heads whether it was shown or not, and now reads only those of the rows
   a shown list draws.
+- 2026-11-17: the review's feed said a run as a sentence ("1 changed in Person") where its split, History and the table said "~1", its header counted entities and relationships but no types, and a card a merge would stop on said nothing of it. Spec 033 gives every screen one way to show a change: runs led by their type with "+3 ~2 −1", the sections "Existing" and "New", a summary line by type under the heading, a kind mark on every entity's row, "Conflicts with main" on a conflicting card, ⌘↵ (`studio_changes::OpenChanged`) and a row button to open the node, runs past 50 entities folded at first, and the list a cached view of its own.

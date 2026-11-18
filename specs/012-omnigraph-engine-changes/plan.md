@@ -430,12 +430,31 @@ type, the property, and whether the query returns that variable's `@id`, would m
 property cells editable as a `.gq` file's are. Engine rule: no query text is exposed; the
 descriptor is the compiler's. *Waits:* 024. *Today:* stored-query views are read-only.
 
+**E52. A commit's schema change.** A commit that changed the schema cannot be compared with its
+parent: `GET /commits/{id}/changes` refuses it (409, `change_diff_refusal.reason`
+`schema_boundary`, naming one type), and `GET /graphs/{id}/schema` answers only the head's
+schema, so Studio cannot read the schema at a commit to compare it itself. The schema at a
+commit (`GET /graphs/{id}/schema?commit=`), or a commit's schema diff (types and properties
+added, changed and removed), would let a commit's tab show what a schema change did, as it
+shows a data change. Engine rule: the same `read` gate as the commit's changes.
+*Waits:* 033. *Today:* "Schema change", the type the refusal names, and no retry.
+
+**E53. A merge conflict's two sides.** A merge's conflicts (`MergeConflictOutput`, from a dry
+run or a 409) name the kind, the type, the entity and a message, but not the values: Studio
+holds the branch's side from its review and nothing of what the target did. The base's, the
+source's and the target's images of the conflicting entity (or the conflicting properties' three
+values) would let a card say what each branch did to it. Engine rule: the dry run stays free of
+effects; the images are read at the commits the merge resolved.
+*Waits:* 033. *Today:* the conflict's kind in words and the server's message, on the card and in
+the conflicts list.
+
 **E44. A commit's change counts in its listing.**
 A commit's change counts are read from its changes (`GET /graphs/{id}/commits/{id}/changes`), one
 page of up to 100 per listed commit, each change carrying its before and after images, only to
 count them; a commit with more shows a partial count. `CommitOutput` in `GET /commits` and
 `GET /commits/{id}` giving the entities the commit added, changed and removed, counted when the
-commit is made, would make the counts of History and the Commits panel one field each and exact.
+commit is made, would make the counts of History and the Commits panel one field each and exact;
+counted by type too, they would give the inspector's summary line (spec 033) without a read.
 *Waits:* 009, 026. *Today:* one changes page per drawn row, kept per commit, partial past 100.
 
 ### First run

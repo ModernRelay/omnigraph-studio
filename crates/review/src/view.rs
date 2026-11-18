@@ -9,8 +9,9 @@ use std::time::Duration;
 use change_cards::{CardLines, CardRows, Row};
 use editor::{Editor, EditorEvent};
 use gpui::{
-    AnyElement, App, AsyncApp, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    ListAlignment, ListState, Render, SharedString, Subscription, Task, WeakEntity, Window, list,
+    AnyElement, AnyView, App, AsyncApp, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    ListAlignment, ListState, Render, SharedString, StyleRefinement, Subscription, Task,
+    WeakEntity, Window, list,
 };
 use gq_language::SchemaModel;
 use graph_client::api::{
@@ -26,6 +27,8 @@ use graph_store::{
     contains_merge_of, revert_query, summary_sentence,
 };
 use serde_json::Value;
+use studio_actions::changes::OpenChanged;
+use studio_actions::graph::OpenNodePage;
 use studio_actions::review::{
     AcceptAndNext, EditChange, Merge, NextChange, PreviousChange, RevertAndNext, Summarize,
     SwitchLayout, ToggleChange,
@@ -149,6 +152,45 @@ impl From<MergeSettled> for Check {
     }
 }
 
+/// The conflicts a merge or its dry run stops on, and each one's place by its type and entity,
+/// made together where the conflicts are, so a drawn card finds its own in one lookup and the
+/// two never drift apart (spec 033).
+#[derive(Debug, Clone)]
+struct Conflicts {
+    list: Vec<MergeConflictOutput>,
+    by_entity: HashMap<(String, String), usize>,
+}
+
+impl Conflicts {
+    fn new(list: Vec<MergeConflictOutput>) -> Self {
+        let by_entity = list
+            .iter()
+            .enumerate()
+            .filter_map(|(ix, conflict)| {
+                Some((
+                    (conflict.type_name.clone(), conflict.entity_id.clone()?),
+                    ix,
+                ))
+            })
+            .collect();
+        Self { list, by_entity }
+    }
+
+    /// The conflict at the entity `id` of type `type_name`, if there is one.
+    fn of(&self, type_name: &str, id: &str) -> Option<&MergeConflictOutput> {
+        let &at = self.by_entity.get(&(type_name.to_owned(), id.to_owned()))?;
+        self.list.get(at)
+    }
+}
+
+impl std::ops::Deref for Conflicts {
+    type Target = [MergeConflictOutput];
+
+    fn deref(&self) -> &[MergeConflictOutput] {
+        &self.list
+    }
+}
+
 #[derive(Debug, Clone)]
 enum MergeState {
     Idle,
@@ -168,7 +210,7 @@ enum MergeState {
         /// The branch's deletion after the merge, when asked for: done, or why not.
         deleted: Option<Result<(), String>>,
     },
-    Conflicts(Vec<MergeConflictOutput>),
+    Conflicts(Conflicts),
     Refused(String),
     /// Never sent (its connection retired, the server refusing the connection, the request not
     /// made, or the branch's head not read before it): nothing was merged, and nothing is to be
@@ -377,7 +419,7 @@ enum Preview {
     Unread,
     Reading,
     Merges(BranchMergeOutcome),
-    Conflicts(Vec<MergeConflictOutput>),
+    Conflicts(Conflicts),
 }
 
 enum LoadState {
@@ -508,6 +550,14 @@ pub struct ReviewView {
     bound_head: Option<String>,
     /// What the review holds, in a sentence, made when it loads: the header draws at every frame.
     summary: String,
+    /// Who made the reviewed commits and how many, for the header beside the summary line
+    /// ("5 commits by act-dev"); empty when the commits are not all known.
+    made_by: String,
+    /// The large runs were folded once, when the review was first read (spec 033).
+    folded_large: bool,
+    /// The changes' list, a view of its own drawn cached (`docs/drawing.md`): typing in the
+    /// search, a field of this view, leaves it as it was until the search lands.
+    list_view: Entity<ReviewRows>,
     /// A model's summary of the branch (spec 019), kept until the head moves.
     ai_summary: SummaryState,
     /// Runs folded to their header, by section, kind and type: a review is read by type, and
@@ -599,6 +649,12 @@ impl Item for ReviewView {
     /// The node whose card holds the selected change (spec 020).
     fn inspected(&mut self, _cx: &mut Context<Self>) -> Option<Inspected> {
         self.selected_node().map(Inspected::Node)
+    }
+
+    /// The list of changes is a cached view of its own, and the search a field beside it: the
+    /// pane draws the review uncached, so a key in the field leaves the list as it was.
+    fn caches_its_parts(&self) -> bool {
+        true
     }
 
     fn tab_title(&self, _cx: &App) -> SharedString {
@@ -727,6 +783,9 @@ impl ReviewView {
             conflict_list: ListState::new(0, ListAlignment::Top, px(800.)),
             bound_head: None,
             summary: String::new(),
+            made_by: String::new(),
+            folded_large: false,
+            list_view: ReviewRows::new(cx),
             ai_summary: SummaryState::None,
             collapsed_runs: HashSet::new(),
             expanded: HashSet::new(),
@@ -861,6 +920,9 @@ impl ReviewView {
                 self.reviewed_keys.clear();
                 self.expanded.clear();
                 self.whole_texts.clear();
+                // Its folds are the deleted branch's: this branch's long runs fold at first again.
+                self.collapsed_runs.clear();
+                self.folded_large = false;
                 self.reload(cx);
             }
             _ => return,
@@ -1097,6 +1159,7 @@ impl ReviewView {
                 let schema_moved = std::mem::take(&mut self.schema_moved_while_loading);
                 self.newer = data.moved_while_reading || schema_moved;
                 self.summary = self.summary_of(&data);
+                self.made_by = self.made_by_of(&data);
                 let ends = data.groups.unnamed_ends();
                 let head = data.head.clone();
                 let changed = !data.folded.changes.is_empty();
@@ -1107,6 +1170,7 @@ impl ReviewView {
                 self.load = LoadState::Ready;
                 self.selected = None;
                 self.lay_out();
+                self.fold_large_once();
                 if typed_since {
                     self.search_after(None, cx);
                 }
@@ -1188,7 +1252,7 @@ impl ReviewView {
             let preview = match read.await {
                 Ok(graph_client::MergePreview::Merges(outcome)) => Preview::Merges(outcome),
                 Ok(graph_client::MergePreview::Conflicts(conflicts)) => {
-                    Preview::Conflicts(conflicts)
+                    Preview::Conflicts(Conflicts::new(conflicts))
                 }
                 Err(_) => Preview::Unread,
             };
@@ -1237,7 +1301,7 @@ impl ReviewView {
     }
 
     /// The conflicts the conflicts view lists: a merge's, else a dry run's.
-    fn conflicts(&self) -> Option<&[MergeConflictOutput]> {
+    fn conflicts(&self) -> Option<&Conflicts> {
         match (&self.merge, &self.preview) {
             (MergeState::Conflicts(conflicts), _) => Some(conflicts),
             (MergeState::Idle, Preview::Conflicts(conflicts)) => Some(conflicts),
@@ -2160,6 +2224,87 @@ impl ReviewView {
         )
     }
 
+    /// How many commits the review holds and who made them ("5 commits by act-dev"), beside
+    /// the summary line; empty when the commits are not all known.
+    fn made_by_of(&self, data: &ReviewData) -> String {
+        if self.scope.is_some() || data.commits_capped.is_some() {
+            return String::new();
+        }
+        let mut actors: Vec<String> = data
+            .commits
+            .iter()
+            .filter_map(|c| c.actor_id.clone())
+            .collect();
+        actors.sort();
+        actors.dedup();
+        let commits = studio_ui::plural(data.commits.len(), "commit", "commits");
+        match actors.as_slice() {
+            [] => commits,
+            [one] => format!("{commits} by {one}"),
+            [one, two] => format!("{commits} by {one} and {two}"),
+            many => format!("{commits} by {} actors", many.len()),
+        }
+    }
+
+    /// Folds the runs too long to read row by row the first time the review is shown, when it
+    /// holds others ([`change_cards::starts_folded`]); a review read again keeps the person's
+    /// folds.
+    fn fold_large_once(&mut self) {
+        if self.folded_large {
+            return;
+        }
+        let Some(data) = &self.data else { return };
+        if data.folded.changes.is_empty() {
+            return;
+        }
+        self.folded_large = true;
+        let keys: Vec<_> = change_cards::starts_folded(&self.headers)
+            .map(|run| run_key(run, data))
+            .collect();
+        if !keys.is_empty() {
+            self.collapsed_runs.extend(keys);
+            self.lay_out();
+        }
+    }
+
+    /// The conflict a merge would stop on at the entity of `group`'s own change, by the dry
+    /// run or the merge, in words: one lookup, whatever the number of conflicts.
+    fn conflict_of(&self, data: &ReviewData, group: usize) -> Option<String> {
+        let g = &data.groups.groups[group];
+        let conflict = self.conflicts()?.of(&g.type_name, &g.id)?;
+        let here = g.change.and_then(|own| data.folded.changes[own].net());
+        Some(conflict_wording(conflict.kind, here, &self.target))
+    }
+
+    /// Opens the selected change's node page where the review holds it, read-only: at the
+    /// reviewed head, or at the fork for a node the branch removes ([`Self::selected_node`]).
+    fn open_selected_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(node) = self.selected_node() else {
+            return;
+        };
+        window.dispatch_action(
+            Box::new(OpenNodePage {
+                type_name: node.type_name,
+                id: node.id,
+                at_commit: node.at_commit,
+                preview: false,
+            }),
+            cx,
+        );
+    }
+
+    /// The list of changes, as [`ReviewRows`] draws it.
+    fn render_list(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        list(
+            self.list_state.clone(),
+            cx.processor(|this, row, window, cx| this.render_row(row, window, cx)),
+        )
+        .flex_1()
+        .min_h_0()
+        .py(px(space::MD))
+        .into_any_element()
+    }
+
     /// Offers Refresh when the session saw the branch's head at another commit than the one
     /// fixes and the merge bind to. Studio's own fixes move that head themselves, so a head seen
     /// while a fix or the merge is out is compared once they are back.
@@ -2415,7 +2560,9 @@ impl ReviewView {
                     }
                 }
                 WriteOutcome::Refused(mut error) => match error.body.merge_conflicts.take() {
-                    Some(conflicts) if !conflicts.is_empty() => MergeState::Conflicts(conflicts),
+                    Some(conflicts) if !conflicts.is_empty() => {
+                        MergeState::Conflicts(Conflicts::new(conflicts))
+                    }
                     _ => MergeState::Refused(error.reason().to_owned()),
                 },
                 WriteOutcome::NotSent { reason } => MergeState::NotSent(reason),
@@ -2489,7 +2636,7 @@ impl ReviewView {
         self.show_conflicts = !self.show_conflicts;
         if self.show_conflicts {
             self.conflict_list
-                .reset(self.conflicts().map_or(0, <[_]>::len));
+                .reset(self.conflicts().map_or(0, |conflicts| conflicts.len()));
         }
         cx.notify();
     }
@@ -2576,7 +2723,24 @@ impl ReviewView {
         // The facts under the heading, as the commit view's: what changed, then where the
         // branch forked from its target.
         let mut facts: Vec<AnyElement> = Vec::new();
-        if !sentence.is_empty() {
+        // Once read, what changed is the summary line under the heading (spec 033); the facts
+        // say who made it and where it forked.
+        let summary = self.data.as_ref().filter(|_| ready).and_then(|data| {
+            data.counts
+                .iter()
+                .any(|c| c.added + c.changed + c.removed > 0)
+                .then(|| change_cards::summary_line(&data.counts, cx))
+        });
+        if ready {
+            if summary.is_none() {
+                facts.push(studio_ui::ds::text::meta(sentence).into_any_element());
+            } else if !self.made_by.is_empty() {
+                facts.push(
+                    studio_ui::ds::meta(IconName::GitCommit, self.made_by.clone())
+                        .into_any_element(),
+                );
+            }
+        } else if !sentence.is_empty() {
             facts.push(studio_ui::ds::text::meta(sentence).into_any_element());
         }
         if let Some(data) = self.data.as_ref().filter(|_| ready) {
@@ -2641,7 +2805,8 @@ impl ReviewView {
                     )))
                     .when(!facts.is_empty(), |header| {
                         header.child(studio_ui::ds::meta_row(facts).flex_wrap())
-                    }),
+                    })
+                    .children(summary),
             )
             .children(self.render_ai_summary(cx))
             .children(self.render_notices(cx))
@@ -2771,8 +2936,13 @@ impl ReviewView {
             ),
             Preview::Conflicts(conflicts) => (
                 format!(
-                    "{} stop a merge into {}. Fix each on the branch, then merge.",
+                    "{} {} a merge into {}. Fix each on the branch, then merge.",
                     studio_ui::plural(conflicts.len(), "conflict", "conflicts"),
+                    if conflicts.len() == 1 {
+                        "stops"
+                    } else {
+                        "stop"
+                    },
                     self.target
                 ),
                 Some(mark(IconName::Warning, Color::Warning)),
@@ -3126,7 +3296,7 @@ impl ReviewView {
     }
 
     fn render_conflicts(&self, cx: &mut Context<Self>) -> AnyElement {
-        let count = self.conflicts().map_or(0, <[_]>::len);
+        let count = self.conflicts().map_or(0, |conflicts| conflicts.len());
         // A merge's own conflicts, or a dry run's read again, replace the list shown.
         if self.conflict_list.item_count() != count {
             self.conflict_list.reset(count);
@@ -3233,10 +3403,8 @@ impl ReviewView {
 
     /// The section a run opens, in the view's words, above the run's row.
     fn section_title(&self, run: &GroupRun) -> Option<String> {
-        run.section.map(|section| match section {
-            GroupSection::Existing => format!("Changes to what {} has", self.target),
-            GroupSection::Added => "Added on the branch".to_owned(),
-        })
+        run.section
+            .map(|section| change_cards::section_words(section).to_owned())
     }
 
     /// The feed's row for a run of one type: a status dot, "1 changed in Task", and when; it
@@ -3300,6 +3468,8 @@ impl ReviewView {
         let total = usize::from(g.change.is_some()) + g.relationships.len();
         if let Some(status) = g.change.and_then(|own| fix_status(&self.cards[own].fix)) {
             Some(status)
+        } else if self.conflict_of(data, group).is_some() {
+            Some((format!("Conflicts with {}", self.target), Color::Conflict))
         } else if unreviewed == 0 {
             Some(("Reviewed".to_owned(), Color::Muted))
         } else if unreviewed < total {
@@ -3338,6 +3508,17 @@ impl ReviewView {
         let status = self.group_status(data, group);
         let summary = change_cards::entity_summary(&data.folded, &data.groups.groups[group]);
         let body = open.then(|| self.entity_body(data, group, cx));
+        // A node's page opens where the review holds it; a relationship's ends have theirs.
+        let open_button = (!data.groups.groups[group].is_edge).then(|| {
+            change_cards::open_button(
+                ("open-change", group),
+                &self.focus_handle,
+                cx.listener(move |this, _, window, cx| {
+                    this.select_group(group, cx);
+                    this.open_selected_page(window, cx);
+                }),
+            )
+        });
         change_cards::entity_row(
             change_cards::EntityRow {
                 id: ("change-head", group).into(),
@@ -3351,6 +3532,7 @@ impl ReviewView {
                 open,
                 selected,
                 dimmed: reviewed,
+                open_button,
             },
             body,
             cx.listener(move |this, _, _, cx| this.click_group(group, cx)),
@@ -3421,7 +3603,7 @@ impl ReviewView {
                         row.bg(studio_ui::ds::surface::selected_document(cx))
                     })
                     .when(!selected, |row| row.hover(move |style| style.bg(hover)))
-                    .child(studio_ui::ds::dot(kind.color()))
+                    .child(change_cards::kind_mark(("item-kind", group), kind))
                     .child(
                         div().flex_1().min_w_0().child(
                             studio_ui::ds::text::body(name)
@@ -3435,6 +3617,12 @@ impl ReviewView {
                                 .truncate(),
                         ),
                     )
+                    .when(self.conflict_of(data, group).is_some(), |row| {
+                        row.child(
+                            studio_ui::ds::icon::meta(IconName::GitMergeConflict)
+                                .color(Color::Conflict),
+                        )
+                    })
                     .when(reviewed, |row| {
                         row.child(studio_ui::ds::icon::meta(IconName::Check).color(Color::Created))
                     })
@@ -4712,25 +4900,19 @@ impl Render for ReviewView {
         let body = match (&self.load, &self.data) {
             (LoadState::Ready, Some(_)) if self.show_conflicts => self.render_conflicts(cx),
             (LoadState::Ready, Some(data)) if data.folded.changes.is_empty() => {
-                studio_ui::ds::empty_state(IconName::Check, "Nothing to review")
-                    .child(studio_ui::ds::state_detail(if data.commits.is_empty() {
-                        format!("{} has no commits of its own.", self.branch)
-                    } else {
-                        format!(
-                            "Its commits change nothing against {} in the end.",
-                            self.target
-                        )
-                    }))
-                    .into_any_element()
+                change_cards::no_changes_state(if data.commits.is_empty() {
+                    format!("{} has no commits of its own.", self.branch)
+                } else {
+                    format!(
+                        "Its commits change nothing against {} in the end.",
+                        self.target
+                    )
+                })
+                .into_any_element()
             }
             (LoadState::Ready, Some(_)) => {
-                let rows = list(
-                    self.list_state.clone(),
-                    cx.processor(|this, row, window, cx| this.render_row(row, window, cx)),
-                )
-                .flex_1()
-                .min_h_0()
-                .py(px(space::MD));
+                let rows = AnyView::from(self.list_view.clone())
+                    .cached(StyleRefinement::default().size_full());
                 match self.layout {
                     ReviewLayout::Feed => rows.into_any_element(),
                     ReviewLayout::Split => h_flex()
@@ -4764,11 +4946,12 @@ impl Render for ReviewView {
                     )
                     .into_any_element()
             }
-            _ if self.reading_slowly => {
-                studio_ui::ds::loading_state("The server is still working out the changes…")
-                    .into_any_element()
-            }
-            _ => studio_ui::ds::loading_state("Reading changes…").into_any_element(),
+            _ if self.reading_slowly => change_cards::reading_state(Some(
+                "The server is still working out the changes. On a large graph this can take a \
+                 few minutes.",
+            ))
+            .into_any_element(),
+            _ => change_cards::reading_state(None).into_any_element(),
         };
         // Typing in the search box must not move between cards.
         let context =
@@ -4800,6 +4983,18 @@ impl Render for ReviewView {
             // the credential may merge, as their buttons and row clicks do.
             .on_action(cx.listener(|this, _: &Summarize, _, cx| this.summarize(cx)))
             .on_action(cx.listener(|this, _: &ToggleChange, _, cx| this.toggle_selected(cx)))
+            // The shared name a commit's tab answers to works here too, so one binding of it
+            // unfolds a change in both (spec 033).
+            .on_action(
+                cx.listener(|this, _: &studio_actions::changes::ToggleChange, _, cx| {
+                    this.toggle_selected(cx)
+                }),
+            )
+            .when(self.selected_node().is_some(), |view| {
+                view.on_action(cx.listener(|this, _: &OpenChanged, window, cx| {
+                    this.open_selected_page(window, cx)
+                }))
+            })
             // ⌘R reads the review again, as its Refresh buttons do, and goes on to the
             // workspace, which reads the graph's schema, branches and counts again.
             .on_action(cx.listener(|this, _: &Refresh, _, cx| {
@@ -4819,6 +5014,44 @@ impl Render for ReviewView {
 
 /// The split's list of changes, beside its record.
 const SPLIT_LIST_WIDTH: f32 = 300.;
+
+/// A review's list of changes as a view of its own, drawn cached and again when the review
+/// notifies (it observes it), as History's rows are (`docs/drawing.md`): a key typed in the
+/// review's search draws the review around the field and leaves the list as it was.
+pub(crate) struct ReviewRows {
+    review: WeakEntity<ReviewView>,
+    _changed: Subscription,
+    /// How often the list was drawn, for the test that typing leaves it.
+    #[cfg(test)]
+    pub(crate) renders: usize,
+}
+
+impl ReviewRows {
+    /// Made with the review, not on its first draw.
+    fn new(cx: &mut Context<ReviewView>) -> Entity<Self> {
+        let review = cx.entity();
+        cx.new(|cx| ReviewRows {
+            review: review.downgrade(),
+            _changed: cx.observe(&review, |_, _, cx| cx.notify()),
+            #[cfg(test)]
+            renders: 0,
+        })
+    }
+}
+
+impl Render for ReviewRows {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        {
+            self.renders += 1;
+        }
+        let list = self
+            .review
+            .update(cx, |review, cx| review.render_list(cx))
+            .unwrap_or_else(|_| gpui::Empty.into_any_element());
+        v_flex().size_full().child(list)
+    }
+}
 
 /// A Refresh button's tooltip, which shows the key that does the same in the review.
 fn refresh_tooltip(
@@ -5105,6 +5338,91 @@ pub(crate) mod tests {
         });
         cx.run_until_parked();
         shown.read_with(cx, |view, _| assert!(matches!(view.load, LoadState::Ready)));
+    }
+
+    /// Typing in the review's search draws the review around the field and leaves its list of
+    /// changes as it was until the search lands, which draws it once (`docs/drawing.md`,
+    /// spec 033): the list is a cached view of its own.
+    #[gpui::test]
+    async fn typing_in_the_search_leaves_the_changes_as_they_were(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+            // Nothing turns while draws are counted: a spinner (this server answers no dry run)
+            // draws the review a few times a second.
+            cx.set_reduce_motion(true);
+        });
+        let (session, _asked) = reviewed_server_writing(false, cx);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            ReviewView::new(session, "feature".into(), "main".into(), window, cx)
+        });
+        cx.run_until_parked();
+        let renders = |cx: &mut gpui::VisualTestContext| {
+            view.read_with(cx, |view, cx| view.list_view.read(cx).renders)
+        };
+        assert!(renders(cx) > 0, "the list is drawn");
+        // The list follows the review.
+        let before = renders(cx);
+        view.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert_eq!(renders(cx), before + 1);
+        // The first key also switches GPUI to keyboard input, which draws the whole window
+        // once; the keys after it are the ones counted.
+        view.update_in(cx, |view, window, cx| {
+            window.focus(&view.search.focus_handle(cx), cx)
+        });
+        cx.simulate_input("p");
+        cx.run_until_parked();
+        let before = renders(cx);
+        cx.simulate_input("er");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| assert_eq!(view.search_text(cx), "per"));
+        assert_eq!(renders(cx), before, "the search field drew the list");
+        // The search lands once typing pauses, and draws the list once.
+        cx.executor().advance_clock(SEARCH_DELAY * 2);
+        cx.run_until_parked();
+        assert_eq!(renders(cx), before + 1);
+    }
+
+    /// A card a merge would stop on says so, found in one lookup of the conflicts; conflicts
+    /// that replaced them with none at that card mark nothing (spec 033).
+    #[gpui::test]
+    async fn a_card_a_merge_would_stop_on_says_so(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, _asked) = reviewed_server_writing(false, cx);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            ReviewView::new(session, "feature".into(), "main".into(), window, cx)
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, _| {
+            let data = view.data.as_ref().expect("read");
+            let (type_name, id) = {
+                let g = &data.groups.groups[0];
+                (g.type_name.clone(), g.id.clone())
+            };
+            let conflict = |id: &str| MergeConflictOutput {
+                entity_kind: graph_client::api::EntityKind::Node,
+                type_name: type_name.clone(),
+                kind: graph_client::api::MergeConflictKind::DivergentUpdate,
+                message: "changed on both".into(),
+                entity_id: Some(id.to_owned()),
+            };
+            view._preview_task = None;
+            view.preview = Preview::Conflicts(Conflicts::new(vec![
+                conflict("someone-else"),
+                conflict(&id),
+            ]));
+            let data = view.data.as_ref().expect("read");
+            let status = view.group_status(data, 0).map(|(text, _)| text);
+            assert_eq!(status.as_deref(), Some("Conflicts with main"));
+            // Conflicts that replaced those, which hold no conflict at it.
+            view.preview = Preview::Conflicts(Conflicts::new(vec![conflict("someone-else")]));
+            let data = view.data.as_ref().expect("read");
+            assert!(view.conflict_of(data, 0).is_none());
+        });
     }
 
     /// Fixes asked for one after the other go one at a time, each bound to the commit the one
