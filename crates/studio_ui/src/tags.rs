@@ -313,10 +313,16 @@ fn hug_width(width: Pixels, scale: f32) -> f32 {
     (f32::from(width) * scale).ceil() / scale
 }
 
-/// A length written in code as GPUI lays it out at `scale`: on the nearest whole device pixel, a
-/// half toward zero, before layout (`AbsoluteLength::to_taffy` in `gpui::taffy`).
+/// GPUI's rounding of a length in device pixels to a whole one: to the nearest, a half toward
+/// zero (`round_half_toward_zero` in `gpui/src/util.rs`). The one copy of the rule here.
+fn round_half_toward_zero(device: f32) -> f32 {
+    (device.abs() - 0.5).ceil().copysign(device)
+}
+
+/// A length written in code as GPUI lays it out at `scale`: on a whole device pixel before
+/// layout (`AbsoluteLength::to_taffy` in `gpui::taffy`).
 fn device_length(length: f32, scale: f32) -> f32 {
-    ((length * scale).abs() - 0.5).ceil().copysign(length) / scale
+    round_half_toward_zero(length * scale) / scale
 }
 
 /// The lengths a [`crate::ds::tag`] and its row are written with, as GPUI lays them out at one
@@ -355,7 +361,7 @@ impl Rect {
     /// divided by the scale (`gpui::taffy::TaffyLayoutEngine::layout_bounds`). Divided edge by
     /// edge instead, a tag 27 device pixels high at 1.5x would be 17.999996 px, not 18.
     fn snapped(self, origin: Point<f32>, scale: f32) -> Bounds<Pixels> {
-        let edge = |at: f32| ((at * scale).abs() - 0.5).ceil().copysign(at * scale);
+        let edge = |at: f32| round_half_toward_zero(at * scale);
         let (left, top) = (edge(origin.x + self.x), edge(origin.y + self.y));
         let (right, bottom) = (
             edge(origin.x + self.x + self.w),
