@@ -558,6 +558,9 @@ pub mod graph {
         /// The saved view (spec 024) of one of the file's queries to show and run, by its id.
         #[serde(default)]
         pub view: Option<String>,
+        /// Open as the pane's preview tab, which the next preview replaces.
+        #[serde(default)]
+        pub preview: bool,
     }
 
     /// Open a query editor that reads one commit, read-only.
@@ -1131,6 +1134,9 @@ pub mod agent {
     #[action(namespace = studio_agent)]
     pub struct OpenConversation {
         pub session: String,
+        /// Open as the pane's preview tab, which the next preview replaces.
+        #[serde(default)]
+        pub preview: bool,
     }
 }
 

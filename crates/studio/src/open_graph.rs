@@ -181,6 +181,24 @@ impl OpenGraphModal {
         this
     }
 
+    /// A managed link with no graph opens the picker on its authenticated connection alone.
+    pub(crate) fn for_connection(
+        workspace: WeakEntity<Workspace>,
+        connection: Entity<Connection>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let platform = ConnectionRegistry::global(cx).read(cx).platform();
+        Self::build(
+            workspace,
+            vec![connection],
+            Vec::new(),
+            platform,
+            window,
+            cx,
+        )
+    }
+
     /// The dialog over `connections`, kept in line with the registry by `subscriptions`, on
     /// `platform`.
     fn build(
@@ -236,7 +254,7 @@ impl OpenGraphModal {
         let selected = first_choice(&connections, cx);
         // A server the dialog shows first is connected, as one chosen in it is.
         if let Some(connection) = &selected {
-            connection.update(cx, |c, cx| c.connect_if_idle(cx));
+            crate::probe_listed(connection, cx);
         }
         // With no server listed the dialog starts on its choices, the first under the keyboard.
         let start = connections.is_empty().then_some(Start::Choices);
@@ -373,7 +391,7 @@ impl OpenGraphModal {
         {
             self.choose(first_choice(&connections, cx), window, cx);
             if let Some(connection) = &self.selected {
-                connection.update(cx, |c, cx| c.connect_if_idle(cx));
+                crate::probe_listed(connection, cx);
             }
             if matches!(self.cursor, Some(Place::Server(_))) {
                 self.cursor = self.selected.as_ref().map(|c| Place::Server(c.entity_id()));
@@ -932,7 +950,10 @@ impl OpenGraphModal {
         let found = self
             .connections
             .iter()
-            .find(|connection| connection.read(cx).server.name == name)
+            .find(|connection| {
+                let server = &connection.read(cx).server;
+                server.source == graph_store::ServerSource::Cli && server.name == name
+            })
             .cloned();
         match found {
             Some(connection) => {
@@ -1032,16 +1053,20 @@ impl OpenGraphModal {
         if let Some(workspace) = self.workspace.upgrade() {
             // A graph the window has open is shown as it is, on its own branch.
             let url = &connection.read(cx).server.url;
-            let open = workspace
-                .read(cx)
-                .open_session_for(url, &graph_id, cx)
-                .map(|session| session.entity_id());
-            // One another window has open is shown there: a graph is open in one window at a
-            // time, since its tabs and drafts are saved by graph.
+            let open = workspace.read(cx).open_session_for(url, &graph_id, cx);
             let elsewhere = open
                 .is_none()
                 .then(|| crate::window_holding(&connection, &graph_id, cx))
                 .flatten();
+            if let Some(session) = open
+                .as_ref()
+                .or_else(|| elsewhere.as_ref().map(|(_, session)| session))
+                && let Err(message) = crate::check_graph_connection(&connection, session, cx)
+            {
+                self.say(Said::GraphId, message);
+                cx.notify();
+                return;
+            }
             match (open, elsewhere) {
                 (None, Some((handle, session))) => cx.defer(move |cx| {
                     handle
@@ -3394,11 +3419,30 @@ mod tests {
     /// graphs again.
     #[gpui::test]
     fn a_cluster_a_target_names_chooses_its_server(cx: &mut TestAppContext) {
-        let alpha = server(&["one"], cx);
-        let beta = server(&["two"], cx);
-        // The test servers share a name: the second is the target's.
-        beta.update(cx, |c, _| c.server.name = "prod".into());
-        let (modal, cx) = dialog(vec![alpha.clone(), beta.clone()], cx);
+        let from_plane = server(&["one"], cx);
+        let environment = server(&["local"], cx);
+        let cli_target = server(&["two"], cx);
+        // A plane-owned connection may have the same display name and endpoint as the CLI target.
+        from_plane.update(cx, |c, _| {
+            c.server.name = "prod".into();
+            c.server.source = graph_store::ServerSource::ControlPlane;
+        });
+        cli_target.update(cx, |c, _| {
+            c.server.name = "prod".into();
+            c.server.source = graph_store::ServerSource::Cli;
+        });
+        let (modal, cx) = dialog(
+            vec![from_plane, environment.clone(), cli_target.clone()],
+            cx,
+        );
+        // Environment servers are still opened through their own row.
+        modal.update_in(cx, |modal, window, cx| {
+            modal.move_to(Place::Server(environment.entity_id()), window, cx);
+        });
+        assert_eq!(
+            modal.read_with(cx, |modal, _| modal.selected.clone()),
+            Some(environment)
+        );
         let target = "prod".to_owned();
         let plane = signed_in_plane(cx);
         modal.update(cx, |modal, cx| {
@@ -3418,7 +3462,10 @@ mod tests {
         let (selected, shown) = modal.read_with(cx, |modal, _| {
             (modal.selected.clone(), modal.plane_shown.clone())
         });
-        assert_eq!(selected.map(|c| c.entity_id()), Some(beta.entity_id()));
+        assert_eq!(
+            selected.map(|c| c.entity_id()),
+            Some(cli_target.entity_id())
+        );
         assert_eq!(shown, None);
         assert!(cx.debug_bounds("open-graph").is_some());
     }

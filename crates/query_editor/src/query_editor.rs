@@ -43,11 +43,13 @@ pub(crate) fn saved_queries_changed(cx: &mut App) {
 /// at once, in its place among the others, and reads the file off the main thread, saying it
 /// is reading until the text is in. `draft` is a remembered tab's text and what it was typed
 /// over (`QueryEditor::file_read` decides between it and the file); with nothing remembered, a
-/// file that cannot be read closes the tab and says so.
+/// file that cannot be read closes the tab and says so. With `preview` it is the pane's
+/// preview tab, which typing in it keeps.
 fn open_file(
     workspace: &mut Workspace,
     path: PathBuf,
     draft: Option<view::Draft>,
+    preview: bool,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Option<Entity<QueryEditor>> {
@@ -56,7 +58,7 @@ fn open_file(
     let key = view::file_key(&path);
     let mut opened = false;
     let tab_path = path.clone();
-    let editor = workspace.open_item(key, window, cx, |window, cx| {
+    let editor = workspace.open_item_with(key, preview, window, cx, |window, cx| {
         opened = true;
         QueryEditor::reading(number, session, tab_path, draft, window, cx)
     })?;
@@ -231,7 +233,9 @@ pub fn init(cx: &mut App) {
                     .view(&graph, id)?;
                 Some((id.to_owned(), view.query.clone()?))
             });
-            if let Some(editor) = open_file(workspace, PathBuf::from(path), draft, window, cx) {
+            if let Some(editor) =
+                open_file(workspace, PathBuf::from(path), draft, false, window, cx)
+            {
                 editor.update(cx, |editor, cx| {
                     editor.set_column_widths(widths);
                     if let Some(commit) = at_commit {
@@ -309,7 +313,14 @@ pub fn init(cx: &mut App) {
         workspace.register_action(|workspace, action: &OpenQueryFile, window, cx| {
             match &action.path {
                 Some(path) => {
-                    let editor = open_file(workspace, PathBuf::from(path), None, window, cx);
+                    let editor = open_file(
+                        workspace,
+                        PathBuf::from(path),
+                        None,
+                        action.preview,
+                        window,
+                        cx,
+                    );
                     // A view of one of its queries (spec 024): shown and run with its values.
                     if let (Some(editor), Some(id)) = (editor, &action.view) {
                         let view = workspace.session().and_then(|session| {
@@ -348,7 +359,7 @@ pub fn init(cx: &mut App) {
                         };
                         workspace
                             .update_in(cx, |workspace, window, cx| {
-                                open_file(workspace, path, None, window, cx)
+                                open_file(workspace, path, None, false, window, cx)
                             })
                             .ok();
                     })

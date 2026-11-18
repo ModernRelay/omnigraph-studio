@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use gpui::{App, AppContext as _, Context, Entity, Global, Task};
 use graph_store::sign_in::{Keychain, PlatformKeychain};
+use model::Reasoning;
 use serde::de::DeserializeOwned;
 use studio_settings::StudioSettings;
 
@@ -17,6 +18,18 @@ pub use model::{Answer, Error, Limits, ModelChoice, Request, Task as ModelTask, 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct Probe {
     pub ok: bool,
+}
+
+/// What a sentence field shows, empty, while no key is stored: it cannot work, and says so
+/// before a sentence is typed (constitution VI). What is needed comes first, since a table's
+/// field is cut short in a narrow tab: it shows about 37 characters in a window of the default
+/// size and about 16 at its narrowest.
+pub const WORDS_NEED_KEY: &str = "OpenRouter key needed · Filter in words";
+
+/// What a control that asks a model says in its tooltip while no key is stored, in place of
+/// what its task sends: `what` names the control, as "Filter in words".
+pub fn needs_key_tip(what: &str) -> String {
+    format!("{what} needs an OpenRouter key. Add one in Settings, under Models.")
 }
 
 /// The keychain item the key is kept under (spec 016's mechanism).
@@ -54,9 +67,18 @@ pub struct Models {
 /// The cached model list: when it was read, and what.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CachedList {
+    /// What a list of this build holds about each model ([`LIST_VERSION`]); 0 in a file from
+    /// before the field.
+    #[serde(default)]
+    version: u32,
     read_at: u64,
     models: Vec<ModelChoice>,
 }
+
+/// 2: each model says how little it can reason. A list kept by an earlier build says nothing
+/// of it, which would read as "can be turned off" for every model, so it is not used and the
+/// list is read again.
+const LIST_VERSION: u32 = 2;
 
 impl Models {
     pub fn global(cx: &App) -> Entity<Self> {
@@ -69,8 +91,9 @@ impl Models {
             .map(|global| global.0.clone())
     }
 
-    /// Sets up the client over Studio's HTTP client, reads the key from the keychain, and
-    /// reads the model list when the cached one is a day old.
+    /// Sets up the client over Studio's HTTP client and reads the key from the keychain. The
+    /// model list is read once a key is held, when the one kept is a day old: without a key
+    /// nothing goes to OpenRouter (spec 019).
     pub fn init(cx: &mut App) {
         let http = cx.http_client();
         let keychain = PlatformKeychain::start(cx);
@@ -104,6 +127,20 @@ impl Models {
     }
 
     fn new(client: model::Client, keychain: Arc<dyn Keychain>, cx: &mut Context<Self>) -> Self {
+        let (read_at, choices) = read_cached_list()
+            .map(|list| (list.read_at, list.models))
+            .unwrap_or_default();
+        Self::with_list(client, keychain, read_at, choices, cx)
+    }
+
+    /// [`Self::new`], with the model list as it was last kept: `choices`, read at `read_at`.
+    fn with_list(
+        client: model::Client,
+        keychain: Arc<dyn Keychain>,
+        read_at: u64,
+        choices: Vec<ModelChoice>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let read = keychain.read(KEYCHAIN_KEY.to_owned());
         cx.spawn(async move |this, cx| {
             let key = match read.await {
@@ -122,15 +159,15 @@ impl Models {
                 };
                 this.key = key;
                 this.sync_key_stored(cx);
+                // Only now, and only with a key: the list is not read for a person who
+                // stored none.
+                this.refresh_list_if_stale(cx);
                 cx.notify();
             })
             .ok();
         })
         .detach();
-        let (read_at, choices) = read_cached_list()
-            .map(|list| (list.read_at, list.models))
-            .unwrap_or_default();
-        let mut this = Self {
+        Self {
             client,
             keychain,
             key: None,
@@ -138,13 +175,18 @@ impl Models {
             choices,
             read_at,
             _refreshing: None,
-        };
-        this.refresh_list_if_stale(cx);
-        this
+        }
     }
 
     pub fn key_state(&self) -> KeyState {
         self.key_state.clone()
+    }
+
+    /// Whether a model call would be refused for want of a key: none is stored, or the models
+    /// were never set up (a view's test). False while the keychain is still being read, so a
+    /// control does not say it needs a key in the first frames of a run that holds one.
+    pub fn needs_key(cx: &App) -> bool {
+        Self::try_global(cx).is_none_or(|models| models.read(cx).key_state == KeyState::None)
     }
 
     /// The settings mirror whether a key is held, so the row shows it; the key itself never
@@ -224,6 +266,7 @@ impl Models {
             .try_global::<StudioSettings>()
             .map(|settings| match tier {
                 Tier::Fast => settings.models.fast.clone(),
+                Tier::Filter => settings.models.filter.clone(),
                 Tier::Careful => settings.models.careful.clone(),
             })
             .filter(|named| !named.trim().is_empty());
@@ -241,27 +284,49 @@ impl Models {
             return Task::ready(Err(Error::NoKey));
         };
         let model = Self::model_for(request.task.tier, cx);
+        let reasoning = self.reasoning_of(&model);
         let client = self.client.clone();
-        cx.background_spawn(async move { client.call(&model, &key, request).await })
+        cx.background_spawn(async move { client.call(&model, &reasoning, &key, request).await })
     }
 
-    /// The models the picker offers, by name; the two defaults when none were read.
+    /// How little `model` can be made to reason: what the list says of it, or of a tier's
+    /// default before the list is read. A model the list does not hold is taken to turn it off.
+    fn reasoning_of(&self, model: &str) -> Reasoning {
+        if let Some(listed) = self.choices.iter().find(|choice| choice.id == model) {
+            return listed.reasoning.clone();
+        }
+        Tier::ALL
+            .into_iter()
+            .find(|tier| tier.default_model() == model)
+            .map(Tier::default_reasoning)
+            .unwrap_or_default()
+    }
+
+    /// The models the picker offers, by name; the tiers' defaults when none were read.
     pub fn choices(&self) -> Vec<ModelChoice> {
         if self.choices.is_empty() {
-            return [Tier::Fast, Tier::Careful]
+            return Tier::ALL
                 .into_iter()
                 .map(|tier| ModelChoice {
                     id: tier.default_model().to_owned(),
                     name: tier.default_model().to_owned(),
                     prompt_per_million: 0.0,
                     completion_per_million: 0.0,
+                    reasoning: tier.default_reasoning(),
                 })
                 .collect();
         }
         self.choices.clone()
     }
 
+    /// Reads the model list again when the one held is a day old, for a person who holds a
+    /// key. Without one nothing is sent to OpenRouter, this request included (spec 019): the
+    /// picker then offers the list last read, or the tiers' defaults. The request itself
+    /// carries no key.
     fn refresh_list_if_stale(&mut self, cx: &mut Context<Self>) {
+        if self.key.is_none() {
+            return;
+        }
         let fresh = now_secs().saturating_sub(self.read_at) < LIST_AGE.as_secs();
         if (fresh && !self.choices.is_empty()) || self._refreshing.is_some() {
             return;
@@ -274,6 +339,7 @@ impl Models {
             match models {
                 Ok(models) => {
                     let cached = CachedList {
+                        version: LIST_VERSION,
                         read_at: now_secs(),
                         models: models.clone(),
                     };
@@ -307,7 +373,14 @@ fn list_path() -> std::path::PathBuf {
 
 fn read_cached_list() -> Option<CachedList> {
     let text = std::fs::read(list_path()).ok()?;
-    serde_json::from_slice(&text).ok()
+    kept_list(&text)
+}
+
+/// A kept list, when this build wrote it or one that holds the same about each model.
+fn kept_list(text: &[u8]) -> Option<CachedList> {
+    serde_json::from_slice::<CachedList>(text)
+        .ok()
+        .filter(|list| list.version == LIST_VERSION)
 }
 
 fn now_secs() -> u64 {
@@ -315,4 +388,314 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use futures::AsyncReadExt as _;
+    use gpui::TestAppContext;
+    use graph_store::sign_in::MemoryKeychain;
+    use http_client::{AsyncBody, FakeHttpClient, Response};
+
+    use super::*;
+
+    const LIST: &str = r#"{"data":[
+      {"id":"anthropic/claude-haiku-5.5","name":"Anthropic: Claude Haiku 5.5","pricing":{"prompt":"0.0000001","completion":"0.0000005"},"supported_parameters":["structured_outputs"]}
+    ]}"#;
+
+    /// A model service that lists one model and counts how often its list is asked for. It is
+    /// asked for nothing else here, and never with the key.
+    fn service(reads: Arc<AtomicUsize>) -> model::Client {
+        let http = FakeHttpClient::create(move |request| {
+            let reads = reads.clone();
+            async move {
+                assert_eq!(request.uri().to_string(), model::MODELS_ENDPOINT);
+                assert!(
+                    request.headers().get("Authorization").is_none(),
+                    "the list is read without the key"
+                );
+                reads.fetch_add(1, Ordering::SeqCst);
+                Ok(Response::builder()
+                    .status(200)
+                    .body(AsyncBody::from(LIST.to_owned()))
+                    .unwrap())
+            }
+        });
+        model::Client::new(http)
+    }
+
+    /// The models of a person whose keychain holds `key`, with no list kept from before.
+    fn models(
+        key: Option<&str>,
+        reads: &Arc<AtomicUsize>,
+        cx: &mut TestAppContext,
+    ) -> Entity<Models> {
+        models_over(service(reads.clone()), key, cx)
+    }
+
+    fn models_over(
+        client: model::Client,
+        key: Option<&str>,
+        cx: &mut TestAppContext,
+    ) -> Entity<Models> {
+        let keychain = MemoryKeychain::default();
+        if let Some(key) = key {
+            keychain.items.lock().unwrap().insert(
+                KEYCHAIN_KEY.to_owned(),
+                (KEYCHAIN_USER.to_owned(), key.as_bytes().to_vec()),
+            );
+        }
+        let keychain: Arc<dyn Keychain> = Arc::new(keychain);
+        cx.update(|cx| {
+            studio_settings::init_test(cx);
+            studio_settings::keep_changes_in_memory(cx);
+            cx.new(|cx| Models::with_list(client, keychain, 0, Vec::new(), cx))
+        })
+    }
+
+    /// A service that lists one model that can turn reasoning off and one that cannot, answers
+    /// every call, and keeps each call's body.
+    fn answering(bodies: Arc<Mutex<Vec<serde_json::Value>>>) -> model::Client {
+        const LIST: &str = r#"{"data":[
+          {"id":"anthropic/claude-haiku-5.5","name":"Anthropic: Claude Haiku 5.5","pricing":{},"supported_parameters":["structured_outputs"],"reasoning":{"mandatory":false,"supported_efforts":["high","medium","low","none"]}},
+          {"id":"google/gemini-3.8-flash","name":"Google: Gemini 3.8 Flash","pricing":{},"supported_parameters":["structured_outputs"],"reasoning":{"mandatory":true,"supported_efforts":["high","medium","low"]}}
+        ]}"#;
+        let http = FakeHttpClient::create(move |request| {
+            let bodies = bodies.clone();
+            async move {
+                if *request.uri() == model::MODELS_ENDPOINT {
+                    return Ok(Response::builder()
+                        .status(200)
+                        .body(AsyncBody::from(LIST.to_owned()))
+                        .unwrap());
+                }
+                let mut sent = String::new();
+                request.into_body().read_to_string(&mut sent).await.unwrap();
+                bodies
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_str(&sent).unwrap());
+                Ok(Response::builder()
+                    .status(200)
+                    .body(AsyncBody::from(
+                        r#"{"choices":[{"message":{"content":"{\"ok\":true}"}}]}"#.to_owned(),
+                    ))
+                    .unwrap())
+            }
+        });
+        model::Client::new(http)
+    }
+
+    /// A short call to a model that cannot turn reasoning off asks for the least effort the
+    /// list names for it; one that can is told to. Before, both were told to turn it off, and
+    /// OpenRouter refused the first (spec 019, 2026-11-16).
+    #[gpui::test]
+    async fn a_call_asks_for_the_least_reasoning_its_model_takes(cx: &mut TestAppContext) {
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let models = models_over(answering(bodies.clone()), Some("sk-or-test"), cx);
+        cx.run_until_parked();
+        for (model, reasoning) in [
+            (
+                "google/gemini-3.8-flash",
+                serde_json::json!({"effort": "low"}),
+            ),
+            (
+                "anthropic/claude-haiku-5.5",
+                serde_json::json!({"enabled": false}),
+            ),
+            // One the list does not hold is taken to turn it off, as before.
+            ("some/other", serde_json::json!({"enabled": false})),
+        ] {
+            cx.update(|cx| {
+                studio_settings::update(cx, move |settings| settings.models.fast = model.into())
+            });
+            cx.run_until_parked();
+            let answer = cx
+                .update(|cx| models.read(cx).test_connection(cx))
+                .await
+                .unwrap();
+            assert!(answer.value.ok);
+            let body = bodies.lock().unwrap().pop().unwrap();
+            assert_eq!(body["model"], model);
+            assert_eq!(body["reasoning"], reasoning, "{model}");
+        }
+    }
+
+    /// A sentence filter goes to the filter's own model, Gemini 3.8 Flash unless the settings
+    /// name another, with room for an answer after what the model reasons. Before the list is
+    /// read it is asked as the list said of it: it cannot turn reasoning off.
+    #[gpui::test]
+    async fn a_filter_goes_to_the_filters_model(cx: &mut TestAppContext) {
+        static FILTER: ModelTask = ModelTask {
+            name: "table-filter",
+            sends: "the type's property names and your sentence",
+            tier: Tier::Filter,
+            limits: Tier::Filter.limits(),
+        };
+        let ask = |models: &Entity<Models>, cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                models.read(cx).call::<Probe>(
+                    Request {
+                        task: &FILTER,
+                        instructions: "Answer with the JSON object only.",
+                        input: "founders".into(),
+                        schema: serde_json::json!({"type": "object"}),
+                    },
+                    cx,
+                )
+            })
+        };
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let models = models_over(answering(bodies.clone()), Some("sk-or-test"), cx);
+        // The keychain has answered and the list has not been asked for yet.
+        models.update(cx, |models, _| {
+            models.key = Some("sk-or-test".into());
+            assert!(models.choices.is_empty());
+            assert_eq!(
+                models.reasoning_of("google/gemini-3.8-flash"),
+                Reasoning::AtLeast("low".into())
+            );
+            assert_eq!(
+                models.reasoning_of("anthropic/claude-haiku-5.5"),
+                Reasoning::Optional
+            );
+        });
+        ask(&models, cx).await.unwrap();
+        let body = bodies.lock().unwrap().pop().unwrap();
+        assert_eq!(body["model"], "google/gemini-3.8-flash");
+        assert_eq!(body["reasoning"], serde_json::json!({"effort": "low"}));
+        assert_eq!(body["max_tokens"], 2000);
+
+        // The fast model is another setting: changing it leaves the filter's alone.
+        cx.update(|cx| {
+            studio_settings::update(cx, |settings| settings.models.fast = "some/other".into())
+        });
+        cx.run_until_parked();
+        ask(&models, cx).await.unwrap();
+        assert_eq!(
+            bodies.lock().unwrap().pop().unwrap()["model"],
+            "google/gemini-3.8-flash"
+        );
+        cx.update(|cx| {
+            studio_settings::update(cx, |settings| {
+                settings.models.filter = "anthropic/claude-haiku-5.5".into()
+            })
+        });
+        cx.run_until_parked();
+        ask(&models, cx).await.unwrap();
+        let body = bodies.lock().unwrap().pop().unwrap();
+        assert_eq!(body["model"], "anthropic/claude-haiku-5.5");
+        assert_eq!(body["reasoning"], serde_json::json!({"enabled": false}));
+    }
+
+    /// A list kept by a build that did not read how little each model reasons is not used: it
+    /// would say every model can turn reasoning off.
+    #[test]
+    fn a_list_kept_by_an_earlier_build_is_read_again() {
+        let models = r#""models":[{"id":"google/gemini-3.8-flash","name":"G","prompt_per_million":0.8,"completion_per_million":4.1}]"#;
+        assert!(kept_list(format!(r#"{{"read_at":5,{models}}}"#).as_bytes()).is_none());
+        assert!(kept_list(format!(r#"{{"version":1,"read_at":5,{models}}}"#).as_bytes()).is_none());
+        let kept = kept_list(format!(r#"{{"version":2,"read_at":5,{models}}}"#).as_bytes());
+        assert_eq!(kept.map(|list| list.read_at), Some(5));
+    }
+
+    /// Nothing goes to OpenRouter for a person who stored no key, the model list included.
+    /// Before, Studio asked for the list at every start whose kept copy was a day old, key or
+    /// not, while its settings said "Nothing is sent without a key."
+    #[gpui::test]
+    async fn without_a_key_the_model_list_is_not_read(cx: &mut TestAppContext) {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let models = models(None, &reads, cx);
+        cx.run_until_parked();
+        models.read_with(cx, |models, _| {
+            assert_eq!(models.key_state(), KeyState::None);
+            assert_eq!(
+                models.choices().len(),
+                3,
+                "the picker offers the three tiers' defaults"
+            );
+        });
+        assert_eq!(reads.load(Ordering::SeqCst), 0, "no key, no request");
+    }
+
+    /// A key held at start reads the list once, and a list read today is not read again.
+    #[gpui::test]
+    async fn a_key_held_at_start_reads_the_list_once(cx: &mut TestAppContext) {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let models = models(Some("sk-or-test"), &reads, cx);
+        cx.run_until_parked();
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        models.update(cx, |models, cx| {
+            assert_eq!(models.key_state(), KeyState::Stored);
+            let offered = models.choices();
+            assert_eq!(offered.len(), 1);
+            assert_eq!(offered[0].id, "anthropic/claude-haiku-5.5");
+            models.refresh_list_if_stale(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(reads.load(Ordering::SeqCst), 1, "a list read today is kept");
+    }
+
+    /// A control learns that a key is wanting from one place: none set up, none stored, and
+    /// not while the keychain is still being read.
+    #[gpui::test]
+    async fn a_key_is_wanting_when_none_is_stored(cx: &mut TestAppContext) {
+        assert!(cx.update(|cx| Models::needs_key(cx)), "no models set up");
+        let reads = Arc::new(AtomicUsize::new(0));
+        let models = models(None, &reads, cx);
+        cx.update(|cx| {
+            cx.set_global(GlobalModels(models.clone()));
+            assert!(!Models::needs_key(cx), "the keychain has not answered yet");
+        });
+        cx.run_until_parked();
+        assert!(cx.update(|cx| Models::needs_key(cx)), "it holds no key");
+
+        models
+            .update(cx, |models, cx| models.set_key("sk-or-test".into(), cx))
+            .await
+            .unwrap();
+        assert!(!cx.update(|cx| Models::needs_key(cx)), "a key is stored");
+        assert_eq!(
+            needs_key_tip("Filter in words"),
+            "Filter in words needs an OpenRouter key. Add one in Settings, under Models."
+        );
+    }
+
+    /// Storing a key is what reads the list, and once the key is removed it is not read again,
+    /// however old the one kept grows.
+    #[gpui::test]
+    async fn storing_a_key_reads_the_list_and_removing_it_reads_no_more(cx: &mut TestAppContext) {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let models = models(None, &reads, cx);
+        cx.run_until_parked();
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+
+        models
+            .update(cx, |models, cx| models.set_key("sk-or-test".into(), cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(reads.load(Ordering::SeqCst), 1, "storing the key reads it");
+
+        models
+            .update(cx, |models, cx| models.set_key(String::new(), cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        models.update(cx, |models, cx| {
+            assert_eq!(models.key_state(), KeyState::None);
+            models.read_at = 0;
+            models.refresh_list_if_stale(cx);
+            assert_eq!(
+                models.choices().len(),
+                1,
+                "the list last read is still offered"
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(reads.load(Ordering::SeqCst), 1, "no key, no request");
+    }
 }

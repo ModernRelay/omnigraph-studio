@@ -595,14 +595,21 @@ fn conversation_row(
             .child(archive),
     )
     .tip(ds::tooltip(about))
-    .on_click(move |_, window, cx| {
-        window.dispatch_action(
-            Box::new(OpenConversation {
-                session: id.clone(),
-            }),
-            cx,
-        )
+    // One click opens the conversation as the pane's preview tab, which the next preview
+    // replaces, and a double click keeps it, as in every list (spec 020).
+    .on_click(move |event, window, cx| {
+        window.dispatch_action(Box::new(open_conversation(&id, event.click_count())), cx)
     })
+}
+
+/// What a click on a conversation's row opens: one click the pane's preview tab, which the next
+/// preview replaces, and a double click a tab that stays (spec 020). Before, every click opened
+/// a tab that stayed, so looking through the conversations left a tab for each.
+fn open_conversation(session: &str, clicks: usize) -> OpenConversation {
+    OpenConversation {
+        session: session.to_owned(),
+        preview: clicks < 2,
+    }
 }
 
 /// Whether `a` and `b` name one folder: the same path, or the same once links are resolved.
@@ -1054,6 +1061,23 @@ pub(crate) fn agent_name(command: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One click on a conversation opens it as the pane's preview tab, and a double click
+    /// opens it to stay, as in every list (spec 020).
+    #[test]
+    fn a_click_previews_a_conversation_and_a_double_click_keeps_it() {
+        let open = |preview| OpenConversation {
+            session: "s1".into(),
+            preview,
+        };
+        assert_eq!(open_conversation("s1", 1), open(true));
+        assert_eq!(open_conversation("s1", 2), open(false));
+        assert_eq!(
+            open_conversation("s1", 3),
+            open(false),
+            "more clicks keep it too"
+        );
+    }
 
     /// Import asks the agent for every folder a graph's conversations run in, the graph's own
     /// and each conversation's, as an agent lists its sessions by exact folder. It keeps only

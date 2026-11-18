@@ -77,7 +77,9 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
   file that changed while its tab was open,
   and a tab with nothing unsaved takes the file's text when its editor takes the keyboard
   again. The left dock's Queries panel lists the folder,
-  newest first, when it is drawn (a hidden panel lists nothing), each file's age drawn again
+  newest first, when it is drawn (a hidden panel lists nothing). One click on a row, a saved
+  file's or a stored query's, opens it as the pane's preview tab, and a double click or ↵ opens
+  it to stay (spec 020; since 2026-11-15, before which one click opened a tab that stayed). Each file's age is drawn again
   each minute it is shown; after a switch to another graph, the last graph's files are not
   shown while this one's are listed (since 2026-10-28; before, they stayed, and opened, until
   the listing landed, and an age stood until something else drew the panel). New query, Open a file… and Show the folder are icon buttons in its title

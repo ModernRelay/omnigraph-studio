@@ -27,7 +27,7 @@ pub enum ServerSource {
     /// `OMNIGRAPH_STUDIO_SERVER` in the environment, for development and tests; its token,
     /// `OMNIGRAPH_STUDIO_TOKEN`, lasts the run.
     Environment,
-    /// A managed cluster that no CLI target names, opened from its control plane: from the
+    /// A managed cluster opened with Studio’s control-plane sign-in: from the
     /// plane's list, from a link that names it, or again at a start by the window that had it
     /// open (spec 021); its data token is the control plane's.
     ControlPlane,
@@ -1089,13 +1089,22 @@ impl Connection {
         &self.client
     }
 
+    /// The graph ids the server itself named, in its listing or by discovery; `None` when it
+    /// said nothing of its graphs. It holds no id Studio only remembers, so what is said to be
+    /// on a server is what the server said.
+    pub fn listed_graph_ids(&self) -> Option<Vec<String>> {
+        match &self.graphs {
+            GraphListing::Listed(graphs) => {
+                Some(graphs.iter().map(|g| g.graph_id.clone()).collect())
+            }
+            GraphListing::Discovered(ids) => Some(ids.clone()),
+            GraphListing::Unknown | GraphListing::NotAllowed | GraphListing::Failed(_) => None,
+        }
+    }
+
     /// Graph ids to offer: the listed or discovered graphs, then known ids the listing lacks.
     pub fn graph_ids(&self) -> Vec<String> {
-        let mut ids: Vec<String> = match &self.graphs {
-            GraphListing::Listed(graphs) => graphs.iter().map(|g| g.graph_id.clone()).collect(),
-            GraphListing::Discovered(ids) => ids.clone(),
-            _ => Vec::new(),
-        };
+        let mut ids = self.listed_graph_ids().unwrap_or_default();
         for id in &self.server.known_graphs {
             if !ids.contains(id) {
                 ids.push(id.clone());
@@ -1130,6 +1139,9 @@ impl Connection {
     /// person's Refresh, or a change to the CLI) or a new source. Requests made after this use
     /// it, and a connection in use checks again; one not yet used connects when it is.
     pub fn set_token(&mut self, token: Option<String>, cx: &mut Context<Self>) {
+        if self.server.source == ServerSource::ControlPlane {
+            return;
+        }
         let was_ready = self.token_ready();
         self.token_given = true;
         // Its lease was the token replaced's: no renewal of that one, under way or owed,
@@ -1822,7 +1834,8 @@ impl Connection {
     /// kept before anything else is asked). One sent that never arrived is not asked for: a token
     /// typed would be dropped the same way.
     pub fn asks_token(&self) -> bool {
-        self.state == ConnectionState::Unauthorized
+        self.server.source != ServerSource::ControlPlane
+            && self.state == ConnectionState::Unauthorized
             && !self.token_not_received()
             && self.sign_in == SignIn::NotOffered
             && self.signing_in.is_none()
@@ -1864,6 +1877,15 @@ impl Connection {
         }
         let login = self.standby.take();
         self.take_token_from(login, cx);
+    }
+
+    /// A control-plane connection follows the sign-in at its own plane. Discard the previous
+    /// data token and its outstanding requests before asking under the new identity.
+    pub(crate) fn plane_sign_in_changed(&mut self, cx: &mut Context<Self>) {
+        if self.client.set_token(None) {
+            cx.emit(ConnectionEvent::CredentialChanged);
+        }
+        self.take_token_from(self.token_source.clone(), cx);
     }
 
     /// Whether a sign-in is held, whatever the sign-in state says: one a sign-in as someone else
@@ -2587,6 +2609,36 @@ mod tests {
                 }
             });
         }
+    }
+
+    /// What a server is said to have is what it listed. A graph Studio only remembers, as one
+    /// asked for and not found, is still offered for opening, but is not named as the
+    /// server's. Before, the page for a missing graph listed that graph under "It has:".
+    #[gpui::test]
+    fn a_remembered_graph_is_offered_but_not_listed(cx: &mut TestAppContext) {
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: vec!["knowlege".into()],
+        };
+        let http = FakeHttpClient::with_404_response();
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        connection.update(cx, |connection, _| {
+            assert_eq!(connection.listed_graph_ids(), None, "nothing said yet");
+            assert_eq!(connection.graph_ids(), ["knowlege"]);
+
+            connection.graphs = GraphListing::Discovered(vec!["knowledge".into(), "notes".into()]);
+            assert_eq!(
+                connection.listed_graph_ids(),
+                Some(vec!["knowledge".to_owned(), "notes".to_owned()])
+            );
+            assert_eq!(connection.graph_ids(), ["knowledge", "notes", "knowlege"]);
+
+            connection.graphs = GraphListing::NotAllowed;
+            assert_eq!(connection.listed_graph_ids(), None);
+            assert_eq!(connection.graph_ids(), ["knowlege"]);
+        });
     }
 
     /// The answer of a token source the connection no longer takes its token from is not taken:

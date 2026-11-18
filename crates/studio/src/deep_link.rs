@@ -13,11 +13,11 @@
 //!   -b com.modernrelay.omnigraph-studio` on macOS, the `x-scheme-handler/omnigraph-studio`
 //!   desktop entry's `Exec` on Linux, and the `omnigraph-studio` URL protocol on Windows; on
 //!   Linux and Windows the link reaches Studio as its argument ([`links_in_args`]).
-//! - `omnigraph-studio://open?api=<control plane>&organization=<org>&cluster=<id>&incarnation=<id>[&graph=<id>]`
+//! - `omnigraph-studio://open-cluster?api=<control plane>&organization=<org>&cluster=<id>&incarnation=<id>[&graph=<id>]`
 //!   opens a managed cluster as its control plane names it, with no target name, so no CLI
 //!   target need name the cluster here (spec 021, Reopening a cluster). The control plane must
-//!   be one Studio holds and is signed in to. The 0.15 CLI's `omnigraph studio` refuses managed
-//!   targets (`target_kind_unsupported`), so it sends none of these yet.
+//!   be one Studio holds and is signed in to. Earlier Studio releases refuse this route.
+//!   The earlier managed `open?api=…&cluster=…` form uses the same receiver in this release.
 //! - `omnigraph-studio://connect?code=<code>` was reserved for that launcher before it existed,
 //!   and is still refused with a note.
 
@@ -181,7 +181,12 @@ pub fn parse(link: &str) -> Result<DeepLink, String> {
     if route == "connect" {
         return Ok(DeepLink::Connect);
     }
-    if route == "open" && get("target").is_none() && get("cluster").is_some() {
+    if route == "open-cluster" && get("target").is_some() {
+        return Err("A managed cluster link cannot name a CLI target.".into());
+    }
+    if route == "open-cluster"
+        || (route == "open" && get("target").is_none() && get("cluster").is_some())
+    {
         // An id goes into a request's path or a header: letters, digits, `_` and `-` only.
         let id = |key: &str| -> Result<String, String> {
             let value = need(key)?;
@@ -400,7 +405,7 @@ mod tests {
     /// the reason. A link that names a target is the CLI target's, whatever else it names.
     #[test]
     fn an_open_link_names_a_managed_cluster() {
-        let link = "omnigraph-studio://open?api=https://platform.omnigraph.dev\
+        let link = "omnigraph-studio://open-cluster?api=https://platform.omnigraph.dev\
                     &organization=org_01M1&cluster=01M5C&incarnation=01M5I";
         let cluster = graph_store::ClusterIdentity {
             route: "https://platform.omnigraph.dev".into(),
@@ -425,7 +430,7 @@ mod tests {
         // As the CLI writes it, the address percent-encoded, with the control plane's path.
         assert_eq!(
             parse(
-                "omnigraph-studio://open?api=https:%2F%2Fcontrol.example.com%2Fprefix\
+                "omnigraph-studio://open-cluster?api=https:%2F%2Fcontrol.example.com%2Fprefix\
                  &organization=org_work&cluster=01CLUSTER&incarnation=01INCARNATION&graph=knowledge"
             ),
             Ok(DeepLink::OpenCluster(ClusterLink {
@@ -439,17 +444,19 @@ mod tests {
             }))
         );
         assert_eq!(
-            parse("omnigraph-studio://open?api=https://c.test&organization=org_1&cluster=01C"),
+            parse(
+                "omnigraph-studio://open-cluster?api=https://c.test&organization=org_1&cluster=01C"
+            ),
             Err("The link has no incarnation.".into())
         );
         assert_eq!(
-            parse("omnigraph-studio://open?organization=org_1&cluster=01C&incarnation=01I"),
+            parse("omnigraph-studio://open-cluster?organization=org_1&cluster=01C&incarnation=01I"),
             Err("The link has no api.".into())
         );
         // An id that could add to a path or a header is no id.
         for (organization, cluster) in [("org_1%0D%0Ax:1", "01C"), ("org_1", "01C%2F..%2Fx")] {
             let refused = parse(&format!(
-                "omnigraph-studio://open?api=https://c.test&organization={organization}\
+                "omnigraph-studio://open-cluster?api=https://c.test&organization={organization}\
                  &cluster={cluster}&incarnation=01I"
             ))
             .unwrap_err();
@@ -463,15 +470,30 @@ mod tests {
         ] {
             assert_eq!(
                 parse(&format!(
-                    "omnigraph-studio://open?api={api}&organization=org_1&cluster=01C&incarnation=01I"
+                    "omnigraph-studio://open-cluster?api={api}&organization=org_1&cluster=01C&incarnation=01I"
                 )),
                 Err("The link's api is not a control plane's address.".into()),
                 "{api}"
             );
         }
-        // With a target it is a CLI target's link, and needs that link's digests.
+        // A managed route always requires its full identity and cannot dispatch to a CLI target.
+        assert_eq!(
+            parse(
+                "omnigraph-studio://open-cluster?api=https://c.test&organization=org_1&incarnation=01I"
+            ),
+            Err("The link has no cluster.".into())
+        );
         assert_eq!(
             parse(&format!("{link}&target=law")),
+            Err("A managed cluster link cannot name a CLI target.".into())
+        );
+
+        // Saved links in the earlier form dispatch to the same corrected receiver.
+        let legacy = link.replace("://open-cluster?", "://open?");
+        assert_eq!(parse(&legacy), parse(link));
+        // The original server route still validates the named target's digests.
+        assert_eq!(
+            parse(&format!("{legacy}&target=law")),
             Err("The link has no binding.".into())
         );
     }

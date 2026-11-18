@@ -481,7 +481,7 @@ fn planes_reading(
             let server = &connection.read(cx).server;
             server.name == graph.target && server.url == graph.url
         });
-        if named {
+        if named && !graph.plane_owned {
             continue;
         }
         if let Some(plane) = registry.plane_at(&cluster.route, cx)
@@ -511,7 +511,13 @@ fn fill_reopened(opened: Vec<(WindowHandle<Workspace>, SavedWindow)>, cx: &mut A
     for (handle, saved) in opened {
         let server_of = |graph: &SavedGraph| {
             let connection = registry.update(cx, |registry, cx| {
-                registry.connection_for_saved(&graph.target, &graph.url, graph.cluster.as_ref(), cx)
+                registry.connection_for_saved(
+                    &graph.target,
+                    &graph.url,
+                    graph.cluster.as_ref(),
+                    graph.plane_owned,
+                    cx,
+                )
             })?;
             let address = connection.read(cx).server.url.clone();
             Some((address, connection))
@@ -577,7 +583,10 @@ fn reopenable<S>(
         let Some((address, server)) = server_of(graph) else {
             return false;
         };
-        if !taken.insert((address, graph.graph.clone())) {
+        if !taken.insert((
+            address.trim_end_matches('/').to_owned(),
+            graph.graph.clone(),
+        )) {
             return false;
         }
         servers.push(server);
@@ -706,13 +715,12 @@ fn link_opened(cx: &mut App) {
     }
 }
 
-/// Connects every server the CLI lists and shows "Open a graph" over them: only when the dialog
-/// lists them, so a start that a link or a reopened window opens a graph for connects only the
-/// servers it shows.
+/// Opens the general picker and probes its listed servers. Managed CLI targets connect when
+/// the person selects one. A link or a reopened window can open its own graph without the picker.
 fn show_open_dialog(workspace: &Entity<Workspace>, window: &mut Window, cx: &mut App) {
     let registry = ConnectionRegistry::global(cx);
     for connection in registry.read(cx).connections.clone() {
-        connection.update(cx, |connection, cx| connection.connect_if_idle(cx));
+        probe_listed(&connection, cx);
     }
     let handle = workspace.downgrade();
     workspace.update(cx, |workspace, cx| {
@@ -720,6 +728,24 @@ fn show_open_dialog(workspace: &Entity<Workspace>, window: &mut Window, cx: &mut
             OpenGraphModal::new(handle, window, cx)
         });
     });
+}
+
+/// Listing a managed CLI target does not select its credential. A click, a keyboard selection,
+/// or reopening a graph the person selected connects it through the normal connection path.
+fn probe_listed(connection: &Entity<graph_store::Connection>, cx: &mut App) {
+    let server = &connection.read(cx).server;
+    if server.source == ServerSource::Cli
+        && ConnectionRegistry::try_global(cx).is_some_and(|registry| {
+            registry
+                .read(cx)
+                .managed_targets
+                .iter()
+                .any(|target| target.name == server.name)
+        })
+    {
+        return;
+    }
+    connection.update(cx, |connection, cx| connection.connect_if_idle(cx));
 }
 
 /// Opens `OMNIGRAPH_STUDIO_GRAPH` on the environment server when both are set, else the first
@@ -795,7 +821,7 @@ fn open_cli_link(open: CliLink, cx: &mut App) {
         let digests = digests.await;
         cx.update(|cx| {
             match digests.and_then(|digests| link_target(&open, digests, cx)) {
-                Ok(target) => open_parsed(DeepLink::Graph(target), cx),
+                Ok((connection, graph)) => open_link_graph(connection, graph, None, None, cx),
                 Err(message) => tell(cx, ToastKind::Error, message),
             }
             link_opened(cx);
@@ -805,16 +831,13 @@ fn open_cli_link(open: CliLink, cx: &mut App) {
 }
 
 /// Opens a link from `omnigraph studio` for a managed target, which names a cluster as its
-/// control plane does and no target (spec 021, Reopening a cluster): on the server that reaches
-/// the cluster already, else on the cluster as its control plane answers for it now. That
+/// control plane does and no target (spec 021, Reopening a cluster). Each link opens the
+/// cluster as its control plane answers for it under Studio's current sign-in. That
 /// control plane must be one Studio holds, with a sign-in held: a link adds no control plane and
 /// signs in to none. The incarnation must be the link's, so a link made before the cluster was
 /// deleted and made again opens nothing. A start's window waits for it as for any link.
 fn open_cluster_link(open: ClusterLink, cx: &mut App) {
     let registry = ConnectionRegistry::global(cx);
-    if let Some(connection) = registry.read(cx).connection_of_cluster(&open.cluster, cx) {
-        return open_cluster_graph(connection, open.graph, cx);
-    }
     let Some(plane) = registry.read(cx).plane_at(&open.cluster.route, cx) else {
         return tell(
             cx,
@@ -841,6 +864,7 @@ fn open_cluster_link(open: ClusterLink, cx: &mut App) {
             None => None,
         };
         cx.update(|cx| {
+            let answer = answer.and_then(|read| read.into_current(plane.read(cx)));
             match link_cluster(&open, &plane, answer, cx) {
                 Ok(connection) => open_cluster_graph(connection, open.graph.clone(), cx),
                 Err(message) => tell(cx, ToastKind::Error, message),
@@ -879,6 +903,11 @@ fn link_cluster(
         }
         Some(Ok(answer)) => answer.data.cluster,
     };
+    if cluster.cluster_id != open.cluster.cluster_id {
+        return Err(format!(
+            "{name} answered for a different cluster. Open the link again."
+        ));
+    }
     if cluster.incarnation != open.cluster.incarnation {
         return Err(format!(
             "{} was deleted and made again since the link was made. Make the link again with \
@@ -906,19 +935,9 @@ fn open_cluster_graph(
     graph: Option<String>,
     cx: &mut App,
 ) {
-    let (url, known) = {
-        let server = &connection.read(cx).server;
-        (server.url.clone(), server.known_graphs.first().cloned())
-    };
+    let known = connection.read(cx).server.known_graphs.first().cloned();
     if let Some(graph) = graph.or(known) {
-        return open_parsed(
-            DeepLink::Graph(deep_link::Target {
-                server: url,
-                graph,
-                branch: None,
-            }),
-            cx,
-        );
+        return open_link_graph(connection, graph, None, None, cx);
     }
     connection.update(cx, |connection, cx| connection.connect_if_idle(cx));
     let choose = move |workspace: &Entity<Workspace>, window: &mut Window, cx: &mut App| {
@@ -926,9 +945,7 @@ fn open_cluster_graph(
         workspace.update(cx, |workspace, cx| {
             workspace.hide_modal(window, cx);
             workspace.toggle_modal(window, cx, |window, cx| {
-                let mut modal = OpenGraphModal::new(handle, window, cx);
-                modal.select(connection, window, cx);
-                modal
+                OpenGraphModal::for_connection(handle, connection, window, cx)
             });
         });
         window.activate_window();
@@ -961,7 +978,7 @@ fn link_target(
     open: &CliLink,
     digests: graph_store::cli::TargetDigests,
     cx: &App,
-) -> Result<deep_link::Target, String> {
+) -> Result<(Entity<graph_store::Connection>, String), String> {
     deep_link::verify(open, &digests.binding, &digests.home)?;
     let connection = ConnectionRegistry::global(cx)
         .read(cx)
@@ -984,14 +1001,10 @@ fn link_target(
                 open.target, server.name
             )
         })?;
-    Ok(deep_link::Target {
-        server: server.url.clone(),
-        graph,
-        branch: None,
-    })
+    Ok((connection.clone(), graph))
 }
 
-/// Opens a parsed link ([`open_link`]).
+/// Resolves a graph, node or query link that carries only a server address.
 fn open_parsed(link: DeepLink, cx: &mut App) {
     let Some(target) = link.target().cloned() else {
         return tell(
@@ -1006,13 +1019,37 @@ fn open_parsed(link: DeepLink, cx: &mut App) {
         Ok(connection) => connection,
         Err(message) => return tell(cx, ToastKind::Error, message),
     };
-    // A link that names no branch opens a graph on main, and leaves one the window has open on
-    // its own branch, as "Open a graph" does.
-    let named_branch = target.branch.clone();
-    // The window that has the graph open, else the active one.
-    let window = window_holding(&connection, &target.graph, cx)
-        .map(|(handle, _)| handle.into())
-        .or_else(|| link_window(cx));
+    let action: Option<Box<dyn gpui::Action>> = match link {
+        DeepLink::Node { type_name, id, .. } => {
+            Some(Box::new(studio_actions::graph::OpenNode { type_name, id }))
+        }
+        DeepLink::Query { text, .. } => {
+            Some(Box::new(studio_actions::graph::NewQueryWithText { text }))
+        }
+        _ => None,
+    };
+    open_link_graph(connection, target.graph, target.branch, action, cx);
+}
+
+/// Delivers a resolved link without choosing its credential again. Tabs and drafts for one
+/// graph are held by one window, so an existing session on another connection must be closed
+/// explicitly before it can be opened on this one.
+fn open_link_graph(
+    connection: Entity<graph_store::Connection>,
+    graph: String,
+    named_branch: Option<String>,
+    action: Option<Box<dyn gpui::Action>>,
+    cx: &mut App,
+) {
+    let window = match window_holding(&connection, &graph, cx) {
+        Some((handle, session)) => {
+            if let Err(message) = check_graph_connection(&connection, &session, cx) {
+                return tell(cx, ToastKind::Error, message);
+            }
+            Some(handle.into())
+        }
+        None => link_window(cx),
+    };
     let open_in = move |workspace: &Entity<Workspace>, window: &mut Window, cx: &mut App| {
         // The link is what the person asked for now: a dialog in the window ("Open a graph",
         // shown at a start with no graph) gives way to it. One that cannot close yet (a write
@@ -1022,9 +1059,7 @@ fn open_parsed(link: DeepLink, cx: &mut App) {
         // and writes to, the link's from now on, which the window says.
         let moved_from = named_branch.as_ref().and_then(|named| {
             let url = connection.read(cx).server.url.clone();
-            let session = workspace
-                .read(cx)
-                .open_session_for(&url, &target.graph, cx)?;
+            let session = workspace.read(cx).open_session_for(&url, &graph, cx)?;
             let now = session.read(cx).branch.clone();
             (now != *named).then_some(now)
         });
@@ -1033,7 +1068,7 @@ fn open_parsed(link: DeepLink, cx: &mut App) {
         show_graph_in(
             workspace,
             connection.clone(),
-            target.graph.clone(),
+            graph.clone(),
             named_branch.clone(),
             window,
             cx,
@@ -1045,28 +1080,14 @@ fn open_parsed(link: DeepLink, cx: &mut App) {
         if let (Some(from), Some(to)) = (moved_from, &named_branch) {
             let message = format!(
                 "{} moved from {from} to {to}, the branch the link names",
-                target.graph
+                graph
             );
             workspace.update(cx, |workspace, cx| {
                 workspace.show_toast(ToastKind::Info, message, cx)
             });
         }
-        match &link {
-            DeepLink::Node { type_name, id, .. } => window.dispatch_action(
-                Box::new(studio_actions::graph::OpenNode {
-                    type_name: type_name.clone(),
-                    id: id.clone(),
-                }),
-                cx,
-            ),
-            DeepLink::Query { text, .. } => window.dispatch_action(
-                Box::new(studio_actions::graph::NewQueryWithText { text: text.clone() }),
-                cx,
-            ),
-            DeepLink::Graph(_)
-            | DeepLink::Open(_)
-            | DeepLink::OpenCluster(_)
-            | DeepLink::Connect => {}
+        if let Some(action) = action {
+            window.dispatch_action(action, cx);
         }
         window.activate_window();
     };
@@ -1120,7 +1141,10 @@ fn link_connection(
         [one] => Ok(one.clone()),
         several => several
             .iter()
-            .find(|connection| window_holding(connection, &target.graph, cx).is_some())
+            .find(|connection| {
+                window_holding(connection, &target.graph, cx)
+                    .is_some_and(|(_, session)| session.read(cx).connection == **connection)
+            })
             .cloned()
             .ok_or_else(|| {
                 let names: Vec<String> = several
@@ -1137,6 +1161,25 @@ fn link_connection(
                 )
             }),
     }
+}
+
+/// A session at the same endpoint may belong to a CLI target, a different managed cluster,
+/// or a server with another credential. Its drafts and any in-flight writes stay with it.
+fn check_graph_connection(
+    wanted: &Entity<graph_store::Connection>,
+    open: &Entity<graph_store::GraphSession>,
+    cx: &App,
+) -> Result<(), String> {
+    let open = open.read(cx);
+    if open.connection != *wanted {
+        return Err(format!(
+            "{} is open on another connection ({}). Close that graph before opening it on {}.",
+            open.graph_id,
+            open.connection.read(cx).server.name,
+            wanted.read(cx).server.name,
+        ));
+    }
+    Ok(())
 }
 
 /// The workspace window that has `graph` on `connection`'s server open, with its session there.
@@ -1591,25 +1634,46 @@ mod start_tests {
         let saved_again = kept
             .read_with(cx, |workspace, cx| workspace.session_snapshot(cx))
             .unwrap();
-        assert_eq!(saved_again, saved(CLOUD).session);
+        let mut expected = saved(CLOUD).session;
+        expected.graphs[0].plane_owned = true;
+        assert_eq!(saved_again, expected);
         assert_eq!(saved_again.graphs[0].cluster, Some(cluster_identity("01I")));
         // The other window's control plane is not one Studio holds: it had nothing to reopen.
         assert!(gone.read_with(cx, |_, _| ()).is_err(), "closed");
     }
 
     /// A link from `omnigraph studio` for a managed target names the cluster as its control
-    /// plane does. It opens on the server that reaches the cluster already; otherwise on what
-    /// the control plane answers for it, refused when Studio does not hold that control plane,
-    /// holds no sign-in to it, or the cluster is another incarnation or has no data endpoint yet
-    /// (spec 021, Reopening a cluster).
+    /// plane does. A matching CLI target or previously opened cluster cannot select another
+    /// credential. The control-plane answer selects the connection for the picker and graph.
+    /// An existing graph opened with another credential keeps its session and its drafts.
     #[gpui::test]
     fn a_link_from_the_cli_opens_a_managed_cluster(cx: &mut TestAppContext) {
         let (registry, _servers, _asked) = studio_with_servers(cx);
         let plane = registry.update(cx, |registry, cx| registry.hold_cloud_for_tests(CLOUD, cx));
+        plane.update(cx, |plane, _| {
+            plane.profiles.push(("work".into(), Some("org_1".into())));
+        });
+        let cli = registry.update(cx, |registry, cx| {
+            let cli =
+                registry.add_cli_target_for_tests("cli", "https://acme.graphs.test", "notes", cx);
+            registry
+                .managed_targets
+                .push(graph_store::cli_config::ManagedTarget {
+                    name: "cli".into(),
+                    profile: "work".into(),
+                    cluster_id: "01C".into(),
+                    cluster_incarnation: "01I".into(),
+                    default_graph: Some("notes".into()),
+                    endpoint: Some("https://acme.graphs.test".into()),
+                });
+            // It is also the first target the normal startup picker would display.
+            registry.connections.rotate_right(1);
+            cli
+        });
         let (workspace, cx) = cx.add_window_view(Workspace::new);
         let link = |api: &str| {
             format!(
-                "omnigraph-studio://open?api={api}&organization=org_1&cluster=01C\
+                "omnigraph-studio://open-cluster?api={api}&organization=org_1&cluster=01C\
                  &incarnation=01I&graph=notes"
             )
         };
@@ -1632,6 +1696,14 @@ mod start_tests {
             "{}",
             last_toast(cx)
         );
+        cx.update(|window, cx| show_open_dialog(&workspace, window, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            cli.read_with(cx, |c, _| c.state.clone()),
+            ConnectionState::Idle,
+            "listing a managed CLI target must not connect it"
+        );
+
         // Held, with no sign-in: nothing is asked of it, and a link signs in to nothing.
         cx.cx.update(|cx| open_link(&link(CLOUD), cx));
         cx.run_until_parked();
@@ -1651,6 +1723,13 @@ mod start_tests {
             cx.cx
                 .update(|cx| link_cluster(&open, &plane, Some(answer), cx))
         };
+        let mut wrong_id = cluster_detail("01I", Some("https://acme.graphs.test"));
+        wrong_id.data.cluster.cluster_id = "other".into();
+        assert!(
+            answered(Ok(wrong_id), cx)
+                .unwrap_err()
+                .contains("different cluster")
+        );
         let remade = answered(
             Ok(cluster_detail("02I", Some("https://acme.graphs.test"))),
             cx,
@@ -1670,27 +1749,70 @@ mod start_tests {
         );
         assert_eq!(
             registry.read_with(cx, |r, _| r.connections.len()),
-            3,
+            4,
             "none opened"
         );
         let connection = answered(
-            Ok(cluster_detail("01I", Some("https://acme.graphs.test"))),
+            Ok(cluster_detail("01I", Some("https://acme.graphs.test/"))),
             cx,
         )
         .expect("opened");
         connection.read_with(cx, |connection, _| {
-            assert_eq!(connection.server.url, "https://acme.graphs.test");
+            assert_eq!(
+                connection.server.url.trim_end_matches('/'),
+                "https://acme.graphs.test"
+            );
             assert_eq!(connection.server.source, ServerSource::ControlPlane);
         });
 
-        // The cluster's server is known now, so the link opens its graph there and asks the
-        // control plane nothing.
+        // The connection is known, but a fresh link still requires Studio to be signed in.
         cx.cx.update(|cx| open_link(&link(CLOUD), cx));
+        cx.run_until_parked();
+        assert!(last_toast(cx).contains("Sign in to Omnigraph Cloud"));
+        workspace.read_with(cx, |workspace, _| assert!(workspace.session().is_none()));
+
+        // Without a graph the picker stays on the control-plane connection at this address.
+        cx.cx
+            .update(|cx| open_cluster_graph(connection.clone(), None, cx));
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            let picker = workspace
+                .active_modal::<OpenGraphModal>()
+                .expect("graph picker");
+            assert!(picker.read(cx).lists(&connection));
+            assert!(!picker.read(cx).lists(&cli));
+        });
+
+        // Exercise the graph handoff after a successful control-plane response, including a
+        // second connection with another credential at the same endpoint.
+        cx.cx
+            .update(|cx| open_cluster_graph(connection.clone(), Some("notes".into()), cx));
         cx.run_until_parked();
         workspace.read_with(cx, |workspace, cx| {
             let session = workspace.session().expect("opened").read(cx);
             assert_eq!(session.graph_id, "notes");
-            assert_eq!(session.connection.entity_id(), connection.entity_id());
+            assert_eq!(session.connection, connection);
+        });
+        assert_eq!(
+            cli.read_with(cx, |c, _| c.state.clone()),
+            ConnectionState::Idle
+        );
+
+        // The one-window-per-graph rule protects tabs and drafts. Reusing an open session
+        // on another credential would let the managed link display its data.
+        cx.update(|window, cx| {
+            show_graph_in(&workspace, cli.clone(), "other".into(), None, window, cx)
+        });
+        cx.cx
+            .update(|cx| open_cluster_graph(connection.clone(), Some("other".into()), cx));
+        cx.run_until_parked();
+        assert!(
+            last_toast(cx).contains("another connection"),
+            "{}",
+            last_toast(cx)
+        );
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(workspace.session().unwrap().read(cx).connection, cli);
         });
     }
 
