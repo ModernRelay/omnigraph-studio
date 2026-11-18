@@ -95,7 +95,7 @@ NEW_QUERY="studio_graph::NewQueryWithText={\"text\":\"$QUERY\"}"
 # A person in the inspector, scrolled with the pointer over the dock: a click selects
 # person-000009's row (the inspector shows the selection, spec 020), whose four relationship
 # groups open by themselves. At 1440x900 every node of the development graph fits the dock, so
-# a scroll there moves nothing; in a 1440x600 window this one is about 230 px taller than the
+# a scroll there moves nothing; in a 1440x600 window this one is about 260 px taller than the
 # dock. The case scrolls 120 px down first, so that each measured frame's 4 px, back and forth
 # every 30 frames, moves the view and never meets an end. Points are window pixels.
 INSPECTOR='click:504,417|scroll:0,-120,at=1270:350'
