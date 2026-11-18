@@ -35,6 +35,8 @@ objc2-core-graphics = { workspace = true }
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
+# `Connection::set_features`, for the dialogs' tests of what a server serves.
+graph_store = { workspace = true, features = ["test-support"] }
 http_client = { workspace = true }
 studio_settings = { workspace = true, features = ["test-support"] }
 studio_theme = { workspace = true, features = ["test-support"] }

@@ -13,7 +13,7 @@ it goes through Omnigraph's own RFC process.
 | E3 | Loopback guard (Host allowlist, Origin check, no CORS) in the launcher | E1 | — |
 | E4 | Owner discovery for a graph root (discovery, not fencing) | E1 | — |
 | E5 | Writer-safety rules for local sessions | E1 | Enforced by the server Studio talks to |
-| E9 | Branch details (head, fork, creator, times) | 002, 008 | Derived from `GET /commits?branch=` |
+| E9 | Branch details (head, fork, creator, times). *Landed in `v0.15.0`* (#1012): `DetailedBranchList` below | 002, 008 | From a 0.15 server one `GET /branches?detailed=true` answers a list's heads; from a 0.14 server each is read alone (`GET /commits?branch=`) |
 | E11 | Typed result columns or Arrow IPC | 004, 007 | Column types from `omnigraph-compiler`'s `describe_query_operation` |
 | E12 | Query profile over HTTP | 007 | Plans only, through `explain query …` |
 | E13 | Index status | 010 | Index facts from `explain` statistics |
@@ -21,7 +21,7 @@ it goes through Omnigraph's own RFC process.
 | E16 | Neighbourhood counts per node | 005, 006 | One count query per edge type, concurrent, cached per pinned commit |
 | E17 | `omnigraph lsp` language server | 007 | `gq_language` calls `omnigraph-compiler` in-process |
 | E18 | Tree-sitter grammars and a Zed extension in the Omnigraph repository | E17 | Grammars in this repository under `grammars/` |
-| E19 | Publish `omnigraph-compiler` to crates.io again (stops at 0.8.0) | 001 | Git dependency on tag `v0.14.0` |
+| E19 | Publish `omnigraph-compiler` to crates.io again (stops at 0.8.0) | 001 | Git dependency on tag `v0.15.0` |
 | E20 | Delegated, branch-scoped credentials for agents, recorded in history beside the actor ([#978](https://github.com/ModernRelay/omnigraph/issues/978)) | 011, 013 | Agent commits are recorded under the person's actor, on a branch named `agent/<stamp>`; Studio's gateway keeps the agent's writes on that branch |
 | E25 | One mutation that both adds and removes (lift rule D2 for one write) | 014 | A relationship replacement saves as two ordered commits, or through a branch and a merge |
 | E26 | Edge update (T16) | 014 | An unkeyed edge's properties save as delete and insert, with a new id |
@@ -29,7 +29,7 @@ it goes through Omnigraph's own RFC process.
 | E28 | Merge bound to the reviewed source head (a precondition on the source, as `If-Graph-Commit` binds a write to its target) | 008 | Checks the source head just before merging; a commit landing in between is merged too, and the outcome says the merge took a commit made after the review was read |
 | E29 | A Blob write bound to an empty cell (`If-None-Match: *` on `PUT /graphs/{id}/blob`; `If-Match` matches only a cell that holds a value; [#1110](https://github.com/ModernRelay/omnigraph/issues/1110)) | 004 | Reads the cell at the head just before sending, and sends only while it is still empty; a value set in between is overwritten |
 | E30 | Lance versions declared as wide as the server sends them: `graph_manifest_version` (`CommitOutput`, `SnapshotOutput`, `SchemaApplyOutput`) and the `published_dataset_version` fields are `u64` in `omnigraph-api-types`, and the OpenAPI document says `int64` with `minimum: 0`. A commit held in a detached `__manifest` version (a write `as commit` or `as unattached branch`) carries a version with the high bit set, past `i64::MAX`, which a client generated from the document cannot decode (format `uint64`, or `int64` without the claim) | 004, 007 | Decodes every manifest and dataset version as `u64`; the contract tests compare field names, not widths |
-| E35 | A diff whose cost follows what changed: `GET /diff` and `GET /branches/diff` read both full tables of each type the endpoints differ in unless they are one transaction apart, so a review on a large graph takes most of a minute ([#969](https://github.com/ModernRelay/omnigraph/issues/969); RFC [#1171](https://github.com/ModernRelay/omnigraph/pull/1171) proposes fragment identity) | 008 | Waits up to five minutes for a read of changes (`graph_client::CHANGE_READ_TIMEOUT`); a review says the server is still working after 10 s, and when it stopped waiting |
+| E35 | A diff whose cost follows what changed: `GET /diff` and `GET /branches/diff` read both full tables of each type the endpoints differ in unless they are one transaction apart, so a review on a large graph takes most of a minute ([#969](https://github.com/ModernRelay/omnigraph/issues/969); RFC [#1171](https://github.com/ModernRelay/omnigraph/pull/1171) proposes fragment identity) | 008 | Waits up to five minutes for a read of changes (`graph_client::CHANGE_READ_TIMEOUT`); a review says the server is still working after 10 s, and when it stopped waiting; *partly landed in `v0.15.0`* (#1201): across several commits of one history with no merge between them a diff reads only the changed rows, while across a merge, or between two branches that both moved, it still reads both tables, so the waits stay, as a 0.14 server needs them too |
 | E36 | A change page that resumes its work: every page of the feed, a diff or a commit's changes plans, resolves and sorts again ([#970](https://github.com/ModernRelay/omnigraph/issues/970)) | 008, 009 | Asks for the largest page (8,192 changes), so most reviews are one page |
 | E37 | A commit found by id without checking out every live branch's `__manifest`: a commit only a branch holds costs 6 to 9 s more to name than its branch ([#972](https://github.com/ModernRelay/omnigraph/issues/972)) | 008, 009 | Names commits by id, which pins the read; naming the branch would need a second read when it moves |
 | E38 | A work bound on a change-feed page: a page works through up to 128 commits and the HTTP API has no parameter to lower it ([#1157](https://github.com/ModernRelay/omnigraph/issues/1157)) | 008 | Reads the feed in pages of up to 8,192 changes, each waited for up to five minutes |
@@ -48,6 +48,7 @@ it goes through Omnigraph's own RFC process.
 | E51 | Full-text search on label-like properties without a per-property `@index`, and a substring (n-gram) mode that finds a word's middle | 031 | Runs `search`/`bm25` only where an index is declared, merges its hits after its own matches, and leaves out a property whose search fails |
 | E52 | The schema at a commit, or a commit's schema diff | 033 | A schema change's tab says "Schema change" and the type the refusal names, with no retry |
 | E53 | A merge conflict's base, source and target images | 033 | The conflict's kind in words and the server's message, on its card and in the conflicts list |
+| E54 | A write refused in validation, before any effect (an `@card` bound, a missing endpoint), states `effects: none` and the violation as a typed detail; 0.14 and 0.15 answer 400 `bad_request` with `effects: unknown, action: reconcile` | 004, 034 | Judges it unknown, as the disposition says, and names the `@card` bound from the server's words; the new-node dialog sends a node with the edges its minimum needs so a 0.15 server does not refuse it |
 
 Every server Studio supports serves these (checked against `v0.14.0`'s OpenAPI document, 2026-10-24):
 
@@ -71,6 +72,30 @@ Every server Studio supports serves these (checked against `v0.14.0`'s OpenAPI d
 Also served: unattached snapshots (`as unattached branch`; `CommitOutput.kind`,
 `GET /commits?listing=unattached`) and `ReadOutput.page` for a paged `branch diff` read. The CLI
 selects a backend with `--target` and reads an operator file of `targets` in its version-1 form
-(#1090, #1115, #1126). Studio's agent CLI follows it (spec 013), from `v0.14.0` on. Since 2026-10-22 Studio reads no operator file for the
+(#1090, #1115, #1126). Studio's agent CLI follows it (spec 013), from `v0.14.0` on.
+Since 2026-10-22 Studio reads no operator file for the
 person's servers: it takes them and their tokens from the CLI's own commands (`target list`,
 `target inspect`, `credentials status`, `credentials export`; spec 003).
+
+## Server features by release
+
+A later release keeps contract 0.14 and adds to it: a field an answer may carry, a parameter a
+route takes, a rule a write must meet. Studio decodes every later field as optional whatever the
+server, and uses what a release adds only where the server serves it: `graph_store::ServerFeatures`
+works that out from the release `/healthz` reports, at each health answer, from this table. A
+version Studio cannot read is taken to be `v0.14.0`, and an edge build (`0.15.1-edge+…`) serves
+what the release before it does. A feature goes in this table and in `FEATURES` together; a test
+(`every_feature_is_named_in_the_docs_with_its_release`) fails when they drift.
+
+| Feature | First release | What the server does | Studio with it | Studio without it (a 0.14 server) |
+|---|---|---|---|---|
+| `RankedReadOutput` | `0.15.0` | A read ordered by `nearest`, `bm25` or `rrf()` answers `ReadOutput.ranking` (#1130) | The query editor names the search, which way it ranks and its score columns, and warns when the search was not exhaustive | Says nothing of a ranking |
+| `DetailedBranchList` | `0.15.0` | `GET /branches?detailed=true` answers each branch's head, start and times (#1012, E9) | The heads a list of branches asks for come from one request, and the branches list says when each branch was made and from which | One `GET /commits?branch=&limit=1` per branch drawn |
+| `AccessClientId` | `0.15.0` | `AccessOutput.client_id` names the OAuth client a person's token was issued to (#1196) | The connection chip's tooltip names it beside the actor | Names the actor alone |
+| `CardMinimumOnEveryWrite` | `0.15.0` | A `@card` minimum is checked on every write that inserts or updates a source node (#1212) | The new-node dialog asks for each edge the minimum needs and saves them with the node in one mutation | Saves the node alone, which the server takes |
+| `NotAdmittedCode` | `0.15.0` | A valid OIDC token whose subject the server admits no principal for is answered 403 `not_admitted` on every route (#1185), where 0.14 answered 401 | The connection says "Not admitted" at the connect, and a 401 to a sign-in held says its token was refused, which a new sign-in may replace | A 401 to a sign-in held says the account may not be admitted |
+| `UniqueOnScalarsOnly` | `0.15.0` | A schema apply refuses `@unique` on a list or vector property (#1306) | The schema view says the server refuses any apply that keeps one | Says 0.15 will, and that no write can set such a property |
+
+A 403 `not_admitted` is read from the answer itself whatever the release: the connection says
+"Not admitted", and a graph or a read refused with it mid-session says to ask the server's
+operator.

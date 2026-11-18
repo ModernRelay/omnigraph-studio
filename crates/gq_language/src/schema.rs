@@ -208,6 +208,17 @@ impl std::fmt::Debug for SchemaModel {
     }
 }
 
+/// Why Omnigraph's admission parser, the one a schema apply runs, refuses `source`, a schema the
+/// server already holds and Studio reads with the compatibility parser ([`SchemaModel::parse`]);
+/// `None` when it admits it. From Omnigraph 0.15 that parser refuses `@unique` on a list or a
+/// vector property, which 0.14 admitted though no write could satisfy it: the graph still opens,
+/// but every apply that keeps the constraint is refused, so the schema view says so.
+pub fn admission_refusal(source: &str) -> Option<String> {
+    omnigraph_compiler::schema::parser::parse_schema(source)
+        .err()
+        .map(|error| error.to_string())
+}
+
 impl SchemaModel {
     /// Compiles `.pg` source the server accepted. The error is the compiler's message.
     ///
@@ -344,6 +355,16 @@ impl SchemaModel {
             (None, None) => true,
             _ => false,
         }
+    }
+
+    /// The edges each node of `node_type` must have at least one of (`@card(n..)`, `n` above 0,
+    /// from `node_type`), in declared order. From Omnigraph 0.15 every write that inserts or
+    /// updates such a node checks them, so a new one is saved with its edges in one mutation.
+    pub fn required_edges(&self, node_type: &str) -> Vec<&EdgeType> {
+        self.edges
+            .iter()
+            .filter(|edge| edge.from == node_type && edge.min > 0)
+            .collect()
     }
 
     pub fn edge(&self, name: &str) -> Option<&EdgeType> {
@@ -538,14 +559,25 @@ pub(crate) mod tests {
     }
 
     /// A graph admitted before a rule tightened opens: the server keeps its schema, which the
-    /// admission parser would now refuse.
+    /// admission parser would now refuse. Omnigraph 0.15 refuses `@unique` on a list or a
+    /// vector property, which 0.14 admitted, as it refused one on a Blob before.
     #[test]
     fn a_schema_admitted_before_a_rule_tightened_still_opens() {
-        let historical =
-            "node Document {\n  slug: String @key\n  payload: Blob?\n  @unique(payload)\n}\n";
-        assert!(omnigraph_compiler::schema::parser::parse_schema(historical).is_err());
-        let schema = SchemaModel::parse(historical).expect("an accepted schema opens");
-        assert!(schema.node("Document").is_some());
+        for historical in [
+            "node Document {\n  slug: String @key\n  payload: Blob?\n  @unique(payload)\n}\n",
+            "node Document {\n  slug: String @key\n  tags: [String]?\n  @unique(tags)\n}\n",
+            "node Document {\n  slug: String @key\n  v: Vector(3)?\n  @unique(v)\n}\n",
+        ] {
+            assert!(
+                omnigraph_compiler::schema::parser::parse_schema(historical).is_err(),
+                "{historical}"
+            );
+            let schema = SchemaModel::parse(historical).expect("an accepted schema opens");
+            assert!(schema.node("Document").is_some());
+            let refusal = admission_refusal(historical).expect("refused at admission");
+            assert!(refusal.contains("@unique is not supported on"), "{refusal}");
+        }
+        assert_eq!(admission_refusal(DEV_SCHEMA), None, "an admitted schema");
     }
 
     /// Every member of a composite key is a key the server will not let change; the node has

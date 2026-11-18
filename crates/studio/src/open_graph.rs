@@ -1862,6 +1862,9 @@ fn state_status(c: &Connection) -> String {
                     "{why} You stay signed in at {service}, as an account this server may not \
                      admit."
                 ),
+                HeldRefusal::Refused => {
+                    format!("{why} You stay signed in at {service}; the server refused its token.")
+                }
             };
         }
         (SignIn::Offered { service, why }, ConnectionState::Unauthorized) => {
@@ -1899,9 +1902,19 @@ fn state_status(c: &Connection) -> String {
                     "The server received no token, though Studio sent the one signed in at \
                      {service}: something between them may drop it."
                 ),
+                // Said by the server itself (Omnigraph 0.15), or read from an older one's 401.
+                HeldRefusal::NotAdmitted if c.not_admitted() => format!(
+                    "The server does not admit {account}, signed in at {service}: signing in \
+                     again as this account cannot help. Ask the server's operator to admit it, \
+                     or sign in as someone else."
+                ),
                 HeldRefusal::NotAdmitted => format!(
                     "The server refused {account}, signed in at {service}: it may not admit \
                      this account."
+                ),
+                HeldRefusal::Refused => format!(
+                    "The server refused the token signed in at {service} for {account}. Sign in \
+                     again."
                 ),
             };
         }
@@ -1911,6 +1924,12 @@ fn state_status(c: &Connection) -> String {
         _ => {}
     }
     match (&c.state, &c.token_unread) {
+        // The server admits no one for this token's identity (Omnigraph 0.15).
+        (ConnectionState::Unauthorized, _) if c.not_admitted() => {
+            "The server accepts this token but admits no one for it, so a new token for the same \
+             account cannot help. Ask the server's operator to admit you."
+                .into()
+        }
         (ConnectionState::Unreachable(error), _) => {
             format!("Could not reach the server: {error}")
         }

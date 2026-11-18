@@ -5,10 +5,11 @@
 ;
 ; SourceDir holds what the zip holds: omnigraph-studio.exe, LICENSE and THIRD-PARTY-NOTICES.md.
 ;
-; `omnigraph studio` finds Studio by the uninstall key this AppId names,
+; `omnigraph studio` (CLI 0.15) opens Studio through the `omnigraph-studio` URL protocol written
+; under [Registry]. The uninstall key this AppId names,
 ; Software\Microsoft\Windows\CurrentVersion\Uninstall\com.modernrelay.omnigraph-studio_is1, in
-; HKCU (or HKLM after an /ALLUSERS install). Never change the AppId: it is how the CLI finds
-; Studio and how a newer installer recognises the copy it upgrades.
+; HKCU (or HKLM after an /ALLUSERS install), is what tells Studio is installed and where. Never
+; change the AppId: it is how a newer installer recognises the copy it upgrades.
 
 #ifndef Version
   #error Pass -DVersion=<version>
@@ -74,6 +75,13 @@ Name: "{autodesktop}\Omnigraph Studio"; Filename: "{app}\omnigraph-studio.exe"; 
 ; `start omnigraph-studio` and ShellExecute open Studio by its executable's name.
 Root: HKA; Subkey: "Software\Microsoft\Windows\CurrentVersion\App Paths\omnigraph-studio.exe"; ValueType: string; ValueName: ""; ValueData: "{app}\omnigraph-studio.exe"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Microsoft\Windows\CurrentVersion\App Paths\omnigraph-studio.exe"; ValueType: string; ValueName: "Path"; ValueData: "{app}"
+; The `omnigraph-studio://` URL protocol: `omnigraph studio` (CLI 0.15) checks for `URL Protocol`
+; and `shell\open\command` under HKCR\omnigraph-studio, then opens the link, which starts Studio
+; with the link as its argument.
+Root: HKA; Subkey: "Software\Classes\omnigraph-studio"; ValueType: string; ValueName: ""; ValueData: "URL:Omnigraph Studio"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\omnigraph-studio"; ValueType: string; ValueName: "URL Protocol"; ValueData: ""
+Root: HKA; Subkey: "Software\Classes\omnigraph-studio\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\omnigraph-studio.exe,0"
+Root: HKA; Subkey: "Software\Classes\omnigraph-studio\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\omnigraph-studio.exe"" ""%1"""
 
 [Run]
 ; Offered on the last page; a silent install (the CLI's, the updater's) never opens Studio.

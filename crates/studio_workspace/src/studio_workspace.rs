@@ -3893,7 +3893,12 @@ impl Workspace {
         let (color, server, url, state, ready, actor, graph, unavailable) = match &self.session {
             Some(session) => {
                 let s = session.read(cx);
-                let actor = s.actor().map(str::to_owned);
+                // Who the credential acts as, and the OAuth client it acts through when the
+                // server names one (Omnigraph 0.15).
+                let actor = s.actor().map(|actor| match s.client_id() {
+                    Some(client) => format!("{actor} through {client}"),
+                    None => actor.to_owned(),
+                });
                 let connection = s.connection.read(cx);
                 let ready = connection.state == ConnectionState::Ready;
                 // The server's round trip from the last health check, beside its state.

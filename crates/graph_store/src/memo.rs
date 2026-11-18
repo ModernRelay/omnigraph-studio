@@ -8,6 +8,12 @@
 //! or read again (Refresh) changes nothing. The memo holds at most `capacity` entries and
 //! forgets the least recently used first. A read nobody waits for any more (every view that
 //! asked dropped it) goes before any answer, and a lookup finds nothing for it.
+//!
+//! A read that answers many keys at once (one detailed branch list for every branch's head)
+//! fills them through a [`Fill`] opened before it is sent: a key forgotten after that, or a
+//! memo cleared, is not filled, by the same rule.
+
+use std::sync::{Arc, Weak};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::Hash;
@@ -57,6 +63,21 @@ pub(crate) struct Memo<K, V, P> {
     /// The most the answers held may weigh together, and how one is weighed.
     budget: Option<(usize, Weigh<V>)>,
     bytes: usize,
+    /// Counts forgets, so a fill can tell a key forgotten after it opened.
+    forgets: u64,
+    /// The count when the memo was last cleared: no fill opened before it fills anything.
+    cleared: u64,
+    /// When each key was last forgotten, kept only while a fill is open.
+    forgotten: HashMap<K, u64>,
+    /// The fills open, while their reads are out.
+    fills: Vec<Weak<()>>,
+}
+
+/// A read that answers many keys at once, opened before it is sent ([`Memo::open_fill`]): what
+/// it answers is kept only for keys not forgotten since. Dropped, it is closed.
+pub(crate) struct Fill {
+    since: u64,
+    _open: Arc<()>,
 }
 
 impl<K: Hash + Eq + Clone, V: Clone, P: Clone + Pend> Memo<K, V, P> {
@@ -69,6 +90,10 @@ impl<K: Hash + Eq + Clone, V: Clone, P: Clone + Pend> Memo<K, V, P> {
             capacity: capacity.max(1),
             budget: None,
             bytes: 0,
+            forgets: 0,
+            cleared: 0,
+            forgotten: HashMap::new(),
+            fills: Vec::new(),
         }
     }
 
@@ -148,8 +173,43 @@ impl<K: Hash + Eq + Clone, V: Clone, P: Clone + Pend> Memo<K, V, P> {
         self.put(key, Held::Done(value));
     }
 
+    /// Opens a fill for a read about to be sent that answers many keys ([`Self::fill`]).
+    pub(crate) fn open_fill(&mut self) -> Fill {
+        let open = Arc::new(());
+        self.fills.push(Arc::downgrade(&open));
+        Fill {
+            since: self.forgets,
+            _open: open,
+        }
+    }
+
+    /// Keeps `value` for `key` from a read opened as `fill`, unless something is held for it
+    /// (its own read answers it) or it was forgotten, or the memo cleared, since the fill
+    /// opened: the answer was read before that and may be what was forgotten. Whether it kept.
+    pub(crate) fn fill(&mut self, fill: &Fill, key: K, value: V) -> bool {
+        let forgotten = self.forgotten.get(&key).is_some_and(|&at| at > fill.since);
+        if self.cleared > fill.since || forgotten || self.holds(&key) {
+            return false;
+        }
+        self.insert(key, value);
+        true
+    }
+
+    /// Whether a fill is open; once none is, what was forgotten need not be remembered.
+    fn filling(&mut self) -> bool {
+        self.fills.retain(|open| open.strong_count() > 0);
+        if self.fills.is_empty() {
+            self.forgotten.clear();
+        }
+        !self.fills.is_empty()
+    }
+
     /// Forgets what is held for `key`: the next read asks again.
     pub(crate) fn forget(&mut self, key: &K) {
+        self.forgets += 1;
+        if self.filling() {
+            self.forgotten.insert(key.clone(), self.forgets);
+        }
         if let Some(slot) = self.entries.remove(key) {
             self.bytes -= slot.weight;
             self.order.remove(&slot.used);
@@ -158,6 +218,9 @@ impl<K: Hash + Eq + Clone, V: Clone, P: Clone + Pend> Memo<K, V, P> {
     }
 
     pub(crate) fn clear(&mut self) {
+        self.forgets += 1;
+        self.cleared = self.forgets;
+        self.forgotten.clear();
         self.entries.clear();
         self.order.clear();
         self.pending.clear();
@@ -281,6 +344,36 @@ mod tests {
     use std::rc::{Rc, Weak};
 
     use super::*;
+
+    /// A read that answers many keys fills only those not forgotten after it opened, nor held:
+    /// its answer was read before a forget and may be what was forgotten. A clear after it
+    /// opened fills nothing; a fill opened after a forget fills that key.
+    #[test]
+    fn a_fill_keeps_nothing_forgotten_since_it_opened() {
+        let mut memo: Memo<&'static str, u32, ()> = Memo::new(8);
+        memo.forget(&"early");
+        let fill = memo.open_fill();
+        memo.insert("held", 1);
+        memo.forget(&"moved");
+        assert!(!memo.fill(&fill, "moved", 10), "forgotten since it opened");
+        assert!(!memo.fill(&fill, "held", 10), "its own answer stays");
+        assert!(memo.fill(&fill, "early", 10), "forgotten before it opened");
+        assert!(memo.fill(&fill, "fresh", 10));
+        assert_eq!(done(&mut memo, "held"), Some(1));
+        assert_eq!(done(&mut memo, "fresh"), Some(10));
+        assert_eq!(done(&mut memo, "moved"), None);
+
+        let after = memo.open_fill();
+        assert!(memo.fill(&after, "moved", 20), "a later read fills it");
+        memo.clear();
+        assert!(!memo.fill(&after, "other", 1), "cleared since it opened");
+        drop((fill, after));
+        memo.forget(&"x");
+        assert!(
+            memo.forgotten.is_empty(),
+            "no fill open: nothing remembered"
+        );
+    }
 
     fn done(memo: &mut Memo<&'static str, u32, ()>, key: &'static str) -> Option<u32> {
         match memo.get(&key) {

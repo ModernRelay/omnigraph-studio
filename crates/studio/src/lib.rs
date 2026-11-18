@@ -740,7 +740,7 @@ pub fn open_link(link: &str, cx: &mut App) {
 }
 
 /// Opens a link from `omnigraph studio`, which names a CLI target: the target's server, once
-/// the digests the link carries match what this Mac's CLI reports for the target (its
+/// the digests the link carries match what this computer's CLI reports for the target (its
 /// `binding`, of what the name resolves to, and `home`, of the operator file it was read
 /// from), so a link made elsewhere, or before the target changed, opens nothing. The check
 /// asks the CLI, off the main thread; a start's window waits for it as for any link.
@@ -1392,7 +1392,7 @@ mod start_tests {
     }
 
     /// A link from `omnigraph studio` names a CLI target; once the digests it carries are what
-    /// this Mac's CLI reports for the target, its server opens, on the graph the link names,
+    /// this computer's CLI reports for the target, its server opens, on the graph the link names,
     /// else the target's default graph. The check runs after the link is parsed, so a start's
     /// window waits for it as for any link.
     #[gpui::test]
@@ -1420,7 +1420,7 @@ mod start_tests {
         });
     }
 
-    /// A link whose digests are not the CLI's here (made on another Mac, or before the target
+    /// A link whose digests are not the CLI's here (made on another computer, or before the target
     /// changed), or whose target the CLI does not list, opens nothing and says which differs.
     #[gpui::test]
     fn a_link_from_the_cli_is_refused_when_its_digests_differ(cx: &mut TestAppContext) {

@@ -14,7 +14,7 @@ Studio is and how to install it: the [README](../README.md). Rules every change 
   Xcode to compile them into a release build (`script/bundle-mac`). Linux: the Wayland, X11 and
   Vulkan development packages listed in `.github/workflows/ci.yml`.
 - An Omnigraph server of `v0.14.0` or later (HTTP contract 0.14). Studio refuses a server
-  that speaks another contract, such as Omnigraph 0.13, and its query checks follow `v0.14.0`.
+  that speaks another contract, such as Omnigraph 0.13, and its query checks follow `v0.15.0`.
 - For the servers of the CLI's targets, the agent panel and the sample graph, the `omnigraph`
   CLI of `v0.14.0` or later, which Omnigraph's installer puts in `~/.local/bin`:
 
@@ -144,10 +144,13 @@ How Studio uses the Omnigraph API, in full (the README has the short form):
   draft is kept until then.
 - **Server policy.** Authorization is the server's Cedar policy; Studio enforces no rules of its
   own. A 403 is shown as a refusal and the draft stays.
-- **Newer routes on demand.** Routes beyond 0.14 are used only when the server's OpenAPI
-  document advertises them. Engine changes Studio would use, and what it does without them, are
-  listed in [deferred-engine-changes.md](deferred-engine-changes.md) and
-  [spec 012](../specs/012-omnigraph-engine-changes/plan.md).
+- **Later releases by their features.** What a release after 0.14.0 adds (a field, a parameter,
+  a rule a write must meet) is used only where the server's release serves it:
+  `graph_store::ServerFeatures` works that out from `/healthz`'s version, and code asks
+  `features.has(…)`. The table is in
+  [deferred-engine-changes.md](deferred-engine-changes.md#server-features-by-release), beside the
+  engine changes Studio would use and what it does without them
+  ([spec 012](../specs/012-omnigraph-engine-changes/plan.md)).
 
 ## Repository
 
@@ -187,8 +190,9 @@ newer version is out and link to it; 0.4.2 and later install it.
 The Windows installer ([spec 027](../specs/027-windows-installer/plan.md)) puts Studio in
 `%LOCALAPPDATA%\Programs\Omnigraph Studio` for one person, with no administrator rights, and
 adds it to the Start menu and Installed apps; uninstalling keeps the settings in
-`%APPDATA%\Omnigraph Studio`. It registers as `com.modernrelay.omnigraph-studio`, the name
-`omnigraph studio` looks up. It ships from 0.4.4. Neither Windows file is signed yet.
+`%APPDATA%\Omnigraph Studio`. It registers as `com.modernrelay.omnigraph-studio`, and from 0.4.9
+the `omnigraph-studio://` URL protocol, which `omnigraph studio` (CLI 0.15) opens a target's link
+through. It ships from 0.4.4. Neither Windows file is signed yet.
 
 ## Not built yet
 

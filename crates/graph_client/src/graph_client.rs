@@ -4,9 +4,9 @@
 //! Layer 2 (`docs/architecture.md`). Plan: `specs/003-connections/plan.md`.
 //!
 //! Built on Zed's `http_client::HttpClient` (Apache-2.0): the app passes `reqwest_client`,
-//! tests pass Zed's fake client. The contract is `openapi/omnigraph-0.14.0.json`, copied
-//! from Omnigraph `v0.14.0` (MIT), the release that fixed contract `0.14` and the oldest server
-//! Studio supports.
+//! tests pass Zed's fake client. The contract is `openapi/omnigraph-0.15.0.json`, copied
+//! from Omnigraph `v0.15.0` (MIT). It still describes contract `0.14`, which `v0.14.0` fixed;
+//! that release is the oldest server Studio supports, so what 0.15 added is read as optional.
 
 pub mod api;
 mod client;

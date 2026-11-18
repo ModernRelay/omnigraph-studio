@@ -651,7 +651,7 @@ pub async fn target_digests(programs: &[PathBuf], name: &str) -> Result<TargetDi
             default_graph: text("/target/default_graph"),
         }),
         _ => Err(format!(
-            "{asked} reported no digests for the target: a CLI of 0.14.1 or later reports them."
+            "{asked} reported no digests for the target: a CLI of 0.15.0 or later reports them."
         )),
     }
 }

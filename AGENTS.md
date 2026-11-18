@@ -28,8 +28,8 @@ intelligence. See `README.md`.
 |---|---|---|
 | Zed crates | tag `v1.27.0` (`c84af5b99cbc`) | `Cargo.toml` `[workspace.dependencies]` |
 | Rust | `1.98.1`, Zed's toolchain at that tag | `rust-toolchain.toml` |
-| Omnigraph HTTP contract | `0.14` (the `v0.14.0` release) | `crates/graph_client/openapi/omnigraph-0.14.0.json` |
-| `omnigraph-compiler` | tag `v0.14.0` | `Cargo.toml` |
+| Omnigraph HTTP contract | `0.14`, as the `v0.15.0` release documents it (`v0.14.0` is the oldest server) | `crates/graph_client/openapi/omnigraph-0.15.0.json` |
+| `omnigraph-compiler` | tag `v0.15.0` | `Cargo.toml` |
 
 Bump Zed only with [the procedure](docs/zed-pin.md). Copy Zed's `[patch.crates-io]` entries
 when you bump: patches do not carry over from a dependency's workspace.
@@ -66,7 +66,9 @@ python3 script/test_release_files.py   # a release's version-free copies and lat
   way needs `script/sign-dev` after it. Make the identity once with
   `script/sign-dev --make-identity`; `script/bundle-mac` uses the same
   identity when no Developer ID is set. The `omnigraph` CLI keeps its sign-in session in the
-  Keychain too and is signed ad hoc: after a CLI update, `script/sign-dev --cli`.
+  Keychain too: its 0.15 and later release and edge builds carry a Developer ID and need
+  nothing; one signed ad hoc (built from source, or older) needs `script/sign-dev --cli` after
+  each update, which leaves a Developer ID build alone.
 - Write files with `studio_settings::write_atomic`, never by truncating in place.
 - A function used on one platform carries the same `cfg` as its caller, so the other platforms
   still build.
@@ -88,6 +90,10 @@ python3 script/test_release_files.py   # a release's version-free copies and lat
   paths). Copies of upstream files stay as upstream wrote them.
 - No Omnigraph engine changes from this repo. Add the need to spec 012 with an ID, list it in
   `docs/deferred-engine-changes.md`, and design against today's API.
+- A server feature a later Omnigraph release adds goes in `graph_store::FEATURES` with its first
+  release and in the table in `docs/deferred-engine-changes.md` (a test keeps them together);
+  code asks `features.has(ServerFeature::…)` and keeps working without it. Never an ad hoc
+  version check, and never a guess from a missing field: decoding stays tolerant.
 - Never add a second copy of GPUI (GPUI Kit, `gpui-pre`, `gpui-ce`, crates.io `gpui`).
 - Never retry a write automatically. Never log tokens, query text or row data.
 - The UI tools stay in `ui_tool_server` (spec 032): only `studio` depends on it, in one module;
