@@ -13,6 +13,8 @@ Studio is and how to install it: the [README](../README.md). Rules every change 
 - macOS: the Command Line Tools (GPUI compiles its Metal shaders when Studio starts); full
   Xcode to compile them into a release build (`script/bundle-mac`). Linux: the Wayland, X11 and
   Vulkan development packages listed in `.github/workflows/ci.yml`.
+- Or, with Nix on Linux or Apple silicon, `nix develop` for the same toolchain, CMake and system
+  libraries, and `nix build` for `result/bin/omnigraph-studio` (`flake.nix`).
 - An Omnigraph server of `v0.14.0` or later (HTTP contract 0.14). Studio refuses a server
   that speaks another contract, such as Omnigraph 0.13, and its query checks follow `v0.15.0`.
 - For the servers of the CLI's targets, the agent panel and the sample graph, the `omnigraph`
