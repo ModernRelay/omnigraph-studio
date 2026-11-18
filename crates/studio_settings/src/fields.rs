@@ -450,6 +450,7 @@ mod tests {
                 "agent.panel_ui_tools",
                 "agent.raise_window",
                 "models.fast",
+                "models.filter",
                 "models.careful",
                 "models.key_stored",
             ],
