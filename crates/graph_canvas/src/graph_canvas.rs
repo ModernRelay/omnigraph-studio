@@ -41,6 +41,7 @@ use studio_actions::canvas::{
 use studio_actions::graph::{
     OpenMap, OpenNodePage, OpenType, ShowNodeInTree, ShowNodeOnCanvas, ShowResultsOnCanvas,
 };
+use studio_actions::workspace::Refresh;
 use studio_actions::{ViewKind, ViewLink};
 use studio_settings::StudioSettings;
 use studio_ui::ds::Tipped;
@@ -3330,9 +3331,13 @@ impl GraphCanvas {
                         d.child(
                             panel("canvas-newer").child(
                                 studio_ui::ds::bar_button("canvas-refresh", "Newer data · Refresh")
-                                    .tip(studio_ui::ds::tooltip(
-                                        "The branch moved since this exploration was read",
-                                    ))
+                                    .tip_fn(|_, cx| {
+                                        studio_ui::ds::tooltip_for_action_view(
+                                            "The branch moved since this exploration was read",
+                                            &Refresh,
+                                            cx,
+                                        )
+                                    })
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.exploration.update(cx, |e, cx| e.refresh(cx));
                                     })),
@@ -3719,6 +3724,13 @@ impl Render for GraphCanvas {
             .on_action(cx.listener(Self::pin_nodes))
             .on_action(cx.listener(Self::unpin_nodes))
             .on_action(cx.listener(Self::reroot_here))
+            // As in the tree: Refresh reads the walk again, and the workspace the session.
+            .on_action(cx.listener(|this, _: &Refresh, _, cx| {
+                if this.draws_exploration() {
+                    this.exploration.update(cx, |e, cx| e.refresh(cx));
+                }
+                cx.propagate();
+            }))
             .on_action(
                 cx.listener(|this, _: &MoveLeft, _, cx| {
                     this.move_selection(Vec2::new(-1., 0.), cx)
@@ -4160,6 +4172,44 @@ mod tests {
         canvas.update(cx, |canvas, cx| canvas.pointer_left(cx));
         cx.run_until_parked();
         assert!(!asked(cx), "stopped, and nothing says they were asked for");
+    }
+
+    /// ⌘R reads the walk again, as in the tree: a canvas on a branch another writer moved
+    /// offers the newer data, and the key takes it.
+    #[gpui::test]
+    async fn cmd_r_reads_the_canvas_again(cx: &mut gpui::TestAppContext) {
+        cx.update(studio_theme::init_test);
+        let (session, served) = graph_store::test_server::followed_session(
+            "node Person {\n  slug: String @key\n  name: String\n}\nedge Knows: Person -> Person\n",
+            |_| serde_json::json!([{ "id": "p1", "label": "Ada", "n": 0 }]),
+            cx,
+        );
+        cx.run_until_parked();
+        let shown = session.clone();
+        let (canvas, cx) = cx.add_window_view(move |_, cx| {
+            GraphCanvas::new(shown.clone(), NodeRef::new("Person", "p1"), None, cx)
+        });
+        let settle = |cx: &mut gpui::VisualTestContext| {
+            for _ in 0..3 {
+                cx.run_until_parked();
+                cx.executor()
+                    .advance_clock(std::time::Duration::from_millis(10));
+            }
+            cx.run_until_parked();
+        };
+        settle(cx);
+        served.lock().unwrap().commit(
+            "c2",
+            vec![graph_store::test_server::node_change("Person", "p1")],
+        );
+        session.update(cx, |session, cx| session.check_heads(cx));
+        settle(cx);
+        let exploration = canvas.read_with(cx, |canvas, _| canvas.exploration.clone());
+        assert!(exploration.read_with(cx, |exploration, _| exploration.newer_available()));
+        cx.update(|window, cx| window.focus(&canvas.focus_handle(cx), cx));
+        cx.dispatch_action(Refresh);
+        settle(cx);
+        assert!(!exploration.read_with(cx, |exploration, _| exploration.newer_available()));
     }
 
     /// A canvas nobody draws (its window is minimized or covered) still answers a reader that
