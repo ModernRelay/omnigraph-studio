@@ -188,6 +188,25 @@ fn drag(
     }
 }
 
+/// One wheel scroll by `(dx, dy)` pixels at `position`, as a pointer delivers it: the event a
+/// `scroll:` step sends once and a `measure:<n>,scroll=` step sends each frame, so a case's setup
+/// and its measured frames scroll alike.
+fn scroll_event(position: gpui::Point<gpui::Pixels>, dx: f32, dy: f32) -> PlatformInput {
+    PlatformInput::Scroll(ScrollEvent {
+        position,
+        delta: ScrollDelta::Pixels(point(px(dx), px(dy))),
+        modifiers: Modifiers::default(),
+        touch_phase: TouchPhase::Moved,
+        source: ScrollSource::Pointer,
+    })
+}
+
+/// The point an `at=<x>:<y>` option names, in window pixels.
+fn at_point(at: &str) -> (f32, f32) {
+    let (x, y) = at.split_once(':').expect("at=<x>:<y>");
+    (x.parse().expect("at x"), y.parse().expect("at y"))
+}
+
 /// `clicks` clicks at `position`, as the platform delivers them: move, then a press and a
 /// release for each, the second of a double click counted as the second.
 fn click(
@@ -799,8 +818,7 @@ fn main() {
                     let (dx, dy) = delta.split_once(':').expect("drag=<dx>:<dy>");
                     drag = Some((dx.parse().expect("drag dx"), dy.parse().expect("drag dy")));
                 } else if let Some(point) = part.strip_prefix("at=") {
-                    let (x, y) = point.split_once(':').expect("at=<x>:<y>");
-                    at = Some((x.parse().expect("at x"), y.parse().expect("at y")));
+                    at = Some(at_point(point));
                 }
             }
             // Input goes to the window's centre, or where `at` puts it: each frame first handles
@@ -862,16 +880,7 @@ fn main() {
                             cx,
                         );
                     } else if let Some((dx, dy)) = scroll {
-                        window.dispatch_event(
-                            PlatformInput::Scroll(ScrollEvent {
-                                position: center,
-                                delta: ScrollDelta::Pixels(point(px(dx * sign), px(dy * sign))),
-                                modifiers: Modifiers::default(),
-                                touch_phase: TouchPhase::Moved,
-                                source: ScrollSource::Pointer,
-                            }),
-                            cx,
-                        );
+                        window.dispatch_event(scroll_event(center, dx * sign, dy * sign), cx);
                     } else if let Some((dx, dy)) = drag {
                         let step = (frame % 30) as f32 + 1.;
                         let along = if sign > 0. { step } else { 30. - step };
@@ -999,22 +1008,13 @@ fn main() {
             let (dx, dy) = (number("dx"), number("dy"));
             let position = match parts.next().and_then(|p| p.strip_prefix("at=")) {
                 Some(at) => {
-                    let (x, y) = at.split_once(':').expect("at=<x>:<y>");
-                    point(px(x.parse().expect("at x")), px(y.parse().expect("at y")))
+                    let (x, y) = at_point(at);
+                    point(px(x), px(y))
                 }
                 None => point(px(width / 2.), px(height / 2.)),
             };
             cx.update_window(handle, |_, window, cx| {
-                window.dispatch_event(
-                    PlatformInput::Scroll(ScrollEvent {
-                        position,
-                        delta: ScrollDelta::Pixels(point(px(dx), px(dy))),
-                        modifiers: Modifiers::default(),
-                        touch_phase: TouchPhase::Moved,
-                        source: ScrollSource::Pointer,
-                    }),
-                    cx,
-                );
+                window.dispatch_event(scroll_event(position, dx, dy), cx);
             })
             .expect("scroll");
             rest(&mut cx, handle, &mut recorder, step_wait);
