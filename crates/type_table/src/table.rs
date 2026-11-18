@@ -10182,6 +10182,9 @@ impl TypeTable {
         if empty {
             // The branch is the status bar's to name. Nodes and edges both add rows at the
             // head; a past commit adds none.
+            // A credential that may not change the branch sees Add Row disabled, saying why, as
+            // the toolbar's Row is.
+            let refused = self.change_refusal(cx);
             let state = if self.filters.is_empty() {
                 studio_ui::ds::empty_state(IconName::Table, format!("No {} rows", self.type_name))
                     .when(self.at_commit.is_none(), |state| {
@@ -10193,6 +10196,10 @@ impl TypeTable {
                                 &self.focus_handle,
                                 cx,
                             )
+                            .disabled(refused.is_some())
+                            .when_some(refused, |button, reason| {
+                                button.tip(studio_ui::ds::tooltip(reason))
+                            })
                             .on_click(cx.listener(
                                 |this, _, window, cx| this.on_insert(&InsertRow, window, cx),
                             )),
