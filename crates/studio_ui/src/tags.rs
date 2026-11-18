@@ -112,10 +112,12 @@ impl Element for Tags {
     /// and boxes centred in a smaller element would be placed from where that element was
     /// before it was put on them, half a pixel off where the boxes were.
     ///
-    /// For the same reason its parent's box must start on a device pixel, as a table's cell
-    /// does: the element is placed from its bounds, and GPUI does not say where they were
-    /// before it rounded them. A box only as high as its contents, centred in a cell, can start
-    /// half a pixel off; [`Tags::tip_fn`] fills the cell for that reason.
+    /// For the same reason its parent's top must be on a device pixel, as a table row's is: the
+    /// element is placed from its bounds, GPUI does not say where they were before it rounded
+    /// them, and the parts are centred down from the top by what can be half a pixel. Across,
+    /// every length is whole device pixels, so a left edge between two rounds as the boxes'
+    /// did. A box only as high as its contents, centred in a cell, can have its top half a
+    /// pixel off; [`Tags::tip_fn`] fills the cell for that reason.
     fn request_layout(
         &mut self,
         _id: Option<&GlobalElementId>,
@@ -480,8 +482,8 @@ mod tests {
 
     /// The same parts drawn twice, one under the other, in a cell's padded box: as the boxes
     /// the table drew before (a row of [`crate::ds::tag`]s, clipped, then the count) and as a
-    /// [`Tags`]. The second cell starts [`PROBE_STEP`] lower, on a whole device pixel at every
-    /// scale, as every cell of the table does. A cell under the pointer carries a tooltip as
+    /// [`Tags`]. The second cell starts [`PROBE_STEP`] lower, its top on a whole device pixel at
+    /// every scale, as every row of the table has. A cell under the pointer carries a tooltip as
     /// the table's does.
     struct Probe {
         width: f32,
