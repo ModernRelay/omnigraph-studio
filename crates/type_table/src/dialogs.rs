@@ -14,7 +14,7 @@ use gpui::{
 };
 use gq_language::{BuiltQuery, Property, ScalarKind, SchemaModel, builder};
 use graph_store::deletes::{self, DeletePlan, UNDO_CAP};
-use graph_store::{DraftKey, FollowUp, GraphSession, Loadable};
+use graph_store::{DraftKey, FollowUp, GraphSession, Loadable, ServerFeature};
 use serde_json::{Map, Value};
 use ui::prelude::*;
 
@@ -246,7 +246,10 @@ fn field_box(editor: &Entity<Editor>, invalid: bool, cx: &App) -> impl IntoEleme
 }
 
 /// The form for a new node, generated from the node's shape: the key first, then required
-/// properties, then optional ones. Blob and Vector values are not entered here.
+/// properties, then optional ones. Blob and Vector values are not entered here. On a server
+/// that checks `@card` minimums on every write (Omnigraph 0.15,
+/// [`ServerFeature::CardMinimumOnEveryWrite`]), it also asks for each edge the node must have,
+/// and saves the node with them in one mutation; a 0.14 server takes the node alone.
 pub struct InsertRowModal {
     table: WeakEntity<TypeTable>,
     session: Entity<GraphSession>,
@@ -254,11 +257,19 @@ pub struct InsertRowModal {
     type_name: String,
     branch: String,
     fields: Vec<Field>,
+    /// The edges the new node must have, one field per edge its minimum asks for.
+    required: Vec<Required>,
     blocked: Option<String>,
     notice: Option<Notice>,
     saving: bool,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
+}
+
+/// One edge a new node must be saved with: its type, and the node at its other end.
+struct Required {
+    edge: String,
+    endpoint: Endpoint,
 }
 
 impl EventEmitter<DismissEvent> for InsertRowModal {}
@@ -288,15 +299,64 @@ impl InsertForm for InsertRowModal {
         self.blocked.as_deref()
     }
 
+    /// ↵ picks the highlighted node in a relationship's field, and inserts otherwise.
+    fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.confirm_pick(window, cx) {
+            self.submit(window, cx);
+        }
+    }
+
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.saving || self.blocked.is_some() || self.held_back() {
             return;
         }
-        let Some(values) = field_values(&mut self.fields, cx) else {
+        let values = field_values(&mut self.fields, cx);
+        let mut ends = Vec::new();
+        let mut valid = values.is_some();
+        for required in &mut self.required {
+            let id = required.endpoint.editor.read(cx).text(cx).trim().to_owned();
+            if id.is_empty() {
+                required.endpoint.error = Some(format!("Pick a {}.", required.endpoint.type_name));
+                valid = false;
+            }
+            ends.push((required.edge.clone(), id));
+        }
+        let Some(values) = values.filter(|_| valid) else {
             cx.notify();
             return;
         };
-        let query = match builder::insert_node(&self.schema, &self.type_name, &values) {
+        let key_name = self
+            .schema
+            .node(&self.type_name)
+            .and_then(|node| node.key.clone());
+        let key_value = key_name
+            .as_ref()
+            .and_then(|key| values.iter().find(|(name, _)| name == key))
+            .map(|(_, value)| value.clone());
+        let built = (|| {
+            let mut parts = vec![builder::insert_node(
+                &self.schema,
+                &self.type_name,
+                &values,
+            )?];
+            if !ends.is_empty() {
+                // The new node is named by its key's value, which the form requires.
+                let id = match &key_value {
+                    Some(Value::String(id)) => id.clone(),
+                    Some(other) => other.to_string(),
+                    None => {
+                        return Err(gq_language::builder::BuildError::NoValues(
+                            self.type_name.clone(),
+                        ));
+                    }
+                };
+                for (edge, to) in &ends {
+                    parts.push(builder::insert_edge(&self.schema, edge, &id, to, &[])?);
+                }
+            }
+            Ok(graph_store::fixes::compose("studio_insert", parts))
+        })();
+        let query = match built {
             Ok(query) => query,
             Err(error) => {
                 self.notice = Some(Notice::new(Tone::Invalid, error.to_string()));
@@ -304,16 +364,21 @@ impl InsertForm for InsertRowModal {
                 return;
             }
         };
-        let key = self
-            .schema
-            .node(&self.type_name)
-            .and_then(|node| node.key.clone())
-            .and_then(|key| values.iter().find(|(name, _)| *name == key))
-            .and_then(|(_, value)| value.as_str().map(str::to_owned));
-        let description = match &key {
+        let key = key_value
+            .as_ref()
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let mut description = match &key {
             Some(key) => format!("Insert {} {key}", self.type_name),
             None => format!("Insert {}", self.type_name),
         };
+        if !ends.is_empty() {
+            let with: Vec<String> = ends
+                .iter()
+                .map(|(edge, to)| format!("{edge} → {to}"))
+                .collect();
+            description = format!("{description} with {}", with.join(", "));
+        }
         // Not `saving`: the dialog closes as the write goes ([`send_insert`]).
         self.notice = None;
         let values: Map<String, Value> = values.into_iter().collect();
@@ -330,18 +395,27 @@ impl InsertForm for InsertRowModal {
         );
     }
 
-    /// Tab and shift-tab move between fields.
+    /// Tab and shift-tab move through the properties, then the relationships.
     fn focus_step(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
-        if self.fields.is_empty() {
-            return;
-        }
-        let current = self
+        let mut handles: Vec<FocusHandle> = self
             .fields
             .iter()
-            .position(|field| field.editor.focus_handle(cx).is_focused(window))
+            .map(|f| f.editor.focus_handle(cx))
+            .collect();
+        handles.extend(
+            self.required
+                .iter()
+                .map(|r| r.endpoint.editor.focus_handle(cx)),
+        );
+        if handles.is_empty() {
+            return;
+        }
+        let current = handles
+            .iter()
+            .position(|handle| handle.is_focused(window))
             .unwrap_or(0) as isize;
-        let next = (current + step).rem_euclid(self.fields.len() as isize) as usize;
-        window.focus(&self.fields[next].editor.focus_handle(cx), cx);
+        let next = (current + step).rem_euclid(handles.len() as isize) as usize;
+        window.focus(&handles[next], cx);
     }
 }
 
@@ -356,6 +430,36 @@ impl Focusable for InsertRowModal {
     }
 }
 
+impl NodeFields for InsertRowModal {
+    type Slot = usize;
+
+    fn slots(&self) -> Vec<usize> {
+        (0..self.required.len()).collect()
+    }
+
+    fn endpoint(&self, slot: usize) -> &Endpoint {
+        &self.required[slot].endpoint
+    }
+
+    fn endpoint_mut(&mut self, slot: usize) -> &mut Endpoint {
+        &mut self.required[slot].endpoint
+    }
+
+    fn slot_id(slot: usize) -> usize {
+        slot
+    }
+
+    fn searched(&self) -> (Entity<GraphSession>, Option<String>) {
+        (self.session.clone(), None)
+    }
+
+    fn after_pick(&self, slot: usize, cx: &App) -> Option<FocusHandle> {
+        self.required
+            .get(slot + 1)
+            .map(|next| next.endpoint.editor.focus_handle(cx))
+    }
+}
+
 impl InsertRowModal {
     pub fn new(
         table: WeakEntity<TypeTable>,
@@ -366,13 +470,29 @@ impl InsertRowModal {
         cx: &mut Context<Self>,
     ) -> Self {
         let branch = session.read(cx).branch.clone();
-        let properties: Vec<Property> = schema
-            .node(&type_name)
-            .map(|node| node.properties.clone())
-            .unwrap_or_default();
+        let node = schema.node(&type_name);
+        let properties: Vec<Property> =
+            node.map(|node| node.properties.clone()).unwrap_or_default();
         let (properties, blocked) = form_properties(&type_name, properties, true);
+        let checks_card = session
+            .read(cx)
+            .features(cx)
+            .has(ServerFeature::CardMinimumOnEveryWrite);
+        let (needed, card_blocked) = if checks_card {
+            required_relationships(&schema, &type_name)
+        } else {
+            (Vec::new(), None)
+        };
         let mut subscriptions = Vec::new();
         let fields = property_fields(properties, &mut subscriptions, window, cx);
+        let required = needed
+            .into_iter()
+            .enumerate()
+            .map(|(slot, (edge, target))| Required {
+                endpoint: new_endpoint(slot, target, &mut subscriptions, window, cx),
+                edge,
+            })
+            .collect();
         Self {
             table,
             session,
@@ -380,13 +500,68 @@ impl InsertRowModal {
             type_name,
             branch,
             fields,
-            blocked,
+            required,
+            blocked: blocked.or(card_blocked),
             notice: None,
             saving: false,
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
         }
     }
+}
+
+/// The edges a new `type_name` must be saved with, as (edge, target type), one for each edge a
+/// minimum asks for; and why the dialog cannot save one at all: the node has no single key to
+/// name it by in its edges, or a required edge has a property the dialog does not take.
+fn required_relationships(
+    schema: &SchemaModel,
+    type_name: &str,
+) -> (Vec<(String, String)>, Option<String>) {
+    let required = schema.required_edges(type_name);
+    if required.is_empty() {
+        return (Vec::new(), None);
+    }
+    let names = || {
+        required
+            .iter()
+            .map(|edge| edge.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if schema
+        .node(type_name)
+        .and_then(|node| node.key.as_ref())
+        .is_none()
+    {
+        return (
+            Vec::new(),
+            Some(format!(
+                "Each {type_name} needs {}, saved with it, and has no single key to name it by; \
+                 insert it with a query.",
+                names()
+            )),
+        );
+    }
+    if let Some(edge) = required
+        .iter()
+        .find(|edge| edge.properties.iter().any(|p| !p.nullable))
+    {
+        return (
+            Vec::new(),
+            Some(format!(
+                "Each {type_name} needs a {} saved with it, which takes values this dialog does \
+                 not; insert it with a query.",
+                edge.name
+            )),
+        );
+    }
+    let needed = required
+        .iter()
+        .flat_map(|edge| {
+            std::iter::repeat_n((edge.name.clone(), edge.to.clone()), edge.min as usize)
+        })
+        .collect();
+    (needed, None)
 }
 
 fn placeholder(property: &Property) -> String {
@@ -432,18 +607,25 @@ fn render_field(field: &Field, cx: &App) -> AnyElement {
 }
 
 impl Render for InsertRowModal {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        insert_dialog(self, "InsertRowModal", Vec::new(), cx)
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let required: Vec<AnyElement> = (0..self.required.len())
+            .map(|slot| {
+                let label = self.required[slot].edge.clone();
+                self.render_endpoint(slot, &label, window, cx)
+            })
+            .collect();
+        insert_dialog(self, "InsertRowModal", (Vec::new(), required), cx)
     }
 }
 
 /// An insert dialog: its title over the branch it writes to; `leading` (an edge's endpoints),
-/// then the property fields; why it cannot insert, and the last write's outcome; and Cancel,
-/// History while that outcome is unknown, and Insert. `context` is its key context.
+/// the property fields, then `trailing` (a new node's required relationships); why it cannot
+/// insert, and the last write's outcome; and Cancel, History while that outcome is unknown, and
+/// Insert. `context` is its key context.
 fn insert_dialog<V: InsertForm>(
     this: &mut V,
     context: &'static str,
-    leading: Vec<AnyElement>,
+    (leading, trailing): (Vec<AnyElement>, Vec<AnyElement>),
     cx: &mut Context<V>,
 ) -> Div {
     let fields: Vec<AnyElement> = this
@@ -482,6 +664,7 @@ fn insert_dialog<V: InsertForm>(
             modal_body()
                 .children(leading)
                 .children(fields)
+                .children(trailing)
                 .children(blocked.clone().map(studio_ui::ds::text::error))
                 .children(notice.map(|notice| {
                     studio_ui::ds::text::body(notice.message).color(notice.tone.color())
@@ -506,8 +689,8 @@ fn insert_dialog<V: InsertForm>(
         )
 }
 
-/// One end of a new edge: a node of `type_name`, searched by id or label while it is typed, at
-/// the commit the table was read at.
+/// A field that names a node of `type_name`, searched by id or label while it is typed: an
+/// edge's end, or a relationship a new node is saved with.
 struct Endpoint {
     type_name: String,
     editor: Entity<Editor>,
@@ -521,6 +704,211 @@ struct Endpoint {
     /// The text `offers` answers; while it differs from the field, a search is out.
     answers: Option<String>,
     error: Option<String>,
+}
+
+/// A node field for `slot`, which lets go of its error and searches as it is edited.
+fn new_endpoint<T: NodeFields + InsertForm>(
+    slot: T::Slot,
+    type_name: String,
+    subscriptions: &mut Vec<Subscription>,
+    window: &mut Window,
+    cx: &mut Context<T>,
+) -> Endpoint {
+    let editor = cx.new(|cx| {
+        let mut editor = Editor::single_line(window, cx);
+        editor.set_placeholder_text(&format!("A {type_name}, by name or id"), window, cx);
+        editor
+    });
+    subscriptions.push(
+        cx.subscribe(&editor, move |this: &mut T, _, event: &EditorEvent, cx| {
+            if let EditorEvent::BufferEdited = event {
+                this.endpoint_mut(slot).error = None;
+                this.form_changed();
+                this.search(slot, cx);
+            }
+        }),
+    );
+    Endpoint {
+        type_name,
+        editor,
+        offers: Offers::default(),
+        picked: None,
+        generation: 0,
+        search: None,
+        // An empty field answers itself: nothing is being looked up.
+        answers: Some(String::new()),
+        error: None,
+    }
+}
+
+/// A form with node fields ([`Endpoint`]), each in a slot: search as typed, ↑/↓ through what is
+/// offered, ↵ to pick.
+trait NodeFields: Sized + 'static {
+    type Slot: Copy + PartialEq + 'static;
+    fn slots(&self) -> Vec<Self::Slot>;
+    fn endpoint(&self, slot: Self::Slot) -> &Endpoint;
+    fn endpoint_mut(&mut self, slot: Self::Slot) -> &mut Endpoint;
+    /// A number for the slot, for its suggestions' element ids.
+    fn slot_id(slot: Self::Slot) -> usize;
+    /// The session searches read, and the commit, when the form reads one.
+    fn searched(&self) -> (Entity<GraphSession>, Option<String>);
+    /// What takes focus once a node is picked in `slot`.
+    fn after_pick(&self, slot: Self::Slot, cx: &App) -> Option<FocusHandle>;
+
+    /// The slot whose field has focus.
+    fn focused_slot(&self, window: &Window, cx: &App) -> Option<Self::Slot> {
+        self.slots().into_iter().find(|slot| {
+            self.endpoint(*slot)
+                .editor
+                .focus_handle(cx)
+                .is_focused(window)
+        })
+    }
+
+    /// ↵ in a node field picks its highlighted node; whether it did. While the field's search
+    /// is out it waits, saying it did: the nodes offered were found for earlier text.
+    fn confirm_pick(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(slot) = self.focused_slot(window, cx) else {
+            return false;
+        };
+        let endpoint = self.endpoint(slot);
+        let typed = endpoint.editor.read(cx).text(cx);
+        if endpoint.answers.as_deref() != Some(typed.trim()) {
+            return true;
+        }
+        match endpoint.offers.highlighted() {
+            Some(index) => {
+                self.pick(slot, index, window, cx);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Searches the slot's type for its text once typing pauses.
+    fn search(&mut self, slot: Self::Slot, cx: &mut Context<Self>) {
+        let (session, snapshot) = self.searched();
+        let endpoint = self.endpoint_mut(slot);
+        let text = endpoint.editor.read(cx).text(cx).trim().to_owned();
+        endpoint.generation += 1;
+        let generation = endpoint.generation;
+        if text.is_empty() || endpoint.picked.as_deref() == Some(text.as_str()) {
+            endpoint.offers.clear();
+            endpoint.search = None;
+            endpoint.answers = Some(text);
+            cx.notify();
+            return;
+        }
+        endpoint.picked = None;
+        let search = suggest::search_nodes(&session, &endpoint.type_name, &text, snapshot, cx);
+        endpoint.search = Some(cx.spawn(async move |this, cx| {
+            let result = search.await;
+            this.update(cx, |this, cx| {
+                let endpoint = this.endpoint_mut(slot);
+                if endpoint.generation != generation {
+                    return;
+                }
+                // A failed search offers nothing, not what an earlier one found.
+                match result {
+                    Ok(hits) => endpoint.offers.set(suggest::from_hits(&hits), true),
+                    Err(_) => endpoint.offers.clear(),
+                }
+                endpoint.answers = Some(text);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// ↑/↓ in a node field: highlights another node.
+    fn move_suggestion(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(slot) = self.focused_slot(window, cx) else {
+            return;
+        };
+        if self.endpoint_mut(slot).offers.step(step) {
+            cx.notify();
+        }
+    }
+
+    /// Puts a node's id in its field and moves to the next field.
+    fn pick(
+        &mut self,
+        slot: Self::Slot,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let endpoint = self.endpoint_mut(slot);
+        let Some(suggestion) = endpoint.offers.get(index).cloned() else {
+            return;
+        };
+        endpoint.picked = Some(suggestion.value.clone());
+        endpoint.offers.clear();
+        let editor = endpoint.editor.clone();
+        editor.update(cx, |editor, cx| {
+            editor.set_text(suggestion.value, window, cx);
+            // Not `move_to_end`: in a single-line editor it only propagates, and the ↵ that
+            // picked would then also be typed into the field.
+            let end = editor.buffer().read(cx).read(cx).len();
+            editor.change_selections(Default::default(), window, cx, |s| {
+                s.select_ranges(vec![end..end])
+            });
+        });
+        if let Some(next) = self.after_pick(slot, cx) {
+            window.focus(&next, cx);
+        }
+        cx.notify();
+    }
+
+    fn render_endpoint(
+        &self,
+        slot: Self::Slot,
+        label: &str,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let endpoint = self.endpoint(slot);
+        let focused = endpoint.editor.focus_handle(cx).is_focused(window);
+        let offers = (focused && !endpoint.offers.is_empty()).then(|| {
+            let pick = cx.listener(move |this, index: &usize, window, cx| {
+                this.pick(slot, *index, window, cx)
+            });
+            studio_ui::ds::row_list(cx)
+                .id(("endpoint-suggestions", Self::slot_id(slot)))
+                .max_h(px(studio_ui::ds::size::LIST_MAX_HEIGHT))
+                .overflow_y_scroll()
+                .children(endpoint.offers.rows(
+                    "endpoint-suggestion",
+                    Rc::new(move |index, window, cx| pick(&index, window, cx)),
+                    cx,
+                ))
+        });
+        v_flex()
+            .gap(px(studio_ui::ds::space::XS))
+            .child(
+                h_flex()
+                    .gap(px(studio_ui::ds::space::MD))
+                    .child(studio_ui::ds::text::body(label.to_owned()))
+                    .child(studio_ui::ds::text::meta(endpoint.type_name.clone()))
+                    .child(studio_ui::ds::text::meta("required")),
+            )
+            .child(
+                div()
+                    .key_context("EdgeEndpoint")
+                    .on_action(cx.listener(|this, _: &SelectNextSuggestion, window, cx| {
+                        this.move_suggestion(1, window, cx)
+                    }))
+                    .on_action(
+                        cx.listener(|this, _: &SelectPreviousSuggestion, window, cx| {
+                            this.move_suggestion(-1, window, cx)
+                        }),
+                    )
+                    .child(field_box(&endpoint.editor, endpoint.error.is_some(), cx)),
+            )
+            .children(offers)
+            .children(endpoint.error.clone().map(studio_ui::ds::text::error_note))
+            .into_any_element()
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -577,20 +965,10 @@ impl InsertForm for InsertEdgeModal {
     /// ↵ picks the highlighted node in an endpoint field, and inserts otherwise. While the
     /// field's search is out it waits: the nodes offered were found for earlier text.
     fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(end) = self.focused_end(window, cx) {
-            let endpoint = self.endpoint_mut(end);
-            let typed = endpoint.editor.read(cx).text(cx);
-            if endpoint.answers.as_deref() != Some(typed.trim()) {
-                return;
-            }
-            if let Some(index) = endpoint.offers.highlighted() {
-                self.pick(end, index, window, cx);
-                return;
-            }
+        if !self.confirm_pick(window, cx) {
+            self.submit(window, cx);
         }
-        self.submit(window, cx);
     }
-
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.saving || self.blocked.is_some() || self.held_back() {
             return;
@@ -679,36 +1057,8 @@ impl InsertEdgeModal {
         let properties: Vec<Property> = edge.map(|edge| edge.properties).unwrap_or_default();
         let (properties, blocked) = form_properties(&edge_name, properties, false);
         let mut subscriptions = Vec::new();
-        let mut endpoint = |end: End, type_name: String, cx: &mut Context<Self>| {
-            let editor = cx.new(|cx| {
-                let mut editor = Editor::single_line(window, cx);
-                editor.set_placeholder_text(&format!("A {type_name}, by name or id"), window, cx);
-                editor
-            });
-            subscriptions.push(cx.subscribe(
-                &editor,
-                move |this: &mut Self, _, event: &EditorEvent, cx| {
-                    if let EditorEvent::BufferEdited = event {
-                        this.endpoint_mut(end).error = None;
-                        this.form_changed();
-                        this.search(end, cx);
-                    }
-                },
-            ));
-            Endpoint {
-                type_name,
-                editor,
-                offers: Offers::default(),
-                picked: None,
-                generation: 0,
-                search: None,
-                // An empty field answers itself: nothing is being looked up.
-                answers: Some(String::new()),
-                error: None,
-            }
-        };
-        let from = endpoint(End::From, from_type, cx);
-        let to = endpoint(End::To, to_type, cx);
+        let from = new_endpoint(End::From, from_type, &mut subscriptions, window, cx);
+        let to = new_endpoint(End::To, to_type, &mut subscriptions, window, cx);
         let fields = property_fields(properties, &mut subscriptions, window, cx);
         Self {
             table,
@@ -726,150 +1076,42 @@ impl InsertEdgeModal {
             _subscriptions: subscriptions,
         }
     }
+}
 
-    fn endpoint_mut(&mut self, end: End) -> &mut Endpoint {
-        match end {
+impl NodeFields for InsertEdgeModal {
+    type Slot = End;
+
+    fn slots(&self) -> Vec<End> {
+        vec![End::From, End::To]
+    }
+
+    fn endpoint(&self, slot: End) -> &Endpoint {
+        match slot {
+            End::From => &self.from,
+            End::To => &self.to,
+        }
+    }
+
+    fn endpoint_mut(&mut self, slot: End) -> &mut Endpoint {
+        match slot {
             End::From => &mut self.from,
             End::To => &mut self.to,
         }
     }
 
-    /// The endpoint whose field has focus.
-    fn focused_end(&self, window: &Window, cx: &App) -> Option<End> {
-        [End::From, End::To].into_iter().find(|end| {
-            let endpoint = match end {
-                End::From => &self.from,
-                End::To => &self.to,
-            };
-            endpoint.editor.focus_handle(cx).is_focused(window)
-        })
+    fn slot_id(slot: End) -> usize {
+        slot as usize
     }
 
-    /// Searches the endpoint's type for its text once typing pauses.
-    fn search(&mut self, end: End, cx: &mut Context<Self>) {
-        let session = self.session.clone();
-        let snapshot = self.snapshot.clone();
-        let endpoint = self.endpoint_mut(end);
-        let text = endpoint.editor.read(cx).text(cx).trim().to_owned();
-        endpoint.generation += 1;
-        let generation = endpoint.generation;
-        if text.is_empty() || endpoint.picked.as_deref() == Some(text.as_str()) {
-            endpoint.offers.clear();
-            endpoint.search = None;
-            endpoint.answers = Some(text);
-            cx.notify();
-            return;
-        }
-        endpoint.picked = None;
-        let search = suggest::search_nodes(&session, &endpoint.type_name, &text, snapshot, cx);
-        endpoint.search = Some(cx.spawn(async move |this, cx| {
-            let result = search.await;
-            this.update(cx, |this, cx| {
-                let endpoint = this.endpoint_mut(end);
-                if endpoint.generation != generation {
-                    return;
-                }
-                // A failed search offers nothing, not what an earlier one found.
-                match result {
-                    Ok(hits) => endpoint.offers.set(suggest::from_hits(&hits), true),
-                    Err(_) => endpoint.offers.clear(),
-                }
-                endpoint.answers = Some(text);
-                cx.notify();
-            })
-            .ok();
-        }));
+    fn searched(&self) -> (Entity<GraphSession>, Option<String>) {
+        (self.session.clone(), self.snapshot.clone())
     }
 
-    /// ↑/↓ in an endpoint field: highlights another node.
-    fn move_suggestion(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(end) = self.focused_end(window, cx) else {
-            return;
-        };
-        if self.endpoint_mut(end).offers.step(step) {
-            cx.notify();
-        }
-    }
-
-    /// Puts a node's id in its endpoint field and moves to the next field.
-    fn pick(&mut self, end: End, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let endpoint = self.endpoint_mut(end);
-        let Some(suggestion) = endpoint.offers.get(index).cloned() else {
-            return;
-        };
-        endpoint.picked = Some(suggestion.value.clone());
-        endpoint.offers.clear();
-        let editor = endpoint.editor.clone();
-        editor.update(cx, |editor, cx| {
-            editor.set_text(suggestion.value, window, cx);
-            // Not `move_to_end`: in a single-line editor it only propagates, and the ↵ that
-            // picked would then also be typed into the field.
-            let end = editor.buffer().read(cx).read(cx).len();
-            editor.change_selections(Default::default(), window, cx, |s| {
-                s.select_ranges(vec![end..end])
-            });
-        });
-        let next = match end {
+    fn after_pick(&self, slot: End, cx: &App) -> Option<FocusHandle> {
+        match slot {
             End::From => Some(self.to.editor.focus_handle(cx)),
             End::To => self.fields.first().map(|f| f.editor.focus_handle(cx)),
-        };
-        if let Some(next) = next {
-            window.focus(&next, cx);
         }
-        cx.notify();
-    }
-
-    fn render_endpoint(
-        &self,
-        end: End,
-        label: &str,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let endpoint = match end {
-            End::From => &self.from,
-            End::To => &self.to,
-        };
-        let focused = endpoint.editor.focus_handle(cx).is_focused(window);
-        let offers = (focused && !endpoint.offers.is_empty()).then(|| {
-            let pick = cx.listener(move |this, index: &usize, window, cx| {
-                this.pick(end, *index, window, cx)
-            });
-            studio_ui::ds::row_list(cx)
-                .id(("endpoint-suggestions", end as usize))
-                .max_h(px(studio_ui::ds::size::LIST_MAX_HEIGHT))
-                .overflow_y_scroll()
-                .children(endpoint.offers.rows(
-                    "endpoint-suggestion",
-                    Rc::new(move |index, window, cx| pick(&index, window, cx)),
-                    cx,
-                ))
-        });
-        v_flex()
-            .gap(px(studio_ui::ds::space::XS))
-            .child(
-                h_flex()
-                    .gap(px(studio_ui::ds::space::MD))
-                    .child(studio_ui::ds::text::body(label.to_owned()))
-                    .child(studio_ui::ds::text::meta(endpoint.type_name.clone()))
-                    .child(studio_ui::ds::text::meta("required")),
-            )
-            .child(
-                div()
-                    .key_context("EdgeEndpoint")
-                    .on_action(cx.listener(|this, _: &SelectNextSuggestion, window, cx| {
-                        this.move_suggestion(1, window, cx)
-                    }))
-                    .on_action(
-                        cx.listener(|this, _: &SelectPreviousSuggestion, window, cx| {
-                            this.move_suggestion(-1, window, cx)
-                        }),
-                    )
-                    .child(field_box(&endpoint.editor, endpoint.error.is_some(), cx)),
-            )
-            .children(offers)
-            .children(endpoint.error.clone().map(studio_ui::ds::text::error_note))
-            .into_any_element()
     }
 }
 
@@ -877,7 +1119,7 @@ impl Render for InsertEdgeModal {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let from = self.render_endpoint(End::From, "From", window, cx);
         let to = self.render_endpoint(End::To, "To", window, cx);
-        insert_dialog(self, "InsertEdgeModal", vec![from, to], cx)
+        insert_dialog(self, "InsertEdgeModal", (vec![from, to], Vec::new()), cx)
     }
 }
 
@@ -1838,6 +2080,122 @@ mod tests {
                     );
                 }
             });
+        }
+    }
+
+    const MEMBERS: &str = "node Team {\n  slug: String @key\n  name: String\n}\n\
+        node Member {\n  slug: String @key\n  name: String\n}\n\
+        node Note {\n  text: String\n}\n\
+        edge MemberOf: Member -> Team @card(1..)\n\
+        edge About: Note -> Team @card(1..)\n";
+
+    /// A new node's required edge: a server that checks `@card` minimums on every write
+    /// (Omnigraph 0.15) gets the node and its edge in one mutation, and the dialog asks for the
+    /// edge's other end before it sends anything; a 0.14 server, which takes the node alone, gets
+    /// the dialog as before. A type with no key to name the node by in its edges cannot be
+    /// inserted from the dialog on 0.15.
+    #[gpui::test]
+    async fn a_new_node_is_saved_with_the_edges_its_minimum_needs(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+            editor::init(cx);
+        });
+        for version in ["0.15.0", "0.14.0"] {
+            let (session, sent) = crate::test_support::session_recording_writes(MEMBERS, cx);
+            let connection = session.read_with(cx, |session, _| session.connection.clone());
+            connection.update(cx, |connection, cx| {
+                connection.set_features(graph_store::ServerFeatures::of(Some(version)), cx)
+            });
+            let (workspace, cx) = cx.add_window_view(studio_workspace::Workspace::new);
+            let table = workspace.update_in(cx, |_, window, cx| {
+                let workspace = cx.entity().downgrade();
+                cx.new(|cx| {
+                    TypeTable::new(
+                        workspace,
+                        session.clone(),
+                        "Member".into(),
+                        None,
+                        window,
+                        cx,
+                    )
+                })
+            });
+            cx.run_until_parked();
+            let schema = Arc::new(SchemaModel::parse(MEMBERS).unwrap());
+            let open = |type_name: &str, cx: &mut gpui::VisualTestContext| {
+                let modal = cx.new_window_entity(|window, cx| {
+                    InsertRowModal::new(
+                        table.downgrade(),
+                        session.clone(),
+                        schema.clone(),
+                        type_name.into(),
+                        window,
+                        cx,
+                    )
+                });
+                cx.run_until_parked();
+                modal
+            };
+            let checks = version == "0.15.0";
+
+            let note = open("Note", cx);
+            note.read_with(cx, |note, _| {
+                assert_eq!(
+                    note.blocked.is_some(),
+                    checks,
+                    "{version}: {:?}",
+                    note.blocked
+                );
+            });
+
+            let modal = open("Member", cx);
+            modal.read_with(cx, |modal, _| {
+                assert_eq!(modal.required.len(), usize::from(checks), "{version}");
+                assert!(modal.blocked.is_none());
+            });
+            modal.update_in(cx, |modal, window, cx| {
+                for (field, text) in modal.fields.iter().zip(["bo", "Bo"]) {
+                    field
+                        .editor
+                        .update(cx, |editor, cx| editor.set_text(text, window, cx));
+                }
+                modal.submit(window, cx);
+            });
+            cx.run_until_parked();
+            if checks {
+                modal.read_with(cx, |modal, _| {
+                    assert_eq!(
+                        modal.required[0].endpoint.error.as_deref(),
+                        Some("Pick a Team."),
+                        "asked for before anything is sent"
+                    );
+                });
+                assert!(sent.lock().unwrap().is_empty(), "nothing sent");
+                modal.update_in(cx, |modal, window, cx| {
+                    modal.required[0]
+                        .endpoint
+                        .editor
+                        .update(cx, |editor, cx| editor.set_text("core", window, cx));
+                    modal.submit(window, cx);
+                });
+                cx.run_until_parked();
+            }
+            let writes = std::mem::take(&mut *sent.lock().unwrap());
+            assert_eq!(writes.len(), 1, "{version}: one mutation");
+            let query = writes[0]["query"].as_str().unwrap();
+            assert!(query.contains("insert Member"), "{query}");
+            assert_eq!(
+                query.contains("insert MemberOf"),
+                checks,
+                "{version}: {query}"
+            );
+            if checks {
+                let params = writes[0]["params"].as_object().unwrap();
+                let values: Vec<&Value> = params.values().collect();
+                assert!(values.contains(&&Value::from("core")), "{params:?}");
+                assert!(values.contains(&&Value::from("bo")), "{params:?}");
+            }
         }
     }
 

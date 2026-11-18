@@ -346,6 +346,16 @@ impl SchemaModel {
         }
     }
 
+    /// The edges each node of `node_type` must have at least one of (`@card(n..)`, `n` above 0,
+    /// from `node_type`), in declared order. From Omnigraph 0.15 every write that inserts or
+    /// updates such a node checks them, so a new one is saved with its edges in one mutation.
+    pub fn required_edges(&self, node_type: &str) -> Vec<&EdgeType> {
+        self.edges
+            .iter()
+            .filter(|edge| edge.from == node_type && edge.min > 0)
+            .collect()
+    }
+
     pub fn edge(&self, name: &str) -> Option<&EdgeType> {
         self.edges.get(*self.edge_index.get(name)?)
     }

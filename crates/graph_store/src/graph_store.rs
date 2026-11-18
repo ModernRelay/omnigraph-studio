@@ -52,6 +52,7 @@ pub use entity_groups::{
 pub use exploration::*;
 pub use fixes::{RevertUnavailable, revert_query};
 pub use graph_client::api::{AccessAction, EntityKind};
+pub use refusal::CardViolation;
 pub use registry::ConnectionRegistry;
 pub use server_features::{FEATURES, OLDEST_SUPPORTED, ServerFeature, ServerFeatures};
 

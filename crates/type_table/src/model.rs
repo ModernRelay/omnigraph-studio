@@ -1057,6 +1057,23 @@ pub enum SaveResult {
 
 pub const UNKNOWN_MESSAGE: &str = "Check History before trying again; your changes are still here";
 
+/// What a write whose outcome is unknown says. A refusal for an `@card` bound says which, in
+/// words: Omnigraph answers one with `effects: unknown` though it wrote nothing (spec 012, E52),
+/// so the outcome stays unknown, but the person learns what to change.
+pub(crate) fn unknown_notice(reason: &str) -> Notice {
+    match graph_store::CardViolation::find(reason) {
+        Some(violation) => Notice::new(
+            Tone::Unknown,
+            format!(
+                "The server answered that {}, but not whether anything was saved. \
+                 {UNKNOWN_MESSAGE}.",
+                violation.sentence()
+            ),
+        ),
+        None => Notice::new(Tone::Unknown, UNKNOWN_MESSAGE),
+    }
+}
+
 /// What a write never sent says: why, and that nothing was written.
 pub(crate) fn not_sent_notice(reason: &str) -> Notice {
     Notice::new(
@@ -1088,9 +1105,7 @@ pub fn save_result(outcome: &WriteOutcome<ChangeOutput>, branch: &str) -> SaveRe
             branch,
         )),
         WriteOutcome::NotSent { reason } => SaveResult::Refused(not_sent_notice(reason)),
-        WriteOutcome::Unknown { .. } => {
-            SaveResult::Unknown(Notice::new(Tone::Unknown, UNKNOWN_MESSAGE))
-        }
+        WriteOutcome::Unknown { reason } => SaveResult::Unknown(unknown_notice(reason)),
     }
 }
 
@@ -1828,6 +1843,27 @@ mod tests {
                 "main"
             ),
             SaveResult::Unknown(Notice::new(Tone::Unknown, UNKNOWN_MESSAGE))
+        );
+        // A refusal for an `@card` bound, which the server answers with `effects: unknown`
+        // (spec 012, E52): still unknown, but it says which bound, so the person knows what to add.
+        assert_eq!(
+            save_result(
+                &WriteOutcome::Unknown {
+                    reason: "the server answered 400 Bad Request and could not say whether the \
+                             change was made: @card violation on edge MemberOf: source 'bo' has \
+                             0 edges (min 1)"
+                        .into()
+                },
+                "main"
+            ),
+            SaveResult::Unknown(Notice::new(
+                Tone::Unknown,
+                format!(
+                    "The server answered that bo would have 0 edges of MemberOf, and the schema \
+                     allows each one at least 1, but not whether anything was saved. \
+                     {UNKNOWN_MESSAGE}."
+                )
+            ))
         );
         // Never sent (the target retired): nothing was written, said as a refusal, not unknown.
         assert_eq!(
