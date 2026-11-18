@@ -4988,10 +4988,12 @@ impl Render for ReviewView {
                         }
                     }))
             })
-            // Merge is registered only while the credential may merge (constitution VIII).
-            .when(self.merge_refusal(cx).is_none(), |view| {
-                view.on_action(cx.listener(|this, _: &Merge, _, cx| this.merge(cx)))
-            })
+            // Merge is registered only while the credential may merge and nothing blocks it,
+            // as its button says (constitution VIII).
+            .when(
+                self.merge_refusal(cx).is_none() && self.mergeable(cx),
+                |view| view.on_action(cx.listener(|this, _: &Merge, _, cx| this.merge(cx))),
+            )
             // Unfolding a change and summarizing the review write nothing: they work whatever
             // the credential may merge, as their buttons and row clicks do.
             .on_action(cx.listener(|this, _: &Summarize, _, cx| this.summarize(cx)))
@@ -6762,6 +6764,30 @@ pub(crate) mod tests {
                 assert!(view.reviewed_keys.is_empty(), "nor its marks");
             });
         }
+    }
+
+    /// Merge is offered by key and in the palette only while it can run: not on a review of
+    /// one commit, whose button is disabled saying to review them all.
+    #[gpui::test]
+    async fn merge_is_offered_only_while_it_can_run(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, _) = review_server(false, None, "f2", |_| (500, json!({})), cx);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            ReviewView::new(session, "feature".into(), "main".into(), window, cx)
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.focus(&view.focus_handle(cx), cx));
+        cx.run_until_parked();
+        assert!(cx.update(|window, cx| window.is_action_available(&Merge, cx)));
+        view.update(cx, |view, cx| {
+            view.scope = Some("f1".into());
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(!cx.update(|window, cx| window.is_action_available(&Merge, cx)));
     }
 
     /// A merge the access route says the credential may not make is not offered: Merge is
