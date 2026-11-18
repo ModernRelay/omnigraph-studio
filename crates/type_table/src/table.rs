@@ -3538,13 +3538,17 @@ impl TypeTable {
     fn render_views_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let views = self.saved_views(cx);
         let active = self.active_view(&views);
+        let active_id = active
+            .as_ref()
+            .and_then(|name| views.iter().find(|view| &view.name == name))
+            .map(|view| view.key());
         let can_save = !self.filters.is_empty()
             || self.sort.is_some()
             || self.grouping.is_some()
             || self.layout != ColumnLayout::default();
         let table = cx.entity().downgrade();
         let graph = self.session.read(cx).overrides_key();
-        let type_name = self.type_name.clone();
+        let workspace = self.workspace.clone();
         let names = match self.kind {
             TableKind::Node => self.session.read(cx).type_naming(&self.type_name),
             TableKind::Edge => None,
@@ -3574,7 +3578,8 @@ impl TypeTable {
                 let active = active.clone();
                 let table = table.clone();
                 let graph = graph.clone();
-                let type_name = type_name.clone();
+                let workspace = workspace.clone();
+                let active_id = active_id.clone();
                 let names = names.clone();
                 Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
                     if views.is_empty() {
@@ -3609,14 +3614,16 @@ impl TypeTable {
                                     .ok();
                             }),
                     );
-                    if let Some(name) = active.clone() {
+                    if let Some((name, id)) = active.clone().zip(active_id.clone()) {
                         let graph = graph.clone();
+                        let workspace = workspace.clone();
                         menu = menu.entry(format!("Delete “{name}”"), None, move |_, cx| {
-                            let (graph, type_name, name) =
-                                (graph.clone(), type_name.clone(), name.clone());
-                            studio_settings::update(cx, move |settings| {
-                                settings.delete_view(&graph, &type_name, &name)
-                            });
+                            crate::types_list::delete_view(
+                                &workspace,
+                                graph.clone(),
+                                id.clone(),
+                                cx,
+                            );
                         });
                     }
                     if let Some(names) = names.clone() {
