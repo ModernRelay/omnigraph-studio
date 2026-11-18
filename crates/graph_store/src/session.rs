@@ -3939,6 +3939,9 @@ impl GraphSession {
         }
         let client = self.client(cx);
         let graph = self.graph_id.clone();
+        // Opened before the read is sent: a head forgotten while it is out (a commit landed on
+        // its branch) is not put back from an answer that may predate the commit.
+        let fill = self.head_commits.open_fill();
         let read = self.counted_read(
             "branches_detailed",
             async move { client.branches_detailed(&graph).await },
@@ -3947,7 +3950,8 @@ impl GraphSession {
         let read = cx
             .spawn(async move |this, cx| {
                 let list = Arc::new(read.await?);
-                this.update(cx, |this, _| this.details_landed(&list)).ok();
+                this.update(cx, |this, _| this.details_landed(&list, &fill))
+                    .ok();
                 Ok(list)
             })
             .shared();
@@ -3956,16 +3960,15 @@ impl GraphSession {
     }
 
     /// Keeps what a detailed branch list says: each branch's head, where no read of it is held
-    /// or under way, and its start and times.
-    fn details_landed(&mut self, list: &BranchListOutput) {
+    /// or under way and it was not forgotten while the list was read ([`crate::memo::Fill`]), and its
+    /// start and times.
+    fn details_landed(&mut self, list: &BranchListOutput, fill: &crate::memo::Fill) {
         self.details_read = None;
         self.details_answered = true;
         self.branch_details.clear();
         for detail in list.details.iter().flatten() {
-            if !self.head_commits.holds(&detail.name) {
-                self.head_commits
-                    .insert(detail.name.clone(), Some(detail.head.clone()));
-            }
+            self.head_commits
+                .fill(fill, detail.name.clone(), Some(detail.head.clone()));
             self.branch_details
                 .insert(detail.name.clone(), detail.clone());
         }
@@ -7310,6 +7313,83 @@ mod tests {
                 "{version}: alone"
             );
         }
+    }
+
+    /// A detailed branch list that answers after a branch's head was forgotten (a commit landed
+    /// on it while the list was out) does not put the old head back: the branch is read alone.
+    #[gpui::test]
+    async fn a_late_detailed_list_does_not_bring_back_a_forgotten_head(cx: &mut TestAppContext) {
+        let asked: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let seen = asked.clone();
+        let http = FakeHttpClient::create(move |request| {
+            let path = request.uri().path().to_owned();
+            let query = request.uri().query().unwrap_or_default().to_owned();
+            let seen = seen.clone();
+            async move {
+                let commit = |id: &str| {
+                    serde_json::json!({ "graph_commit_id": id, "created_at": 2,
+                        "graph_manifest_version": 2, "kind": "published" })
+                };
+                let body = if path.ends_with("/healthz") {
+                    serde_json::json!({ "status": "ok", "version": "0.15.0",
+                        "internal_schema_version": 16 })
+                } else if path.ends_with("/commits") {
+                    seen.lock().unwrap().push(format!("commits?{query}"));
+                    serde_json::json!({ "commits": [commit("f2")] })
+                } else if path.ends_with("/branches") {
+                    seen.lock().unwrap().push(format!("branches?{query}"));
+                    serde_json::json!({ "branches": ["feature", "main"], "details": [
+                        { "name": "feature", "head": commit("f1"), "updated_at": 5 },
+                        { "name": "main", "head": commit("m1"), "updated_at": 3 },
+                    ]})
+                } else if path.ends_with("/graphs") {
+                    serde_json::json!({ "graphs": [] })
+                } else {
+                    serde_json::json!({})
+                };
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                    .body(AsyncBody::from(body.to_string()))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        connection.update(cx, |connection, cx| connection.connect(cx));
+        cx.run_until_parked();
+        let session =
+            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+        cx.run_until_parked();
+        asked.lock().unwrap().clear();
+        // The list asks for main's head; before its answer lands, feature's head is forgotten.
+        let main = session.update(cx, |session, cx| {
+            let main = session.head_commit("main", false, cx);
+            session.head_commits.forget(&"feature".into());
+            main
+        });
+        cx.run_until_parked();
+        let main = futures::executor::block_on(main).unwrap().unwrap();
+        assert_eq!(main.graph_commit_id, "m1");
+        session.read_with(cx, |session, _| {
+            assert!(
+                !session.head_commits.holds(&"feature".into()),
+                "not put back"
+            );
+        });
+        let feature = session.update(cx, |session, cx| session.head_commit("feature", false, cx));
+        cx.run_until_parked();
+        let feature = futures::executor::block_on(feature).unwrap().unwrap();
+        assert_eq!(feature.graph_commit_id, "f2", "its own head, read alone");
+        assert_eq!(
+            std::mem::take(&mut *asked.lock().unwrap()),
+            ["branches?detailed=true", "commits?branch=feature&limit=1"]
+        );
     }
 
     /// The stored-query catalog is read when a view first wants it, not with the graph's first
