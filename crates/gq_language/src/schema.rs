@@ -208,6 +208,17 @@ impl std::fmt::Debug for SchemaModel {
     }
 }
 
+/// Why Omnigraph's admission parser, the one a schema apply runs, refuses `source`, a schema the
+/// server already holds and Studio reads with the compatibility parser ([`SchemaModel::parse`]);
+/// `None` when it admits it. From Omnigraph 0.15 that parser refuses `@unique` on a list or a
+/// vector property, which 0.14 admitted though no write could satisfy it: the graph still opens,
+/// but every apply that keeps the constraint is refused, so the schema view says so.
+pub fn admission_refusal(source: &str) -> Option<String> {
+    omnigraph_compiler::schema::parser::parse_schema(source)
+        .err()
+        .map(|error| error.to_string())
+}
+
 impl SchemaModel {
     /// Compiles `.pg` source the server accepted. The error is the compiler's message.
     ///
@@ -563,7 +574,10 @@ pub(crate) mod tests {
             );
             let schema = SchemaModel::parse(historical).expect("an accepted schema opens");
             assert!(schema.node("Document").is_some());
+            let refusal = admission_refusal(historical).expect("refused at admission");
+            assert!(refusal.contains("@unique is not supported on"), "{refusal}");
         }
+        assert_eq!(admission_refusal(DEV_SCHEMA), None, "an admitted schema");
     }
 
     /// Every member of a composite key is a key the server will not let change; the node has
