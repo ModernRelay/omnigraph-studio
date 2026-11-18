@@ -92,8 +92,10 @@ fi
 
 QUERY='query people() { match { $p: Person } return { $p.slug, $p.name, $p.title, $p.email, $p.born, $p.tags } }'
 NEW_QUERY="studio_graph::NewQueryWithText={\"text\":\"$QUERY\"}"
-# A company with its people, in the inspector, scrolled with the pointer over the dock.
-INSPECTOR='studio_graph::PeekNode={"type_name":"Company","id":"company-00009"}'
+# A company with its people, in the inspector, scrolled with the pointer over the dock: a click
+# selects company-00009's row (the inspector shows the selection, spec 020) and another opens
+# its worksAt group. Points are window pixels of the default 1440x900 window.
+INSPECTOR='click:504,417|click:1150,434'
 
 # name, then the snapshot steps. "window redraw" draws every view again, as a frame of an
 # animation (a dialog coming up, a toast, the connection dot) does: the cost of motion.
@@ -101,6 +103,7 @@ cases=(
   "table filter key|$PERSON|studio_table::AddFilter|measure:$FRAMES,type"
   "table cell key|$PERSON|studio_table::EditCell|key:right|studio_table::EditCell|measure:$FRAMES,type"
   "table scroll|$PERSON|measure:$FRAMES,scroll=40"
+  "relationship scroll|$PERSON|measure:1,scroll=-900:0|measure:$FRAMES,scroll=40"
   "query key (6 columns)|$NEW_QUERY|studio_query::Run|measure:$FRAMES,type"
   "palette key|$PERSON|studio::GoTo|measure:$FRAMES,type"
   "window redraw|$PERSON|measure:$FRAMES,refresh"
@@ -117,7 +120,13 @@ for ((round = 1; round <= ROUNDS; round++)); do
   for case in "${cases[@]}"; do
     IFS='|' read -r -a parts <<<"$case"
     name=${parts[0]}
-    line=$("$SNAPSHOT" "$OUT/frame.png" "${parts[@]:1}" 2>&1 | grep '^measure' || true)
+    # The last measure step is the case's; the steps before it set the case up. A case that
+    # measures nothing says why (an action renamed or removed, a server not answering).
+    output=$("$SNAPSHOT" "$OUT/frame.png" "${parts[@]:1}" 2>&1 || true)
+    line=$(grep '^measure' <<<"$output" | tail -1 || true)
+    if [[ -z "$line" ]]; then
+      echo "$name: $(grep -v '^snapshot data\|frame\.png$\|^note: ' <<<"$output" | grep . | tail -1)" >&2
+    fi
     median=$(sed -n 's/.*cpu median \([^,]*\),.*/\1/p' <<<"$line")
     p95=$(sed -n 's/.*cpu median [^,]*, p95 \([^,]*\),.*/\1/p' <<<"$line")
     mean=$(sed -n 's/.*cpu median [^|]*, mean \([^ ]*\) |.*/\1/p' <<<"$line")

@@ -83,7 +83,8 @@ times over.
 
 `script/measure-frames` runs the common cases against the development graph (`script/dev-server`)
 on `release-fast`: a key in the table's filter field, in a cell, in the query editor with six
-result columns, and in the Go To palette; a table scroll; the whole window drawn again, as each
+result columns, and in the Go To palette; a table scroll, and one with the relationship columns in
+view (scrolled sideways to them first); the whole window drawn again, as each
 frame of an animation draws it (a dialog or a toast coming up, the connection dot); and a
 scroll of a node page, the inspector, its tree and History, and a pan of its canvas. On 2026-10-18 (Apple M5 Pro, load
 average 8) each key cost 1.2 to 2.0 ms of main-thread CPU and a table scroll 4.3 ms. On the
