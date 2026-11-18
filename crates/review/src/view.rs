@@ -2962,6 +2962,8 @@ impl ReviewView {
             .on_click(cx.listener(|this, _, _, cx| this.toggle_conflicts(cx)))
         });
         let delete_refused = self.delete_refusal(cx);
+        // The checkbox is off while Merge is, saying why as Merge does (constitution VI).
+        let delete_blocked = delete_refused.clone().or_else(|| self.merge_blocked(cx));
         Some(
             h_flex()
                 .flex_none()
@@ -2994,7 +2996,7 @@ impl ReviewView {
                             !deletable,
                             cx,
                         )
-                        .when_some(delete_refused, |checkbox, reason| {
+                        .when_some(delete_blocked, |checkbox, reason| {
                             checkbox.tip(studio_ui::ds::tooltip(reason))
                         })
                         .when(deletable, |checkbox| {
