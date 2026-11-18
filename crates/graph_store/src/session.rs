@@ -4315,6 +4315,19 @@ impl GraphSession {
         }
     }
 
+    /// [`GraphSession::blob_bytes`] for what a view shows, so the ledger names the view that
+    /// asked (spec 030).
+    pub fn blob_bytes_in(
+        &mut self,
+        scope: &ReadScope,
+        cell: BlobCell,
+        snapshot: Option<String>,
+        range: std::ops::Range<u64>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Vec<u8>, ReadError>> {
+        self.asked_by(scope.id, |this| this.blob_bytes(cell, snapshot, range, cx))
+    }
+
     /// Bytes `range` of a managed Blob value, for a preview.
     pub fn blob_bytes(
         &mut self,
@@ -4327,7 +4340,7 @@ impl GraphSession {
         let graph = self.graph_id.clone();
         let branch = self.branch.clone();
         self.counted_read(
-            "blob_head",
+            "blob_bytes",
             async move {
                 let at = match &snapshot {
                     Some(commit) => BlobAt::Snapshot(commit),

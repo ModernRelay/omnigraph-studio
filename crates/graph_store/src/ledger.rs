@@ -26,6 +26,8 @@ pub enum ReadView {
     Exploration,
     /// A node search: the command palette's, while it is open (spec 031).
     Search,
+    /// A type's gallery: its pages and its tiles' files (spec 035).
+    Gallery,
 }
 
 /// Who asked for a read: a view through its scope, or a caller the ledger cannot name yet.
