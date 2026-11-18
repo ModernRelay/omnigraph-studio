@@ -2661,6 +2661,7 @@ impl GraphCanvas {
 
     fn canvas_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<ContextMenu> {
         let any_pinned = !self.pinned.is_empty();
+        let any_hidden = !self.hidden.is_empty();
         let empty = self.scene.nodes.is_empty();
         ContextMenu::build(window, cx, move |menu, _, _| {
             menu.when(!empty, |menu| {
@@ -2669,6 +2670,9 @@ impl GraphCanvas {
             })
             .when(any_pinned, |menu| {
                 menu.action("Reset layout", Box::new(ResetLayout))
+            })
+            .when(any_hidden, |menu| {
+                menu.action("Show hidden", Box::new(studio_actions::canvas::ShowHidden))
             })
         })
     }
@@ -3276,7 +3280,12 @@ impl GraphCanvas {
                     })
                     .unwrap_or_default();
                 let nodes = studio_ui::plural(self.node_count, "node", "nodes");
-                format!("From {root} · {nodes}")
+                // Nodes hidden (by Hide Nodes) are said, as the menu offers them back: the
+                // canvas did not lose them (constitution V).
+                match self.hidden.len() {
+                    0 => format!("From {root} · {nodes}"),
+                    hidden => format!("From {root} · {nodes} · {hidden} hidden"),
+                }
             }
             // The root is the picker's label, beside this.
             Mode::Schema => studio_ui::plural(self.node_count, "type", "types"),
