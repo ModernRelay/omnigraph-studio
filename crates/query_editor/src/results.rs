@@ -4,7 +4,9 @@
 use std::collections::{HashMap, HashSet};
 
 use gq_language::{ResultColumn, SchemaModel, TokenKind};
-use graph_client::api::{BranchMergeOutcome, ChangeOutput, CommitKind};
+use graph_client::api::{
+    BranchMergeOutcome, ChangeOutput, CommitKind, RankOrder, RankingOutput, SearchFunction,
+};
 use serde_json::{Map, Value};
 use studio_actions::graph::ResultNode;
 use studio_ui::short_commit_id;
@@ -355,6 +357,40 @@ pub fn summarize_detail(detail: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// What a ranked read says of how it ordered its rows (`ReadOutput.ranking`, Omnigraph 0.15):
+/// the search, which way its score ranks, and the columns holding the score; and, when the
+/// search was not exhaustive, a warning that a better row than those returned may exist. A
+/// server before 0.15 sends no ranking, and the results say nothing of it, as before.
+pub fn ranking_fact(ranking: &RankingOutput) -> (String, Option<String>) {
+    let search = match ranking.by {
+        SearchFunction::Nearest => "nearest",
+        SearchFunction::Bm25 => "bm25",
+        SearchFunction::Rrf => "rrf",
+        SearchFunction::Other => "a search",
+    };
+    let order = match ranking.order {
+        RankOrder::Ascending => " · lowest score first",
+        RankOrder::Descending => " · highest score first",
+        RankOrder::Other => "",
+    };
+    let columns = match ranking.score_columns.as_slice() {
+        [] => String::new(),
+        [one] => format!(" · score in {one}"),
+        many => format!(" · scores in {}", many.join(", ")),
+    };
+    let fact = format!("Ranked by {search}{order}{columns}");
+    let warning = (!ranking.exhaustive).then(|| {
+        let better = match ranking.by {
+            SearchFunction::Nearest => "a nearer row",
+            _ => "a better-ranked row",
+        };
+        format!(
+            "Not exhaustive: the search did not compare every row, so {better} than these may exist"
+        )
+    });
+    (fact, warning)
 }
 
 /// `1 row`, `12,480 rows`: a result's row count, as Studio writes every count.
@@ -878,6 +914,38 @@ fn edits_in_words(sent: &str, edits: &[TextEditOutput]) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A ranked read names its search, which way it ranks and its score columns, and warns when
+    /// the search left rows uncompared.
+    #[test]
+    fn a_ranked_read_says_how_it_ranked() {
+        use graph_client::api::{RankOrder, RankingOutput, SearchFunction};
+        let nearest = RankingOutput {
+            by: SearchFunction::Nearest,
+            order: RankOrder::Ascending,
+            exhaustive: false,
+            score_columns: vec!["d".into()],
+        };
+        let (fact, warning) = super::ranking_fact(&nearest);
+        assert_eq!(fact, "Ranked by nearest · lowest score first · score in d");
+        assert_eq!(
+            warning.as_deref(),
+            Some(
+                "Not exhaustive: the search did not compare every row, so a nearer row than \
+                 these may exist"
+            )
+        );
+        let fused = RankingOutput {
+            by: SearchFunction::Rrf,
+            order: RankOrder::Descending,
+            exhaustive: true,
+            score_columns: vec![],
+        };
+        assert_eq!(
+            super::ranking_fact(&fused),
+            ("Ranked by rrf · highest score first".to_owned(), None)
+        );
+    }
+
     use serde_json::json;
     use studio_ui::value_text;
 
