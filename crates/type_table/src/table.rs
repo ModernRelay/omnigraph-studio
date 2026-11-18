@@ -11356,44 +11356,33 @@ impl TypeTable {
             .collect();
         let fit = chips_that_fit(&labels, count, available);
         let more = count - fit as i64;
-        // The count stays in view; the tags give way, whole.
-        let cell = h_flex()
-            .w_full()
-            .min_w_0()
-            .gap(px(space::XS))
-            .child(
-                h_flex()
-                    .min_w_0()
-                    .gap(px(space::XS))
-                    .overflow_hidden()
-                    .children(
-                        labels[..fit]
-                            .iter()
-                            .map(|label| studio_ui::ds::tag(label.to_string(), cx)),
-                    ),
-            )
-            .when(more > 0, |cell| {
-                cell.child(
-                    div().flex_none().child(
-                        studio_ui::cell_text(
-                            if fit == 0 {
-                                studio_ui::group_count(count)
-                            } else {
-                                format!("+{}", studio_ui::group_count(more))
-                            },
-                            cx,
-                        )
-                        .color(Color::Muted.color(cx))
-                        .hug(),
-                    ),
-                )
-            });
+        // The count stays in view; the tags give way, whole. One element lays out and paints
+        // them all: as boxes, each tag was two layout nodes and the cell three more, in every
+        // relationship cell of every frame.
+        let cell = studio_ui::tags(
+            labels[..fit]
+                .iter()
+                .map(|label| SharedString::from(label.to_string())),
+            (more > 0).then(|| {
+                SharedString::from(if fit == 0 {
+                    studio_ui::group_count(count)
+                } else {
+                    format!("+{}", studio_ui::group_count(more))
+                })
+            }),
+            cx,
+        );
         if self.frame_pointer != Some((ix, col)) {
             return cell.into_any_element();
         }
         // The other type is the column's, looked up when the tooltip shows.
         let table = cx.weak_entity();
-        cell.id(ElementId::NamedInteger("relation".into(), id))
+        // The cell's height, as a text cell's tooltip takes.
+        h_flex()
+            .size_full()
+            .min_w_0()
+            .child(cell)
+            .id(ElementId::NamedInteger("relation".into(), id))
             .debug_selector(move || format!("relation-tip-{ix}-{col}"))
             .tip_fn(move |_, cx| {
                 let other = table.upgrade().and_then(|table| {

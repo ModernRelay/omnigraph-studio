@@ -21,6 +21,7 @@ pub mod node_names;
 mod overlay_slot;
 mod resize;
 pub mod rows;
+mod tags;
 pub mod text;
 mod tooltip;
 mod values;
@@ -36,6 +37,7 @@ pub use overlay_slot::{OverlaySlot, OverlaySlotElement};
 pub use resize::{
     COLUMN_MAX_WIDTH, COLUMN_MIN_WIDTH, ColumnDrag, ColumnResize, clamp_width, column_resize_handle,
 };
+pub use tags::{Tags, tags};
 pub use values::{
     CopyableValue, format_bytes, format_elapsed, group_count, group_digits, now_micros, plural,
     relative_span, relative_time, short_commit_id, utc_date_time, value_text,

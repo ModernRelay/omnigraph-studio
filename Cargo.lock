@@ -9595,6 +9595,7 @@ dependencies = [
  "menu",
  "pulldown-cmark",
  "serde_json",
+ "smallvec",
  "studio_settings",
  "studio_theme",
  "theme",
