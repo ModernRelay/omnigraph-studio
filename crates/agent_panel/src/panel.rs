@@ -3693,7 +3693,14 @@ impl AgentPanel {
                     gutter_row(None, self.render_sign_in(cx)).into_any_element()
                 }
                 State::Exited { message, stderr } => {
-                    let mut callout = studio_ui::ds::callout(Severity::Error, message.clone());
+                    // What the message ends with ("…, then Restart"), as the sign-in's has it.
+                    let restart = ds::row_button("agent-exited-restart", "Restart")
+                        .start_icon(Icon::new(IconName::RotateCw))
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.restart(&Restart, window, cx)),
+                        );
+                    let mut callout = studio_ui::ds::callout(Severity::Error, message.clone())
+                        .actions_slot(restart);
                     if !stderr.is_empty() {
                         callout =
                             callout.description_slot(studio_ui::ds::code_block(stderr.clone(), cx));
