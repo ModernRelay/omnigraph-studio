@@ -1786,7 +1786,7 @@ impl Workspace {
                 ItemEvent::UpdateTab => {
                     // Work in a preview tab keeps it.
                     let id = item.entity_id();
-                    if item.read(cx).is_dirty(cx)
+                    if item.read(cx).keeps_preview(cx)
                         && let Some((pane, _)) = this.find_item(id)
                         && let Some(pane) = this.pane_mut(pane)
                     {
@@ -1834,7 +1834,7 @@ impl Workspace {
         // A preview with work in it is not replaced.
         if let Some(current) = pane.preview
             && let Some(index) = pane.position(current)
-            && pane.items[index].is_dirty(cx)
+            && pane.items[index].keeps_preview(cx)
         {
             pane.keep(current);
         }
@@ -7649,6 +7649,101 @@ mod tests {
             assert_eq!(tabs, [second, third]);
             assert!(!pane.is_preview(0), "the kept tab stays");
             assert!(pane.is_preview(1), "the new one is the preview");
+        });
+    }
+
+    /// A tab that holds work its dirty state does not say (a conversation whose agent is on a
+    /// turn) is asked before the next preview takes its place, and stays; one that says so
+    /// while it is the preview stays for good once it said it. Neither asks before closing.
+    #[gpui::test]
+    fn a_preview_that_keeps_itself_is_not_replaced(cx: &mut gpui::TestAppContext) {
+        struct Working {
+            focus_handle: FocusHandle,
+            key: &'static str,
+            working: bool,
+        }
+        impl EventEmitter<ItemEvent> for Working {}
+        impl Focusable for Working {
+            fn focus_handle(&self, _: &App) -> FocusHandle {
+                self.focus_handle.clone()
+            }
+        }
+        impl Render for Working {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().track_focus(&self.focus_handle)
+            }
+        }
+        impl Item for Working {
+            fn tab_title(&self, _: &App) -> SharedString {
+                "Working".into()
+            }
+            fn dedupe_key(&self, _: &App) -> Option<SharedString> {
+                Some(self.key.into())
+            }
+            fn keeps_preview(&self, _: &App) -> bool {
+                self.working
+            }
+        }
+        fn preview(
+            key: &'static str,
+            working: bool,
+            workspace: &mut Workspace,
+            window: &mut Window,
+            cx: &mut Context<Workspace>,
+        ) -> Entity<Working> {
+            workspace
+                .open_item_with(key.to_owned(), true, window, cx, move |_, cx| Working {
+                    focus_handle: cx.focus_handle(),
+                    key,
+                    working,
+                })
+                .expect("opened")
+        }
+        let tabs = |workspace: &Workspace| -> Vec<EntityId> {
+            workspace
+                .items()
+                .iter()
+                .map(|item| item.item_id())
+                .collect()
+        };
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            cx.set_global(StudioSettings::default());
+        });
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        // Asked at the replacing: working, it stays and the next opens beside it.
+        workspace.update_in(cx, |workspace, window, cx| {
+            let first = preview("first", true, workspace, window, cx);
+            let second = preview("second", false, workspace, window, cx);
+            assert_eq!(tabs(workspace), [first.entity_id(), second.entity_id()]);
+            assert!(!first.read(cx).is_dirty(cx), "closing it does not ask");
+        });
+        // Told: a tab that said it holds work stays when it holds none by the next preview.
+        let second = workspace.update(cx, |workspace, _| workspace.items()[1].item_id());
+        let third = workspace.update_in(cx, |workspace, window, cx| {
+            let third = preview("third", false, workspace, window, cx);
+            assert_eq!(
+                tabs(workspace)[1],
+                third.entity_id(),
+                "idle, the second gave way"
+            );
+            assert!(!tabs(workspace).contains(&second));
+            third
+        });
+        cx.update(|_, cx| {
+            third.update(cx, |third, cx| {
+                third.working = true;
+                cx.emit(ItemEvent::UpdateTab);
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| third.update(cx, |third, _| third.working = false));
+        workspace.update_in(cx, |workspace, window, cx| {
+            let fourth = preview("fourth", false, workspace, window, cx);
+            assert_eq!(
+                tabs(workspace)[1..],
+                [third.entity_id(), fourth.entity_id()]
+            );
         });
     }
 

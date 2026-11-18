@@ -853,9 +853,10 @@ pub struct AgentPanel {
     workspace: WeakEntity<Workspace>,
     /// The graph's conversations, which this tab records itself in.
     sessions: Entity<AgentSessions>,
-    /// Whether the tab last said it holds unsaved work ([`AgentPanel::holds_work`]): the tab
-    /// is told when that changes, not at every change.
+    /// Whether the tab last said it holds unsaved work ([`AgentPanel::holds_work`]) and a
+    /// running turn: the tab is told when either changes, not at every change.
     dirty: bool,
+    turn_running: bool,
     /// The agent's replies as rendered markdown, by entry index, with how much of the text each
     /// has taken in; a streaming reply appends its new tail.
     markdown: std::collections::HashMap<usize, (Entity<Markdown>, usize)>,
@@ -1060,6 +1061,13 @@ impl Item for AgentPanel {
         self.holds_work()
     }
 
+    /// A conversation whose agent is mid-turn is work too: the next conversation looked at
+    /// must not take the place of its preview tab and stop the agent (spec 020). Closing it
+    /// still does not ask; that is the person stopping it.
+    fn keeps_preview(&self, _cx: &App) -> bool {
+        self.holds_work() || self.turn_running()
+    }
+
     /// The tab comes back after a restart with its conversation.
     fn serialize(&self, _cx: &App) -> Option<SavedItem> {
         Some(SavedItem {
@@ -1143,8 +1151,10 @@ impl AgentPanel {
         cx.observe_self(|this, cx| {
             this.sync_live(cx);
             let dirty = this.holds_work();
-            if dirty != this.dirty {
+            let turn_running = this.turn_running();
+            if dirty != this.dirty || turn_running != this.turn_running {
                 this.dirty = dirty;
+                this.turn_running = turn_running;
                 cx.emit(ItemEvent::UpdateTab);
             }
         })
@@ -1171,6 +1181,7 @@ impl AgentPanel {
             workspace,
             sessions,
             dirty: false,
+            turn_running: false,
             focus_handle,
             composer,
             has_draft: false,
@@ -2297,6 +2308,11 @@ impl AgentPanel {
             || self.opening.is_some()
             || self.queue.holds_messages()
             || self.pending_index().is_some()
+    }
+
+    /// Whether the agent is working on a turn, which closing the tab stops.
+    fn turn_running(&self) -> bool {
+        matches!(self.state, State::Prompting { .. })
     }
 
     /// Answers the write card at `index`, which its buttons and keys do.
@@ -5056,6 +5072,109 @@ mod tests {
         );
         write("", cx);
         assert_eq!(*told.borrow(), [true, false], "the draft is gone");
+    }
+
+    /// A conversation opened by one click is the pane's preview tab (spec 020). Once its agent
+    /// is working on a turn, the next conversation looked at opens beside it rather than taking
+    /// its place, which would stop the agent mid-turn, also when nothing in the composer said
+    /// so first. Closing it still does not ask: a running turn is not unsaved work.
+    #[gpui::test]
+    async fn a_conversation_mid_turn_keeps_its_preview_tab(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, _) = graph_store::test_server::followed_session(
+            "node Person {\n  slug: String @key\n}\n",
+            |_| serde_json::json!([]),
+            cx,
+        );
+        cx.run_until_parked();
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        // No agent is chosen, so nothing starts when the tabs are drawn.
+        let preview = |id: &str,
+                       workspace: &mut Workspace,
+                       window: &mut Window,
+                       cx: &mut Context<Workspace>| {
+            let panel = open_session(workspace, id.to_owned(), true, window, cx).expect("opened");
+            panel.update(cx, |panel, _| panel.agent.clear());
+            panel
+        };
+        let tabs = |workspace: &Workspace| -> Vec<gpui::EntityId> {
+            workspace
+                .items()
+                .iter()
+                .map(|item| item.item_id())
+                .collect()
+        };
+        let first = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.set_session(session.clone(), window, cx);
+            preview("s1", workspace, window, cx)
+        });
+        cx.run_until_parked();
+
+        // Idle, the next preview takes its place.
+        let second = workspace.update_in(cx, |workspace, window, cx| {
+            preview("s2", workspace, window, cx)
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(
+                tabs(workspace),
+                [second.entity_id()],
+                "an idle preview gives way"
+            );
+        });
+        drop(first);
+
+        // Mid-turn, it stays, and the next opens beside it.
+        cx.update(|_, cx| {
+            second.update(cx, |panel, cx| {
+                panel.state = State::Prompting {
+                    agent: "claude".into(),
+                };
+                cx.notify();
+            })
+        });
+        cx.run_until_parked();
+        assert!(
+            second.read_with(cx, |panel, cx| !panel.is_dirty(cx)),
+            "closing a running turn does not ask"
+        );
+        let third = workspace.update_in(cx, |workspace, window, cx| {
+            preview("s3", workspace, window, cx)
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(
+                tabs(workspace),
+                [second.entity_id(), third.entity_id()],
+                "the conversation mid-turn stays"
+            );
+        });
+
+        // Kept for good: the turn ending does not make it a preview again.
+        cx.update(|_, cx| {
+            second.update(cx, |panel, cx| {
+                panel.state = State::Ready {
+                    agent: "claude".into(),
+                };
+                cx.notify();
+            })
+        });
+        cx.run_until_parked();
+        let fourth = workspace.update_in(cx, |workspace, window, cx| {
+            preview("s4", workspace, window, cx)
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(
+                tabs(workspace),
+                [second.entity_id(), fourth.entity_id()],
+                "the kept tab stays and the next preview replaces the last"
+            );
+        });
     }
 
     /// Starting a conversation nothing was sent in again (Restart, or Start again after a slow
