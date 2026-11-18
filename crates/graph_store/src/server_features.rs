@@ -4,8 +4,11 @@
 //! Every server Studio connects to speaks HTTP contract 0.14, and a later release adds to it
 //! without changing the header: a field an answer may carry, a parameter a route accepts, a
 //! rule a write must meet. Answers are decoded tolerantly whatever the server (`graph_client`
-//! reads every later field as optional); this table says what Studio may *ask for* and how it
-//! must *save*, worked out once per health answer from the release `/healthz` reports.
+//! reads every later field as optional). This table is every later addition Studio uses, worked
+//! out once per health answer from the release `/healthz` reports: most say what Studio may *ask
+//! for*, how it must *save* or what an answer *means*; two (`RankedReadOutput`,
+//! `AccessClientId`) are read from the answer alone, and are listed so that the table, and the
+//! docs it is checked against, name every 0.15 addition Studio follows.
 //!
 //! A feature a later server serves goes in [`FEATURES`] with the first release that serves it,
 //! and in `docs/deferred-engine-changes.md` beside that release; code asks
@@ -29,6 +32,11 @@ pub enum ServerFeature {
     /// (#1212): a new node must be saved with the edges it needs in one mutation, and a node
     /// already below its minimum is refused even a property-only update.
     CardMinimumOnEveryWrite,
+    /// A valid OIDC token whose subject the server admits no principal for is answered 403
+    /// `not_admitted` on every route (#1185), where 0.14 answered 401. The connection takes
+    /// that 403 as not admitted, and on such a server a 401 to a sign-in held means its token
+    /// was refused, which a new sign-in may replace, not that the account is not admitted.
+    NotAdmittedCode,
     /// A schema apply refuses `@unique` on a list or vector property (#1306), which no write
     /// could satisfy; a graph that already has one opens, but every apply keeping it is refused.
     /// The schema view says which the server does.
@@ -42,6 +50,7 @@ pub const FEATURES: &[(ServerFeature, &str)] = &[
     (ServerFeature::DetailedBranchList, "0.15.0"),
     (ServerFeature::AccessClientId, "0.15.0"),
     (ServerFeature::CardMinimumOnEveryWrite, "0.15.0"),
+    (ServerFeature::NotAdmittedCode, "0.15.0"),
     (ServerFeature::UniqueOnScalarsOnly, "0.15.0"),
 ];
 

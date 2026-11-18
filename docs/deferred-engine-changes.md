@@ -93,8 +93,9 @@ what the release before it does. A feature goes in this table and in `FEATURES` 
 | `DetailedBranchList` | `0.15.0` | `GET /branches?detailed=true` answers each branch's head, start and times (#1012, E9) | The heads a list of branches asks for come from one request, and the branches list says when each branch was made and from which | One `GET /commits?branch=&limit=1` per branch drawn |
 | `AccessClientId` | `0.15.0` | `AccessOutput.client_id` names the OAuth client a person's token was issued to (#1196) | The connection chip's tooltip names it beside the actor | Names the actor alone |
 | `CardMinimumOnEveryWrite` | `0.15.0` | A `@card` minimum is checked on every write that inserts or updates a source node (#1212) | The new-node dialog asks for each edge the minimum needs and saves them with the node in one mutation | Saves the node alone, which the server takes |
+| `NotAdmittedCode` | `0.15.0` | A valid OIDC token whose subject the server admits no principal for is answered 403 `not_admitted` on every route (#1185), where 0.14 answered 401 | The connection says "Not admitted" at the connect, and a 401 to a sign-in held says its token was refused, which a new sign-in may replace | A 401 to a sign-in held says the account may not be admitted |
 | `UniqueOnScalarsOnly` | `0.15.0` | A schema apply refuses `@unique` on a list or vector property (#1306) | The schema view says the server refuses any apply that keeps one | Says 0.15 will, and that no write can set such a property |
 
-`v0.15.0` also answers a valid OIDC token whose subject it admits no principal for with 403
-`not_admitted` (#1185), where 0.14 answered 401; Studio reads the code from the answer itself,
-whatever the release, and says to ask the server's operator.
+A 403 `not_admitted` is read from the answer itself whatever the release: the connection says
+"Not admitted", and a graph or a read refused with it mid-session says to ask the server's
+operator.
