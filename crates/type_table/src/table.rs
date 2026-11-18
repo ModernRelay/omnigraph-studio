@@ -1051,6 +1051,9 @@ pub struct TypeTable {
     frame_looks: Rc<RefCell<HashMap<usize, RowLook>>>,
     /// The places this frame's lines draw.
     frame_places: Rc<[GridPlace]>,
+    /// The columns this frame's rows draw cells in: those the rows' own view meets
+    /// ([`Self::rows_drawn`]). Every other place of [`Self::frame_places`] is an empty box.
+    frame_rows_drawn: Vec<bool>,
     /// The cells this frame draws may be changed: the table reads the branch, and the
     /// credential may change it. Found once a frame, not for every cell.
     frame_writable: bool,
@@ -1060,6 +1063,10 @@ pub struct TypeTable {
     /// The columns the last drawn rows drew.
     #[cfg(test)]
     frame_drawn: Vec<bool>,
+    /// For each frame the table rendered, the columns its rows drew cells in
+    /// ([`Self::frame_rows_drawn`] as the frame's last call for lines left it), oldest first.
+    #[cfg(test)]
+    frames_rows_drawn: Vec<Vec<bool>>,
     /// A column being dragged wider or narrower: its key, and where the pointer and the column's
     /// width were when the drag began.
     resizing: Option<ColumnResize<String>>,
@@ -1554,10 +1561,13 @@ impl TypeTable {
             frame_line_count: 0,
             frame_looks: Rc::default(),
             frame_places: Rc::from([]),
+            frame_rows_drawn: Vec::new(),
             frame_writable: false,
             frame_pointer: None,
             #[cfg(test)]
             frame_drawn: Vec::new(),
+            #[cfg(test)]
+            frames_rows_drawn: Vec::new(),
             frame_now: chrono::Local::now(),
             frame_minute: 0,
             grid,
@@ -10279,6 +10289,8 @@ impl TypeTable {
         let menu_open = self.header_menu.is_some();
         // The header and every line draw the same places: the columns in view and gaps.
         let drawn = Rc::new(self.drawn_columns(window, cx));
+        #[cfg(test)]
+        self.frames_rows_drawn.push(Vec::new());
         let column_widths: Vec<Pixels> = self
             .columns
             .iter()
@@ -10487,10 +10499,14 @@ impl TypeTable {
                     // out, for the rows these lines show, not every row between their first
                     // and last: grouped, a folded section's rows are on no line.
                     this.frame_line_range = Some(range.clone());
+                    this.frame_rows_drawn = this.rows_drawn(&drawn, window, cx);
                     this.drawn(window, cx);
                     #[cfg(test)]
                     {
                         this.frame_drawn = drawn.to_vec();
+                        if let Some(frame) = this.frames_rows_drawn.last_mut() {
+                            *frame = this.frame_rows_drawn.clone();
+                        }
                     }
                     let Some(lines) = this.frame_lines.clone() else {
                         if this.more_error.is_none()
@@ -11645,6 +11661,9 @@ impl TypeTable {
                         cell.child(self.render_row_check(ix, &row.id, cx))
                     })
                     .into_any_element(),
+                GridPlace::Column(col) if self.frame_rows_drawn.get(col) == Some(&false) => {
+                    div().into_any_element()
+                }
                 GridPlace::Column(col) => self.render_cell(ix, col, row, window, cx),
                 GridPlace::Gap(_) => div().into_any_element(),
             })
@@ -11750,24 +11769,63 @@ impl TypeTable {
         cx.notify();
     }
 
-    /// The columns rows draw this frame: the pinned first, those in the horizontal view with
-    /// one either side, the cursor's and the edited cell's. A row lays out each cell it draws,
-    /// so a wide type would otherwise pay for every column on every scroll
-    /// (`docs/drawing.md`). Worked out as the frame is drawn, so the header draws the same.
+    /// The columns this frame's header and lines have places for, and the reads ask about:
+    /// the pinned first, those the window's width would show with one either side, the
+    /// cursor's and the edited cell's. A row lays out each cell it draws, so a wide type would
+    /// otherwise pay for every column on every scroll (`docs/drawing.md`); the rows draw the
+    /// cells of only those of these their own strip meets ([`Self::rows_drawn`]). Worked out
+    /// as the frame is drawn, before the grid is laid out, so the header draws the same.
     fn drawn_columns(&self, window: &Window, cx: &App) -> Vec<bool> {
+        self.drawn_columns_within(window.viewport_size().width, cx)
+    }
+
+    /// Of the columns `drawn` for the frame ([`Self::drawn_columns`]), those whose cells the
+    /// rows draw: the ones the scrolled part of the rows meets, by its width in this frame.
+    /// The window's width bounds the grid's before the grid is laid out, so the header and the
+    /// reads pick from it; but beside the sidebar and the inspector the grid is about half the
+    /// window, and every row drew the cells of several columns past its edge (with the
+    /// relationship columns there, a sixth of a scroll frame). The header's scrolled strip
+    /// tracks the table's horizontal scroll handle and comes before the rows in the view
+    /// ([`Self::render_header_row`], then the table), so GPUI has set the handle's bounds to
+    /// this frame's width of the scrolled part before the list asks for the lines to draw, also
+    /// when a dock closes beside the grid. The width read here is the part every row scrolls,
+    /// with the pinned column already left out. The header and every line keep the same
+    /// places; a column the rows leave out is an empty box as wide as it is, as a gap is.
+    fn rows_drawn(&self, drawn: &[bool], window: &Window, cx: &App) -> Vec<bool> {
+        let view = self
+            .table_state
+            .read(cx)
+            .horizontal_scroll_handle
+            .bounds()
+            .size
+            .width;
+        if view <= Pixels::ZERO || view >= window.viewport_size().width {
+            return drawn.to_vec();
+        }
+        let within = self.drawn_columns_within(view, cx);
+        drawn
+            .iter()
+            .zip(within)
+            .map(|(drawn, within)| *drawn && within)
+            .collect()
+    }
+
+    /// The columns drawn when the scrolled part of the grid is `width` wide: the pinned first,
+    /// those in view with one either side, the cursor's and the edited cell's.
+    fn drawn_columns_within(&self, width: Pixels, cx: &App) -> Vec<bool> {
         if self.columns.is_empty() {
             return Vec::new();
         }
         let handle = &self.table_state.read(cx).horizontal_scroll_handle;
-        // The scrolled part is never wider than the window, whose width is this frame's, also
-        // in the frame that resizes it; the offset is this frame's too, as a scroll draws again.
+        // `width` is this frame's: the window's, also in the frame that resizes it, or the
+        // scrolled strip's ([`Self::rows_drawn`]); the offset is this frame's too, as a scroll
+        // draws again.
         let scrolled: Vec<Pixels> = self
             .columns
             .iter()
             .skip(1)
             .map(|column| px(self.layout.width(column)))
             .collect();
-        let width = window.viewport_size().width;
         let content = scrolled.iter().fold(Pixels::ZERO, |sum, w| sum + *w);
         let shown_left = studio_ui::scrolled_within(-handle.offset().x, content, width);
         let shown = shown_left..shown_left + width;
@@ -16660,6 +16718,107 @@ mod tests {
             "every column fits now: {:?}",
             rows_drew(cx)
         );
+    }
+
+    /// The table in a narrower box than its window, as beside the sidebar and the inspector.
+    struct NarrowHost {
+        table: Entity<TypeTable>,
+        width: Pixels,
+    }
+
+    impl Render for NarrowHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .child(div().w(self.width).h_full().child(self.table.clone()))
+        }
+    }
+
+    /// Rows draw the cells of the columns their own view meets, not of every column the
+    /// window's width would show: in a grid half the window's width, the columns past its
+    /// edge are empty boxes in each row. When the grid widens with the window unchanged (a
+    /// dock closing beside it), the rows draw the columns it uncovers in that same frame.
+    #[gpui::test]
+    async fn rows_draw_the_cells_their_own_view_meets(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let properties: String = (1..=20).map(|i| format!("  p{i:02}: String?\n")).collect();
+        let schema = format!("node Person {{\n  slug: String @key\n{properties}}}\n");
+        let session = session(&schema, cx);
+        let (host, cx) = cx.add_window_view(|window, cx| {
+            let table = cx.new(|cx| {
+                TypeTable::new(
+                    WeakEntity::new_invalid(),
+                    session,
+                    "Person".into(),
+                    None,
+                    window,
+                    cx,
+                )
+            });
+            NarrowHost {
+                table,
+                width: px(600.),
+            }
+        });
+        cx.run_until_parked();
+        let table = host.read_with(cx, |host, _| host.table.clone());
+        let frame = |cx: &mut gpui::VisualTestContext| {
+            table.read_with(cx, |table, _| {
+                (table.frame_drawn.clone(), table.frame_rows_drawn.clone())
+            })
+        };
+        let (picked, rows) = frame(cx);
+        assert_eq!(picked.len(), 21);
+        assert!(
+            rows[0] && rows[1],
+            "the pinned column and the first: {rows:?}"
+        );
+        let past_the_edge: Vec<usize> = (0..21).filter(|&col| picked[col] && !rows[col]).collect();
+        assert!(
+            !past_the_edge.is_empty(),
+            "the window's width picks columns past the grid's edge: {picked:?} {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .zip(&picked)
+                .all(|(row, picked)| !row || *picked),
+            "the rows draw only columns the frame picked"
+        );
+        // A row's places stay the header's; a column it leaves out is an empty box.
+        table.read_with(cx, |table, _| {
+            let columns = table
+                .frame_places
+                .iter()
+                .filter(|place| matches!(place, GridPlace::Column(_)))
+                .count();
+            assert_eq!(columns, picked.iter().filter(|drawn| **drawn).count());
+        });
+
+        // The grid widens to the window's width, the window unchanged. The rows of the first
+        // frame after it draw what it uncovers: the reads it starts draw the grid again, and
+        // that later frame must not be what makes them right.
+        table.update(cx, |table, _| table.frames_rows_drawn.clear());
+        host.update(cx, |host, cx| {
+            host.width = px(6000.);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let frames = table.read_with(cx, |table, _| table.frames_rows_drawn.clone());
+        let first = frames.first().expect("the widened grid is drawn");
+        assert_eq!(
+            first.len(),
+            21,
+            "the frame's list asked for its lines: {frames:?}"
+        );
+        assert!(
+            past_the_edge.iter().all(|&col| first[col]),
+            "the frame that widens the grid draws what it uncovers: {first:?} of {frames:?}"
+        );
+        let (picked, rows) = frame(cx);
+        assert_eq!(rows, picked);
     }
 
     /// A row put in or taken out moves the rows after it: the places drawn hold other rows
