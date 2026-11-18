@@ -3388,11 +3388,30 @@ mod tests {
     /// graphs again.
     #[gpui::test]
     fn a_cluster_a_target_names_chooses_its_server(cx: &mut TestAppContext) {
-        let alpha = server(&["one"], cx);
-        let beta = server(&["two"], cx);
-        // The test servers share a name: the second is the target's.
-        beta.update(cx, |c, _| c.server.name = "prod".into());
-        let (modal, cx) = dialog(vec![alpha.clone(), beta.clone()], cx);
+        let from_plane = server(&["one"], cx);
+        let environment = server(&["local"], cx);
+        let cli_target = server(&["two"], cx);
+        // A plane-owned connection may have the same display name and endpoint as the CLI target.
+        from_plane.update(cx, |c, _| {
+            c.server.name = "prod".into();
+            c.server.source = graph_store::ServerSource::ControlPlane;
+        });
+        cli_target.update(cx, |c, _| {
+            c.server.name = "prod".into();
+            c.server.source = graph_store::ServerSource::Cli;
+        });
+        let (modal, cx) = dialog(
+            vec![from_plane, environment.clone(), cli_target.clone()],
+            cx,
+        );
+        // Environment servers are still opened through their own row.
+        modal.update_in(cx, |modal, window, cx| {
+            modal.move_to(Place::Server(environment.entity_id()), window, cx);
+        });
+        assert_eq!(
+            modal.read_with(cx, |modal, _| modal.selected.clone()),
+            Some(environment)
+        );
         let target = "prod".to_owned();
         let plane = signed_in_plane(cx);
         modal.update(cx, |modal, cx| {
@@ -3412,7 +3431,10 @@ mod tests {
         let (selected, shown) = modal.read_with(cx, |modal, _| {
             (modal.selected.clone(), modal.plane_shown.clone())
         });
-        assert_eq!(selected.map(|c| c.entity_id()), Some(beta.entity_id()));
+        assert_eq!(
+            selected.map(|c| c.entity_id()),
+            Some(cli_target.entity_id())
+        );
         assert_eq!(shown, None);
         assert!(cx.debug_bounds("open-graph").is_some());
     }
