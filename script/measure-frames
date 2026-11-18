@@ -103,7 +103,7 @@ cases=(
   "table filter key|$PERSON|studio_table::AddFilter|measure:$FRAMES,type"
   "table cell key|$PERSON|studio_table::EditCell|key:right|studio_table::EditCell|measure:$FRAMES,type"
   "table scroll|$PERSON|measure:$FRAMES,scroll=40"
-  "relationship scroll|$PERSON|measure:1,scroll=-900:0|measure:$FRAMES,scroll=40"
+  "relationship scroll|$PERSON|measure:1,scroll=-900:0|wait:$SNAPSHOT_WAIT_MS|measure:$FRAMES,scroll=40"
   "query key (6 columns)|$NEW_QUERY|studio_query::Run|measure:$FRAMES,type"
   "palette key|$PERSON|studio::GoTo|measure:$FRAMES,type"
   "window redraw|$PERSON|measure:$FRAMES,refresh"
