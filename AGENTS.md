@@ -78,6 +78,10 @@ python3 script/test_release_files.py   # a release's version-free copies and lat
   Studio's own releases. Only `graph_store` turns responses into entities.
 - Every new action goes in `studio_actions`, gets a default binding in `assets/keymaps/`, and
   appears in the palette.
+- For a view's polish (radius, alignment, elevation, motion, icons, hit areas), load the
+  `make-interfaces-feel-better` skill (`.agents/skills/`, read through `.claude/skills`). Its
+  examples are CSS; apply them in GPUI and tokens, and Studio's own rules win
+  (`.agents/skills/README.md`).
 - Copying from Zed is allowed (GPL). Keep the file's copyright notice and add a
   `// Forked from zed-industries/zed <path> @ <commit>` line. Keep forks small.
 - Write the product's name Omnigraph: one word, a lower-case g (`omnigraph` in identifiers and
