@@ -8,14 +8,15 @@
 //! It looks as [`crate::ds::tag`]s in a row clipped at its end, then the count, does.
 
 use gpui::{
-    App, Bounds, DefiniteLength, Element, ElementId, GlobalElementId, Hsla, InspectorElementId,
-    IntoElement, LayoutId, Length, Pixels, Point, ShapedLine, SharedString, Size, Style, TextAlign,
-    TextStyleRefinement, Window, px,
+    AnyView, App, Bounds, DefiniteLength, Div, Element, ElementId, GlobalElementId, Hsla,
+    InspectorElementId, InteractiveElement, IntoElement, LayoutId, Length, ParentElement, Pixels,
+    Point, ShapedLine, SharedString, Size, Stateful, Style, Styled, TextAlign, TextStyleRefinement,
+    Window, div, px,
 };
 use smallvec::SmallVec;
 
 use crate::cell_text::{cut_line, line_height, shape_line};
-use crate::ds::{TAG_MAX_WIDTH, size, space};
+use crate::ds::{Anchor, TAG_MAX_WIDTH, size, space};
 
 /// See the module documentation.
 pub struct Tags {
@@ -25,6 +26,8 @@ pub struct Tags {
     count_style: TextStyleRefinement,
     background: Hsla,
     radius: Pixels,
+    /// Where the tooltip of [`Tags::tip_fn`] hangs from: the row of the parts.
+    anchor: Option<Anchor>,
 }
 
 /// `tags` in quiet pills, then `count` in the muted body text when there is one. The tags give
@@ -46,6 +49,25 @@ pub fn tags(
         count_style: body.color(ui::Color::Muted.color(cx)).style,
         background: crate::ds::surface::tag(cx),
         radius: px(crate::ds::radii(cx).xs),
+        anchor: None,
+    }
+}
+
+impl Tags {
+    /// The element with the tooltip `build` makes, for the cell under the pointer. The box that
+    /// carries the tooltip fills the cell, as the element does, so the parts stand where they
+    /// stand in every other cell; the tooltip hangs under the row of the parts, where it hung
+    /// under the row of boxes.
+    pub fn tip_fn(
+        mut self,
+        id: impl Into<ElementId>,
+        build: impl Fn(&mut Window, &mut App) -> AnyView + 'static,
+    ) -> Stateful<Div> {
+        let anchor = Anchor::new();
+        self.anchor = Some(anchor.clone());
+        anchor
+            .tip_fn(div().id(id).size_full().min_w_0(), build)
+            .child(self)
     }
 }
 
@@ -88,6 +110,11 @@ impl Element for Tags {
     /// its parts across that height itself: GPUI gives an element its bounds on device pixels,
     /// and boxes centred in a smaller element would be placed from where that element was
     /// before it was put on them, half a pixel off where the boxes were.
+    ///
+    /// For the same reason its parent's box must start on a device pixel, as a table's cell
+    /// does: the element is placed from its bounds, and GPUI does not say where they were
+    /// before it rounded them. A box only as high as its contents, centred in a cell, can start
+    /// half a pixel off; [`Tags::tip_fn`] fills the cell for that reason.
     fn request_layout(
         &mut self,
         _id: Option<&GlobalElementId>,
@@ -127,7 +154,8 @@ impl Element for Tags {
         style.size.width = Length::Definite(DefiniteLength::Fraction(1.));
         style.min_size.width = Length::Definite(DefiniteLength::Absolute(px(0.).into()));
         style.size.height = Length::Definite(DefiniteLength::Fraction(1.));
-        style.min_size.height = Length::Definite(DefiniteLength::Absolute(shaped.height().into()));
+        let height = shaped.height(window.scale_factor());
+        style.min_size.height = Length::Definite(DefiniteLength::Absolute(height.into()));
         (window.request_layout(style, [], cx), shaped)
     }
 
@@ -141,7 +169,9 @@ impl Element for Tags {
         cx: &mut App,
     ) -> Placed {
         let scale = window.scale_factor();
+        let height = shaped.height(scale);
         let plan = plan(
+            &Lengths::at(scale),
             &shaped
                 .tags
                 .iter()
@@ -152,14 +182,23 @@ impl Element for Tags {
                 .as_ref()
                 .map(|line| hug_width(line.width, scale)),
             f32::from(bounds.size.width),
-            f32::from(shaped.height()),
+            f32::from(height),
             f32::from(shaped.tag_line_height),
             f32::from(shaped.count_line_height),
         );
         // Where the row of parts would stand, centred in the element as its parent centred it.
         let origin = bounds.origin.map(f32::from)
-            + Point::new(0., f32::from(bounds.size.height - shaped.height()) / 2.);
+            + Point::new(0., f32::from(bounds.size.height - height) / 2.);
         let snap = |rect: Rect| rect.snapped(origin, scale);
+        let row = snap(Rect {
+            x: 0.,
+            y: 0.,
+            w: f32::from(bounds.size.width),
+            h: f32::from(height),
+        });
+        if let Some(anchor) = &self.anchor {
+            anchor.record(row);
+        }
         let tags = std::mem::take(&mut shaped.tags)
             .into_iter()
             .zip(&self.tags)
@@ -187,6 +226,7 @@ impl Element for Tags {
                 placed.clip,
                 placed.tags.iter().map(|(tag, _, _)| *tag).collect(),
                 placed.count,
+                self.anchor.as_ref().map(|_| row),
             ))
         });
         placed
@@ -249,12 +289,13 @@ impl Element for Tags {
 }
 
 impl Shaped {
-    /// As high as a tag when there is one, and as the count's line when there is one.
-    fn height(&self) -> Pixels {
+    /// As high as a tag when there is one, and as the count's line when there is one, at
+    /// `scale`.
+    fn height(&self, scale: f32) -> Pixels {
         let tag = if self.tags.is_empty() {
             px(0.)
         } else {
-            px(size::TAG)
+            px(Lengths::at(scale).tag_height)
         };
         let count = if self.count.is_some() {
             self.count_line_height
@@ -271,6 +312,33 @@ fn hug_width(width: Pixels, scale: f32) -> f32 {
     (f32::from(width) * scale).ceil() / scale
 }
 
+/// A length written in code as GPUI lays it out at `scale`: on the nearest whole device pixel, a
+/// half toward zero, before layout (`AbsoluteLength::to_taffy` in `gpui::taffy`).
+fn device_length(length: f32, scale: f32) -> f32 {
+    ((length * scale).abs() - 0.5).ceil().copysign(length) / scale
+}
+
+/// The lengths a [`crate::ds::tag`] and its row are written with, as GPUI lays them out at one
+/// scale. At 1.25x a tag 18 px high is 22 device pixels, not 22.5.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Lengths {
+    gap: f32,
+    padding: f32,
+    tag_height: f32,
+    tag_max_width: f32,
+}
+
+impl Lengths {
+    fn at(scale: f32) -> Self {
+        Self {
+            gap: device_length(space::XS, scale),
+            padding: device_length(space::SM, scale),
+            tag_height: device_length(size::TAG, scale),
+            tag_max_width: device_length(TAG_MAX_WIDTH, scale),
+        }
+    }
+}
+
 /// A box relative to the element's origin, before it is put on device pixels.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Rect {
@@ -282,17 +350,19 @@ struct Rect {
 
 impl Rect {
     /// On device pixels as GPUI puts a laid-out box: each edge in window space, a half rounded
-    /// toward zero (`gpui::taffy::TaffyLayoutEngine::layout_bounds`).
+    /// toward zero, and the size taken between the edges in device pixels before both are
+    /// divided by the scale (`gpui::taffy::TaffyLayoutEngine::layout_bounds`). Divided edge by
+    /// edge instead, a tag 27 device pixels high at 1.5x would be 17.999996 px, not 18.
     fn snapped(self, origin: Point<f32>, scale: f32) -> Bounds<Pixels> {
-        let edge = |at: f32| (((at * scale).abs() - 0.5).ceil().copysign(at * scale)) / scale;
+        let edge = |at: f32| ((at * scale).abs() - 0.5).ceil().copysign(at * scale);
         let (left, top) = (edge(origin.x + self.x), edge(origin.y + self.y));
         let (right, bottom) = (
             edge(origin.x + self.x + self.w),
             edge(origin.y + self.y + self.h),
         );
         Bounds {
-            origin: Point::new(px(left), px(top)),
-            size: Size::new(px(right - left), px(bottom - top)),
+            origin: Point::new(px(left / scale), px(top / scale)),
+            size: Size::new(px((right - left) / scale), px((bottom - top) / scale)),
         }
     }
 }
@@ -316,8 +386,10 @@ struct Plan {
 /// Lays the parts out as the boxes [`crate::ds::tag`] draws would be: a row of the tags, each
 /// as wide as its line and its padding up to [`TAG_MAX_WIDTH`], a gap apart, that gives way to
 /// the count after it (a gap further on, as wide as its line, never narrower), all centred
-/// across the element. `tag_widths` and `count_width` are the lines' hugging widths.
+/// across the element. `tag_widths` and `count_width` are the lines' hugging widths, and
+/// `lengths` the written ones at the element's scale.
 fn plan(
+    lengths: &Lengths,
     tag_widths: &[f32],
     count_width: Option<f32>,
     width: f32,
@@ -325,11 +397,15 @@ fn plan(
     tag_line_height: f32,
     count_line_height: f32,
 ) -> Plan {
-    let (gap, padding) = (space::XS, space::SM);
-    let tag_height = if tag_widths.is_empty() { 0. } else { size::TAG };
+    let (gap, padding) = (lengths.gap, lengths.padding);
+    let tag_height = if tag_widths.is_empty() {
+        0.
+    } else {
+        lengths.tag_height
+    };
     let boxes: SmallVec<[f32; 2]> = tag_widths
         .iter()
-        .map(|text| (text + 2. * padding).min(TAG_MAX_WIDTH))
+        .map(|text| (text + 2. * padding).min(lengths.tag_max_width))
         .collect();
     let content = boxes.iter().sum::<f32>() + gap * boxes.len().saturating_sub(1) as f32;
     // The row of tags shrinks to what the count leaves; the count keeps its width.
@@ -381,7 +457,14 @@ mod tests {
     use gpui::{TestAppContext, VisualTestContext};
     use std::cell::RefCell;
 
-    type Drawn = (Bounds<Pixels>, Vec<Bounds<Pixels>>, Option<Point<Pixels>>);
+    /// A drawn element's clip, tags, count and, when it carries a tooltip, the row the tooltip
+    /// hangs from.
+    type Drawn = (
+        Bounds<Pixels>,
+        Vec<Bounds<Pixels>>,
+        Option<Point<Pixels>>,
+        Option<Bounds<Pixels>>,
+    );
 
     thread_local! {
         /// What each [`Tags`] drawn in a test placed: its clip, its tags and its count.
@@ -390,13 +473,23 @@ mod tests {
 
     /// The same parts drawn twice, one under the other, in a cell's padded box: as the boxes
     /// the table drew before (a row of [`crate::ds::tag`]s, clipped, then the count) and as a
-    /// [`Tags`].
+    /// [`Tags`]. The second cell starts [`PROBE_STEP`] lower, on a whole device pixel at every
+    /// scale, as every cell of the table does. A cell under the pointer carries a tooltip as
+    /// the table's does.
     struct Probe {
         width: f32,
         height: f32,
         tags: Vec<&'static str>,
         count: Option<&'static str>,
+        under_pointer: bool,
     }
+
+    /// How far below the boxes the element is drawn: a whole device pixel at each of [`SCALES`].
+    const PROBE_STEP: f32 = 40.;
+
+    /// The scales Studio is drawn at: Retina, a plain screen, and the fractional scales of
+    /// Windows and Linux.
+    const SCALES: [f32; 5] = [1., 1.25, 1.5, 1.75, 2.];
 
     impl gpui::Render for Probe {
         fn render(
@@ -415,6 +508,7 @@ mod tests {
                     .items_center()
             };
             let boxes = h_flex()
+                .debug_selector(|| "boxes".into())
                 .w_full()
                 .min_w_0()
                 .gap(px(space::XS))
@@ -445,73 +539,174 @@ mod tests {
                 self.count.map(SharedString::from),
                 cx,
             );
+            let element = if self.under_pointer {
+                under_pointer(element)
+            } else {
+                element.into_any_element()
+            };
             v_flex()
-                .child(cell().child(boxes))
+                .child(
+                    div()
+                        .flex_none()
+                        .h(px(PROBE_STEP))
+                        .child(cell().child(boxes)),
+                )
                 .child(cell().child(element))
         }
     }
 
+    /// The cell under the pointer, as the table draws it.
+    fn under_pointer(element: Tags) -> gpui::AnyElement {
+        element
+            .tip_fn("probe-tip", |_, cx| crate::ds::tooltip_view("Person", cx))
+            .into_any_element()
+    }
+
     /// The element puts each tag, the row it is clipped to and the count on the bounds the
-    /// boxes had, one cell lower: with room, short of room, past a tag's widest, with no tag,
-    /// and in a cell whose height centres them on a half pixel.
+    /// boxes had, one cell lower, at each scale Studio draws at: with room, short of room, past
+    /// a tag's widest, with no tag, in cells whose height centres them on a half pixel, and in
+    /// a table's 28 px cell, under the pointer and not.
     #[gpui::test]
     fn the_element_draws_where_the_boxes_did(cx: &mut TestAppContext) {
         cx.update(studio_theme::init_test);
         let cases = [
-            (300., 32., vec!["Ada Lovelace", "Grace Hopper"], Some("+3")),
-            (120., 32., vec!["Ada Lovelace", "Grace Hopper"], Some("+3")),
+            (
+                300.,
+                32.,
+                vec!["Ada Lovelace", "Grace Hopper"],
+                Some("+3"),
+                false,
+            ),
+            (
+                120.,
+                32.,
+                vec!["Ada Lovelace", "Grace Hopper"],
+                Some("+3"),
+                false,
+            ),
             (
                 600.,
                 33.,
                 vec!["A name far too long to fit in one tag of a cell"],
                 None,
+                false,
             ),
-            (200., 32., vec![], Some("12")),
-            (160., 31., vec!["Ada"], None),
+            (200., 32., vec![], Some("12"), false),
+            (160., 31., vec!["Ada"], None, false),
+            (
+                300.,
+                28.,
+                vec!["Ada Lovelace", "Grace Hopper"],
+                Some("+3"),
+                false,
+            ),
+            (
+                300.,
+                28.,
+                vec!["Ada Lovelace", "Grace Hopper"],
+                Some("+3"),
+                true,
+            ),
+            (
+                120.,
+                28.,
+                vec!["Ada Lovelace", "Grace Hopper"],
+                Some("+3"),
+                true,
+            ),
+            (200., 28., vec![], Some("12"), true),
         ];
-        for (width, height, names, count) in cases {
-            PLACED.with_borrow_mut(Vec::clear);
-            let (_, cx): (_, &mut VisualTestContext) = cx.add_window_view(|_, _| Probe {
-                width,
-                height,
-                tags: names.clone(),
-                count,
-            });
-            cx.run_until_parked();
-            let (clip, drawn, count_at) = PLACED
-                .with_borrow(|all| all.last().cloned())
-                .expect("the element was drawn");
-            let lower = |bounds: Bounds<Pixels>| Bounds {
-                origin: bounds.origin + Point::new(px(0.), px(height)),
-                ..bounds
-            };
-            let case = format!("{width}x{height} {names:?} {count:?}");
-            for (ix, tag) in drawn.iter().enumerate() {
-                let boxed = cx
-                    .debug_bounds(format!("box-{ix}").leak())
-                    .unwrap_or_else(|| panic!("{case}: box {ix} was not drawn"));
-                assert_eq!(*tag, lower(boxed), "{case}: tag {ix}");
-            }
-            assert_eq!(drawn.len(), names.len(), "{case}");
-            if !names.is_empty() {
-                let row = cx.debug_bounds("boxes-row").expect("the row");
-                assert_eq!(clip, lower(row), "{case}: the row the tags are clipped to");
-            }
-            match (count_at, cx.debug_bounds("box-count")) {
-                (Some(at), Some(boxed)) => {
-                    assert_eq!(at, lower(boxed).origin, "{case}: the count")
+        let mut wrong = Vec::new();
+        for scale in SCALES {
+            for (width, height, names, count, under_pointer) in cases.clone() {
+                PLACED.with_borrow_mut(Vec::clear);
+                let (_, cx): (_, &mut VisualTestContext) = cx.add_window_view(|_, _| Probe {
+                    width,
+                    height,
+                    tags: names.clone(),
+                    count,
+                    under_pointer,
+                });
+                cx.simulate_scale_factor_change(scale);
+                cx.run_until_parked();
+                let (clip, drawn, count_at, tip_row) = PLACED
+                    .with_borrow(|all| all.last().cloned())
+                    .expect("the element was drawn");
+                let lower = |bounds: Bounds<Pixels>| Bounds {
+                    origin: bounds.origin + Point::new(px(0.), px(PROBE_STEP)),
+                    ..bounds
+                };
+                let case = format!(
+                    "{scale}x: {width}x{height} {names:?} {count:?}{}",
+                    if under_pointer {
+                        " under the pointer"
+                    } else {
+                        ""
+                    }
+                );
+                let mut check = |what: String, element: Bounds<Pixels>, boxes: Bounds<Pixels>| {
+                    if element != lower(boxes) {
+                        wrong.push(format!(
+                            "{case}: {what} at {element:?}, the box at {:?}",
+                            lower(boxes)
+                        ));
+                    }
+                };
+                assert_eq!(drawn.len(), names.len(), "{case}");
+                for (ix, tag) in drawn.iter().enumerate() {
+                    let boxed = cx
+                        .debug_bounds(format!("box-{ix}").leak())
+                        .unwrap_or_else(|| panic!("{case}: box {ix} was not drawn"));
+                    check(format!("tag {ix}"), *tag, boxed);
                 }
-                (None, None) => {}
-                other => panic!("{case}: count {other:?}"),
+                if !names.is_empty() {
+                    let row = cx.debug_bounds("boxes-row").expect("the row");
+                    check("the row the tags are clipped to".into(), clip, row);
+                }
+                match (count_at, cx.debug_bounds("box-count")) {
+                    (Some(at), Some(boxed)) => check(
+                        "the count".into(),
+                        Bounds {
+                            origin: at,
+                            size: boxed.size,
+                        },
+                        boxed,
+                    ),
+                    (None, None) => {}
+                    other => panic!("{case}: count {other:?}"),
+                }
+                // The tooltip hangs from the row of the parts, as it hung from the row of boxes.
+                match (under_pointer, tip_row) {
+                    (true, Some(row)) => {
+                        let boxes = cx.debug_bounds("boxes").expect("the boxes' row");
+                        check("the row the tooltip hangs from".into(), row, boxes);
+                    }
+                    (false, None) => {}
+                    other => panic!("{case}: tooltip row {other:?}"),
+                }
             }
         }
+        assert!(
+            wrong.is_empty(),
+            "{} parts off:\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        );
     }
 
     /// Two tags and a count, with room for all: the tags a gap apart, padded, the count a gap
     /// after them, everything centred in the row's height.
     #[test]
     fn tags_and_a_count_sit_as_the_boxes_would() {
-        let plan = plan(&[30., 40.], Some(15.), 200., 18., 14., 16.);
+        let plan = plan(
+            &Lengths::at(1.),
+            &[30., 40.],
+            Some(15.),
+            200.,
+            18.,
+            14.,
+            16.,
+        );
         assert_eq!(plan.tags.len(), 2);
         assert_eq!(
             plan.tags[0].tag,
@@ -548,7 +743,7 @@ mod tests {
     /// A long name stops at the widest a tag grows, and its line gets what is left inside.
     #[test]
     fn a_long_tag_stops_at_its_widest() {
-        let plan = plan(&[400.], None, 600., 18., 14., 0.);
+        let plan = plan(&Lengths::at(1.), &[400.], None, 600., 18., 14., 0.);
         assert_eq!(plan.tags[0].tag.w, TAG_MAX_WIDTH);
         assert_eq!(plan.tags[0].text.w, TAG_MAX_WIDTH - 2. * space::SM);
         assert_eq!(plan.count, None);
@@ -557,11 +752,19 @@ mod tests {
     /// Short of room, the row of tags gives way and the count keeps its width at the row's end.
     #[test]
     fn the_tags_give_way_to_the_count() {
-        let short = plan(&[60., 60.], Some(20.), 100., 18., 14., 16.);
+        let short = plan(
+            &Lengths::at(1.),
+            &[60., 60.],
+            Some(20.),
+            100.,
+            18.,
+            14.,
+            16.,
+        );
         assert_eq!(short.clip.w, 100. - space::XS - 20.);
         assert_eq!(short.count.unwrap().x, 100. - 20.);
         // No tags: the count still stands a gap in, where the empty row of tags ends.
-        let bare = plan(&[], Some(20.), 100., 16., 14., 16.);
+        let bare = plan(&Lengths::at(1.), &[], Some(20.), 100., 16., 14., 16.);
         assert_eq!(bare.count.unwrap().x, space::XS);
         assert_eq!(bare.clip.h, 0.);
     }
@@ -594,6 +797,35 @@ mod tests {
         assert_eq!(at.size, Size::new(px(10.), px(3.)));
         let at = rect.snapped(Point::new(10., 20.), 2.);
         assert_eq!(at.origin, Point::new(px(10.5), px(21.5)));
+    }
+
+    /// The lengths a tag is written with land on whole device pixels as GPUI lays them out,
+    /// and a box's size is taken in device pixels: at 1.25x a tag 18 px high is 22 device
+    /// pixels, and at 1.5x it is 18 px exactly.
+    #[test]
+    fn written_lengths_land_as_gpui_lays_them_out() {
+        let device = |scale: f32| {
+            let lengths = Lengths::at(scale);
+            [
+                lengths.tag_height,
+                lengths.padding,
+                lengths.gap,
+                lengths.tag_max_width,
+            ]
+            // The nearest device pixel: dividing by 1.75 and multiplying back is not exact.
+            .map(|length| (length * scale).round())
+        };
+        assert_eq!(device(1.), [18., 6., 4., 160.]);
+        assert_eq!(device(1.25), [22., 7., 5., 200.]);
+        assert_eq!(device(1.75), [31., 10., 7., 280.]);
+        assert_eq!(device(2.), [36., 12., 8., 320.]);
+        let tag = Rect {
+            x: 0.,
+            y: 0.,
+            w: 84.,
+            h: 18.,
+        };
+        assert_eq!(tag.snapped(Point::new(12., 46.), 1.5).size.height, px(18.));
     }
 
     /// GPUI moves an element and its states from step to step of every frame, for each cell.

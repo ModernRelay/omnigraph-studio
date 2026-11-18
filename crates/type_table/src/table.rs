@@ -11377,15 +11377,12 @@ impl TypeTable {
         }
         // The other type is the column's, looked up when the tooltip shows.
         let table = cx.weak_entity();
-        // As high as the tags and the count, as the row of them was, so the tooltip stands
-        // where it did, under them.
-        h_flex()
-            .w_full()
-            .min_w_0()
-            .child(cell)
-            .id(ElementId::NamedInteger("relation".into(), id))
-            .debug_selector(move || format!("relation-tip-{ix}-{col}"))
-            .tip_fn(move |_, cx| {
+        // The box that carries the tooltip fills the cell, as the tags do in every other cell,
+        // so they do not move when the pointer comes; the tooltip hangs under them, where it
+        // hung under the row of boxes.
+        cell.tip_fn(
+            ElementId::NamedInteger("relation".into(), id),
+            move |_, cx| {
                 let other = table.upgrade().and_then(|table| {
                     let group = table.read(cx).columns.get(col)?.relationship()?;
                     Some(group.other_type.clone())
@@ -11398,8 +11395,10 @@ impl TypeTable {
                     ),
                     cx,
                 )
-            })
-            .into_any_element()
+            },
+        )
+        .debug_selector(move || format!("relation-tip-{ix}-{col}"))
+        .into_any_element()
     }
 
     /// A Blob cell: "Blob" while it is read, then its size and "Preview" (a click opens the
