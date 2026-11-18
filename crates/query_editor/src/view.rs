@@ -22,11 +22,11 @@ use gpui::{
 };
 use gq_language::check::{Destroys, Publication};
 use gq_language::{QueryInfo, ResultColumn, SchemaModel};
-use graph_client::api::ErrorCode;
 use graph_client::api::{
     ChangeRequest, ParamDescriptor, ParamKind, QueryCatalogEntry, QueryRequest, ReadOutput,
     ReadPageOutput,
 };
+use graph_client::api::{ErrorCode, RankingOutput};
 use graph_client::{ReadError, Unauthorized, WriteOutcome};
 use graph_store::{GraphSession, SessionEvent};
 use serde_json::{Map, Value};
@@ -44,7 +44,7 @@ use studio_ui::{
     format_value, grid_cell, grid_header, grid_places, is_numeric, resizable_grid_header,
     short_commit_id, value_text,
 };
-use studio_workspace::{Item, ItemEvent, ItemStatus, KeyHint, SavedItem};
+use studio_workspace::{Inspected, InspectedNode, Item, ItemEvent, ItemStatus, KeyHint, SavedItem};
 use ui::prelude::*;
 use ui::{KeyBinding, PopoverMenu};
 
@@ -52,8 +52,9 @@ use crate::analysis::Analysis;
 use crate::completion::GqCompletionProvider;
 use crate::results::{
     PlanItem, ResultGraph, ResultTable, ServerDiagnostic, SourceMap, WriteEffect, diff_page_text,
-    is_branch_diff, is_plan, plan_items, rows_label, server_diagnostic, type_label,
+    is_branch_diff, is_plan, plan_items, ranking_fact, rows_label, server_diagnostic, type_label,
 };
+use crate::row_note::RowNote;
 
 /// How long typing pauses before the source is checked again.
 const CHECK_DELAY: Duration = Duration::from_millis(150);
@@ -98,6 +99,16 @@ struct Prepared {
 }
 
 /// Where a read's rows came from, as its answer says.
+/// What the inspector shows of a result's selected cell (spec 020).
+#[derive(Debug, Clone, PartialEq)]
+enum Picked {
+    /// The cell holds a whole node: that node, read where the rows were.
+    Node(InspectedNode),
+    /// The cell holds a value: its row, by its place in the result, every column in full
+    /// ([`RowNote`]).
+    Row(usize),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ReadAt {
     Branch(String),
@@ -192,6 +203,9 @@ struct RowsOutput {
     commit: Option<String>,
     /// A paged read's page (`branch diff`): the commits it compares and its continuation.
     page: Option<ReadPageOutput>,
+    /// How a read ordered by a search ranked its rows (Omnigraph 0.15); `None` for any other
+    /// read, and from an earlier server, which does not say.
+    ranking: Option<RankingOutput>,
     /// Which page this is, from 1; 0 for a read that is not paged.
     page_number: usize,
     /// The run that reads the next page, when the server says there is one.
@@ -397,6 +411,10 @@ impl Failure {
                     (Some(unauthorized), _) => unauthorized.reason(),
                     (None, Some(ErrorCode::Forbidden)) => {
                         "Your token may not read this graph or branch."
+                    }
+                    (None, Some(ErrorCode::NotAdmitted)) => {
+                        "The server has not admitted your sign-in, and signing in again will not \
+                         help. Ask the server's operator to admit you."
                     }
                     (None, Some(ErrorCode::BadRequest)) => {
                         "Fix the query (the problems list shows what the compiler sees) and run it again."
@@ -683,6 +701,12 @@ pub struct QueryEditor {
     pending_write: Option<PendingWrite>,
     writing: bool,
     selected: Option<(usize, usize)>,
+    /// What the selected cell shows in the inspector, as the workspace was last told of it
+    /// ([`ItemEvent::Selected`]).
+    inspected: Option<Picked>,
+    /// The inspector's view of the selected value's row, made when the inspector asks and kept
+    /// while that row stays selected.
+    row_note: Option<Entity<RowNote>>,
     /// Result columns dragged to a width, by name: they keep it in later results and come back
     /// with the tab.
     column_widths: BTreeMap<String, f32>,
@@ -798,6 +822,37 @@ impl Item for QueryEditor {
     /// The result area is drawn cached on its own (`QueryResults`).
     fn caches_its_parts(&self) -> bool {
         true
+    }
+
+    /// The commit a query tab opened at a commit reads (spec 032).
+    fn held_at(&self, _cx: &App) -> Option<String> {
+        self.at_commit.clone()
+    }
+
+    /// The selected cell of the result (spec 020): the node it holds, or its row.
+    fn inspected(&mut self, cx: &mut Context<Self>) -> Option<Inspected> {
+        match self.picked(cx)? {
+            Picked::Node(node) => Some(Inspected::Node(node)),
+            Picked::Row(row) => {
+                let note = match &self.row_note {
+                    Some(note) => note.clone(),
+                    None => {
+                        let Output::Rows(output) = &self.output else {
+                            return None;
+                        };
+                        let (held, _) = self.rows_read_at(output, cx);
+                        let note = RowNote::new(row, &output.table, held)?;
+                        let note = cx.new(|_| note);
+                        self.row_note = Some(note.clone());
+                        note
+                    }
+                };
+                Some(Inspected::View {
+                    view: note.into(),
+                    scrolls_itself: false,
+                })
+            }
+        }
     }
 
     fn tab_title(&self, _cx: &App) -> SharedString {
@@ -1045,6 +1100,8 @@ impl QueryEditor {
         });
         let editor_focus = editor.focus_handle(cx);
         let subscriptions = vec![
+            // The inspector shows the result's selected cell (spec 020).
+            cx.observe_self(|this, cx| this.report_selection(cx)),
             cx.subscribe_in(
                 &editor,
                 window,
@@ -1149,6 +1206,8 @@ impl QueryEditor {
             pending_write: None,
             writing: false,
             selected: None,
+            inspected: None,
+            row_note: None,
             column_widths: BTreeMap::new(),
             resizing: None,
             filled_example: false,
@@ -3415,6 +3474,7 @@ impl QueryEditor {
                     read_at,
                     commit: output.graph_commit_id,
                     page: output.page,
+                    ranking: output.ranking,
                     page_number: prepared.page,
                     next,
                     rerun,
@@ -3684,6 +3744,65 @@ impl QueryEditor {
 
     // ---- results ----
 
+    /// Where a view of one of the result's nodes reads, as `(held at, read at)`. Rows held at a
+    /// commit are read there, as the views they open are. Rows read at the window's branch are
+    /// read at the commit they came from, and follow the branch. Rows of a branch the window
+    /// has left since, and a statement's, which names its own branches, are shown as they were
+    /// read: held at their commit, so nothing is edited from another branch's values.
+    fn rows_read_at(&self, output: &RowsOutput, cx: &App) -> (Option<String>, Option<String>) {
+        match &output.read_at {
+            ReadAt::Commit(commit) => (Some(commit.clone()), None),
+            ReadAt::Branch(branch) if *branch == self.session.read(cx).branch => {
+                (None, output.commit.clone())
+            }
+            ReadAt::Branch(_) | ReadAt::Statement => (output.commit.clone(), None),
+        }
+    }
+
+    /// What the inspector shows of the selected cell: the node it holds, or else its row.
+    fn picked(&self, cx: &App) -> Option<Picked> {
+        let (row, column) = self.selected?;
+        let Output::Rows(output) = &self.output else {
+            return None;
+        };
+        let values = output.table.rows.get(row)?;
+        let node = output
+            .table
+            .node_types
+            .get(column)
+            .and_then(Option::as_ref)
+            .zip(
+                values
+                    .get(column)
+                    .and_then(|value| value.get("@id"))
+                    .and_then(Value::as_str),
+            );
+        Some(match node {
+            Some((type_name, id)) => {
+                let (at_commit, snapshot) = self.rows_read_at(output, cx);
+                Picked::Node(InspectedNode {
+                    type_name: type_name.clone(),
+                    id: id.to_owned(),
+                    at_commit,
+                    snapshot,
+                })
+            }
+            None => Picked::Row(row),
+        })
+    }
+
+    /// Tells the workspace when the selected cell shows another thing in the inspector, or
+    /// nothing: called whenever the tab notifies, so every way the selection goes is seen (a
+    /// click, an arrow key, a run, which clears it).
+    fn report_selection(&mut self, cx: &mut Context<Self>) {
+        let picked = self.picked(cx);
+        if picked != self.inspected {
+            self.inspected = picked;
+            self.row_note = None;
+            cx.emit(ItemEvent::Selected);
+        }
+    }
+
     fn select_cell(
         &mut self,
         row: usize,
@@ -3854,6 +3973,28 @@ impl QueryEditor {
                 start.push(
                     ds::meta(IconName::Clock, format_elapsed(rows.elapsed)).into_any_element(),
                 );
+                if let Some(ranking) = &rows.ranking {
+                    let (fact, warning) = ranking_fact(ranking);
+                    start.push(ds::meta(IconName::Crosshair, fact).into_any_element());
+                    if let Some(warning) = warning {
+                        start.push(
+                            h_flex()
+                                .id("ranking-not-exhaustive")
+                                .gap(px(studio_ui::ds::space::XS))
+                                .child(
+                                    studio_ui::ds::icon::meta(IconName::Warning)
+                                        .color(Color::Warning),
+                                )
+                                .child(
+                                    studio_ui::ds::text::meta("Not exhaustive")
+                                        .color(Color::Warning)
+                                        .single_line(),
+                                )
+                                .tip(studio_ui::ds::tooltip(warning))
+                                .into_any_element(),
+                        );
+                    }
+                }
                 // Where the rows were read, when it is not the branch the status bar shows: the
                 // branch changed since, and a commit pin is named by the commit itself. A
                 // statement read no branch of the tab's; a diff says which commits it compared.
@@ -4689,8 +4830,17 @@ impl QueryEditor {
                 let mut column = GridColumn::new(name.clone(), name.clone())
                     .width(px(rows.widths[i]))
                     .align_right(rows.right_aligned[i]);
-                if let Some(Some(ty)) = table.types.get(i) {
-                    column = column.detail(ty.clone());
+                let ty = table.types.get(i).cloned().flatten();
+                // A ranked read's score columns say so beside their type.
+                let score = rows
+                    .ranking
+                    .as_ref()
+                    .is_some_and(|ranking| ranking.score_columns.contains(name));
+                match (ty, score) {
+                    (Some(ty), true) => column = column.detail(format!("{ty} · score")),
+                    (None, true) => column = column.detail("score"),
+                    (Some(ty), false) => column = column.detail(ty),
+                    (None, false) => {}
                 }
                 column
             })
@@ -5114,16 +5264,26 @@ impl QueryEditor {
                         ds::meta(IconName::GitBranch, format!("from {from}")).into_any_element(),
                     );
                 }
+                // The commit is a link to its changes, so a write can be checked against what
+                // it was meant to do (spec 033): a click previews its tab, a second keeps it.
                 if let Some((commit, what)) = effect.commit() {
+                    let id = commit.to_owned();
                     facts.push(
                         div()
                             .id("write-commit")
+                            .cursor_pointer()
                             .child(ds::meta_code(
                                 IconName::GitCommit,
                                 short_commit_id(commit),
                                 cx,
                             ))
-                            .tip(studio_ui::ds::tooltip(format!("{what} {commit}")))
+                            .tip(
+                                studio_ui::ds::tooltip(format!("{what} {commit}"))
+                                    .meta("Click to see its changes"),
+                            )
+                            .on_click(move |event, window, cx| {
+                                open_write_commit(id.clone(), event.click_count() < 2, window, cx)
+                            })
                             .into_any_element(),
                     );
                 }
@@ -5661,11 +5821,62 @@ fn results_set(
     }
 }
 
+/// Opens the commit a write's result names, so the write is checked against what it was meant
+/// to do (spec 033): a preview takes the pane's preview slot, not the query's place, since the
+/// source tab is never replaced (spec 020), as History keeps itself.
+fn open_write_commit(commit_id: String, preview: bool, window: &mut Window, cx: &mut App) {
+    if preview && let Some(workspace) = studio_workspace::workspace_for(window) {
+        workspace.update(cx, |workspace, cx| workspace.keep_active_tab(cx));
+    }
+    window.dispatch_action(
+        Box::new(studio_actions::graph::OpenCommit { commit_id, preview }),
+        cx,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// A write's commit, opened from the query's tab as a preview, keeps that tab: a query
+    /// previewed in the pane is not replaced by the commit (review of #130).
+    #[gpui::test]
+    async fn a_writes_commit_keeps_the_querys_tab(cx: &mut gpui::TestAppContext) {
+        struct Tab(gpui::FocusHandle);
+        impl gpui::Render for Tab {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                gpui::Empty
+            }
+        }
+        impl gpui::Focusable for Tab {
+            fn focus_handle(&self, _: &App) -> gpui::FocusHandle {
+                self.0.clone()
+            }
+        }
+        impl gpui::EventEmitter<studio_workspace::ItemEvent> for Tab {}
+        impl studio_workspace::Item for Tab {
+            fn tab_title(&self, _: &App) -> SharedString {
+                "query".into()
+            }
+        }
+        cx.update(studio_theme::init_test);
+        let (workspace, cx) = cx.add_window_view(studio_workspace::Workspace::new);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace
+                .open_item_with::<Tab>("query", true, window, cx, |_, cx| Tab(cx.focus_handle()));
+            assert!(workspace.active_tab_is_preview(), "the query is a preview");
+        });
+        cx.update(|window, cx| open_write_commit("c9".into(), true, window, cx));
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                !workspace.active_tab_is_preview(),
+                "the query's tab is kept"
+            );
+        });
+    }
 
     /// A row keeps the start of a long text that a cell shows, not the whole, which the table
     /// holds already; other values as they read.
@@ -5970,6 +6181,46 @@ mod tests {
                 Output::Rows(rows) => rows.widths.clone(),
                 _ => panic!("no rows"),
             }
+        }
+
+        /// A ranked read keeps how the server ranked it, which its results show; an answer
+        /// without a ranking (a read in another order, or a 0.14 server's) shows none.
+        #[gpui::test]
+        async fn a_ranked_read_keeps_its_ranking(cx: &mut TestAppContext) {
+            init(cx);
+            let session = session(cx);
+            let (editor, cx) =
+                cx.add_window_view(|window, cx| QueryEditor::new(1, session, window, cx));
+            editor.update(cx, |editor, _| {
+                let read = |ranking: Value| -> ReadOutput {
+                    let mut output = json!({
+                        "query_name": "near",
+                        "target": {"branch": "main"},
+                        "row_count": 1,
+                        "columns": ["slug", "d"],
+                        "rows": [{"slug": "a", "d": 0.5}],
+                    });
+                    if !ranking.is_null() {
+                        output["ranking"] = ranking;
+                    }
+                    serde_json::from_value(output).unwrap()
+                };
+                let at = || ReadAt::Branch("main".into());
+                let ranked = read(json!({ "by": "nearest", "order": "ascending",
+                    "exhaustive": false, "score_columns": ["d"] }));
+                editor.finish_read(people(), at(), Ok(ranked), Duration::ZERO, None);
+                let Output::Rows(rows) = &editor.output else {
+                    panic!("rows")
+                };
+                let ranking = rows.ranking.as_ref().expect("kept");
+                assert!(!ranking.exhaustive);
+                assert_eq!(ranking.score_columns, ["d"]);
+                editor.finish_read(people(), at(), Ok(read(Value::Null)), Duration::ZERO, None);
+                let Output::Rows(rows) = &editor.output else {
+                    panic!("rows")
+                };
+                assert!(rows.ranking.is_none(), "none from an answer without one");
+            });
         }
 
         /// Only a run that explained shows its answer as a plan: a read that returns columns
@@ -6616,6 +6867,122 @@ mod tests {
                         "the canvas, unpinned"
                     );
                 });
+            }
+        }
+
+        /// The inspector shows the result's selected cell (spec 020). A cell holding a whole
+        /// node shows that node, read where the rows were: held at the tab's commit, or at the
+        /// rows' commit while they follow the window's branch. A value shows its row, every
+        /// column in full, in the same view while the row stays selected. A run clears the
+        /// selection, and the inspector with it. Before, the inspector read "Nothing selected"
+        /// beside a selected cell.
+        #[gpui::test]
+        async fn the_inspector_shows_a_results_selected_node_or_row(cx: &mut TestAppContext) {
+            use std::{cell::Cell, rc::Rc};
+            init(cx);
+            for held in [Some("c1"), None] {
+                let people = json!({
+                    "query_name": "people",
+                    "target": {"branch": held.is_none().then_some("main"), "snapshot": held},
+                    "row_count": 2,
+                    "columns": ["p", "name", "slug"],
+                    "rows": [
+                        {"p": {"@id": "p1", "slug": "p1", "name": "Ada"}, "name": "Ada", "slug": "p1"},
+                        {"p": {"@id": "p2", "slug": "p2", "name": "Grace"}, "name": "Grace", "slug": "p2"},
+                    ],
+                    "graph_commit_id": "c1",
+                });
+                let (session, _) = served(
+                    cx,
+                    vec![schema_route(PEOPLE), ("/query", people.to_string())],
+                );
+                let (editor, cx) =
+                    cx.add_window_view(|window, cx| QueryEditor::new(1, session, window, cx));
+                cx.run_until_parked();
+                let run = |cx: &mut gpui::VisualTestContext| {
+                    editor.update_in(cx, |editor, window, cx| {
+                        editor.set_text(
+                            "query people() { match { $p: Person } return { $p, $p.name, $p.slug } }",
+                            window,
+                            cx,
+                        );
+                        if let Some(commit) = held {
+                            editor.pin_to(commit.into(), cx);
+                        }
+                        editor.run(&Run, window, cx);
+                    });
+                    cx.run_until_parked();
+                };
+                run(cx);
+                let told = Rc::new(Cell::new(0));
+                let _subscription = cx.update(|_, cx| {
+                    let told = told.clone();
+                    cx.subscribe(&editor, move |_, event: &ItemEvent, _| {
+                        if matches!(event, ItemEvent::Selected) {
+                            told.set(told.get() + 1);
+                        }
+                    })
+                });
+                let select = |row: usize, column: usize, cx: &mut gpui::VisualTestContext| {
+                    editor.update_in(cx, |editor, window, cx| {
+                        editor.select_cell(row, column, window, cx)
+                    });
+                    cx.run_until_parked();
+                };
+                let inspected =
+                    |cx: &mut gpui::VisualTestContext| editor.update(cx, Item::inspected);
+                let row_of = |inspected: Option<Inspected>| match inspected {
+                    Some(Inspected::View { view, .. }) => view
+                        .downcast::<RowNote>()
+                        .unwrap_or_else(|_| panic!("a row's note: {held:?}")),
+                    _ => panic!("a value shows its row: {held:?}"),
+                };
+                assert!(inspected(cx).is_none(), "nothing selected yet");
+
+                // The node's own cell: the node, read where the rows were.
+                select(0, 0, cx);
+                assert_eq!(told.get(), 1);
+                let Some(Inspected::Node(node)) = inspected(cx) else {
+                    panic!("a node cell shows its node: {held:?}");
+                };
+                assert_eq!(
+                    node,
+                    InspectedNode {
+                        type_name: "Person".into(),
+                        id: "p1".into(),
+                        at_commit: held.map(str::to_owned),
+                        snapshot: held.is_none().then(|| "c1".to_owned()),
+                    }
+                );
+
+                // A value: its row, and the same view from another value of the row.
+                select(0, 1, cx);
+                assert_eq!(told.get(), 2);
+                let first = row_of(inspected(cx));
+                first.read_with(cx, |note, _| {
+                    assert_eq!(note.place(), (1, 2));
+                    let said: Vec<(String, String)> = note.read();
+                    let said: Vec<(&str, &str)> = said
+                        .iter()
+                        .map(|(name, value)| (name.as_str(), value.as_str()))
+                        .collect();
+                    assert_eq!(said, [("p", "Person p1"), ("name", "Ada"), ("slug", "p1")]);
+                });
+                select(0, 2, cx);
+                assert_eq!(told.get(), 2, "the same row says nothing");
+                assert_eq!(row_of(inspected(cx)).entity_id(), first.entity_id());
+
+                // Another row is another view.
+                select(1, 2, cx);
+                assert_eq!(told.get(), 3);
+                let second = row_of(inspected(cx));
+                assert_ne!(second.entity_id(), first.entity_id());
+                second.read_with(cx, |note, _| assert_eq!(note.place(), (2, 2)));
+
+                // A run clears the selection: nothing is shown until a cell is selected again.
+                run(cx);
+                assert_eq!(told.get(), 4);
+                assert!(inspected(cx).is_none());
             }
         }
 

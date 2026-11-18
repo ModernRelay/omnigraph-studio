@@ -5,8 +5,11 @@ Name=Omnigraph Studio
 GenericName=Graph browser
 Comment=Browse, query and change Omnigraph graphs
 TryExec=omnigraph-studio
-Exec=omnigraph-studio
+Exec=omnigraph-studio %u
 Icon=omnigraph-studio
 Categories=Development;Database;
 StartupNotify=true
 StartupWMClass=omnigraph-studio
+# `omnigraph studio` (CLI 0.15) runs this entry's `Exec` with the link once `xdg-mime` names it
+# the scheme's handler: xdg-mime default omnigraph-studio.desktop x-scheme-handler/omnigraph-studio
+MimeType=x-scheme-handler/omnigraph-studio;

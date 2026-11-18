@@ -1185,6 +1185,11 @@ impl Focusable for BlobView {
 }
 
 impl Item for BlobView {
+    /// The commit a held tab reads, read-only (spec 032).
+    fn held_at(&self, _cx: &App) -> Option<String> {
+        self.held.then(|| self.snapshot.clone()).flatten()
+    }
+
     fn tab_title(&self, _cx: &App) -> SharedString {
         format!("{} · {}", self.cell.property, self.cell.id).into()
     }

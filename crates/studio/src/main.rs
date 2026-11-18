@@ -19,6 +19,11 @@ fn main() {
     // `omnigraph-studio://` links arrive outside the app's context, at a start or later; each
     // is passed on to the app, which opens it.
     let (links_tx, links_rx) = smol::channel::unbounded::<String>();
+    // On Linux and Windows the platform starts Studio with the link as its argument (the
+    // desktop entry's `%u`, the URL protocol's `"%1"`), and GPUI does not hand it on.
+    for link in studio::deep_link::links_in_args(std::env::args_os().skip(1)) {
+        links_tx.try_send(link).ok();
+    }
     app.on_open_urls(move |urls| {
         for url in urls {
             links_tx.try_send(url).ok();

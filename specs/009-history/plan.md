@@ -59,7 +59,9 @@ from Zed with notices).
   are never asked for, its row reads "first commit" in the changes column, and its detail says
   it is the graph's first commit. History opens the commits it lists in their own tabs with
   the commit as listed (a click in the panel, a double click, ↵, the row menu's "Open in a
-  tab"), which is not read again. A commit named by its id alone (a restored tab, a toast's
+  tab"), which is not read again. The inspector shows the selected commit (spec 020, since
+  2026-11-14): who wrote it, when, on which branch, its parents as links, the branches whose
+  head it is, and its counts once read. A commit named by its id alone (a restored tab, a toast's
   "View commit", a parent link) asks for its changes beside its own read, not after it, and
   the server's `parentless_commit` refusal shows it as the first (since 2026-10-21; before, it
   waited for its own read, a round trip more on every commit tab). A commit tab's "Load more
@@ -236,3 +238,4 @@ away are dropped.
 - 2026-10-20: for a token refused commits by id, History read the other branches' whole
   listings, every commit since each began. It reads the newest page of each (1,000 commits),
   and the stubs say why the commits merged are not drawn (Design).
+- 2026-11-17: a commit's tab selected nothing, so the inspector stayed empty and no change led to its node; a schema change was an error with a Try again that only repeated the refusal, and a blank in History's row; a partial count read "+100 + more". Spec 033: a commit's tab selects (J/K, Space, ⌘↵ to open the node at the commit, the inspector following), its states are shared with the review ("Schema change" names the type and offers no retry), its sections read "Existing" and "New" under a summary line by type, and every list of commits says its counts through `change_cards::commit_counts` ("…" when partial, "schema change", "first commit"). The inspector's commit adds its counts by type.

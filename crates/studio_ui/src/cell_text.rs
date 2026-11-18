@@ -23,12 +23,12 @@ pub struct CellText {
     text: SharedString,
     align: TextAlign,
     hug: bool,
-    style: TextStyleRefinement,
+    pub(crate) style: TextStyleRefinement,
 }
 
 /// The most of a text one line shows: a column is at most `COLUMN_MAX_WIDTH` wide, so the rest
 /// of a long value (a paragraph in a Text cell) is never copied, scanned or shaped.
-const SHOWN_CHARS: usize = 512;
+pub(crate) const SHOWN_CHARS: usize = 512;
 
 /// `text` on one line, from the start of its room, as a small label draws it. A control
 /// character (a line break, a tab) shows as its picture, as a single-line label has it.
@@ -237,29 +237,48 @@ impl Element for CellText {
 impl CellText {
     /// The whole line, shaped in `text_style`.
     fn shape(&self, text_style: &TextStyle, font_size: Pixels, window: &Window) -> ShapedLine {
-        window.text_system().shape_line(
-            self.text.clone(),
-            font_size,
-            &[text_style.to_run(self.text.len())],
-            None,
-        )
+        shape_line(&self.text, text_style, font_size, window)
     }
 
     /// The line cut to `width` at its end, in the text style in effect.
     fn cut(&self, width: Pixels, window: &mut Window, cx: &mut App) -> Box<ShapedLine> {
-        let text_style = window.text_style();
-        let font_size = text_style.font_size.to_pixels(window.rem_size());
-        let runs = [text_style.to_run(self.text.len())];
-        let (text, runs) = cx
-            .text_system()
-            .line_wrapper(text_style.font(), font_size)
-            .truncate_line(self.text.clone(), width, "…", &runs, TruncateFrom::End);
-        Box::new(
-            window
-                .text_system()
-                .shape_line(text, font_size, &runs, None),
-        )
+        Box::new(cut_line(&self.text, width, window, cx))
     }
+}
+
+/// `text`, shaped whole in `text_style`.
+pub(crate) fn shape_line(
+    text: &SharedString,
+    text_style: &TextStyle,
+    font_size: Pixels,
+    window: &Window,
+) -> ShapedLine {
+    window.text_system().shape_line(
+        text.clone(),
+        font_size,
+        &[text_style.to_run(text.len())],
+        None,
+    )
+}
+
+/// `text` cut to `width` at its end, "…" taking the place of what does not show, in the text
+/// style in effect.
+pub(crate) fn cut_line(
+    text: &SharedString,
+    width: Pixels,
+    window: &mut Window,
+    cx: &mut App,
+) -> ShapedLine {
+    let text_style = window.text_style();
+    let font_size = text_style.font_size.to_pixels(window.rem_size());
+    let runs = [text_style.to_run(text.len())];
+    let (text, runs) = cx
+        .text_system()
+        .line_wrapper(text_style.font(), font_size)
+        .truncate_line(text.clone(), width, "…", &runs, TruncateFrom::End);
+    window
+        .text_system()
+        .shape_line(text, font_size, &runs, None)
 }
 
 /// The start of `text` one line can show ([`SHOWN_CHARS`]), found without reading the rest: what
@@ -272,7 +291,7 @@ pub fn shown_part(text: SharedString) -> SharedString {
 }
 
 /// `text` with each control character as its picture: GPUI shapes one line only.
-fn one_line(text: SharedString) -> SharedString {
+pub(crate) fn one_line(text: SharedString) -> SharedString {
     match ui::utils::replace_control_characters(&text) {
         std::borrow::Cow::Owned(replaced) => replaced.into(),
         std::borrow::Cow::Borrowed(_) => text,
@@ -280,7 +299,7 @@ fn one_line(text: SharedString) -> SharedString {
 }
 
 /// The height of a line of `text_style`, on whole pixels as GPUI's text is.
-fn line_height(text_style: &TextStyle, font_size: Pixels, window: &Window) -> Pixels {
+pub(crate) fn line_height(text_style: &TextStyle, font_size: Pixels, window: &Window) -> Pixels {
     window.pixel_snap(
         text_style
             .line_height

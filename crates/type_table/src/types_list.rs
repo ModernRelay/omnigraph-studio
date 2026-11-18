@@ -494,6 +494,7 @@ impl TypesList {
                     via: None,
                     preview: true,
                     filters: None,
+                    separate: false,
                 };
                 studio_ui::ds::SidebarRow::new(("type", ix), name.clone())
                     .start(studio_ui::kind_swatch(name, *is_edge, cx))

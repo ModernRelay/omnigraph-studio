@@ -4,24 +4,24 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use change_cards::{CardLines, CardRows, Row};
+use change_cards::{CardLines, CardRows, CommitCounts, Row};
 use gpui::{
-    AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, ListAlignment,
-    ListState, Render, SharedString, Subscription, Task, Window, list,
+    AnyElement, AnyView, App, Context, Entity, EventEmitter, FocusHandle, Focusable, ListAlignment,
+    ListState, Render, SharedString, StyleRefinement, Subscription, Task, WeakEntity, Window, list,
 };
 use gq_language::SchemaModel;
-use graph_client::ReadError;
-use graph_client::api::{ChangeCauseOutput, ChangeDiffRefusalReason, CommitKind, CommitOutput};
+use graph_client::api::{ChangeCauseOutput, CommitKind, CommitOutput};
 use graph_store::{
     ChangeFold, EntityGroups, FoldedChanges, GraphSession, GroupRun, GroupSection, NodeNames,
     SessionEvent, TypeCounts,
 };
-use studio_actions::graph::{CreateBranchAt, OpenCommit, OpenQueryAt, OpenType};
+use studio_actions::changes::{OpenChanged, ToggleChange};
+use studio_actions::graph::{CreateBranchAt, OpenCommit, OpenNodePage, OpenQueryAt, OpenType};
 use studio_actions::history::{LoadMoreChanges, NewBranchHere};
 use studio_ui::ds::Tipped;
 use studio_ui::menu::ContextMenu;
 use studio_ui::{now_micros, relative_time, short_commit_id, utc_date_time};
-use studio_workspace::{Item, ItemEvent, SavedItem, Workspace};
+use studio_workspace::{Inspected, InspectedNode, Item, ItemEvent, SavedItem, Workspace};
 use ui::prelude::*;
 use ui::{KeyBinding, PopoverMenu};
 
@@ -35,9 +35,17 @@ enum State {
     Loading,
     Ready,
     Failed(SharedString),
-    /// The graph's first commit: it has no parent to compare with, so its changes are not
-    /// asked for (the server refuses them, `parentless_commit`).
-    First,
+    /// Changes the server will never list, said as History's rows say them
+    /// ([`crate::counts::lasting`]): the graph's first commit, whose changes are not asked for;
+    /// a schema change; history cleaned up; another comparison refused. Asking again gets the
+    /// same answer, so nothing offers it.
+    Lasting(CommitCounts),
+}
+
+/// Why a read of a commit's changes stopped short of them.
+enum Stop {
+    Lasting(CommitCounts),
+    Failed(String),
 }
 
 pub struct CommitView {
@@ -89,6 +97,21 @@ pub struct CommitView {
     read_owed: bool,
     _regroup_task: Option<Task<()>>,
     _schema_subscription: Subscription,
+    /// The entity selected, by its group: J and K move it, Space unfolds it, ⌘↵ opens its page,
+    /// and the inspector shows its node (spec 033, as a review's selection does).
+    selected: Option<usize>,
+    /// The selected entity by type and id, which [`Self::selected`] is found again from when
+    /// the groups are made again: a later page or a schema groups and orders them anew.
+    selected_key: Option<(String, String)>,
+    /// The first change was selected once, as the commit opened.
+    selected_first: bool,
+    /// The node the workspace was last told is selected ([`ItemEvent::Selected`]).
+    inspected: Option<InspectedNode>,
+    /// The large runs were folded once, when the changes were first shown ([`change_cards::FOLD_PAST`]).
+    folded_large: bool,
+    /// The changes' list, a view of its own drawn cached (`docs/drawing.md`): the header's reads
+    /// and the tab's own redraws leave it as it was.
+    list_view: Entity<CommitRows>,
 }
 
 impl EventEmitter<ItemEvent> for CommitView {}
@@ -117,6 +140,14 @@ impl Item for CommitView {
             kind: "commit".into(),
             data: serde_json::json!({ "commit_id": self.commit_id }),
         })
+    }
+
+    fn inspected(&mut self, _cx: &mut Context<Self>) -> Option<Inspected> {
+        self.selected_node().map(Inspected::Node)
+    }
+
+    fn caches_its_parts(&self) -> bool {
+        true
     }
 }
 
@@ -190,6 +221,12 @@ impl CommitView {
             read_owed: false,
             _regroup_task: None,
             _schema_subscription: schema_subscription,
+            selected: None,
+            selected_key: None,
+            selected_first: false,
+            inspected: None,
+            folded_large: false,
+            list_view: CommitRows::new(cx),
         }
     }
 
@@ -237,7 +274,7 @@ impl CommitView {
         self._task = None;
         self.more_error = None;
         self.next_page_token = None;
-        self.state = State::First;
+        self.state = State::Lasting(CommitCounts::First);
         true
     }
 
@@ -305,9 +342,11 @@ impl CommitView {
                             break Ok(());
                         }
                     }
-                    // The graph's first commit: it has no parent to compare with.
-                    Err(error) if is_parentless(&error) => break Err(None),
-                    Err(error) => break Err(Some(describe(&error))),
+                    // One reading of a refusal, shared with History's rows.
+                    Err(error) => match crate::counts::lasting(&error) {
+                        Some(said) => break Err(Stop::Lasting(said)),
+                        None => break Err(Stop::Failed(error.to_string())),
+                    },
                 }
             };
             let read_any = fold.raw_changes() > start;
@@ -336,19 +375,26 @@ impl CommitView {
             this.update(cx, |this, cx| {
                 this.fold = fold;
                 let result = match result {
-                    Err(None) => {
+                    // A page after changes were shown keeps them, says why the rest cannot be
+                    // read, and offers no more, since asking again gets the same answer.
+                    Err(Stop::Lasting(said)) if read_any || !this.rows.is_empty() => {
+                        this.more_error = Some(said.words().into());
+                        token = None;
+                        Ok(())
+                    }
+                    Err(Stop::Lasting(said)) => {
                         this.next_page_token = None;
                         this.more_error = None;
-                        this.state = State::First;
+                        this.state = State::Lasting(said);
                         cx.notify();
                         return;
                     }
                     // A failure after changes were shown keeps them, and those read since.
-                    Err(Some(message)) if read_any || !this.rows.is_empty() => {
+                    Err(Stop::Failed(message)) if read_any || !this.rows.is_empty() => {
                         this.more_error = Some(message.into());
                         Ok(())
                     }
-                    Err(Some(message)) => Err(message),
+                    Err(Stop::Failed(message)) => Err(message),
                     Ok(()) => Ok(()),
                 };
                 match result {
@@ -364,6 +410,18 @@ impl CommitView {
                         this.card_rows = CardRows::default();
                         this.read_names(cx);
                         this.next_page_token = token;
+                        this.fold_large_once();
+                        // The groups are made anew: the selection is found again by its entity.
+                        this.reselect(cx);
+                        // The first change is selected and unfolded as the commit opens, as the
+                        // review's is, so its values and its node show from the start.
+                        if !std::mem::replace(&mut this.selected_first, true) {
+                            let first = this.visible_groups().first().copied();
+                            this.select_group(first, cx);
+                            if let Some((type_name, id)) = this.selected_key.clone() {
+                                this.open.insert((type_name, id));
+                            }
+                        }
                         // Rows read further down keep the place the person scrolled to.
                         this.reset_list();
                         this.state = State::Ready;
@@ -447,6 +505,9 @@ impl CommitView {
                 this.runs = runs;
                 this.row_runs = row_runs(&this.rows);
                 this.schema = made_with;
+                // Grouped again, the groups are others: the selection is found again by its
+                // entity.
+                this.reselect(cx);
                 this.card_rows = CardRows::default();
                 this.read_names(cx);
                 this.reset_list();
@@ -486,18 +547,24 @@ impl CommitView {
                     .as_ref()
                     .and_then(|c| c.merged_parent_commit_id.clone())
             });
-        let changes = match &self.state {
-            State::Ready => {
-                let total = self.folded.entity_count() + self.folded.relationship_count();
-                let mut text = studio_ui::plural(total, "change", "changes");
-                if self.next_page_token.is_some() {
-                    text.push_str(" so far");
-                }
-                Some(text)
-            }
-            State::Loading => Some("Reading changes…".into()),
-            State::Failed(_) | State::First => None,
-        };
+        // What the commit changed, by type, once read; "so far" while more are to read.
+        let summary = matches!(self.state, State::Ready | State::Loading)
+            .then(|| {
+                self.counts
+                    .iter()
+                    .any(|c| c.added + c.changed + c.removed > 0)
+            })
+            .filter(|any| *any)
+            .map(|_| {
+                h_flex()
+                    .gap(px(studio_ui::ds::space::MD))
+                    .items_center()
+                    .flex_wrap()
+                    .child(change_cards::summary_line(&self.counts, cx))
+                    .when(self.next_page_token.is_some(), |line| {
+                        line.child(studio_ui::ds::text::meta("so far"))
+                    })
+            });
         // A parent is a link to its own commit.
         let parent_link = |id: String, icon: IconName, name: &'static str, tooltip: String| {
             let short = short_commit_id(&id);
@@ -570,9 +637,6 @@ impl CommitView {
                 "Open the merged branch's commit".into(),
             ));
         }
-        if let Some(changes) = changes {
-            facts.push(studio_ui::ds::text::meta(changes).into_any_element());
-        }
         let full_id = self.commit_id.clone();
         v_flex()
             .flex_none()
@@ -604,6 +668,7 @@ impl CommitView {
                     ),
             )
             .child(studio_ui::ds::meta_row(facts).flex_wrap())
+            .children(summary)
             .into_any_element()
     }
 
@@ -657,6 +722,7 @@ impl CommitView {
                                         via: None,
                                         preview: false,
                                         filters: None,
+                                        separate: false,
                                     }),
                                 );
                             }
@@ -747,6 +813,174 @@ impl CommitView {
             .pb(px(studio_ui::ds::space::LG))
     }
 
+    /// Folds the runs too long to read row by row the first time changes are shown, when the
+    /// commit holds others ([`change_cards::starts_folded`]); later pages leave the person's
+    /// folds as they are.
+    fn fold_large_once(&mut self) {
+        if self.folded_large || self.runs.is_empty() {
+            return;
+        }
+        self.folded_large = true;
+        let keys: Vec<_> = change_cards::starts_folded(&self.runs)
+            .map(|run| run_key(run, &self.groups))
+            .collect();
+        self.folded_runs.extend(keys);
+    }
+
+    /// The entities' groups in list order, leaving out those of folded runs.
+    fn visible_groups(&self) -> Vec<usize> {
+        self.rows
+            .iter()
+            .enumerate()
+            .filter_map(|(row, kind)| match kind {
+                Row::Entity(ix) => {
+                    let run = self.row_runs.get(row).copied().unwrap_or_default();
+                    let folded = self
+                        .runs
+                        .get(run)
+                        .is_some_and(|run| self.folded_runs.contains(&run_key(run, &self.groups)));
+                    (!folded).then_some(*ix)
+                }
+                Row::Header(_) => None,
+            })
+            .collect()
+    }
+
+    /// J and K: the next or previous entity shown, scrolled into view.
+    fn step(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let visible = self.visible_groups();
+        let Some(&first) = visible.first() else {
+            return;
+        };
+        let next = match self
+            .selected
+            .and_then(|s| visible.iter().position(|&ix| ix == s))
+        {
+            Some(at) if forward => visible[(at + 1).min(visible.len() - 1)],
+            Some(at) => visible[at.saturating_sub(1)],
+            None => first,
+        };
+        self.select_group(Some(next), cx);
+        if let Some(row) = self
+            .rows
+            .iter()
+            .position(|row| matches!(row, Row::Entity(ix) if *ix == next))
+        {
+            self.list_state.scroll_to_reveal_item(row);
+        }
+        self.report_selection(cx);
+        cx.notify();
+    }
+
+    /// Space: the selected entity unfolds, or folds back.
+    fn toggle_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(group) = self.selected.and_then(|ix| self.groups.groups.get(ix)) else {
+            return;
+        };
+        let key = (group.type_name.clone(), group.id.clone());
+        if !self.open.remove(&key) {
+            self.open.insert(key);
+        }
+        cx.notify();
+    }
+
+    /// Where entity `ix`'s page opens: its node at this commit, or, for one the commit removed,
+    /// at its parent, where it last was. None for a relationship, whose ends have the pages.
+    fn page_of(&self, ix: usize) -> Option<(String, String, String)> {
+        let group = self.groups.groups.get(ix)?;
+        if group.is_edge {
+            return None;
+        }
+        let removed = group.change.is_some_and(|own| {
+            change_cards::kind_of_change(&self.folded.changes[own])
+                == studio_ui::ChangeKind::Removed
+        });
+        let commit = if removed {
+            self.commit
+                .as_ref()
+                .and_then(|c| c.parent_commit_id.clone())
+                .or_else(|| self.cause.as_ref().and_then(|c| c.parent_commit_id.clone()))?
+        } else {
+            self.commit_id.clone()
+        };
+        Some((group.type_name.clone(), group.id.clone(), commit))
+    }
+
+    /// The node of the selected entity, as the inspector shows it, held where its page opens.
+    fn selected_node(&self) -> Option<InspectedNode> {
+        let (type_name, id, commit) = self.page_of(self.selected?)?;
+        Some(InspectedNode {
+            type_name,
+            id,
+            at_commit: Some(commit),
+            snapshot: None,
+        })
+    }
+
+    /// Selects group `ix`, by its index and its entity, and tells the inspector.
+    fn select_group(&mut self, ix: Option<usize>, cx: &mut Context<Self>) {
+        self.selected = ix;
+        self.selected_key = ix
+            .and_then(|ix| self.groups.groups.get(ix))
+            .map(|group| (group.type_name.clone(), group.id.clone()));
+        self.report_selection(cx);
+    }
+
+    /// Finds the selected entity among groups made anew, which a later page or another schema
+    /// orders otherwise; one no longer among them leaves nothing selected. The inspector is
+    /// told either way.
+    fn reselect(&mut self, cx: &mut Context<Self>) {
+        let found = self.selected_key.as_ref().and_then(|(type_name, id)| {
+            self.groups
+                .groups
+                .iter()
+                .position(|group| group.type_name == *type_name && group.id == *id)
+        });
+        self.select_group(found, cx);
+    }
+
+    /// Tells the workspace when the selected entity's node is another one, or none.
+    fn report_selection(&mut self, cx: &mut Context<Self>) {
+        let node = self.selected_node();
+        if node != self.inspected {
+            self.inspected = node;
+            cx.emit(ItemEvent::Selected);
+        }
+    }
+
+    /// Opens entity `ix`'s page where the change left it ([`Self::page_of`]), read-only.
+    fn open_page(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((type_name, id, commit)) = self.page_of(ix) else {
+            return;
+        };
+        self.select_group(Some(ix), cx);
+        window.dispatch_action(
+            Box::new(OpenNodePage {
+                type_name,
+                id,
+                at_commit: Some(commit),
+                preview: false,
+            }),
+            cx,
+        );
+    }
+
+    /// The list of changes, as [`CommitRows`] draws it.
+    fn render_list(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let more = usize::from(self.next_page_token.is_some());
+        if self.list_state.item_count() != self.rows.len() + more {
+            self.list_state.reset(self.rows.len() + more);
+        }
+        list(
+            self.list_state.clone(),
+            cx.processor(|this, row, window, cx| this.render_row(row, window, cx)),
+        )
+        .flex_1()
+        .min_h_0()
+        .py(px(studio_ui::ds::space::MD))
+        .into_any_element()
+    }
+
     fn render_row(
         &mut self,
         row: usize,
@@ -763,13 +997,9 @@ impl CommitView {
                     ("commit-run", ix),
                     run,
                     change_cards::RunWords {
-                        section: run.section.map(|section| {
-                            match section {
-                                GroupSection::Existing => "Changes to existing entities",
-                                GroupSection::Added => "Added",
-                            }
-                            .to_owned()
-                        }),
+                        section: run
+                            .section
+                            .map(|section| change_cards::section_words(section).to_owned()),
                         detail: change_cards::run_detail(run),
                         when: None,
                     },
@@ -806,6 +1036,13 @@ impl CommitView {
                     change_cards::identity(&self.groups, &self.folded, ix, schema, &self.names);
                 let summary = change_cards::entity_summary(&self.folded, group);
                 let body = open.then(|| self.entity_body(ix, kind, cx));
+                let open_button = self.page_of(ix).map(|_| {
+                    change_cards::open_button(
+                        ("open-change", ix),
+                        &self.focus_handle,
+                        cx.listener(move |this, _, window, cx| this.open_page(ix, window, cx)),
+                    )
+                });
                 change_cards::entity_row(
                     change_cards::EntityRow {
                         id: ("commit-change", ix).into(),
@@ -817,11 +1054,14 @@ impl CommitView {
                         first,
                         last,
                         open,
-                        selected: false,
+                        selected: self.selected == Some(ix),
                         dimmed: false,
+                        open_button,
                     },
                     body,
+                    // A click selects the entity and unfolds it, or folds it again (spec 020).
                     cx.listener(move |this, _, _, cx| {
+                        this.select_group(Some(ix), cx);
                         if !this.open.remove(&card_key) {
                             this.open.insert(card_key.clone());
                         }
@@ -838,7 +1078,7 @@ impl CommitView {
                     studio_ui::ds::button(
                         "load-more",
                         if matches!(self.state, State::Loading) {
-                            "Reading changes…"
+                            "Reading the changes…"
                         } else if self.more_error.is_some() {
                             "Try again"
                         } else {
@@ -867,7 +1107,7 @@ impl CommitView {
 /// off every branch, what it is; it names the branch it was written on, which it is not on. A
 /// commit still being read (`pending`) says nothing yet, since its kind decides; one that could
 /// not be read is placed by its changes' cause, which names its authored branch.
-fn branch_fact(
+pub(crate) fn branch_fact(
     commit: Option<&CommitOutput>,
     cause: Option<&ChangeCauseOutput>,
     pending: bool,
@@ -892,9 +1132,6 @@ fn branch_fact(
         CommitKind::Other => return None,
     })
 }
-
-/// What the graph's first commit is called where its changes would show.
-pub(crate) const FIRST_COMMIT: &str = "The graph's first commit";
 
 /// Whether `commit` is the graph's first: it has no parent, so it has no changes the server can
 /// tell (it refuses them with a 409, `parentless_commit`), and none are asked for.
@@ -976,47 +1213,6 @@ pub(crate) fn branch_here_cli(commit_id: &str) -> String {
     format!("omnigraph branch create <name> --from-commit {commit_id}")
 }
 
-/// Whether the server refused a commit's changes because the commit has no parent: the
-/// graph's first commit.
-fn is_parentless(error: &ReadError) -> bool {
-    matches!(
-        error,
-        ReadError::Refused(summary)
-            if summary.change_diff_refusal.as_ref().map(|refusal| refusal.reason)
-                == Some(ChangeDiffRefusalReason::ParentlessCommit)
-    )
-}
-
-/// Why a commit's changes could not be read, with the server's reason as it came. A comparison
-/// the server refused says what stopped it by the refusal's reason: a schema change between the
-/// commit and its parent, naming the type at it; any other reason claims no schema change.
-fn describe(error: &ReadError) -> String {
-    match error {
-        ReadError::Refused(summary) if summary.status == 409 => {
-            let message = &summary.message;
-            match summary.change_diff_refusal.as_ref() {
-                Some(refusal) if refusal.reason == ChangeDiffRefusalReason::SchemaBoundary => {
-                    match &refusal.type_name {
-                        Some(type_name) => format!(
-                            "This commit cannot be compared with its parent across a change to \
-                             {type_name}'s schema: {message}"
-                        ),
-                        None => format!(
-                            "This commit cannot be compared with its parent across a schema \
-                             change: {message}"
-                        ),
-                    }
-                }
-                _ => format!("This commit cannot be compared with its parent: {message}"),
-            }
-        }
-        ReadError::Refused(summary) if summary.status == 410 => {
-            "The history behind this commit was cleaned up, so its changes cannot be read.".into()
-        }
-        other => other.to_string(),
-    }
-}
-
 /// The list's rows: a header for each run of one type, then its cards.
 impl Render for CommitView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1027,7 +1223,6 @@ impl Render for CommitView {
             });
         }
         let header = self.render_header(cx);
-        let more = usize::from(self.next_page_token.is_some());
         let body = match &self.state {
             // Read again from the start: nothing of the commit's changes was read.
             State::Failed(message) => {
@@ -1044,30 +1239,19 @@ impl Render for CommitView {
                     )
                     .into_any_element()
             }
-            State::Ready if self.rows.is_empty() => {
-                studio_ui::ds::empty_state(IconName::Check, "No entity changes").into_any_element()
-            }
-            State::First => studio_ui::ds::empty_state(IconName::GitCommit, FIRST_COMMIT)
-                .child(studio_ui::ds::text::muted(
-                    "It has no parent, so it has no changes to compare.",
-                ))
-                .into_any_element(),
+            State::Ready if self.rows.is_empty() => change_cards::no_changes_state(
+                "This commit changed no node or relationship against its parent.",
+            )
+            .into_any_element(),
+            State::Lasting(said) => change_cards::lasting_state(said)
+                .map(IntoElement::into_any_element)
+                .unwrap_or_else(|| gpui::Empty.into_any_element()),
             State::Loading if self.rows.is_empty() => {
-                studio_ui::ds::loading_state("Reading changes…").into_any_element()
+                change_cards::reading_state(None).into_any_element()
             }
-            _ => {
-                if self.list_state.item_count() != self.rows.len() + more {
-                    self.list_state.reset(self.rows.len() + more);
-                }
-                list(
-                    self.list_state.clone(),
-                    cx.processor(|this, row, window, cx| this.render_row(row, window, cx)),
-                )
-                .flex_1()
-                .min_h_0()
-                .py(px(studio_ui::ds::space::MD))
-                .into_any_element()
-            }
+            _ => AnyView::from(self.list_view.clone())
+                .cached(StyleRefinement::default().size_full())
+                .into_any_element(),
         };
         v_flex()
             .key_context("CommitView")
@@ -1085,8 +1269,59 @@ impl Render for CommitView {
             .when(self.offers_more(), |view| {
                 view.on_action(cx.listener(|this, _: &LoadMoreChanges, _, cx| this.load_more(cx)))
             })
+            // As the review moves among its changes (spec 033).
+            .on_action(cx.listener(|this, _: &menu::SelectNext, _, cx| this.step(true, cx)))
+            .on_action(cx.listener(|this, _: &menu::SelectPrevious, _, cx| this.step(false, cx)))
+            .on_action(cx.listener(|this, _: &ToggleChange, _, cx| this.toggle_selected(cx)))
+            .when(
+                self.selected.and_then(|ix| self.page_of(ix)).is_some(),
+                |view| {
+                    view.on_action(cx.listener(|this, _: &OpenChanged, window, cx| {
+                        if let Some(ix) = this.selected {
+                            this.open_page(ix, window, cx);
+                        }
+                    }))
+                },
+            )
             .child(header)
             .child(body)
+    }
+}
+
+/// A commit's list of changes as a view of its own, drawn cached and again when the commit view
+/// notifies (it observes it), as History's rows are (`docs/drawing.md`).
+pub(crate) struct CommitRows {
+    commit: WeakEntity<CommitView>,
+    _changed: Subscription,
+    /// How often the list was drawn, for the tests that guard it.
+    #[cfg(test)]
+    pub(crate) renders: usize,
+}
+
+impl CommitRows {
+    /// Made with the view, not on its first draw.
+    fn new(cx: &mut Context<CommitView>) -> Entity<Self> {
+        let commit = cx.entity();
+        cx.new(|cx| CommitRows {
+            commit: commit.downgrade(),
+            _changed: cx.observe(&commit, |_, _, cx| cx.notify()),
+            #[cfg(test)]
+            renders: 0,
+        })
+    }
+}
+
+impl Render for CommitRows {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        {
+            self.renders += 1;
+        }
+        let list = self
+            .commit
+            .update(cx, |commit, cx| commit.render_list(cx))
+            .unwrap_or_else(|_| gpui::Empty.into_any_element());
+        v_flex().size_full().child(list)
     }
 }
 
@@ -1116,6 +1351,9 @@ fn run_key(run: &GroupRun, groups: &EntityGroups) -> (GroupSection, bool, String
 mod tests {
     use std::time::Duration;
 
+    use graph_client::ReadError;
+    use graph_client::api::ChangeDiffRefusalReason;
+
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1126,6 +1364,193 @@ mod tests {
 
     use super::*;
 
+    /// A session whose server answers every read of commit c9's changes with `answer`.
+    fn answering(
+        answer: impl Fn() -> (u16, serde_json::Value) + Send + Sync + 'static,
+        cx: &mut TestAppContext,
+    ) -> Entity<GraphSession> {
+        let answer = Arc::new(answer);
+        let http = FakeHttpClient::create(move |_| {
+            let (status, body) = answer();
+            async move {
+                Ok(Response::builder()
+                    .status(status)
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                    .body(AsyncBody::from(body.to_string()))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx))
+    }
+
+    /// J and K move among a commit's changes as the review's do, each key drawing the list once,
+    /// and the inspector follows the node selected, held at the commit (spec 033).
+    #[gpui::test]
+    async fn moving_through_a_commits_changes_draws_the_list_once_a_key(cx: &mut TestAppContext) {
+        cx.update(studio_theme::init_test);
+        let session = answering(
+            || {
+                let change = |id: &str| json!({ "kind": "node", "type": { "id": "Person", "name": "Person" }, "id": id, "op": "insert", "before": null, "after": { "properties": { "slug": id } } });
+                let cause = json!({ "graph_commit_id": "c9", "parent_commit_id": "c8", "authored_branch": "main", "authored_at": 0 });
+                (
+                    200,
+                    json!({ "cause": cause, "changes": [change("p1"), change("p2"), change("p3")] }),
+                )
+            },
+            cx,
+        );
+        let (view, cx) =
+            cx.add_window_view(|_, cx| CommitView::new(session, "c9".into(), None, cx));
+        cx.run_until_parked();
+        let renders = |cx: &mut gpui::VisualTestContext| {
+            view.read_with(cx, |view, cx| view.list_view.read(cx).renders)
+        };
+        assert!(renders(cx) > 0, "the list is drawn");
+        let selected = |cx: &mut gpui::VisualTestContext| {
+            view.read_with(cx, |view, _| {
+                view.selected_node().map(|node| (node.id, node.at_commit))
+            })
+        };
+        assert_eq!(
+            selected(cx),
+            Some(("p1".to_owned(), Some("c9".to_owned()))),
+            "the first change is selected as the commit opens"
+        );
+        for (key, id) in [(true, "p2"), (true, "p3"), (true, "p3"), (false, "p2")] {
+            let before = renders(cx);
+            view.update(cx, |view, cx| view.step(key, cx));
+            cx.run_until_parked();
+            assert_eq!(renders(cx), before + 1, "one draw a key");
+            assert_eq!(selected(cx), Some((id.to_owned(), Some("c9".to_owned()))));
+        }
+        // The first was unfolded as the commit opened; Space unfolds the selected change, and
+        // folds it back.
+        view.read_with(cx, |view, _| {
+            assert!(view.open.contains(&("Person".to_owned(), "p1".to_owned())));
+            assert!(!view.open.contains(&("Person".to_owned(), "p2".to_owned())));
+        });
+        view.update(cx, |view, cx| view.toggle_selected(cx));
+        view.read_with(cx, |view, _| {
+            assert!(view.open.contains(&("Person".to_owned(), "p2".to_owned())))
+        });
+    }
+
+    /// The selection stays on its node when a later page sorts a change before it: the groups
+    /// are made anew and ordered otherwise (review of #130; it failed at fa76ad1, where the
+    /// selection was an index and moved to p00000).
+    #[gpui::test]
+    async fn the_selection_stays_on_its_node_when_a_later_page_sorts_first(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(studio_theme::init_test);
+        let http = FakeHttpClient::create(move |request| {
+            let uri = request.uri().to_string();
+            let cause = json!({ "graph_commit_id": "c9", "parent_commit_id": "c8", "authored_branch": "main", "authored_at": 0 });
+            let body = if !uri.contains("/changes") {
+                json!({})
+            } else if !uri.contains("t2") {
+                let changes: Vec<_> = (0..CAP)
+                    .map(|i| json!({ "kind": "node", "type": { "id": "Person", "name": "Person" }, "id": format!("p{i:05}"), "op": "insert", "before": null, "after": { "properties": { "slug": format!("p{i:05}") } } }))
+                    .collect();
+                json!({ "cause": cause, "changes": changes, "next_page_token": "t2" })
+            } else {
+                let company = json!({ "kind": "node", "type": { "id": "Company", "name": "Company" }, "id": "c1", "op": "update", "before": { "properties": { "slug": "c1", "city": "Tokyo" } }, "after": { "properties": { "slug": "c1", "city": "Osaka" } } });
+                json!({ "cause": cause, "changes": [company] })
+            };
+            async move {
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                    .body(AsyncBody::from(body.to_string()))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let session =
+            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+        let view = cx.new(|cx| CommitView::new(session, "c9".into(), None, cx));
+        cx.run_until_parked();
+        let node = |view: &CommitView| view.selected_node().map(|node| node.id);
+        view.update(cx, |view, cx| {
+            assert_eq!(node(view).as_deref(), Some("p00000"));
+            view.step(true, cx);
+            assert_eq!(node(view).as_deref(), Some("p00001"));
+            view.load_more(cx);
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            assert_eq!(view.groups.groups.len(), CAP + 1, "both pages read");
+            assert_eq!(node(view).as_deref(), Some("p00001"));
+            // An entity no longer among the groups leaves nothing selected.
+            view.groups.groups.retain(|group| group.id != "p00001");
+            view.reselect(cx);
+            assert_eq!(node(view), None);
+        });
+    }
+
+    /// A commit whose history was cleaned up says so, as History's rows do, and offers nothing
+    /// to try again, since asking again gets the same 410 (review of #130).
+    #[gpui::test]
+    async fn a_cleaned_up_commit_says_so_and_offers_no_retry(cx: &mut TestAppContext) {
+        cx.update(studio_theme::init_test);
+        let session = answering(
+            || {
+                (
+                    410,
+                    json!({ "error": "history cleaned up", "code": "gone" }),
+                )
+            },
+            cx,
+        );
+        let view = cx.new(|cx| CommitView::new(session, "c9".into(), None, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(
+                matches!(view.state, State::Lasting(CommitCounts::CleanedUp)),
+                "cleaned up, as History's row says"
+            );
+            assert!(!view.offers_more(), "no Try again, no LoadMoreChanges");
+        });
+    }
+
+    /// A commit across a schema change says so, as what it is rather than a failure, and is
+    /// not offered again, since asking again gets the same answer (spec 033).
+    #[gpui::test]
+    async fn a_schema_change_is_said_as_one_and_not_offered_again(cx: &mut TestAppContext) {
+        cx.update(studio_theme::init_test);
+        let session = answering(
+            || {
+                (
+                    409,
+                    json!({ "error": "entity changes cross an unprovable schema boundary at type 'Person'", "code": "conflict", "change_diff_refusal": { "reason": "schema_boundary", "graph_commit_id": "c9", "type_name": "Person" } }),
+                )
+            },
+            cx,
+        );
+        let view = cx.new(|cx| CommitView::new(session, "c9".into(), None, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(
+                matches!(&view.state, State::Lasting(CommitCounts::SchemaChange(Some(t))) if t == "Person"),
+                "a schema change, at Person"
+            );
+            assert!(!view.offers_more(), "nothing to try again");
+        });
+    }
+
     /// A comparison the server refused says why by the refusal's typed reason: the graph's first
     /// commit is told apart, a schema change names its type, and another 409 is told as the
     /// server put it, claiming no schema change.
@@ -1133,9 +1558,9 @@ mod tests {
     fn a_refused_comparison_says_why() {
         use ChangeDiffRefusalReason::{ParentlessCommit, SchemaBoundary};
         use graph_client::api::ChangeDiffRefusalOutput;
-        let refused = |refusal: Option<(ChangeDiffRefusalReason, Option<&str>)>| {
+        let refused = |status: u16, refusal: Option<(ChangeDiffRefusalReason, Option<&str>)>| {
             ReadError::Refused(graph_client::ApiErrorSummary {
-                status: 409,
+                status,
                 message: "as the server put it".into(),
                 code: None,
                 diagnostic: None,
@@ -1150,19 +1575,31 @@ mod tests {
                 unauthorized: None,
             })
         };
-        assert!(is_parentless(&refused(Some((ParentlessCommit, None)))));
-        assert!(!is_parentless(&refused(Some((SchemaBoundary, None)))));
-        assert!(!is_parentless(&refused(None)));
-        let typed = describe(&refused(Some((SchemaBoundary, Some("Person")))));
-        assert!(typed.contains("a change to Person's schema"), "{typed}");
-        let untyped = describe(&refused(Some((SchemaBoundary, None))));
-        assert!(untyped.contains("across a schema change"), "{untyped}");
-        let other = describe(&refused(None));
-        assert!(!other.contains("schema"), "{other}");
-        // Each keeps the server's reason as it came.
-        for said in [typed, untyped, other] {
-            assert!(said.ends_with(": as the server put it"), "{said}");
-        }
+        let lasting = crate::counts::lasting;
+        assert_eq!(
+            lasting(&refused(409, Some((ParentlessCommit, None)))),
+            Some(CommitCounts::First)
+        );
+        assert_eq!(
+            lasting(&refused(409, Some((SchemaBoundary, Some("Person"))))),
+            Some(CommitCounts::SchemaChange(Some("Person".into())))
+        );
+        assert_eq!(
+            lasting(&refused(409, Some((SchemaBoundary, None)))),
+            Some(CommitCounts::SchemaChange(None))
+        );
+        // Another refused comparison, or one whose reason this build does not know, claims no
+        // schema change and keeps the server's reason as it came.
+        let other = lasting(&refused(409, None)).expect("lasting");
+        assert_eq!(
+            other,
+            CommitCounts::NotComparable("as the server put it".into())
+        );
+        assert!(other.words().ends_with(": as the server put it"));
+        assert!(!other.words().contains("schema"));
+        assert_eq!(lasting(&refused(410, None)), Some(CommitCounts::CleanedUp));
+        // A failure that may pass is not lasting: it is offered again.
+        assert_eq!(lasting(&refused(503, None)), None);
     }
 
     /// A failed read of more changes keeps those read before it, and the next press goes on
@@ -1508,7 +1945,7 @@ mod tests {
         assert_eq!(first_changes(), 1);
         for view in [listed, own] {
             view.read_with(cx, |view, _| {
-                assert!(matches!(view.state, State::First));
+                assert!(matches!(view.state, State::Lasting(CommitCounts::First)));
                 assert_eq!(view.branch_here(), Some("c0"), "a branch can start there");
             });
         }
@@ -1620,7 +2057,7 @@ mod tests {
         });
         first.read_with(cx, |view, _| {
             assert!(view.commit_pending);
-            assert!(matches!(view.state, State::First));
+            assert!(matches!(view.state, State::Lasting(CommitCounts::First)));
         });
         cx.executor().advance_clock(held);
         cx.run_until_parked();
@@ -1629,7 +2066,9 @@ mod tests {
             assert_eq!(view.branch_here(), Some("c9"));
             assert!(matches!(view.state, State::Ready));
         });
-        first.read_with(cx, |view, _| assert!(matches!(view.state, State::First)));
+        first.read_with(cx, |view, _| {
+            assert!(matches!(view.state, State::Lasting(CommitCounts::First)))
+        });
         let asked = asked.lock().unwrap();
         let times = |end: &str| asked.iter().filter(|path| path.ends_with(end)).count();
         assert_eq!(times("/commits/c0/changes"), 1);

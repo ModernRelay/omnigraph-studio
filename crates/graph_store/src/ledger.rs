@@ -24,6 +24,8 @@ pub enum ReadView {
     Page,
     /// The relationship tree and the graph canvas.
     Exploration,
+    /// A node search: the command palette's, while it is open (spec 031).
+    Search,
 }
 
 /// Who asked for a read: a view through its scope, or a caller the ledger cannot name yet.

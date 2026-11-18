@@ -18,9 +18,11 @@ mod exploration;
 pub mod fixes;
 pub mod ledger;
 mod memo;
+pub mod node_search;
 mod refusal;
 mod registry;
 pub mod scope;
+mod server_features;
 mod session;
 pub mod sign_in;
 #[cfg(any(test, feature = "test-support"))]
@@ -50,7 +52,9 @@ pub use entity_groups::{
 pub use exploration::*;
 pub use fixes::{RevertUnavailable, revert_query};
 pub use graph_client::api::{AccessAction, EntityKind};
+pub use refusal::CardViolation;
 pub use registry::ConnectionRegistry;
+pub use server_features::{FEATURES, OLDEST_SUPPORTED, ServerFeature, ServerFeatures};
 
 /// The Omnigraph CLI as Studio finds, checks and runs it, for its own servers and tokens
 /// (spec 003) and for the agent's CLI (spec 013): where Studio looks ([`cli::candidates`]),
@@ -66,8 +70,8 @@ pub mod cli {
 }
 pub use session::{
     BranchStart, DraftEntry, DraftKey, ExternalWrite, FollowUp, GraphSession, HeadWatch, HeldAs,
-    Loadable, MergeEntry, MergeSent, MergeSettled, OutcomeEntry, OutcomeKind, SchemaFailure,
-    SessionEvent, Wrote, nothing_sent, open_session, open_session_behind,
+    Loadable, MergeEntry, MergeSent, MergeSettled, NAME_LIMIT, OutcomeEntry, OutcomeKind,
+    SchemaFailure, SessionEvent, Wrote, nothing_sent, open_session, open_session_behind,
 };
 
 /// The user agent of Studio's requests.

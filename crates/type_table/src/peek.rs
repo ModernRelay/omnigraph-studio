@@ -25,7 +25,7 @@ use graph_store::{
 };
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use serde_json::{Map, Value};
-use studio_actions::graph::{OpenBlob, OpenNodePage, PeekNode};
+use studio_actions::graph::{OpenBlob, OpenNodePage, ShowNodeInTree, ShowNodeOnCanvas};
 use studio_actions::node::{CancelField, ExpandField, SaveField, SaveNodeDrafts};
 use studio_actions::table::{SelectNextSuggestion, SelectPreviousSuggestion};
 use studio_ui::ds::Tipped;
@@ -454,6 +454,9 @@ pub struct NodePeek {
     edge_writes: HashSet<usize>,
     /// Why a group's last write did not land.
     group_notices: HashMap<usize, Notice>,
+    /// On a page, the related node a click selected, by type and id: the inspector shows it
+    /// (spec 020). The inspector's own view selects nothing: its rows open pages.
+    selected: Option<(String, String)>,
     /// The relationship groups with no neighbours are listed too. By default the peek folds
     /// them into one row at the end, and a page hides them, its toolbar's eye showing them
     /// again, as a tree's does.
@@ -500,8 +503,17 @@ pub struct NodePeek {
     /// the workspace, or one behind another tab when its branch moves, reads nothing until it
     /// is shown.
     node_owed: bool,
+    /// The first read of the node waits a moment ([`COUNT_DELAY`]): the view follows a
+    /// selection that may be moving, and a node the selection passes is not read.
+    node_waits: bool,
+    _node_wait: Option<Task<()>>,
     /// Refresh asking after the branch's head before it reads the node again.
     _refresh: Option<Task<()>>,
+    /// The names of the neighbours shown, read under a new choice of what names their type
+    /// ([`Self::rename_neighbours`]); let go with what was read.
+    _renaming: HashMap<u64, Task<()>>,
+    /// The number the next of those reads is kept under.
+    next_renaming: u64,
     /// Takes the copied mark down; a refresh keeps it, and a second copy starts it again.
     _copied: Option<Task<()>>,
     _subscription: Subscription,
@@ -622,21 +634,18 @@ impl NodePeek {
                 return;
             }
             // The schema names some type's nodes otherwise (spec 002, "Node names"): the title
-            // takes its new name from the values held, and the neighbours shown are read again
-            // under theirs; a group not read yet waits to be drawn, as before.
+            // takes its new name from the values held, and the neighbours shown take theirs in
+            // place; a group not read yet waits to be drawn, as before.
             if let SessionEvent::SchemaChanged = event
                 && let Some(now) = session.read(cx).schema_model()
-                && this
+                && let Some(was) = this
                     .schema
-                    .as_ref()
-                    .is_some_and(|was| was.source == now.source && !was.same_as(&now))
+                    .clone()
+                    .filter(|was| was.source == now.source && !was.same_as(&now))
             {
+                let renamed = now.renamed_since(&was);
                 this.schema = Some(now);
-                for index in 0..this.groups.len() {
-                    if matches!(this.groups[index].neighbours, Loadable::Loaded(_)) {
-                        this.load_group(index, false, cx);
-                    }
-                }
+                this.rename_neighbours(&renamed, cx);
                 cx.notify();
                 return;
             }
@@ -763,6 +772,7 @@ impl NodePeek {
             saving_drafts: false,
             drafts_notice: None,
             confirm_discard: false,
+            selected: None,
             show_empty: false,
             folded: HashSet::new(),
             scope: Some(scope),
@@ -778,8 +788,12 @@ impl NodePeek {
             node_reads: 0,
             node_waiters: Vec::new(),
             node_owed: false,
+            node_waits: debounce,
+            _node_wait: None,
             focus_handle: cx.focus_handle(),
             _refresh: None,
+            _renaming: HashMap::new(),
+            next_renaming: 0,
             _copied: None,
             _subscription: subscription,
         };
@@ -829,6 +843,7 @@ impl NodePeek {
     }
 
     /// Opening this node's page, at the commit the view holds or the head; `None` for an edge.
+    /// From the inspector it opens as a preview, as a pick does.
     fn open_page_action(&self) -> Option<OpenNodePage> {
         let PeekSubject::Node { type_name, id } = &self.subject else {
             return None;
@@ -837,7 +852,30 @@ impl NodePeek {
             type_name: type_name.clone(),
             id: id.clone(),
             at_commit: self.held_commit(),
+            preview: true,
         })
+    }
+
+    /// The related node selected on a page, which the inspector shows: read at the commit the
+    /// page holds, or at the head.
+    pub(crate) fn selected_node(&self) -> Option<studio_workspace::InspectedNode> {
+        let (type_name, id) = self.selected.clone()?;
+        Some(studio_workspace::InspectedNode {
+            type_name,
+            id,
+            at_commit: self.held_commit(),
+            snapshot: None,
+        })
+    }
+
+    /// Selects a related node on a page; its row shows it, and the page's tab tells the
+    /// inspector ([`crate::node_page::NodePage`]).
+    fn select_related(&mut self, type_name: &str, id: &str, cx: &mut Context<Self>) {
+        let selected = Some((type_name.to_owned(), id.to_owned()));
+        if self.selected != selected {
+            self.selected = selected;
+            cx.notify();
+        }
     }
 
     /// Neighbours read at a time under a group.
@@ -942,6 +980,120 @@ impl NodePeek {
         }
     }
 
+    /// Names the neighbours shown of the `renamed` types by what names them now, in place
+    /// (spec 002, "Node names"): every group stays as it is, open or closed, with its count and
+    /// rows, and the names are read at the commit each group was read at, a read per type of
+    /// at most 500 ids ([`GraphSession::node_names`]), none for a type now named by its key.
+    /// Before, every group with neighbours was read again whole: it closed, showed as loading,
+    /// and read its count too, whatever type it reached.
+    fn rename_neighbours(
+        &mut self,
+        renamed: &std::collections::BTreeSet<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut by_commit: HashMap<Option<String>, Vec<(String, String)>> = HashMap::new();
+        for group in &self.groups {
+            if !renamed.contains(&group.group.other_type) {
+                continue;
+            }
+            if let Loadable::Loaded(rows) = &group.neighbours {
+                let ends = by_commit.entry(group.read_at.clone()).or_default();
+                ends.extend(
+                    rows.iter()
+                        .map(|row| (group.group.other_type.clone(), row.id.clone())),
+                );
+            }
+        }
+        if by_commit.is_empty() {
+            return;
+        }
+        let reads: Vec<_> = by_commit
+            .into_iter()
+            .flat_map(|(commit, ends)| {
+                ends.chunks(graph_store::NAME_LIMIT)
+                    .map(|chunk| (commit.clone(), chunk.to_vec()))
+                    .collect::<Vec<_>>()
+            })
+            .map(|(commit, ends)| {
+                let asked: HashSet<(String, String)> = ends.iter().cloned().collect();
+                let read = self.session.update(cx, |session, cx| {
+                    session.node_names(ends, commit.clone(), cx)
+                });
+                (commit, asked, read)
+            })
+            .collect();
+        // What each type is named by under this choice: a read that lands after another
+        // choice names nothing of a type named otherwise since.
+        let named_by: HashMap<String, Option<String>> = renamed
+            .iter()
+            .map(|type_name| {
+                (
+                    type_name.clone(),
+                    names_by(self.schema.as_deref(), type_name),
+                )
+            })
+            .collect();
+        self.next_renaming += 1;
+        let id = self.next_renaming;
+        let task = cx.spawn(async move |this, cx| {
+            for (commit, asked, read) in reads {
+                let (names, answered) = read.await;
+                this.update(cx, |this, cx| {
+                    let schema = this.schema.clone();
+                    for group in &mut this.groups {
+                        let type_name = &group.group.other_type;
+                        let still = named_by
+                            .get(type_name)
+                            .is_some_and(|by| *by == names_by(schema.as_deref(), type_name));
+                        // Names at the commit the group was read at, not another's.
+                        if !still || group.read_at != commit {
+                            continue;
+                        }
+                        let Loadable::Loaded(rows) = &mut group.neighbours else {
+                            continue;
+                        };
+                        for row in rows {
+                            let end = (type_name.clone(), row.id.clone());
+                            if !asked.contains(&end) {
+                                continue;
+                            }
+                            // A node left out of an answered read has no name besides its key;
+                            // one a failed read left out keeps the name it showed.
+                            match names.get(&end) {
+                                Some(name) => row.label = Some(name.clone()),
+                                None if answered => row.label = None,
+                                None => {}
+                            }
+                        }
+                    }
+                    cx.notify();
+                })
+                .ok();
+            }
+            this.update(cx, |this, _| this._renaming.remove(&id)).ok();
+        });
+        self._renaming.insert(id, task);
+    }
+
+    /// Group `index`'s neighbours, read under `read_under`, landed: when the schema names their
+    /// type by another property since (spec 002, "Node names"), their names are read again
+    /// under it, as a table's relationship cells are. A group still loading, or a next page
+    /// out, when the choice changed would otherwise show the old names for good.
+    fn rename_if_named_otherwise(
+        &mut self,
+        index: usize,
+        read_under: Option<&SchemaModel>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(group) = self.groups.get(index) else {
+            return;
+        };
+        let other = group.group.other_type.clone();
+        if names_by(read_under, &other) != names_by(self.schema.as_deref(), &other) {
+            self.rename_neighbours(&std::collections::BTreeSet::from([other]), cx);
+        }
+    }
+
     /// The connection's token changed ([`SessionEvent::CredentialChanged`]): the new one may
     /// see less than the old, so nothing the old one read stays shown (the node, its
     /// relationships, its Blob values and what the table read of it) and the reads still out
@@ -958,6 +1110,7 @@ impl NodePeek {
     fn forget_read(&mut self, cx: &mut Context<Self>) {
         self.known.clear();
         self.groups.clear();
+        self._renaming.clear();
         self.absent.clear();
         self.groups_absent.clear();
         // So do the Blob values shown, their previews and the reads still out: nothing of them
@@ -2262,6 +2415,11 @@ impl NodePeek {
         group.neighbours = Loadable::Loading;
         group.read_at = snapshot.clone();
         let relationship = group.group.clone();
+        // The schema its neighbours are named under ([`Self::rename_if_named_otherwise`]).
+        let read_under = self.schema.clone();
+        let Some(group) = self.groups.get_mut(index) else {
+            return;
+        };
         group._task = Some(cx.spawn(async move |this, cx| {
             if debounce {
                 cx.background_executor().timer(COUNT_DELAY).await;
@@ -2292,6 +2450,7 @@ impl NodePeek {
                                 group.expanded = opens;
                             }
                         }
+                        this.rename_if_named_otherwise(index, read_under.as_deref(), cx);
                     }
                     Err(error) => this.group_refused(
                         index,
@@ -2484,6 +2643,7 @@ impl NodePeek {
                         Err(error) => group.neighbours = Loadable::Failed(error.to_string()),
                     }
                 }
+                this.rename_if_named_otherwise(index, Some(&schema), cx);
                 cx.notify();
             })
             .ok();
@@ -3360,9 +3520,9 @@ impl NodePeek {
 
     /// Reads the other type's nodes matching what is typed, eight at a time, after a pause.
     fn search(&mut self, cx: &mut Context<Self>) {
-        let Some(schema) = self.schema.clone() else {
+        if self.schema.is_none() {
             return;
-        };
+        }
         let Some(adding) = self.adding.as_mut() else {
             return;
         };
@@ -3371,15 +3531,15 @@ impl NodePeek {
         };
         let text = adding.editor.read(cx).text(cx).trim().to_owned();
         let other = &group.group.other_type;
-        let search = suggest::search_nodes(&self.session, &schema, other, &text, None, cx);
+        let search = suggest::search_nodes(&self.session, other, &text, None, cx);
         adding._search = Some(cx.spawn(async move |this, cx| {
             let result = search.await;
             this.update(cx, |this, cx| {
                 if let Some(adding) = this.adding.as_mut() {
                     // A failed search offers nothing, not what an earlier one found.
                     match result {
-                        Ok(rows) => {
-                            adding.offers.set(suggest::from_node_rows(&rows), true);
+                        Ok(hits) => {
+                            adding.offers.set(suggest::from_hits(&hits), true);
                             adding.found = Loadable::Loaded(());
                         }
                         Err(error) => {
@@ -4855,6 +5015,7 @@ impl NodePeek {
                             via: None,
                             preview: false,
                             filters: None,
+                            separate: false,
                         }),
                         cx,
                     );
@@ -5011,9 +5172,10 @@ impl NodePeek {
                     }
                 });
                 let removes = self.edits_relationships();
+                let on_page = self.page;
                 v_flex()
                     .children(neighbours.iter().enumerate().map(|(n, neighbour)| {
-                        let (peek, page) = node_actions(&other, &neighbour.id, at_commit.clone());
+                        let open = open_node(&other, &neighbour.id, at_commit.clone());
                         let label = neighbour
                             .label
                             .clone()
@@ -5023,18 +5185,47 @@ impl NodePeek {
                             label.clone(),
                         )
                         .flush()
-                        .start(studio_ui::type_mark(&other, &label, cx))
-                        .tip(studio_ui::ds::tooltip(format!(
-                            "Peek {} · ⌘-click opens its page",
-                            neighbour.id
-                        )))
-                        .on_click(move |event, window, cx| {
-                            if event.modifiers().platform {
-                                window.dispatch_action(Box::new(page.clone()), cx)
-                            } else {
-                                window.dispatch_action(Box::new(peek.clone()), cx)
-                            }
-                        });
+                        .start(studio_ui::type_mark(&other, &label, cx));
+                        let row = if on_page {
+                            // A page holds a selection, as a table and a tree do: a click
+                            // selects the related node, which the inspector shows, and a second
+                            // click opens its page.
+                            let (ty, id) = (other.clone(), neighbour.id.clone());
+                            let selected = self
+                                .selected
+                                .as_ref()
+                                .is_some_and(|(shown, at)| *shown == ty && *at == id);
+                            row.selected(selected)
+                                .tip(studio_ui::ds::tooltip(format!(
+                                    "{} · double-click to open",
+                                    neighbour.id
+                                )))
+                                .on_click(cx.listener(
+                                    move |this, event: &gpui::ClickEvent, window, cx| {
+                                        if event.click_count() >= 2
+                                            || event.modifiers().secondary(cx)
+                                        {
+                                            let mut open = open.clone();
+                                            open.preview = false;
+                                            window.dispatch_action(Box::new(open), cx);
+                                        } else {
+                                            this.select_related(&ty, &id, cx);
+                                        }
+                                    },
+                                ))
+                        } else {
+                            // The inspector describes what is selected and is no place to go
+                            // (constitution XIII): its related nodes open in the center.
+                            row.tip(studio_ui::ds::tooltip(format!(
+                                "Open {} · double-click keeps the tab",
+                                neighbour.id
+                            )))
+                            .on_click(move |event, window, cx| {
+                                let mut open = open.clone();
+                                open.preview = event.click_count() < 2;
+                                window.dispatch_action(Box::new(open), cx);
+                            })
+                        };
                         match neighbour.edge_id.clone().filter(|_| removes) {
                             // Pressed once, "Remove" stays until it is pressed again.
                             Some(edge_id) if self.removing.as_deref() == Some(edge_id.as_str()) => {
@@ -5065,7 +5256,7 @@ impl NodePeek {
         let label_width = self.label_width();
         let endpoint = |label: &'static str, icon: IconName, ty: &String, key: &str| {
             let id = values.get(key).and_then(Value::as_str)?.to_owned();
-            let (peek, page) = node_actions(ty, &id, at_commit.clone());
+            let open = open_node(ty, &id, at_commit.clone());
             Some(
                 studio_ui::ds::property_row(icon, label, label_width)
                     .px(px(space::XS))
@@ -5076,14 +5267,12 @@ impl NodePeek {
                                 .hover(move |s| s.bg(hover))
                                 .cursor_pointer()
                                 .tip(studio_ui::ds::tooltip(format!(
-                                    "Peek {id} · {ty} · ⌘-click opens its page"
+                                    "Open {id} · {ty} · double-click keeps the tab"
                                 )))
                                 .on_click(move |event, window, cx| {
-                                    if event.modifiers().platform {
-                                        window.dispatch_action(Box::new(page.clone()), cx)
-                                    } else {
-                                        window.dispatch_action(Box::new(peek.clone()), cx)
-                                    }
+                                    let mut open = open.clone();
+                                    open.preview = event.click_count() < 2;
+                                    window.dispatch_action(Box::new(open), cx);
                                 }),
                         ),
                     ),
@@ -5104,21 +5293,15 @@ impl NodePeek {
     }
 }
 
-/// Peeking a node and opening its page, at the commit the view holds or the head.
-fn node_actions(type_name: &str, id: &str, at_commit: Option<String>) -> (PeekNode, OpenNodePage) {
-    (
-        PeekNode {
-            type_name: type_name.to_owned(),
-            id: id.to_owned(),
-            at_commit: at_commit.clone(),
-            snapshot: None,
-        },
-        OpenNodePage {
-            type_name: type_name.to_owned(),
-            id: id.to_owned(),
-            at_commit,
-        },
-    )
+/// Opening a related node's page, at the commit the view holds or the head: as a preview, which
+/// a second click keeps.
+fn open_node(type_name: &str, id: &str, at_commit: Option<String>) -> OpenNodePage {
+    OpenNodePage {
+        type_name: type_name.to_owned(),
+        id: id.to_owned(),
+        at_commit,
+        preview: true,
+    }
 }
 
 /// Where a relationship group's row sits (`NodePeek::place`); `active` when the person is
@@ -5342,7 +5525,14 @@ impl Focusable for NodePeek {
 impl Render for NodePeek {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if std::mem::take(&mut self.node_owed) {
-            cx.defer_in(window, |this, _, cx| this.load_node(cx));
+            if std::mem::take(&mut self.node_waits) {
+                self._node_wait = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(COUNT_DELAY).await;
+                    this.update(cx, |this, cx| this.load_node(cx)).ok();
+                }));
+            } else {
+                cx.defer_in(window, |this, _, cx| this.load_node(cx));
+            }
         }
         self.sync_markdown(cx);
         self.render_list(cx)
@@ -5521,7 +5711,8 @@ impl NodePeek {
         let label = self.label();
         let at = self.snapshot.clone();
         let page = self.page;
-        // The peek opens the node's page; the page is it.
+        // The inspector opens the node it shows, in each of a node's views; a page is one of
+        // them, and its own strip opens the others.
         let open_page = (!page).then(|| self.open_page_action()).flatten();
         let at_commit = self.held_commit();
         let has_properties = self
@@ -5543,32 +5734,45 @@ impl NodePeek {
                     )
                     .child(div().flex_1())
                     .children(open_page.map(|open| {
-                        studio_ui::ds::icon_button("peek-open-page", IconName::ArrowUpRight)
-                            .icon_color(Color::Muted)
-                            .tip(studio_ui::ds::tooltip("Open the node's page"))
-                            .on_click(move |_, window, cx| {
-                                window.dispatch_action(Box::new(open.clone()), cx)
-                            })
-                    }))
-                    .when(is_node, |header| {
-                        let explore = studio_actions::graph::ShowNodeOnCanvas {
+                        let tree = ShowNodeInTree {
                             type_name: type_name.clone(),
                             id: id.clone(),
                             at_commit: at_commit.clone(),
                             preview: true,
                         };
-                        header.child(
-                            studio_ui::ds::button("peek-canvas", "Canvas")
-                                .style(ButtonStyle::Subtle)
-                                .start_icon(
-                                    Icon::new(IconName::Crosshair),
-                                )
-                                .tip(studio_ui::ds::tooltip("Walk the graph from this node"))
-                                .on_click(move |_, window, cx| {
-                                    window.dispatch_action(Box::new(explore.clone()), cx)
-                                }),
-                        )
-                    }),
+                        let canvas = ShowNodeOnCanvas {
+                            type_name: type_name.clone(),
+                            id: id.clone(),
+                            at_commit: at_commit.clone(),
+                            preview: true,
+                        };
+                        h_flex()
+                            .gap(px(space::XXS))
+                            .child(
+                                studio_ui::ds::button("peek-open-page", "Page")
+                                    .style(ButtonStyle::Subtle)
+                                    .tip(studio_ui::ds::tooltip("Open this node's page"))
+                                    .on_click(move |_, window, cx| {
+                                        window.dispatch_action(Box::new(open.clone()), cx)
+                                    }),
+                            )
+                            .child(
+                                studio_ui::ds::button("peek-open-tree", "Tree")
+                                    .style(ButtonStyle::Subtle)
+                                    .tip(studio_ui::ds::tooltip("Open a tree from this node"))
+                                    .on_click(move |_, window, cx| {
+                                        window.dispatch_action(Box::new(tree.clone()), cx)
+                                    }),
+                            )
+                            .child(
+                                studio_ui::ds::button("peek-open-canvas", "Canvas")
+                                    .style(ButtonStyle::Subtle)
+                                    .tip(studio_ui::ds::tooltip("Walk the graph from this node"))
+                                    .on_click(move |_, window, cx| {
+                                        window.dispatch_action(Box::new(canvas.clone()), cx)
+                                    }),
+                            )
+                    })),
             )
             .child({
                 let title = label.unwrap_or_else(|| id.clone());
@@ -5666,6 +5870,16 @@ fn listed_properties<'a>(
         .collect()
 }
 
+/// The property `type_name`'s nodes are named by under `schema`, none for their key.
+fn names_by(schema: Option<&SchemaModel>, type_name: &str) -> Option<String> {
+    schema?.node(type_name)?.label_property().map(str::to_owned)
+}
+
+/// A group as the view shows it, for tests: its relationship's key, its count, whether it is
+/// open, and the names of its neighbours, once they are in.
+#[cfg(test)]
+pub(crate) type GroupShown = (String, Loadable<i64>, bool, Option<Vec<Option<String>>>);
+
 #[cfg(test)]
 impl NodePeek {
     /// What the view shows of property `name`, and whether it shows it saving: for tests of the
@@ -5692,6 +5906,24 @@ impl NodePeek {
     /// The commit the Blob values the view shows hold at ([`BlobsAt`]).
     pub(crate) fn blobs_held_at(&self) -> Option<&str> {
         self.blobs_at.commit(self.snapshot.as_deref())
+    }
+
+    /// Each group the view shows ([`GroupShown`]).
+    pub(crate) fn groups_shown(&self) -> Vec<GroupShown> {
+        self.groups
+            .iter()
+            .map(|group| {
+                (
+                    builder::relationship_key(&group.group),
+                    group.count.clone(),
+                    group.expanded,
+                    group
+                        .neighbours
+                        .loaded()
+                        .map(|rows| rows.iter().map(|row| row.label.clone()).collect()),
+                )
+            })
+            .collect()
     }
 }
 
@@ -5939,6 +6171,71 @@ mod tests {
         session.read_with(cx, |session, _| {
             assert!(session.draft(&key).is_none(), "saved, and let go")
         });
+    }
+
+    /// A page holds a selection, as a table and a tree do (spec 020): a related node selected on
+    /// it is what its tab hands the inspector, read at the commit the page holds, and the tab
+    /// says so once for each node selected.
+    #[gpui::test]
+    async fn a_related_node_selected_on_a_page_is_what_the_inspector_shows(
+        cx: &mut TestAppContext,
+    ) {
+        use studio_workspace::{Inspected, Item, ItemEvent};
+
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let session = session(PEOPLE, cx);
+        cx.run_until_parked();
+        for held in [None, Some("c1")] {
+            let (page, cx) = cx.add_window_view({
+                let session = session.clone();
+                move |_, cx| {
+                    crate::node_page::NodePage::new(
+                        session,
+                        "Person".into(),
+                        "p1".into(),
+                        held.map(str::to_owned),
+                        None,
+                        cx,
+                    )
+                }
+            });
+            cx.run_until_parked();
+            let told = Rc::new(std::cell::Cell::new(0));
+            let heard = told.clone();
+            let _hearing = cx.update(|_, cx| {
+                cx.subscribe(&page, move |_, event: &ItemEvent, _| {
+                    if matches!(event, ItemEvent::Selected) {
+                        heard.set(heard.get() + 1);
+                    }
+                })
+            });
+            page.update(cx, |page, cx| {
+                assert!(Item::inspected(page, cx).is_none(), "nothing selected yet");
+            });
+            let view = page.read_with(cx, |page, _| page.view().clone());
+            let select = |id: &str, cx: &mut VisualTestContext| {
+                view.update(cx, |view, cx| view.select_related("Person", id, cx));
+                cx.run_until_parked();
+                page.update(cx, |page, cx| match Item::inspected(page, cx) {
+                    Some(Inspected::Node(node)) => {
+                        assert_eq!(node.type_name, "Person");
+                        assert_eq!(node.at_commit.as_deref(), held, "where the page reads");
+                        assert_eq!(node.snapshot, None);
+                        node.id
+                    }
+                    _ => panic!("the related node selected"),
+                })
+            };
+            assert_eq!(select("p2", cx), "p2");
+            assert_eq!(told.get(), 1);
+            assert_eq!(select("p2", cx), "p2");
+            assert_eq!(told.get(), 1, "the same node again is no news");
+            assert_eq!(select("p3", cx), "p3");
+            assert_eq!(told.get(), 2);
+        }
     }
 
     /// A page at the branch head follows the window to another branch and reads its node there.

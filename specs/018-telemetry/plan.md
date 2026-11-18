@@ -10,10 +10,10 @@ left outside this repository. Step 1 built 2026-11-11 · 2026-10-29 · reports w
 
 Telemetry shipped in one release, 0.4.5, on by default: it recorded and sent anonymous usage
 data from its first start and told of it in the status bar, without waiting for an answer. The
-change that made it wait (2026-11-13) reached only the edge build of 2026-11-14. The published
-pages (`docs/telemetry.md`, `docs/privacy.md`), which 0.4.5 links to, by then said usage data was
-sent "only if you agree". Rather than ship a third behaviour, telemetry was taken out whole, in
-0.4.7 (no 0.4.6 was released).
+change that made it wait (2026-11-13) reached only the earlier edge build of 2026-11-14. The
+published pages (`docs/telemetry.md`, `docs/privacy.md`), which 0.4.5 links to, by then said
+usage data was sent "only if you agree". Rather than ship a third behaviour, telemetry was
+taken out whole, in 0.4.7 (no 0.4.6 was released).
 
 What went:
 
@@ -41,11 +41,17 @@ telemetry crate is linked and drops every event, since nothing starts it.
 Left outside this repository, for whoever holds them:
 
 - The PostHog project (US Cloud) and the reports it stores, kept one year by its plan unless
-  deleted sooner. 0.4.5 and the edge builds of 2026-11-13 and 2026-11-14 (the last only once
-  the person agreed) keep sending to its token until they are updated. Those builds delete a
-  batch PostHog refuses (`posthog::answer_for`: any answer but a 2xx, a 429 or a 5xx), so a
-  token revoked there should end it; that was not tried.
-- The repository variable `OMNIGRAPH_STUDIO_POSTHOG_TOKEN`, which no workflow reads now.
+  deleted sooner. 0.4.5, the edge build of 2026-11-13 and the earlier edge build of 2026-11-14
+  (the last only once the person agreed) keep sending to its token until they are updated.
+  The edge build that replaced those two later on 2026-11-14 has no telemetry, but it reaches
+  only a person who downloads it: Studio updates an edge build to a full release alone
+  (`release.yml`: "the edge build reaches no updater"), so the others stop when they take
+  0.4.7 or a later release. The three builds delete a batch PostHog refuses
+  (`posthog::answer_for`: any answer but a 2xx, a 429 or a 5xx), so a token revoked there
+  should end it; that was not tried.
+- The project's token, which each of 0.4.5's binaries holds (validation log, 2026-11-14). The
+  repository variable that held it, `OMNIGRAPH_STUDIO_POSTHOG_TOKEN`, was deleted on
+  2026-11-14, once no workflow read it.
 
 ## Problem
 
@@ -407,6 +413,11 @@ What step 1 changed from the design above:
 | 2026-11-13 | Usage data waits for the notice's answer | `studio_telemetry`: `usage_waits_for_the_notice_then_is_anonymous` (nothing recorded, held or sent before the answer; after it, one event under the run's own ID and no install ID), `a_choice_in_settings_answers_the_notice`; the other telemetry tests, which choose in Settings first | Pass. A person who had not answered before 0.4.6 sends nothing until they do |
 | 2026-11-14 | What 0.4.5 does, against what the published pages said | `git tag --contains` for `b30f5c2`, `db6279b` and `98edf23`; `v0.4.5:crates/studio_telemetry/src/studio_telemetry.rs` `follow_settings` (`usage = blocked.is_none() && options.usage != Off`) and `v0.4.5:crates/studio/src/telemetry_status.rs` ("Anonymous usage data is on", "Change…"); `v0.4.5:.github/workflows/release.yml`; `gh variable list` (the token variable last changed 2026-11-12T18:59Z, the 0.4.5 build ran 2026-11-13T06:48Z); `gh release list` | 0.4.5 has the first two commits and not the third: usage data on by default, sent without waiting. Its build had the token. No 0.4.6 exists. Not checked: the shipped binary itself, or what PostHog received |
 | 2026-11-14 | Telemetry is removed whole, and Studio builds and runs without it | `rg -i 'studio_telemetry\|posthog' crates assets script .github Cargo.toml` (no match); `Cargo.lock` loses `studio_telemetry` alone (24 lines, the reverse of what adding it gained); `studio_settings`: `the_telemetry_choices_an_earlier_studio_wrote_are_not_a_problem`, `a_retired_setting_is_matched_whole_from_the_root`; `studio`: `the_telemetry_files_an_earlier_studio_kept_are_removed`, `an_install_id_stays_where_the_person_can_find_it`; `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all --check`, `cargo deny check` and the four `script/` checks (macOS) | Pass: 1,369 tests, 0 failed, 9 ignored (main's 1,388, less the crate's 22, plus these 3). Not run as an installed release build, so the deletion at start was not tried on a folder 0.4.5 wrote |
+| 2026-11-14 | The 0.4.7 builds hold nothing of telemetry, and 0.4.5's hold all of it | The four binaries the release run built for `v0.4.7` (`gh run download`: macOS arm64, Windows x86_64, Linux x86_64 and aarch64) and three that 0.4.5 published (macOS, Windows, Linux x86_64), each searched as bytes, case ignored, for `posthog`, a `phc_` project token, `studio_telemetry`, `OMNIGRAPH_STUDIO_TELEMETRY`, `DO_NOT_TRACK`, `daily_summary`, `agent_turn_finished` and "Anonymous usage data" | 0.4.7: none of the eight in any binary. 0.4.5: all eight in the macOS binary and all but `daily_summary` in the other two; each holds one project token. This is the check of the shipped binary that the row above left out |
+| 2026-11-14 | The built 0.4.7 app deletes what 0.4.5 kept and keeps the install ID | The macOS app of that release run (`codesign --verify --deep --strict`; `spctl`: accepted, Notarized Developer ID), started once, hidden, against a data folder made by hand in 0.4.5's shape: `telemetry/pending.jsonl`, `sent.jsonl`, `crashes/*.json` and `install-id`, and a `settings.json` with `studio.telemetry` set (and `omnigraph_cloud` empty, so the start read no cloud sign-in); left running about 25 s, its sockets listed twice a second (`lsof -i`) | `pending.jsonl`, `sent.jsonl` and `crashes` gone; `install-id` kept with its text; `settings.json` byte for byte as it was; `logs/Studio.log` empty, so no warning or error. One socket was seen, to an address of `openrouter.ai`: the model list (spec 019), which led to the next row. None to PostHog's addresses, though a sampling can miss a short connection. The folder was not one a real 0.4.5 wrote, and the Windows and Linux builds were not started |
+| 2026-11-14 | The privacy notice names every place Studio sends to | `docs/privacy.md` read against constitution I's list of the crates that make requests and their code: `studio_update` (GitHub); `studio_workspace::models` `refresh_list_if_stale` and `model::Client::list_models` (the model list: no key, read at start when the copy is a day old); `model::Client::call` (`provider.data_collection: "deny"`, which OpenRouter documents as "use only providers which do not collect user data") and the three tasks' inputs (`filter_words::input_with`, `review::summary`, `type_table::fill::input`); `graph_store::control_plane` `take_up_kept` and `sign_in` (nothing goes to Omnigraph Cloud before a sign-in is held or asked for); `AgentSettings::command` (empty until chosen). Every web address in `crates` and `assets` listed (`rg`) | The notice named GitHub alone until this date. It now also names the model list, the AI features with a key, the agent panel and Omnigraph Cloud. The 2026-11-13 row's "Matches" had read it against telemetry and the updater only (Corrections) |
+| 2026-11-14 | The edge download holds nothing of telemetry, and the pages name the edge builds that did | The edge release as published at 21:44 UTC from `9b501e6` (`gh release download edge`): its `SHA256SUMS`, the macOS app's signature (`codesign --verify --deep --strict`; `spctl`), and every file of the four unpacked builds searched as bytes for the eight texts of the 0.4.7 row, with `openrouter.ai` and `Omnigraph-Studio/` as two that must be found. The edge runs of `release.yml` since 2026-11-12 (`gh run list`): the commit of each against `b30f5c2`, `db6279b` and `98edf23` (`git merge-base --is-ancestor`), its `[workspace.package]` version, when its `Publish edge` job started and ended, and whether its Settings has a Privacy section (`git grep '"Privacy"'` under `crates/studio` and `crates/studio_settings`) | Checksums match; the app is accepted, Notarized Developer ID, version 0.4.7; none of the eight texts in any file of any build, and both of the others in each build's binary. Four edge builds: `243d0c7` (2026-11-12, version 0.4.4, no telemetry), `2548c7f` (offered from 2026-11-13 05:44 UTC, version 0.4.4, usage data on by default), `5c5c8ad` (from 2026-11-14 05:42 UTC, version 0.4.5, asks first) and `9b501e6` (from 2026-11-14 21:44 UTC, version 0.4.7, no telemetry). The last job deleted the edge release and made it again between 21:44:04 and 21:44:29 UTC, so a download from 21:45 UTC is of `9b501e6` or a later build. The Privacy section is in the two edge builds with telemetry and in 0.4.5 (`cfeee8f`), and in neither of the other two. So 2026-11-14 has two edge builds, and the pages named one (Corrections). The files of `9b501e6`'s build were searched, not started; the three builds before it were read from their commits, their files having been replaced |
+| 2026-11-15 | The published 0.4.7 holds nothing of telemetry, and a 0.4.5 takes it by itself | The release as published at 09:33 UTC from `9b501e6` (`gh release download v0.4.7`, 15 files): `SHA256SUMS`; the copies without a version against the versioned files; `latest.json` against the tag, the `.sig` file and what `releases/latest/download/latest.json` serves; the macOS update archive and the Windows installer against `crates/studio_update/update-key.pub`, the same file at `v0.4.5`, by an Ed25519 check written for it and first tried on 0.4.5's update and on a copy of that with one byte changed; the macOS app of the disk image and of the update archive (`codesign`, `spctl`); every file of the five unpacked builds searched for the eight texts of the 0.4.7 row, as the same search of 0.4.5's five builds finds them. Then the macOS app 0.4.5 published, started once, hidden, from a scratch folder, with `OMNIGRAPH_STUDIO_TELEMETRY=0`, `DO_NOT_TRACK=1` and usage data off in its `settings.json`, its sockets listed twice a second | All 14 checksums match; the copies are the same files; the manifest names 0.4.7 and is what `latest` serves; both signatures verify (key `C7AFF42C88875398`) and the changed copy's does not; both apps are 0.4.7, accepted, Notarized Developer ID, with one binary; none of the eight texts in any file. 37 s after its start the 0.4.5 bundle on disk was 0.4.7, with that binary and a valid signature. It was seen connected to two of GitHub's addresses and to one in `2606:4700::6812:…`, where `openrouter.ai`'s are (the model list: `models.json` was written), and to none that PostHog's names resolve to; a sampling can miss a short connection, and what stops this 0.4.5 sending is the two variables (`blocked_by_environment`). It kept no `telemetry` folder. Two limits of the update itself: the manifest names `macos-aarch64` alone, so on Windows and Linux a 0.4.5 says a newer version exists and the person installs it; and a 0.4.5 that is running goes on as 0.4.5 until it is started again |
 
 ## Corrections
 
@@ -429,3 +440,14 @@ What step 1 changed from the design above:
   send: `kind` also took `blob` and `merge`, and `outcome` also `published`, `refused` and
   `unknown`. The page was generated from the catalog's JSON schema and kept only the variants
   that carried a description. The page as it is kept now lists them all.
+- 2026-11-14: `docs/privacy.md` said a person's graphs "go only to those servers" and "never
+  come to us", and gave GitHub's update check as the one request Studio makes for itself, in
+  the 2026-11-13 edition and in the one rewritten for the removal. None of the three held
+  whole: Studio has read OpenRouter's model list at start, with no key, since spec 019
+  (2026-10-30); an AI feature used with a key and the agent panel send graph content to their
+  providers; and a graph kept in Omnigraph Cloud is kept by us. The notice says each now.
+- 2026-11-14: "The edge build of 14 November 2026" (`docs/privacy.md`, `docs/telemetry.md`,
+  and "Removed" above) named one build. From 21:44 UTC that day there were two: `5c5c8ad`,
+  which asks first, and `9b501e6`, made after the removal. The pages now say the earlier of
+  the two where they mean the one that sent, and that an edge build downloaded from 21:45 UTC
+  that day sends nothing.

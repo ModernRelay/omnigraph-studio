@@ -9,7 +9,7 @@
 //! the previous one settles. `type:<text>` types text into the focused editor (`\n` is a new
 //! line); it is `editor::HandleInput` with the text. `click:<x>,<y>` clicks at a point in
 //! window pixels (half the PNG's, which is drawn at 2x), with `,cmd` or `,shift` held when
-//! added and `,right` for the secondary button; `hover:<x>,<y>` moves the pointer there and rests; `key:<keystroke>` presses keys as the keymap sees them (`key:tab`, `key:cmd-4`);
+//! added, `,right` for the secondary button and `,double` for a double click; `hover:<x>,<y>` moves the pointer there and rests; `scroll:<dx>,<dy>[,at=<x>:<y>]` scrolls once by that many pixels at the window's centre (or at that point) and rests, to set a case up without measuring; `key:<keystroke>` presses keys as the keymap sees them (`key:tab`, `key:cmd-4`);
 //! `drag:<x1>,<y1>,<x2>,<y2>` presses at
 //! the first point, moves to the second in steps, and releases (`,shift` or `,cmd` held); `wait:<ms>` lets that long pass
 //! (for a write from outside to land between steps); `shot:<path>` saves the window as it
@@ -38,7 +38,10 @@
 //! as JSON. `run:<command>` runs a command and waits for it (another writer's commit);
 //! `head:<ms>` waits, at most that long, for the session's branch head to move. `SNAPSHOT_WAIT_MS` (default
 //! 1500) is how long to let each step's network work finish; `SNAPSHOT_SIZE` is
-//! `WIDTHxHEIGHT` (default 1440x900). Remembered tabs are not restored unless `OMNIGRAPH_STUDIO_NO_RESTORE=0`. The run
+//! `WIDTHxHEIGHT` (default 1440x900). `SNAPSHOT_WINDOW_BUTTONS` draws the window's own buttons
+//! as another platform's, which this one would leave to the system: `windows`, `linux` (all
+//! three at the right) or `linux-left` (close at the left, as some desktops lay them out).
+//! Remembered tabs are not restored unless `OMNIGRAPH_STUDIO_NO_RESTORE=0`. The run
 //! keeps its state in a fresh temporary directory unless `OMNIGRAPH_STUDIO_DATA` names one, so
 //! it neither reads nor writes the app's settings, tabs or conversations.
 
@@ -185,34 +188,55 @@ fn drag(
     }
 }
 
-/// A left click at `position`, as the platform delivers one: move, press, release.
+/// One wheel scroll by `(dx, dy)` pixels at `position`, as a pointer delivers it: the event a
+/// `scroll:` step sends once and a `measure:<n>,scroll=` step sends each frame, so a case's setup
+/// and its measured frames scroll alike.
+fn scroll_event(position: gpui::Point<gpui::Pixels>, dx: f32, dy: f32) -> PlatformInput {
+    PlatformInput::Scroll(ScrollEvent {
+        position,
+        delta: ScrollDelta::Pixels(point(px(dx), px(dy))),
+        modifiers: Modifiers::default(),
+        touch_phase: TouchPhase::Moved,
+        source: ScrollSource::Pointer,
+    })
+}
+
+/// The point an `at=<x>:<y>` option names, in window pixels.
+fn at_point(at: &str) -> gpui::Point<gpui::Pixels> {
+    let (x, y) = at.split_once(':').expect("at=<x>:<y>");
+    point(px(x.parse().expect("at x")), px(y.parse().expect("at y")))
+}
+
+/// `clicks` clicks at `position`, as the platform delivers them: move, then a press and a
+/// release for each, the second of a double click counted as the second.
 fn click(
     cx: &mut HeadlessAppContext,
     handle: AnyWindowHandle,
     position: gpui::Point<gpui::Pixels>,
     modifiers: Modifiers,
     button: MouseButton,
+    clicks: usize,
 ) {
-    let events = [
-        PlatformInput::MouseMove(MouseMoveEvent {
-            position,
-            pressed_button: None,
-            modifiers: Modifiers::default(),
-        }),
-        PlatformInput::MouseDown(MouseDownEvent {
+    let mut events = vec![PlatformInput::MouseMove(MouseMoveEvent {
+        position,
+        pressed_button: None,
+        modifiers: Modifiers::default(),
+    })];
+    for click_count in 1..=clicks {
+        events.push(PlatformInput::MouseDown(MouseDownEvent {
             button,
             position,
             modifiers,
-            click_count: 1,
+            click_count,
             first_mouse: false,
-        }),
-        PlatformInput::MouseUp(MouseUpEvent {
+        }));
+        events.push(PlatformInput::MouseUp(MouseUpEvent {
             button,
             position,
             modifiers,
-            click_count: 1,
-        }),
-    ];
+            click_count,
+        }));
+    }
     for event in events {
         cx.update_window(handle, |_, window, cx| {
             window.dispatch_event(event, cx);
@@ -655,6 +679,31 @@ fn main() {
     // while a window is active (the branch-head poll) run.
     cx.update_window(handle, |_, window, _| window.activate_window())
         .expect("activate the snapshot window");
+    if let Ok(platform) = std::env::var("SNAPSHOT_WINDOW_BUTTONS") {
+        use gpui::{WindowButton, WindowButtonLayout};
+        use studio_ui::window_buttons::{RIGHT_SIDE, WindowButtons};
+        let buttons = match platform.as_str() {
+            "windows" => WindowButtons::Windows,
+            "linux" => WindowButtons::Linux(RIGHT_SIDE),
+            "linux-left" => WindowButtons::Linux(WindowButtonLayout {
+                left: [Some(WindowButton::Close), None, None],
+                right: [
+                    Some(WindowButton::Minimize),
+                    Some(WindowButton::Maximize),
+                    None,
+                ],
+            }),
+            other => panic!("SNAPSHOT_WINDOW_BUTTONS is windows, linux or linux-left: {other}"),
+        };
+        cx.update_window(handle, |_, window, cx| {
+            if let Some(workspace) = studio_workspace::workspace_for(window) {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.draw_window_buttons_as(buttons, cx)
+                });
+            }
+        })
+        .expect("draw the window's buttons");
+    }
     // `reads:<path>` measures the whole run, the start (until the schema is read) among it.
     let mut reads = actions
         .iter()
@@ -748,7 +797,7 @@ fn main() {
             let mut typing = false;
             let mut scroll: Option<(f32, f32)> = None;
             let mut drag: Option<(f32, f32)> = None;
-            let mut at: Option<(f32, f32)> = None;
+            let mut at: Option<gpui::Point<gpui::Pixels>> = None;
             let mut live = false;
             for part in parts {
                 if part == "live" {
@@ -769,17 +818,13 @@ fn main() {
                     let (dx, dy) = delta.split_once(':').expect("drag=<dx>:<dy>");
                     drag = Some((dx.parse().expect("drag dx"), dy.parse().expect("drag dy")));
                 } else if let Some(point) = part.strip_prefix("at=") {
-                    let (x, y) = point.split_once(':').expect("at=<x>:<y>");
-                    at = Some((x.parse().expect("at x"), y.parse().expect("at y")));
+                    at = Some(at_point(point));
                 }
             }
             // Input goes to the window's centre, or where `at` puts it: each frame first handles
             // one scroll or one move of a held button, as a frame of a real zoom or pan does,
             // then draws.
-            let center = match at {
-                Some((x, y)) => point(px(x), px(y)),
-                None => point(px(width / 2.), px(height / 2.)),
-            };
+            let center = at.unwrap_or_else(|| point(px(width / 2.), px(height / 2.)));
             if drag.is_some() {
                 cx.update_window(handle, |_, window, cx| {
                     window.dispatch_event(
@@ -832,16 +877,7 @@ fn main() {
                             cx,
                         );
                     } else if let Some((dx, dy)) = scroll {
-                        window.dispatch_event(
-                            PlatformInput::Scroll(ScrollEvent {
-                                position: center,
-                                delta: ScrollDelta::Pixels(point(px(dx * sign), px(dy * sign))),
-                                modifiers: Modifiers::default(),
-                                touch_phase: TouchPhase::Moved,
-                                source: ScrollSource::Pointer,
-                            }),
-                            cx,
-                        );
+                        window.dispatch_event(scroll_event(center, dx * sign, dy * sign), cx);
                     } else if let Some((dx, dy)) = drag {
                         let step = (frame % 30) as f32 + 1.;
                         let along = if sign > 0. { step } else { 30. - step };
@@ -958,6 +994,26 @@ fn main() {
             rest(&mut cx, handle, &mut recorder, step_wait);
             continue;
         }
+        if let Some(rest_of) = spec.strip_prefix("scroll:") {
+            let mut parts = rest_of.split(',').map(str::trim);
+            let mut number = |what: &str| -> f32 {
+                parts
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or_else(|| panic!("scroll:<dx>,<dy>[,at=<x>:<y>]: {what}"))
+            };
+            let (dx, dy) = (number("dx"), number("dy"));
+            let position = match parts.next().and_then(|p| p.strip_prefix("at=")) {
+                Some(at) => at_point(at),
+                None => point(px(width / 2.), px(height / 2.)),
+            };
+            cx.update_window(handle, |_, window, cx| {
+                window.dispatch_event(scroll_event(position, dx, dy), cx);
+            })
+            .expect("scroll");
+            rest(&mut cx, handle, &mut recorder, step_wait);
+            continue;
+        }
         if let Some(keys) = spec.strip_prefix("key:") {
             for key in keys.split(' ') {
                 cx.update_window(handle, |_, window, cx| {
@@ -1008,14 +1064,29 @@ fn main() {
             } else {
                 MouseButton::Left
             };
+            let clicks = if parts.contains(&"double") { 2 } else { 1 };
             match reads.as_mut() {
                 Some(reads) if recorder.is_none() => {
                     let start = Reads::begin(&mut cx, handle);
-                    click(&mut cx, handle, point(px(x), px(y)), modifiers, button);
+                    click(
+                        &mut cx,
+                        handle,
+                        point(px(x), px(y)),
+                        modifiers,
+                        button,
+                        clicks,
+                    );
                     reads.step("click", start, &mut cx, handle, READS_CAP, |_| true);
                 }
                 _ => {
-                    click(&mut cx, handle, point(px(x), px(y)), modifiers, button);
+                    click(
+                        &mut cx,
+                        handle,
+                        point(px(x), px(y)),
+                        modifiers,
+                        button,
+                        clicks,
+                    );
                     rest(&mut cx, handle, &mut recorder, step_wait);
                 }
             }

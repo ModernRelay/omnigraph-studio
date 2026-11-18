@@ -69,6 +69,11 @@ the interaction and asserts the count:
 | `query_editor` `a_wide_result_draws_only_the_columns_in_view` | A 60-column result draws the columns in view and one gap for the rest, as wide as they are; scrolled to the end, the last |
 | `query_editor` `typing_in_the_query_leaves_the_results_as_they_were` | The result area follows the tab's `notify`; typing in the query does not draw it |
 | `query_editor` `typing_leaves_the_problems_as_they_were` | The problems strip is a cached view of its own; typing that leaves the problems unchanged does not draw it |
+| `graph_store` `counts_landing_together_are_taken_in_one_walk` | Expand all on 140 nodes asks 2,800 counts in 40 reads; the walk is flattened at most once a read and views hear at most one `Loaded` a read (3 walks and 2 events measured; 2,801 and 2,800 before) |
+| `graph_canvas` `long_names_wrap_and_drawing_them_wraps_nothing` | A walk's names are wrapped and measured once, when it is laid out (`paint::chip_text`); pointing at every chip and zooming draw the canvas and wrap no name and lay out nothing; the chips drawn, as tall and wide as their wrapped names, do not overlap |
+| `command_palette` `answers_land_in_one_draw_whatever_the_types` | Twelve node types' answers land in one draw (`LANDING_DELAY`), not one a type; moving through the rows draws the palette once a key |
+| `review` `typing_in_the_search_leaves_the_changes_as_they_were` | The review's list of changes is a cached view of its own (`ReviewRows`): keys in its search draw it no times, the search landing once |
+| `history` `moving_through_a_commits_changes_draws_the_list_once_a_key` | A commit's list of changes is a cached view of its own (`CommitRows`): J and K draw it once a key |
 | `studio_workspace` `a_tab_that_caches_its_parts_keeps_them_while_a_field_changes` | A tab that caches its parts keeps them while a field changes; a cached tab draws them again, which is the GPUI behavior the opt-out exists for |
 
 Draw counts are exact, so they run in CI. Times are not: the machine's load moves them several
@@ -78,9 +83,11 @@ times over.
 
 `script/measure-frames` runs the common cases against the development graph (`script/dev-server`)
 on `release-fast`: a key in the table's filter field, in a cell, in the query editor with six
-result columns, and in the Go To palette; a table scroll; the whole window drawn again, as each
+result columns, and in the Go To palette; a table scroll, and one with the relationship columns in
+view (scrolled sideways to them first); the whole window drawn again, as each
 frame of an animation draws it (a dialog or a toast coming up, the connection dot); and a
-scroll of a node page, the inspector, its tree and History, and a pan of its canvas. On 2026-10-18 (Apple M5 Pro, load
+scroll of a node page, the inspector (in a 1440x600 window, where a person's relationships are
+taller than the dock), its tree and History, and a pan of its canvas. On 2026-10-18 (Apple M5 Pro, load
 average 8) each key cost 1.2 to 2.0 ms of main-thread CPU and a table scroll 4.3 ms. On the
 personal graph's 92-column Person type a table scroll costs 4.0 ms, and a 63-column query
 result 2.2 ms.

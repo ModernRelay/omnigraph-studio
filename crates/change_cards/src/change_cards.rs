@@ -6,25 +6,36 @@
 //! neither of those layers can do alone, so the two views draw the same cards from one place.
 //! What a card can do (review, revert, edit) stays with the view that offers it.
 //!
-//! Since 2026-11-01 both views draw the review's feed: a run of one type is a row ("2 changed
-//! in Event") folding a bordered table of its entities ([`run_row`]), each entity a row of its
-//! name, what changed in a few words and its id ([`entity_row`]), unfolding to its property
-//! rows and relationship lines ([`entity_body`]).
+//! Since 2026-11-01 both views draw the review's feed: a run of one type is a row folding a
+//! bordered table of its entities ([`run_row`]), each entity a row of its name, what changed in
+//! a few words and its id ([`entity_row`]), unfolding to its property rows and relationship
+//! lines ([`entity_body`]).
+//!
+//! Since spec 033 this crate holds the one way Studio shows a change, wherever it shows one:
+//! the kind's mark (+ ~ −, in the added, changed and removed colours, never colour alone,
+//! [`kind_mark`]), counts as "+3 ~2 −1" ([`studio_ui::change_counts`], and
+//! [`commit_counts`] for a listed commit), the summary line of counts by type
+//! ([`summary_line`]), a run's row led by its type ([`run_row`]), the two sections
+//! ([`section_words`]) and the states of a change being read, empty, refused or the first
+//! ([`reading_state`], [`no_changes_state`], [`schema_change_state`], [`first_commit_state`]).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use gpui::{AnyElement, App, ClickEvent, Div, ElementId, Window};
-use gq_language::SchemaModel;
+use gpui::{AnyElement, App, ClickEvent, Div, ElementId, Stateful, Window};
+use gq_language::{ScalarKind, SchemaModel};
 use graph_store::{
-    EntityGroup, EntityGroups, FoldedChange, FoldedChanges, GroupRun, NetChange, NodeNames,
-    RelationshipEntry, entity_name,
+    EntityGroup, EntityGroups, FoldedChange, FoldedChanges, GroupRun, GroupSection, NetChange,
+    NodeNames, RelationshipEntry, TypeCounts, entity_name,
 };
+use serde_json::Value;
+use studio_ui::ds::Tipped as _;
 use studio_ui::ds::{radii, space};
 use studio_ui::{
-    ChangeKind, PropertyRow, RelationshipLine, TextFolds, change_counts, group_digits,
+    ChangeKind, PropertyRow, RelationshipLine, TextFolds, change_counts, format_bytes, group_digits,
 };
+use ui::SharedString;
 use ui::prelude::*;
 
 /// One row of a list of cards: the header of a run of one type's cards, by its index in the
@@ -263,48 +274,295 @@ pub fn section_title(title: impl Into<SharedString>) -> Div {
         .child(studio_ui::ds::text::meta(title.into()))
 }
 
-/// A run's counts as the feed says them, and the word to its type: "1 changed" "in" Task,
-/// "2 added" "to" Email, "1 removed" "from" Person; a run of entities standing for their
-/// relationships alone, "3 entities" "with relationships that changed in".
-pub fn run_sentence(run: &GroupRun) -> (String, &'static str) {
-    let mut parts = Vec::new();
-    if run.changed > 0 {
-        parts.push(format!("{} changed", group_digits(run.changed)));
+/// The title of the section a run opens, the same in a review and a commit (spec 033): changes
+/// to what was there before, then what is new. A review's "before" is its target at the fork,
+/// a commit's its parent.
+pub fn section_words(section: GroupSection) -> &'static str {
+    match section {
+        GroupSection::Existing => "Existing",
+        GroupSection::Added => "New",
     }
-    if run.added > 0 {
-        parts.push(format!("{} added", group_digits(run.added)));
-    }
-    if run.removed > 0 {
-        parts.push(format!("{} removed", group_digits(run.removed)));
-    }
-    if parts.is_empty() {
-        return (
-            studio_ui::plural(run.groups.len(), "entity", "entities"),
-            "with relationships that changed in",
-        );
-    }
-    let joiner = match (run.changed, run.added, run.removed) {
-        (0, _, 0) => "to",
-        (0, 0, _) => "from",
-        _ => "in",
-    };
-    (parts.join(", "), joiner)
 }
 
-/// What a run's row says beside its type, past the counts: how many relationships its entities
-/// carry, when that is all that changed. The properties each change touched are said once, on
-/// its entity's row, and in full when it opens, never again on the type's row. A run of one
-/// entity says nothing more, since that entity's own row says it.
-pub fn run_detail(run: &GroupRun) -> String {
-    if run.groups.len() < 2 || run.changed + run.added + run.removed > 0 {
-        String::new()
-    } else if run.relationships > 0 {
-        format!(
-            "with {}",
-            studio_ui::plural(run.relationships, "relationship", "relationships")
-        )
+/// The kind of a change as its mark: its symbol (+ ~ −, · for an entity standing only for its
+/// relationships) in its colour, in a slot as wide in every row, its word in the tooltip, so the
+/// kind never rests on colour alone.
+pub fn kind_mark(id: impl Into<ElementId>, kind: ChangeKind) -> Stateful<Div> {
+    div()
+        .id(id)
+        .w(px(space::MD))
+        .flex_none()
+        .tip(studio_ui::ds::tooltip(kind.label()))
+        .child(studio_ui::ds::text::body(kind.symbol()).color(kind.color()))
+}
+
+/// What a change does, counted by type, on one line that wraps: each type's mark and name, then
+/// its counts ("Person +1 ~1 · WorksAt +1"), node types before relationship types. A review and
+/// a commit put it under their heading, so the size and spread of a change read before its
+/// first card.
+pub fn summary_line(counts: &[TypeCounts], cx: &App) -> Div {
+    let mut ordered: Vec<&TypeCounts> = counts
+        .iter()
+        .filter(|c| c.added + c.changed + c.removed > 0)
+        .collect();
+    ordered.sort_by_key(|c| c.is_edge);
+    h_flex()
+        .flex_wrap()
+        .gap_x(px(space::LG))
+        .gap_y(px(space::XS))
+        .children(ordered.into_iter().enumerate().map(|(ix, c)| {
+            let tip = format!(
+                "{}: {}",
+                c.type_name,
+                kind_words(c.added, c.changed, c.removed, c.is_edge)
+            );
+            h_flex()
+                .id(("summary-type", ix))
+                .gap(px(space::SM))
+                .items_center()
+                .tip(studio_ui::ds::tooltip(tip))
+                .child(studio_ui::kind_swatch(&c.type_name, c.is_edge, cx))
+                .child(studio_ui::ds::text::body(c.type_name.clone()))
+                .child(change_counts(c.added, c.changed, c.removed))
+        }))
+}
+
+/// Counts in words, for a tooltip: "1 added, 2 changed", nodes or relationships.
+pub fn kind_words(added: usize, changed: usize, removed: usize, is_edge: bool) -> String {
+    let (one, many) = if is_edge {
+        ("relationship", "relationships")
     } else {
+        ("node", "nodes")
+    };
+    let mut parts = Vec::new();
+    for (count, word) in [(added, "added"), (changed, "changed"), (removed, "removed")] {
+        if count > 0 {
+            parts.push(format!("{} {word}", studio_ui::plural(count, one, many)));
+        }
+    }
+    if parts.is_empty() {
+        "no changes".to_owned()
+    } else {
+        parts.join(", ")
+    }
+}
+
+/// What a listed commit's change count says, wherever a commit is listed (History's rows and
+/// hover card, the Commits panel, the inspector): its counts, or why it has none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitCounts {
+    /// Counted from its changes; `partial` when only the first page was read.
+    Counted {
+        added: usize,
+        changed: usize,
+        removed: usize,
+        partial: bool,
+    },
+    /// The graph's first commit: nothing before it to compare with.
+    First,
+    /// The server cannot compare it with its parent across a schema change, at this type when
+    /// it names one.
+    SchemaChange(Option<String>),
+    /// The history behind it was cleaned up.
+    CleanedUp,
+    /// The server refused to compare it with its parent for another reason, as it says it.
+    NotComparable(String),
+}
+
+impl CommitCounts {
+    /// The words a commit's counts read as in a tooltip or for an agent.
+    pub fn words(&self) -> String {
+        match self {
+            CommitCounts::Counted {
+                added,
+                changed,
+                removed,
+                partial,
+            } => {
+                let total = added + changed + removed;
+                if total == 0 {
+                    return "No changes".to_owned();
+                }
+                let mut parts = Vec::new();
+                for (count, word) in [(added, "added"), (changed, "changed"), (removed, "removed")]
+                {
+                    if *count > 0 {
+                        parts.push(format!("{} {word}", studio_ui::group_digits(*count)));
+                    }
+                }
+                let text = parts.join(", ");
+                if *partial {
+                    format!(
+                        "{text}, counted from its first {} changes; it has more",
+                        studio_ui::group_digits(total)
+                    )
+                } else {
+                    text
+                }
+            }
+            CommitCounts::First => {
+                "The graph's first commit: nothing before it to compare with".into()
+            }
+            CommitCounts::SchemaChange(Some(type_name)) => format!(
+                "A schema change, at {type_name}: Omnigraph does not list data changes across one"
+            ),
+            CommitCounts::SchemaChange(None) => {
+                "A schema change: Omnigraph does not list data changes across one".into()
+            }
+            CommitCounts::CleanedUp => {
+                "The history behind this commit was cleaned up, so its changes cannot be read"
+                    .into()
+            }
+            CommitCounts::NotComparable(message) => {
+                format!("This commit cannot be compared with its parent: {message}")
+            }
+        }
+    }
+}
+
+/// A listed commit's counts as one element: "+3 ~2 −1", with a muted "…" when only its first
+/// page was counted; "no changes", "first commit", "schema change" or "cleaned up" otherwise.
+/// The words are its tooltip.
+pub fn commit_counts(id: impl Into<ElementId>, counts: &CommitCounts) -> AnyElement {
+    let body = match counts {
+        CommitCounts::Counted {
+            added,
+            changed,
+            removed,
+            partial,
+        } if added + changed + removed > 0 => h_flex()
+            .gap(px(space::XS))
+            .child(change_counts(*added, *changed, *removed))
+            .when(*partial, |row| row.child(studio_ui::ds::text::meta("…")))
+            .into_any_element(),
+        CommitCounts::Counted { .. } => studio_ui::ds::text::meta("no changes").into_any_element(),
+        CommitCounts::First => studio_ui::ds::text::meta("first commit").into_any_element(),
+        CommitCounts::SchemaChange(_) => {
+            studio_ui::ds::text::meta("schema change").into_any_element()
+        }
+        CommitCounts::CleanedUp => studio_ui::ds::text::meta("cleaned up").into_any_element(),
+        CommitCounts::NotComparable(_) => {
+            studio_ui::ds::text::meta("not comparable").into_any_element()
+        }
+    };
+    div()
+        .id(id)
+        .flex_none()
+        .tip(studio_ui::ds::tooltip(counts.words()))
+        .child(body)
+        .into_any_element()
+}
+
+/// Entities a run holds past which it starts folded to its row, when the change holds other runs
+/// too: a change of thousands reads first as its types and their counts, and a run is unfolded
+/// when it is wanted (spec 033). A change of one run shows it open, however long.
+pub const FOLD_PAST: usize = 50;
+
+/// The runs that start folded when `runs` are first shown ([`FOLD_PAST`]).
+pub fn starts_folded(runs: &[GroupRun]) -> impl Iterator<Item = &GroupRun> {
+    let several = runs.len() > 1;
+    runs.iter()
+        .filter(move |run| several && run.groups.len() > FOLD_PAST)
+}
+
+/// The button at an entity row's end that opens its page as the change left it, or, for a
+/// removal, as it was before: the row's own action, beside ⌘↵ (`studio_changes::OpenChanged`).
+pub fn open_button(
+    id: impl Into<ElementId>,
+    focus: &gpui::FocusHandle,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    let focus = focus.clone();
+    studio_ui::ds::row_icon_button(id, IconName::ArrowUpRight)
+        .tip_fn(move |_, cx| {
+            studio_ui::ds::tooltip_for_action_in_view(
+                "Open its page, as the change left it",
+                &studio_actions::changes::OpenChanged,
+                &focus,
+                cx,
+            )
+        })
+        .on_click(move |event, window, cx| {
+            cx.stop_propagation();
+            on_click(event, window, cx)
+        })
+        .into_any_element()
+}
+
+/// The changes being read: a muted line in their place, and `detail` under it (a large graph's
+/// "this can take a few minutes").
+pub fn reading_state(detail: Option<&str>) -> Div {
+    studio_ui::ds::loading_state("Reading the changes…")
+        .children(detail.map(|detail| studio_ui::ds::state_detail(detail.to_owned())))
+}
+
+/// Nothing changed: the check, "No changes", and `detail`, which says against what.
+pub fn no_changes_state(detail: impl Into<SharedString>) -> Div {
+    studio_ui::ds::empty_state(IconName::Check, "No changes")
+        .child(studio_ui::ds::state_detail(detail.into()))
+}
+
+/// A commit that changed the schema, which Omnigraph cannot compare with its parent: said as
+/// what it is, not as a failure, and never offered again, since asking again gets the same.
+pub fn schema_change_state(type_name: Option<&str>) -> Div {
+    let detail = match type_name {
+        Some(type_name) => format!(
+            "This commit changed {type_name}'s schema. Omnigraph does not list a commit's data \
+             changes across a schema change; the schema as it is now is in Schema."
+        ),
+        None => "This commit changed the schema. Omnigraph does not list a commit's data changes \
+                 across a schema change; the schema as it is now is in Schema."
+            .to_owned(),
+    };
+    studio_ui::ds::empty_state(IconName::FileCode, "Schema change")
+        .child(studio_ui::ds::state_detail(detail))
+}
+
+/// What a commit's tab shows in place of its changes when the server will never list them, the
+/// same reading History's rows give the commit ([`commit_counts`]): its first commit, a schema
+/// change, history cleaned up, another comparison refused. None for counted changes, which the
+/// tab lists. None of these offers a retry, since asking again gets the same answer.
+pub fn lasting_state(counts: &CommitCounts) -> Option<Div> {
+    Some(match counts {
+        CommitCounts::Counted { .. } => return None,
+        CommitCounts::First => first_commit_state(),
+        CommitCounts::SchemaChange(type_name) => schema_change_state(type_name.as_deref()),
+        CommitCounts::CleanedUp => {
+            studio_ui::ds::empty_state(IconName::Trash, "History cleaned up").child(
+                studio_ui::ds::state_detail(
+                    "The history behind this commit was cleaned up, so its changes cannot be read.",
+                ),
+            )
+        }
+        CommitCounts::NotComparable(message) => {
+            studio_ui::ds::empty_state(IconName::Info, "Not comparable").child(
+                studio_ui::ds::state_detail(format!(
+                    "The server does not compare this commit with its parent: {message}"
+                )),
+            )
+        }
+    })
+}
+
+/// The graph's first commit: nothing before it to compare with.
+pub fn first_commit_state() -> Div {
+    studio_ui::ds::empty_state(IconName::GitCommit, "The graph's first commit").child(
+        studio_ui::ds::state_detail("It has no parent, so it has no changes to compare."),
+    )
+}
+
+/// What a run's row says beside its type, past the counts: for a run of entities standing only
+/// for their relationships, which has no counts of its own, how many. The properties each
+/// change touched are said once, on its entity's row, and in full when it opens, never again on
+/// the type's row.
+pub fn run_detail(run: &GroupRun) -> String {
+    if run.changed + run.added + run.removed > 0 {
         String::new()
+    } else {
+        format!(
+            "{} with changed relationships",
+            studio_ui::plural(run.groups.len(), "node", "nodes")
+        )
     }
 }
 
@@ -339,8 +597,9 @@ pub struct RunWords {
     pub when: Option<String>,
 }
 
-/// The row of a run of one type: its status dot, a chevron, "1 changed in" and the type, then
-/// `words`. It folds the run's entities away (`folded`, a rule under it) and back on a click.
+/// The row of a run of one type: a chevron, the type's mark and name, its counts ("+1 ~2"),
+/// then `words`. It folds the run's entities away (`folded`, a rule under it) and back on a
+/// click. Led by the type, as the summary line and the split's list are (spec 033).
 pub fn run_row(
     id: impl Into<ElementId>,
     run: &GroupRun,
@@ -354,16 +613,6 @@ pub fn run_row(
         detail,
         when,
     } = words;
-    let (counts, joiner) = run_sentence(run);
-    let color = if run.changed > 0 {
-        Color::Modified
-    } else if run.removed > 0 {
-        Color::Deleted
-    } else if run.added > 0 {
-        Color::Created
-    } else {
-        Color::Muted
-    };
     let hover = studio_ui::ds::surface::hover(cx);
     // The hover is a rounded row the feed's width, inset by `space::SM` so its text keeps the
     // feed's edge, and kept `space::XS` clear of the table under it, whose open head is grey too.
@@ -377,16 +626,14 @@ pub fn run_row(
         .rounded(px(radii(cx).sm))
         .cursor_pointer()
         .hover(move |style| style.bg(hover))
-        .child(studio_ui::ds::dot(color))
         .child(studio_ui::ds::icon::meta(if folded {
             IconName::ChevronRight
         } else {
             IconName::ChevronDown
         }))
-        .child(studio_ui::ds::text::body(counts))
-        .child(studio_ui::ds::text::muted(joiner))
         .child(studio_ui::kind_swatch(&run.type_name, run.is_edge, cx))
         .child(studio_ui::ds::text::body(run.type_name.clone()))
+        .child(change_counts(run.added, run.changed, run.removed))
         .child(
             div()
                 .flex_1()
@@ -471,9 +718,10 @@ pub fn entity_summary(folded: &FoldedChanges, group: &EntityGroup) -> String {
                 "property",
                 "properties",
             )),
-            (Some(before), None) => parts.push(format!(
-                "{} removed",
-                studio_ui::plural(before.properties.len(), "property", "properties")
+            (Some(before), None) => parts.push(studio_ui::plural(
+                before.properties.len(),
+                "property",
+                "properties",
             )),
             (None, None) => {}
         }
@@ -507,7 +755,13 @@ pub struct EntityRow {
     pub selected: bool,
     /// Drawn receded: a reviewed entity.
     pub dimmed: bool,
+    /// What opens the entity's page where the change left it, shown at the row's end while the
+    /// row is hovered or selected (spec 033).
+    pub open_button: Option<AnyElement>,
 }
+
+/// The hover group of an entity's row: its open button shows while it is hovered.
+const ENTITY_ROW_GROUP: &str = "entity-row";
 
 /// An entity's row in the table under its run: a chevron, its name (struck through when
 /// removed), what changed in a few words while it is folded, its status and its id; `body`
@@ -531,6 +785,7 @@ pub fn entity_row(
         open,
         selected,
         dimmed,
+        open_button,
     } = row;
     let radius = studio_ui::ds::radius::flush(radii(cx).md);
     let hover = studio_ui::ds::surface::hover(cx);
@@ -548,11 +803,13 @@ pub fn entity_row(
         })
         .when(!selected, |head| head.hover(move |style| style.bg(hover)))
         .when(dimmed, |head| head.opacity(studio_ui::ds::opacity::DIMMED))
+        .group(ENTITY_ROW_GROUP)
         .child(studio_ui::ds::icon::meta(if open {
             IconName::ChevronDown
         } else {
             IconName::ChevronRight
         }))
+        .child(kind_mark("entity-kind", kind))
         .child(
             studio_ui::ds::text::body(name)
                 .when(kind == ChangeKind::Removed, |name| name.strikethrough())
@@ -568,6 +825,12 @@ pub fn entity_row(
                 .buffer_font(cx)
                 .single_line()
                 .truncate()
+        }))
+        .children(open_button.map(|button| {
+            div()
+                .flex_none()
+                .when(!selected, |slot| slot.visible_on_hover(ENTITY_ROW_GROUP))
+                .child(button)
         }))
         .on_click(on_click);
     let outline = studio_ui::ds::surface::outline(cx);
@@ -650,11 +913,96 @@ fn kind_of(net: Option<NetChange>) -> ChangeKind {
 }
 
 fn property_rows(change: &FoldedChange, schema: Option<&SchemaModel>) -> Vec<PropertyRow> {
+    let blobs = blob_properties(change, schema);
     change
         .card_diffs(schema)
         .into_iter()
-        .map(|diff| PropertyRow::new(diff.name, diff.before.as_ref(), diff.after.as_ref()))
+        .map(|diff| {
+            if blobs.contains(&diff.name.as_str()) {
+                let (before, after) = blob_sides(diff.before.as_ref(), diff.after.as_ref());
+                return PropertyRow::new(diff.name, before.as_ref(), after.as_ref());
+            }
+            PropertyRow::new(diff.name, diff.before.as_ref(), diff.after.as_ref())
+        })
         .collect()
+}
+
+/// The names of the change's type's Blob properties, as the schema declares them.
+fn blob_properties<'a>(change: &FoldedChange, schema: Option<&'a SchemaModel>) -> Vec<&'a str> {
+    let Some(schema) = schema else {
+        return Vec::new();
+    };
+    let properties = if change.is_edge() {
+        schema.edge(&change.type_name).map(|e| &e.properties)
+    } else {
+        schema.node(&change.type_name).map(|n| &n.properties)
+    };
+    properties
+        .into_iter()
+        .flatten()
+        .filter(|p| p.kind == ScalarKind::Blob)
+        .map(|p| p.name.as_str())
+        .collect()
+}
+
+/// A Blob's two sides as a card says them, never its bytes: the change feed spells a stored
+/// value `base64:<bytes>`, an external one by its URI, and a range of an object as
+/// `{"uri", "offset", "length"}`. Two values that read alike (the same size) each add a short
+/// mark of their bytes, so a changed Blob never reads unchanged.
+fn blob_sides(before: Option<&Value>, after: Option<&Value>) -> (Option<Value>, Option<Value>) {
+    let mut b = before.map(blob_words);
+    let mut a = after.map(blob_words);
+    if let (Some(Value::String(bw)), Some(Value::String(aw)), Some(bv), Some(av)) =
+        (&mut b, &mut a, before, after)
+        && bw == aw
+        && bv != av
+    {
+        bw.push_str(&format!(" · {}", fingerprint(bv)));
+        aw.push_str(&format!(" · {}", fingerprint(av)));
+    }
+    (b, a)
+}
+
+/// What a Blob value is, in the words a card shows: "Blob · 2.1 KB", "Blob · s3://…", or
+/// null as it is.
+fn blob_words(value: &Value) -> Value {
+    let words = match value {
+        Value::Null => return Value::Null,
+        Value::String(text) => match text.strip_prefix("base64:") {
+            Some(payload) => format!("Blob · {}", format_bytes(base64_len(payload))),
+            None => format!("Blob · {text}"),
+        },
+        Value::Object(range) => {
+            let uri = range.get("uri").and_then(Value::as_str).unwrap_or("?");
+            match range.get("length").and_then(Value::as_u64) {
+                Some(length) => format!("Blob · {} of {uri}", format_bytes(length)),
+                None => format!("Blob · {uri}"),
+            }
+        }
+        _ => "Blob".to_owned(),
+    };
+    Value::String(words)
+}
+
+/// How many bytes a base64 payload decodes to, from its length alone.
+fn base64_len(payload: &str) -> u64 {
+    let payload = payload.trim();
+    let padding = payload.bytes().rev().take_while(|&b| b == b'=').count();
+    let chars = payload.len() - padding;
+    (chars as u64 * 3) / 4
+}
+
+/// Six hex digits that tell two values apart (FNV-1a over the value as the feed spelled it).
+fn fingerprint(value: &Value) -> String {
+    let text = match value {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    };
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in text.bytes() {
+        hash = (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193);
+    }
+    format!("{:06x}", hash & 0x00ff_ffff)
 }
 
 #[cfg(test)]
@@ -662,7 +1010,8 @@ mod tests {
     use super::*;
 
     /// A type's row names no properties: each entity's row says which of its changed, so a
-    /// type's row says only how many relationships a run of unchanged entities carries.
+    /// type's row says only how many nodes a run of unchanged entities holds, which has no
+    /// counts of its own.
     #[test]
     fn a_types_row_leaves_the_properties_to_its_entities() {
         let run = |changed, relationships| GroupRun {
@@ -676,12 +1025,81 @@ mod tests {
             relationships,
         };
         assert_eq!(run_detail(&run(2, 3)), "");
-        assert_eq!(run_detail(&run(0, 3)), "with 3 relationships");
+        assert_eq!(run_detail(&run(0, 3)), "2 nodes with changed relationships");
         let one = GroupRun {
             groups: vec![0],
             ..run(0, 3)
         };
-        assert_eq!(run_detail(&one), "", "its entity's row says it");
+        assert_eq!(run_detail(&one), "1 node with changed relationships");
+    }
+
+    /// A listed commit's counts read the same wherever it is listed, and say why when there are
+    /// none: a partial count says it counted the first page only; a schema change and a commit
+    /// past cleanup are what they are, not a failure to retry.
+    #[test]
+    fn a_commits_counts_say_what_they_counted_or_why_there_are_none() {
+        let counted = |added, changed, removed, partial| CommitCounts::Counted {
+            added,
+            changed,
+            removed,
+            partial,
+        };
+        assert_eq!(counted(3, 1, 0, false).words(), "3 added, 1 changed");
+        assert_eq!(
+            counted(100, 0, 0, true).words(),
+            "100 added, counted from its first 100 changes; it has more"
+        );
+        assert_eq!(counted(0, 0, 0, false).words(), "No changes");
+        assert_eq!(
+            CommitCounts::SchemaChange(Some("Person".into())).words(),
+            "A schema change, at Person: Omnigraph does not list data changes across one"
+        );
+        assert!(
+            CommitCounts::First
+                .words()
+                .starts_with("The graph's first commit")
+        );
+        assert_eq!(
+            kind_words(1, 0, 2, true),
+            "1 relationship added, 2 relationships removed"
+        );
+        assert_eq!(kind_words(0, 1, 0, false), "1 node changed");
+        assert_eq!(section_words(GroupSection::Existing), "Existing");
+        assert_eq!(section_words(GroupSection::Added), "New");
+    }
+
+    /// A Blob reads as its size, or where its bytes are, never as its bytes; two of one size
+    /// that differ each carry a mark so the change shows.
+    #[test]
+    fn a_blob_reads_as_its_size_not_its_bytes() {
+        use serde_json::json;
+        // "hello" is five bytes, "aGVsbG8=" in base64.
+        assert_eq!(blob_words(&json!("base64:aGVsbG8=")), json!("Blob · 5 B"));
+        assert_eq!(base64_len(&"QUJD".repeat(700)), 2_100);
+        assert_eq!(
+            blob_words(&json!("s3://bucket/report.pdf")),
+            json!("Blob · s3://bucket/report.pdf")
+        );
+        assert_eq!(
+            blob_words(&json!({"uri": "s3://b/o", "offset": 10, "length": 2_140})),
+            json!("Blob · 2.1 KB of s3://b/o")
+        );
+        assert_eq!(blob_words(&Value::Null), Value::Null);
+
+        let (b, a) = blob_sides(
+            Some(&json!("base64:aGVsbG8=")),
+            Some(&json!("base64:d29ybGQ=")),
+        );
+        let (b, a) = (b.unwrap(), a.unwrap());
+        assert_ne!(b, a, "a changed Blob of the same size still reads changed");
+        assert!(b.as_str().unwrap().starts_with("Blob · 5 B · "));
+        let (b, a) = blob_sides(Some(&json!("base64:aGk=")), Some(&json!("base64:aGVsbG8=")));
+        assert_eq!(
+            (b.unwrap(), a.unwrap()),
+            (json!("Blob · 2 B"), json!("Blob · 5 B"))
+        );
+        let (b, a) = blob_sides(None, Some(&json!("base64:aGk=")));
+        assert_eq!((b, a.unwrap()), (None, json!("Blob · 2 B")));
     }
 
     /// A card of many relationships shows its first few, more each time they are asked for,

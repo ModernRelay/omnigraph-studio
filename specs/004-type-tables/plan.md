@@ -231,17 +231,18 @@ stay put), IX (paged, virtualized).
 - Reading on a branch (since 2026-11-01): a table on any branch but `main` reads what the
   branch changed in its type, as the net diff from the merge base (`branches/merge-base`, then
   `/diff` a page at a time, folded per entity as review folds, up to review's cap of 20,000
-  changes), and draws it as a diff draws its lines, in green and red only: a row the branch
+  changes), and draws it as every change in Studio is drawn (spec 033): a row the branch
   added on a faint wash of green (`ds::surface::wash`) with a bar of it in the gutter; a
-  changed row with the green bar and no wash, each changed cell showing what the target holds
+  changed row with a bar in the modified colour and no wash (green, as an added row's, until
+  2026-11-17), each changed cell showing what the target holds
   struck through on the red mark beside the branch's value on the green one
   (`ds::surface::mark`), as the review's row says a change (since 2026-11-01; before, a changed
   row and its cells were washed in the modified colour, which said that something changed but
   not what); and the rows the branch removed first, before the rows read, their last values
   struck through in the removed colour. A removed row is on the branch no more: it is not picked, edited or opened, and a
   grouped table shows none (it is in no section). The toolbar counts them after the row count,
-  "+3 ~2 −1" (the changed count muted: its colour is in the cells), with the kinds in words as
-  its tooltip. The diff is read when the table is next
+  "+3 ~2 −1" in the kinds' colours (`studio_ui::change_counts`; the changed count was muted
+  until 2026-11-17), with the kinds in words as its tooltip. The diff is read when the table is next
   drawn, as the rows are, and again when the rows are read at another commit (Refresh, a branch
   or schema move) or the table's own write moves its pin; a read that fails leaves the rows
   unmarked. On `main`, and at a commit, nothing is read.
@@ -393,9 +394,11 @@ its open section.
 ### Editing
 
 - A cell cursor, as a spreadsheet's: a click puts it on a cell and the arrows move it, ringed
-  in the accent green with the scale's row corners (`ds::cell_cursor`). A click on a name also
-  peeks its row, as one on a value nobody may edit there does; a second click, or ↵, opens the
-  cell: a value's edit, a relationship's related rows. One overlay editor; Esc cancels, Tab
+  in the accent green with the scale's row corners (`ds::cell_cursor`). A click opens nothing,
+  in any column: the inspector shows the cursor's row while it is shown (spec 020; before
+  2026-11-13 a click on a name, or on a value nobody may edit there, peeked its row and opened
+  the inspector). A second click, or ↵, opens the cell: a value's edit, a node's page from its
+  key, a relationship's related rows. One overlay editor; Esc cancels, Tab
   moves to the next cell. (Before 2026-11-02 one click edited a value and opened a
   relationship, so the arrows had no cell to move from.)
 - A text that reads as markdown ends in ⤢ under the pointer, on the cursor's cell and in its
@@ -802,3 +805,7 @@ kept answers.
   write is out is compared once its outcome moved the pin. Offscreen snapshots do run timers
   (`wait:` advances the simulated clock), and the snapshot window is now active, so the poll
   shows there.
+- 2026-11-17: "green and red only" made green mean "changed" in the table and "added" everywhere
+  else. A changed row's bar takes the modified colour and its count the kinds' colours, as in
+  the review and History; the cells' red and green marks stay, and are now how every changed
+  value reads (spec 033).

@@ -9,6 +9,7 @@ mod hover;
 mod name_view;
 mod queries_panel;
 mod results;
+mod row_note;
 mod schema_view;
 mod syntax;
 mod view;

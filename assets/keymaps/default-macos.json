@@ -12,12 +12,17 @@
       "cmd-k": "studio::ToggleCommandPalette",
       "cmd-p": "studio::GoTo",
       "cmd-,": "studio::OpenSettings",
+      "cmd-alt-,": "studio::OpenAgentSettings",
       "cmd-shift-b": "studio::SwitchBranch",
       "cmd-shift-n": "studio::NewWindow",
       "cmd-[": "studio::GoBack",
       "cmd-]": "studio::GoForward",
       "cmd-q": "studio::Quit",
-      "cmd-alt-shift-f": "studio::ToggleFrameOverlay"
+      "cmd-alt-shift-f": "studio::ToggleFrameOverlay",
+      "cmd-=": "studio::IncreaseFontSize",
+      "cmd-+": "studio::IncreaseFontSize",
+      "cmd--": "studio::DecreaseFontSize",
+      "cmd-0": "studio::ResetFontSize"
     }
   },
   {
@@ -82,10 +87,7 @@
       "1": "studio_canvas::ActualSize",
       "=": "studio_canvas::ZoomIn",
       "+": "studio_canvas::ZoomIn",
-      "-": "studio_canvas::ZoomOut",
-      "cmd-0": "studio_canvas::FitToWindow",
-      "cmd-=": "studio_canvas::ZoomIn",
-      "cmd--": "studio_canvas::ZoomOut"
+      "-": "studio_canvas::ZoomOut"
     }
   },
   {
@@ -213,7 +215,7 @@
       "left": "studio_table::MoveLeft",
       "right": "studio_table::MoveRight",
       "enter": "studio_table::EditCell",
-      "space": "studio_table::PeekRow",
+      "space": "studio::ToggleInspector",
       "cmd-enter": "studio_table::OpenRowPage",
       "g": "studio_table::ShowRowOnCanvas",
       "cmd-c": "studio_table::CopyCell",
@@ -296,7 +298,7 @@
     "bindings": {
       "f": "studio_tree::RerootHere",
       "g": "studio_tree::ShowOnCanvas",
-      "space": "studio_tree::PeekSelected",
+      "space": "studio::ToggleInspector",
       "h": "studio_tree::ToggleEmptyGroups"
     }
   },
@@ -315,8 +317,15 @@
     }
   },
   {
+    "context": "NodePage && !Editor",
+    "bindings": {
+      "space": "studio::ToggleInspector"
+    }
+  },
+  {
     "context": "Ontology",
     "bindings": {
+      "space": "studio::ToggleInspector",
       "escape": "studio_ontology::Back",
       "up": "studio_ontology::SelectPrevious",
       "down": "studio_ontology::SelectNext",
@@ -336,9 +345,10 @@
       "right": "studio_canvas::MoveRight",
       "up": "studio_canvas::MoveUp",
       "down": "studio_canvas::MoveDown",
-      "space": "studio_canvas::PeekSelected",
+      "space": "studio::ToggleInspector",
       "cmd-enter": "studio_canvas::OpenSelectedPage",
       "f": "studio_canvas::FocusSelected",
+      "alt-enter": "studio_canvas::FollowRelationship",
       "[": "studio_canvas::WalkBack",
       "]": "studio_canvas::WalkForward",
       "r": "studio_canvas::ResetLayout",
@@ -388,6 +398,13 @@
     }
   },
   {
+    "context": "Confirm",
+    "bindings": {
+      "enter": "menu::Confirm",
+      "escape": "menu::Cancel"
+    }
+  },
+  {
     "context": "QueryResults",
     "bindings": {
       "cmd-c": "studio_query::CopyCell",
@@ -410,6 +427,7 @@
   {
     "context": "Review",
     "bindings": {
+      "cmd-enter": "studio_changes::OpenChanged",
       "cmd-y": "studio_review::AcceptAndNext",
       "alt-cmd-z": "studio_review::RevertAndNext",
       "cmd-shift-enter": "studio_review::Merge",
@@ -429,7 +447,13 @@
     "context": "CommitView",
     "bindings": {
       "b": "studio_history::NewBranchHere",
-      "cmd-alt-n": "studio_history::LoadMoreChanges"
+      "cmd-alt-n": "studio_history::LoadMoreChanges",
+      "j": "menu::SelectNext",
+      "down": "menu::SelectNext",
+      "k": "menu::SelectPrevious",
+      "up": "menu::SelectPrevious",
+      "space": "studio_changes::ToggleChange",
+      "cmd-enter": "studio_changes::OpenChanged"
     }
   },
   {

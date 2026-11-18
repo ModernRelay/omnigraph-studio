@@ -436,7 +436,7 @@ pub fn overrides_key(target: &str, graph: &str) -> String {
 
 /// The agent the agent panel runs (spec 011): a program and its arguments, and extra
 /// environment variables. Empty until the person chooses one.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct AgentSettings {
     /// The program the agent panel runs over the Agent Client Protocol.
@@ -450,6 +450,54 @@ pub struct AgentSettings {
     /// go through, each shown as a card.
     #[schemars(title = "Ask before writes")]
     pub ask_before_writes: bool,
+    // Spec 032.
+    /// Claude Code, Codex and other agents on this computer can connect to Studio over MCP to
+    /// open tables, pages, canvases and queries, walk a canvas or a tree, and read which tabs
+    /// are open. They can't change a graph.
+    #[schemars(title = "Run Studio's MCP server for external agents")]
+    pub outside_agents: bool,
+    /// The MCP server asks for the same port at each start and keeps its token in the system
+    /// keychain, so a copied command keeps working across restarts. Off: a new address and token
+    /// each start.
+    #[schemars(title = "Keep the server's address and token between starts")]
+    pub keep_address: bool,
+    /// The port Studio asks for first while it keeps its address; the nine after it are tried
+    /// when it is taken. Edited in `settings.json`.
+    #[schemars(extend("x-hidden" = true))]
+    pub ui_tools_port: u16,
+    /// The agent in Studio's panel can open and walk things in its conversation's window, as an
+    /// external agent can. Off: it has the omnigraph CLI only.
+    #[schemars(title = "Give the agent panel Studio's UI tools")]
+    pub panel_ui_tools: bool,
+    /// A window an agent opens or shows something in comes to the front. Off: it changes where
+    /// it is, and says "Opened by" in its status bar.
+    #[schemars(title = "Bring Studio to the front when an agent shows something")]
+    pub raise_window: bool,
+}
+
+/// The port the UI tool server asks for first while it keeps its address (spec 032, "The
+/// port"). 24187 is in the registered range 10000-49151, below Linux's ephemeral range
+/// (32768-60999), macOS's and Windows' (49152-65535) and Kubernetes' NodePorts (30000-32767),
+/// so the system never hands it out; IANA lists 24007-24241 as unassigned (registry of
+/// 2026-11-10); and no common development tool or database defaults to it or to the nine after
+/// it (3000-3999, 4000, 5000-5999, 8000-8999, 9000-9999, 5432, 6379, 11211, 27017, the MCP
+/// inspector's 6274 and 6277), nor does Studio itself (the dev server's 8787, the sign-in bed's
+/// 8791, OAuth's loopback callbacks and the agent gateway, which take system-chosen ports).
+pub const DEFAULT_UI_TOOLS_PORT: u16 = 24187;
+
+impl Default for AgentSettings {
+    fn default() -> Self {
+        Self {
+            command: Vec::new(),
+            env: BTreeMap::new(),
+            ask_before_writes: false,
+            outside_agents: true,
+            keep_address: true,
+            ui_tools_port: DEFAULT_UI_TOOLS_PORT,
+            panel_ui_tools: true,
+            raise_window: false,
+        }
+    }
 }
 
 /// Model calls through OpenRouter (spec 019): the model each kind of task runs on, whether a
@@ -505,6 +553,7 @@ pub struct StudioSettings {
     )]
     pub ui_font_family: Option<String>,
     /// Text size for menus, tables and panels.
+    // The range is `FONT_SIZES`, which a test holds this to.
     #[schemars(
         title = "Interface font size",
         range(min = 10, max = 24),
@@ -1192,6 +1241,49 @@ fn apply(settings: StudioSettings, cx: &mut App) {
     cx.refresh_windows();
 }
 
+/// The text sizes Settings allows, in px: the interface's and the query editor's.
+pub const FONT_SIZES: std::ops::RangeInclusive<f32> = 10.0..=24.0;
+
+impl StudioSettings {
+    /// The interface's and the query editor's text sizes, each moved `by` px: the two move
+    /// together, so the editor stays as much smaller or larger than the interface as it was.
+    /// `None` when either would leave [`FONT_SIZES`]: a step at the limit changes nothing,
+    /// rather than moving one size and not the other.
+    pub fn font_sizes_stepped(&self, by: f32) -> Option<(f32, f32)> {
+        let (interface, editor) = (self.ui_font_size + by, self.buffer_font_size + by);
+        (FONT_SIZES.contains(&interface) && FONT_SIZES.contains(&editor))
+            .then_some((interface, editor))
+    }
+}
+
+/// Makes text `by` px larger (or smaller, below zero) in the interface and the query editor,
+/// and keeps it in the settings file ([`update`]). Nothing changes at the limit.
+pub fn step_font_sizes(by: f32, cx: &mut App) {
+    let Some((interface, editor)) = StudioSettings::get(cx).font_sizes_stepped(by) else {
+        return;
+    };
+    update(cx, |settings| {
+        settings.ui_font_size = interface;
+        settings.buffer_font_size = editor;
+    });
+}
+
+/// Puts the interface's and the query editor's text back at their default sizes, and keeps
+/// that in the settings file. Nothing is written when they are there already.
+pub fn reset_font_sizes(cx: &mut App) {
+    let defaults = StudioSettings::default();
+    let now = StudioSettings::get(cx);
+    if now.ui_font_size == defaults.ui_font_size
+        && now.buffer_font_size == defaults.buffer_font_size
+    {
+        return;
+    }
+    update(cx, |settings| {
+        settings.ui_font_size = defaults.ui_font_size;
+        settings.buffer_font_size = defaults.buffer_font_size;
+    });
+}
+
 /// Applies a change, and writes it into the settings file on the write thread, in turn with
 /// every other write: reading, editing and syncing the file can take tens of milliseconds, too
 /// long for a click. The file is read again first, so an edit another program made since
@@ -1475,6 +1567,80 @@ mod tests {
         });
     }
 
+    /// The text-size keys move the interface's and the editor's sizes together, and stop at
+    /// the range the settings page offers rather than moving one size and not the other.
+    #[test]
+    fn text_sizes_step_together_and_stop_at_the_limits() {
+        let mut settings = StudioSettings::default();
+        let (interface, editor) = (settings.ui_font_size, settings.buffer_font_size);
+        assert_eq!(
+            settings.font_sizes_stepped(1.),
+            Some((interface + 1., editor + 1.))
+        );
+        assert_eq!(
+            settings.font_sizes_stepped(-1.),
+            Some((interface - 1., editor - 1.))
+        );
+        // At the top the interface's size cannot grow, so the editor's does not either.
+        settings.ui_font_size = *FONT_SIZES.end();
+        assert_eq!(settings.font_sizes_stepped(1.), None);
+        assert_eq!(
+            settings.font_sizes_stepped(-1.),
+            Some((FONT_SIZES.end() - 1., editor - 1.))
+        );
+        // At the bottom the editor's size stops both.
+        settings.ui_font_size = 12.;
+        settings.buffer_font_size = *FONT_SIZES.start();
+        assert_eq!(settings.font_sizes_stepped(-1.), None);
+        for path in ["ui_font_size", "buffer_font_size"] {
+            let field = fields()
+                .iter()
+                .find(|field| field.path.join(".") == path)
+                .unwrap();
+            let FieldKind::Number { min, max, .. } = field.kind else {
+                panic!("{path} is a number");
+            };
+            assert_eq!(
+                (min as f32, max as f32),
+                (*FONT_SIZES.start(), *FONT_SIZES.end()),
+                "{path}'s range on the settings page"
+            );
+        }
+    }
+
+    /// A step changes the settings in effect and a reset puts the defaults back; a step at the
+    /// limit changes nothing, and the two sizes stay as far apart as they were.
+    #[gpui::test]
+    fn the_text_size_steps_change_the_settings_in_effect(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            init_test(cx);
+            keep_changes_in_memory(cx);
+            let sizes = |cx: &App| {
+                let settings = StudioSettings::get(cx);
+                (settings.ui_font_size, settings.buffer_font_size)
+            };
+            let defaults = sizes(cx);
+            reset_font_sizes(cx);
+            assert_eq!(sizes(cx), defaults, "nothing to put back");
+            step_font_sizes(1., cx);
+            step_font_sizes(1., cx);
+            assert_eq!(sizes(cx), (defaults.0 + 2., defaults.1 + 2.));
+            step_font_sizes(-1., cx);
+            assert_eq!(sizes(cx), (defaults.0 + 1., defaults.1 + 1.));
+            reset_font_sizes(cx);
+            assert_eq!(sizes(cx), defaults);
+            for _ in 0..40 {
+                step_font_sizes(1., cx);
+            }
+            assert_eq!(sizes(cx).0, *FONT_SIZES.end(), "it stops at the largest");
+            assert_eq!(
+                sizes(cx).0 - sizes(cx).1,
+                defaults.0 - defaults.1,
+                "and the editor's text is as much smaller as it was"
+            );
+        });
+    }
+
     #[test]
     fn only_an_installed_build_is_a_release_build() {
         let release = |path: &str| is_release_build(std::path::Path::new(path));
@@ -1572,6 +1738,23 @@ mod tests {
         let documented: serde_json::Value = serde_json::from_str(text).unwrap();
         let actual = serde_json::to_value(StudioSettings::default()).unwrap();
         assert_eq!(documented, actual, "default.json names every setting");
+    }
+
+    /// Spec 032's settings: agents outside Studio, a kept address on the default port and the
+    /// panel's agent's tools are on; bringing the window to the front is off.
+    #[test]
+    fn the_agents_window_settings_default_as_the_person_asked() {
+        let agent = StudioSettings::default().agent;
+        assert!(agent.outside_agents && agent.keep_address && agent.panel_ui_tools);
+        assert!(!agent.raise_window);
+        assert_eq!(agent.ui_tools_port, DEFAULT_UI_TOOLS_PORT);
+        assert!(
+            (10_000..32_768).contains(&DEFAULT_UI_TOOLS_PORT),
+            "registered, not ephemeral"
+        );
+        // An older file without them takes them as defaults.
+        let read = StudioSettings::read("{ \"agent\": { \"outside_agents\": false } }").unwrap();
+        assert!(!read.settings.agent.outside_agents && read.settings.agent.keep_address);
     }
 
     #[test]

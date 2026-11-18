@@ -96,10 +96,60 @@ impl ViewLink {
     }
 }
 
+/// A node by its type and id, as an action that names nodes takes it (spec 032).
+#[derive(
+    Clone, Debug, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize, schemars::JsonSchema,
+)]
+pub struct NodeId {
+    pub type_name: String,
+    pub id: String,
+}
+
+/// An expansion of several nodes' neighbourhoods (spec 032), as the canvas and the tree take it:
+/// the nodes (none: the marked nodes, else the selected one), the relationships to open
+/// (`out:WorksAt`, `in:Knows`; none: every one), how deep, and how many of each relationship's
+/// neighbours a second level opens and a canvas draws.
+#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize, schemars::JsonSchema)]
+pub struct Expansion {
+    #[serde(default)]
+    pub nodes: Vec<NodeId>,
+    /// Relationship names with their direction from the node: `out:WorksAt`, `in:Knows`.
+    #[serde(default)]
+    pub relationships: Option<Vec<String>>,
+    /// 1 opens the nodes' relationships; 2 also opens those of the neighbours they read.
+    #[serde(default = "one")]
+    pub depth: u8,
+    /// How many of each relationship's neighbours are drawn and go on to the second level;
+    /// none: the canvas's own step.
+    #[serde(default)]
+    pub limit_per_relationship: Option<usize>,
+    /// Open it though it is past what is opened without asking, as the person's answer to
+    /// the question would.
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+fn one() -> u8 {
+    1
+}
+
 pub mod workspace {
     use gpui::{Action, actions};
     use schemars::JsonSchema;
     use serde::Deserialize;
+
+    /// Show or hide the inspector, the right dock: what the active tab has selected (spec 020).
+    /// Space in a table, a tree and a canvas, which each had an action of their own for it.
+    #[derive(Clone, Debug, Default, PartialEq, Action)]
+    #[action(
+        namespace = studio,
+        deprecated_aliases = [
+            "studio_table::PeekRow",
+            "studio_tree::PeekSelected",
+            "studio_canvas::PeekSelected"
+        ]
+    )]
+    pub struct ToggleInspector;
 
     /// Open the active tab's view at this place in its view strip.
     #[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Action)]
@@ -122,6 +172,14 @@ pub mod workspace {
             About,
             /// Open Studio's settings.
             OpenSettings,
+            /// Open Studio's settings at Agent: the agent the panel runs, and Studio's MCP server
+            /// for external agents.
+            OpenAgentSettings,
+            /// Start or stop Studio's MCP server for external agents.
+            ToggleMcpServer,
+            /// Replace the MCP server's token: every external agent holding the old one is
+            /// refused from then on, until its command is copied again.
+            ReplaceMcpToken,
             /// Switch the window's graph to another branch.
             SwitchBranch,
             /// Open a new window.
@@ -147,8 +205,6 @@ pub mod workspace {
             ActivatePreviousItem,
             /// Show or hide the sidebar, the left dock.
             ToggleSidebar,
-            /// Show or hide the inspector, the right dock.
-            ToggleInspector,
             /// Show or hide the bottom panel: nodes, history and the activity log.
             ToggleActivity,
             /// Zoom the active pane over the document area, or end a zoom.
@@ -161,6 +217,14 @@ pub mod workspace {
             /// Read the open graph's schema, branches and counts again, and the view in
             /// focus.
             Refresh,
+            /// Make text one size larger, in the interface and the query editor, and keep it:
+            /// zoom in. Rows, columns and panels keep their size.
+            IncreaseFontSize,
+            /// Make text one size smaller, in the interface and the query editor, and keep
+            /// it: zoom out. Rows, columns and panels keep their size.
+            DecreaseFontSize,
+            /// Put the interface's and the query editor's text back at their default sizes.
+            ResetFontSize,
         ]
     );
 
@@ -172,8 +236,8 @@ pub mod workspace {
         pub url: String,
     }
 
-    /// Show a panel in its dock and give it the keyboard: `types`, `explore`, `queries`,
-    /// `branches`, `agent-conversations`, `inspector`, `nodes`, `history`, `activity`.
+    /// Show a panel in its dock and give it the keyboard: `types`, `queries`, `branches`,
+    /// `commits`, `agent-conversations`, `inspector`, `activity`.
     #[derive(Clone, Debug, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action)]
     #[action(namespace = studio)]
     pub struct ActivatePanel {
@@ -307,6 +371,10 @@ pub mod graph {
         /// is, since it may hold other work.
         #[serde(default)]
         pub filters: Option<serde_json::Value>,
+        /// With `filter_id`: open the filtered rows in a tab of their own, which can be closed,
+        /// and leave the type's open table as it is.
+        #[serde(default)]
+        pub separate: bool,
     }
 
     /// Open the schema's map: the graph's types and how they relate, one type at a time.
@@ -403,22 +471,7 @@ pub mod graph {
         pub held: bool,
     }
 
-    /// Show one node in the inspector without revealing it in the tree, read at the branch
-    /// head or held at a commit.
-    #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
-    #[action(namespace = studio_graph)]
-    pub struct PeekNode {
-        pub type_name: String,
-        pub id: String,
-        #[serde(default)]
-        pub at_commit: Option<String>,
-        /// The commit the view it comes from shows while that view follows the head: the peek
-        /// reads there, as the view does, and offers Refresh when the branch has moved past it.
-        #[serde(default)]
-        pub snapshot: Option<String>,
-    }
-
-    /// Open one node in the inspector and the Explore panel.
+    /// Open one node as a page in its own tab, read at the branch head.
     #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
     #[action(namespace = studio_graph)]
     pub struct OpenNode {
@@ -481,6 +534,9 @@ pub mod graph {
         pub id: String,
         #[serde(default)]
         pub at_commit: Option<String>,
+        /// Open as the pane's preview tab, which the next preview replaces.
+        #[serde(default)]
+        pub preview: bool,
     }
 
     /// Open a new query tab with this text. It is not run.
@@ -626,8 +682,6 @@ pub mod table {
             SelectPreviousSuggestion,
             /// Cancel the edit, or step back one level.
             Cancel,
-            /// Show the selected row in the inspector, or hide it.
-            PeekRow,
             /// Open the selected row's node as a page.
             OpenRowPage,
             /// Read the table again: from the branch head, or at the commit it is held at.
@@ -715,7 +769,7 @@ pub mod tree {
             ExpandAll,
             /// Collapse the selected row's subtree.
             CollapseAll,
-            /// Open the selected node in the inspector.
+            /// Open the selected node's page, or open or close the selected group.
             OpenSelected,
             /// Make the selected node the tree's root.
             RerootHere,
@@ -723,8 +777,6 @@ pub mod tree {
             ShowOnCanvas,
             /// Clear the text typed to filter the tree.
             ClearFilter,
-            /// Show the selected node in the inspector, keeping focus in the tree.
-            PeekSelected,
             /// Open a table filtered to the selected node, or to its neighbours in a group.
             OpenTable,
             /// Open the selected node's page, or a relationship group's table.
@@ -733,6 +785,39 @@ pub mod tree {
             ToggleEmptyGroups,
         ]
     );
+
+    /// Select a node's row in the tree by its type and id, as a click does; with none
+    /// named, the node it starts from.
+    #[derive(
+        Clone, Debug, Default, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action,
+    )]
+    #[action(namespace = studio_tree)]
+    #[serde(default)]
+    pub struct SelectNode {
+        pub type_name: String,
+        pub id: String,
+    }
+
+    /// Expand nodes' neighbourhoods in the tree: the selected node, every relationship, one
+    /// level deep; asked first when it opens many rows.
+    #[derive(
+        Clone, Debug, Default, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action,
+    )]
+    #[action(namespace = studio_tree)]
+    pub struct ExpandNeighbourhood {
+        #[serde(flatten)]
+        pub expansion: crate::Expansion,
+    }
+
+    /// Collapse nodes' rows in the tree: the selected node, or those named.
+    #[derive(
+        Clone, Debug, Default, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action,
+    )]
+    #[action(namespace = studio_tree)]
+    pub struct CollapseNodes {
+        #[serde(default)]
+        pub nodes: Vec<crate::NodeId>,
+    }
 }
 
 pub mod query {
@@ -805,6 +890,21 @@ pub mod history {
     );
 }
 
+pub mod changes {
+    use gpui::actions;
+
+    actions!(
+        studio_changes,
+        [
+            /// Open the page of the selected change's node or relationship, as the change left
+            /// it, or as it was before a removal.
+            OpenChanged,
+            /// Unfold the selected change to what it holds, or fold it back to its line.
+            ToggleChange,
+        ]
+    );
+}
+
 pub mod review {
     use gpui::actions;
 
@@ -859,12 +959,13 @@ pub mod canvas {
             MoveUp,
             /// Select the nearest node below.
             MoveDown,
-            /// Show the selected node in the inspector.
-            PeekSelected,
             /// Open the selected node's page.
             OpenSelectedPage,
             /// Center and zoom on the selected node.
             FocusSelected,
+            /// Follow the selected single-target relationship (a manager, a parent folder) hop
+            /// after hop, to the end of its chain.
+            FollowRelationship,
             /// Select the node the selected one was reached from.
             WalkBack,
             /// Go back down the path walked with WalkBack.
@@ -875,8 +976,90 @@ pub mod canvas {
             ClearSelection,
             /// Let the layout place every node again, forgetting where nodes were dragged.
             ResetLayout,
+            /// Start a new canvas walk from the selected node, in a tab of its own.
+            RerootHere,
+            /// Draw again the nodes hidden from the canvas.
+            ShowHidden,
         ]
     );
+
+    /// Select a node on the canvas by its type and id, as a click does; with none
+    /// named, the node it starts from.
+    #[derive(
+        Clone, Debug, Default, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action,
+    )]
+    #[action(namespace = studio_canvas)]
+    #[serde(default)]
+    pub struct SelectNode {
+        pub type_name: String,
+        pub id: String,
+    }
+
+    /// Expand nodes' neighbourhoods: the marked nodes, or the selected one, every relationship,
+    /// one level deep; asked first when it opens more than a canvas can show well.
+    #[derive(
+        Clone, Debug, Default, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action,
+    )]
+    #[action(namespace = studio_canvas)]
+    pub struct ExpandNeighbourhood {
+        #[serde(flatten)]
+        pub expansion: crate::Expansion,
+    }
+
+    /// Collapse nodes: the marked nodes, or the selected one.
+    #[derive(
+        Clone, Debug, Default, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action,
+    )]
+    #[action(namespace = studio_canvas)]
+    pub struct CollapseNodes {
+        #[serde(default)]
+        pub nodes: Vec<crate::NodeId>,
+    }
+
+    /// Show more of a relationship's neighbours: the selected relationship or "+K more", or the
+    /// one named, of the node named.
+    #[derive(
+        Clone, Debug, Default, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action,
+    )]
+    #[action(namespace = studio_canvas)]
+    pub struct ShowMore {
+        #[serde(default)]
+        pub node: Option<crate::NodeId>,
+        /// The relationship with its direction from the node: `out:WorksAt`, `in:Knows`.
+        #[serde(default)]
+        pub relationship: Option<String>,
+    }
+
+    /// Hide nodes from the canvas, with what hangs off them: the marked nodes, or the selected
+    /// one. Show hidden draws them again.
+    #[derive(
+        Clone, Debug, Default, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action,
+    )]
+    #[action(namespace = studio_canvas)]
+    pub struct HideNodes {
+        #[serde(default)]
+        pub nodes: Vec<crate::NodeId>,
+    }
+
+    /// Keep nodes where they are drawn: the marked nodes, or the selected one.
+    #[derive(
+        Clone, Debug, Default, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action,
+    )]
+    #[action(namespace = studio_canvas)]
+    pub struct PinNodes {
+        #[serde(default)]
+        pub nodes: Vec<crate::NodeId>,
+    }
+
+    /// Let the layout place nodes again: the marked nodes, or the selected one.
+    #[derive(
+        Clone, Debug, Default, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action,
+    )]
+    #[action(namespace = studio_canvas)]
+    pub struct UnpinNodes {
+        #[serde(default)]
+        pub nodes: Vec<crate::NodeId>,
+    }
 }
 
 pub mod ontology {

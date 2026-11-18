@@ -9,6 +9,9 @@ every surface and nothing drifts. This refuses, outside the design system and te
 
 - a literal size, space, corner, offset or type size (`.h(px(12.))`, `.gap(px(6.))`,
   `point(px(-4.), …)`, `rems_from_px(22.)`);
+- a canvas chip's inner spacing written as a number (`const PILL_PAD_Y: f32 = 4.;`): a chip's
+  padding, gaps and mark take `ds::space` and `ds::size`, as a control's do (the canvas's
+  world-unit layout gaps are not interface spacing and stay numbers);
 - GPUI's rem utilities (`.gap_2()`, `.px_3()`, `.h_6()`) and its corner and shadow utilities
   (`.rounded_md()`, `.shadow_lg()`);
 - a raw colour (`gpui::black()`, `rgb(0x…)`, `hsla(…)`) or the theme's palette read directly
@@ -63,6 +66,7 @@ SYSTEM = {
     "crates/studio_ui/src/tooltip.rs",
     "crates/studio_ui/src/modal.rs",
     "crates/studio_ui/src/menu.rs",
+    "crates/studio_ui/src/window_buttons.rs",
 }
 # Crates that are not views: the theme itself, and those that draw nothing.
 NOT_VIEWS = {"studio_theme", "studio_settings", "studio_actions", "graph_client", "graph_store",
@@ -81,6 +85,7 @@ RULES = [
     ("literal offset", re.compile(
         r"(point|snap_to_window_with_margin|size)\(\s*px\(-?(?!0\.?\))[0-9][0-9.]*\.?\)")),
     ("literal type size", re.compile(r"\brems(_from_px)?\(\s*[0-9]")),
+    ("chip spacing outside ds::space", re.compile(r"\bconst PILL_[A-Z_]+: f32 = -?[0-9]")),
     ("corner utility", re.compile(r"\.rounded_(xs|sm|md|lg|xl|2xl|3xl)\(\)")),
     ("shadow utility", re.compile(r"\.shadow_(2xs|xs|sm|md|lg|xl|2xl)\(\)")),
     ("raw colour", re.compile(r"gpui::(black|white)\(\)|\brgb\(0x|\brgba\(0x|\bhsla\(")),

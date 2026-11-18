@@ -30,8 +30,8 @@ use gq_language::{Filter, FilterOp};
 use graph_store::GraphSession;
 use serde_json::Value;
 use studio_actions::graph::{
-    OpenBlob, OpenNode, OpenNodePage, OpenSavedView, OpenTextEditor, OpenType, PeekNode,
-    RestoreSavedView, UndoDelete,
+    OpenBlob, OpenNode, OpenNodePage, OpenSavedView, OpenTextEditor, OpenType, RestoreSavedView,
+    UndoDelete,
 };
 use studio_workspace::{PanelPosition, ToastKind, Workspace};
 use ui::IconName;
@@ -45,9 +45,11 @@ use types_list::TypesList;
 
 /// Registers this surface: the tabs it restores (a type's table, a node's page, a Blob, a long
 /// text), and with every new workspace the left dock's Graph panel and the actions that open what it shows (`OpenType`, `OpenNode`, `OpenNodePage`,
-/// `PeekNode`, `OpenBlob`, `OpenTextEditor`, `UndoDelete`). Its keys are in `assets/keymaps/`
+/// `OpenBlob`, `OpenTextEditor`, `UndoDelete`), and the inspector's view of a node another
+/// crate's tab has selected (`register_node_inspector`). Its keys are in `assets/keymaps/`
 /// (`TypeTable`, `TypeTable && editing`).
 pub fn init(cx: &mut App) {
+    studio_workspace::register_node_inspector(cx, node_inspector);
     // A Blob tab comes back with the value it showed, at the commit it read it at, writing to
     // the branch it wrote to.
     studio_workspace::register_item_kind(cx, "blob", |data, workspace, window, cx| {
@@ -63,6 +65,7 @@ pub fn init(cx: &mut App) {
                 type_name,
                 id,
                 at_commit: text("at_commit"),
+                preview: false,
             };
             // Named as it was until it is shown: a page behind another tab reads nothing.
             open_node_page(workspace, &action, text("label"), window, cx);
@@ -136,8 +139,24 @@ pub fn init(cx: &mut App) {
                 .clone()
                 .and_then(|filters| serde_json::from_value(filters).ok())
                 .unwrap_or_default();
+            // A filtered table opened beside the type's own (an agent's, spec 032) has a key of
+            // its own, so the type's table, as the person has it, is left alone.
+            let own_key = (action.separate && filter.is_some()).then(|| {
+                format!(
+                    "{}#{}{}",
+                    table_key(&action.type_name, action.at_commit.as_deref()),
+                    action
+                        .via
+                        .as_deref()
+                        .map(|via| format!("{via}:"))
+                        .unwrap_or_default(),
+                    action.filter_id.as_deref().unwrap_or_default()
+                )
+            });
+            let separate = own_key.is_some();
             let opening = Opening {
                 filters: filter.clone().into_iter().chain(captured).collect(),
+                own_key,
                 ..Opening::default()
             };
             let table = open_type(
@@ -149,33 +168,28 @@ pub fn init(cx: &mut App) {
                 window,
                 cx,
             );
-            // A tab open already shows only it now; a new one opened with it.
-            if let (Some(table), Some(filter)) = (table, filter) {
+            // A tab open already shows only it now; a new one opened with it. A filtered table of
+            // its own opened with it, or is shown as it is.
+            if let (Some(table), Some(filter), false) = (table, filter, separate) {
                 table.update(cx, |table, cx| table.show_only(filter, cx));
             }
         });
-        workspace.register_action(|workspace, action: &PeekNode, _window, cx| {
-            peek_node(
-                workspace,
-                &action.type_name,
-                &action.id,
-                action.at_commit.clone(),
-                action.snapshot.clone(),
-                cx,
-            );
-            // A peek asked for shows the inspector, even when its dock was hidden.
-            workspace.reveal_inspector(cx);
-        });
-        // A node opens in the center, as its page (spec 020); a peek is `PeekNode`.
+        // A node opens in the center, as its page (spec 020); the inspector shows what a
+        // tab has selected, and is asked for nothing.
         workspace.register_action(|workspace, action: &OpenNode, window, cx| {
             let page = OpenNodePage {
                 type_name: action.type_name.clone(),
                 id: action.id.clone(),
                 at_commit: None,
+                preview: false,
             };
             open_node_page(workspace, &page, None, window, cx);
         });
         workspace.register_action(|workspace, action: &OpenNodePage, window, cx| {
+            // A page is opened from what a tab shows or has selected (a row, a chip, a related
+            // node in the inspector): that tab stays, as a view's source does, so Back returns
+            // to it with its selection (spec 020).
+            workspace.keep_active_tab(cx);
             open_node_page(workspace, action, None, window, cx);
         });
         workspace.register_action(|workspace, action: &OpenTextEditor, window, cx| {
@@ -210,9 +224,10 @@ fn open_type(
     }
     let handle = cx.entity().downgrade();
     let name = type_name.to_owned();
-    let key = match &opening.view {
-        Some(view) => view_key(view, at_commit.as_deref()),
-        None => table_key(type_name, at_commit.as_deref()),
+    let key = match (&opening.own_key, &opening.view) {
+        (Some(own), _) => own.clone(),
+        (None, Some(view)) => view_key(view, at_commit.as_deref()),
+        (None, None) => table_key(type_name, at_commit.as_deref()),
     };
     workspace.open_item_with::<TypeTable>(key, preview, window, cx, move |window, cx| {
         TypeTable::opening(handle, session, name, at_commit, opening, window, cx)
@@ -280,6 +295,10 @@ pub(crate) fn saved_table(data: &Value) -> Option<(String, Option<String>, Openi
         group_by,
         layout,
         view: data.get("view").and_then(Value::as_str).map(str::to_owned),
+        own_key: data
+            .get("own_key")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
     };
     Some((type_name, at_commit, opening))
 }
@@ -306,6 +325,7 @@ pub(crate) fn view_opening(view: &studio_settings::SavedView) -> Opening {
         group_by: view.group_by.clone(),
         layout: model::ColumnLayout::new(view.hidden.clone(), view.order.clone()),
         view: Some(view.key()),
+        own_key: None,
     }
 }
 
@@ -531,44 +551,38 @@ pub(crate) fn table_key(type_name: &str, at_commit: Option<&str>) -> String {
     }
 }
 
-/// Shows one node in the inspector, held at `at_commit`, or else read at `snapshot`, the
-/// commit the view it comes from shows, or at the branch head.
-fn peek_node(
-    workspace: &mut Workspace,
-    type_name: &str,
-    id: &str,
-    at_commit: Option<String>,
-    snapshot: Option<String>,
-    cx: &mut Context<Workspace>,
-) {
-    let Some(session) = workspace.session().cloned() else {
-        return;
-    };
+/// The inspector's view of a node a tab of another crate has selected (a tree's row, a canvas's
+/// chip): held at the commit the tab is held at, or else read at the commit the tab shows, or
+/// at the branch head. It follows a selection that may be moving, so what it reads waits a
+/// moment, and a node the selection passes is not read.
+fn node_inspector(
+    node: &studio_workspace::InspectedNode,
+    session: &Entity<GraphSession>,
+    cx: &mut App,
+) -> gpui::AnyView {
     let subject = PeekSubject::Node {
-        type_name: type_name.to_owned(),
-        id: id.to_owned(),
+        type_name: node.type_name.clone(),
+        id: node.id.clone(),
     };
-    let holds = at_commit.is_some();
-    let snapshot = at_commit.or(snapshot);
-    let peek = cx.new(|cx| {
+    let holds = node.at_commit.is_some();
+    let snapshot = node.at_commit.clone().or_else(|| node.snapshot.clone());
+    let session = session.clone();
+    cx.new(|cx| {
         let mut peek = NodePeek::new(
             session,
             subject,
             None,
             snapshot,
             Default::default(),
-            false,
+            true,
             cx,
         );
         if holds {
             peek.hold_commit();
         }
         peek
-    });
-    let peek: gpui::AnyView = peek.into();
-    workspace.set_inspector(Some(peek.clone()), cx);
-    // The peek is a list that draws, and reads, only the relationship groups in view.
-    workspace.set_panel_scrolls_itself(&peek, cx);
+    })
+    .into()
 }
 
 /// Opens a text property in its editor, or shows the tab it is in.
@@ -614,7 +628,7 @@ fn open_node_page(
         action.id.clone(),
         action.at_commit.clone(),
     );
-    workspace.open_item(key, window, cx, move |_window, cx| {
+    workspace.open_item_with::<NodePage>(key, action.preview, window, cx, move |_window, cx| {
         NodePage::new(session, type_name, id, at_commit, saved_label, cx)
     });
 }

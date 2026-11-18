@@ -2802,6 +2802,19 @@ impl GroupBy {
         .collect()
     }
 
+    /// For a grouping by the neighbours' relationship, the node type its values are, whose
+    /// label names them ([`neighbour_values`]); none for a grouping by a property.
+    pub fn value_type<'a>(
+        &self,
+        schema: &'a SchemaModel,
+        group: &RelationshipGroup,
+    ) -> Option<&'a NodeType> {
+        (self.on == GroupOn::Relationship)
+            .then(|| self.hop(schema, group).ok())
+            .flatten()
+            .map(|(other, _)| other)
+    }
+
     /// For a grouping by the neighbours' relationship: the type at its other end, and the hop
     /// from a neighbour `$m` to a value `$v`.
     fn hop<'a>(
@@ -3006,14 +3019,13 @@ pub fn neighbours_without_properties(
     for clause in sorted.iter().flat_map(|(clauses, _, _)| clauses) {
         extra.push_str(&format!("\n    {clause}"));
     }
-    // A search narrows the neighbours to ids starting with, or labels containing, the text.
-    if let Some(text) = narrow.search.filter(|text| !text.is_empty()) {
-        let label = other
-            .label_property()
-            .filter(|label| Some(*label) != other.key.as_deref());
+    // A search narrows the neighbours to those whose id or searched properties hold every
+    // word of the text (spec 031), as a type's server search does.
+    if let Some(text) = narrow.search.filter(|text| !text.trim().is_empty()) {
+        let properties = searched_properties(other);
         extra.push_str(&format!(
             "\n    {}",
-            text_match("m", label, text, &mut params)
+            text_match("m", &properties, text, &mut params)
         ));
     }
     if let Some((by, value)) = narrow.value {
@@ -3288,39 +3300,151 @@ pub fn node_labels(
     }))
 }
 
-/// Nodes of one type whose id starts with `text`, or whose label contains it (spec 002, ⌘P go
-/// to a node); with no text, the type's first nodes. Columns: `id`, then `label` when the type
-/// has a label other than its key. It reads the type's rows alone, so a commit to no node of
-/// the type leaves its answer as it was.
+/// The most text properties a node search reads and matches of one type
+/// ([`searched_properties`]).
+pub const SEARCHED_PROPERTIES: usize = 4;
+
+/// Parts of a property's name that mark it as a way people find a node by: an address, a site,
+/// a handle (spec 031, "What a search matches").
+const CONTACT_WORDS: [&str; 7] = [
+    "email", "mail", "website", "domain", "url", "handle", "username",
+];
+
+/// The text properties a node search matches, besides the id (spec 031): the property chosen
+/// to name the type's nodes, the schema's name for them, then the type's contact-like ones
+/// (an email, a website), at most [`SEARCHED_PROPERTIES`], each once. Never the key, which is
+/// the id; never a property only a reserved word names.
+pub fn searched_properties(node: &NodeType) -> Vec<&str> {
+    let mut found: Vec<&str> = Vec::new();
+    let mut add = |name: &str| {
+        if Some(name) != node.key.as_deref()
+            && !found.contains(&name)
+            && found.len() < SEARCHED_PROPERTIES
+            && crate::schema::nameable_in_where(name)
+            && let Some(property) = node.property(name)
+            && property.can_name()
+        {
+            found.push(&property.name);
+        }
+    };
+    if let Some(label) = node.label_property() {
+        add(label);
+    }
+    if let Some(label) = node.default_label_property() {
+        add(label);
+    }
+    for property in node.label_candidates() {
+        let name = property.name.to_lowercase();
+        if CONTACT_WORDS.iter().any(|word| name.contains(word)) {
+            add(&property.name);
+        }
+    }
+    found
+}
+
+/// The column a node search names searched property `at` by: `p0`, `p1`, …, so a property
+/// named `id` cannot collide with the id's column.
+pub fn searched_column(at: usize) -> String {
+    format!("p{at}")
+}
+
+/// The columns every node search returns: `id`, then each of [`searched_properties`] as
+/// [`searched_column`].
+fn searched_columns(var: &str, properties: &[&str]) -> Vec<String> {
+    let mut columns = vec![format!("${var}.@id as id")];
+    for (at, property) in properties.iter().enumerate() {
+        columns.push(format!("${var}.{property} as {}", searched_column(at)));
+    }
+    columns
+}
+
+/// Every node of a type, by id, with the text of its [`searched_properties`] (spec 031, the
+/// name index): at most `limit` rows, so a caller asking one more than it keeps learns the type
+/// has more. Columns: `id`, `p0`, `p1`, …. It reads the type's rows alone, so it is carried to
+/// a later commit that changed no node of the type.
+pub fn node_index(
+    schema: &SchemaModel,
+    type_name: &str,
+    limit: u32,
+) -> Result<BuiltQuery, BuildError> {
+    let node = node(schema, type_name)?;
+    let properties = searched_properties(node);
+    let text = format!(
+        "query studio_search_index() {{\n  match {{\n    $n: {ty}\n  }}\n  return {{ {columns} }}\n  order {{ $n.@id asc }}\n  limit {limit}\n}}\n",
+        ty = node.name,
+        columns = searched_columns("n", &properties).join(", "),
+    );
+    Ok(BuiltQuery {
+        name: "studio_search_index".into(),
+        text,
+        depends: Depends::Types {
+            nodes: vec![node.name.clone()],
+            edges: Vec::new(),
+        },
+        ..Default::default()
+    })
+}
+
+/// Nodes of one type whose id or [`searched_properties`] hold every word of `text` in one of its
+/// [`spellings`] (spec 031, the server's search for a type too large to hold); with no text, the
+/// type's first nodes. Columns: `id`, `p0`, `p1`, …. It reads the type's rows alone.
 pub fn node_search(
     schema: &SchemaModel,
     type_name: &str,
     text: &str,
     limit: u32,
 ) -> Result<BuiltQuery, BuildError> {
+    find(schema, type_name, text, false, limit)
+}
+
+/// As [`node_search`], but the whole text is one phrase, in one of its [`spellings`]: what a
+/// name typed in full, its words in order, matches, which every word on its own also matches
+/// among many more nodes (`studio_find_phrase`).
+pub fn node_phrase_search(
+    schema: &SchemaModel,
+    type_name: &str,
+    text: &str,
+    limit: u32,
+) -> Result<BuiltQuery, BuildError> {
+    find(schema, type_name, text, true, limit)
+}
+
+fn find(
+    schema: &SchemaModel,
+    type_name: &str,
+    text: &str,
+    phrase: bool,
+    limit: u32,
+) -> Result<BuiltQuery, BuildError> {
     let node = node(schema, type_name)?;
+    let properties = searched_properties(node);
     let mut params = Params::new();
-    let label = node
-        .label_property()
-        .filter(|label| Some(*label) != node.key.as_deref());
-    let mut columns = vec!["$n.@id as id".to_owned()];
-    if let Some(label) = label {
-        columns.push(format!("$n.{label} as label"));
-    }
     // No text has no spelling to try, and `()` is not a filter.
-    let predicate = if text.is_empty() {
+    let predicate = if text.trim().is_empty() {
         String::new()
     } else {
-        format!("\n    {}", text_match("n", label, text, &mut params))
+        let words: Vec<&str> = match phrase {
+            true => vec![text.trim()],
+            false => text.split_whitespace().collect(),
+        };
+        format!(
+            "\n    {}",
+            words_match("n", &properties, &words, &mut params)
+        )
+    };
+    let name = if phrase {
+        "studio_find_phrase"
+    } else {
+        "studio_find"
     };
     let text = format!(
-        "query studio_find({sig}) {{\n  match {{\n    $n: {ty}{predicate}\n  }}\n  return {{ {columns} }}\n  order {{ $n.@id asc }}\n  limit {limit}\n}}\n",
+        "query {name}({sig}) {{\n  match {{\n    $n: {ty}{predicate}\n  }}\n  return {{ {columns} }}\n  order {{ $n.@id asc }}\n  limit {limit}\n}}\n",
         sig = params.signature(),
         ty = node.name,
-        columns = columns.join(", "),
+        columns = searched_columns("n", &properties).join(", "),
     );
     Ok(BuiltQuery {
-        name: "studio_find".into(),
+        name: name.into(),
         text,
         params: params.values,
         depends: Depends::Types {
@@ -3332,9 +3456,53 @@ pub fn node_search(
     })
 }
 
-/// The spellings a search tries, since `contains` and `starts_with` compare exactly: as typed,
-/// lowercase, and with each word capitalized ("ada lov" also finds "Ada Lovelace").
-fn spellings(text: &str) -> Vec<String> {
+/// Nodes of one type that Omnigraph's full-text search finds for `text` in `property`, most
+/// relevant first (`search` filtered, `bm25` ordered; spec 031). The engine folds case and
+/// stems words; it needs a full-text index on the property (`Property::full_text`, else `T27`).
+/// Columns: `id`, `p0`, `p1`, … as [`node_search`], then `matched`, the property's text.
+pub fn node_text_search(
+    schema: &SchemaModel,
+    type_name: &str,
+    property: &str,
+    text: &str,
+    limit: u32,
+) -> Result<BuiltQuery, BuildError> {
+    let node = node(schema, type_name)?;
+    let found = self::property(node, property)?;
+    if !found.full_text {
+        return Err(BuildError::UnknownProperty {
+            type_name: node.name.clone(),
+            property: property.to_owned(),
+        });
+    }
+    let properties = searched_properties(node);
+    let mut params = Params::new();
+    let q = params.add("q", "String", Value::String(text.trim().to_owned()));
+    let mut columns = searched_columns("n", &properties);
+    columns.push(format!("$n.{property} as matched"));
+    let text = format!(
+        "query studio_find_text({sig}) {{\n  match {{\n    $n: {ty}\n    search($n.{property}, {q})\n  }}\n  return {{ {columns} }}\n  order {{ bm25($n.{property}, {q}) }}\n  limit {limit}\n}}\n",
+        sig = params.signature(),
+        ty = node.name,
+        columns = columns.join(", "),
+    );
+    Ok(BuiltQuery {
+        name: "studio_find_text".into(),
+        text,
+        params: params.values,
+        depends: Depends::Types {
+            nodes: vec![node.name.clone()],
+            edges: Vec::new(),
+        },
+        seeds: None,
+        empty_without: None,
+    })
+}
+
+/// The spellings a server search tries for one word or phrase, since `contains` compares
+/// exactly: as typed, lowercase, capitalized, each word capitalized, and in capitals ("mck"
+/// also finds "Mck…", "MCK…").
+fn spellings(word: &str) -> Vec<String> {
     let capitalize = |word: &str| {
         let mut chars = word.chars();
         match chars.next() {
@@ -3342,16 +3510,16 @@ fn spellings(text: &str) -> Vec<String> {
             None => String::new(),
         }
     };
-    // Capitalized from the lowercase spelling, so "LOVELACE" or "aDA" also finds "Lovelace",
-    // "Ada".
-    let lower = text.to_lowercase();
+    let lower = word.to_lowercase();
+    // A phrase's words each capitalized ("ada lovelace" finds "Ada Lovelace").
     let words: Vec<String> = lower.split(' ').map(capitalize).collect();
     let mut found: Vec<String> = Vec::new();
     for spelling in [
-        text.to_owned(),
+        word.to_owned(),
         lower.clone(),
         capitalize(&lower),
         words.join(" "),
+        word.to_uppercase(),
     ] {
         if !spelling.is_empty() && !found.contains(&spelling) {
             found.push(spelling);
@@ -3360,47 +3528,28 @@ fn spellings(text: &str) -> Vec<String> {
     found
 }
 
-/// `$var`'s id starting with, or its label containing, `text` in any of its [`spellings`].
-fn text_match(var: &str, label: Option<&str>, text: &str, params: &mut Params) -> String {
-    let mut tests = Vec::new();
-    for (index, spelling) in spellings(text).into_iter().enumerate() {
-        let q = params.add(&format!("q{index}"), "String", Value::String(spelling));
-        tests.push(format!("${var}.@id starts_with {q}"));
-        if let Some(label) = label {
-            tests.push(format!("${var}.{label} contains {q}"));
+/// Every word of `text`, in any of its [`spellings`], in `$var`'s id or one of `properties`:
+/// the words in any order, each anywhere ("bank nordhafen" finds "Nordhafen Bank AG").
+fn text_match(var: &str, properties: &[&str], text: &str, params: &mut Params) -> String {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    words_match(var, properties, &words, params)
+}
+
+/// Each of `words`, in any of its [`spellings`], in `$var`'s id or one of `properties`.
+fn words_match(var: &str, properties: &[&str], words: &[&str], params: &mut Params) -> String {
+    let mut clauses = Vec::new();
+    for (w, word) in words.iter().enumerate() {
+        let mut tests = Vec::new();
+        for (s, spelling) in spellings(word).into_iter().enumerate() {
+            let q = params.add(&format!("q{w}_{s}"), "String", Value::String(spelling));
+            tests.push(format!("${var}.@id contains {q}"));
+            for property in properties {
+                tests.push(format!("${var}.{property} contains {q}"));
+            }
         }
+        clauses.push(format!("({})", tests.join(" or ")));
     }
-    format!("({})", tests.join(" or "))
-}
-
-/// Whether a node with this id and label answers [`node_search`] for `text`, decided as the
-/// query's predicate decides it (`label` is the search's `label` column): every node answers
-/// no text.
-pub fn search_matches(id: &str, label: Option<&str>, text: &str) -> bool {
-    text.is_empty()
-        || spellings(text).iter().any(|spelling| {
-            id.starts_with(spelling.as_str())
-                || label.is_some_and(|label| label.contains(spelling.as_str()))
-        })
-}
-
-/// Whether every node that answers [`node_search`] for `text` also answered it for
-/// `previous`: each spelling `text` is tried in starts with one `previous` was tried in, so
-/// an id starting with it, or a label containing it, matched before. A caller holding every
-/// node that answered `previous` filters them with [`search_matches`] instead of asking again.
-/// Checked rather than assumed from `text` starting with `previous`: lowercasing can change a
-/// letter by what follows it (a final sigma). Every node answered no text.
-pub fn search_narrows(previous: &str, text: &str) -> bool {
-    if previous.is_empty() {
-        return true;
-    }
-    let before = spellings(previous);
-    !text.is_empty()
-        && spellings(text).iter().all(|spelling| {
-            before
-                .iter()
-                .any(|earlier| spelling.starts_with(earlier.as_str()))
-        })
+    clauses.join(" and ")
 }
 
 /// The condition that binds a statement to the value its row showed for `property` (`old`, as
@@ -4129,15 +4278,15 @@ mod tests {
 
     #[test]
     fn searches_try_the_usual_spellings() {
-        assert_eq!(spellings("ada lov"), ["ada lov", "Ada lov", "Ada Lov"]);
-        assert_eq!(spellings("Ada"), ["Ada", "ada"]);
-        assert_eq!(spellings("person-0001"), ["person-0001", "Person-0001"]);
+        assert_eq!(spellings("ada"), ["ada", "Ada", "ADA"]);
+        assert_eq!(spellings("Ada"), ["Ada", "ada", "ADA"]);
+        assert_eq!(spellings("mcK"), ["mcK", "mck", "Mck", "MCK"]);
         // Typed in capitals: capitalized from the lowercase spelling.
         assert_eq!(spellings("LOVELACE"), ["LOVELACE", "lovelace", "Lovelace"]);
         let schema = dev();
         let query = node_search(&schema, "Person", "ada", 5).unwrap();
         assert!(
-            query.text.contains("$n.name contains $q1"),
+            query.text.contains("$n.name contains $q0_1"),
             "{}",
             query.text
         );
@@ -4150,6 +4299,96 @@ mod tests {
                 edges: Vec::new()
             }
         );
+    }
+
+    /// Each word is matched on its own, in any order, in the id or any searched property: one
+    /// clause per word, joined by `and` (spec 031, the server's search).
+    #[test]
+    fn a_search_matches_each_word_on_its_own() {
+        let schema = dev();
+        let query = node_search(&schema, "Person", "lovelace ada", 5).unwrap();
+        assert_compiles(&query);
+        assert_eq!(query.text.matches(") and (").count(), 1, "{}", query.text);
+        assert_eq!(query.params["q0_0"], json!("lovelace"));
+        assert_eq!(query.params["q1_1"], json!("Ada"));
+        assert!(
+            query.text.contains("$n.email contains $q1_2"),
+            "{}",
+            query.text
+        );
+        assert!(
+            query.text.contains("$n.@id contains $q0_0"),
+            "{}",
+            query.text
+        );
+    }
+
+    /// A phrase is matched whole, in its spellings: a name typed in full among the many nodes
+    /// that hold each of its words.
+    #[test]
+    fn a_phrase_search_matches_the_whole_text() {
+        let schema = dev();
+        let query = node_phrase_search(&schema, "Person", "ada lovelace", 25).unwrap();
+        assert_compiles(&query);
+        assert_eq!(query.name, "studio_find_phrase");
+        assert_eq!(query.params["q0_0"], json!("ada lovelace"));
+        assert_eq!(query.params["q0_1"], json!("Ada lovelace"));
+        assert_eq!(query.params["q0_2"], json!("Ada Lovelace"));
+        assert!(!query.text.contains(") and ("), "{}", query.text);
+    }
+
+    /// What a search reads: the name chosen in Settings, the schema's name and contact-like
+    /// properties, never the key (spec 031).
+    #[test]
+    fn a_search_reads_the_chosen_name_the_schemas_name_and_contacts() {
+        let schema = SchemaModel::parse(
+            "node Person {\n  slug: String @key\n  name: String\n  title: String?\n  \
+             work_email: String?\n  linkedin_url: String?\n  tags: [String]?\n  in: String?\n}\n\
+             node Tag {\n  slug: String @key\n}\n",
+        )
+        .unwrap();
+        let person = schema.node("Person").unwrap();
+        assert_eq!(
+            searched_properties(person),
+            ["name", "work_email", "linkedin_url"]
+        );
+        let chosen = schema.with_labels(&[("Person".to_owned(), "title".to_owned())].into());
+        assert_eq!(
+            searched_properties(chosen.node("Person").unwrap()),
+            ["title", "name", "work_email", "linkedin_url"]
+        );
+        assert!(searched_properties(schema.node("Tag").unwrap()).is_empty());
+        let index = node_index(&schema, "Person", 5001).unwrap();
+        assert_compiles_in(&schema, &index);
+        assert!(index.text.contains("$n.work_email as p1"), "{}", index.text);
+        assert!(index.text.contains("limit 5001"), "{}", index.text);
+        let tag = node_search(&schema, "Tag", "yc", 8).unwrap();
+        assert_compiles_in(&schema, &tag);
+    }
+
+    /// The engine's full-text search, ranked by relevance, on a property with a full-text
+    /// index; refused on one without (`T27`).
+    #[test]
+    fn a_full_text_search_ranks_by_relevance_on_an_indexed_property() {
+        let schema = SchemaModel::parse(
+            "node Decision {\n  slug: String @key\n  statement: String @index\n  note: String?\n}\n",
+        )
+        .unwrap();
+        let query = node_text_search(&schema, "Decision", "statement", "launch week", 25).unwrap();
+        assert_compiles_in(&schema, &query);
+        assert!(
+            query.text.contains("search($n.statement, $q)"),
+            "{}",
+            query.text
+        );
+        assert!(
+            query.text.contains("order { bm25($n.statement, $q) }"),
+            "{}",
+            query.text
+        );
+        let key = node_text_search(&schema, "Decision", "slug", "hunt", 25).unwrap();
+        assert_compiles_in(&schema, &key);
+        assert!(node_text_search(&schema, "Decision", "note", "x", 25).is_err());
     }
 
     /// A bulk set is one mutation with a statement per value the rows showed, each bound to it:
@@ -5768,12 +6007,13 @@ mod tests {
         for node in &schema.nodes {
             let query = node_search(&schema, &node.name, "ada", 5).unwrap();
             assert_compiles(&query);
-            assert_eq!(query.params["q0"], json!("ada"));
-            assert_eq!(query.params["q1"], json!("Ada"));
+            assert_eq!(query.params["q0_0"], json!("ada"));
+            assert_eq!(query.params["q0_1"], json!("Ada"));
+            assert_compiles(&node_index(&schema, &node.name, 10).unwrap());
         }
         let person = node_search(&schema, "Person", "ada", 5).unwrap();
         assert!(
-            person.text.contains("$n.name contains $q0"),
+            person.text.contains("$n.name contains $q0_0"),
             "{}",
             person.text
         );
@@ -5781,28 +6021,6 @@ mod tests {
         let first = node_search(&schema, "Person", "", 5).unwrap();
         assert_compiles(&first);
         assert!(first.params.is_empty());
-    }
-
-    #[test]
-    fn longer_search_text_matches_among_what_shorter_text_matched() {
-        assert!(search_matches("ada-lovelace", None, "ada"));
-        assert!(search_matches("p-1", Some("Ada Lovelace"), "ada lov"));
-        assert!(search_matches("p-1", Some("Ada Lovelace"), "Lovelace"));
-        assert!(!search_matches("p-1", Some("Ada Lovelace"), "grace"));
-        assert!(!search_matches("p-1", None, "ada"));
-
-        assert!(search_narrows("ad", "ada"));
-        assert!(search_narrows("ada", "ada lov"));
-        assert!(search_narrows("Ada", "Ada L"));
-        assert!(!search_narrows("ada", "ad"), "shorter text can match more");
-        assert!(!search_narrows("ada", "grace"));
-        // Every node answers no text (the type's first nodes).
-        assert!(search_matches("p-1", None, ""));
-        assert!(search_narrows("", "ada"));
-        assert!(!search_narrows("ada", ""));
-        // "ΑΣ" lowercases to "ας" but "ΑΣΑ" to "ασα": the lowercase spelling does not grow,
-        // so the narrower search asks again.
-        assert!(!search_narrows("ΑΣ", "ΑΣΑ"));
     }
 
     #[test]

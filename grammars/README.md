@@ -3,7 +3,7 @@
 Tree-sitter grammars for Omnigraph's languages, used by the query editor for highlighting,
 folding and outline (spec 007):
 
-- `tree-sitter-gq`: queries, mutations and statements (`.gq`) at Omnigraph `v0.14.0`, the
+- `tree-sitter-gq`: queries, mutations and statements (`.gq`) at Omnigraph `v0.15.0`, the
   `omnigraph-compiler` tag Studio pins; its `query.pest` is unchanged from
   `edge-20261020-7fd9cc9`, where the corpus below was checked. Built: the query editor's buffer
   parses with it (`query_editor::syntax`).

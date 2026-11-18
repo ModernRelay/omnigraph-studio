@@ -1,8 +1,10 @@
-//! Request and response types for the Omnigraph 0.14 HTTP API.
+//! Request and response types for the Omnigraph HTTP API, contract 0.14.
 //!
-//! Field names and optionality follow `openapi/omnigraph-0.14.0.json`; the test at the bottom
-//! of this file fails if a type here and the contract disagree. Add fields only as surfaces
-//! need them, and add each new type to the test.
+//! Field names and optionality follow `openapi/omnigraph-0.15.0.json`, Omnigraph `v0.15.0`'s
+//! document of contract 0.14; the test at the bottom of this file fails if a type here and the
+//! contract disagree. Add fields only as surfaces need them, and add each new type to the test.
+//! A field a later release added is optional, so an answer from a `v0.14.0` server, the oldest
+//! Studio supports, still decodes.
 
 use std::sync::Arc;
 
@@ -240,6 +242,45 @@ pub struct ReadOutput {
     /// Where a paged statement read (`branch diff`) stands; `None` for every other answer.
     #[serde(default)]
     pub page: Option<ReadPageOutput>,
+    /// How a read ordered by a search (`nearest`, `bm25`, `rrf`) ranked its rows; `None` for
+    /// any other order, and from a server before Omnigraph 0.15.0. Decoded, not yet shown.
+    #[serde(default)]
+    pub ranking: Option<RankingOutput>,
+}
+
+/// The ranking a read ordered its rows by (Omnigraph 0.15.0 and later).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct RankingOutput {
+    /// The search function the leading `order` key names.
+    pub by: SearchFunction,
+    /// Whether a smaller score ranks first (a `nearest` distance) or a larger one.
+    pub order: RankOrder,
+    /// Whether no row the search admitted and did not return outranks a returned one: `false`
+    /// when a nearer row may exist.
+    pub exhaustive: bool,
+    /// The returned columns that hold the ranking's own score, in return order.
+    pub score_columns: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchFunction {
+    Nearest,
+    Bm25,
+    Rrf,
+    /// A value a later build speaking contract 0.14 may send, so an answer still decodes.
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RankOrder {
+    Ascending,
+    Descending,
+    /// A value a later build speaking contract 0.14 may send, so an answer still decodes.
+    #[serde(other)]
+    Other,
 }
 
 /// A `branch diff` answer's page: the commits it compares, and the token `after page "<token>"`
@@ -285,6 +326,7 @@ impl ReadOutput {
             rows: Arc::new(Value::Array(Vec::new())),
             graph_commit_id: Some(commit),
             page: None,
+            ranking: None,
         }
     }
 }
@@ -322,6 +364,30 @@ pub struct ChangeOutput {
 #[derive(Debug, Clone, Deserialize)]
 pub struct BranchListOutput {
     pub branches: Vec<String>,
+    /// Each readable branch's head and start, sent only for `detailed=true` (Omnigraph 0.15.0
+    /// and later), which Studio does not ask for yet.
+    #[serde(default)]
+    pub details: Option<Vec<BranchDetailOutput>>,
+}
+
+/// One live branch as `GET /branches?detailed=true` reports it. The optional fields are absent
+/// on `main`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BranchDetailOutput {
+    pub name: String,
+    /// The commit a read of the branch sees.
+    pub head: CommitOutput,
+    /// When the head last moved, in Unix epoch microseconds.
+    pub updated_at: i64,
+    /// When the branch was created, in Unix epoch microseconds recorded to the second.
+    #[serde(default)]
+    pub created_at: Option<i64>,
+    /// The branch this one started from, as it was named then.
+    #[serde(default)]
+    pub from: Option<String>,
+    /// The commit the branch started at; a later merge does not move it.
+    #[serde(default)]
+    pub from_commit_id: Option<String>,
 }
 
 /// `POST /graphs/{id}/branches`: the new branch starts at `from`'s head, or at the published
@@ -437,6 +503,10 @@ pub struct AccessOutput {
     /// With `branch`, the actions allowed on it (with `target_branch`, also `branch_create`
     /// and `branch_merge` from it into that one). Empty without `branch`.
     pub actions: Vec<AccessAction>,
+    /// The OAuth client a verified OIDC access token was issued to (Omnigraph 0.15.0 and
+    /// later); the actor stays the person's. Text the client chose, so shown escaped if ever.
+    #[serde(default)]
+    pub client_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
@@ -762,6 +832,10 @@ pub struct ErrorOutput {
 pub enum ErrorCode {
     Unauthorized,
     Forbidden,
+    /// A valid OIDC token whose subject the server admits no principal for (403, Omnigraph
+    /// 0.15.0 and later; 0.14 answered 401). Signing in again cannot help: the server's
+    /// operator must admit the identity.
+    NotAdmitted,
     BadRequest,
     ApiContractMismatch,
     NotFound,
@@ -876,7 +950,7 @@ mod contract_tests {
 
     use serde_json::Value;
 
-    const CONTRACT: &str = include_str!("../openapi/omnigraph-0.14.0.json");
+    const CONTRACT: &str = include_str!("../openapi/omnigraph-0.15.0.json");
 
     /// (schema name, the fields our type declares). Fields we declare must exist in the
     /// contract, and every field the contract requires must be declared.
@@ -948,7 +1022,12 @@ mod contract_tests {
                 "rows",
                 "graph_commit_id",
                 "page",
+                "ranking",
             ],
+        ),
+        (
+            "RankingOutput",
+            &["by", "order", "exhaustive", "score_columns"],
         ),
         (
             "ReadPageOutput",
@@ -973,7 +1052,18 @@ mod contract_tests {
                 "outcome",
             ],
         ),
-        ("BranchListOutput", &["branches"]),
+        ("BranchListOutput", &["branches", "details"]),
+        (
+            "BranchDetailOutput",
+            &[
+                "name",
+                "head",
+                "updated_at",
+                "created_at",
+                "from",
+                "from_commit_id",
+            ],
+        ),
         ("BranchCreateRequest", &["name", "from", "from_commit"]),
         (
             "BranchCreateOutput",
@@ -997,6 +1087,7 @@ mod contract_tests {
                 "branch",
                 "target_branch",
                 "actions",
+                "client_id",
             ],
         ),
         (
@@ -1153,11 +1244,14 @@ mod contract_tests {
             &["already_up_to_date", "fast_forward", "merged"],
         ),
         ("ChangeOp", &["insert", "update", "delete"]),
+        ("SearchFunction", &["nearest", "bm25", "rrf"]),
+        ("RankOrder", &["ascending", "descending"]),
         (
             "ErrorCode",
             &[
                 "unauthorized",
                 "forbidden",
+                "not_admitted",
                 "bad_request",
                 "api_contract_mismatch",
                 "not_found",
@@ -1312,6 +1406,107 @@ mod contract_tests {
         assert_eq!(state, GraphAvailability::Other);
         let op: super::ChangeOp = serde_json::from_str(r#""upsert""#).unwrap();
         assert_eq!(op, super::ChangeOp::Other);
+    }
+
+    /// An answer from a `v0.14.0` server, without the fields 0.15 added, still decodes, and
+    /// one from `v0.15.0` decodes with them: a read's ranking, a detailed branch list, the OAuth
+    /// client on an access answer, and the `not_admitted` code.
+    #[test]
+    fn answers_of_both_releases_decode() {
+        use super::{
+            AccessOutput, BranchListOutput, ErrorCode, ErrorOutput, RankOrder, RankingOutput,
+            ReadOutput, SearchFunction,
+        };
+        // 0.14.0.
+        let read: ReadOutput = serde_json::from_str(
+            r#"{"query_name":"near","target":{"branch":"main"},"row_count":0,"columns":["id"],"rows":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(read.ranking, None);
+        let branches: BranchListOutput =
+            serde_json::from_str(r#"{"branches":["feature","main"]}"#).unwrap();
+        assert!(branches.details.is_none());
+        let access: AccessOutput = serde_json::from_str(
+            r#"{"graph_id":"g","actor_id":"act-ada","graph_wide":["read"],"actions":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(access.client_id, None);
+        let refused: ErrorOutput = serde_json::from_str(
+            r#"{"error":"token expired","code":"unauthorized","disposition":{"action":"fix","effects":"none"}}"#,
+        )
+        .unwrap();
+        assert_eq!(refused.code, Some(ErrorCode::Unauthorized));
+
+        // 0.15.0.
+        let read: ReadOutput = serde_json::from_str(
+            r#"{"query_name":"near","target":{"branch":"main"},"row_count":0,"columns":["id","d"],"rows":[],
+                "ranking":{"by":"nearest","order":"ascending","exhaustive":false,"score_columns":["d"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read.ranking,
+            Some(RankingOutput {
+                by: SearchFunction::Nearest,
+                order: RankOrder::Ascending,
+                exhaustive: false,
+                score_columns: vec!["d".into()],
+            })
+        );
+        let unranked: ReadOutput = serde_json::from_str(
+            r#"{"query_name":"q","target":{"branch":"main"},"row_count":0,"rows":[],"ranking":null}"#,
+        )
+        .unwrap();
+        assert_eq!(unranked.ranking, None);
+        let branches: BranchListOutput = serde_json::from_value(serde_json::json!({
+            "branches": ["feature", "main"],
+            "details": [
+                {
+                    "name": "feature",
+                    "head": {
+                        "graph_commit_id": "c2", "graph_manifest_version": 7, "created_at": 2,
+                        "graph_branch": "feature", "parent_commit_id": "c1",
+                        "merged_parent_commit_id": null, "actor_id": "act-ada",
+                        "published": true, "kind": "published"
+                    },
+                    "updated_at": 1714000000000000_i64, "created_at": 1713000000000000_i64,
+                    "from": "main", "from_commit_id": "c1"
+                },
+                {
+                    "name": "main",
+                    "head": {
+                        "graph_commit_id": "c1", "graph_manifest_version": 5, "created_at": 1,
+                        "graph_branch": null, "parent_commit_id": null,
+                        "merged_parent_commit_id": null, "actor_id": null,
+                        "published": true, "kind": "published"
+                    },
+                    "updated_at": 1713000000000000_i64
+                }
+            ]
+        }))
+        .unwrap();
+        let details = branches.details.unwrap();
+        assert_eq!(details[0].from.as_deref(), Some("main"));
+        assert_eq!(details[0].head.graph_commit_id, "c2");
+        assert_eq!(details[1].created_at, None);
+        let access: AccessOutput = serde_json::from_str(
+            r#"{"graph_id":"g","actor_id":"act-ada","graph_wide":["read"],"actions":[],"client_id":"studio"}"#,
+        )
+        .unwrap();
+        assert_eq!(access.client_id.as_deref(), Some("studio"));
+        let not_admitted: ErrorOutput = serde_json::from_str(
+            r#"{"error":"identity not admitted","code":"not_admitted","disposition":{"action":"fix","effects":"none"}}"#,
+        )
+        .unwrap();
+        assert_eq!(not_admitted.code, Some(ErrorCode::NotAdmitted));
+        // A search function or order a later build adds still decodes.
+        let later: RankingOutput = serde_json::from_str(
+            r#"{"by":"hybrid","order":"sideways","exhaustive":true,"score_columns":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            (later.by, later.order),
+            (SearchFunction::Other, RankOrder::Other)
+        );
     }
 
     /// A commit held in a detached `__manifest` version decodes: Lance sets the high bit of a

@@ -92,20 +92,27 @@ fi
 
 QUERY='query people() { match { $p: Person } return { $p.slug, $p.name, $p.title, $p.email, $p.born, $p.tags } }'
 NEW_QUERY="studio_graph::NewQueryWithText={\"text\":\"$QUERY\"}"
-# A company with its people, in the inspector, scrolled with the pointer over the dock.
-INSPECTOR='studio_graph::PeekNode={"type_name":"Company","id":"company-00009"}'
+# A person in the inspector, scrolled with the pointer over the dock: a click selects
+# person-000009's row (the inspector shows the selection, spec 020), whose four relationship
+# groups open by themselves. At 1440x900 every node of the development graph fits the dock, so
+# a scroll there moves nothing; in a 1440x600 window this one is about 260 px taller than the
+# dock. The case scrolls 120 px down first, so that each measured frame's 4 px, back and forth
+# every 30 frames, moves the view and never meets an end. Points are window pixels.
+INSPECTOR='click:504,417|scroll:0,-120,at=1270:350'
 
-# name, then the snapshot steps. "window redraw" draws every view again, as a frame of an
+# name, then the snapshot steps, after `size=<w>x<h>` for a case that needs another window
+# than the default 1440x900. "window redraw" draws every view again, as a frame of an
 # animation (a dialog coming up, a toast, the connection dot) does: the cost of motion.
 cases=(
   "table filter key|$PERSON|studio_table::AddFilter|measure:$FRAMES,type"
   "table cell key|$PERSON|studio_table::EditCell|key:right|studio_table::EditCell|measure:$FRAMES,type"
   "table scroll|$PERSON|measure:$FRAMES,scroll=40"
+  "relationship scroll|$PERSON|scroll:-900,0|measure:$FRAMES,scroll=40"
   "query key (6 columns)|$NEW_QUERY|studio_query::Run|measure:$FRAMES,type"
   "palette key|$PERSON|studio::GoTo|measure:$FRAMES,type"
   "window redraw|$PERSON|measure:$FRAMES,refresh"
   "node page scroll|$PAGE|measure:$FRAMES,scroll=40"
-  "inspector scroll|studio_graph::OpenType={\"type_name\":\"Company\"}|$INSPECTOR|measure:$FRAMES,scroll=40,at=1270:500"
+  "inspector scroll|size=1440x600|$PERSON|$INSPECTOR|measure:$FRAMES,scroll=4,at=1270:350"
   "tree scroll|$PAGE|studio_graph::OpenAsTree|measure:$FRAMES,scroll=40"
   "canvas pan|$PAGE|studio_graph::OpenAsCanvas|measure:$FRAMES,drag=4:2"
   "canvas zoom|$PAGE|studio_graph::OpenAsCanvas|measure:$FRAMES,scroll=40"
@@ -117,7 +124,22 @@ for ((round = 1; round <= ROUNDS; round++)); do
   for case in "${cases[@]}"; do
     IFS='|' read -r -a parts <<<"$case"
     name=${parts[0]}
-    line=$("$SNAPSHOT" "$OUT/frame.png" "${parts[@]:1}" 2>&1 | grep '^measure' || true)
+    # Bash before 4.4 (macOS's /bin/bash is 3.2) calls an empty array unbound under `set -u`,
+    # so it is expanded only when it holds something.
+    size=()
+    if [[ ${parts[1]} == size=* ]]; then
+      size=("SNAPSHOT_SIZE=${parts[1]#size=}")
+      parts=("$name" "${parts[@]:2}")
+    fi
+    # A case that measures nothing says why (an action renamed or removed, a server not
+    # answering): the tool ends with an error status when any step fails, after its measure
+    # line or before it.
+    if output=$(env ${size[@]+"${size[@]}"} "$SNAPSHOT" "$OUT/frame.png" "${parts[@]:1}" 2>&1); then
+      line=$(grep '^measure' <<<"$output" | tail -1 || true)
+    else
+      line=""
+      echo "$name: $(grep -v '^snapshot data\|frame\.png$\|^note: ' <<<"$output" | grep . | tail -1)" >&2
+    fi
     median=$(sed -n 's/.*cpu median \([^,]*\),.*/\1/p' <<<"$line")
     p95=$(sed -n 's/.*cpu median [^,]*, p95 \([^,]*\),.*/\1/p' <<<"$line")
     mean=$(sed -n 's/.*cpu median [^|]*, mean \([^ ]*\) |.*/\1/p' <<<"$line")

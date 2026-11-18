@@ -117,7 +117,9 @@ place), X (designed on 0.13; the better routes are deferred).
     label, each entity a row with a dot of its kind, muted with a check once reviewed), and
     on the right the selected one as a record: the type and kind, the name as a heading, its
     id, the actions, then its property rows and relationships (which say what changed), ending in
-    "Reviewed, next" (⌘Y). J and K step through the list.
+    "Reviewed, next" (⌘Y). J and K step through the list. The inspector shows the node whose
+    card holds the selected change (spec 020, since 2026-11-14), read at the reviewed head, or
+    at the fork for a node the branch removes.
 - A property row is its name in a column, then its body (`studio_ui::property_row`,
   `TextFolds`): a short change reads before → after on one line (the old value struck
   through, muted); a text (over 72 characters, or with line breaks) reads line by line, a
@@ -371,3 +373,4 @@ place), X (designed on 0.13; the better routes are deferred).
 - 2026-10-22: "Branches" did not say when a row's head is read, which `26129fd` changed: the
   list read the first 20 heads whether it was shown or not, and now reads only those of the rows
   a shown list draws.
+- 2026-11-17: the review's feed said a run as a sentence ("1 changed in Person") where its split, History and the table said "~1", its header counted entities and relationships but no types, and a card a merge would stop on said nothing of it. Spec 033 gives every screen one way to show a change: runs led by their type with "+3 ~2 −1", the sections "Existing" and "New", a summary line by type under the heading, a kind mark on every entity's row, "Conflicts with main" on a conflicting card, ⌘↵ (`studio_changes::OpenChanged`) and a row button to open the node, runs past 50 entities folded at first, and the list a cached view of its own.

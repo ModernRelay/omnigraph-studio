@@ -10,6 +10,7 @@
 //!
 //! Layer 5 (`docs/architecture.md`). Plan: `specs/006-graph-canvas/plan.md`.
 
+mod by_id;
 mod domains;
 mod layout;
 mod model;
@@ -33,19 +34,18 @@ use graph_store::{
     NodeRef, PageStatus, SessionEvent,
 };
 use studio_actions::canvas::{
-    ClearSelection, CollapseNode, ExpandNode, FitToWindow, FocusSelected, MoveDown, MoveLeft,
-    MoveRight, MoveUp, OpenSelectedPage, PeekSelected, ResetLayout, SelectAll, WalkBack,
+    ClearSelection, CollapseNode, ExpandNode, FitToWindow, FocusSelected, FollowRelationship,
+    MoveDown, MoveLeft, MoveRight, MoveUp, OpenSelectedPage, ResetLayout, SelectAll, WalkBack,
     WalkForward, ZoomIn, ZoomOut,
 };
 use studio_actions::graph::{
-    OpenMap, OpenNodePage, OpenType, PeekNode, ShowNodeInTree, ShowNodeOnCanvas,
-    ShowResultsOnCanvas,
+    OpenMap, OpenNodePage, OpenType, ShowNodeInTree, ShowNodeOnCanvas, ShowResultsOnCanvas,
 };
 use studio_actions::{ViewKind, ViewLink};
 use studio_settings::StudioSettings;
 use studio_ui::ds::Tipped;
 use studio_ui::ds::space;
-use studio_workspace::{Item, ItemEvent, SavedItem, Workspace};
+use studio_workspace::{Inspected, InspectedNode, Item, ItemEvent, SavedItem, Workspace};
 use ui::prelude::*;
 
 use layout::{LayoutKind, LayoutNode, Vec2};
@@ -65,6 +65,9 @@ const REVEAL_MIN_ZOOM: f32 = 0.55;
 const REVEAL_MARGIN: f32 = 64.;
 /// Half a chip's height, at zoom 1, for what an expansion shows.
 const REVEAL_HALF_HEIGHT: f32 = 16.;
+/// The room, in pixels, kept between the selected chip and the canvas's edge when the canvas's
+/// size changes under a view the person placed ([`GraphCanvas::keep_selected_in`]).
+const KEEP_MARGIN: f32 = 24.;
 
 /// Registers the canvas's keys and the actions that open it.
 pub fn init(cx: &mut App) {
@@ -322,7 +325,7 @@ fn pin_key(id: &SceneId) -> Option<String> {
             key.node.id,
             gq_language::builder::relationship_key(&key.group)
         )),
-        SceneId::More(_) => None,
+        SceneId::More(_) | SceneId::Note(_) => None,
     }
 }
 
@@ -407,6 +410,9 @@ pub(crate) struct GraphCanvas {
     camera_touched: bool,
     /// The canvas's size at the last fit, to fit again when it changes.
     fitted_size: Option<Size<Pixels>>,
+    /// The canvas's size when it was last drawn: a view the person placed stays where it is
+    /// when the size changes, but the selected chip is kept in it ([`Self::keep_selected_in`]).
+    drawn_size: Option<Size<Pixels>>,
     fit_zoom: f32,
     fit_pending: bool,
     center_on: Option<SceneId>,
@@ -414,15 +420,16 @@ pub(crate) struct GraphCanvas {
     /// show what it opened.
     reveal_new: bool,
     selected: Option<SceneId>,
+    /// The selected chip's node as the workspace was last told of it ([`ItemEvent::Selected`]):
+    /// the inspector shows it.
+    inspected: Option<NodeRef>,
     /// Nodes stepped back from with `[`, most recent last, for `]`.
     walked: Vec<SceneId>,
     hovered: Option<usize>,
-    /// The node the first click of a double click opened: the second leaves it open.
-    clicked_open: Option<SceneId>,
     /// The cut chip the pointer rested on, shown open (spec 006, "Opened chips").
     opened: Option<SceneId>,
     drag: Option<Drag>,
-    /// Chips marked together: by an area drawn with ⇧-drag, ⇧-click, or ⌘A.
+    /// Chips marked together: by an area drawn with ⇧-drag, a ⇧-click or ⌘-click, or ⌘A.
     marked: HashSet<SceneId>,
     /// The area being drawn, from where the drag began to the pointer, in window pixels.
     area: Option<(Point<Pixels>, Point<Pixels>)>,
@@ -447,8 +454,54 @@ pub(crate) struct GraphCanvas {
     bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     /// Each node's chip on screen as last painted, for hit testing.
     chips: Rc<RefCell<Vec<Bounds<Pixels>>>>,
+    /// A single-target relationship being followed hop after hop ([`FollowRelationship`]).
+    follow: Option<Follow>,
+    /// Nodes hidden from the canvas, with what hangs off them (spec 032, `HideNodes`), until
+    /// Show hidden.
+    hidden: HashSet<NodeRef>,
+    /// How many times the canvas was drawn, for the drawing-cost guards (docs/drawing.md).
+    #[cfg(test)]
+    renders: Cell<usize>,
     _subscriptions: Vec<Subscription>,
 }
+
+/// A single-target relationship followed to the end of its chain: the field it waits on to
+/// read its target, then the next node's field, until a node has none, the walk comes back
+/// to a node on its path, or [`FOLLOW_MAX`] hops are taken.
+#[derive(Debug, Clone)]
+struct Follow {
+    group: gq_language::RelationshipGroup,
+    field: ExplorePath,
+    hops: usize,
+    /// The walk's root it started from: another root ends it.
+    root: Option<NodeRef>,
+    /// The walk's open paths as the follow's own opening left them: the walk opened or closed
+    /// by anything else (a click, ⌫, a collapse of an ancestor) ends it.
+    expected: HashSet<ExplorePath>,
+    /// The last node it reached (or started from), drawn: where it ends when the next would not
+    /// be drawn.
+    last: NodeRef,
+    /// The view centres on each node reached until the person moves it (a scroll, a pinch, a
+    /// pan, a zoom or a fit); the follow then goes on walking and leaves the view where it is.
+    recentre: bool,
+}
+
+/// Whether `node`'s type has `group` too, so a follow of it goes on from `node`: the same
+/// relationship, the same way, to the same type (a manager's manager).
+fn continues(
+    schema: &gq_language::SchemaModel,
+    group: &gq_language::RelationshipGroup,
+    node: &NodeRef,
+) -> bool {
+    schema
+        .relationships_of(&node.type_name)
+        .iter()
+        .any(|own| own == group)
+}
+
+/// The most hops one follow takes: a chain longer than this stops there, drawn as far as it
+/// went, and following it again goes on from its end (constitution IX).
+const FOLLOW_MAX: usize = 100;
 
 impl EventEmitter<ItemEvent> for GraphCanvas {}
 impl EventEmitter<TypeEvent> for GraphCanvas {}
@@ -460,6 +513,47 @@ impl Focusable for GraphCanvas {
 }
 
 impl Item for GraphCanvas {
+    /// A query's result picture is a canvas too, with no view strip to say so.
+    fn view_kind(&self, _cx: &App) -> Option<ViewKind> {
+        match self.mode() {
+            Mode::Schema => None,
+            Mode::Explore | Mode::Results => Some(ViewKind::Canvas),
+        }
+    }
+
+    fn outline(&self, cx: &App) -> Option<studio_workspace::ViewOutline> {
+        self.outline_of(cx)
+    }
+
+    fn settling(&self, cx: &App) -> bool {
+        self.settling_now(cx)
+    }
+
+    fn catch_up(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.catch_up_now(cx);
+    }
+
+    fn refuses(
+        &self,
+        action: &dyn gpui::Action,
+        _on: Option<&studio_actions::NodeId>,
+        cx: &App,
+    ) -> Option<studio_workspace::Refusal> {
+        self.refusal_of(action, cx)
+    }
+
+    /// The selected chip's node, read as the canvas reads: held at its commit, or at the commit
+    /// it shows, which may be behind the head ("Newer data").
+    fn inspected(&mut self, cx: &mut Context<Self>) -> Option<Inspected> {
+        let node = self.inspected_node()?;
+        Some(Inspected::Node(InspectedNode {
+            type_name: node.type_name,
+            id: node.id,
+            at_commit: self.held_at(),
+            snapshot: self.exploration.read(cx).pin().map(str::to_owned),
+        }))
+    }
+
     fn tab_title(&self, cx: &App) -> SharedString {
         if let Some((_, results)) = &self.results {
             return match &results.at_commit {
@@ -506,6 +600,7 @@ impl Item for GraphCanvas {
                     type_name: node.type_name,
                     id: node.id,
                     at_commit: at_commit.clone(),
+                    preview: false,
                 }))
             }
             ViewKind::Tree => Some(Box::new(ShowNodeInTree {
@@ -516,6 +611,49 @@ impl Item for GraphCanvas {
             })),
             _ => None,
         }
+    }
+
+    fn held_at(&self, _cx: &App) -> Option<String> {
+        GraphCanvas::held_at(self)
+    }
+
+    /// The marked chips' nodes, or else the selected one, and the node the walk is from (spec
+    /// 032). A schema canvas selects types, not nodes.
+    fn selected_ids(&self, _cx: &App) -> Option<studio_workspace::SelectedIds> {
+        if self.schema_walk.is_some() {
+            return None;
+        }
+        let mut nodes: Vec<&NodeRef> = self
+            .marked
+            .iter()
+            .filter_map(|id| match id {
+                SceneId::Node(node) => Some(node),
+                _ => None,
+            })
+            .collect();
+        nodes.sort_by(|a, b| (&a.type_name, &a.id).cmp(&(&b.type_name, &b.id)));
+        let selected = self.inspected_node();
+        if nodes.is_empty()
+            && let Some(node) = &selected
+        {
+            nodes.push(node);
+        }
+        let root = self
+            .walk
+            .as_ref()
+            .map(|(root, _)| (root.type_name.clone(), root.id.clone()));
+        if nodes.is_empty() && root.is_none() {
+            return None;
+        }
+        let first = nodes.first().map(|node| node.type_name.clone());
+        let shared = nodes
+            .iter()
+            .all(|node| Some(&node.type_name) == first.as_ref());
+        Some(studio_workspace::SelectedIds {
+            type_name: first.filter(|_| shared),
+            ids: nodes.iter().map(|node| node.id.clone()).collect(),
+            root,
+        })
     }
 
     fn thing(&self, _cx: &App) -> Option<studio_actions::Thing> {
@@ -622,6 +760,8 @@ impl GraphCanvas {
         cx: &mut Context<Self>,
     ) -> Self {
         let subscriptions = vec![
+            // The inspector shows the selected chip's node (spec 020).
+            cx.observe_self(|this, cx| this.report_selection(cx)),
             cx.subscribe(&exploration, |this, _, event, cx| match event {
                 // A results canvas draws none of the exploration, and its tab marks no newer
                 // data ([`Self::is_stale`]): the walk's changes are nothing to it.
@@ -631,9 +771,12 @@ impl GraphCanvas {
                     this._loaded = None;
                     cx.emit(ItemEvent::UpdateTab);
                     this.owe_layout(cx);
+                    this.follow_still_wanted(cx);
+                    this.advance_follow(cx);
                 }
                 // Reads that finish together (a node's counts) are laid out in one go.
                 ExplorationEvent::Loaded => {
+                    this.advance_follow(cx);
                     if this._loaded.is_none() {
                         this._loaded = Some(cx.spawn(async move |this, cx| {
                             cx.background_executor().timer(COALESCE_LOADS).await;
@@ -667,6 +810,9 @@ impl GraphCanvas {
                 }
             }),
         ];
+        // A walk opens with the node it starts from selected, so the inspector shows it
+        // (spec 020); a query's result picture starts with none.
+        let selected = walk.as_ref().map(|(root, _)| SceneId::Node(root.clone()));
         let mut canvas = Self {
             session,
             exploration,
@@ -695,14 +841,15 @@ impl GraphCanvas {
             appear: HashMap::new(),
             camera_touched: false,
             fitted_size: None,
+            drawn_size: None,
             fit_zoom: 1.,
             fit_pending: true,
             center_on: None,
             reveal_new: false,
-            selected: None,
+            selected,
+            inspected: None,
             walked: Vec::new(),
             hovered: None,
-            clicked_open: None,
             opened: None,
             drag: None,
             marked: HashSet::new(),
@@ -712,11 +859,15 @@ impl GraphCanvas {
             read_ahead: None,
             _open: None,
             _loaded: None,
+            hidden: HashSet::new(),
             scene_index: HashMap::new(),
             drawn: None,
             char_widths: CharWidths::default(),
             bounds: Rc::new(Cell::new(None)),
             chips: Rc::new(RefCell::new(Vec::new())),
+            follow: None,
+            #[cfg(test)]
+            renders: Cell::new(0),
             _subscriptions: subscriptions,
         };
         canvas.rebuild(cx);
@@ -824,11 +975,16 @@ impl GraphCanvas {
         self.session.read(cx).schema_model()?;
         let exploration = self.exploration.read(cx);
         let entries = exploration.entries();
-        Some(model::explore_scene(
-            &entries,
-            exploration.state(),
-            &self.hub_limits,
-            self.node_cap(cx),
+        // The more of what an expansion asked to be drawn of a relationship and what "+K more"
+        // drew: neither takes back what the other drew.
+        let mut limits = self.hub_limits.clone();
+        for (key, limit) in exploration.expansion_limits() {
+            let drawn = limits.entry(key.clone()).or_insert(*limit);
+            *drawn = (*drawn).max(*limit);
+        }
+        Some(model::without(
+            model::explore_scene(&entries, exploration.state(), &limits, self.node_cap(cx)),
+            &self.hidden,
         ))
     }
 
@@ -964,13 +1120,14 @@ impl GraphCanvas {
         let nodes: Vec<LayoutNode> = scene
             .nodes
             .iter()
-            .zip(&widths)
-            .map(|(node, width)| LayoutNode {
+            .zip(widths.iter().zip(&texts))
+            .map(|(node, (width, text))| LayoutNode {
                 parent: node.parent,
                 kind: match node.kind {
                     SceneKind::Hub { .. } => LayoutKind::Hub,
-                    SceneKind::More { .. } => LayoutKind::More,
-                    _ => LayoutKind::Node,
+                    // A note ends its node's column, as "+K more" ends a relationship's.
+                    SceneKind::More { .. } | SceneKind::Note { .. } => LayoutKind::More,
+                    SceneKind::Node { .. } => LayoutKind::Node,
                 },
                 space: *width,
                 // "+K more" stands for what is not drawn yet: it moves to the end of
@@ -988,16 +1145,15 @@ impl GraphCanvas {
                     }
                     _ => None,
                 },
-                previous: if matches!(node.kind, SceneKind::More { .. }) {
-                    None
-                } else {
-                    dragged.get(&node.id).copied().or_else(|| {
-                        pin_key(&node.id)
-                            .and_then(|key| self.pinned.get(&key))
-                            .or_else(|| self.known.get(&node.id))
-                            .copied()
-                    })
-                },
+                // A chip dragged, or placed by hand, stands where it is, with what hangs off
+                // it; where it was drawn keeps a root's chip on its side.
+                pinned: dragged.get(&node.id).copied().or_else(|| {
+                    pin_key(&node.id)
+                        .and_then(|key| self.pinned.get(&key))
+                        .copied()
+                }),
+                previous: self.known.get(&node.id).copied(),
+                half_height: paint::chip_half_height(text),
             })
             .collect();
         let spacing = if self.schema_walk.is_some() {
@@ -1009,7 +1165,7 @@ impl GraphCanvas {
             scene,
             texts,
             widths,
-            move || layout::spaced_positions(&nodes, spacing),
+            move || layout::walk_positions(&nodes, spacing),
             cx,
         );
     }
@@ -1101,6 +1257,8 @@ impl GraphCanvas {
                 previous: pin_key(&node.id)
                     .and_then(|key| self.pinned.get(&key).copied())
                     .or(fixed[i]),
+                pinned: None,
+                half_height: paint::chip_half_height(&texts[i]),
                 side: None,
             })
             .collect();
@@ -1374,6 +1532,36 @@ impl GraphCanvas {
         self.fitted_size = Some(viewport.size);
     }
 
+    /// Moves the view just enough to show the selected chip whole in `viewport`, at the zoom
+    /// it has: the canvas's size changed under a view the person placed.
+    fn keep_selected_in(&mut self, viewport: Bounds<Pixels>) {
+        let Some(index) = self.selected_index() else {
+            return;
+        };
+        let Some(at) = self.positions.get(index).copied() else {
+            return;
+        };
+        let half_width = self.half_widths.get(index).copied().unwrap_or(60.) * self.zoom;
+        let half_height = REVEAL_HALF_HEIGHT * self.zoom;
+        let margin = KEEP_MARGIN;
+        let middle = viewport.center();
+        let screen = to_screen(at, viewport, self.center, self.zoom);
+        let (x, y) = (
+            f32::from(screen.x - middle.x),
+            f32::from(screen.y - middle.y),
+        );
+        let reach_x = (f32::from(viewport.size.width) / 2. - half_width - margin).max(0.);
+        let reach_y = (f32::from(viewport.size.height) / 2. - half_height - margin).max(0.);
+        let (over_x, over_y) = (
+            x - x.clamp(-reach_x, reach_x),
+            y - y.clamp(-reach_y, reach_y),
+        );
+        if over_x != 0. || over_y != 0. {
+            self.glide = None;
+            self.center = self.center + Vec2::new(over_x / self.zoom, over_y / self.zoom);
+        }
+    }
+
     fn min_zoom(&self) -> f32 {
         (self.fit_zoom * 0.8).min(0.2)
     }
@@ -1413,6 +1601,39 @@ impl GraphCanvas {
     }
 
     // ---- interaction ----
+
+    /// The node the inspector shows: the selected chip's, a relationship's pill or "+K more"
+    /// showing the node it belongs to. A schema canvas selects types, which its page describes.
+    fn inspected_node(&self) -> Option<NodeRef> {
+        if self.schema_walk.is_some() {
+            return None;
+        }
+        match self.selected.as_ref()? {
+            SceneId::Node(node) | SceneId::Note(node) => Some(node.clone()),
+            SceneId::Hub(key) | SceneId::More(key) => Some(key.node.clone()),
+        }
+    }
+
+    /// Tells the workspace when the selected chip is another node's, or none: called whenever
+    /// the canvas notifies, so every way its selection changes is seen (a click, an arrow, a
+    /// tree of the same walk). The inspector then asks for the node ([`Item::inspected`]) if it
+    /// is shown.
+    fn report_selection(&mut self, cx: &mut Context<Self>) {
+        let node = self.inspected_node();
+        if node != self.inspected {
+            self.inspected = node;
+            cx.emit(ItemEvent::Selected);
+        }
+    }
+
+    /// The type selected on a schema canvas, which its page describes in the inspector.
+    pub(crate) fn selected_type(&self) -> Option<&str> {
+        self.schema_walk.as_ref()?;
+        match self.selected.as_ref()? {
+            SceneId::Node(node) => Some(node.type_name.as_str()),
+            SceneId::Hub(_) | SceneId::More(_) | SceneId::Note(_) => None,
+        }
+    }
 
     fn select(&mut self, index: Option<usize>, cx: &mut Context<Self>) {
         // A new selection starts a new walk; `[` and `]` keep theirs.
@@ -1457,13 +1678,13 @@ impl GraphCanvas {
     fn open_after_rest(&mut self, cx: &mut Context<Self>) {
         self.opened = None;
         self._open = None;
-        let Some(node) = self.hovered.and_then(|index| self.scene.nodes.get(index)) else {
+        let Some(index) = self.hovered else {
             return;
         };
-        if paint::whole_label(node).is_none() {
+        if !self.is_cut(index) {
             return;
         }
-        let id = node.id.clone();
+        let id = self.scene.nodes[index].id.clone();
         self._open = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(OPEN_AFTER).await;
             this.update(cx, |this, cx| {
@@ -1474,15 +1695,18 @@ impl GraphCanvas {
         }));
     }
 
+    /// Whether chip `index` is a node whose name its chip cuts.
+    fn is_cut(&self, index: usize) -> bool {
+        match (self.scene.nodes.get(index), self.texts.get(index)) {
+            (Some(node), Some(text)) => paint::whole_label(node, text).is_some(),
+            _ => false,
+        }
+    }
+
     /// The chip shown open: the one the pointer rested on, else the selected one, when its name
     /// is cut (spec 006, "Opened chips").
     fn opened_index(&self) -> Option<usize> {
-        let cut = |index: &usize| {
-            self.scene
-                .nodes
-                .get(*index)
-                .is_some_and(|node| paint::whole_label(node).is_some())
-        };
+        let cut = |index: &usize| self.is_cut(*index);
         self.opened
             .as_ref()
             .and_then(|id| self.index_of(id))
@@ -1519,6 +1743,7 @@ impl GraphCanvas {
                             type_name: graph_node.type_name,
                             id: graph_node.id,
                             at_commit: self.held_at(),
+                            preview: false,
                         }),
                         cx,
                     );
@@ -1533,8 +1758,27 @@ impl GraphCanvas {
                     }
                 }
             }
+            // A read that failed is read again; otherwise "+K more" shows more.
+            SceneKind::More {
+                note: Some(model::Note::Failed(targets)),
+                ..
+            }
+            | SceneKind::Note {
+                note: model::Note::Failed(targets),
+                ..
+            } => self.retry(&targets, cx),
             SceneKind::More { key, .. } => self.show_more(key, cx),
+            SceneKind::Note { .. } => {}
         }
+    }
+
+    /// Reads `targets` again, as a failed chip's Retry does.
+    fn retry(&mut self, targets: &[graph_store::LoadTarget], cx: &mut Context<Self>) {
+        self.exploration.update(cx, |exploration, cx| {
+            for target in targets {
+                exploration.retry(target, cx);
+            }
+        });
     }
 
     /// On a schema canvas: a type expands, or closes; a pill expands the type it leads to;
@@ -1557,6 +1801,8 @@ impl GraphCanvas {
             SceneKind::More { key, .. } => {
                 *self.hub_limits.entry(key).or_insert(HUB_STEP) += HUB_STEP;
             }
+            // A schema canvas reads nothing, so it notes nothing.
+            SceneKind::Note { .. } => {}
         }
         self.rebuild(cx);
     }
@@ -1575,6 +1821,7 @@ impl GraphCanvas {
                 let ty = match id {
                     SceneId::Node(node) => &node.type_name,
                     SceneId::Hub(key) | SceneId::More(key) => &key.node.type_name,
+                    SceneId::Note(node) => &node.type_name,
                 };
                 walk.collapse(ty);
             }
@@ -1598,7 +1845,14 @@ impl GraphCanvas {
             self.rebuild(cx);
             return;
         }
-        let limit = self.hub_limits.entry(key.clone()).or_insert(HUB_STEP);
+        // From what is drawn: an expansion's limit, or the step.
+        let drawn = self
+            .exploration
+            .read(cx)
+            .expansion_limit(&key)
+            .unwrap_or(HUB_STEP)
+            .max(HUB_STEP);
+        let limit = self.hub_limits.entry(key.clone()).or_insert(drawn);
         *limit += HUB_STEP;
         let wanted = *limit;
         let exploration = self.exploration.read(cx);
@@ -1779,8 +2033,10 @@ impl GraphCanvas {
                     SceneKind::Hub { .. } => {
                         pin_key(&node.id).is_none_or(|key| !self.pinned.contains_key(&key))
                     }
-                    SceneKind::More { .. } => true,
-                    _ => false,
+                    // What hangs off it as text, not a chip of its own: "+K more" and the
+                    // note of what its reads have come to.
+                    SceneKind::More { .. } | SceneKind::Note { .. } => true,
+                    SceneKind::Node { .. } => false,
                 };
                 if follows
                     && taken.insert(child)
@@ -1825,6 +2081,7 @@ impl GraphCanvas {
                     None if drag.pans() => {
                         self.center = drag.center - delta;
                         self.camera_touched = true;
+                        self.view_moved_by_hand();
                     }
                     None => {}
                 }
@@ -1876,8 +2133,8 @@ impl GraphCanvas {
             return;
         }
         let hit = self.hit(event.position);
-        // ⌘-click marks a chip, or unmarks it, as ⌘-click picks rows in a table.
-        if event.modifiers.secondary(cx) {
+        // ⌘-click and ⇧-click mark a chip, or unmark it, as they pick rows in a table.
+        if event.modifiers.secondary(cx) || event.modifiers.shift {
             if let Some(index) = hit {
                 let id = self.scene.nodes[index].id.clone();
                 if !self.marked.remove(&id) {
@@ -1891,65 +2148,50 @@ impl GraphCanvas {
             self.marked.clear();
             cx.notify();
         }
+        // A click selects the chip, and the inspector shows its node while it is shown.
         self.select(hit, cx);
         let Some(index) = hit else {
             return;
         };
-        // ⇧-click shows the chip in the inspector and opens nothing.
-        if event.modifiers.shift {
-            self.peek(index, window, cx);
-            return;
-        }
-        let clicked_open = self.clicked_open.take().filter(|_| event.click_count >= 2);
         match self.scene.nodes[index].kind {
             // A click opens a relationship or closes it, and shows more; a double click is
             // that one click, not an open and a close.
-            SceneKind::Hub { .. } | SceneKind::More { .. } => {
+            SceneKind::Hub { .. } | SceneKind::More { .. } | SceneKind::Note { .. } => {
                 if event.click_count < 2 {
                     self.activate(index, false, window, cx);
                 }
             }
+            // A second click opens the node, as it opens a row of a tree or a table: its page,
+            // or on a schema canvas the type's description. Closing is ⌫ and the menu's.
+            SceneKind::Node { .. } if event.click_count >= 2 => self.open(index, window, cx),
             // A click expands a closed node; an open one is only selected, so a click never
-            // folds away what was walked. A double click closes it, unless its first click
-            // opened it.
+            // folds away what was walked.
             SceneKind::Node { expanded, .. }
                 if (self.scene.nodes[index].path.is_some() || self.schema_walk.is_some())
                     && !expanded =>
             {
-                if event.click_count < 2 {
-                    self.clicked_open = Some(self.scene.nodes[index].id.clone());
-                    self.activate(index, true, window, cx);
-                }
-            }
-            _ if event.click_count >= 2
-                && clicked_open.as_ref() != Some(&self.scene.nodes[index].id) =>
-            {
-                self.activate(index, false, window, cx)
+                self.activate(index, true, window, cx);
             }
             _ => {}
         }
     }
 
-    /// Shows a chip's node in the inspector without opening anything: a relationship pill
-    /// or "+K more" shows the node it belongs to.
-    fn peek(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+    /// Opens a chip's node: its page, or on a schema canvas the type's description, which the
+    /// page holding the canvas shows. A relationship's pill and "+K more" open nothing.
+    fn open(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let SceneKind::Node { node, .. } = &self.scene.nodes[index].kind else {
+            return;
+        };
         if self.schema_walk.is_some() {
-            if let SceneKind::Node { node, .. } = &self.scene.nodes[index].kind {
-                cx.emit(TypeEvent::Details(node.type_name.clone()));
-            }
+            cx.emit(TypeEvent::Details(node.type_name.clone()));
             return;
         }
-        let node = match &self.scene.nodes[index].kind {
-            SceneKind::Node { node, .. } => node.clone(),
-            SceneKind::Hub { key, .. } | SceneKind::More { key, .. } => key.node.clone(),
-        };
         window.dispatch_action(
-            Box::new(PeekNode {
-                type_name: node.type_name,
-                id: node.id,
+            Box::new(OpenNodePage {
+                type_name: node.type_name.clone(),
+                id: node.id.clone(),
                 at_commit: self.held_at(),
-                // The commit the canvas shows, which may be behind the head ("Newer data").
-                snapshot: self.exploration.read(cx).pin().map(str::to_owned),
+                preview: false,
             }),
             cx,
         );
@@ -2113,11 +2355,12 @@ impl GraphCanvas {
                     via: None,
                     preview: true,
                     filters: None,
+                    separate: false,
                 }),
             )
             .entry(
                 "Details",
-                Some(Box::new(PeekSelected)),
+                Some(Box::new(OpenSelectedPage)),
                 Self::on_menu(&this, move |_, _, cx| {
                     cx.emit(TypeEvent::Details(details.clone()))
                 }),
@@ -2159,11 +2402,12 @@ impl GraphCanvas {
                     menu = menu
                         .entry(
                             "Open",
-                            None,
+                            Some(Box::new(OpenSelectedPage)),
                             open_action(OpenNodePage {
                                 type_name: type_name.clone(),
                                 id: key.clone(),
                                 at_commit: at_commit.clone(),
+                                preview: false,
                             }),
                         )
                         .when(node.path.is_some(), |menu| {
@@ -2217,6 +2461,7 @@ impl GraphCanvas {
                                 via: None,
                                 preview: false,
                                 filters: None,
+                                separate: false,
                             }),
                         )
                         .when_some(names.clone(), |menu, names| {
@@ -2236,6 +2481,7 @@ impl GraphCanvas {
                         if *open { "Close" } else { "Open" },
                         None,
                         Self::on_menu(&this, {
+                            let id = id.clone();
                             move |canvas, window, cx| {
                                 if let Some(index) = canvas.index_of(&id) {
                                     canvas.activate(index, false, window, cx);
@@ -2243,6 +2489,23 @@ impl GraphCanvas {
                             }
                         }),
                     );
+                    // A single-target relationship (a manager, a parent folder) is followed
+                    // to the end of its chain in one go.
+                    if exploring
+                        && schema
+                            .as_ref()
+                            .is_some_and(|schema| graph_store::is_field(schema, &group))
+                    {
+                        menu = menu.entry(
+                            format!("Follow {} all the way", group.edge),
+                            Some(Box::new(FollowRelationship)),
+                            Self::on_menu(&this, move |canvas, _, cx| {
+                                if let Some(index) = canvas.index_of(&id) {
+                                    canvas.start_follow(index, cx);
+                                }
+                            }),
+                        );
+                    }
                     let sections = schema
                         .as_ref()
                         .map(|schema| gq_language::builder::GroupBy::sections(schema, &group))
@@ -2297,7 +2560,23 @@ impl GraphCanvas {
                             via: Some(gq_language::builder::relationship_key(&back)),
                             preview: false,
                             filters: None,
+                            separate: false,
                         }),
+                    );
+                }
+                SceneKind::More {
+                    note: Some(model::Note::Failed(targets)),
+                    ..
+                }
+                | SceneKind::Note {
+                    note: model::Note::Failed(targets),
+                    ..
+                } => {
+                    let targets = targets.clone();
+                    menu = menu.entry(
+                        "Retry",
+                        None,
+                        Self::on_menu(&this, move |canvas, _, cx| canvas.retry(&targets, cx)),
                     );
                 }
                 SceneKind::More { key, .. } => {
@@ -2310,6 +2589,7 @@ impl GraphCanvas {
                         }),
                     );
                 }
+                SceneKind::Note { .. } => {}
             }
             if pinned {
                 let id = node.id.clone();
@@ -2342,8 +2622,8 @@ impl GraphCanvas {
                     menu.entry(
                         "Expand all",
                         None,
-                        Self::on_menu(&this, move |canvas, _, cx| {
-                            canvas.expand_marked(&expand, true, cx)
+                        Self::on_menu(&this, move |canvas, window, cx| {
+                            canvas.expand_marked_asking(&expand, window, cx)
                         }),
                     )
                     .entry(
@@ -2398,9 +2678,15 @@ impl GraphCanvas {
             self.close_all(ids, cx);
             return;
         }
+        let paths = self.marked_paths(ids);
+        self.exploration
+            .update(cx, |e, cx| e.set_open(&paths, true, cx));
+    }
+
+    /// The paths of the marked nodes and pills among `ids`.
+    fn marked_paths(&self, ids: &[SceneId]) -> Vec<ExplorePath> {
         let at = self.scene.indices();
-        let paths: Vec<ExplorePath> = ids
-            .iter()
+        ids.iter()
             .filter_map(|id| at.get(id).copied())
             .filter_map(|index| {
                 let node = &self.scene.nodes[index];
@@ -2409,9 +2695,28 @@ impl GraphCanvas {
                     _ => None,
                 }
             })
-            .collect();
-        self.exploration
-            .update(cx, |e, cx| e.set_open(&paths, true, cx));
+            .collect()
+    }
+
+    /// Expand all on the marked chips, asked first when it opens more than a canvas can show
+    /// well or asks thousands of reads ([`graph_store::Opening::asks`]; spec 006).
+    fn expand_marked_asking(
+        &mut self,
+        ids: &[SceneId],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let paths = self.marked_paths(ids);
+        let opening = self.exploration.read(cx).opening(&paths, false);
+        let exploration = self.exploration.clone();
+        let expand = move |_: &mut Window, cx: &mut App| {
+            exploration.update(cx, |e, cx| e.set_open(&paths, true, cx));
+        };
+        if opening.asks() {
+            studio_workspace::confirm_expand(window, cx, opening.nodes, opening.reads, expand);
+        } else {
+            expand(window, cx);
+        }
     }
 
     /// Keeps the marked chips where they are drawn now.
@@ -2451,6 +2756,11 @@ impl GraphCanvas {
     }
 
     fn clear_selection(&mut self, _: &ClearSelection, _: &mut Window, cx: &mut Context<Self>) {
+        // Esc ends a follow under way first: it stops where it got to.
+        if self.follow.take().is_some() {
+            cx.notify();
+            return;
+        }
         if self.marked.is_empty() {
             cx.propagate();
             return;
@@ -2462,6 +2772,7 @@ impl GraphCanvas {
     fn scroll(&mut self, event: &ScrollEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.settle_camera();
         self.camera_touched = true;
+        self.view_moved_by_hand();
         let delta = event.delta.pixel_delta(window.line_height());
         let factor = (-f32::from(delta.y) * 0.004).exp();
         self.zoom_around(factor, Some(event.position), window);
@@ -2471,6 +2782,7 @@ impl GraphCanvas {
     fn pinch(&mut self, event: &PinchEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.settle_camera();
         self.camera_touched = true;
+        self.view_moved_by_hand();
         self.zoom_around(1. + event.delta, Some(event.position), window);
         cx.notify();
     }
@@ -2497,6 +2809,7 @@ impl GraphCanvas {
         self.fit(viewport);
         // Fitted on request: a resize fits again until the view is moved by hand.
         self.camera_touched = false;
+        self.view_moved_by_hand();
         self.glide_from(from, cx);
         cx.notify();
     }
@@ -2505,6 +2818,7 @@ impl GraphCanvas {
         let from = self.camera_now(Instant::now());
         self.zoom_around(ZOOM_STEP, None, window);
         self.camera_touched = true;
+        self.view_moved_by_hand();
         self.glide_from(from, cx);
         cx.notify();
     }
@@ -2513,6 +2827,7 @@ impl GraphCanvas {
         let from = self.camera_now(Instant::now());
         self.zoom_around(1. / ZOOM_STEP, None, window);
         self.camera_touched = true;
+        self.view_moved_by_hand();
         self.glide_from(from, cx);
         cx.notify();
     }
@@ -2568,36 +2883,16 @@ impl GraphCanvas {
         self.walked = walked;
     }
 
-    /// Space: inspects the selected chip as ⇧-click does, a relationship's pill its node.
-    fn peek_selected(&mut self, _: &PeekSelected, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(index) = self.selected_index() {
-            self.peek(index, window, cx);
-        }
-    }
-
-    /// ⌘↵: the selected node's page (spec 014).
+    /// ⌘↵: the selected node's page (spec 014), or the selected type's description, as a
+    /// second click opens them.
     fn open_selected_page(
         &mut self,
         _: &OpenSelectedPage,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(index) = self.selected_index() else {
-            return;
-        };
-        if self.schema_walk.is_some() {
-            self.peek(index, window, cx);
-            return;
-        }
-        if let SceneKind::Node { node, .. } = &self.scene.nodes[index].kind {
-            window.dispatch_action(
-                Box::new(studio_actions::graph::OpenNodePage {
-                    type_name: node.type_name.clone(),
-                    id: node.id.clone(),
-                    at_commit: self.held_at(),
-                }),
-                cx,
-            );
+        if let Some(index) = self.selected_index() {
+            self.open(index, window, cx);
         }
     }
 
@@ -2614,6 +2909,195 @@ impl GraphCanvas {
             self.glide_from(from, cx);
             cx.notify();
         }
+    }
+
+    /// ⌥↵: follows the selected single-target relationship (a manager, a parent folder) to
+    /// the end of its chain, each node it reaches expanded, so a chain of 40 managers is one
+    /// action on one canvas. On a node reached through one, it follows the same relationship
+    /// on from that node.
+    fn follow_relationship(
+        &mut self,
+        _: &FollowRelationship,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(index) = self.selected_index() {
+            self.start_follow(index, cx);
+        }
+    }
+
+    /// Starts following from chip `index`: a single-target pill, or a node reached through one.
+    fn start_follow(&mut self, index: usize, cx: &mut Context<Self>) {
+        if !self.draws_exploration() {
+            return;
+        }
+        let Some(node) = self.scene.nodes.get(index) else {
+            return;
+        };
+        let Some(schema) = self.exploration.read(cx).schema() else {
+            return;
+        };
+        // The relationship, its field's path, the node it starts from and that node's path.
+        let (group, field, last, owner) = match (&node.kind, &node.path) {
+            (SceneKind::Hub { key, .. }, Some(path))
+                if graph_store::is_field(&schema, &key.group) =>
+            {
+                let owner = node
+                    .parent
+                    .and_then(|parent| self.scene.nodes.get(parent))
+                    .and_then(|parent| parent.path.clone());
+                (key.group.clone(), path.clone(), key.node.clone(), owner)
+            }
+            // A node reached through a single-target relationship goes on along it, when its
+            // type has that relationship too (a manager's manager, not a person's employer's).
+            (
+                SceneKind::Node {
+                    node: graph_node, ..
+                },
+                Some(path),
+            ) => match path.steps() {
+                [
+                    ..,
+                    graph_store::Step::Group(group),
+                    graph_store::Step::Node(_),
+                ] if graph_store::is_field(&schema, group)
+                    && continues(&schema, group, graph_node) =>
+                {
+                    (
+                        group.clone(),
+                        path.child_group(group),
+                        graph_node.clone(),
+                        Some(path.clone()),
+                    )
+                }
+                _ => return,
+            },
+            _ => return,
+        };
+        let opens: Vec<ExplorePath> = owner.into_iter().chain([field.clone()]).collect();
+        self.follow = Some(Follow {
+            group,
+            field,
+            hops: 0,
+            root: self.exploration.read(cx).root().cloned(),
+            expected: HashSet::new(),
+            last,
+            recentre: true,
+        });
+        self.open_for_follow(&opens, cx);
+        self.advance_follow(cx);
+    }
+
+    /// Opens `paths` for the follow under way, and records the walk's open paths it leaves, so
+    /// an opening or closing by anything else is seen ([`Self::follow_still_wanted`]).
+    fn open_for_follow(&mut self, paths: &[ExplorePath], cx: &mut Context<Self>) {
+        self.exploration
+            .update(cx, |exploration, cx| exploration.set_open(paths, true, cx));
+        let open = self.exploration.read(cx).state().expanded.clone();
+        if let Some(follow) = self.follow.as_mut() {
+            follow.expected = open;
+        }
+    }
+
+    /// Ends the follow under way when the walk changed under it: another root, or a path
+    /// opened or closed by anything but the follow (a click, ⌫, an ancestor collapsed, Expand
+    /// all). A follow is the person's one action; anything else they do takes over.
+    fn follow_still_wanted(&mut self, cx: &mut Context<Self>) {
+        let Some(follow) = self.follow.as_ref() else {
+            return;
+        };
+        let exploration = self.exploration.read(cx);
+        if exploration.root() != follow.root.as_ref()
+            || exploration.state().expanded != follow.expected
+        {
+            self.follow = None;
+        }
+    }
+
+    /// The person moved the view: a follow under way stops centring it on each node it
+    /// reaches, and goes on walking.
+    fn view_moved_by_hand(&mut self) {
+        if let Some(follow) = self.follow.as_mut() {
+            follow.recentre = false;
+        }
+    }
+
+    /// Takes the next hop of the relationship being followed once its field's target is read:
+    /// opens the target and its own field. Ends at a node with none, at a node already on the
+    /// path, after [`FOLLOW_MAX`] hops, or when the field could not be read; the view centres on
+    /// each node reached, so it travels with the chain.
+    fn advance_follow(&mut self, cx: &mut Context<Self>) {
+        let Some(follow) = self.follow.clone() else {
+            return;
+        };
+        let entries = self.exploration.read(cx).entries();
+        let Some(at) = entries.iter().position(|entry| {
+            entry.path == follow.field && matches!(entry.kind, EntryKind::Field { .. })
+        }) else {
+            // Its node is not open yet, or the walk closed it: wait, or stop if closed.
+            if !self.exploration.read(cx).state().is_expanded(&follow.field) {
+                self.follow = None;
+            }
+            return;
+        };
+        let EntryKind::Field {
+            target, loading, ..
+        } = &entries[at].kind
+        else {
+            return;
+        };
+        let failed = entries.get(at + 1).is_some_and(|next| {
+            next.parent == Some(at) && matches!(next.kind, EntryKind::Error { .. })
+        });
+        let Some(target) = target else {
+            if !*loading || failed {
+                self.follow = None;
+            }
+            return;
+        };
+        let node_path = follow.field.child_node(&target.node);
+        let cycle = entries
+            .iter()
+            .any(|entry| entry.path == node_path && matches!(entry.kind, EntryKind::Cycle { .. }));
+        // The walk is read uncapped and drawn capped (`canvas_max_nodes`): a target the
+        // scene would leave out is not followed to. The follow ends at the last node drawn,
+        // and the cap's banner says what is not drawn.
+        let id = SceneId::Node(target.node.clone());
+        let (drawn, full) = self.explore_scene(cx).map_or((false, true), |scene| {
+            (
+                scene.nodes.iter().any(|node| node.id == id),
+                scene.nodes.len() >= scene.cap,
+            )
+        });
+        if !drawn {
+            if follow.recentre {
+                self.center_on = Some(SceneId::Node(follow.last.clone()));
+            }
+            self.follow = None;
+            return;
+        }
+        if follow.recentre {
+            self.center_on = Some(id);
+        }
+        // A relationship that reaches another type (a person's employer) ends at its target,
+        // which has no such relationship to go on along.
+        let goes_on = self
+            .exploration
+            .read(cx)
+            .schema()
+            .is_some_and(|schema| continues(&schema, &follow.group, &target.node));
+        if cycle || !goes_on || full || follow.hops + 1 >= FOLLOW_MAX {
+            self.follow = None;
+            return;
+        }
+        let next = node_path.child_group(&follow.group);
+        self.follow = Some(Follow {
+            field: next.clone(),
+            hops: follow.hops + 1,
+            last: target.node.clone(),
+            ..follow
+        });
+        self.open_for_follow(&[node_path, next], cx);
     }
 
     fn move_selection(&mut self, direction: Vec2, cx: &mut Context<Self>) {
@@ -2633,6 +3117,7 @@ impl GraphCanvas {
         let palette = paint::Palette {
             text: Color::Default.color(cx),
             muted: Color::Muted.color(cx),
+            error: Color::Error.color(cx),
             // Chips are white cards in the light theme, with interfaces.dev's shadow.
             card: studio_ui::ds::surface::solid(cx),
             shadow: studio_ui::ds::elevation::layers(studio_ui::ds::elevation::Lift::Rest, cx),
@@ -2703,11 +3188,7 @@ impl GraphCanvas {
     /// The caption, bottom left: what is drawn, and what a click does.
     fn render_caption(&self, cx: &mut Context<Self>) -> impl IntoElement {
         // What a click does; the summary at the top says what is drawn.
-        let text = if self.schema_walk.is_some() {
-            "click to expand · double-click to close · ⇧-click for details"
-        } else {
-            "click to open · ⇧-click to inspect · ⇧-drag to select"
-        };
+        let text = caption(self.mode());
         // A floating bar as the summary and zoom are: one height, surface and corner.
         studio_ui::ds::float_bar("canvas-caption", cx)
             .absolute()
@@ -2972,6 +3453,7 @@ impl GraphCanvas {
                                                 via: None,
                                                 preview: false,
                                                 filters: None,
+                                                separate: false,
                                             }),
                                             cx,
                                         )
@@ -3020,8 +3502,9 @@ fn measurer(cx: &App, widths: &CharWidths) -> impl Fn(&str, f32, gpui::FontWeigh
 /// Character widths measured so far, by character, size and weight, for one font family.
 type CharWidths = Rc<RefCell<(SharedString, HashMap<(char, u32, u32), f32>)>>;
 
-/// Each chip's text, and half its width as `measure` measures it: made once a layout, for the
-/// layout's room and for drawing the chips it places.
+/// Each chip's text, its name wrapped, and half its width as `measure` measures it: made
+/// once a layout, for the layout's room and for drawing the chips it places, so a frame
+/// wraps and measures nothing.
 fn chip_texts(
     scene: &Scene,
     measure: &impl Fn(&str, f32, gpui::FontWeight) -> f32,
@@ -3030,11 +3513,22 @@ fn chip_texts(
         .nodes
         .iter()
         .map(|node| {
-            let text = paint::chip_text(node);
+            let text = paint::chip_text(node, measure);
             let half = paint::chip_width(&text, measure) / 2.;
             (text, half)
         })
         .unzip()
+}
+
+/// What a click does on a canvas in `mode`, as its caption says it; [`GraphCanvas::mouse_up`]
+/// and [`GraphCanvas::activate`] do what it says.
+fn caption(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Schema => "click to expand · double-click for details · ⇧-drag to select",
+        // A result's node has no walk to expand: a click selects it, a double click opens it.
+        Mode::Results => "click to select · double-click to open · ⇧-drag to select",
+        Mode::Explore => "click to expand · double-click to open · ⇧-drag to select",
+    }
 }
 
 /// How long finished reads are gathered before the canvas is laid out again: about a frame.
@@ -3087,6 +3581,8 @@ fn to_world(screen: Point<Pixels>, viewport: Bounds<Pixels>, center: Vec2, zoom:
 
 impl Render for GraphCanvas {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        self.renders.set(self.renders.get() + 1);
         // What the session's events left to read is read once the walk is drawn, and what its
         // changes left to lay out is laid out.
         if self.draws_exploration() && self.exploration.read(cx).owes_reads() {
@@ -3105,6 +3601,16 @@ impl Render for GraphCanvas {
                 studio_ui::ds::error_state("The schema could not be read", message)
                     .into_any_element(),
             ),
+            // A root that could not be read is drawn as no chip; the banner above says why.
+            Loadable::Loaded(_)
+                if self.mode() == Mode::Explore
+                    && matches!(
+                        self.exploration.read(cx).state().root_status,
+                        Loadable::Failed(_)
+                    ) =>
+            {
+                None
+            }
             Loadable::Loaded(_) if self.scene.nodes.is_empty() => Some(
                 match self.mode() {
                     Mode::Explore | Mode::Schema => studio_ui::ds::loading_state("Laying out…"),
@@ -3157,7 +3663,12 @@ impl Render for GraphCanvas {
                 }
                 self.glide = None;
                 self.fit(viewport);
+            } else if self.drawn_size.is_some_and(|size| size != viewport.size) {
+                // The person placed the view, so it is not fitted again; what is selected
+                // stays in sight, as when the inspector opens beside the canvas.
+                self.keep_selected_in(viewport);
             }
+            self.drawn_size = Some(viewport.size);
         }
         let background = studio_ui::ds::surface::canvas(cx);
         let canvas = self.render_canvas(cx).into_any_element();
@@ -3194,11 +3705,20 @@ impl Render for GraphCanvas {
             .on_action(cx.listener(Self::collapse_node))
             .on_action(cx.listener(Self::walk_back))
             .on_action(cx.listener(Self::walk_forward))
-            .on_action(cx.listener(Self::peek_selected))
             .on_action(cx.listener(Self::open_selected_page))
             .on_action(cx.listener(Self::focus_selected))
+            .on_action(cx.listener(Self::follow_relationship))
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::clear_selection))
+            .on_action(cx.listener(Self::select_node))
+            .on_action(cx.listener(Self::expand_neighbourhood))
+            .on_action(cx.listener(Self::collapse_nodes))
+            .on_action(cx.listener(Self::show_more_of))
+            .on_action(cx.listener(Self::hide_nodes))
+            .on_action(cx.listener(Self::show_hidden))
+            .on_action(cx.listener(Self::pin_nodes))
+            .on_action(cx.listener(Self::unpin_nodes))
+            .on_action(cx.listener(Self::reroot_here))
             .on_action(
                 cx.listener(|this, _: &MoveLeft, _, cx| {
                     this.move_selection(Vec2::new(-1., 0.), cx)
@@ -3377,7 +3897,12 @@ mod tests {
 
     /// The chips' texts of [`scene_of`]'s scene.
     fn texts_of(names: &[&str]) -> Vec<paint::ChipText> {
-        scene_of(names).nodes.iter().map(paint::chip_text).collect()
+        let measure = |text: &str, _: f32, _: gpui::FontWeight| text.len() as f32 * 7.;
+        scene_of(names)
+            .nodes
+            .iter()
+            .map(|node| paint::chip_text(node, &measure))
+            .collect()
     }
 
     fn scene_of(names: &[&str]) -> Scene {
@@ -3637,6 +4162,49 @@ mod tests {
         assert!(!asked(cx), "stopped, and nothing says they were asked for");
     }
 
+    /// A canvas nobody draws (its window is minimized or covered) still answers a reader that
+    /// waits for it: asked to catch up, it lays out what it left for a draw, and has settled.
+    #[gpui::test]
+    async fn a_canvas_not_drawn_catches_up_when_asked(cx: &mut gpui::TestAppContext) {
+        cx.update(studio_theme::init_test);
+        let (session, _served) = graph_store::test_server::followed_session(
+            "node Person {\n  slug: String @key\n  name: String\n}\nedge Knows: Person -> Person\n",
+            |_| serde_json::json!([{ "id": "p1", "label": "Ada", "n": 1 }]),
+            cx,
+        );
+        cx.run_until_parked();
+        let canvas = cx.new(|cx| GraphCanvas::new(session, NodeRef::new("Person", "p1"), None, cx));
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+        let drawn = canvas.read_with(cx, |canvas, cx| {
+            assert!(
+                canvas.layout_owed,
+                "what was read is owed a layout at the next draw"
+            );
+            assert!(canvas.settling_now(cx), "so the canvas has not settled");
+            canvas.scene.nodes.len()
+        });
+        // No draw comes. The reader asks, as often as it looks.
+        for _ in 0..10 {
+            canvas.update(cx, |canvas, cx| canvas.catch_up_now(cx));
+            cx.run_until_parked();
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(40));
+            cx.run_until_parked();
+        }
+        canvas.read_with(cx, |canvas, cx| {
+            assert!(!canvas.layout_owed);
+            assert!(!canvas.settling_now(cx), "settled without a draw");
+            assert!(
+                canvas.scene.nodes.len() > drawn,
+                "what was read is laid out: {} chips, {drawn} before",
+                canvas.scene.nodes.len()
+            );
+        });
+    }
+
     /// A walk's change that leaves its scene as drawn lays out nothing: the chips stay put, and
     /// no layout runs off the main thread for them. Before, every change laid the same scene
     /// out again, as "+K more" did while its page was read. A change of the scene lays out.
@@ -3712,9 +4280,127 @@ mod tests {
         });
     }
 
-    /// A canvas of a result read at a commit holds that commit: peeking at a node and opening
-    /// its page read there, after the session moves to another branch too, and its tab says
-    /// so. A result read at the branch head opens what it opens at the head, as before.
+    /// What a press on a chip does (spec 020): one click selects it, which the inspector shows; a
+    /// second opens the node's page, kept, as it opens a row of a tree; ⇧-click marks a chip and
+    /// leaves the selection where it is; a click on the canvas lets both go.
+    #[gpui::test]
+    async fn a_click_selects_a_chip_and_a_second_opens_its_page(cx: &mut gpui::TestAppContext) {
+        cx.update(studio_theme::init_test);
+        let (session, _served) = graph_store::test_server::followed_session(
+            "node Person {\n  slug: String @key\n  name: String\n}\n",
+            |_| serde_json::json!([]),
+            cx,
+        );
+        cx.run_until_parked();
+        let pages: Rc<RefCell<Vec<OpenNodePage>>> = Rc::default();
+        cx.update(|cx| {
+            let heard = pages.clone();
+            cx.on_action(move |action: &OpenNodePage, _| heard.borrow_mut().push(action.clone()));
+        });
+        let person = |id: &str| studio_actions::graph::ResultNode {
+            type_name: "Person".into(),
+            id: id.into(),
+            label: Some(id.to_uppercase()),
+        };
+        let action = ShowResultsOnCanvas {
+            title: "people · result".into(),
+            nodes: vec![person("p1"), person("p2")],
+            links: vec![(0, 1)],
+            at_commit: None,
+        };
+        let (canvas, cx) =
+            cx.add_window_view(|_, cx| GraphCanvas::with_results(session, &action, cx));
+        cx.run_until_parked();
+        // The chips where a frame would have painted them: one per node, side by side.
+        let chip = |index: usize| {
+            Bounds::new(
+                point(px(100. * index as f32 + 20.), px(20.)),
+                gpui::size(px(40.), px(20.)),
+            )
+        };
+        let middle = |id: &str, cx: &mut gpui::VisualTestContext| {
+            canvas.read_with(cx, |canvas, _| {
+                let index = canvas
+                    .index_of(&SceneId::Node(NodeRef::new("Person", id)))
+                    .expect("drawn");
+                chip(index).center()
+            })
+        };
+        let press =
+            |at: Point<Pixels>, shift: bool, clicks: usize, cx: &mut gpui::VisualTestContext| {
+                let modifiers = gpui::Modifiers {
+                    shift,
+                    ..Default::default()
+                };
+                canvas.update_in(cx, |canvas, window, cx| {
+                    let chips = (0..canvas.scene.nodes.len()).map(chip).collect();
+                    *canvas.chips.borrow_mut() = chips;
+                    for click_count in 1..=clicks {
+                        let down = MouseDownEvent {
+                            button: MouseButton::Left,
+                            position: at,
+                            modifiers,
+                            click_count,
+                            first_mouse: false,
+                        };
+                        canvas.mouse_down(&down, window, cx);
+                        let up = MouseUpEvent {
+                            button: MouseButton::Left,
+                            position: at,
+                            modifiers,
+                            click_count,
+                        };
+                        canvas.mouse_up(&up, window, cx);
+                    }
+                });
+                cx.run_until_parked();
+            };
+        let inspected = |cx: &mut gpui::VisualTestContext| {
+            canvas.read_with(cx, |canvas, _| canvas.inspected_node().map(|node| node.id))
+        };
+        let (p1, p2) = (middle("p1", cx), middle("p2", cx));
+        assert_eq!(
+            inspected(cx),
+            None,
+            "a result's picture starts with nothing selected"
+        );
+
+        press(p1, false, 1, cx);
+        assert_eq!(inspected(cx).as_deref(), Some("p1"));
+        assert!(pages.borrow().is_empty(), "a click opens nothing");
+
+        press(p1, false, 2, cx);
+        let opened = pages.borrow_mut().drain(..).collect::<Vec<_>>();
+        assert_eq!(opened.len(), 1, "{opened:?}");
+        assert_eq!((opened[0].id.as_str(), opened[0].preview), ("p1", false));
+
+        press(p2, true, 1, cx);
+        assert_eq!(
+            inspected(cx).as_deref(),
+            Some("p1"),
+            "a marked chip is not selected"
+        );
+        canvas.read_with(cx, |canvas, _| {
+            assert!(
+                canvas
+                    .marked
+                    .contains(&SceneId::Node(NodeRef::new("Person", "p2")))
+            );
+        });
+        assert!(pages.borrow().is_empty());
+
+        press(point(px(900.), px(600.)), false, 1, cx);
+        assert_eq!(
+            inspected(cx),
+            None,
+            "a click on the canvas lets the selection go"
+        );
+        canvas.read_with(cx, |canvas, _| assert!(canvas.marked.is_empty()));
+    }
+
+    /// A canvas of a result read at a commit holds that commit: the node it hands the inspector
+    /// and the page it opens read there, after the session moves to another branch too, and
+    /// its tab says so. A result read at the branch head opens what it opens at the head.
     #[gpui::test]
     async fn a_result_read_at_a_commit_opens_its_nodes_there(cx: &mut gpui::TestAppContext) {
         cx.update(studio_theme::init_test);
@@ -3728,10 +4414,6 @@ mod tests {
         type Opened = Rc<RefCell<Vec<(&'static str, Option<String>)>>>;
         let opened: Opened = Rc::default();
         cx.update(|cx| {
-            let heard = opened.clone();
-            cx.on_action(move |action: &PeekNode, _| {
-                heard.borrow_mut().push(("peek", action.at_commit.clone()))
-            });
             let heard = opened.clone();
             cx.on_action(move |action: &OpenNodePage, _| {
                 heard.borrow_mut().push(("page", action.at_commit.clone()))
@@ -3757,13 +4439,32 @@ mod tests {
                 cx.add_window_view(|_, cx| GraphCanvas::with_results(session, &action, cx));
             cx.update(|window, cx| window.focus(&canvas.focus_handle(cx), cx));
             cx.run_until_parked();
-            canvas.update_in(cx, |canvas, window, cx| {
+            // What the inspector is handed for the selected chip, and where it reads.
+            let inspects =
+                |canvas: &mut GraphCanvas, cx: &mut Context<GraphCanvas>| match Item::inspected(
+                    canvas, cx,
+                ) {
+                    Some(Inspected::Node(node)) => {
+                        assert_eq!(
+                            (node.type_name.as_str(), node.id.as_str()),
+                            ("Person", "p1")
+                        );
+                        node.at_commit
+                    }
+                    _ => panic!("the selected chip's node"),
+                };
+            canvas.update(cx, |canvas, cx| {
                 assert_eq!(Item::tab_title(canvas, cx).as_ref(), title);
-                let index = canvas
+                canvas
                     .index_of(&SceneId::Node(NodeRef::new("Person", "p1")))
                     .expect("p1 is drawn");
+                assert!(
+                    Item::inspected(canvas, cx).is_none(),
+                    "nothing selected yet"
+                );
                 canvas.selected = Some(SceneId::Node(NodeRef::new("Person", "p1")));
-                canvas.peek(index, window, cx);
+                let at = inspects(canvas, cx);
+                opened.borrow_mut().push(("inspect", at));
             });
             cx.dispatch_action(OpenSelectedPage);
             // The session moves to another branch: the result's commit still holds.
@@ -3773,9 +4474,10 @@ mod tests {
                     .update(cx, |session, cx| session.set_branch("fix".into(), cx))
             });
             cx.run_until_parked();
-            canvas.update_in(cx, |canvas, window, cx| {
-                let index = canvas.selected_index().expect("still selected");
-                canvas.peek(index, window, cx);
+            canvas.update(cx, |canvas, cx| {
+                canvas.selected_index().expect("still selected");
+                let at = inspects(canvas, cx);
+                opened.borrow_mut().push(("inspect", at));
             });
             cx.dispatch_action(OpenSelectedPage);
             cx.run_until_parked();
@@ -3783,9 +4485,9 @@ mod tests {
             assert_eq!(
                 opened.borrow_mut().drain(..).collect::<Vec<_>>(),
                 [
-                    ("peek", held.clone()),
+                    ("inspect", held.clone()),
                     ("page", held.clone()),
-                    ("peek", held.clone()),
+                    ("inspect", held.clone()),
                     ("page", held),
                 ],
             );
@@ -3838,5 +4540,540 @@ mod tests {
                 "a tab's reset leaves the graph's saved positions alone"
             );
         });
+    }
+    /// A reporting chain on a fake server: p1 reports to p2, p2 to p3, and so on up to
+    /// `length` people; the last reports to nobody. Each person's manager is a single-target
+    /// relationship, drawn as a pill.
+    pub(super) const CHAIN_SCHEMA: &str = "node Person {\n  slug: String @key\n  name: String\n}\n\
+        edge ReportsTo: Person -> Person @card(0..1)\n";
+
+    pub(super) fn chain_session(
+        length: usize,
+        cx: &mut gpui::TestAppContext,
+    ) -> Entity<GraphSession> {
+        named_chain_session(length, |n| format!("Person {n}"), cx)
+    }
+
+    /// [`chain_session`], each person named by `name`.
+    pub(super) fn named_chain_session(
+        length: usize,
+        name: fn(usize) -> String,
+        cx: &mut gpui::TestAppContext,
+    ) -> Entity<GraphSession> {
+        served_chain_session(length, name, cx).0
+    }
+
+    /// [`named_chain_session`], with the fake server, to hold its reads.
+    pub(super) fn served_chain_session(
+        length: usize,
+        name: fn(usize) -> String,
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        Entity<GraphSession>,
+        std::sync::Arc<std::sync::Mutex<graph_store::test_server::Served>>,
+    ) {
+        cx.update(studio_theme::init_test);
+        let (session, served) = graph_store::test_server::followed_session(
+            CHAIN_SCHEMA,
+            move |asked| {
+                let id = asked["params"]["id"].as_str().unwrap_or("p1").to_owned();
+                let n: usize = id.trim_start_matches('p').parse().unwrap_or(1);
+                match asked["name"].as_str() {
+                    Some("studio_node") => serde_json::json!([{ "id": id, "label": name(n) }]),
+                    Some("studio_neighbours") if n < length => serde_json::json!([{
+                        "id": format!("p{}", n + 1),
+                        "label": name(n + 1),
+                    }]),
+                    _ => serde_json::json!([]),
+                }
+            },
+            cx,
+        );
+        cx.run_until_parked();
+        (session, served)
+    }
+
+    /// Settles a canvas's reads and layouts.
+    pub(super) fn settle(cx: &mut gpui::VisualTestContext) {
+        for _ in 0..4 {
+            cx.run_until_parked();
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(50));
+        }
+        cx.run_until_parked();
+    }
+
+    /// The node a single-target relationship reaches expands on a click and on ↵, as the
+    /// caption says ("click to expand"), and opens no page (H1 in the canvas UX report). Before,
+    /// a click only selected it and ↵ opened its page in another tab, so a chain of managers
+    /// stopped after one hop.
+    #[gpui::test]
+    async fn a_node_reached_through_a_single_target_relationship_expands(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let session = chain_session(3, cx);
+        let pages: Rc<RefCell<usize>> = Rc::default();
+        cx.update(|cx| {
+            let heard = pages.clone();
+            cx.on_action(move |_: &OpenNodePage, _| *heard.borrow_mut() += 1);
+        });
+        let (canvas, cx) = cx.add_window_view(|_, cx| {
+            GraphCanvas::new(session, NodeRef::new("Person", "p1"), None, cx)
+        });
+        cx.update(|window, cx| window.focus(&canvas.focus_handle(cx), cx));
+        settle(cx);
+        let exploration = canvas.read_with(cx, |canvas, _| canvas.exploration.clone());
+        // Open p1's manager pill.
+        canvas.update_in(cx, |canvas, window, cx| {
+            let hub = canvas
+                .scene
+                .nodes
+                .iter()
+                .position(|node| matches!(node.kind, SceneKind::Hub { .. }))
+                .expect("p1's manager pill");
+            canvas.activate(hub, false, window, cx);
+        });
+        settle(cx);
+        let p2 = SceneId::Node(NodeRef::new("Person", "p2"));
+        let p2_path = canvas.read_with(cx, |canvas, _| {
+            let index = canvas.index_of(&p2).expect("p2 is drawn");
+            canvas.scene.nodes[index]
+                .path
+                .clone()
+                .expect("p2 has a path")
+        });
+        // ↵ on p2 expands it, and opens no page.
+        canvas.update_in(cx, |canvas, _, cx| {
+            let index = canvas.index_of(&p2).unwrap();
+            canvas.select(Some(index), cx);
+        });
+        cx.dispatch_action(ExpandNode);
+        settle(cx);
+        assert!(exploration.read_with(cx, |e, _| e.state().is_expanded(&p2_path)));
+        assert_eq!(*pages.borrow(), 0, "no page opened");
+        // p2's own manager pill is drawn, hanging off p2.
+        canvas.read_with(cx, |canvas, _| {
+            let p2 = canvas.index_of(&p2).unwrap();
+            assert!(canvas.scene.nodes.iter().any(|node| {
+                matches!(node.kind, SceneKind::Hub { .. }) && node.parent == Some(p2)
+            }));
+        });
+    }
+
+    /// Following a single-target relationship walks its whole chain on one canvas: from p1's
+    /// manager pill, 41 people, each reached through the one before, and it stops at the one
+    /// who reports to nobody. ⌥↵ on a node reached through one goes on from there.
+    #[gpui::test]
+    async fn following_a_relationship_walks_its_whole_chain(cx: &mut gpui::TestAppContext) {
+        let session = chain_session(41, cx);
+        let (canvas, cx) = cx.add_window_view(|_, cx| {
+            GraphCanvas::new(session, NodeRef::new("Person", "p1"), None, cx)
+        });
+        cx.update(|window, cx| window.focus(&canvas.focus_handle(cx), cx));
+        settle(cx);
+        canvas.update_in(cx, |canvas, _, cx| {
+            let hub = canvas
+                .scene
+                .nodes
+                .iter()
+                .position(|node| matches!(node.kind, SceneKind::Hub { .. }))
+                .expect("p1's manager pill");
+            canvas.select(Some(hub), cx);
+        });
+        cx.dispatch_action(FollowRelationship);
+        for _ in 0..200 {
+            settle(cx);
+            if canvas.read_with(cx, |canvas, _| canvas.follow.is_none()) {
+                break;
+            }
+        }
+        canvas.update_in(cx, |canvas, _, cx| canvas.lay_out_owed(cx));
+        settle(cx);
+        canvas.read_with(cx, |canvas, _| {
+            assert!(canvas.follow.is_none(), "the follow ended");
+            for n in 1..=41 {
+                let id = SceneId::Node(NodeRef::new("Person", format!("p{n}")));
+                let index = canvas
+                    .index_of(&id)
+                    .unwrap_or_else(|| panic!("p{n} is drawn"));
+                if n > 1 {
+                    // Each hangs off the pill of the one before.
+                    let pill = canvas.scene.nodes[index].parent.expect("a pill");
+                    let owner = canvas.scene.nodes[pill].parent.expect("an owner");
+                    assert_eq!(
+                        canvas.scene.nodes[owner].id,
+                        SceneId::Node(NodeRef::new("Person", format!("p{}", n - 1)))
+                    );
+                }
+            }
+            assert!(
+                canvas
+                    .index_of(&SceneId::Node(NodeRef::new("Person", "p42")))
+                    .is_none(),
+                "nobody past the end"
+            );
+        });
+    }
+
+    /// Long names wrap and their chips grow: drawn, a chain of file paths and meeting titles
+    /// shows each over up to three lines, and no two chips overlap, since the layout makes
+    /// room for each chip as tall and as wide as it is drawn. Pointing at chips and zooming
+    /// then draw the canvas and wrap or lay out nothing: names are wrapped once, with the
+    /// layout (docs/drawing.md).
+    #[gpui::test]
+    async fn long_names_wrap_and_drawing_them_wraps_nothing(cx: &mut gpui::TestAppContext) {
+        use gpui::{Modifiers, ScrollDelta};
+        let session = named_chain_session(
+            6,
+            |n| match n % 2 {
+                0 => format!("/archive/2024/q3/contracts/northwind-global-msa-v{n}-final.pdf"),
+                _ => format!("Quarterly business review {n} with Northwind Global procurement"),
+            },
+            cx,
+        );
+        let (canvas, cx) = cx.add_window_view(|_, cx| {
+            GraphCanvas::new(session, NodeRef::new("Person", "p1"), None, cx)
+        });
+        cx.update(|window, cx| window.focus(&canvas.focus_handle(cx), cx));
+        settle(cx);
+        canvas.update_in(cx, |canvas, _, cx| {
+            let hub = canvas
+                .scene
+                .nodes
+                .iter()
+                .position(|node| matches!(node.kind, SceneKind::Hub { .. }))
+                .expect("p1's manager pill");
+            canvas.start_follow(hub, cx);
+        });
+        for _ in 0..40 {
+            settle(cx);
+            if canvas.read_with(cx, |canvas, _| canvas.follow.is_none()) {
+                break;
+            }
+        }
+        // Every layout in, then the whole chain fitted to the window.
+        canvas.update_in(cx, |canvas, _, cx| canvas.lay_out_owed(cx));
+        settle(cx);
+        canvas.update_in(cx, |canvas, window, cx| {
+            canvas.center_on = None;
+            // Glides run on the wall clock, which the test's does not move.
+            canvas.glide = None;
+            canvas.appear.clear();
+            canvas.fit(canvas.viewport(window));
+            cx.notify();
+        });
+        settle(cx);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let rects: Vec<Bounds<Pixels>> = canvas.read_with(cx, |canvas, _| {
+            let wrapped = canvas
+                .texts
+                .iter()
+                .filter(|text| text.rows.len() > 1)
+                .count();
+            assert!(wrapped >= 6, "every long name wraps ({wrapped})");
+            assert!(
+                canvas
+                    .texts
+                    .iter()
+                    .all(|text| text.rows.len() <= paint::CHIP_MAX_LINES)
+            );
+            canvas.chips.borrow().clone()
+        });
+        let drawn: Vec<&Bounds<Pixels>> = rects
+            .iter()
+            .filter(|rect| rect.size.width > px(0.))
+            .collect();
+        assert!(drawn.len() >= 12, "the chain is drawn: {}", drawn.len());
+        for (i, a) in drawn.iter().enumerate() {
+            for b in &drawn[i + 1..] {
+                assert!(!a.intersects(b), "chips overlap: {a:?} {b:?}");
+            }
+        }
+        // Point at every chip, then zoom: drawn again, nothing wrapped or laid out.
+        let (made, generation, renders) = canvas.read_with(cx, |canvas, _| {
+            (
+                paint::CHIP_TEXTS_MADE.with(std::cell::Cell::get),
+                canvas.layout_generation,
+                canvas.renders.get(),
+            )
+        });
+        for rect in &drawn {
+            cx.simulate_mouse_move(rect.center(), None, Modifiers::none());
+            cx.run_until_parked();
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        cx.simulate_event(ScrollEvent {
+            position: drawn[0].center(),
+            delta: ScrollDelta::Pixels(point(px(0.), px(40.))),
+            ..Default::default()
+        });
+        settle(cx);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        canvas.read_with(cx, |canvas, _| {
+            assert!(canvas.renders.get() > renders, "pointing draws the canvas");
+            assert_eq!(canvas.layout_generation, generation, "no layout");
+            assert_eq!(
+                paint::CHIP_TEXTS_MADE.with(std::cell::Cell::get),
+                made,
+                "no name wrapped again"
+            );
+        });
+    }
+
+    /// Following a single-target relationship to another type (a person's employer) ends at
+    /// its target, which has no such relationship: the company is drawn and the follow
+    /// stops. Before, it opened the relationship on the company too and never ended.
+    #[gpui::test]
+    async fn following_a_relationship_to_another_type_ends_at_its_target(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(studio_theme::init_test);
+        let (session, _served) = graph_store::test_server::followed_session(
+            "node Person {\n  slug: String @key\n  name: String\n}\n\
+             node Company {\n  slug: String @key\n  name: String\n}\n\
+             edge Employer: Person -> Company @card(0..1)\n",
+            |asked| match (asked["name"].as_str(), asked["params"]["id"].as_str()) {
+                (Some("studio_node"), _) => serde_json::json!([{ "id": "p1", "label": "Ada" }]),
+                (Some("studio_neighbours"), Some("p1")) => {
+                    serde_json::json!([{ "id": "c1", "label": "Acme" }])
+                }
+                _ => serde_json::json!([]),
+            },
+            cx,
+        );
+        cx.run_until_parked();
+        let (canvas, cx) = cx.add_window_view(|_, cx| {
+            GraphCanvas::new(session, NodeRef::new("Person", "p1"), None, cx)
+        });
+        settle(cx);
+        canvas.update_in(cx, |canvas, _, cx| {
+            let hub = canvas
+                .scene
+                .nodes
+                .iter()
+                .position(|node| matches!(node.kind, SceneKind::Hub { .. }))
+                .expect("Ada's employer pill");
+            canvas.start_follow(hub, cx);
+        });
+        for _ in 0..10 {
+            settle(cx);
+        }
+        canvas.read_with(cx, |canvas, _| {
+            assert!(canvas.follow.is_none(), "the follow ended at the company");
+            assert!(
+                canvas
+                    .index_of(&SceneId::Node(NodeRef::new("Company", "c1")))
+                    .is_some(),
+                "the company is drawn"
+            );
+        });
+    }
+
+    /// A follow p1's manager pill started, on a canvas of a chain of `length`, with the server
+    /// holding every read once it has started, so the follow waits on its next hop.
+    fn waiting_follow(
+        length: usize,
+        cx: &mut gpui::TestAppContext,
+    ) -> (Entity<GraphCanvas>, &mut gpui::VisualTestContext) {
+        let (session, served) = served_chain_session(length, |n| format!("Person {n}"), cx);
+        let (canvas, cx) = cx.add_window_view(|_, cx| {
+            GraphCanvas::new(session, NodeRef::new("Person", "p1"), None, cx)
+        });
+        cx.update(|window, cx| window.focus(&canvas.focus_handle(cx), cx));
+        settle(cx);
+        served.lock().unwrap().hold = Box::new(|_| true);
+        canvas.update_in(cx, |canvas, _, cx| {
+            let hub = canvas
+                .scene
+                .nodes
+                .iter()
+                .position(|node| matches!(node.kind, SceneKind::Hub { .. }))
+                .expect("p1's manager pill");
+            canvas.start_follow(hub, cx);
+        });
+        settle(cx);
+        assert!(
+            canvas.read_with(cx, |canvas, _| canvas.follow.is_some()),
+            "waiting"
+        );
+        (canvas, cx)
+    }
+
+    /// A follow is the person's one action, and anything else they do takes over: it ends when
+    /// the walk is closed under it (here its root collapsed). Before, it ended only by itself:
+    /// a collapse of its ancestor left it waiting, and it went on, expanding and centring the
+    /// view, when the walk was opened again.
+    #[gpui::test]
+    async fn a_follow_ends_when_its_ancestor_is_collapsed(cx: &mut gpui::TestAppContext) {
+        // The root collapsed: the follow's paths below it are left open, and it ends.
+        let (canvas, cx) = waiting_follow(41, cx);
+        let exploration = canvas.read_with(cx, |canvas, _| canvas.exploration.clone());
+        exploration.update(cx, |e, cx| e.set_open(&[ExplorePath::root()], false, cx));
+        settle(cx);
+        assert!(
+            canvas.read_with(cx, |canvas, _| canvas.follow.is_none()),
+            "collapsed"
+        );
+        // Opened again, nothing goes on by itself.
+        exploration.update(cx, |e, cx| e.set_open(&[ExplorePath::root()], true, cx));
+        settle(cx);
+        assert!(
+            canvas.read_with(cx, |canvas, _| canvas.follow.is_none()),
+            "stays ended"
+        );
+    }
+
+    /// Esc ends a follow under way, where it got to.
+    #[gpui::test]
+    async fn escape_ends_a_follow(cx: &mut gpui::TestAppContext) {
+        let (canvas, cx) = waiting_follow(41, cx);
+        cx.dispatch_action(ClearSelection);
+        assert!(canvas.read_with(cx, |canvas, _| canvas.follow.is_none()));
+    }
+
+    /// Another chip opened by the person (here the manager reached so far, closed with ⌫)
+    /// ends a follow under way.
+    #[gpui::test]
+    async fn opening_or_closing_by_hand_ends_a_follow(cx: &mut gpui::TestAppContext) {
+        let (canvas, cx) = waiting_follow(41, cx);
+        let exploration = canvas.read_with(cx, |canvas, _| canvas.exploration.clone());
+        let other = exploration.read_with(cx, |exploration, _| {
+            let state = exploration.state();
+            state
+                .expanded
+                .iter()
+                .find(|path| !path.is_root() && path.ends_at_node())
+                .cloned()
+                .expect("a node the follow opened")
+        });
+        exploration.update(cx, |e, cx| e.collapse(&other, cx));
+        settle(cx);
+        assert!(canvas.read_with(cx, |canvas, _| canvas.follow.is_none()));
+    }
+
+    /// Scrolling (a zoom) during a follow leaves the view where the person put it: the follow
+    /// goes on walking and stops centring the view on each node it reaches.
+    #[gpui::test]
+    async fn a_view_moved_by_hand_is_left_alone_by_a_follow(cx: &mut gpui::TestAppContext) {
+        let (canvas, cx) = waiting_follow(41, cx);
+        canvas.update_in(cx, |canvas, window, cx| {
+            let event = ScrollEvent {
+                delta: gpui::ScrollDelta::Pixels(point(px(0.), px(40.))),
+                ..Default::default()
+            };
+            canvas.scroll(&event, window, cx);
+            assert!(
+                canvas
+                    .follow
+                    .as_ref()
+                    .is_some_and(|follow| !follow.recentre)
+            );
+            assert!(canvas.center_on.is_none());
+        });
+    }
+
+    /// A follow reads no further than the canvas draws: with the node cap at 12, it ends at the
+    /// last person drawn, and opens nobody the scene leaves out. Before, it checked its hops
+    /// against the walk, which is read uncapped, and went on through all 41 people.
+    #[gpui::test]
+    async fn a_follow_ends_at_the_last_node_the_cap_draws(cx: &mut gpui::TestAppContext) {
+        let session = chain_session(41, cx);
+        cx.update(|cx| {
+            let mut settings = StudioSettings::default();
+            settings.studio.canvas_max_nodes = 12;
+            cx.set_global(settings);
+        });
+        let (canvas, cx) = cx.add_window_view(|_, cx| {
+            GraphCanvas::new(session, NodeRef::new("Person", "p1"), None, cx)
+        });
+        settle(cx);
+        canvas.update_in(cx, |canvas, _, cx| {
+            let hub = canvas
+                .scene
+                .nodes
+                .iter()
+                .position(|node| matches!(node.kind, SceneKind::Hub { .. }))
+                .expect("p1's manager pill");
+            canvas.start_follow(hub, cx);
+        });
+        for _ in 0..60 {
+            settle(cx);
+            if canvas.read_with(cx, |canvas, _| canvas.follow.is_none()) {
+                break;
+            }
+        }
+        canvas.update_in(cx, |canvas, _, cx| canvas.lay_out_owed(cx));
+        settle(cx);
+        canvas.read_with(cx, |canvas, cx| {
+            assert!(canvas.follow.is_none(), "the follow ended");
+            let drawn: HashSet<NodeRef> = canvas
+                .scene
+                .nodes
+                .iter()
+                .filter_map(|node| match &node.kind {
+                    SceneKind::Node { node, .. } => Some(node.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert!(canvas.scene.nodes.len() <= 12, "under the cap");
+            let opened: Vec<NodeRef> = canvas
+                .exploration
+                .read(cx)
+                .state()
+                .expanded
+                .iter()
+                .filter(|path| path.ends_at_node() && !path.is_root())
+                .filter_map(|path| path.nodes().last().cloned())
+                .collect();
+            assert!(!opened.is_empty(), "it walked");
+            for node in &opened {
+                assert!(drawn.contains(node), "{node:?} was opened, not drawn");
+            }
+        });
+    }
+
+    /// A dragged node takes its note with it ("No relationships", Retry), as it takes its
+    /// pills and "+K more": the note is laid out as its child, so one left behind would jump
+    /// back at the next layout. Found by Cursor Bugbot on #110.
+    #[gpui::test]
+    async fn a_dragged_node_takes_its_note(cx: &mut gpui::TestAppContext) {
+        let (canvas, _, ada) = canvas_of_ada(cx);
+        canvas.update(cx, |canvas, cx| {
+            let mut scene = scene_of(&["Ada"]);
+            scene.nodes.push(crate::model::SceneNode {
+                id: SceneId::Note(ada.clone()),
+                kind: SceneKind::Note {
+                    node: ada.clone(),
+                    note: crate::model::Note::Empty,
+                },
+                label: "No relationships".into(),
+                color_key: "Person".into(),
+                parent: Some(0),
+                path: None,
+            });
+            let texts = vec![texts_of(&["Ada"]).remove(0), texts_of(&["x"]).remove(0)];
+            canvas.apply_layout(
+                scene,
+                texts,
+                vec![10.; 2],
+                vec![Vec2::default(), Vec2::new(60., 0.)],
+                cx,
+            );
+            let followers: Vec<usize> = canvas
+                .followers(&[0])
+                .into_iter()
+                .map(|(index, _)| index)
+                .collect();
+            assert_eq!(followers, [1], "the note goes with its node");
+        });
+    }
+
+    /// The caption says what a click does where it is drawn: a result's node is selected by
+    /// a click and opened by a double click.
+    #[test]
+    fn the_caption_says_what_a_click_does() {
+        assert!(caption(Mode::Explore).starts_with("click to expand · double-click to open"));
+        assert!(caption(Mode::Results).starts_with("click to select · double-click to open"));
+        assert!(caption(Mode::Schema).starts_with("click to expand"));
     }
 }

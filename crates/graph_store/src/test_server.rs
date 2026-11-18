@@ -134,6 +134,18 @@ pub fn followed_session(
     rows: impl Fn(&Value) -> Value + Send + 'static,
     cx: &mut TestAppContext,
 ) -> (Entity<GraphSession>, Arc<Mutex<Served>>) {
+    followed_session_named("dev", schema, rows, cx)
+}
+
+/// [`followed_session`] on a server named `name`, at an address of its own: what a window
+/// saves of its graph is kept under the server, so tests that share a data directory each
+/// start with nothing restored.
+pub fn followed_session_named(
+    name: &str,
+    schema: &str,
+    rows: impl Fn(&Value) -> Value + Send + 'static,
+    cx: &mut TestAppContext,
+) -> (Entity<GraphSession>, Arc<Mutex<Served>>) {
     use futures::AsyncReadExt as _;
     let served = Arc::new(Mutex::new(Served {
         head: "c1".into(),
@@ -242,8 +254,12 @@ pub fn followed_session(
         }
     });
     let server = ServerEntry {
-        name: "dev".into(),
-        url: "http://127.0.0.1:8787".into(),
+        name: name.into(),
+        url: if name == "dev" {
+            "http://127.0.0.1:8787".into()
+        } else {
+            format!("http://{name}.test")
+        },
         source: ServerSource::Environment,
         known_graphs: Vec::new(),
     };

@@ -281,7 +281,11 @@ same way.
   one held would, the one it replaces ending as replaced, and no other sign-in starts until it is
   kept, so nothing is offered before. A sign-in as someone else that fails says why, and why the
   one held ended if it did meanwhile; one held that still stands reads as not admitted, or as not
-  answering when its service did not answer. While a sign-in is under way, the one it replaces answering, a renewal or that it ended,
+  answering when its service did not answer. An Omnigraph 0.15 server says itself that it does
+  not admit an account (403 `not_admitted` on every route, the graph list included), which the
+  connection reads at the connect as not admitted for the whole server; from such a server a 401
+  to the one held reads as its token refused, which a new sign-in may replace (spec 034,
+  `ServerFeature::NotAdmittedCode`). While a sign-in is under way, the one it replaces answering, a renewal or that it ended,
   does not change the state shown, and one the service ends meanwhile ends as replaced, its token
   revoked, since the sign-in under way answers for the item; should that one not be taken, the
   item is spent, and the next launch, refused once, forgets it. A connection released while a
