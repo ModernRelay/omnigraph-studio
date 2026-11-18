@@ -1930,8 +1930,20 @@ fn state_status(c: &Connection) -> String {
              account cannot help. Ask the server's operator to admit you."
                 .into()
         }
+        // What to do next, as the page of a graph that did not open says it.
         (ConnectionState::Unreachable(error), _) => {
-            format!("Could not reach the server: {error}")
+            let next = if graph_client::is_loopback(&c.server.url) {
+                format!(
+                    "Is omnigraph-server running at {}? Start it, then Retry.",
+                    c.server.url
+                )
+            } else {
+                "Check the address and your network, then Retry.".to_owned()
+            };
+            format!(
+                "Could not reach the server: {}. {next}",
+                studio_ui::clause(error)
+            )
         }
         // A cluster opened from its control plane asks the control plane, not the CLI.
         (ConnectionState::Unauthorized, Some(reason))
@@ -2199,6 +2211,25 @@ mod tests {
             }
         });
         connection
+    }
+
+    /// A server that did not answer says what to do next, as the page of a graph that did not
+    /// open does: start a local one, or check a remote one's address and the network.
+    #[gpui::test]
+    fn an_unreachable_server_says_what_to_do_next(cx: &mut TestAppContext) {
+        let local = server(&[], cx);
+        let said = local.update(cx, |c, _| {
+            c.state = ConnectionState::Unreachable("the connection was refused".into());
+            state_status(c)
+        });
+        let url = local.read_with(cx, |c, _| c.server.url.clone());
+        assert_eq!(
+            said,
+            format!(
+                "Could not reach the server: the connection was refused. Is omnigraph-server \
+                 running at {url}? Start it, then Retry."
+            )
+        );
     }
 
     fn dialog(
