@@ -132,6 +132,27 @@ pub fn verify(link: &CliLink, binding: &str, home: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The link that opens `target` again, at the node `node` (its type and key) when there is one:
+/// what Copy Link puts on the clipboard, as [`parse`] reads it. It carries no token, so it opens
+/// only in a Studio that knows the server.
+pub fn link_to(target: &Target, node: Option<(&str, &str)>) -> String {
+    let route = if node.is_some() { "node" } else { "graph" };
+    let mut url = Url::parse(&format!("{SCHEME}://{route}")).expect("a link's own shape parses");
+    {
+        let mut query = url.query_pairs_mut();
+        query
+            .append_pair("server", &target.server)
+            .append_pair("graph", &target.graph);
+        if let Some((type_name, id)) = node {
+            query.append_pair("type", type_name).append_pair("id", id);
+        }
+        if let Some(branch) = &target.branch {
+            query.append_pair("branch", branch);
+        }
+    }
+    url.to_string()
+}
+
 /// Reads a link, or says what is wrong with it.
 pub fn parse(link: &str) -> Result<DeepLink, String> {
     if link.len() > LINK_MAX {
@@ -272,6 +293,28 @@ mod tests {
             graph: "knowledge".into(),
             branch: None,
         }
+    }
+
+    /// A copied link opens what it was copied from: the graph and branch, and the node, with
+    /// what a query string must escape escaped.
+    #[test]
+    fn a_copied_link_opens_what_it_was_copied_from() {
+        let at = Target {
+            server: "https://graphs.example.com:8443/omnigraph".into(),
+            graph: "knowledge".into(),
+            branch: Some("review/q4 & more".into()),
+        };
+        assert_eq!(parse(&link_to(&at, None)), Ok(DeepLink::Graph(at.clone())));
+        assert_eq!(
+            parse(&link_to(&at, Some(("Person", "ada lovelace?&=")))),
+            Ok(DeepLink::Node {
+                target: at.clone(),
+                type_name: "Person".into(),
+                id: "ada lovelace?&=".into(),
+            })
+        );
+        let on_main = Target { branch: None, ..at };
+        assert!(!link_to(&on_main, None).contains("branch"));
     }
 
     #[test]

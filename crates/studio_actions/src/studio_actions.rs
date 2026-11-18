@@ -217,6 +217,9 @@ pub mod workspace {
             /// Read the open graph's schema, branches and counts again, and the view in
             /// focus; connect again to a server that did not answer.
             Refresh,
+            /// Copy a link to the node the tab shows, or else to its graph and branch: it opens
+            /// the same place in a Studio that knows the server, and carries no token.
+            CopyLink,
             /// Make text one size larger, in the interface and the query editor, and keep it:
             /// zoom in. Rows, columns and panels keep their size.
             IncreaseFontSize,

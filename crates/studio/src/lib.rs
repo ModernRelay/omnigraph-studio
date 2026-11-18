@@ -193,6 +193,10 @@ pub fn init(cx: &mut App) {
         workspace.register_action(|workspace, _: &OpenSettings, window, cx| {
             open_settings(workspace, window, cx);
         });
+        workspace.register_action_when(
+            |workspace, _| workspace.session().is_some(),
+            |workspace, _: &studio_actions::workspace::CopyLink, _, cx| copy_link(workspace, cx),
+        );
         workspace.register_action(|_, _: &studio_actions::workspace::ToggleMcpServer, _, cx| {
             studio_settings::update(cx, |settings| {
                 settings.agent.outside_agents = !settings.agent.outside_agents
@@ -260,6 +264,30 @@ fn open_design_system(workspace: &mut Workspace, window: &mut Window, cx: &mut C
         cx,
         design_gallery::DesignGallery::new,
     );
+}
+
+/// Copy Link: the node the active tab shows, or else the window's graph and branch, as a link
+/// that opens it again ([`deep_link::link_to`]).
+fn copy_link(workspace: &mut Workspace, cx: &mut Context<Workspace>) {
+    let Some(session) = workspace.session() else {
+        return;
+    };
+    let session = session.read(cx);
+    let target = deep_link::Target {
+        server: session.connection.read(cx).server.url.clone(),
+        graph: session.graph_id.clone(),
+        branch: (session.branch != "main").then(|| session.branch.clone()),
+    };
+    let node = match workspace.active_item().and_then(|item| item.thing(cx)) {
+        Some(studio_actions::Thing::Node { type_name, id }) => Some((type_name, id)),
+        _ => None,
+    };
+    let link = deep_link::link_to(
+        &target,
+        node.as_ref()
+            .map(|(type_name, id)| (type_name.as_str(), id.as_str())),
+    );
+    cx.write_to_clipboard(gpui::ClipboardItem::new_string(link));
 }
 
 /// Opens the settings tab, offering the workspace's graph as a scope.
@@ -1802,6 +1830,35 @@ mod start_tests {
             work.read_with(cx, |work, _| work.state.clone()),
             ConnectionState::Idle,
             "the other credential is not used"
+        );
+    }
+
+    /// Copy Link puts a link to the window's graph and branch on the clipboard, which opens
+    /// the same place again; one on main names no branch.
+    #[gpui::test]
+    fn copy_link_copies_where_the_window_is(cx: &mut TestAppContext) {
+        let (_registry, servers, _asked) = studio_with_servers(cx);
+        let session = cx.new(|cx| {
+            graph_store::GraphSession::new(
+                servers[0].clone(),
+                "knowledge".into(),
+                "review".into(),
+                cx,
+            )
+        });
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.set_session(session.clone(), window, cx)
+        });
+        workspace.update(cx, copy_link);
+        let copied = cx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(
+            deep_link::parse(&copied.unwrap()),
+            Ok(deep_link::DeepLink::Graph(deep_link::Target {
+                server: "http://a.test".into(),
+                graph: "knowledge".into(),
+                branch: Some("review".into()),
+            }))
         );
     }
 
