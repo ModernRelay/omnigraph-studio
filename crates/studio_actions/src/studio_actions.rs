@@ -172,14 +172,14 @@ pub mod workspace {
             About,
             /// Open Studio's settings.
             OpenSettings,
-            /// Open Studio's settings at Agent: the agent the panel runs, and whether agents
-            /// outside Studio may show things in Studio.
+            /// Open Studio's settings at Agent: the agent the panel runs, and Studio's MCP server
+            /// for external agents.
             OpenAgentSettings,
-            /// Let agents outside Studio show things in Studio, or stop letting them.
-            ToggleOutsideAgents,
-            /// Replace the token agents outside Studio use: every agent holding the old one is
+            /// Start or stop Studio's MCP server for external agents.
+            ToggleMcpServer,
+            /// Replace the MCP server's token: every external agent holding the old one is
             /// refused from then on, until its command is copied again.
-            ReplaceAgentToken,
+            ReplaceMcpToken,
             /// Switch the window's graph to another branch.
             SwitchBranch,
             /// Open a new window.

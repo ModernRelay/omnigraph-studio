@@ -2226,7 +2226,7 @@ mod tests {
         assert!(selection.json.to_string().len() <= ANSWER_BUDGET);
     }
 
-    /// With "Bring the window to the front" on, a window an agent shows something in comes to
+    /// With "Bring Studio to the front" on, a window an agent shows something in comes to
     /// the front; off, it stays behind.
     #[gpui::test]
     async fn the_window_comes_to_the_front_only_when_the_person_asked(cx: &mut TestAppContext) {

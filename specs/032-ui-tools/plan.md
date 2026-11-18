@@ -263,7 +263,7 @@ the pane's preview tab where the action supports `preview`, so the person's pinn
 tool never closes a tab or changes the filters of a tab the person has open: a filtered table
 (`graph_open_type` with `filter_id`) opens as a tab of its own, which the person can close, and
 the type's open table is left as it is. If the window is not in front, the tool opens its tab
-there and does not raise the window, unless the person turned on "Bring the window to the front
+there and does not raise the window, unless the person turned on "Bring Studio to the front
 when an agent shows something". The window shows one chip in the status bar, "Opened by
 <agent>", for 4 seconds; the chip uses the motion rules in VII.
 
@@ -387,9 +387,9 @@ form for the `studio` server, and shows the result's words instead: "Opened Proj
 On by default (2026-11-16, at Ragnor's request; kept on 2026-11-18). Since 2026-11-18 the
 server starts only when an agent is let in, so with this switch off, and no conversation
 started, no server runs, no keychain item is read and no token file is written. The switches are
-in Settings, under Agent:
+in Settings, under Agent. Their names say what they are (renamed 2026-11-18, at Ragnor's request: "Let agents outside Studio show things in Studio" did not say it was an MCP server, which is the word a person setting up Claude Code or Codex looks for). Their keys in `settings.json` are unchanged:
 
-- **Let agents outside Studio show things in Studio.** When on, Studio writes
+- **Run Studio's MCP server for external agents.** When on, Studio writes
   `<data dir>/ui-tools/endpoint.json` (mode 0600, with `studio_settings::write_atomic`) with
   `url` and `token`. The token is 32 random bytes, encoded as base64url, and it changes each
   time Studio starts. The row below the switch shows the command that adds Studio to Claude Code,
@@ -398,7 +398,7 @@ in Settings, under Agent:
   shows the `config.toml` entry: `url`, `bearer_token_env_var`, and an `approval_mode =
   "approve"` line per tool, since Codex otherwise asks before each call.
 - When off, an outside token is refused and the file is deleted.
-- **Keep the same address between starts**, on by default. Studio asks for the port it used
+- **Keep the server's address and token between starts**, on by default. Studio asks for the port it used
   last, then `agent.ui_tools_port` (24187, below) and the nine after it, passing over any another
   process holds, and only then takes one the system chooses; the row says which port is in use
   when it is not the one asked for, and that the command must be copied again. It never takes a
@@ -407,10 +407,10 @@ in Settings, under Agent:
   command keeps working across restarts; `endpoint.json` and `token` are still written for the
   copied commands. **New token** replaces it, confirmed with ↵ since nothing is lost: every agent
   holding the old one gets 401 from then on. Off, the address and token are made per run.
-- **Let the agent in Studio show things in the window**, on by default. The server starts with
+- **Give the agent panel Studio's UI tools**, on by default. The server starts with
   the first conversation that asks for its entry. Off, a conversation names no UI tool server,
   passes none in `session/new`, asks for no entry, and `AGENTS.md` says nothing of one.
-- **Bring the window to the front when an agent shows something**, off by default.
+- **Bring Studio to the front when an agent shows something**, off by default.
 
 ### The port
 
@@ -523,7 +523,7 @@ fixed here:
 - `tree_open_table` on a relationship's row filters the type's open table, as the person's own
   click does: the rule that a tool never changes an open tab's filters is kept only for
   `graph_open_type` (`UiTool::apart_when_filtered`).
-- "Bring the window to the front" calls `Window::activate_window` only, which does not pass
+- "Bring Studio to the front" calls `Window::activate_window` only, which does not pass
   another application's window on macOS.
 - The port used last is tried before `agent.ui_tools_port`, so a port set after the first start
   is not asked for.
