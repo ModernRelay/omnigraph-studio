@@ -3,7 +3,8 @@
 
 use gpui::{Action, Context, Entity, Render, Subscription, Window};
 use semver::Version;
-use studio_actions::update::{DownloadUpdate, RestartToUpdate};
+use studio_actions::update::{DownloadUpdate, RestartToUpdate, ViewReleaseNotes};
+use studio_ui::ds::Tipped as _;
 use studio_update::{UpdateState, Updater};
 use ui::prelude::*;
 
@@ -12,6 +13,10 @@ pub(crate) struct Shown {
     pub text: String,
     /// A button's label and the action it runs.
     pub button: Option<(String, Box<dyn Action>)>,
+    /// What the button does, where its label does not say.
+    pub tip: Option<String>,
+    /// Release Notes beside the button, for an update Studio does not install itself.
+    pub notes: bool,
     /// Work under way that the person asked for: a spinner before the text. Work in the
     /// background shows its text alone, so nothing moves on screen unasked (constitution VII).
     pub busy: bool,
@@ -22,6 +27,8 @@ pub(crate) fn shown(state: &UpdateState, running: &Version, asked: bool) -> Opti
     let said = |text: String, busy: bool| Shown {
         text,
         button: None,
+        tip: None,
+        notes: false,
         busy: busy && asked,
         error: false,
     };
@@ -41,6 +48,8 @@ pub(crate) fn shown(state: &UpdateState, running: &Version, asked: bool) -> Opti
                 format!("Restart to update to {version}"),
                 RestartToUpdate.boxed_clone(),
             )),
+            tip: None,
+            notes: false,
             busy: false,
             error: false,
         },
@@ -49,6 +58,8 @@ pub(crate) fn shown(state: &UpdateState, running: &Version, asked: bool) -> Opti
                 .clone()
                 .unwrap_or_else(|| format!("{version} is available")),
             button: Some(("Download".into(), DownloadUpdate.boxed_clone())),
+            tip: Some(format!("Open the {version} download in your browser")),
+            notes: true,
             busy: false,
             error: false,
         },
@@ -103,8 +114,18 @@ impl Render for UpdateStatus {
             })
             .children(shown.button.map(|(label, action)| {
                 studio_ui::ds::button("update-action", label)
+                    .when_some(shown.tip, |button, tip| {
+                        button.tip(studio_ui::ds::tooltip(tip))
+                    })
                     .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
             }))
+            .when(shown.notes, |item| {
+                item.child(
+                    studio_ui::ds::button("update-notes", "Release Notes").on_click(
+                        |_, window, cx| window.dispatch_action(ViewReleaseNotes.boxed_clone(), cx),
+                    ),
+                )
+            })
             .into_any_element()
     }
 }
@@ -128,6 +149,30 @@ mod tests {
         let shown = shown(&downloading, &Version::new(0, 2, 1), false).unwrap();
         assert_eq!(shown.text, "Downloading 0.3.0 · 42%");
         assert!(!shown.busy);
+    }
+
+    /// An update Studio does not install itself offers its download, saying it opens in the
+    /// browser, and its release notes beside it (spec 017, Linux and Windows).
+    #[test]
+    fn an_update_to_download_offers_its_release_notes() {
+        let available = UpdateState::Available {
+            version: Version::new(0, 3, 0),
+            reason: None,
+        };
+        let shown = shown(&available, &Version::new(0, 2, 1), false).unwrap();
+        assert!(shown.notes);
+        assert_eq!(
+            shown.tip.as_deref(),
+            Some("Open the 0.3.0 download in your browser")
+        );
+        let ready = UpdateState::Ready {
+            version: Version::new(0, 3, 0),
+        };
+        assert!(
+            !super::shown(&ready, &Version::new(0, 2, 1), false)
+                .unwrap()
+                .notes
+        );
     }
 
     #[test]
