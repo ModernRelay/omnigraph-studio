@@ -118,7 +118,10 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::NoKey => write!(f, "No OpenRouter key is stored. Add one in Settings."),
+            Error::NoKey => write!(
+                f,
+                "No OpenRouter key is stored. Add one in Settings, under Models."
+            ),
             Error::Refused(status, message) => {
                 write!(f, "OpenRouter answered {status}: {message}")
             }

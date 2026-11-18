@@ -44,7 +44,7 @@ pub fn init(cx: &mut App) {
     // A restored tab comes back with its conversation.
     studio_workspace::register_item_kind(cx, "agent", |data, workspace, window, cx| {
         match data.get("session").and_then(|id| id.as_str()) {
-            Some(id) => panel::open_session(workspace, id.to_owned(), window, cx),
+            Some(id) => panel::open_session(workspace, id.to_owned(), false, window, cx),
             None => panel::new_conversation(workspace, window, cx),
         };
     });
@@ -78,13 +78,21 @@ pub fn init(cx: &mut App) {
             panel::new_conversation(workspace, window, cx);
         });
         workspace.register_action(|workspace, action: &OpenConversation, window, cx| {
-            panel::open_session(workspace, action.session.clone(), window, cx);
+            panel::open_session(
+                workspace,
+                action.session.clone(),
+                action.preview,
+                window,
+                cx,
+            );
         });
         workspace.register_action(|workspace, _: &ShowConversations, _window, cx| {
             workspace.activate_panel(sessions_panel::PANEL_ID, cx);
         });
         workspace.register_action(|workspace, action: &Ask, window, cx| {
             if let Some(panel) = panel::open(workspace, window, cx) {
+                // What is asked is work in that tab: a preview tab holding it stays.
+                workspace.keep_tab(panel.entity_id());
                 let text = action.text.clone();
                 panel.update(cx, |panel, cx| panel.send_text(text, window, cx));
             }

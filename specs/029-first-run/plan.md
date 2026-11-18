@@ -277,7 +277,7 @@ the schema failed and no tab is open, as `sign_in_prompt` does:
 
 | Kind | Title | Detail | Actions |
 |---|---|---|---|
-| NotFound | "No graph named `ID` on SERVER" | the server's graph ids when it lists them ("It has: a, b, c"), else "This server does not list its graphs." | a row per listed graph (opens it in this window), **Open a graph…** |
+| NotFound | "No graph named `ID` on SERVER" | the graph ids the server itself lists, without the one that is missing ("It has: a, b, c"; "This server lists no other graph." when it lists that one alone), else "This server does not list its graphs." | a row per graph so named (opens it in this window), **Open a graph…** |
 | Unauthorized | "SERVER refused the token" | the refusal's reason | a masked token field and **Update token** (the dialog's flow), **Open a graph…** |
 | Forbidden | "This token may not read `ID`" | the server's reason | **Open a graph…** |
 | Unreachable | "Could not reach SERVER" | the transport error, and for a loopback address "Is `omnigraph-server` running?" | **Retry** (reloads the schema), **Open a graph…** |
@@ -356,6 +356,7 @@ E1 (`omnigraph studio`) would replace the local recipe.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-11-15 | The page for a missing graph names what the server listed, and never the missing graph | `graph_store` `connection::tests::a_remembered_graph_is_offered_but_not_listed` (`listed_graph_ids` holds the listing or the discovery alone, `graph_ids` still offers a remembered id after it), `studio_workspace` `open_failure::tests::a_missing_graph_is_not_said_to_be_on_the_server` (the line and the rows for a listing with and without the missing id, an empty one and none). Offscreen (`crates/studio/examples/snapshot.rs`, a window opened on `knowlege` at the sample server, which lists `knowledge` and `notes`): "It has: knowledge, notes." over those two rows | Fixed. The page took its graphs from `Connection::graph_ids`, which adds the ids Studio remembers for the server. A graph is remembered when it is asked for, so "No graph named X" was followed by "It has: …, X." and a row that opened X again |
 | 2026-11-11 | The CLI refuses a token target at a loopback `http://` endpoint | `target add loc --json` with `{"kind":"server","endpoint":"http://127.0.0.1:8787/","auth":{"provider":"token","source":{"store":{}}}}` on a fresh operator file, CLI 0.15.0 | `targets.loc.endpoint: endpoint requires HTTPS; HTTP is only allowed for anonymous loopback servers` |
 | 2026-11-11 | The recipe makes a graph a server can serve | `cluster apply --target DATA --config SRC --json` with the cluster.yaml and schema above | `knowledge` `outcome: created`, `converged: true` |
 | 2026-11-11 | The server will not start while apply's lock is held | `omnigraph-server --cluster DATA --bind 127.0.0.1:8799 --unauthenticated` before `force-unlock` | exits with a panic at `crates/omnigraph-server/src/settings.rs:79`; after the `sed` one-liner's `force-unlock`, `serving omnigraph … graph_count=1` |
@@ -386,5 +387,9 @@ E1 (`omnigraph studio`) would replace the local recipe.
   the Data panel says "The graph did not open." with the server's words and Try again.
 - **Dialog rows are one line**, title and meta side by side as the graph rows are, rather than a
   new two-line row size.
+- **The missing graph's page listed the missing graph** (2026-11-15): its "It has:" line and its
+  rows came from the ids Studio offers for a server, the remembered ones among them, where the
+  design says the server's own. They come from the server's listing now, without the graph that
+  would not open.
 - **The agent's sign-in restarts the agent's conversation** once the agent accepts it, on the same
   agent process, which the panel holds while the sign-in runs.

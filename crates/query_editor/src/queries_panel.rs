@@ -105,17 +105,19 @@ impl PanelRow {
         }
     }
 
-    /// What opening the row dispatches, as a click and ↵ do.
-    fn open(&self) -> Option<Box<dyn Action>> {
+    /// What opening the row dispatches. With `preview` it opens as the pane's preview tab, as
+    /// one click does; a double click and ↵ keep it (spec 020).
+    fn open(&self, preview: bool) -> Option<Box<dyn Action>> {
         match self {
             PanelRow::Saved { path, .. } => Some(Box::new(OpenQueryFile {
                 path: Some(path.to_string_lossy().into_owned()),
                 view: None,
+                preview,
             })),
             PanelRow::Stored { name, .. } => Some(Box::new(OpenStoredQuery {
                 name: name.clone(),
                 view: None,
-                preview: false,
+                preview,
             })),
             _ => None,
         }
@@ -271,35 +273,39 @@ impl QueriesPanel {
         self.step(false, cx);
     }
 
-    /// Opens the selected row's query, as clicking it does.
+    /// Opens the selected row's query in a tab that stays, as a double click does.
     fn open_selected(&mut self, _: &OpenSelected, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(open) = self
             .selected_row()
             .and_then(|ix| self.rows.get(ix))
-            .and_then(PanelRow::open)
+            .and_then(|row| row.open(false))
         {
             window.dispatch_action(open, cx);
         }
     }
 
     /// What clicking row `ix` does: selects it, so the keyboard goes on from it, and opens it.
+    /// One click opens it as the pane's preview tab, which the next preview replaces, and a
+    /// double click keeps it, as in every list (spec 020). Before, one click opened a tab
+    /// that stayed, so looking through the queries left a tab for each.
     fn click(
         &self,
         ix: usize,
         cx: &mut Context<Self>,
-    ) -> impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static {
+    ) -> impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static + use<> {
         let panel = cx.entity().downgrade();
-        let row = self.rows.get(ix);
-        let (key, open) = (row.and_then(PanelRow::key), row.and_then(PanelRow::open));
-        move |_, window, cx| {
+        let row = self.rows.get(ix).cloned();
+        let key = row.as_ref().and_then(PanelRow::key);
+        move |event, window, cx| {
             panel
                 .update(cx, |panel, cx| {
                     panel.selected = key.clone();
                     cx.notify();
                 })
                 .ok();
-            if let Some(open) = &open {
-                window.dispatch_action(open.boxed_clone(), cx);
+            let preview = event.click_count() < 2;
+            if let Some(open) = row.as_ref().and_then(|row| row.open(preview)) {
+                window.dispatch_action(open, cx);
             }
         }
     }
@@ -683,6 +689,104 @@ mod tests {
     /// click does, a saved file and a stored query alike. The selection stays on its query
     /// while the rows above it change. Nothing reads the catalog before the panel is drawn:
     /// drawing it asks for it.
+    /// A mouse click of `count` presses, as a row's handler is given it.
+    fn click_of(count: usize) -> gpui::ClickEvent {
+        let (button, position, modifiers) = (
+            gpui::MouseButton::Left,
+            gpui::Point::default(),
+            gpui::Modifiers::default(),
+        );
+        gpui::ClickEvent::Mouse(gpui::MouseClickEvent {
+            down: gpui::MouseDownEvent {
+                button,
+                position,
+                modifiers,
+                click_count: count,
+                first_mouse: false,
+            },
+            up: gpui::MouseUpEvent {
+                button,
+                position,
+                modifiers,
+                click_count: count,
+            },
+        })
+    }
+
+    /// One click opens a query as the pane's preview tab, which the next preview replaces; a
+    /// double click and ↵ open it to stay (spec 020), for a saved file and a stored query
+    /// alike. Before, one click opened a tab that stayed, so looking through the queries left
+    /// a tab for each.
+    #[gpui::test]
+    async fn a_click_previews_a_query_and_a_double_click_or_return_keeps_it(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(studio_theme::init_test);
+        let session = session(cx);
+        cx.run_until_parked();
+        let opened: Arc<Mutex<Vec<(String, bool)>>> = Arc::default();
+        cx.update(|cx| {
+            cx.bind_keys([KeyBinding::new("enter", OpenSelected, Some("QueriesPanel"))]);
+            let files = opened.clone();
+            cx.on_action(move |open: &OpenQueryFile, _| {
+                let path = open.path.clone().unwrap_or_default();
+                files.lock().unwrap().push((path, open.preview));
+            });
+            let stored = opened.clone();
+            cx.on_action(move |open: &OpenStoredQuery, _| {
+                stored
+                    .lock()
+                    .unwrap()
+                    .push((open.name.clone(), open.preview));
+            });
+        });
+        let (panel, cx) = cx.add_window_view(|window, cx| {
+            QueriesPanel::new(WeakEntity::new_invalid(), Some(session), window, cx)
+        });
+        cx.run_until_parked();
+        let people = PathBuf::from("/queries/people.gq");
+        panel.update(cx, |panel, cx| {
+            panel.files = vec![(people.clone(), SystemTime::UNIX_EPOCH)];
+            panel.files_of = panel.graph_key(cx);
+            cx.notify();
+        });
+        cx.update(|window, cx| window.focus(&panel.focus_handle(cx), cx));
+        cx.run_until_parked();
+        let file = RowKey::Saved(people.clone());
+        let stored = RowKey::Stored("people_titled".into());
+        let click = |key: &RowKey, count: usize, cx: &mut gpui::VisualTestContext| {
+            let handler = panel.update(cx, |panel, cx| {
+                let ix = panel.rows.iter().position(|row| row.is(key));
+                panel.click(ix.expect("the row"), cx)
+            });
+            cx.update(|window, cx| handler(&click_of(count), window, cx));
+            cx.run_until_parked();
+            assert_eq!(
+                panel.read_with(cx, |panel, _| panel.selected.clone()),
+                Some(key.clone()),
+                "a click selects the row"
+            );
+        };
+
+        click(&file, 1, cx);
+        click(&file, 2, cx);
+        click(&stored, 1, cx);
+        click(&stored, 2, cx);
+        // ↵ on the row the last click selected.
+        cx.simulate_keystrokes("enter");
+        let file = people.to_string_lossy().into_owned();
+        assert_eq!(
+            *opened.lock().unwrap(),
+            [
+                (file.clone(), true),
+                (file, false),
+                ("people_titled".to_owned(), true),
+                ("people_titled".to_owned(), false),
+                ("people_titled".to_owned(), false),
+            ]
+        );
+    }
+
     #[gpui::test]
     async fn the_rows_are_selected_and_opened_by_keys(cx: &mut TestAppContext) {
         cx.update(studio_theme::init_test);

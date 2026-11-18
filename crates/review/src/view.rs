@@ -42,7 +42,7 @@ use studio_ui::{
     ChangeKind, RelationshipLine, TextFolds, change_counts, group_digits, short_commit_id,
     type_swatch,
 };
-use studio_workspace::models::{Error as ModelError, Models, Request as ModelRequest};
+use studio_workspace::models::{self, Error as ModelError, Models, Request as ModelRequest};
 use studio_workspace::{
     Inspected, InspectedNode, Item, ItemEvent, SavedItem, Workspace, workspace_for,
 };
@@ -3037,11 +3037,15 @@ impl ReviewView {
                 studio_ui::ds::tooltip_with_meta(
                     "A model's summary of the branch, for the reviewer",
                     Some(&Summarize),
-                    format!(
-                        "{} go to {}",
-                        summary::TASK.sends,
-                        Models::model_for(summary::TASK.tier, cx)
-                    ),
+                    if Models::needs_key(cx) {
+                        models::needs_key_tip("Summarize")
+                    } else {
+                        format!(
+                            "{} go to {}",
+                            summary::TASK.sends,
+                            Models::model_for(summary::TASK.tier, cx)
+                        )
+                    },
                     cx,
                 )
             })
