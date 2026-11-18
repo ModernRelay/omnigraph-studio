@@ -24,15 +24,16 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use gpui::{AnyElement, App, ClickEvent, Div, ElementId, Stateful, Window};
-use gq_language::SchemaModel;
+use gq_language::{ScalarKind, SchemaModel};
 use graph_store::{
     EntityGroup, EntityGroups, FoldedChange, FoldedChanges, GroupRun, GroupSection, NetChange,
     NodeNames, RelationshipEntry, TypeCounts, entity_name,
 };
+use serde_json::Value;
 use studio_ui::ds::Tipped as _;
 use studio_ui::ds::{radii, space};
 use studio_ui::{
-    ChangeKind, PropertyRow, RelationshipLine, TextFolds, change_counts, group_digits,
+    ChangeKind, PropertyRow, RelationshipLine, TextFolds, change_counts, format_bytes, group_digits,
 };
 use ui::SharedString;
 use ui::prelude::*;
@@ -912,11 +913,96 @@ fn kind_of(net: Option<NetChange>) -> ChangeKind {
 }
 
 fn property_rows(change: &FoldedChange, schema: Option<&SchemaModel>) -> Vec<PropertyRow> {
+    let blobs = blob_properties(change, schema);
     change
         .card_diffs(schema)
         .into_iter()
-        .map(|diff| PropertyRow::new(diff.name, diff.before.as_ref(), diff.after.as_ref()))
+        .map(|diff| {
+            if blobs.contains(&diff.name.as_str()) {
+                let (before, after) = blob_sides(diff.before.as_ref(), diff.after.as_ref());
+                return PropertyRow::new(diff.name, before.as_ref(), after.as_ref());
+            }
+            PropertyRow::new(diff.name, diff.before.as_ref(), diff.after.as_ref())
+        })
         .collect()
+}
+
+/// The names of the change's type's Blob properties, as the schema declares them.
+fn blob_properties<'a>(change: &FoldedChange, schema: Option<&'a SchemaModel>) -> Vec<&'a str> {
+    let Some(schema) = schema else {
+        return Vec::new();
+    };
+    let properties = if change.is_edge() {
+        schema.edge(&change.type_name).map(|e| &e.properties)
+    } else {
+        schema.node(&change.type_name).map(|n| &n.properties)
+    };
+    properties
+        .into_iter()
+        .flatten()
+        .filter(|p| p.kind == ScalarKind::Blob)
+        .map(|p| p.name.as_str())
+        .collect()
+}
+
+/// A Blob's two sides as a card says them, never its bytes: the change feed spells a stored
+/// value `base64:<bytes>`, an external one by its URI, and a range of an object as
+/// `{"uri", "offset", "length"}`. Two values that read alike (the same size) each add a short
+/// mark of their bytes, so a changed Blob never reads unchanged.
+fn blob_sides(before: Option<&Value>, after: Option<&Value>) -> (Option<Value>, Option<Value>) {
+    let mut b = before.map(blob_words);
+    let mut a = after.map(blob_words);
+    if let (Some(Value::String(bw)), Some(Value::String(aw)), Some(bv), Some(av)) =
+        (&mut b, &mut a, before, after)
+        && bw == aw
+        && bv != av
+    {
+        bw.push_str(&format!(" · {}", fingerprint(bv)));
+        aw.push_str(&format!(" · {}", fingerprint(av)));
+    }
+    (b, a)
+}
+
+/// What a Blob value is, in the words a card shows: "Blob · 2.1 KB", "Blob · s3://…", or
+/// null as it is.
+fn blob_words(value: &Value) -> Value {
+    let words = match value {
+        Value::Null => return Value::Null,
+        Value::String(text) => match text.strip_prefix("base64:") {
+            Some(payload) => format!("Blob · {}", format_bytes(base64_len(payload))),
+            None => format!("Blob · {text}"),
+        },
+        Value::Object(range) => {
+            let uri = range.get("uri").and_then(Value::as_str).unwrap_or("?");
+            match range.get("length").and_then(Value::as_u64) {
+                Some(length) => format!("Blob · {} of {uri}", format_bytes(length)),
+                None => format!("Blob · {uri}"),
+            }
+        }
+        _ => "Blob".to_owned(),
+    };
+    Value::String(words)
+}
+
+/// How many bytes a base64 payload decodes to, from its length alone.
+fn base64_len(payload: &str) -> u64 {
+    let payload = payload.trim();
+    let padding = payload.bytes().rev().take_while(|&b| b == b'=').count();
+    let chars = payload.len() - padding;
+    (chars as u64 * 3) / 4
+}
+
+/// Six hex digits that tell two values apart (FNV-1a over the value as the feed spelled it).
+fn fingerprint(value: &Value) -> String {
+    let text = match value {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    };
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in text.bytes() {
+        hash = (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193);
+    }
+    format!("{:06x}", hash & 0x00ff_ffff)
 }
 
 #[cfg(test)]
@@ -980,6 +1066,40 @@ mod tests {
         assert_eq!(kind_words(0, 1, 0, false), "1 node changed");
         assert_eq!(section_words(GroupSection::Existing), "Existing");
         assert_eq!(section_words(GroupSection::Added), "New");
+    }
+
+    /// A Blob reads as its size, or where its bytes are, never as its bytes; two of one size
+    /// that differ each carry a mark so the change shows.
+    #[test]
+    fn a_blob_reads_as_its_size_not_its_bytes() {
+        use serde_json::json;
+        // "hello" is five bytes, "aGVsbG8=" in base64.
+        assert_eq!(blob_words(&json!("base64:aGVsbG8=")), json!("Blob · 5 B"));
+        assert_eq!(base64_len(&"QUJD".repeat(700)), 2_100);
+        assert_eq!(
+            blob_words(&json!("s3://bucket/report.pdf")),
+            json!("Blob · s3://bucket/report.pdf")
+        );
+        assert_eq!(
+            blob_words(&json!({"uri": "s3://b/o", "offset": 10, "length": 2_140})),
+            json!("Blob · 2.1 KB of s3://b/o")
+        );
+        assert_eq!(blob_words(&Value::Null), Value::Null);
+
+        let (b, a) = blob_sides(
+            Some(&json!("base64:aGVsbG8=")),
+            Some(&json!("base64:d29ybGQ=")),
+        );
+        let (b, a) = (b.unwrap(), a.unwrap());
+        assert_ne!(b, a, "a changed Blob of the same size still reads changed");
+        assert!(b.as_str().unwrap().starts_with("Blob · 5 B · "));
+        let (b, a) = blob_sides(Some(&json!("base64:aGk=")), Some(&json!("base64:aGVsbG8=")));
+        assert_eq!(
+            (b.unwrap(), a.unwrap()),
+            (json!("Blob · 2 B"), json!("Blob · 5 B"))
+        );
+        let (b, a) = blob_sides(None, Some(&json!("base64:aGk=")));
+        assert_eq!((b, a.unwrap()), (None, json!("Blob · 2 B")));
     }
 
     /// A card of many relationships shows its first few, more each time they are asked for,
