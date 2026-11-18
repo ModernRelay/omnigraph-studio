@@ -49,6 +49,8 @@
       "cmd-alt-shift-2": ["studio::OpenViewAt", { "index": 1, "beside": true }],
       "cmd-alt-3": ["studio::OpenViewAt", { "index": 2 }],
       "cmd-alt-shift-3": ["studio::OpenViewAt", { "index": 2, "beside": true }],
+      "cmd-alt-4": ["studio::OpenViewAt", { "index": 3 }],
+      "cmd-alt-shift-4": ["studio::OpenViewAt", { "index": 3, "beside": true }],
       "shift-escape": "studio::ToggleZoom",
       "ctrl-cmd-enter": "studio::ToggleFocusMode",
       "cmd-w": "studio::CloseActiveItem",
@@ -223,6 +225,28 @@
       "cmd-alt-f": "studio_table::FilterBySelection",
       "cmd-alt-u": "studio_blob::ChooseFile",
       "ctrl-cmd-backspace": "studio_blob::ClearValue"
+    }
+  },
+  {
+    "context": "Gallery",
+    "bindings": {
+      "left": "studio_gallery::MoveLeft",
+      "right": "studio_gallery::MoveRight",
+      "up": "studio_gallery::MoveUp",
+      "down": "studio_gallery::MoveDown",
+      "home": "studio_gallery::MoveToFirst",
+      "end": "studio_gallery::MoveToLast",
+      "space": "studio::ToggleInspector",
+      "enter": "studio_gallery::OpenFile",
+      "cmd-enter": "studio_gallery::OpenRowPage",
+      "x": "studio_gallery::TogglePick",
+      "cmd-a": "studio_gallery::PickAll",
+      "escape": "studio_gallery::ClearPicks",
+      "cmd-c": "studio_gallery::CopyIds",
+      "f": "studio_gallery::ShowNextFile",
+      "=": "studio_gallery::LargerTiles",
+      "-": "studio_gallery::SmallerTiles",
+      "cmd-r": "studio_gallery::Refresh"
     }
   },
   {

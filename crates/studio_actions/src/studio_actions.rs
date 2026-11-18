@@ -32,6 +32,8 @@ pub enum ViewKind {
     Source,
     Review,
     History,
+    /// A type's rows as tiles of their files (spec 035).
+    Gallery,
 }
 
 impl ViewKind {
@@ -45,6 +47,7 @@ impl ViewKind {
             Self::Source => "Source",
             Self::Review => "Review",
             Self::History => "History",
+            Self::Gallery => "Gallery",
         }
     }
 }
@@ -343,6 +346,8 @@ pub mod graph {
             OpenAsReview,
             /// Show this branch's commits.
             OpenAsHistory,
+            /// Show what the active tab shows as tiles of its files.
+            OpenAsGallery,
             /// Create a branch from the current branch.
             CreateBranch,
             /// Delete the current branch.
@@ -430,6 +435,41 @@ pub mod graph {
         #[serde(default)]
         pub at_commit: Option<String>,
         /// The row selected at opening, by id.
+        #[serde(default)]
+        pub select: Option<String>,
+        /// Open as the pane's preview tab, which the next preview replaces (spec 002).
+        #[serde(default)]
+        pub preview: bool,
+    }
+
+    /// Show a set of a node type's rows as tiles of one of its files (spec 035): the type's rows
+    /// under filters and an order, or the rows listed, fixed at opening.
+    #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema, Action)]
+    #[action(namespace = studio_graph)]
+    pub struct ShowSetInGallery {
+        /// The set in words, as its tab names it: "Note, design".
+        pub title: String,
+        pub type_name: String,
+        /// The filters it reads under, as a table keeps them.
+        #[serde(default)]
+        pub filters: Option<serde_json::Value>,
+        /// The order it reads in: `{"property", "descending"}`, as a table keeps it.
+        #[serde(default)]
+        pub sort: Option<serde_json::Value>,
+        /// The rows it holds, by id, when they are listed rather than read.
+        #[serde(default)]
+        pub ids: Option<Vec<String>>,
+        /// The Blob property its tiles show; the type's first when `None`.
+        #[serde(default)]
+        pub property: Option<String>,
+        /// Read held at this commit, read-only; `None` follows the branch head.
+        #[serde(default)]
+        pub at_commit: Option<String>,
+        /// The commit its first reads are pinned to while it follows the branch: the commit the
+        /// table it came from read, so it shows the same rows.
+        #[serde(default)]
+        pub snapshot: Option<String>,
+        /// The row whose tile has the cursor at opening, by id.
         #[serde(default)]
         pub select: Option<String>,
         /// Open as the pane's preview tab, which the next preview replaces (spec 002).
@@ -715,6 +755,48 @@ pub mod table {
             CopyAsStoredQuery,
             /// Show the view as it was saved, leaving what was changed in its tab.
             RevertView,
+        ]
+    );
+}
+
+pub mod gallery {
+    use gpui::actions;
+
+    actions!(
+        studio_gallery,
+        [
+            /// Move the cursor to the tile before.
+            MoveLeft,
+            /// Move the cursor to the tile after.
+            MoveRight,
+            /// Move the cursor to the tile a line up.
+            MoveUp,
+            /// Move the cursor to the tile a line down.
+            MoveDown,
+            /// Move the cursor to the first tile.
+            MoveToFirst,
+            /// Move the cursor to the last tile read.
+            MoveToLast,
+            /// Open the file of the tile under the cursor in a tab of its own.
+            OpenFile,
+            /// Open the row of the tile under the cursor as a page.
+            OpenRowPage,
+            /// Pick the tile under the cursor, or take it out of the picks.
+            TogglePick,
+            /// Pick every tile read.
+            PickAll,
+            /// Take every tile out of the picks.
+            ClearPicks,
+            /// Copy the picked rows' ids, a line each, or the id of the row under the cursor.
+            CopyIds,
+            /// Show the next file property on the tiles.
+            ShowNextFile,
+            /// Make the tiles larger.
+            LargerTiles,
+            /// Make the tiles smaller.
+            SmallerTiles,
+            /// Read the gallery again: from the branch head, or at the commit it is held at.
+            Refresh,
         ]
     );
 }
