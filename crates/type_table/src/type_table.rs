@@ -10,6 +10,7 @@ mod branch_diff;
 mod cell_select;
 mod dialogs;
 mod fill;
+mod gallery;
 mod grouping;
 mod model;
 mod node_page;
@@ -21,6 +22,7 @@ mod table;
 #[cfg(test)]
 mod test_support;
 mod text_editor;
+mod tile;
 mod types_list;
 use filter_words as words;
 mod write;
@@ -31,12 +33,13 @@ use graph_store::GraphSession;
 use serde_json::Value;
 use studio_actions::graph::{
     OpenBlob, OpenNode, OpenNodePage, OpenSavedView, OpenTextEditor, OpenType, RestoreSavedView,
-    UndoDelete,
+    ShowSetInGallery, UndoDelete,
 };
 use studio_workspace::{PanelPosition, ToastKind, Workspace};
 use ui::IconName;
 
 use blob_view::BlobView;
+use gallery::{TileSize, TypeGallery};
 use node_page::NodePage;
 use peek::{NodePeek, PeekSubject};
 use table::{Opening, TypeTable};
@@ -87,6 +90,17 @@ pub fn init(cx: &mut App) {
             open_text_editor(workspace, &action, window, cx);
         }
     });
+    // A gallery comes back holding its set, at the commit it held or at the head (spec 035).
+    studio_workspace::register_item_kind(cx, "gallery", |data, workspace, window, cx| {
+        if let Ok(opening) = serde_json::from_value::<ShowSetInGallery>(data.clone()) {
+            let size = data
+                .get("size")
+                .cloned()
+                .and_then(|size| serde_json::from_value(size).ok())
+                .unwrap_or_default();
+            open_gallery(workspace, opening, size, window, cx);
+        }
+    });
     studio_workspace::register_item_kind(cx, "type_table", |data, workspace, window, cx| {
         if let Some((type_name, at_commit, opening)) = saved_table(data) {
             open_type(workspace, &type_name, at_commit, opening, false, window, cx);
@@ -116,6 +130,9 @@ pub fn init(cx: &mut App) {
         });
         workspace.register_action(|workspace, action: &RestoreSavedView, _window, cx| {
             restore_saved_view(workspace, action, cx);
+        });
+        workspace.register_action(|workspace, action: &ShowSetInGallery, window, cx| {
+            open_gallery(workspace, action.clone(), TileSize::default(), window, cx);
         });
         workspace.register_action(|workspace, action: &OpenBlob, window, cx| {
             open_blob(workspace, action, None, window, cx);
@@ -232,6 +249,48 @@ fn open_type(
     workspace.open_item_with::<TypeTable>(key, preview, window, cx, move |window, cx| {
         TypeTable::opening(handle, session, name, at_commit, opening, window, cx)
     })
+}
+
+/// Opens a set's gallery (spec 035), or activates it when it is open.
+fn open_gallery(
+    workspace: &mut Workspace,
+    opening: ShowSetInGallery,
+    size: TileSize,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Option<Entity<TypeGallery>> {
+    let session = workspace.session().cloned()?;
+    if let Some(schema) = session.read(cx).schema_model()
+        && schema.node(&opening.type_name).is_none()
+    {
+        workspace.show_toast(
+            ToastKind::Error,
+            format!("The schema has no node type {}.", opening.type_name),
+            cx,
+        );
+        return None;
+    }
+    let handle = cx.entity().downgrade();
+    let key = gallery_key(&opening);
+    let preview = opening.preview;
+    workspace.open_item_with::<TypeGallery>(key, preview, window, cx, move |window, cx| {
+        TypeGallery::new(handle, session, opening, size, window, cx)
+    })
+}
+
+/// A gallery's tab key: its type, the commit it holds, and the set it reads (spec 020, "Tab
+/// identity"); not the file it shows, which a person changes in the tab.
+pub(crate) fn gallery_key(opening: &ShowSetInGallery) -> String {
+    let set = serde_json::json!({
+        "filters": opening.filters,
+        "sort": opening.sort,
+        "ids": opening.ids,
+    });
+    format!(
+        "gallery/{}@{}/{set}",
+        opening.type_name,
+        opening.at_commit.as_deref().unwrap_or("head")
+    )
 }
 
 /// What every type table's tab key starts with ([`table_key`]).

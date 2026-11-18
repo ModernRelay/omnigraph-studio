@@ -1,0 +1,2114 @@
+//! A type's rows as tiles of one of their files (spec 035): a uniform grid of square previews
+//! with captions, one tab per set, read a page at a time at one commit. Each tile's file is
+//! read on its own through the Blob route once scrolling pauses, at most four at once, and
+//! drawn from a preview decoded and scaled off the main thread; the previews held are capped.
+
+use std::cell::Cell;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::ops::Range;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Duration;
+
+use collections::IndexSet;
+use gpui::{
+    AnyView, App, ClickEvent, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    KeyContext, Render, ScrollStrategy, SharedString, StyleRefinement, Subscription, Task,
+    UniformListScrollHandle, WeakEntity, Window, uniform_list,
+};
+use gq_language::{BuiltQuery, Filter, ScalarKind, SchemaModel, Sort, builder};
+use graph_client::api::ReadOutput;
+use graph_client::{BlobCell, BlobMeta, ReadError};
+use graph_store::scope::ReadScope;
+use graph_store::{GraphSession, HeadWatch, Loadable, NetChange, SessionEvent};
+use serde_json::Value;
+use studio_actions::gallery::{
+    ClearPicks, CopyIds, LargerTiles, MoveDown, MoveLeft, MoveRight, MoveToFirst, MoveToLast,
+    MoveUp, OpenFile, OpenRowPage, PickAll, Refresh, ShowNextFile, SmallerTiles, TogglePick,
+};
+use studio_actions::graph::{
+    OpenBlob, OpenNodePage, OpenType, ResultNode, ShowNodeOnCanvas, ShowSetInGallery, ShowSetInTree,
+};
+use studio_actions::workspace::ToggleInspector;
+use studio_actions::{ViewKind, ViewLink};
+use studio_ui::ds::{Tipped, space};
+use studio_ui::menu::ContextMenu;
+use studio_ui::{ChangeKind, plural};
+use studio_workspace::{Inspected, Item, ItemEvent, ItemStatus, KeyHint, SavedItem, Workspace};
+use ui::PopoverMenu;
+use ui::prelude::*;
+
+use crate::branch_diff::{BranchDiff, TARGET};
+use crate::model::{Paging, Row, node_rows};
+use crate::peek::{NodePeek, PeekSubject};
+use crate::tile::{self, FIRST_READ, Facts, Look};
+
+/// How long scrolling rests before the tiles drawn are read, as the table's Blob cells wait.
+const READ_AFTER: Duration = Duration::from_millis(120);
+/// How many tiles' files are read at once: half the connection's slots
+/// (`graph_client::READ_CONCURRENCY`), so pages, counts and the inspector never wait behind them.
+pub(crate) const READS_AT_ONCE: usize = 4;
+/// The most the previews held may take; past it the tiles farthest from the lines drawn let
+/// theirs go, and read it again if they come back.
+pub(crate) const PREVIEWS_HELD: usize = 64 * 1024 * 1024;
+/// How long after a tile's read lands the grid draws it, taking every other landing meanwhile
+/// in the same draw (the command palette's landing delay): tiles land in bursts as a screen is
+/// read, and one draw each would draw the grid dozens of times.
+pub(crate) const LANDING_DELAY: Duration = Duration::from_millis(30);
+
+/// How large a gallery's tiles are drawn; each line's tiles grow from it to fill the line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TileSize {
+    Small,
+    #[default]
+    Medium,
+    Large,
+}
+
+impl TileSize {
+    const ALL: [TileSize; 3] = [TileSize::Small, TileSize::Medium, TileSize::Large];
+
+    fn edge(self) -> f32 {
+        match self {
+            TileSize::Small => studio_ui::ds::size::TILE_SMALL,
+            TileSize::Medium => studio_ui::ds::size::TILE,
+            TileSize::Large => studio_ui::ds::size::TILE_LARGE,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            TileSize::Small => "S",
+            TileSize::Medium => "M",
+            TileSize::Large => "L",
+        }
+    }
+
+    fn larger(self) -> Self {
+        match self {
+            TileSize::Small => TileSize::Medium,
+            _ => TileSize::Large,
+        }
+    }
+
+    fn smaller(self) -> Self {
+        match self {
+            TileSize::Large => TileSize::Medium,
+            _ => TileSize::Small,
+        }
+    }
+}
+
+/// How many tiles of at least `edge` fit a line `width` wide, and how wide each is drawn so the
+/// line is filled: the grid's edges keep [`space::EDGE`], and tiles [`space::LG`] apart.
+pub(crate) fn line_layout(width: f32, edge: f32) -> (usize, f32) {
+    let inner = (width - 2. * space::EDGE).max(edge);
+    let columns = ((inner + space::LG) / (edge + space::LG)).floor().max(1.) as usize;
+    let tile = (inner - space::LG * (columns as f32 - 1.)) / columns as f32;
+    (columns, tile.max(edge.min(inner)))
+}
+
+/// What is known of one tile's file.
+#[derive(Debug)]
+struct Tile {
+    meta: Loadable<BlobMeta>,
+    /// What its first bytes said.
+    facts: Option<Facts>,
+    look: Loadable<Look>,
+}
+
+impl Default for Tile {
+    fn default() -> Self {
+        Self {
+            meta: Loadable::NotLoaded,
+            facts: None,
+            look: Loadable::NotLoaded,
+        }
+    }
+}
+
+/// A tile and the property it shows, by row id.
+type TileKey = (String, String);
+
+pub struct TypeGallery {
+    workspace: WeakEntity<Workspace>,
+    session: Entity<GraphSession>,
+    type_name: String,
+    /// The set in words, as the tab names it.
+    title: String,
+    branch: String,
+    /// The commit the gallery is held at, read-only; `None` follows its branch.
+    at_commit: Option<String>,
+    /// The commit the table it came from read, which its first page is pinned to.
+    opened_at: Option<String>,
+    filters: Vec<Filter>,
+    sort: Option<Sort>,
+    /// The rows it holds, when listed rather than read; how many of them were asked for.
+    ids: Option<Vec<String>>,
+    listed_asked: usize,
+    /// The Blob property the tiles show, and the type's Blob properties.
+    property: Option<String>,
+    files: Vec<String>,
+    schema: Option<Arc<SchemaModel>>,
+    rows: Vec<Row>,
+    paging: Paging,
+    first_page: Loadable<()>,
+    loading_more: bool,
+    more_error: Option<String>,
+    _page: Option<Task<()>>,
+    count: Loadable<i64>,
+    _count: Option<Task<()>>,
+    /// Bumped by each read from the start: an answer to an older one is let go.
+    generation: u64,
+    cursor: Option<usize>,
+    select_on_load: Option<String>,
+    picks: IndexSet<String>,
+    pick_anchor: Option<usize>,
+    size: TileSize,
+    tiles: HashMap<TileKey, Tile>,
+    tile_tasks: HashMap<TileKey, Task<()>>,
+    tile_queue: VecDeque<TileKey>,
+    /// What the previews held take, against [`PREVIEWS_HELD`].
+    held: usize,
+    /// The lines the grid drew last, and those whose tiles were asked for.
+    lines_drawn: Range<usize>,
+    lines_read: Option<Range<usize>>,
+    _read_wait: Option<Task<()>>,
+    /// A draw owed for tiles that landed, [`LANDING_DELAY`] after the first of them.
+    _landing: Option<Task<()>>,
+    /// The grid's width as last laid out, and the line layout it gives.
+    width: Rc<Cell<f32>>,
+    diff: Option<Arc<BranchDiff>>,
+    /// The merge base the branch's diff is read from: a removed row's file is read there.
+    diff_base: Option<String>,
+    _diff: Option<Task<()>>,
+    newer: bool,
+    scope: Option<ReadScope>,
+    _head_watch: Option<HeadWatch>,
+    peek: Option<(String, Entity<NodePeek>)>,
+    inspected_row: Option<String>,
+    grid: Entity<GalleryGrid>,
+    scroll: UniformListScrollHandle,
+    focus_handle: FocusHandle,
+    _subscriptions: Vec<Subscription>,
+    #[cfg(test)]
+    pub(crate) renders: usize,
+}
+
+impl EventEmitter<ItemEvent> for TypeGallery {}
+
+impl Focusable for TypeGallery {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl TypeGallery {
+    pub(crate) fn new(
+        workspace: WeakEntity<Workspace>,
+        session: Entity<GraphSession>,
+        opening: ShowSetInGallery,
+        size: TileSize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let grid = GalleryGrid::new(cx);
+        let branch = session.read(cx).branch.clone();
+        let filters: Vec<Filter> = opening
+            .filters
+            .clone()
+            .and_then(|filters| serde_json::from_value(filters).ok())
+            .unwrap_or_default();
+        let sort = opening.sort.as_ref().and_then(|sort| {
+            Some(Sort {
+                property: sort.get("property")?.as_str()?.to_owned(),
+                descending: sort.get("descending")?.as_bool()?,
+            })
+        });
+        let scope = opening.at_commit.is_none().then(|| {
+            session.update(cx, |session, _| {
+                let branch = session.branch.clone();
+                session.read_scope(&branch, graph_store::ledger::ReadView::Gallery)
+            })
+        });
+        let head_watch = opening.at_commit.is_none().then(|| {
+            let branch = branch.clone();
+            session.update(cx, |session, cx| session.watch_head(&branch, cx))
+        });
+        let subscriptions = vec![
+            cx.subscribe_in(&session, window, Self::on_session_event),
+            // The inspector shows the tile under the cursor (spec 020).
+            cx.observe_self(|this, cx| this.report_selection(cx)),
+            cx.on_release(|this: &mut Self, cx| this.release_all(cx)),
+        ];
+        let mut this = Self {
+            workspace,
+            session,
+            type_name: opening.type_name,
+            title: opening.title,
+            branch,
+            at_commit: opening.at_commit,
+            opened_at: opening.snapshot,
+            filters,
+            sort,
+            ids: opening.ids,
+            listed_asked: 0,
+            property: opening.property,
+            files: Vec::new(),
+            schema: None,
+            rows: Vec::new(),
+            paging: Paging::default(),
+            first_page: Loadable::NotLoaded,
+            loading_more: false,
+            more_error: None,
+            _page: None,
+            count: Loadable::NotLoaded,
+            _count: None,
+            generation: 0,
+            cursor: None,
+            select_on_load: opening.select,
+            picks: IndexSet::default(),
+            pick_anchor: None,
+            size,
+            tiles: HashMap::new(),
+            tile_tasks: HashMap::new(),
+            tile_queue: VecDeque::new(),
+            held: 0,
+            lines_drawn: 0..0,
+            lines_read: None,
+            _read_wait: None,
+            _landing: None,
+            width: Rc::new(Cell::new(0.)),
+            diff: None,
+            diff_base: None,
+            _diff: None,
+            newer: false,
+            scope,
+            _head_watch: head_watch,
+            peek: None,
+            inspected_row: None,
+            grid,
+            scroll: UniformListScrollHandle::new(),
+            focus_handle: cx.focus_handle(),
+            _subscriptions: subscriptions,
+            #[cfg(test)]
+            renders: 0,
+        };
+        this.read_from_start(cx);
+        this
+    }
+
+    /// What reopens this gallery, as an action: the set it holds, where it reads, and the file
+    /// its tiles show.
+    pub(crate) fn opening(&self) -> ShowSetInGallery {
+        ShowSetInGallery {
+            title: self.title.clone(),
+            type_name: self.type_name.clone(),
+            filters: (!self.filters.is_empty())
+                .then(|| serde_json::to_value(&self.filters).ok())
+                .flatten(),
+            sort: self.sort.as_ref().map(|sort| {
+                serde_json::json!({"property": sort.property, "descending": sort.descending})
+            }),
+            ids: self.ids.clone(),
+            property: self.property.clone(),
+            at_commit: self.at_commit.clone(),
+            snapshot: None,
+            select: None,
+            preview: false,
+        }
+    }
+
+    // ---- reading ----
+
+    /// Reads the set from its first page: at the held commit, at the commit the gallery was
+    /// opened at (its source's, once), or at the head. Every preview is let go.
+    fn read_from_start(&mut self, cx: &mut Context<Self>) {
+        self.generation += 1;
+        self.release_all(cx);
+        self.rows.clear();
+        self.paging = Paging::default();
+        self.listed_asked = 0;
+        self.first_page = Loadable::Loading;
+        self.loading_more = false;
+        self.more_error = None;
+        self.count = Loadable::NotLoaded;
+        self.newer = false;
+        self.diff = None;
+        self.diff_base = None;
+        self.lines_read = None;
+        self.schema = self.session.read(cx).schema_model();
+        self.files = self
+            .schema
+            .as_ref()
+            .and_then(|schema| schema.node(&self.type_name))
+            .map(|node| {
+                node.properties
+                    .iter()
+                    .filter(|p| p.kind == ScalarKind::Blob)
+                    .map(|p| p.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if self
+            .property
+            .as_ref()
+            .is_none_or(|property| !self.files.contains(property))
+        {
+            self.property = self.files.first().cloned();
+        }
+        if self.schema.is_none() {
+            // The schema is read with the session; its event reads the set then.
+            cx.notify();
+            return;
+        }
+        let snapshot = self.at_commit.clone().or_else(|| self.opened_at.take());
+        self.read_page(snapshot, true, cx);
+        self.read_diff(cx);
+        cx.notify();
+    }
+
+    /// The graph's page size (`studio.type_table_page_size`, or the graph's own).
+    fn page_size(&self, cx: &App) -> u32 {
+        self.session
+            .read(cx)
+            .options(cx)
+            .type_table_page_size
+            .max(1)
+    }
+
+    fn page_query(&mut self, size: u32) -> Option<BuiltQuery> {
+        let schema = self.schema.clone()?;
+        match &self.ids {
+            Some(ids) => {
+                let from = self.listed_asked.min(ids.len());
+                let to = (from + size as usize).min(ids.len());
+                self.listed_asked = to;
+                builder::nodes_by_ids(&schema, &self.type_name, &ids[from..to]).ok()
+            }
+            None => builder::node_page(
+                &schema,
+                &self.type_name,
+                &self.filters,
+                self.sort.as_ref(),
+                &self.paging.start,
+                size,
+            )
+            .ok(),
+        }
+    }
+
+    /// Reads the next page, at `snapshot` (the pin once the first page set it).
+    fn read_page(&mut self, snapshot: Option<String>, first: bool, cx: &mut Context<Self>) {
+        let base = self.page_size(cx);
+        let size = self.paging.next_page_size(base);
+        let Some(query) = self.page_query(size) else {
+            self.first_page = Loadable::Failed(format!(
+                "The schema has no node type {} to read.",
+                self.type_name
+            ));
+            return;
+        };
+        let generation = self.generation;
+        let read = self.read_shown(&query, snapshot, cx);
+        if !first {
+            self.loading_more = true;
+        }
+        self._page = Some(cx.spawn(async move |this, cx| {
+            let result = read.await;
+            this.update(cx, |this, cx| {
+                if this.generation == generation {
+                    this.take_page(result, first, size, base, cx);
+                }
+            })
+            .ok();
+        }));
+    }
+
+    fn read_shown(
+        &self,
+        query: &BuiltQuery,
+        snapshot: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<ReadOutput, ReadError>> {
+        let scope = self.scope.clone();
+        self.session.update(cx, |session, cx| {
+            session.read_scoped(scope.as_ref(), query, snapshot, cx)
+        })
+    }
+
+    fn take_page(
+        &mut self,
+        result: Result<ReadOutput, ReadError>,
+        first: bool,
+        size: u32,
+        base: u32,
+        cx: &mut Context<Self>,
+    ) {
+        self.loading_more = false;
+        let output = match result {
+            Ok(output) => output,
+            Err(error) => {
+                if first {
+                    self.first_page = Loadable::Failed(error.to_string());
+                } else {
+                    self.more_error = Some(error.to_string());
+                }
+                cx.notify();
+                return;
+            }
+        };
+        let mut page = node_rows(&output.rows);
+        match &self.ids {
+            Some(ids) => {
+                // Listed rows keep the order they were listed in.
+                let place: HashMap<&str, usize> = ids
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, id)| (id.as_str(), ix))
+                    .collect();
+                page.sort_by_key(|row| place.get(row.id.as_str()).copied().unwrap_or(usize::MAX));
+                if self.paging.pinned.is_none() {
+                    self.paging.pinned = output.graph_commit_id.clone();
+                }
+                self.paging.exhausted = self.listed_asked >= ids.len();
+                self.paging.page_size = size;
+                self.paging.ahead = base;
+            }
+            None => {
+                let sort_column = self.sort.as_ref().map(|sort| sort.property.clone());
+                let nulls_follow = self.sort_nulls_follow();
+                self.paging.accept(
+                    output.graph_commit_id.as_deref(),
+                    &page,
+                    size,
+                    base,
+                    sort_column.as_deref(),
+                    nulls_follow,
+                );
+            }
+        }
+        // A row the branch removed is shown first already; it is not read twice.
+        let shown: HashSet<String> = self.rows.iter().map(|row| row.id.clone()).collect();
+        self.rows
+            .extend(page.into_iter().filter(|row| !shown.contains(&row.id)));
+        if first {
+            self.first_page = Loadable::Loaded(());
+            self.compare_head(cx);
+            self.read_count(cx);
+            self.cursor = match self.select_on_load.take() {
+                Some(id) => self.rows.iter().position(|row| row.id == id),
+                None => None,
+            }
+            .or((!self.rows.is_empty()).then_some(0));
+            // After the cursor, which moves with its tile past the rows put before it.
+            self.place_removed();
+            if let Some(cursor) = self.cursor {
+                self.scroll_to_tile(cursor);
+            }
+            cx.emit(ItemEvent::UpdateTab);
+        }
+        cx.notify();
+    }
+
+    fn sort_nulls_follow(&self) -> bool {
+        self.at_commit.is_some()
+            || self
+                .sort
+                .as_ref()
+                .and_then(|sort| {
+                    self.schema
+                        .as_ref()?
+                        .node(&self.type_name)?
+                        .property(&sort.property)
+                        .cloned()
+                })
+                .is_none_or(|property| property.nullable)
+    }
+
+    /// Reads the next page when the lines drawn come within a page of the last row read.
+    fn want_more(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.first_page, Loadable::Loaded(())) || self.more_error.is_some() {
+            return;
+        }
+        let (columns, _) = self.line_layout();
+        let visible_end = (self.lines_drawn.end * columns).min(self.rows.len());
+        if self
+            .paging
+            .wants_more(self.rows.len(), visible_end, self.loading_more)
+        {
+            let pin = self.paging.pinned.clone();
+            self.read_page(pin, false, cx);
+        }
+    }
+
+    /// The count of the set at the pin: what the session counted, or one read; a listed set is
+    /// as long as its list.
+    fn read_count(&mut self, cx: &mut Context<Self>) {
+        if let Some(ids) = &self.ids {
+            self.count = Loadable::Loaded(ids.len() as i64);
+            return;
+        }
+        if self.paging.exhausted {
+            self.count = Loadable::Loaded(self.rows.len() as i64);
+            return;
+        }
+        let Some(query) = self
+            .schema
+            .as_ref()
+            .and_then(|schema| builder::node_count(schema, &self.type_name, &self.filters).ok())
+        else {
+            return;
+        };
+        let generation = self.generation;
+        self.count = Loadable::Loading;
+        let read = self.read_shown(&query, self.paging.pinned.clone(), cx);
+        self._count = Some(cx.spawn(async move |this, cx| {
+            let result = read.await;
+            this.update(cx, |this, cx| {
+                if this.generation != generation {
+                    return;
+                }
+                this.count = match result {
+                    Ok(output) => builder::count_of(&output.rows)
+                        .map_or_else(|| Loadable::Failed("No count".into()), Loadable::Loaded),
+                    Err(error) => Loadable::Failed(error.to_string()),
+                };
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// What the branch changed in the type, against its target (spec 033), read as the table
+    /// reads it: on a branch other than the target, following it.
+    fn read_diff(&mut self, cx: &mut Context<Self>) {
+        self._diff = None;
+        if self.branch == TARGET || self.at_commit.is_some() || self.ids.is_some() {
+            return;
+        }
+        let (session, branch, type_name) = (
+            self.session.clone(),
+            self.branch.clone(),
+            self.type_name.clone(),
+        );
+        let generation = self.generation;
+        self._diff = Some(cx.spawn(async move |this, cx| {
+            let Some((base, folded)) =
+                crate::table::read_branch_diff_from(&session, &branch, cx).await
+            else {
+                return;
+            };
+            let diff =
+                cx.background_executor()
+                    .spawn(async move {
+                        BranchDiff::of(&folded, graph_store::EntityKind::Node, &type_name)
+                    })
+                    .await;
+            this.update(cx, |this, cx| {
+                if this.generation != generation {
+                    return;
+                }
+                this.diff = Some(Arc::new(diff));
+                this.diff_base = Some(base);
+                this.place_removed();
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Puts the rows the branch removed first, once the first page and the diff are both in.
+    fn place_removed(&mut self) {
+        let (Some(diff), Loadable::Loaded(())) = (self.diff.clone(), &self.first_page) else {
+            return;
+        };
+        let shown: HashSet<&str> = self.rows.iter().map(|row| row.id.as_str()).collect();
+        let placed: Vec<Row> = diff
+            .removed()
+            .iter()
+            .filter(|row| !shown.contains(row.id.as_str()))
+            .cloned()
+            .collect();
+        if placed.is_empty() {
+            return;
+        }
+        let moved = placed.len();
+        self.rows.splice(0..0, placed);
+        // The cursor stays on its tile, which moves on by the tiles put before it.
+        self.cursor = self.cursor.map(|cursor| cursor + moved);
+        self.pick_anchor = self.pick_anchor.map(|anchor| anchor + moved);
+    }
+
+    fn change_of(&self, id: &str) -> Option<NetChange> {
+        self.diff.as_ref()?.mark(id).map(|mark| mark.net)
+    }
+
+    fn is_removed(&self, id: &str) -> bool {
+        self.change_of(id) == Some(NetChange::Removed)
+    }
+
+    /// Whether the branch changed the file the tiles show in row `id`.
+    fn file_changed(&self, id: &str) -> bool {
+        let Some(property) = &self.property else {
+            return false;
+        };
+        self.diff
+            .as_ref()
+            .and_then(|diff| diff.mark(id))
+            .is_some_and(|mark| mark.changed.contains(property))
+    }
+
+    /// Offers Refresh once the branch's head is past the pin.
+    fn compare_head(&mut self, cx: &App) {
+        if self.at_commit.is_some() {
+            return;
+        }
+        let head = self.session.read(cx).head(&self.branch).map(str::to_owned);
+        self.newer = head.is_some() && head != self.paging.pinned;
+    }
+
+    fn on_session_event(
+        &mut self,
+        _: &Entity<GraphSession>,
+        event: &SessionEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            SessionEvent::SchemaChanged if self.schema.is_none() => self.read_from_start(cx),
+            SessionEvent::SchemaChanged | SessionEvent::SchemaMoved => {
+                self.newer = true;
+                cx.notify();
+            }
+            // The window moved to another branch: a gallery that follows its branch reads it.
+            SessionEvent::BranchChanged if self.at_commit.is_none() => {
+                self.branch = self.session.read(cx).branch.clone();
+                let branch = self.branch.clone();
+                self.scope = Some(self.session.update(cx, |session, _| {
+                    session.read_scope(&branch, graph_store::ledger::ReadView::Gallery)
+                }));
+                self._head_watch = Some(
+                    self.session
+                        .update(cx, |session, cx| session.watch_head(&branch, cx)),
+                );
+                self.read_from_start(cx);
+            }
+            SessionEvent::HeadMoved { branch, head }
+                if *branch == self.branch && self.at_commit.is_none() =>
+            {
+                let newer = self.paging.pinned.as_deref().is_some_and(|pin| pin != head);
+                if newer != self.newer {
+                    self.newer = newer;
+                    cx.notify();
+                }
+            }
+            // A new token may see less: what was read under the old one is read again.
+            SessionEvent::CredentialChanged => {
+                self.opened_at = self.paging.pinned.clone();
+                self.read_from_start(cx);
+            }
+            _ => {}
+        }
+    }
+
+    fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.read_from_start(cx);
+    }
+
+    // ---- tiles ----
+
+    /// The line layout for the width last laid out.
+    fn line_layout(&self) -> (usize, f32) {
+        let width = self.width.get();
+        let width = if width > 0. {
+            width
+        } else {
+            studio_ui::ds::size::WINDOW_WIDTH - studio_ui::ds::size::SIDEBAR_WIDTH
+        };
+        line_layout(width, self.size.edge())
+    }
+
+    fn line_count(&self) -> usize {
+        let (columns, _) = self.line_layout();
+        self.rows.len().div_ceil(columns)
+    }
+
+    /// The commit a row's file is read at: where it last was for a row the branch removed, else
+    /// the pin.
+    fn commit_of(&self, id: &str) -> Option<String> {
+        if self.is_removed(id) {
+            return self.diff_base.clone();
+        }
+        self.paging.pinned.clone()
+    }
+
+    /// The grid drew `lines`: the next page is read when they near the end, and their tiles'
+    /// files once scrolling rests.
+    fn drew_lines(&mut self, lines: Range<usize>, cx: &mut Context<Self>) {
+        self.lines_drawn = lines.clone();
+        self.want_more(cx);
+        if self.lines_read.as_ref() == Some(&lines) || self.property.is_none() {
+            return;
+        }
+        self.lines_read = Some(lines.clone());
+        self._read_wait = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(READ_AFTER).await;
+            this.update(cx, |this, cx| this.read_tiles(lines, cx)).ok();
+        }));
+    }
+
+    /// The keys of the tiles on `lines`, in the order they are drawn.
+    fn keys_on(&self, lines: Range<usize>) -> Vec<TileKey> {
+        let Some(property) = &self.property else {
+            return Vec::new();
+        };
+        let (columns, _) = self.line_layout();
+        let from = (lines.start * columns).min(self.rows.len());
+        let to = (lines.end * columns).min(self.rows.len());
+        self.rows[from..to]
+            .iter()
+            .map(|row| (row.id.clone(), property.clone()))
+            .collect()
+    }
+
+    /// Reads the files of the tiles on `lines`, the first first; reads out for tiles no longer
+    /// drawn are dropped, which stops their requests, and are asked again when they return.
+    pub(crate) fn read_tiles(&mut self, lines: Range<usize>, cx: &mut Context<Self>) {
+        let keys = self.keys_on(lines);
+        let on: HashSet<&TileKey> = keys.iter().collect();
+        let gone: Vec<TileKey> = self
+            .tile_tasks
+            .keys()
+            .filter(|key| !on.contains(key))
+            .cloned()
+            .collect();
+        for key in gone {
+            self.tile_tasks.remove(&key);
+            if let Some(tile) = self.tiles.get_mut(&key) {
+                if matches!(tile.meta, Loadable::Loading) {
+                    tile.meta = Loadable::NotLoaded;
+                }
+                if matches!(tile.look, Loadable::Loading) {
+                    tile.look = Loadable::NotLoaded;
+                }
+            }
+        }
+        self.tile_queue.retain(|key| on.contains(key));
+        for key in &keys {
+            let tile = self.tiles.entry(key.clone()).or_default();
+            let unread = matches!(tile.look, Loadable::NotLoaded);
+            if unread && !self.tile_tasks.contains_key(key) && !self.tile_queue.contains(key) {
+                tile.look = Loadable::Loading;
+                self.tile_queue.push_back(key.clone());
+            }
+        }
+        self.read_queued(cx);
+    }
+
+    fn read_queued(&mut self, cx: &mut Context<Self>) {
+        while self.tile_tasks.len() < READS_AT_ONCE {
+            let Some(key) = self.tile_queue.pop_front() else {
+                break;
+            };
+            let task = self.read_tile(key.clone(), cx);
+            self.tile_tasks.insert(key, task);
+        }
+    }
+
+    /// One tile's file: what the cell holds, its first bytes, and the rest of a file drawn
+    /// whole, then its preview made off the main thread.
+    fn read_tile(&mut self, key: TileKey, cx: &mut Context<Self>) -> Task<()> {
+        let cell = BlobCell {
+            edge: false,
+            type_name: self.type_name.clone(),
+            id: key.0.clone(),
+            property: key.1.clone(),
+        };
+        let snapshot = self.commit_of(&key.0);
+        // A removed row's file is read where it last was, which is no view's commit.
+        let scope = (!self.is_removed(&key.0))
+            .then(|| self.scope.clone())
+            .flatten();
+        let known = self
+            .tiles
+            .get(&key)
+            .and_then(|tile| tile.meta.loaded().cloned());
+        let session = self.session.downgrade();
+        let generation = self.generation;
+        cx.spawn(async move |this, cx| {
+            let meta = match known {
+                Some(meta) => Ok(meta),
+                None => {
+                    let Ok(read) = session.update(cx, |session, cx| match &scope {
+                        Some(scope) => {
+                            session.blob_meta_in(scope, cell.clone(), snapshot.clone(), cx)
+                        }
+                        None => session.blob_meta(cell.clone(), snapshot.clone(), cx),
+                    }) else {
+                        return;
+                    };
+                    read.await.map_err(|error| error.to_string())
+                }
+            };
+            let size = match &meta {
+                Ok(BlobMeta::Managed { size, .. }) => Some(*size),
+                _ => None,
+            };
+            let still = this
+                .update(cx, |this, cx| {
+                    if this.generation != generation {
+                        return false;
+                    }
+                    let tile = this.tiles.entry(key.clone()).or_default();
+                    match meta {
+                        Ok(meta) => {
+                            if size.is_none() {
+                                tile.look = Loadable::Loaded(Look::Icon);
+                            }
+                            tile.meta = Loadable::Loaded(meta);
+                        }
+                        Err(error) => {
+                            tile.meta = Loadable::Failed(error.clone());
+                            tile.look = Loadable::Failed(error);
+                        }
+                    }
+                    this.landed(cx);
+                    true
+                })
+                .unwrap_or(false);
+            let (Some(size), true) = (size, still) else {
+                this.update(cx, |this, cx| this.tile_done(&key, cx)).ok();
+                return;
+            };
+            let result = read_file(&session, &cell, &snapshot, scope.as_ref(), size, cx).await;
+            let look = match result {
+                Ok((bytes, facts)) => {
+                    this.update(cx, |this, _| {
+                        if let Some(tile) = this.tiles.get_mut(&key) {
+                            tile.facts = Some(facts);
+                        }
+                    })
+                    .ok();
+                    let svg = cx.update(|cx| cx.svg_renderer());
+                    Ok(cx
+                        .background_spawn(async move { tile::look(bytes, size, &svg) })
+                        .await)
+                }
+                Err(error) => Err(error),
+            };
+            this.update(cx, |this, cx| {
+                if this.generation != generation {
+                    if let Ok(Look::Image { image, .. }) = &look {
+                        image.release(cx);
+                    }
+                    return;
+                }
+                if let Some(tile) = this.tiles.get_mut(&key) {
+                    tile.look = match look {
+                        Ok(look) => {
+                            this.held += look.held();
+                            Loadable::Loaded(look)
+                        }
+                        Err(error) => Loadable::Failed(error),
+                    };
+                }
+                this.tile_done(&key, cx);
+                this.let_go_past_cap(cx);
+                this.landed(cx);
+            })
+            .ok();
+        })
+    }
+
+    /// A tile's read landed: the grid draws it [`LANDING_DELAY`] from the first landing not yet
+    /// drawn, with every other that lands meanwhile.
+    fn landed(&mut self, cx: &mut Context<Self>) {
+        if self._landing.is_some() {
+            return;
+        }
+        self._landing = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(LANDING_DELAY).await;
+            this.update(cx, |this, cx| {
+                this._landing = None;
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn tile_done(&mut self, key: &TileKey, cx: &mut Context<Self>) {
+        self.tile_tasks.remove(key);
+        self.read_queued(cx);
+    }
+
+    /// Frees the previews of the tiles farthest from the lines drawn while they hold more than
+    /// [`PREVIEWS_HELD`]; each is read again if it comes back into view. The tiles drawn keep
+    /// theirs, so a screen that alone holds more than the cap is not read again and again.
+    fn let_go_past_cap(&mut self, cx: &mut App) {
+        if self.held <= PREVIEWS_HELD {
+            return;
+        }
+        let (columns, _) = self.line_layout();
+        let middle = (self.lines_drawn.start + self.lines_drawn.end) * columns / 2;
+        let drawn = self.lines_drawn.start * columns..self.lines_drawn.end * columns;
+        let place: HashMap<&str, usize> = self
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(ix, row)| (row.id.as_str(), ix))
+            .collect();
+        let mut held: Vec<(usize, TileKey)> = self
+            .tiles
+            .iter()
+            .filter(|(_, tile)| matches!(tile.look, Loadable::Loaded(Look::Image { .. })))
+            .filter_map(|(key, _)| {
+                let ix = place.get(key.0.as_str()).copied().unwrap_or(usize::MAX);
+                (!drawn.contains(&ix)).then(|| (ix.abs_diff(middle), key.clone()))
+            })
+            .collect();
+        held.sort_by_key(|(distance, _)| std::cmp::Reverse(*distance));
+        for (_, key) in held {
+            if self.held <= PREVIEWS_HELD {
+                break;
+            }
+            if let Some(tile) = self.tiles.get_mut(&key)
+                && let Loadable::Loaded(look) =
+                    std::mem::replace(&mut tile.look, Loadable::NotLoaded)
+            {
+                self.held = self.held.saturating_sub(look.held());
+                if let Look::Image { image, .. } = look {
+                    image.release(cx);
+                }
+            }
+        }
+    }
+
+    /// Frees every preview and drops every read: a read from the start, or the tab closed.
+    fn release_all(&mut self, cx: &mut App) {
+        for tile in self.tiles.values() {
+            if let Loadable::Loaded(Look::Image { image, .. }) = &tile.look {
+                image.release(cx);
+            }
+        }
+        self.tiles.clear();
+        self.tile_tasks.clear();
+        self.tile_queue.clear();
+        self.held = 0;
+    }
+
+    // ---- the cursor and picks ----
+
+    fn cursor_row(&self) -> Option<&Row> {
+        self.rows.get(self.cursor?)
+    }
+
+    fn selected_row_id(&self) -> Option<&str> {
+        self.cursor_row()
+            .filter(|row| !self.is_removed(&row.id))
+            .map(|row| row.id.as_str())
+    }
+
+    fn report_selection(&mut self, cx: &mut Context<Self>) {
+        let selected = self.selected_row_id().map(str::to_owned);
+        if selected != self.inspected_row {
+            self.inspected_row = selected;
+            cx.emit(ItemEvent::Selected);
+        }
+    }
+
+    fn scroll_to_tile(&self, ix: usize) {
+        let (columns, _) = self.line_layout();
+        self.scroll
+            .scroll_to_item(ix / columns, ScrollStrategy::Nearest);
+    }
+
+    /// Moves the cursor by `by` tiles, or by lines with `lines`.
+    pub(crate) fn move_cursor(&mut self, by: isize, lines: bool, cx: &mut Context<Self>) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let (columns, _) = self.line_layout();
+        let last = self.rows.len() - 1;
+        let at = self.cursor.unwrap_or(0);
+        let next = if lines {
+            let wanted = at as isize + by * columns as isize;
+            if wanted < 0 {
+                at % columns
+            } else {
+                // ↓ on the line above a short last line goes to its last tile.
+                (wanted as usize).min(last)
+            }
+        } else {
+            (at as isize + by).clamp(0, last as isize) as usize
+        };
+        self.set_cursor(next, cx);
+    }
+
+    fn set_cursor(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if self.cursor == Some(ix) {
+            return;
+        }
+        self.cursor = Some(ix);
+        self.scroll_to_tile(ix);
+        cx.notify();
+    }
+
+    fn move_to_end(&mut self, cx: &mut Context<Self>) {
+        if let Some(last) = self.rows.len().checked_sub(1) {
+            self.set_cursor(last, cx);
+        }
+    }
+
+    /// Picks the tile at `ix`, or takes it out; with `range`, picks from the last tile picked.
+    fn pick(&mut self, ix: usize, range: bool, cx: &mut Context<Self>) {
+        let Some(id) = self.rows.get(ix).map(|row| row.id.clone()) else {
+            return;
+        };
+        if self.is_removed(&id) {
+            return;
+        }
+        match self.pick_anchor.filter(|_| range) {
+            Some(anchor) => {
+                for ix in anchor.min(ix)..=anchor.max(ix).min(self.rows.len() - 1) {
+                    let id = self.rows[ix].id.clone();
+                    if !self.is_removed(&id) {
+                        self.picks.insert(id);
+                    }
+                }
+            }
+            None => {
+                if !self.picks.shift_remove(&id) {
+                    self.picks.insert(id);
+                }
+                self.pick_anchor = Some(ix);
+            }
+        }
+        cx.notify();
+    }
+
+    fn pick_all(&mut self, cx: &mut Context<Self>) {
+        let ids: Vec<String> = self
+            .rows
+            .iter()
+            .filter(|row| !self.is_removed(&row.id))
+            .map(|row| row.id.clone())
+            .collect();
+        self.picks.extend(ids);
+        cx.notify();
+    }
+
+    fn clear_picks(&mut self, cx: &mut Context<Self>) {
+        if self.picks.is_empty() {
+            return;
+        }
+        self.picks.clear();
+        self.pick_anchor = None;
+        cx.notify();
+    }
+
+    fn copy_ids(&self, cx: &mut App) {
+        let ids: Vec<&str> = if self.picks.is_empty() {
+            self.selected_row_id().into_iter().collect()
+        } else {
+            self.picks.iter().map(String::as_str).collect()
+        };
+        if !ids.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(ids.join("\n")));
+        }
+    }
+
+    fn click_tile(
+        &mut self,
+        ix: usize,
+        event: &ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus_handle, cx);
+        let modifiers = event.modifiers();
+        if modifiers.secondary(cx) || modifiers.shift {
+            self.pick(ix, modifiers.shift, cx);
+            self.set_cursor(ix, cx);
+            return;
+        }
+        self.set_cursor(ix, cx);
+        if event.click_count() >= 2 {
+            self.open_file(window, cx);
+        }
+    }
+
+    fn open_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(row), Some(property)) = (self.cursor_row(), self.property.clone()) else {
+            return;
+        };
+        let removed = self.is_removed(&row.id);
+        let at_commit = self.commit_of(&row.id);
+        window.dispatch_action(
+            Box::new(OpenBlob {
+                type_name: self.type_name.clone(),
+                id: row.id.clone(),
+                property,
+                edge: false,
+                // Held where it was read when the gallery holds its commit or the row is gone
+                // from the branch; else it writes on the branch, bound to the value read here.
+                held: self.at_commit.is_some() || removed,
+                at_commit,
+            }),
+            cx,
+        );
+    }
+
+    fn open_row_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.selected_row_id().map(str::to_owned) else {
+            return;
+        };
+        if let Some(workspace) = self.workspace.upgrade() {
+            workspace.update(cx, |workspace, cx| workspace.keep_active_tab(cx));
+        }
+        window.dispatch_action(
+            Box::new(OpenNodePage {
+                type_name: self.type_name.clone(),
+                id,
+                at_commit: self.at_commit.clone(),
+                preview: false,
+            }),
+            cx,
+        );
+    }
+
+    fn show_file(&mut self, property: String, cx: &mut Context<Self>) {
+        if self.property.as_ref() == Some(&property) {
+            return;
+        }
+        self.property = Some(property);
+        self.lines_read = None;
+        cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
+    }
+
+    fn show_next_file(&mut self, cx: &mut Context<Self>) {
+        let next = match &self.property {
+            Some(shown) => self
+                .files
+                .iter()
+                .position(|file| file == shown)
+                .map(|ix| self.files[(ix + 1) % self.files.len()].clone()),
+            None => self.files.first().cloned(),
+        };
+        if let Some(next) = next {
+            self.show_file(next, cx);
+        }
+    }
+
+    fn set_size(&mut self, size: TileSize, cx: &mut Context<Self>) {
+        if self.size == size {
+            return;
+        }
+        self.size = size;
+        self.lines_read = None;
+        if let Some(cursor) = self.cursor {
+            self.scroll_to_tile(cursor);
+        }
+        cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
+    }
+
+    // ---- what it opens ----
+
+    fn row_label(&self, row: &Row) -> Option<String> {
+        let schema = self.schema.as_ref()?;
+        let label = schema.node(&self.type_name)?.label_property()?;
+        row.values
+            .get(label)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    }
+
+    fn picked_nodes(&self) -> Option<Vec<ResultNode>> {
+        (!self.picks.is_empty()).then(|| {
+            self.rows
+                .iter()
+                .filter(|row| self.picks.contains(&row.id))
+                .map(|row| ResultNode {
+                    type_name: self.type_name.clone(),
+                    id: row.id.clone(),
+                    label: self.row_label(row),
+                })
+                .collect()
+        })
+    }
+
+    fn filters_value(&self) -> Option<Value> {
+        (!self.filters.is_empty())
+            .then(|| serde_json::to_value(&self.filters).ok())
+            .flatten()
+    }
+
+    // ---- drawing ----
+
+    fn count_text(&self) -> String {
+        let total = match &self.count {
+            Loadable::Loaded(n) => Some(*n),
+            _ => None,
+        };
+        match total {
+            Some(total) if self.paging.exhausted || self.rows.len() as i64 >= total => {
+                plural(total.max(0) as usize, "row", "rows")
+            }
+            Some(total) => format!(
+                "{} of {} read",
+                studio_ui::group_count(self.rows.len() as i64),
+                studio_ui::group_count(total)
+            ),
+            None if matches!(self.count, Loadable::Loading) => "counting…".into(),
+            None => plural(self.rows.len(), "row", "rows"),
+        }
+    }
+
+    fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        studio_ui::ds::toolbar(cx)
+            .children(studio_workspace::view_strip(Item::views(self, cx), cx))
+            .child(studio_ui::kind_swatch(&self.type_name, false, cx))
+            .child(studio_ui::ds::text::title(self.type_name.clone()))
+            .child(studio_ui::ds::text::muted(self.count_text()))
+            .children(self.render_diff_counts())
+            .when_some(self.at_commit.as_ref(), |bar, commit| {
+                bar.child(studio_ui::ds::meta_code(
+                    IconName::GitCommit,
+                    format!("Read only · {}", studio_ui::short_commit_id(commit)),
+                    cx,
+                ))
+            })
+            .when(self.newer, |bar| {
+                bar.child(
+                    studio_ui::ds::button("gallery-newer", "Newer data · Refresh")
+                        .style(ButtonStyle::Tinted(ui::TintColor::Accent))
+                        .tip(studio_ui::ds::tooltip_for_action(
+                            "Read the branch head again",
+                            &Refresh,
+                        ))
+                        .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                )
+            })
+            .child(div().flex_1())
+            .child(
+                studio_ui::ds::toolbar_actions()
+                    .gap(px(space::SM))
+                    .child(self.render_file_menu(cx))
+                    .child(self.render_sizes(cx)),
+            )
+    }
+
+    fn render_diff_counts(&self) -> Option<AnyElement> {
+        let (added, changed, removed) = self.diff.as_ref()?.counts();
+        if added + changed + removed == 0 {
+            return None;
+        }
+        let tooltip = format!(
+            "On {} against {TARGET}: {} added, {} changed, {} removed",
+            self.branch,
+            plural(added, "row", "rows"),
+            plural(changed, "row", "rows"),
+            plural(removed, "row", "rows"),
+        );
+        Some(
+            div()
+                .id("gallery-diff-counts")
+                .tip(studio_ui::ds::tooltip(tooltip))
+                .child(studio_ui::change_counts(added, changed, removed))
+                .into_any_element(),
+        )
+    }
+
+    /// The File chip: which Blob property the tiles show.
+    fn render_file_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let gallery = cx.entity().downgrade();
+        let (files, shown) = (self.files.clone(), self.property.clone());
+        let menu = PopoverMenu::new("gallery-file-menu")
+            .anchor(gpui::Anchor::TopRight)
+            .trigger(
+                studio_ui::ds::chip_button(
+                    "gallery-file",
+                    IconName::Image,
+                    "File",
+                    self.property.clone().map(SharedString::from),
+                )
+                .disabled(self.files.len() < 2)
+                .tip(if self.files.len() < 2 {
+                    studio_ui::ds::tooltip(format!(
+                        "The tiles show {}, the type's one file",
+                        self.property.as_deref().unwrap_or("no file")
+                    ))
+                } else {
+                    studio_ui::ds::tooltip_for_action("Which file the tiles show", &ShowNextFile)
+                }),
+            )
+            .menu(move |window, cx| {
+                let (gallery, files, shown) = (gallery.clone(), files.clone(), shown.clone());
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    for file in &files {
+                        let (gallery, chosen) = (gallery.clone(), file.clone());
+                        menu = menu.toggleable_entry(
+                            file.clone(),
+                            shown.as_ref() == Some(file),
+                            ui::IconPosition::Start,
+                            None,
+                            move |_, cx| {
+                                gallery
+                                    .update(cx, |gallery, cx| gallery.show_file(chosen.clone(), cx))
+                                    .ok();
+                            },
+                        );
+                    }
+                    menu
+                }))
+            });
+        studio_ui::ds::control_chip("gallery-file-chip", menu)
+    }
+
+    /// The tile size, as a segmented control; `=` and `−` step it.
+    fn render_sizes(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        studio_ui::ds::segmented_track(cx).children(TileSize::ALL.into_iter().map(|size| {
+            let current = size == self.size;
+            studio_ui::ds::segment(("gallery-size", size as usize), size.label(), current, cx)
+                .tip(studio_ui::ds::tooltip(match size {
+                    TileSize::Small => "Small tiles · −",
+                    TileSize::Medium => "Medium tiles",
+                    TileSize::Large => "Large tiles · =",
+                }))
+                .on_click(cx.listener(move |this, _, _, cx| this.set_size(size, cx)))
+        }))
+    }
+
+    /// The grid, or the state that stands in for it.
+    fn render_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let focus = self.focus_handle.clone();
+        match &self.first_page {
+            Loadable::NotLoaded | Loadable::Loading => {
+                return studio_ui::ds::loading_state("Reading…").into_any_element();
+            }
+            Loadable::Failed(reason) => {
+                return studio_ui::ds::error_state(
+                    format!("Could not read {}", self.type_name),
+                    reason.clone(),
+                )
+                .child(
+                    studio_ui::ds::state_action("gallery-retry", "Retry", &Refresh, &focus, cx)
+                        .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                )
+                .into_any_element();
+            }
+            Loadable::Loaded(()) => {}
+        }
+        if self.property.is_none() {
+            return studio_ui::ds::empty_state(
+                IconName::Image,
+                format!("{} has no files now", self.type_name),
+            )
+            .into_any_element();
+        }
+        if self.rows.is_empty() {
+            let title = if self.filters.is_empty() && self.ids.is_none() {
+                "No rows"
+            } else {
+                "No rows match"
+            };
+            return studio_ui::ds::empty_state(IconName::Image, title).into_any_element();
+        }
+        let width = self.width.clone();
+        let gallery = cx.entity_id();
+        let measure = gpui::canvas(
+            move |bounds, _, cx| {
+                let now = f32::from(bounds.size.width);
+                if (width.get() - now).abs() > 0.5 {
+                    width.set(now);
+                    cx.defer(move |cx| cx.notify(gallery));
+                }
+            },
+            |_, (), _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .w_full()
+        .h(px(0.));
+        let _ = window;
+        let lines = self.line_count() + usize::from(self.more_error.is_some());
+        div()
+            .relative()
+            .size_full()
+            .child(measure)
+            .child(
+                uniform_list(
+                    "gallery-lines",
+                    lines,
+                    cx.processor(|this, range: Range<usize>, window, cx| {
+                        this.drew_lines(range.clone(), cx);
+                        this.render_lines(range, window, cx)
+                    }),
+                )
+                .track_scroll(&self.scroll)
+                .size_full()
+                .py(px(space::EDGE)),
+            )
+            .into_any_element()
+    }
+
+    fn render_lines(
+        &self,
+        range: Range<usize>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let (columns, tile) = self.line_layout();
+        let line_count = self.line_count();
+        range
+            .map(|line| {
+                if line >= line_count {
+                    return self.render_more_error(cx);
+                }
+                let from = line * columns;
+                let to = (from + columns).min(self.rows.len());
+                h_flex()
+                    .w_full()
+                    .px(px(space::EDGE))
+                    .pb(px(space::LG))
+                    .gap(px(space::LG))
+                    .items_start()
+                    .children((from..to).map(|ix| self.render_tile(ix, tile, cx)))
+                    .into_any_element()
+            })
+            .collect()
+    }
+
+    fn render_more_error(&self, cx: &mut Context<Self>) -> AnyElement {
+        let error = self.more_error.clone().unwrap_or_default();
+        h_flex()
+            .w_full()
+            .px(px(space::EDGE))
+            .gap(px(space::MD))
+            .child(studio_ui::ds::text::error(format!(
+                "The next page could not be read: {error}"
+            )))
+            .child(
+                studio_ui::ds::row_button("gallery-retry-more", "Retry").on_click(cx.listener(
+                    |this, _, _, cx| {
+                        this.more_error = None;
+                        this.want_more(cx);
+                        cx.notify();
+                    },
+                )),
+            )
+            .into_any_element()
+    }
+
+    /// One tile: its preview in a well, the row's name and what the file is. The cursor's tile
+    /// is ringed in the focus colour, a picked one checked, and a branch's change marked as
+    /// every change is (spec 033).
+    fn render_tile(&self, ix: usize, width: f32, cx: &mut Context<Self>) -> AnyElement {
+        let row = &self.rows[ix];
+        let radii = studio_ui::ds::radii(cx);
+        let property = self.property.clone().unwrap_or_default();
+        let tile = self.tiles.get(&(row.id.clone(), property.clone()));
+        let cursor = self.cursor == Some(ix);
+        let picked = self.picks.contains(&row.id);
+        let change = self.change_of(&row.id);
+        let removed = change == Some(NetChange::Removed);
+        let name = self.row_label(row).unwrap_or_else(|| row.id.clone());
+        let (meta, meta_color) = self.meta_of(&row.id, tile, &property);
+        // The ring and the fill sit [`space::XS`] outside the well, inside a ring as wide as
+        // the accent line: the well's corner is concentric within the tile's.
+        let gap = studio_ui::ds::size::ACCENT_LINE + space::XS;
+        let outer = radii.md;
+        let well_radius = studio_ui::ds::radius::within(outer, gap);
+        let inner = width - 2. * gap;
+        let fill = if cursor {
+            Some(studio_ui::ds::surface::selected_document(cx))
+        } else if picked {
+            Some(studio_ui::ds::surface::picked(cx))
+        } else {
+            None
+        };
+        let preview = self.render_preview(tile, inner, well_radius, cx);
+        let kind = change.map(|net| match net {
+            NetChange::Added => ChangeKind::Added,
+            NetChange::Changed => ChangeKind::Changed,
+            NetChange::Removed => ChangeKind::Removed,
+        });
+        let tip = format!("{name}\n{meta}");
+        v_flex()
+            .id(("gallery-tile", ix))
+            .debug_selector(move || format!("gallery-tile-{ix}"))
+            .w(px(width))
+            .flex_none()
+            .p(px(space::XS))
+            .rounded(px(outer))
+            .border(px(studio_ui::ds::size::ACCENT_LINE))
+            .border_color(if cursor {
+                studio_ui::ds::surface::focus(cx)
+            } else {
+                gpui::transparent_black()
+            })
+            .when_some(fill, |tile, fill| tile.bg(fill))
+            .when(removed, |tile| tile.opacity(studio_ui::ds::opacity::DIMMED))
+            .cursor_pointer()
+            .tip(studio_ui::ds::tooltip(tip))
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                this.click_tile(ix, event, window, cx)
+            }))
+            .child(
+                div()
+                    .relative()
+                    .size(px(inner))
+                    .rounded(px(well_radius))
+                    .overflow_hidden()
+                    .bg(studio_ui::ds::surface::well(cx))
+                    .child(preview)
+                    // A bar of the change's colour along the preview's top edge.
+                    .when_some(
+                        kind.filter(|kind| *kind != ChangeKind::Removed),
+                        |well, kind| {
+                            well.child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .left_0()
+                                    .w_full()
+                                    .h(px(studio_ui::ds::size::ACCENT_LINE))
+                                    .bg(kind.color().color(cx)),
+                            )
+                        },
+                    )
+                    .when(picked, |well| {
+                        well.child(
+                            div()
+                                .absolute()
+                                .top(px(space::SM))
+                                .left(px(space::SM))
+                                .child(studio_ui::ds::check_box(
+                                    ("gallery-pick", ix),
+                                    ui::ToggleState::Selected,
+                                    cx,
+                                )),
+                        )
+                    }),
+            )
+            .child(
+                v_flex()
+                    .h(px(studio_ui::ds::size::TILE_CAPTION))
+                    .pt(px(space::SM))
+                    .px(px(space::XXS))
+                    .gap(px(space::XXS))
+                    .when(kind == Some(ChangeKind::Added), |caption| {
+                        caption
+                            .rounded(px(well_radius))
+                            .bg(studio_ui::ds::surface::wash(Color::Created, cx))
+                    })
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .gap(px(space::XS))
+                            .when_some(kind, |line, kind| {
+                                line.child(
+                                    studio_ui::ds::text::body(kind.symbol()).color(kind.color()),
+                                )
+                            })
+                            .child(
+                                div().min_w_0().flex_1().child(
+                                    studio_ui::ds::text::body(name)
+                                        .single_line()
+                                        .truncate()
+                                        .when(removed, |label| label.strikethrough()),
+                                ),
+                            ),
+                    )
+                    .child(
+                        studio_ui::ds::text::meta(meta)
+                            .color(meta_color)
+                            .single_line()
+                            .truncate(),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// A tile's meta line and its colour: what the file is, or why there is none.
+    fn meta_of(&self, id: &str, tile: Option<&Tile>, property: &str) -> (String, Color) {
+        if self.file_changed(id) {
+            return ("File changed".into(), Color::Modified);
+        }
+        match tile.map(|tile| (&tile.meta, tile.facts.as_ref())) {
+            Some((Loadable::Loaded(BlobMeta::Managed { size, .. }), facts)) => {
+                (tile::meta_line(facts, *size), Color::Muted)
+            }
+            Some((Loadable::Loaded(BlobMeta::Null), _)) => {
+                (format!("No {property}"), Color::Disabled)
+            }
+            Some((Loadable::Loaded(BlobMeta::External { uri }), _)) => (
+                format!("External · {}", crate::blob::host(uri)),
+                Color::Muted,
+            ),
+            Some((Loadable::Failed(_), _)) => ("Could not read".into(), Color::Warning),
+            _ => (String::new(), Color::Muted),
+        }
+    }
+
+    fn render_preview(
+        &self,
+        tile: Option<&Tile>,
+        edge: f32,
+        radius: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let centered = || div().size_full().flex().items_center().justify_center();
+        let Some(tile) = tile else {
+            return centered().into_any_element();
+        };
+        let icon = |name: IconName, color: Color| {
+            centered()
+                .child(studio_ui::ds::icon::tile(name).color(color))
+                .into_any_element()
+        };
+        match (&tile.meta, &tile.look) {
+            (Loadable::Loaded(BlobMeta::Null), _) => icon(IconName::Dash, Color::Disabled),
+            (Loadable::Loaded(BlobMeta::External { .. }), _) => icon(IconName::Link, Color::Muted),
+            (_, Loadable::Failed(_)) | (Loadable::Failed(_), _) => {
+                icon(IconName::Warning, Color::Warning)
+            }
+            (_, Loadable::Loaded(Look::Image { image, .. })) => {
+                // Fitted, never past twice its own pixels.
+                let (w, h) = image_size(image, tile.facts.as_ref());
+                let room = edge - 2. * space::MD;
+                let scale = (room / w).min(room / h).min(2.);
+                let (w, h) = (w * scale, h * scale);
+                centered()
+                    .child(
+                        div()
+                            .relative()
+                            .w(px(w))
+                            .h(px(h))
+                            .child(
+                                gpui::img(image.source())
+                                    .size_full()
+                                    .object_fit(gpui::ObjectFit::Contain),
+                            )
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .left_0()
+                                    .size_full()
+                                    .rounded(px(studio_ui::ds::radius::within(radius, space::MD)))
+                                    .border(px(studio_ui::ds::size::HAIRLINE))
+                                    .border_color(studio_ui::ds::surface::image_outline(cx)),
+                            ),
+                    )
+                    .into_any_element()
+            }
+            (_, Loadable::Loaded(Look::Text(text))) => {
+                studio_ui::ds::preview_text(text.clone(), cx).into_any_element()
+            }
+            (_, Loadable::Loaded(Look::Empty)) => centered()
+                .child(studio_ui::ds::text::meta("Empty"))
+                .into_any_element(),
+            (_, Loadable::Loaded(Look::Icon)) => {
+                let kind = tile.facts.map(|facts| facts.kind);
+                icon(kind_icon(kind), Color::Muted)
+            }
+            _ => match tile.facts {
+                Some(facts) => icon(kind_icon(Some(facts.kind)), Color::Disabled),
+                None => centered().into_any_element(),
+            },
+        }
+    }
+}
+
+/// The size a preview is laid out at, in pixels: an image's own, an SVG's from its header when
+/// known, else a square.
+fn image_size(image: &crate::blob::ShownImage, facts: Option<&Facts>) -> (f32, f32) {
+    match image {
+        crate::blob::ShownImage::Raster(render) => {
+            let size = render.size(0);
+            let (w, h) = (size.width.0 as f32, size.height.0 as f32);
+            // A thumbnail stands for the image's own size, which may be larger.
+            match facts.and_then(|facts| facts.pixels) {
+                Some((pw, ph)) if pw as f32 >= w => (pw as f32, ph as f32),
+                _ => (w.max(1.), h.max(1.)),
+            }
+        }
+        crate::blob::ShownImage::Svg(_) => (
+            studio_ui::ds::size::TILE_LARGE,
+            studio_ui::ds::size::TILE_LARGE,
+        ),
+    }
+}
+
+/// The icon a file of `kind` stands as when it is not drawn.
+fn kind_icon(kind: Option<crate::blob::ValueKind>) -> IconName {
+    use crate::blob::ValueKind;
+    match kind {
+        Some(ValueKind::Image(_)) | Some(ValueKind::Svg) => IconName::Image,
+        Some(ValueKind::Pdf) => IconName::FileDoc,
+        Some(ValueKind::Text) => IconName::FileTextOutlined,
+        Some(ValueKind::Binary) | None => IconName::FileGeneric,
+    }
+}
+
+/// A file of `size` bytes read at `snapshot`: its first [`FIRST_READ`] bytes, and the rest
+/// when it is drawn whole ([`tile::draws_whole`]), with what its first bytes say.
+async fn read_file(
+    session: &WeakEntity<GraphSession>,
+    cell: &BlobCell,
+    snapshot: &Option<String>,
+    scope: Option<&ReadScope>,
+    size: u64,
+    cx: &mut gpui::AsyncApp,
+) -> Result<(Vec<u8>, Facts), String> {
+    let mut bytes = Vec::new();
+    let mut wanted = size.min(FIRST_READ);
+    let mut facts = None;
+    while (bytes.len() as u64) < wanted {
+        let from = bytes.len() as u64;
+        let read = session
+            .update(cx, |session, cx| match scope {
+                Some(scope) => {
+                    session.blob_bytes_in(scope, cell.clone(), snapshot.clone(), from..wanted, cx)
+                }
+                None => session.blob_bytes(cell.clone(), snapshot.clone(), from..wanted, cx),
+            })
+            .map_err(|_| "The graph closed.".to_owned())?;
+        let chunk = read.await.map_err(|error| error.to_string())?;
+        if chunk.is_empty() {
+            break;
+        }
+        bytes.extend(chunk);
+        if facts.is_none() && bytes.len() as u64 >= wanted.min(FIRST_READ) {
+            let judged = Facts::of(&bytes);
+            if tile::draws_whole(&judged, size) {
+                wanted = size;
+            }
+            facts = Some(judged);
+        }
+    }
+    let facts = facts.unwrap_or_else(|| Facts::of(&bytes));
+    Ok((bytes, facts))
+}
+
+impl Item for TypeGallery {
+    fn thing(&self, _cx: &App) -> Option<studio_actions::Thing> {
+        Some(studio_actions::Thing::Type(self.type_name.clone()))
+    }
+
+    fn view_kind(&self, _cx: &App) -> Option<ViewKind> {
+        Some(ViewKind::Gallery)
+    }
+
+    fn held_at(&self, _cx: &App) -> Option<String> {
+        self.at_commit.clone()
+    }
+
+    /// The strip a node table has, Gallery current (spec 020).
+    fn views(&self, _cx: &App) -> Vec<ViewLink> {
+        let tree = if self.rows.is_empty() {
+            ViewLink::disabled_because(ViewKind::Tree, "No rows to show")
+        } else if self.picks.is_empty() {
+            ViewLink::to(ViewKind::Tree)
+                .saying("Show these rows, each opening to its relationships")
+        } else {
+            ViewLink::to(ViewKind::Tree).saying(format!(
+                "Show the {}, each opening to its relationships",
+                plural(self.picks.len(), "picked row", "picked rows")
+            ))
+        };
+        let canvas = match self.selected_row_id() {
+            Some(id) => {
+                let name = self
+                    .cursor_row()
+                    .and_then(|row| self.row_label(row))
+                    .unwrap_or_else(|| id.to_owned());
+                ViewLink::to(ViewKind::Canvas).saying(format!("Walk from {name}"))
+            }
+            None => ViewLink::disabled_because(ViewKind::Canvas, "Select a tile to walk from it"),
+        };
+        vec![
+            ViewLink::to(ViewKind::Table).saying(format!("The {} table", self.type_name)),
+            tree,
+            canvas,
+            ViewLink::current(ViewKind::Gallery),
+        ]
+    }
+
+    fn view_action(&self, kind: ViewKind, _cx: &App) -> Option<Box<dyn gpui::Action>> {
+        match kind {
+            ViewKind::Table => Some(Box::new(OpenType {
+                type_name: self.type_name.clone(),
+                at_commit: self.at_commit.clone(),
+                filter_id: None,
+                via: None,
+                preview: true,
+                filters: self.filters_value(),
+                separate: false,
+            })),
+            ViewKind::Tree => Some(Box::new(ShowSetInTree {
+                title: self.title.clone(),
+                type_name: Some(self.type_name.clone()),
+                filters: self.filters_value(),
+                nodes: self.picked_nodes().or_else(|| {
+                    self.ids.as_ref().map(|ids| {
+                        ids.iter()
+                            .map(|id| ResultNode {
+                                type_name: self.type_name.clone(),
+                                id: id.clone(),
+                                label: None,
+                            })
+                            .collect()
+                    })
+                }),
+                total: match &self.count {
+                    Loadable::Loaded(n) if self.picks.is_empty() => Some((*n).max(0) as u64),
+                    _ => None,
+                },
+                at_commit: self.at_commit.clone(),
+                select: self.selected_row_id().map(str::to_owned),
+                preview: true,
+            })),
+            ViewKind::Canvas => Some(Box::new(ShowNodeOnCanvas {
+                type_name: self.type_name.clone(),
+                id: self.selected_row_id()?.to_owned(),
+                at_commit: self.at_commit.clone(),
+                preview: true,
+            })),
+            _ => None,
+        }
+    }
+
+    fn selected_ids(&self, _cx: &App) -> Option<studio_workspace::SelectedIds> {
+        let ids: Vec<String> = if self.picks.is_empty() {
+            self.selected_row_id()
+                .map(str::to_owned)
+                .into_iter()
+                .collect()
+        } else {
+            self.picks.iter().cloned().collect()
+        };
+        (!ids.is_empty()).then(|| studio_workspace::SelectedIds {
+            type_name: Some(self.type_name.clone()),
+            ids,
+            root: None,
+        })
+    }
+
+    /// The tile under the cursor's row, with the values the gallery read of it, as the table's
+    /// peek shows a row.
+    fn inspected(&mut self, cx: &mut Context<Self>) -> Option<Inspected> {
+        let Some(id) = self.selected_row_id().map(str::to_owned) else {
+            self.peek = None;
+            return None;
+        };
+        if let Some((shown, peek)) = &self.peek
+            && *shown == id
+        {
+            return Some(Inspected::View {
+                view: peek.clone().into(),
+                scrolls_itself: true,
+            });
+        }
+        let values = self.cursor_row()?.values.clone();
+        let (session, type_name, snapshot) = (
+            self.session.clone(),
+            self.type_name.clone(),
+            self.paging.pinned.clone(),
+        );
+        let held = self.at_commit.is_some();
+        let peek = cx.new(|cx| {
+            let mut peek = NodePeek::new(
+                session,
+                PeekSubject::Node {
+                    type_name,
+                    id: id.clone(),
+                },
+                Some(values),
+                snapshot,
+                HashMap::new(),
+                true,
+                cx,
+            );
+            if held {
+                peek.hold_commit();
+            }
+            peek
+        });
+        self.peek = Some((id, peek.clone()));
+        Some(Inspected::View {
+            view: peek.into(),
+            scrolls_itself: true,
+        })
+    }
+
+    fn caches_its_parts(&self) -> bool {
+        true
+    }
+
+    fn tab_title(&self, _cx: &App) -> SharedString {
+        let title = format!("Gallery: {}", self.title);
+        match &self.at_commit {
+            Some(commit) => format!("{title} @ {}", studio_ui::short_commit_id(commit)).into(),
+            None => title.into(),
+        }
+    }
+
+    fn tab_icon(&self, _cx: &App) -> Option<IconName> {
+        Some(IconName::Image)
+    }
+
+    fn dedupe_key(&self, _cx: &App) -> Option<SharedString> {
+        Some(crate::gallery_key(&self.opening()).into())
+    }
+
+    fn serialize(&self, _cx: &App) -> Option<SavedItem> {
+        let mut data = serde_json::to_value(self.opening()).ok()?;
+        if let Some(map) = data.as_object_mut() {
+            map.insert(
+                "size".into(),
+                serde_json::to_value(self.size).unwrap_or(Value::Null),
+            );
+        }
+        Some(SavedItem {
+            kind: "gallery".into(),
+            data,
+        })
+    }
+
+    fn is_stale(&self, _cx: &App) -> bool {
+        self.newer
+    }
+
+    fn status(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> Option<ItemStatus> {
+        let mut start = Vec::new();
+        if self.loading_more || !self.tile_tasks.is_empty() {
+            start.push(studio_ui::ds::spinner().into_any_element());
+        }
+        if !self.picks.is_empty() {
+            start.push(
+                studio_ui::ds::text::meta(plural(self.picks.len(), "picked", "picked"))
+                    .into_any_element(),
+            );
+        }
+        let focus = self.focus_handle.clone();
+        let key =
+            |label: &str, action: &dyn gpui::Action| KeyHint::new(label.to_owned(), action, &focus);
+        let keys = vec![
+            key("Move", &MoveRight),
+            key("Peek", &ToggleInspector),
+            key("Open the file", &OpenFile),
+            key("Open the row", &OpenRowPage),
+            key("Pick", &TogglePick),
+            key("Pick all", &PickAll),
+            key("Copy ids", &CopyIds),
+            key("Next file", &ShowNextFile),
+            key("Larger tiles", &LargerTiles),
+            key("Smaller tiles", &SmallerTiles),
+            key("Refresh", &Refresh),
+        ];
+        Some(ItemStatus {
+            start,
+            end: Vec::new(),
+            keys,
+        })
+    }
+}
+
+impl Render for TypeGallery {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        {
+            self.renders += 1;
+        }
+        let mut context = KeyContext::new_with_defaults(cx.platform_info().os);
+        context.add("Gallery");
+        let grid = self.grid.clone();
+        v_flex()
+            .key_context(context)
+            .track_focus(&self.focus_handle)
+            .size_full()
+            .bg(studio_ui::ds::surface::document(cx))
+            .on_action(cx.listener(|this, _: &MoveLeft, _, cx| this.move_cursor(-1, false, cx)))
+            .on_action(cx.listener(|this, _: &MoveRight, _, cx| this.move_cursor(1, false, cx)))
+            .on_action(cx.listener(|this, _: &MoveUp, _, cx| this.move_cursor(-1, true, cx)))
+            .on_action(cx.listener(|this, _: &MoveDown, _, cx| this.move_cursor(1, true, cx)))
+            .on_action(cx.listener(|this, _: &MoveToFirst, _, cx| this.set_cursor(0, cx)))
+            .on_action(cx.listener(|this, _: &MoveToLast, _, cx| this.move_to_end(cx)))
+            .on_action(cx.listener(|this, _: &OpenFile, window, cx| this.open_file(window, cx)))
+            .on_action(
+                cx.listener(|this, _: &OpenRowPage, window, cx| this.open_row_page(window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &TogglePick, _, cx| {
+                if let Some(cursor) = this.cursor {
+                    this.pick(cursor, false, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &PickAll, _, cx| this.pick_all(cx)))
+            .on_action(cx.listener(|this, _: &ClearPicks, _, cx| this.clear_picks(cx)))
+            .on_action(cx.listener(|this, _: &CopyIds, _, cx| this.copy_ids(cx)))
+            .when(self.files.len() > 1, |gallery| {
+                gallery
+                    .on_action(cx.listener(|this, _: &ShowNextFile, _, cx| this.show_next_file(cx)))
+            })
+            .on_action(cx.listener(|this, _: &LargerTiles, _, cx| {
+                let size = this.size.larger();
+                this.set_size(size, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SmallerTiles, _, cx| {
+                let size = this.size.smaller();
+                this.set_size(size, cx)
+            }))
+            .on_action(cx.listener(|this, _: &Refresh, _, cx| this.refresh(cx)))
+            .child(self.render_toolbar(cx))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .child(AnyView::from(grid).cached(StyleRefinement::default().size_full())),
+            )
+    }
+}
+
+/// The gallery's tiles, drawn as a view of their own and cached (`docs/drawing.md`): the
+/// toolbar's menus and the status bar draw without them.
+pub(crate) struct GalleryGrid {
+    gallery: WeakEntity<TypeGallery>,
+    _gallery_changed: Subscription,
+    #[cfg(test)]
+    pub(crate) renders: usize,
+}
+
+impl GalleryGrid {
+    /// Made with the gallery, not on its first draw, so GPUI counts it among what the gallery's
+    /// draw depends on (`docs/drawing.md`).
+    fn new(cx: &mut Context<TypeGallery>) -> Entity<Self> {
+        let gallery = cx.entity();
+        cx.new(|cx| GalleryGrid {
+            gallery: gallery.downgrade(),
+            _gallery_changed: cx.observe(&gallery, |_, _, cx| cx.notify()),
+            #[cfg(test)]
+            renders: 0,
+        })
+    }
+}
+
+impl Render for GalleryGrid {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        {
+            self.renders += 1;
+        }
+        self.gallery
+            .update(cx, |gallery, cx| gallery.render_body(window, cx))
+            .unwrap_or_else(|_| gpui::Empty.into_any_element())
+    }
+}
+
+#[cfg(test)]
+mod tests;

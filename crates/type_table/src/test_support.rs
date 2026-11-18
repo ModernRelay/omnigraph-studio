@@ -475,6 +475,37 @@ pub(crate) fn session_with_blobs(
     (session, blobs)
 }
 
+/// A server with `schema`, each read answered with the rows `answer` gives for its request
+/// body, Blob cells it holds, and with `changes`, a branch's diff against main as
+/// [`session_with_branch_diff`] answers it: what a gallery reads (spec 035).
+pub(crate) fn session_with_files(
+    schema: &str,
+    answer: impl Fn(&Value) -> Value + Send + Sync + 'static,
+    changes: Option<Value>,
+    cx: &mut TestAppContext,
+) -> (Entity<GraphSession>, Arc<Blobs>) {
+    let blobs = Arc::new(Blobs::default());
+    let routes = Routes {
+        blobs: blobs.clone(),
+        diff: changes.map(|changes| {
+            Arc::new(BranchDiffRoute {
+                changes,
+                reads: Mutex::new(Vec::new()),
+            })
+        }),
+        ..Routes::default()
+    };
+    let session = serve_blobs(
+        schema,
+        Arc::new(answer),
+        always(200, committed("c2", "c1")),
+        None,
+        routes,
+        cx,
+    );
+    (session, blobs)
+}
+
 /// What the access route answers for a credential that reads every branch and changes none.
 pub(crate) fn read_only_access() -> Value {
     json!({ "graph_id": "knowledge", "actor_id": "act-reader", "graph_wide": ["read"], "actions": ["read"] })
@@ -568,6 +599,9 @@ pub(crate) struct Blobs {
     tags: std::sync::atomic::AtomicU64,
     /// A gate the next Blob write waits at before it is answered, once one is set.
     pub(crate) hold: Mutex<Option<futures::channel::oneshot::Receiver<()>>>,
+    /// Every read of a cell, in order: `HEAD Type/id/property`, or `GET Type/id/property
+    /// from-to` for a range, `GET Type/id/property` whole.
+    pub(crate) reads: Mutex<Vec<String>>,
 }
 
 impl Blobs {
@@ -638,6 +672,13 @@ impl Blobs {
                 .unwrap_or_default()
         };
         let cell = format!("{}/{}/{}", param("type"), param("id"), param("property"));
+        if matches!(method, "HEAD" | "GET") {
+            let read = match (method, range.and_then(|range| range.strip_prefix("bytes="))) {
+                ("GET", Some(range)) => format!("GET {cell} {range}"),
+                _ => format!("{method} {cell}"),
+            };
+            self.reads.lock().unwrap().push(read);
+        }
         let held = match method {
             "HEAD" | "GET" => self.get_at(&cell, &param("snapshot")),
             _ => self.get(&cell),
