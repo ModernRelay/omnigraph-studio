@@ -276,7 +276,9 @@ fn copy_link(workspace: &mut Workspace, cx: &mut Context<Workspace>) {
     let target = deep_link::Target {
         server: session.connection.read(cx).server.url.clone(),
         graph: session.graph_id.clone(),
-        branch: (session.branch != "main").then(|| session.branch.clone()),
+        // Named even when it is main: a link without one keeps a window already showing the
+        // graph on its own branch (`show_graph_in`), so it would open somewhere else there.
+        branch: Some(session.branch.clone()),
     };
     let node = match workspace.active_item().and_then(|item| item.thing(cx)) {
         Some(studio_actions::Thing::Node { type_name, id }) => Some((type_name, id)),
@@ -1956,10 +1958,34 @@ mod start_tests {
     }
 
     /// Copy Link puts a link to the window's graph and branch on the clipboard, which opens
-    /// the same place again; one on main names no branch.
+    /// the same place again. One copied on main names main too: opened in a window already on
+    /// another branch of the graph, a link without a branch keeps that branch.
     #[gpui::test]
     fn copy_link_copies_where_the_window_is(cx: &mut TestAppContext) {
         let (_registry, servers, _asked) = studio_with_servers(cx);
+        let on_main = cx.new(|cx| {
+            graph_store::GraphSession::new(
+                servers[0].clone(),
+                "knowledge".into(),
+                "main".into(),
+                cx,
+            )
+        });
+        let (main_window, main_cx) = cx.add_window_view(Workspace::new);
+        main_window.update_in(main_cx, |workspace, window, cx| {
+            workspace.set_session(on_main.clone(), window, cx)
+        });
+        main_window.update(main_cx, copy_link);
+        let copied = main_cx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(
+            deep_link::parse(&copied.unwrap()),
+            Ok(deep_link::DeepLink::Graph(deep_link::Target {
+                server: "http://a.test".into(),
+                graph: "knowledge".into(),
+                branch: Some("main".into()),
+            }))
+        );
+
         let session = cx.new(|cx| {
             graph_store::GraphSession::new(
                 servers[0].clone(),

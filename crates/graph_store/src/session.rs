@@ -1439,7 +1439,7 @@ impl GraphSession {
 
     /// The person's Refresh: [`Self::reload`], and a CLI server's token asked of the CLI again
     /// ([`Connection::refresh_token`]); a server that did not answer is connected again at once
-    /// ([`Connection::connect`], which asks for the token itself), not at its next check, two
+    /// ([`Connection::connect_again`], which asks for the token itself), not at its next check, two
     /// minutes after a failure. Only Refresh asks it: a graph first shown reads with the
     /// token its connect was given. A graph whose first reads have not gone yet sends them the
     /// way it would have ([`Self::open_when_ready`]): once its token is there, connecting a
@@ -1453,7 +1453,7 @@ impl GraphSession {
         self.reload(cx);
         self.connection.update(cx, |connection, cx| {
             if matches!(connection.state, ConnectionState::Unreachable(_)) {
-                connection.connect(cx)
+                connection.connect_again(cx)
             } else {
                 connection.refresh_token(cx)
             }
