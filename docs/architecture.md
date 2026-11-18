@@ -13,7 +13,7 @@ other: what two features share moves down a layer.
 |---|---|---|---|
 | 0 | `studio_actions` | Every action type, with doc comments that become palette descriptions | `gpui` |
 | 1 | `studio_settings`, `studio_theme` | Typed layered settings; graph tokens over Zed's themes, set up through Zed's `theme_settings`, the themes Studio bundles, and Studio's icons in place of Zed's | `gpui`, `settings`, `theme`, `theme_settings`, `assets`, serde |
-| 2 | `graph_client` | Every request to an Omnigraph server: contract header, DTOs for the 0.14 API, write outcomes, change-feed paging. **No `gpui`** | Zed `http_client` (Apache-2.0), serde |
+| 2 | `graph_client` | Every request to an Omnigraph server: contract header, DTOs for contract 0.14 (Omnigraph `v0.15.0`'s document), write outcomes, change-feed paging. **No `gpui`** | Zed `http_client` (Apache-2.0), serde |
 | 2 | `control_client` | Every request to a managed control plane (spec 021): the organization's clusters, a cluster's detail and status, and a cluster's data token, with a control-plane token and never a graph token. DTOs checked against the control plane's pinned OpenAPI document. **No `gpui`** | Zed `http_client`, serde |
 | 2 | `oauth_client` | Studio as an OAuth public client (spec 016): a server's sign-in details, its sign-in service's metadata, PKCE, the loopback callback, the token endpoint. **No `gpui`** | Zed `http_client`, `smol`, `sha2` |
 | 2 | `model` | Model calls through OpenRouter (spec 019): a task's input and schema in, a typed answer out; the only crate that calls OpenRouter. Holds no key and reads no setting. **No `gpui`** | Zed `http_client`, `smol`, `schemars` |
@@ -23,13 +23,21 @@ other: what two features share moves down a layer.
 | 3 | `studio_update` | The updater (spec 017): checks Studio's own releases, downloads, verifies and installs an update. The only requests not to an Omnigraph server or the sign-in service it names | `gpui`, `studio_settings`, `http_client`, `minisign-verify` |
 | 3 | `filter_words` | A filter from a sentence (spec 019): what a type's table or a relationship in the tree sends the model, the answer's shape, and the answer checked against the keys, operators, orders and groupings offered. **No `gpui`** | `model`, `gq_language`, serde |
 | 4 | `studio_workspace` | The window frame: panes, tabs, docks, panels, status bar, modal and toast layers | `gpui`, `ui`, `studio_ui`, `studio_actions`, `studio_settings` |
-| 4 | `change_cards` | The entity cards a review and a commit's view share: an entity's card, its relationship lines, a run's header, how many lines a card shows | `gpui`, `ui`, `studio_ui`, `graph_store`, `gq_language` |
+| 4 | `change_cards` | One way to show a change (spec 033), wherever Studio shows one: an entity's row and card, its relationship lines, a run's row, the kind's mark, the summary line by type, a listed commit's counts, the states of a change being read, empty or across a schema change, the button that opens a change's node | `gpui`, `ui`, `studio_ui`, `studio_actions`, `graph_store`, `gq_language` |
 | 5 | `command_palette`, `type_table`, `relationship_tree`, `graph_canvas`, `query_editor`, `review`, `history`, `agent_panel` | One surface each | layers 0–4 |
+| 5 | `ui_tool_server` | Studio's UI tools and the server that serves them (spec 032): the allow-list of Studio's actions an agent may call and what each answers (`tools`), served as MCP over Streamable HTTP on `127.0.0.1` to the panel's agents and, when turned on, to agents outside Studio. Makes no request to an Omnigraph server. Only `studio` depends on it, and hands `agent_panel` its entries through `agent_panel::UiToolEndpoint`; the workspace and the views know nothing of it | layers 0–4, `smol`, `httparse`, `getrandom` |
 | 6 | `studio` | The binary: initialises every crate in order, menus, windows, single instance, URL scheme | everything |
 
 `studio_workspace` is forked and trimmed from Zed's `workspace`, without projects,
 collaboration or Zed's database (spec 002). `command_palette` is forked from Zed's `picker` and
 `command_palette` the same way.
+
+The UI tools (spec 032) are one feature and stay in one crate. A person's key, the palette and
+a tool reach the same action handlers; what `ui_tool_server` needs of a window it reads through
+what the workspace and every tab answer any reader (`Workspace::pane_tabs`; `Item::outline`,
+`settling`, `catch_up` and `refuses`), and none of those names an agent or a tool. Only
+`crates/studio/src/ui_tools.rs` names the crate, and nothing in it runs until an agent is
+served. `script/check-layers.py` checks all but the last, which a test does.
 
 ## Data flow
 
@@ -55,8 +63,8 @@ view (layer 5) ──reads──▶ entity in graph_store ──calls──▶ g
 
 | Entity | Holds | Notes |
 |---|---|---|
-| `Connection` | server URL and name (the CLI target it is reached as, or `environment`), the token (in memory only: the one the CLI exports for that target, or one given), contract and version check, health and latency, the graph list, state (`connecting`, `ready`, `contract-mismatch`, `unauthorized`, `unreachable`) | One per server address; the status-bar chip renders it. Health is checked while a window shows one of its graphs or the Open dialog lists it (`Connection::watch`). A graph's first reads wait until its token is ready (`Connection::token_ready`) |
-| `GraphSession` | graph id, branch, schema, branch list, type counts and the commit they count (`counts_commit`), the heads it watches, the read memo, what the credential may do, drafts and the outcome log | One per open graph in a window; its views share it. Each view holds its own snapshot pin. What Studio saves of it is under one key, its CLI target and its id (`overrides_key`, `<target>/<graph>`). A new token on its connection reads what it may do again, forgets every answer the read memo kept with the old one (reads at a commit, Blob cells, relationship counts, branch heads, commits' changes), and reads the type counts, the stored-query catalog (once a view has wanted it) and the branch list again, showing none of the old token's meanwhile; a parked session forgets at once and reads when shown again. A read a view sent under the old token answers nothing of it, and views that show what they read (tables, node pages, the tree and canvas, review) let it go and read it again at the commit they show. It keeps the schema, which the server answers alike to every credential that may read the graph, and reads it again only when none is held, since a 401 may have refused it; it keeps the heads and change logs, which describe commits and only carry forward answers read since. A 403 on its graph reads what the credential may do again and keeps the answers; one on another graph of the server changes nothing here |
+| `Connection` | server URL and name (the CLI target it is reached as, or `environment`), the token (in memory only: the one the CLI exports for that target, or one given), contract and version check, health and latency, what the server serves beyond contract 0.14 (`ServerFeatures`, from the release each health answer reports), the graph list, state (`connecting`, `ready`, `contract-mismatch`, `unauthorized`, `unreachable`) | One per server address; the status-bar chip renders it. Code asks `features.has(ServerFeature::…)` before it asks a server for something a later release added or saves as a later release requires, never compares versions itself; a health answer whose release serves other features says so (`ConnectionEvent::FeaturesChanged`), and the sessions on it read the branch list again (spec 003, Server features). Health is checked while a window shows one of its graphs or the Open dialog lists it (`Connection::watch`). A graph's first reads wait until its token is ready (`Connection::token_ready`) |
+| `GraphSession` | graph id, branch, schema, branch list, type counts and the commit they count (`counts_commit`), the heads it watches, the read memo, the node-search name indexes by type and commit (spec 031; at most 32 MiB, forgotten with the memo), what the credential may do, drafts and the outcome log | One per open graph in a window; its views share it. Each view holds its own snapshot pin. What Studio saves of it is under one key, its CLI target and its id (`overrides_key`, `<target>/<graph>`). A new token on its connection reads what it may do again, forgets every answer the read memo kept with the old one (reads at a commit, Blob cells, relationship counts, branch heads, commits' changes), and reads the type counts, the stored-query catalog (once a view has wanted it) and the branch list again, showing none of the old token's meanwhile; a parked session forgets at once and reads when shown again. A read a view sent under the old token answers nothing of it, and views that show what they read (tables, node pages, the tree and canvas, review) let it go and read it again at the commit they show. It keeps the schema, which the server answers alike to every credential that may read the graph, and reads it again only when none is held, since a 401 may have refused it; it keeps the heads and change logs, which describe commits and only carry forward answers read since. A 403 on its graph reads what the credential may do again and keeps the answers; one on another graph of the server changes nothing here |
 | `SchemaModel` | the `.pg` source from `GET /schema`, compiled with `omnigraph-compiler` into node, edge and property shapes | One per session, rebuilt when the schema is read again (Refresh, or another writer's schema seen at a head move) |
 | `Exploration` | the set of expanded paths (node → relationship group → node …) | Shared by the relationship tree and the canvas |
 | Drafts (`GraphSession::drafts`) | unsaved property values by branch, each with the value it was read at (spec 014) | A branch's wait while another is shown; a save is one mutation bound to the values read |
@@ -137,7 +145,7 @@ write that matched nothing, or a 412, reopens the draft.
 - `#[gpui::test]` for views and entities, against `graph_client` driven by Zed's
   `FakeHttpClient` with recorded responses.
 - `graph_client` and `gq_language` have plain unit tests; they do not depend on GPUI.
-- `crates/graph_client/openapi/omnigraph-0.14.0.json` (Omnigraph `v0.14.0`) is the contract:
+- `crates/graph_client/openapi/omnigraph-0.15.0.json` (Omnigraph `v0.15.0`, contract 0.14) is the contract:
   `graph_client`'s contract tests check every DTO's fields and every enum's variants against its
   schemas, and `every_route_the_client_calls_is_in_the_contract` makes
   each of the client's calls once and checks that its method and path are one of the
@@ -159,8 +167,9 @@ Studio connects to running servers:
 3. A local graph is opened by serving it first (`omnigraph-server --cluster <dir>`); Studio
    does not open storage itself.
 4. A managed cluster is opened from its control plane: from the plane's list in the Open
-   dialog, or from the link `omnigraph studio` sends for a managed target, with the control
-   plane's data token (spec 021). No CLI target need name it. The window that has one of its
+   dialog, or from an `omnigraph-studio://open` link that names it (the 0.15 CLI's `omnigraph
+   studio` refuses managed targets, so it sends none yet), with the control plane's data token
+   (spec 021). No CLI target need name it. The window that has one of its
    graphs open saves the cluster as the control plane names it (`ClusterIdentity`: route,
    organization, id, incarnation) and reopens it at the next start; Studio still keeps no list
    of clusters (`specs/021-control-plane/reopening.md`).

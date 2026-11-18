@@ -3,7 +3,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use graph_store::{Entry, EntryKind, ExplorePath, ExploreState, GroupKey, Loadable, NodeRef};
+use graph_store::{
+    Entry, EntryKind, ExplorePath, ExploreState, GroupKey, LoadTarget, Loadable, NodeRef,
+    PageStatus,
+};
 
 /// Neighbours a hub shows before "+K more", and how many each click on it adds.
 pub const HUB_STEP: usize = 8;
@@ -13,6 +16,22 @@ pub enum SceneId {
     Node(NodeRef),
     Hub(GroupKey),
     More(GroupKey),
+    /// What an open node's relationships say while none is drawn.
+    Note(NodeRef),
+}
+
+/// What is not drawn yet says, in place of it (H5 and H16 in the canvas UX report): an open
+/// node's relationships, or an open relationship's neighbours.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Note {
+    /// Still being read.
+    Reading,
+    /// Could not be read: the reads Retry asks for again.
+    Failed(Vec<LoadTarget>),
+    /// Read, and there are none.
+    Empty,
+    /// There are some, and the node cap left them out: the cap's banner counts them.
+    LeftOut,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -29,8 +48,37 @@ pub enum SceneKind {
         count: Option<u64>,
         open: bool,
     },
-    /// The neighbours of a hub not drawn yet.
-    More { key: GroupKey, hidden: u64 },
+    /// The neighbours of a hub not drawn yet, or what reading them says.
+    More {
+        key: GroupKey,
+        hidden: u64,
+        note: Option<Note>,
+    },
+    /// What an open node's relationships say while none is drawn: being read, could not be
+    /// read (with Retry), or none.
+    Note { node: NodeRef, note: Note },
+}
+
+impl Note {
+    /// What a node's note chip says.
+    pub fn of_relationships(&self) -> &'static str {
+        match self {
+            Note::Reading => "Reading relationships…",
+            Note::Failed(_) => "Couldn't read relationships · Retry",
+            Note::Empty => "No relationships",
+            Note::LeftOut => "Relationships not drawn · over the node cap",
+        }
+    }
+
+    /// What a relationship's "+K more" says in place of its count.
+    pub fn of_neighbours(&self) -> &'static str {
+        match self {
+            Note::Reading => "Reading…",
+            Note::Failed(_) => "Couldn't read · Retry",
+            Note::Empty => "None",
+            Note::LeftOut => "Not drawn · over the node cap",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -61,6 +109,59 @@ pub struct Scene {
     /// The node cap the scene was built under, which its banner names: a setting changed
     /// since is not this scene's until it is built again.
     pub cap: usize,
+}
+
+/// `scene` without the nodes hidden (`HideNodes`), nor what hangs off them: the chips
+/// whose chain of parents reaches a hidden node (spec 032, "Hide"). The walk's root is never
+/// hidden.
+pub fn without(scene: Scene, hidden: &HashSet<NodeRef>) -> Scene {
+    if hidden.is_empty() {
+        return scene;
+    }
+    let gone: Vec<bool> = (0..scene.nodes.len())
+        .map(|index| {
+            let mut at = Some(index);
+            while let Some(ix) = at {
+                let node = &scene.nodes[ix];
+                if let SceneKind::Node {
+                    node, root: false, ..
+                } = &node.kind
+                    && hidden.contains(node)
+                {
+                    return true;
+                }
+                at = node.parent;
+            }
+            false
+        })
+        .collect();
+    let mut kept_at = vec![None; scene.nodes.len()];
+    let mut nodes = Vec::new();
+    for (index, node) in scene.nodes.into_iter().enumerate() {
+        if !gone[index] {
+            kept_at[index] = Some(nodes.len());
+            nodes.push(node);
+        }
+    }
+    for node in &mut nodes {
+        node.parent = node.parent.and_then(|parent| kept_at[parent]);
+    }
+    let edges = scene
+        .edges
+        .into_iter()
+        .filter_map(|edge| {
+            Some(SceneEdge {
+                from: kept_at[edge.from]?,
+                to: kept_at[edge.to]?,
+            })
+        })
+        .collect();
+    Scene {
+        nodes,
+        edges,
+        capped: scene.capped,
+        cap: scene.cap,
+    }
 }
 
 impl Scene {
@@ -94,6 +195,7 @@ pub fn open_paths(entries: &[Entry], state: &ExploreState, ids: &[SceneId]) -> V
             SceneId::Hub(key) | SceneId::More(key) => {
                 hubs.insert(key);
             }
+            SceneId::Note(_) => {}
         }
     }
     entries
@@ -183,6 +285,9 @@ pub fn explore_scene(
     let mut shown_per_hub: HashMap<usize, usize> = HashMap::new();
     // The lines drawn so far, so a line is drawn once without searching every line.
     let mut lines: HashSet<(usize, usize)> = HashSet::new();
+    // What each open node's relationships have come to, by its chip: its note says it while
+    // none is drawn, and when one could not be read.
+    let mut progress: HashMap<usize, Progress> = HashMap::new();
     let label_of = |node: &NodeRef| {
         state
             .label(node)
@@ -210,6 +315,12 @@ pub fn explore_scene(
         }
         let parent_scene = entry.parent.and_then(|parent| placed[parent]);
         match &entry.kind {
+            // A root that could not be read is drawn as no chip: the canvas's banner says why.
+            EntryKind::Node { .. }
+                if entry.parent.is_none() && matches!(state.root_status, Loadable::Failed(_)) =>
+            {
+                skipped[index] = true;
+            }
             EntryKind::Node { node, expanded, .. } => {
                 let id = SceneId::Node(node.clone());
                 // A hub draws `limit` neighbour edges, whether or not their nodes are new.
@@ -272,6 +383,12 @@ pub fn explore_scene(
                     skipped[index] = true;
                     continue;
                 };
+                let noted = progress.entry(owner).or_default();
+                match count {
+                    Loadable::NotLoaded | Loadable::Loading => noted.reading = true,
+                    Loadable::Failed(_) => noted.failed.push(LoadTarget::Count(key.clone())),
+                    Loadable::Loaded(_) => {}
+                }
                 // A hub is drawn once it is counted and has something: the pills do not
                 // appear for every relationship and then go as their counts come in empty.
                 if !matches!(count, Loadable::Loaded(n) if *n > 0) {
@@ -279,7 +396,9 @@ pub fn explore_scene(
                     continue;
                 }
                 let id = SceneId::Hub(key.clone());
+                // Counted toward its node's note once drawn; one the cap leaves out says so.
                 if let Some(existing) = by_id.get(&id).copied() {
+                    progress.entry(owner).or_default().hubs += 1;
                     placed[index] = Some(existing);
                     if *expanded
                         && let SceneKind::Hub { open, .. } = &mut scene.nodes[existing].kind
@@ -289,11 +408,13 @@ pub fn explore_scene(
                     continue;
                 }
                 if scene.nodes.len() >= cap {
+                    progress.entry(owner).or_default().left_out = true;
                     hidden.insert(id);
                     skipped[index] = true;
                     capped[index] = true;
                     continue;
                 }
+                progress.entry(owner).or_default().hubs += 1;
                 let arrow = key.group.direction.arrow();
                 // Searched (the Explore tree's "Find among"), the hub's neighbours are the
                 // matches alone: counted once all are read, else unknown. The relationship's
@@ -334,7 +455,7 @@ pub fn explore_scene(
             // node it reaches. (The tree shows it inline, as a field.)
             EntryKind::Field {
                 key,
-                target: Some(target),
+                target: Some(_),
                 ..
             } => {
                 let Some(owner) = parent_scene else {
@@ -375,42 +496,18 @@ pub fn explore_scene(
                         hub
                     }
                     None => {
+                        // Left out by the cap, with the target the walk puts under it.
+                        progress.entry(owner).or_default().left_out = true;
                         hidden.insert(hub_id);
-                        if open {
-                            hidden.insert(SceneId::Node(target.node.clone()));
-                        }
+                        skipped[index] = true;
+                        capped[index] = true;
                         continue;
                     }
                 };
+                // Opened, its target is the node entry the walk puts under it (a node of the
+                // walk, expandable as any), drawn by the entries that follow.
+                progress.entry(owner).or_default().hubs += 1;
                 placed[index] = Some(hub);
-                if !open {
-                    continue;
-                }
-                let id = SceneId::Node(target.node.clone());
-                let to = match by_id.get(&id).copied() {
-                    Some(existing) => existing,
-                    None if scene.nodes.len() < cap => add(
-                        &mut scene,
-                        &mut by_id,
-                        SceneNode {
-                            id,
-                            kind: SceneKind::Node {
-                                node: target.node.clone(),
-                                root: false,
-                                expanded: false,
-                            },
-                            label: label_of(&target.node),
-                            color_key: target.node.type_name.clone(),
-                            parent: Some(hub),
-                            path: None,
-                        },
-                    ),
-                    None => {
-                        hidden.insert(id);
-                        continue;
-                    }
-                };
-                push_edge(&mut scene, &mut lines, hub, to);
             }
             EntryKind::Cycle { node, .. } => {
                 if let (Some(hub), Some(existing)) = (
@@ -423,8 +520,35 @@ pub fn explore_scene(
             // The canvas draws a grouped relationship as its hub: a value's neighbours hang
             // from the hub, as they do without grouping.
             EntryKind::Bucket { .. } => placed[index] = parent_scene,
-            EntryKind::Field { .. }
-            | EntryKind::OtherValues { .. }
+            // A single target still being read, or one that could not be (its error row
+            // follows), counts toward its node's note.
+            EntryKind::Field {
+                target: None,
+                loading,
+                ..
+            } => {
+                if let Some(owner) = parent_scene {
+                    progress.entry(owner).or_default().reading |= *loading;
+                }
+            }
+            EntryKind::Error {
+                target: target @ LoadTarget::Page(_),
+                ..
+            } => {
+                let field_owner = entry
+                    .parent
+                    .filter(|parent| matches!(entries[*parent].kind, EntryKind::Field { .. }))
+                    .and_then(|field| entries[field].parent)
+                    .and_then(|node| placed[node]);
+                if let Some(owner) = field_owner {
+                    progress
+                        .entry(owner)
+                        .or_default()
+                        .failed
+                        .push(target.clone());
+                }
+            }
+            EntryKind::OtherValues { .. }
             | EntryKind::More { .. }
             | EntryKind::Loading { .. }
             | EntryKind::Error { .. } => {}
@@ -445,16 +569,23 @@ pub fn explore_scene(
         };
         let drawn = drawn_from.get(&hub).copied().unwrap_or(0);
         let total = count.unwrap_or(0);
-        if total > drawn && scene.nodes.len() >= cap {
+        let note = neighbours_note(state, &key, drawn);
+        let wanted = total > drawn || note.is_some();
+        if wanted && scene.nodes.len() >= cap {
             hidden.insert(SceneId::More(key));
-        } else if total > drawn {
+        } else if wanted {
+            let label = match &note {
+                Some(note) => note.of_neighbours().to_owned(),
+                None => format!("+{} more", total - drawn),
+            };
             let more = SceneNode {
                 id: SceneId::More(key.clone()),
                 kind: SceneKind::More {
                     key: key.clone(),
-                    hidden: total - drawn,
+                    hidden: total.saturating_sub(drawn),
+                    note,
                 },
-                label: format!("+{} more", total - drawn),
+                label,
                 color_key: key.group.edge.clone(),
                 parent: Some(hub),
                 path: scene.nodes[hub].path.clone(),
@@ -462,6 +593,44 @@ pub fn explore_scene(
             let index = add(&mut scene, &mut by_id, more);
             push_edge(&mut scene, &mut lines, hub, index);
         }
+    }
+
+    // An open node with no relationship drawn says why, and one with a relationship that
+    // could not be read says so, with Retry.
+    let mut owners: Vec<(usize, Progress)> = progress.into_iter().collect();
+    owners.sort_by_key(|(owner, _)| *owner);
+    for (owner, noted) in owners {
+        let SceneKind::Node { node, .. } = &scene.nodes[owner].kind else {
+            continue;
+        };
+        let note = if !noted.failed.is_empty() {
+            Note::Failed(noted.failed)
+        } else if noted.hubs > 0 {
+            continue;
+        } else if noted.left_out {
+            Note::LeftOut
+        } else if noted.reading {
+            Note::Reading
+        } else {
+            Note::Empty
+        };
+        // A note left out by the cap would leave an open node saying nothing; one cut by the
+        // cap is the cap's own exit for that node, so it is drawn past it. At most one a
+        // drawn open node.
+        if scene.nodes.len() >= cap && note != Note::LeftOut {
+            continue;
+        }
+        let node = node.clone();
+        let chip = SceneNode {
+            id: SceneId::Note(node.clone()),
+            label: note.of_relationships().to_owned(),
+            color_key: node.type_name.clone(),
+            kind: SceneKind::Note { node, note },
+            parent: Some(owner),
+            path: None,
+        };
+        let index = add(&mut scene, &mut by_id, chip);
+        push_edge(&mut scene, &mut lines, owner, index);
     }
 
     // A chip one path left out and another drew is drawn.
@@ -473,12 +642,48 @@ pub fn explore_scene(
             let type_name = match id {
                 SceneId::Node(node) => node.type_name.as_str(),
                 SceneId::Hub(key) | SceneId::More(key) => key.group.other_type.as_str(),
+                SceneId::Note(node) => node.type_name.as_str(),
             };
             *counts.entry(type_name).or_default() += 1;
         }
         scene.capped = most_left_out(counts).map(|type_name| (hidden.len(), type_name));
     }
     scene
+}
+
+/// What an open node's relationships have come to.
+#[derive(Debug, Default)]
+struct Progress {
+    /// Some are still being read.
+    reading: bool,
+    /// The reads that failed, for Retry.
+    failed: Vec<LoadTarget>,
+    /// How many are drawn.
+    hubs: usize,
+    /// The node cap left one or more out.
+    left_out: bool,
+}
+
+/// What an open relationship's "+K more" says in place of its count, with `drawn` of its
+/// neighbours drawn: its first neighbours (or values) being read, or a read that failed.
+fn neighbours_note(state: &ExploreState, key: &GroupKey, drawn: u64) -> Option<Note> {
+    match state.grouping.get(&key.group) {
+        Some(by) => match state.values.get(&(key.clone(), by.clone())) {
+            Some(Loadable::Failed(_)) => Some(Note::Failed(vec![LoadTarget::Values(
+                key.clone(),
+                by.clone(),
+            )])),
+            None | Some(Loadable::NotLoaded | Loadable::Loading) if drawn == 0 => {
+                Some(Note::Reading)
+            }
+            _ => None,
+        },
+        None => match state.neighbours.get(key).map(|list| &list.status) {
+            Some(PageStatus::Failed(_)) => Some(Note::Failed(vec![LoadTarget::Page(key.clone())])),
+            None | Some(PageStatus::Loading) if drawn == 0 => Some(Note::Reading),
+            _ => None,
+        },
+    }
 }
 
 /// Records `entry`, under an entry the cap left out, as not drawn, unless it is drawn by
@@ -666,6 +871,238 @@ mod tests {
             .expect("the company once open");
         assert_eq!(open.nodes[company].parent, Some(hub));
         assert!(open.edges.iter().any(|e| e.from == hub && e.to == company));
+    }
+
+    /// The node a single-target relationship reaches is a node of the walk: it has a path,
+    /// so a click or ↵ expands it to its own relationships, as any node does (H1 in the
+    /// canvas UX report). Before, it was drawn with no path and only opened a page.
+    #[test]
+    fn a_single_target_node_expands_as_any_node() {
+        let schema = SchemaModel::parse(&format!(
+            "{SCHEMA}edge Employer: Person -> Company @card(0..1)\n"
+        ))
+        .unwrap();
+        let mut state = ExploreState::rooted(person("ada"));
+        state.root_status = Loadable::Loaded(());
+        let employer = schema
+            .relationships_of("Person")
+            .iter()
+            .find(|g| g.edge == "Employer")
+            .cloned()
+            .unwrap();
+        let acme = NodeRef::new("Company", "acme");
+        state.neighbours.insert(
+            GroupKey::new(person("ada"), employer.clone()),
+            NeighbourList {
+                rows: vec![Neighbour {
+                    node: acme.clone(),
+                    label: None,
+                    edge: Vec::new(),
+                }],
+                exhausted: true,
+                ..Default::default()
+            },
+        );
+        let field = ExplorePath::root().child_group(&employer);
+        state.expanded.insert(field.clone());
+        let scene = explore_scene(&state.entries(&schema), &state, &HashMap::new(), node_cap());
+        let company = scene.index_of(&SceneId::Node(acme.clone())).unwrap();
+        let acme_path = field.child_node(&acme);
+        assert_eq!(scene.nodes[company].path.as_ref(), Some(&acme_path));
+        // Expanded, Acme shows its own relationships once counted.
+        let works_in = schema
+            .relationships_of("Company")
+            .iter()
+            .find(|g| g.edge == "WorksAt")
+            .cloned()
+            .unwrap();
+        let acme_works = GroupKey::new(acme.clone(), works_in);
+        state.counts.insert(acme_works.clone(), Loadable::Loaded(2));
+        state.expanded.insert(acme_path);
+        let scene = explore_scene(&state.entries(&schema), &state, &HashMap::new(), node_cap());
+        let company = scene.index_of(&SceneId::Node(acme)).unwrap();
+        assert!(matches!(
+            scene.nodes[company].kind,
+            SceneKind::Node { expanded: true, .. }
+        ));
+        let hub = scene
+            .index_of(&SceneId::Hub(acme_works))
+            .expect("Acme's own relationship");
+        assert_eq!(scene.nodes[hub].parent, Some(company));
+    }
+
+    /// The note an open node's relationships leave in place of hubs (H5, H16 in the canvas UX
+    /// report): "Reading relationships…" while counted, "No relationships" when there are
+    /// none, and "Couldn't read relationships · Retry", with what to read again, when a count
+    /// failed; none once a relationship is drawn. Before, an open node with failed or empty
+    /// counts drew nothing, as if it had no relationships either way.
+    #[test]
+    fn an_open_node_says_what_its_relationships_have_come_to() {
+        let schema = SchemaModel::parse(SCHEMA).unwrap();
+        let mut state = ExploreState::rooted(person("ada"));
+        state.root_status = Loadable::Loaded(());
+        let groups: Vec<GroupKey> = schema
+            .relationships_of("Person")
+            .iter()
+            .map(|group| GroupKey::new(person("ada"), group.clone()))
+            .collect();
+        let note = |state: &ExploreState| {
+            let scene = explore_scene(&state.entries(&schema), state, &HashMap::new(), node_cap());
+            let note = scene
+                .nodes
+                .iter()
+                .find(|node| node.id == SceneId::Note(person("ada")))
+                .map(|node| (node.label.clone(), node.kind.clone()));
+            if note.is_some() {
+                let ada = scene.index_of(&SceneId::Node(person("ada"))).unwrap();
+                let chip = scene.index_of(&SceneId::Note(person("ada"))).unwrap();
+                assert_eq!(scene.nodes[chip].parent, Some(ada), "under its node");
+            }
+            note
+        };
+        assert_eq!(note(&state).unwrap().0, "Reading relationships…");
+        for key in &groups {
+            state.counts.insert(key.clone(), Loadable::Loaded(0));
+        }
+        assert_eq!(note(&state).unwrap().0, "No relationships");
+        state
+            .counts
+            .insert(groups[0].clone(), Loadable::Failed("refused".into()));
+        let (label, kind) = note(&state).unwrap();
+        assert_eq!(label, "Couldn't read relationships · Retry");
+        assert_eq!(
+            kind,
+            SceneKind::Note {
+                node: person("ada"),
+                note: Note::Failed(vec![LoadTarget::Count(groups[0].clone())]),
+            }
+        );
+        state.counts.insert(groups[0].clone(), Loadable::Loaded(3));
+        assert_eq!(note(&state), None, "a relationship drawn says it all");
+    }
+
+    /// An open node whose relationships the node cap left out says so, past the cap, and not
+    /// "No relationships": here Bob's one pill, his employer, is cut by a cap of 3 (Ada, her
+    /// Knows pill, Bob). Before, the pill was counted before the cap cut it, so Bob, open,
+    /// said nothing at all.
+    #[test]
+    fn a_node_whose_relationships_the_cap_left_out_says_so() {
+        let schema = SchemaModel::parse(&format!(
+            "{SCHEMA}edge Employer: Person -> Company @card(0..1)\n"
+        ))
+        .unwrap();
+        let group = |edge: &str, direction: Direction| {
+            schema
+                .relationships_of("Person")
+                .iter()
+                .find(|g| g.edge == edge && g.direction == direction)
+                .cloned()
+                .unwrap()
+        };
+        let (knows, employer) = (
+            group("Knows", Direction::Outgoing),
+            group("Employer", Direction::Outgoing),
+        );
+        let mut state = ExploreState::rooted(person("ada"));
+        state.root_status = Loadable::Loaded(());
+        for who in ["ada", "bob"] {
+            for relationship in schema.relationships_of("Person") {
+                state.counts.insert(
+                    GroupKey::new(person(who), relationship.clone()),
+                    Loadable::Loaded(0),
+                );
+            }
+        }
+        let ada_knows = GroupKey::new(person("ada"), knows.clone());
+        state.counts.insert(ada_knows.clone(), Loadable::Loaded(1));
+        let list = |node: NodeRef| NeighbourList {
+            rows: vec![Neighbour {
+                node,
+                label: None,
+                edge: Vec::new(),
+            }],
+            exhausted: true,
+            ..Default::default()
+        };
+        state.neighbours.insert(ada_knows, list(person("bob")));
+        state.neighbours.insert(
+            GroupKey::new(person("ada"), employer.clone()),
+            NeighbourList {
+                exhausted: true,
+                ..Default::default()
+            },
+        );
+        state.neighbours.insert(
+            GroupKey::new(person("bob"), employer),
+            list(NodeRef::new("Company", "acme")),
+        );
+        let knows_path = ExplorePath::root().child_group(&knows);
+        state.expanded.insert(knows_path.clone());
+        state.expanded.insert(knows_path.child_node(&person("bob")));
+        let scene = explore_scene(&state.entries(&schema), &state, &HashMap::new(), 3);
+        let note = scene
+            .nodes
+            .iter()
+            .find(|node| node.id == SceneId::Note(person("bob")))
+            .expect("Bob says why nothing hangs off him");
+        assert_eq!(note.label, "Relationships not drawn · over the node cap");
+        assert!(
+            scene.capped.is_some(),
+            "the banner counts what the cap left out"
+        );
+    }
+
+    /// An open relationship's "+K more" says "Reading…" until its first neighbours come, and
+    /// "Couldn't read · Retry", with the page to read again, when they could not be read.
+    /// Before, it said "+1500 more" either way, with no neighbours drawn.
+    #[test]
+    fn an_open_relationship_says_when_its_neighbours_are_read_or_failed() {
+        let (schema, mut state) = exploration();
+        let knows = schema
+            .relationships_of("Person")
+            .iter()
+            .find(|g| g.edge == "Knows" && g.direction == Direction::Outgoing)
+            .cloned()
+            .unwrap();
+        let key = GroupKey::new(person("ada"), knows);
+        let more = |state: &ExploreState| {
+            let scene = explore_scene(&state.entries(&schema), state, &HashMap::new(), node_cap());
+            let index = scene.index_of(&SceneId::More(key.clone())).unwrap();
+            (
+                scene.nodes[index].label.clone(),
+                scene.nodes[index].kind.clone(),
+            )
+        };
+        assert_eq!(more(&state).0, "+12 more");
+        let rows = state.neighbours.remove(&key).unwrap();
+        assert_eq!(more(&state).0, "Reading…");
+        state.neighbours.insert(
+            key.clone(),
+            NeighbourList {
+                status: PageStatus::Failed("timed out".into()),
+                ..Default::default()
+            },
+        );
+        let (label, kind) = more(&state);
+        assert_eq!(label, "Couldn't read · Retry");
+        assert!(matches!(
+            kind,
+            SceneKind::More { note: Some(Note::Failed(targets)), .. }
+                if targets == vec![LoadTarget::Page(key.clone())]
+        ));
+        state.neighbours.insert(key.clone(), rows);
+        assert_eq!(more(&state).0, "+12 more");
+    }
+
+    /// A root that could not be read (no node with its key) draws no chip: the canvas's
+    /// banner says why. Before, a chip of its key stood there, counted as "1 node".
+    #[test]
+    fn a_root_that_could_not_be_read_draws_no_chip() {
+        let schema = SchemaModel::parse(SCHEMA).unwrap();
+        let mut state = ExploreState::rooted(person("nobody"));
+        state.root_status = Loadable::Failed("No Person with key nobody at this commit.".into());
+        let scene = explore_scene(&state.entries(&schema), &state, &HashMap::new(), node_cap());
+        assert!(scene.nodes.is_empty(), "{:?}", scene.nodes);
     }
 
     #[test]
@@ -893,7 +1330,18 @@ mod tests {
     fn the_cap_counts_relationships_and_each_node_once() {
         let (schema, state) = exploration();
         let scene = explore_scene(&state.entries(&schema), &state, &HashMap::new(), 1);
-        assert_eq!(scene.nodes.len(), 1);
+        // The cap holds every chip but the note of an open node it left with none drawn,
+        // which says why and stands past it.
+        let (notes, chips): (Vec<_>, Vec<_>) = scene
+            .nodes
+            .iter()
+            .partition(|node| matches!(node.kind, SceneKind::Note { .. }));
+        assert_eq!(chips.len(), 1);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(
+            notes[0].label,
+            "Relationships not drawn · over the node cap"
+        );
         assert_eq!(scene.capped, Some((1 + 20 + 1, "Person".into())));
     }
 }

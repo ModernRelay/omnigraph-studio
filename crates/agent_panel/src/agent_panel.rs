@@ -23,9 +23,11 @@ mod requester;
 mod sessions;
 mod sessions_panel;
 mod skill;
+mod ui_tools;
 
 pub use launch::launch_agent;
 pub use panel::PRESETS;
+pub use ui_tools::{UiToolEndpoint, UiToolEntry};
 
 use gpui::{App, AppContext as _};
 use studio_actions::agent::{Ask, NewConversation, OpenAgent, OpenConversation, ShowConversations};

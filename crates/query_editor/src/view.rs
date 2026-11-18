@@ -22,11 +22,11 @@ use gpui::{
 };
 use gq_language::check::{Destroys, Publication};
 use gq_language::{QueryInfo, ResultColumn, SchemaModel};
-use graph_client::api::ErrorCode;
 use graph_client::api::{
     ChangeRequest, ParamDescriptor, ParamKind, QueryCatalogEntry, QueryRequest, ReadOutput,
     ReadPageOutput,
 };
+use graph_client::api::{ErrorCode, RankingOutput};
 use graph_client::{ReadError, Unauthorized, WriteOutcome};
 use graph_store::{GraphSession, SessionEvent};
 use serde_json::{Map, Value};
@@ -52,7 +52,7 @@ use crate::analysis::Analysis;
 use crate::completion::GqCompletionProvider;
 use crate::results::{
     PlanItem, ResultGraph, ResultTable, ServerDiagnostic, SourceMap, WriteEffect, diff_page_text,
-    is_branch_diff, is_plan, plan_items, rows_label, server_diagnostic, type_label,
+    is_branch_diff, is_plan, plan_items, ranking_fact, rows_label, server_diagnostic, type_label,
 };
 use crate::row_note::RowNote;
 
@@ -203,6 +203,9 @@ struct RowsOutput {
     commit: Option<String>,
     /// A paged read's page (`branch diff`): the commits it compares and its continuation.
     page: Option<ReadPageOutput>,
+    /// How a read ordered by a search ranked its rows (Omnigraph 0.15); `None` for any other
+    /// read, and from an earlier server, which does not say.
+    ranking: Option<RankingOutput>,
     /// Which page this is, from 1; 0 for a read that is not paged.
     page_number: usize,
     /// The run that reads the next page, when the server says there is one.
@@ -408,6 +411,10 @@ impl Failure {
                     (Some(unauthorized), _) => unauthorized.reason(),
                     (None, Some(ErrorCode::Forbidden)) => {
                         "Your token may not read this graph or branch."
+                    }
+                    (None, Some(ErrorCode::NotAdmitted)) => {
+                        "The server has not admitted your sign-in, and signing in again will not \
+                         help. Ask the server's operator to admit you."
                     }
                     (None, Some(ErrorCode::BadRequest)) => {
                         "Fix the query (the problems list shows what the compiler sees) and run it again."
@@ -815,6 +822,11 @@ impl Item for QueryEditor {
     /// The result area is drawn cached on its own (`QueryResults`).
     fn caches_its_parts(&self) -> bool {
         true
+    }
+
+    /// The commit a query tab opened at a commit reads (spec 032).
+    fn held_at(&self, _cx: &App) -> Option<String> {
+        self.at_commit.clone()
     }
 
     /// The selected cell of the result (spec 020): the node it holds, or its row.
@@ -3462,6 +3474,7 @@ impl QueryEditor {
                     read_at,
                     commit: output.graph_commit_id,
                     page: output.page,
+                    ranking: output.ranking,
                     page_number: prepared.page,
                     next,
                     rerun,
@@ -3960,6 +3973,28 @@ impl QueryEditor {
                 start.push(
                     ds::meta(IconName::Clock, format_elapsed(rows.elapsed)).into_any_element(),
                 );
+                if let Some(ranking) = &rows.ranking {
+                    let (fact, warning) = ranking_fact(ranking);
+                    start.push(ds::meta(IconName::Crosshair, fact).into_any_element());
+                    if let Some(warning) = warning {
+                        start.push(
+                            h_flex()
+                                .id("ranking-not-exhaustive")
+                                .gap(px(studio_ui::ds::space::XS))
+                                .child(
+                                    studio_ui::ds::icon::meta(IconName::Warning)
+                                        .color(Color::Warning),
+                                )
+                                .child(
+                                    studio_ui::ds::text::meta("Not exhaustive")
+                                        .color(Color::Warning)
+                                        .single_line(),
+                                )
+                                .tip(studio_ui::ds::tooltip(warning))
+                                .into_any_element(),
+                        );
+                    }
+                }
                 // Where the rows were read, when it is not the branch the status bar shows: the
                 // branch changed since, and a commit pin is named by the commit itself. A
                 // statement read no branch of the tab's; a diff says which commits it compared.
@@ -4795,8 +4830,17 @@ impl QueryEditor {
                 let mut column = GridColumn::new(name.clone(), name.clone())
                     .width(px(rows.widths[i]))
                     .align_right(rows.right_aligned[i]);
-                if let Some(Some(ty)) = table.types.get(i) {
-                    column = column.detail(ty.clone());
+                let ty = table.types.get(i).cloned().flatten();
+                // A ranked read's score columns say so beside their type.
+                let score = rows
+                    .ranking
+                    .as_ref()
+                    .is_some_and(|ranking| ranking.score_columns.contains(name));
+                match (ty, score) {
+                    (Some(ty), true) => column = column.detail(format!("{ty} · score")),
+                    (None, true) => column = column.detail("score"),
+                    (Some(ty), false) => column = column.detail(ty),
+                    (None, false) => {}
                 }
                 column
             })
@@ -5220,16 +5264,26 @@ impl QueryEditor {
                         ds::meta(IconName::GitBranch, format!("from {from}")).into_any_element(),
                     );
                 }
+                // The commit is a link to its changes, so a write can be checked against what
+                // it was meant to do (spec 033): a click previews its tab, a second keeps it.
                 if let Some((commit, what)) = effect.commit() {
+                    let id = commit.to_owned();
                     facts.push(
                         div()
                             .id("write-commit")
+                            .cursor_pointer()
                             .child(ds::meta_code(
                                 IconName::GitCommit,
                                 short_commit_id(commit),
                                 cx,
                             ))
-                            .tip(studio_ui::ds::tooltip(format!("{what} {commit}")))
+                            .tip(
+                                studio_ui::ds::tooltip(format!("{what} {commit}"))
+                                    .meta("Click to see its changes"),
+                            )
+                            .on_click(move |event, window, cx| {
+                                open_write_commit(id.clone(), event.click_count() < 2, window, cx)
+                            })
                             .into_any_element(),
                     );
                 }
@@ -5767,11 +5821,62 @@ fn results_set(
     }
 }
 
+/// Opens the commit a write's result names, so the write is checked against what it was meant
+/// to do (spec 033): a preview takes the pane's preview slot, not the query's place, since the
+/// source tab is never replaced (spec 020), as History keeps itself.
+fn open_write_commit(commit_id: String, preview: bool, window: &mut Window, cx: &mut App) {
+    if preview && let Some(workspace) = studio_workspace::workspace_for(window) {
+        workspace.update(cx, |workspace, cx| workspace.keep_active_tab(cx));
+    }
+    window.dispatch_action(
+        Box::new(studio_actions::graph::OpenCommit { commit_id, preview }),
+        cx,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// A write's commit, opened from the query's tab as a preview, keeps that tab: a query
+    /// previewed in the pane is not replaced by the commit (review of #130).
+    #[gpui::test]
+    async fn a_writes_commit_keeps_the_querys_tab(cx: &mut gpui::TestAppContext) {
+        struct Tab(gpui::FocusHandle);
+        impl gpui::Render for Tab {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                gpui::Empty
+            }
+        }
+        impl gpui::Focusable for Tab {
+            fn focus_handle(&self, _: &App) -> gpui::FocusHandle {
+                self.0.clone()
+            }
+        }
+        impl gpui::EventEmitter<studio_workspace::ItemEvent> for Tab {}
+        impl studio_workspace::Item for Tab {
+            fn tab_title(&self, _: &App) -> SharedString {
+                "query".into()
+            }
+        }
+        cx.update(studio_theme::init_test);
+        let (workspace, cx) = cx.add_window_view(studio_workspace::Workspace::new);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace
+                .open_item_with::<Tab>("query", true, window, cx, |_, cx| Tab(cx.focus_handle()));
+            assert!(workspace.active_tab_is_preview(), "the query is a preview");
+        });
+        cx.update(|window, cx| open_write_commit("c9".into(), true, window, cx));
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                !workspace.active_tab_is_preview(),
+                "the query's tab is kept"
+            );
+        });
+    }
 
     /// A row keeps the start of a long text that a cell shows, not the whole, which the table
     /// holds already; other values as they read.
@@ -6076,6 +6181,46 @@ mod tests {
                 Output::Rows(rows) => rows.widths.clone(),
                 _ => panic!("no rows"),
             }
+        }
+
+        /// A ranked read keeps how the server ranked it, which its results show; an answer
+        /// without a ranking (a read in another order, or a 0.14 server's) shows none.
+        #[gpui::test]
+        async fn a_ranked_read_keeps_its_ranking(cx: &mut TestAppContext) {
+            init(cx);
+            let session = session(cx);
+            let (editor, cx) =
+                cx.add_window_view(|window, cx| QueryEditor::new(1, session, window, cx));
+            editor.update(cx, |editor, _| {
+                let read = |ranking: Value| -> ReadOutput {
+                    let mut output = json!({
+                        "query_name": "near",
+                        "target": {"branch": "main"},
+                        "row_count": 1,
+                        "columns": ["slug", "d"],
+                        "rows": [{"slug": "a", "d": 0.5}],
+                    });
+                    if !ranking.is_null() {
+                        output["ranking"] = ranking;
+                    }
+                    serde_json::from_value(output).unwrap()
+                };
+                let at = || ReadAt::Branch("main".into());
+                let ranked = read(json!({ "by": "nearest", "order": "ascending",
+                    "exhaustive": false, "score_columns": ["d"] }));
+                editor.finish_read(people(), at(), Ok(ranked), Duration::ZERO, None);
+                let Output::Rows(rows) = &editor.output else {
+                    panic!("rows")
+                };
+                let ranking = rows.ranking.as_ref().expect("kept");
+                assert!(!ranking.exhaustive);
+                assert_eq!(ranking.score_columns, ["d"]);
+                editor.finish_read(people(), at(), Ok(read(Value::Null)), Duration::ZERO, None);
+                let Output::Rows(rows) = &editor.output else {
+                    panic!("rows")
+                };
+                assert!(rows.ranking.is_none(), "none from an answer without one");
+            });
         }
 
         /// Only a run that explained shows its answer as a plan: a read that returns columns

@@ -374,33 +374,10 @@ pub struct Opening {
 }
 
 impl Opening {
-    /// Whether it is past what is opened without asking.
+    /// Whether it is past what is opened without asking. The view words the question
+    /// (`studio_workspace::confirm_expand`).
     pub fn asks(&self) -> bool {
         self.nodes > EXPAND_NODES_WITHOUT_ASKING || self.reads > EXPAND_READS_WITHOUT_ASKING
-    }
-
-    /// What a view asks before it opens this: a title, what it costs, and the action's label.
-    pub fn question(&self) -> (String, String, String) {
-        let reads = match self.reads {
-            1 => "1 read".to_owned(),
-            n => format!("{} reads", studio_ui::group_digits(n)),
-        };
-        if self.nodes == 0 {
-            return (
-                "Open these relationships?".to_owned(),
-                format!("Opening them asks the server for {reads}, and shows what they hold."),
-                "Open".to_owned(),
-            );
-        }
-        let nodes = studio_ui::group_digits(self.nodes);
-        (
-            format!("Expand {nodes} nodes?"),
-            format!(
-                "Each node shows its relationships: that asks the server for {reads}, and \
-                 draws a hub for every relationship with neighbours."
-            ),
-            format!("Expand {nodes} nodes"),
-        )
     }
 }
 
@@ -1008,13 +985,14 @@ impl ExploreState {
             let list = self.neighbours.get(&key);
             if is_field(schema, group) {
                 let index_of_field = out.len();
+                let target = list.and_then(|list| list.rows.first().cloned());
                 out.push(Entry {
                     path: group_path.clone(),
                     depth: depth + 1,
                     parent: Some(index),
                     kind: EntryKind::Field {
                         key: key.clone(),
-                        target: list.and_then(|list| list.rows.first().cloned()),
+                        target: target.clone(),
                         loading: list.is_none_or(|list| list.status == PageStatus::Loading),
                     },
                 });
@@ -1028,6 +1006,37 @@ impl ExploreState {
                             message: message.clone(),
                         },
                     });
+                    continue;
+                }
+                // A field opened (the canvas opens one as a relationship, spec 006) walks on to
+                // its target: a node of the walk under it, expandable as any, so a chain of
+                // single parents (an org chart, a folder path) is walked on one canvas.
+                if let Some(target) = target
+                    && self.expanded.contains(&group_path)
+                {
+                    let node_path = group_path.child_node(&target.node);
+                    match ancestors.iter().find(|(n, _)| *n == target.node) {
+                        Some((_, ancestor)) => out.push(Entry {
+                            path: node_path,
+                            depth: depth + 2,
+                            parent: Some(index_of_field),
+                            kind: EntryKind::Cycle {
+                                node: target.node.clone(),
+                                via: target.clone(),
+                                ancestor: *ancestor,
+                            },
+                        }),
+                        None => self.push_node(
+                            schema,
+                            &target.node,
+                            Some(&target),
+                            node_path,
+                            depth + 2,
+                            Some(index_of_field),
+                            ancestors,
+                            out,
+                        ),
+                    }
                 }
                 continue;
             }
@@ -1715,10 +1724,56 @@ pub struct Exploration {
     /// ([`Self::read_owed`]): a hidden tree, a results canvas or a background tab reads nothing
     /// for it.
     owed: bool,
+    /// The second level of an expansion asked for with a depth of 2 (spec 032): opened once
+    /// what the first opened has been read.
+    deeper: Option<Deeper>,
+    /// Why the second level of the last expansion was not opened: what it would open, past
+    /// what is opened without asking, with no confirmation given.
+    deeper_stopped: Option<Opening>,
+    /// The look at the second level, after the change in hand ([`Self::owe_deeper`]).
+    deeper_owed: Option<Task<()>>,
+    /// How many neighbours of each relationship an expansion asked to be drawn.
+    expansion_limits: HashMap<GroupKey, usize>,
     _subscription: Subscription,
 }
 
 impl EventEmitter<ExplorationEvent> for Exploration {}
+
+/// A relationship group by name, with its direction from the node: `out:WorksAt`, `in:Knows`
+/// (spec 032). An expansion and a view's outline name relationships this way.
+pub fn relationship_key(group: &RelationshipGroup) -> String {
+    let direction = match group.direction {
+        Direction::Outgoing => "out",
+        Direction::Incoming => "in",
+    };
+    format!("{direction}:{}", group.edge)
+}
+
+/// What an expansion of several nodes opens (spec 032, `ExpandNeighbourhood`): each node's path and
+/// the paths of the relationships asked for, what that costs, and what could not be found.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ExpandPlan {
+    /// The nodes' paths and their relationships' paths, to open together.
+    pub paths: Vec<ExplorePath>,
+    /// The relationships opened, one per node and relationship.
+    pub groups: Vec<GroupKey>,
+    /// What opening them costs, as the person's Expand all is asked about.
+    pub opening: Opening,
+    /// Nodes asked for that the exploration does not show.
+    pub missing: Vec<NodeRef>,
+    /// Relationships asked for that none of the nodes has.
+    pub unknown: Vec<String>,
+}
+
+/// An expansion's second level, waiting for its first to be read.
+#[derive(Debug, Clone)]
+struct Deeper {
+    groups: Vec<GroupKey>,
+    relationships: Option<Vec<String>>,
+    /// How many neighbours of each relationship go on to the second level.
+    limit: usize,
+    confirm: bool,
+}
 
 impl Exploration {
     /// Neighbours per page for this graph (setting `studio.tree_page_size`, or the graph's own).
@@ -1747,6 +1802,12 @@ impl Exploration {
             let mut exploration = Exploration::new(session.clone(), cx);
             exploration.held = at_commit;
             exploration.pin = exploration.held.clone();
+            // A name the session already holds names the walk until the root is read, so a tab
+            // and an agent's answer name the node, not its id (spec 032).
+            let known = session.read(cx).known_label(&root.type_name, &root.id);
+            if let Some(label) = known {
+                exploration.state.labels.insert(root.clone(), Some(label));
+            }
             exploration.root_at(root, cx);
             exploration
         });
@@ -1874,6 +1935,10 @@ impl Exploration {
             names_owed: BTreeSet::new(),
             naming: HashMap::new(),
             owed: false,
+            deeper: None,
+            deeper_stopped: None,
+            deeper_owed: None,
+            expansion_limits: HashMap::new(),
             _subscription: subscription,
         }
     }
@@ -2145,8 +2210,9 @@ impl Exploration {
         }
     }
 
-    /// Reads a group's neighbours again, narrowed to ids starting with or labels containing
-    /// `text` (spec 005: the filter for groups over one page); empty text reads them all.
+    /// Reads a group's neighbours again, narrowed to those whose id or searched properties hold
+    /// every word of `text` (spec 005: the filter for groups over one page; spec 031: each
+    /// word on its own, in four spellings); empty text reads them all.
     pub fn search_group(&mut self, key: &GroupKey, text: &str, cx: &mut Context<Self>) {
         let text = text.trim();
         let current = self
@@ -2602,6 +2668,178 @@ impl Exploration {
     fn changed(&mut self, cx: &mut Context<Self>) {
         cx.emit(ExplorationEvent::Changed);
         cx.notify();
+        // The first level of an expansion read, its second opens.
+        self.owe_deeper(cx);
+    }
+
+    /// How many reads are out: a view has not settled while any is.
+    pub fn reads_out(&self) -> usize {
+        self.tasks.len() + self.landed.len()
+    }
+
+    /// An expansion's second level is still to open.
+    pub fn expanding(&self) -> bool {
+        self.deeper.is_some()
+    }
+
+    /// What the last expansion's second level would have opened, when it was not opened for
+    /// want of a confirmation.
+    pub fn deeper_stopped(&self) -> Option<Opening> {
+        self.deeper_stopped
+    }
+
+    /// What expanding `nodes` would open (spec 032): each node shown, with the relationships
+    /// `relationships` names (`out:WorksAt`, `in:Knows`), or all of them. The paths are those
+    /// the exploration shows the nodes at, the shallowest first, as the person's views open
+    /// them.
+    pub fn plan_expand(&self, nodes: &[NodeRef], relationships: Option<&[String]>) -> ExpandPlan {
+        let mut plan = ExpandPlan::default();
+        let Some(schema) = self.schema() else {
+            plan.missing = nodes.to_vec();
+            return plan;
+        };
+        let entries = self.entries();
+        let mut used: HashSet<String> = HashSet::new();
+        for node in nodes {
+            let path = entries
+                .iter()
+                .filter(|entry| matches!(&entry.kind, EntryKind::Node { node: n, .. } if n == node))
+                .min_by_key(|entry| entry.depth)
+                .map(|entry| entry.path.clone());
+            let Some(path) = path else {
+                plan.missing.push(node.clone());
+                continue;
+            };
+            plan.paths.push(path.clone());
+            for group in schema.relationships_of(&node.type_name) {
+                let key = relationship_key(group);
+                if let Some(wanted) = relationships
+                    && !wanted.contains(&key)
+                {
+                    continue;
+                }
+                used.insert(key);
+                plan.paths.push(path.child_group(group));
+                plan.groups.push(GroupKey::new(node.clone(), group.clone()));
+            }
+        }
+        plan.unknown = relationships
+            .into_iter()
+            .flatten()
+            .filter(|key| !used.contains(*key))
+            .cloned()
+            .collect();
+        plan.opening = self.opening(&plan.paths, false);
+        plan
+    }
+
+    /// Opens what `plan` names, as one change; with `depth` 2, the neighbours its relationships
+    /// read (the first `limit` of each) open the same way once they are read, unless that
+    /// second level would be asked about and `confirm` is not given.
+    pub fn expand_planned(
+        &mut self,
+        plan: &ExpandPlan,
+        relationships: Option<Vec<String>>,
+        depth: u8,
+        limit: usize,
+        confirm: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.deeper_stopped = None;
+        for key in &plan.groups {
+            self.expansion_limits.insert(key.clone(), limit);
+        }
+        self.deeper = (depth >= 2 && !plan.groups.is_empty()).then(|| Deeper {
+            groups: plan.groups.clone(),
+            relationships,
+            limit,
+            confirm,
+        });
+        self.set_open(&plan.paths, true, cx);
+    }
+
+    /// Opens an expansion's second level: the neighbours its first level read.
+    fn open_deeper(&mut self, cx: &mut Context<Self>) {
+        let Some(deeper) = self.deeper.clone() else {
+            return;
+        };
+        // Each relationship of the first level is read as far as the limit asks first: a count
+        // of none, a list read to its end, or as many rows as the limit. A list short of it
+        // reads its next page; one not read yet (a Refresh dropped it) waits for its read.
+        let mut waiting = false;
+        let mut started = false;
+        for key in &deeper.groups {
+            if matches!(self.state.counts.get(key), Some(Loadable::Loaded(0))) {
+                continue;
+            }
+            match self.state.neighbours.get(key) {
+                Some(list) if list.rows.len() >= deeper.limit || list.exhausted => {}
+                Some(list) if list.status == PageStatus::Idle => {
+                    waiting = true;
+                    started = true;
+                    self.start(LoadTarget::Page(key.clone()), cx);
+                }
+                _ => waiting = true,
+            }
+        }
+        // Nothing out will bring what is missing (the relationship was closed meanwhile):
+        // the second level opens from what was read.
+        if waiting && (started || !self.tasks.is_empty()) {
+            return;
+        }
+        self.deeper = None;
+        let mut nodes: Vec<NodeRef> = Vec::new();
+        for key in &deeper.groups {
+            if let Some(list) = self.state.neighbours.get(key) {
+                for row in list.rows.iter().take(deeper.limit) {
+                    if !nodes.contains(&row.node) {
+                        nodes.push(row.node.clone());
+                    }
+                }
+            }
+        }
+        if nodes.is_empty() {
+            cx.notify();
+            return;
+        }
+        let plan = self.plan_expand(&nodes, deeper.relationships.as_deref());
+        if plan.opening.asks() && !deeper.confirm {
+            self.deeper_stopped = Some(plan.opening);
+            cx.notify();
+            return;
+        }
+        for key in &plan.groups {
+            self.expansion_limits.insert(key.clone(), deeper.limit);
+        }
+        self.set_open(&plan.paths, true, cx);
+    }
+
+    /// How many of a relationship's neighbours an expansion asked to be drawn, when one did:
+    /// a canvas draws that many, as it draws more after "+K more".
+    pub fn expansion_limit(&self, key: &GroupKey) -> Option<usize> {
+        self.expansion_limits.get(key).copied()
+    }
+
+    /// Every relationship's limit an expansion asked for ([`Self::expansion_limit`]).
+    pub fn expansion_limits(&self) -> &HashMap<GroupKey, usize> {
+        &self.expansion_limits
+    }
+
+    /// Looks at an expansion's second level after the change in hand has had its effects: a
+    /// Refresh drops what was read before it reads again, and the reads it starts are seen.
+    fn owe_deeper(&mut self, cx: &mut Context<Self>) {
+        if self.deeper.is_none() || self.deeper_owed.is_some() {
+            return;
+        }
+        self.deeper_owed = Some(cx.spawn(async move |this, cx| {
+            this.update(cx, |this, cx| {
+                this.deeper_owed = None;
+                if this.tasks.is_empty() && this.landed.is_empty() {
+                    this.open_deeper(cx);
+                }
+            })
+            .ok();
+        }));
     }
 
     fn request_missing(&mut self, cx: &mut Context<Self>) {
@@ -2918,16 +3156,19 @@ impl Exploration {
         self.next_task
     }
 
-    /// The read numbered `ticket` for `target` finished: its entry goes, unless a read of the
-    /// same target started since holds it.
-    fn finished(&mut self, target: &LoadTarget, ticket: u64) {
-        if self
+    /// The read numbered `ticket` for `target` landed: whether it is still the read held for
+    /// its target, whose entry then goes. One dropped since, or started again under another
+    /// search, order, filter or grouping, is not: its answer stands for nothing, as when
+    /// dropping its task stopped it before answers waited in a queue.
+    fn finished(&mut self, target: &LoadTarget, ticket: u64) -> bool {
+        let held = self
             .tasks
             .get(target)
-            .is_some_and(|(held, _)| *held == ticket)
-        {
+            .is_some_and(|(held, _)| *held == ticket);
+        if held {
             self.tasks.remove(target);
         }
+        held
     }
 
     /// Waits for a count the session reads together with the others asked for this turn, read
@@ -3046,10 +3287,9 @@ impl Exploration {
                 answer,
             } in landed
             {
-                if generation != this.generation {
+                if generation != this.generation || !this.finished(&target, ticket) {
                     continue;
                 }
-                this.finished(&target, ticket);
                 let taken = match answer {
                     Answer::Read(result) => this.apply(&target, result, sent_at.as_deref(), cx),
                     Answer::Count(group, count) => {
@@ -3072,6 +3312,8 @@ impl Exploration {
             cx.emit(ExplorationEvent::Loaded);
             cx.notify();
         }
+        // The first level of an expansion read, its second opens.
+        self.owe_deeper(cx);
     }
 
     /// Takes a count read with the others asked for in its turn, read at `sent_at` (the head
@@ -3222,6 +3464,7 @@ mod tests {
             rows: rows.into(),
             graph_commit_id: Some("c1".into()),
             page: None,
+            ranking: None,
         }
     }
 
@@ -3392,6 +3635,60 @@ mod tests {
         assert_eq!(
             state.path_of(&schema, &person("cy")),
             Some(knows_path.child_node(&person("cy")))
+        );
+    }
+
+    /// A field opened walks on to its target, a node of the walk that expands as any: its own
+    /// field is read and opens in turn, so a chain of single parents goes on, and a target
+    /// already on the path is a cycle row. Closed, the field shows its target inline only.
+    #[test]
+    fn an_opened_field_walks_on_to_its_target() {
+        let schema = schema();
+        let mut state = loaded_root(&schema);
+        let manager = group(&schema, "Person", "Manager", Direction::Outgoing);
+        let key = |node: &str| GroupKey::new(person(node), manager.clone());
+        let page = |id: &str| output(&["id", "label"], json!([{"id": id, "label": id}]));
+        state.apply_page(key("ada"), &page("bob"), 50);
+        let root = ExplorePath::root();
+        state.expand(&root);
+        let field = root.child_group(&manager);
+        let shown = kinds(&state.entries(&schema));
+        assert!(!shown.iter().any(|row| row == "    node bob"), "{shown:#?}");
+        state.expand(&field);
+        let bob = field.child_node(&person("bob"));
+        let entries = state.entries(&schema);
+        let at = entries
+            .iter()
+            .position(|entry| entry.path == bob)
+            .expect("bob is a node of the walk");
+        assert!(matches!(
+            entries[at].kind,
+            EntryKind::Node {
+                expanded: false,
+                ..
+            }
+        ));
+        let field_row = entries[at].parent.expect("under the field");
+        assert!(matches!(entries[field_row].kind, EntryKind::Field { .. }));
+        // Bob expands: his counts and his own field are read.
+        state.expand(&bob);
+        let missing = state.missing_loads(&schema);
+        assert!(
+            missing.contains(&LoadTarget::Page(key("bob"))),
+            "{missing:?}"
+        );
+        // Bob's manager is Cy, whose manager is Ada: the walk goes on, then cycles.
+        state.apply_page(key("bob"), &page("cy"), 50);
+        let bob_field = bob.child_group(&manager);
+        state.expand(&bob_field);
+        let cy = bob_field.child_node(&person("cy"));
+        state.expand(&cy);
+        state.apply_page(key("cy"), &page("ada"), 50);
+        state.expand(&cy.child_group(&manager));
+        let shown = kinds(&state.entries(&schema));
+        assert!(
+            shown.contains(&"            cycle ada -> 0".to_owned()),
+            "{shown:#?}"
         );
     }
 
@@ -5437,16 +5734,6 @@ mod tests {
                 }
             );
             assert!(all.asks());
-            assert_eq!(
-                all.question(),
-                (
-                    "Expand 140 nodes?".to_owned(),
-                    "Each node shows its relationships: that asks the server for 2,800 reads, \
-                     and draws a hub for every relationship with neighbours."
-                        .to_owned(),
-                    "Expand 140 nodes".to_owned(),
-                )
-            );
             let few = exploration.opening(&people[..10], false);
             assert_eq!(
                 few,
@@ -5522,6 +5809,80 @@ mod tests {
                 exploration.state().labels
             );
             assert!(exploration.naming.is_empty(), "the landed read let go of");
+        });
+    }
+
+    /// An answer queued for a read started again since (a new search) is not taken: before
+    /// answers waited in a queue, dropping the read's task stopped its answer, and taken, the
+    /// old search's page was appended to the new one's list, which then showed both searches'
+    /// rows and was marked read while the new search was still out.
+    #[gpui::test]
+    async fn an_answer_queued_for_a_read_started_again_is_not_taken(cx: &mut gpui::TestAppContext) {
+        use crate::test_server::followed_session;
+        const KNOWING: &str = "node Person {\n  slug: String @key\n  name: String\n}\nedge Knows: Person -> Person @card(0..)\n";
+        // Each search's page: two rows named after the text searched.
+        let (session, _served) = followed_session(
+            KNOWING,
+            |asked| {
+                let params = asked["params"].as_object().cloned().unwrap_or_default();
+                let searched = ["ann", "bo"]
+                    .into_iter()
+                    .find(|text| params.values().any(|value| value == text));
+                match (asked["name"].as_str(), searched) {
+                    (Some("studio_node"), _) => json!([{ "id": "p0", "label": "Zed" }]),
+                    (Some("studio_page_degrees"), _) => json!([{ "id": "p0", "n": 300 }]),
+                    (Some("studio_neighbours"), Some(text)) => json!([
+                        { "id": format!("{text}-1"), "edge_id": format!("e-{text}-1"), "label": text },
+                        { "id": format!("{text}-2"), "edge_id": format!("e-{text}-2"), "label": text },
+                    ]),
+                    _ => json!([]),
+                }
+            },
+            cx,
+        );
+        cx.run_until_parked();
+        let schema = SchemaModel::parse(KNOWING).unwrap();
+        let knows = group(&schema, "Person", "Knows", Direction::Outgoing);
+        let key = GroupKey::new(NodeRef::new("Person", "p0"), knows.clone());
+        let exploration = cx.update(|cx| Exploration::for_session(&session, cx));
+        exploration.update(cx, |exploration, cx| {
+            exploration.root_at(NodeRef::new("Person", "p0"), cx);
+        });
+        cx.run_until_parked();
+        exploration.update(cx, |exploration, cx| {
+            exploration.expand(&ExplorePath::root().child_group(&knows), cx);
+        });
+        cx.run_until_parked();
+
+        // The first search's page lands and waits in the queue, not taken yet.
+        exploration.update(cx, |exploration, cx| {
+            exploration.search_group(&key, "ann", cx)
+        });
+        let queued = |cx: &mut gpui::TestAppContext| {
+            exploration.read_with(cx, |exploration, _| {
+                exploration
+                    .landed
+                    .iter()
+                    .any(|landed| landed.target == LoadTarget::Page(key.clone()))
+            })
+        };
+        for _ in 0..10_000 {
+            if queued(cx) {
+                break;
+            }
+            cx.executor().tick();
+        }
+        assert!(queued(cx), "the first search's page is queued");
+        // A keystroke later the search is another.
+        exploration.update(cx, |exploration, cx| {
+            exploration.search_group(&key, "bo", cx)
+        });
+        cx.run_until_parked();
+        exploration.read_with(cx, |exploration, _| {
+            let list = &exploration.state().neighbours[&key];
+            let ids: Vec<&str> = list.rows.iter().map(|row| row.node.id.as_str()).collect();
+            assert_eq!(ids, ["bo-1", "bo-2"], "the second search's rows alone");
+            assert_eq!(list.status, PageStatus::Idle);
         });
     }
 }

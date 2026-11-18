@@ -4,7 +4,9 @@
 use std::collections::{HashMap, HashSet};
 
 use gq_language::{ResultColumn, SchemaModel, TokenKind};
-use graph_client::api::{BranchMergeOutcome, ChangeOutput, CommitKind};
+use graph_client::api::{
+    BranchMergeOutcome, ChangeOutput, CommitKind, RankOrder, RankingOutput, SearchFunction,
+};
 use serde_json::{Map, Value};
 use studio_actions::graph::ResultNode;
 use studio_ui::short_commit_id;
@@ -357,6 +359,40 @@ pub fn summarize_detail(detail: &str) -> String {
         .join(", ")
 }
 
+/// What a ranked read says of how it ordered its rows (`ReadOutput.ranking`, Omnigraph 0.15):
+/// the search, which way its score ranks, and the columns holding the score; and, when the
+/// search was not exhaustive, a warning that a better row than those returned may exist. A
+/// server before 0.15 sends no ranking, and the results say nothing of it, as before.
+pub fn ranking_fact(ranking: &RankingOutput) -> (String, Option<String>) {
+    let search = match ranking.by {
+        SearchFunction::Nearest => "nearest",
+        SearchFunction::Bm25 => "bm25",
+        SearchFunction::Rrf => "rrf",
+        SearchFunction::Other => "a search",
+    };
+    let order = match ranking.order {
+        RankOrder::Ascending => " · lowest score first",
+        RankOrder::Descending => " · highest score first",
+        RankOrder::Other => "",
+    };
+    let columns = match ranking.score_columns.as_slice() {
+        [] => String::new(),
+        [one] => format!(" · score in {one}"),
+        many => format!(" · scores in {}", many.join(", ")),
+    };
+    let fact = format!("Ranked by {search}{order}{columns}");
+    let warning = (!ranking.exhaustive).then(|| {
+        let better = match ranking.by {
+            SearchFunction::Nearest => "a nearer row",
+            _ => "a better-ranked row",
+        };
+        format!(
+            "Not exhaustive: the search did not compare every row, so {better} than these may exist"
+        )
+    });
+    (fact, warning)
+}
+
 /// `1 row`, `12,480 rows`: a result's row count, as Studio writes every count.
 pub fn rows_label(count: i64) -> String {
     studio_ui::plural(usize::try_from(count).unwrap_or(0), "row", "rows")
@@ -570,7 +606,11 @@ impl WriteEffect {
     /// A run line's few words: `nodes` and `edges` are a mutation's counts.
     pub fn note(&self, nodes: i64, edges: i64) -> String {
         match self {
-            WriteEffect::Committed { .. } => format!("Committed · {nodes} nodes, {edges} edges"),
+            WriteEffect::Committed { .. } => format!(
+                "Committed · {}, {}",
+                studio_ui::plural(nodes.max(0) as usize, "node", "nodes"),
+                studio_ui::plural(edges.max(0) as usize, "edge", "edges")
+            ),
             WriteEffect::Unchanged { .. } => "Nothing changed".into(),
             WriteEffect::Proposal { commit, .. } => {
                 format!("Held as commit {}", short_commit_id(commit))
@@ -874,6 +914,38 @@ fn edits_in_words(sent: &str, edits: &[TextEditOutput]) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A ranked read names its search, which way it ranks and its score columns, and warns when
+    /// the search left rows uncompared.
+    #[test]
+    fn a_ranked_read_says_how_it_ranked() {
+        use graph_client::api::{RankOrder, RankingOutput, SearchFunction};
+        let nearest = RankingOutput {
+            by: SearchFunction::Nearest,
+            order: RankOrder::Ascending,
+            exhaustive: false,
+            score_columns: vec!["d".into()],
+        };
+        let (fact, warning) = super::ranking_fact(&nearest);
+        assert_eq!(fact, "Ranked by nearest · lowest score first · score in d");
+        assert_eq!(
+            warning.as_deref(),
+            Some(
+                "Not exhaustive: the search did not compare every row, so a nearer row than \
+                 these may exist"
+            )
+        );
+        let fused = RankingOutput {
+            by: SearchFunction::Rrf,
+            order: RankOrder::Descending,
+            exhaustive: true,
+            score_columns: vec![],
+        };
+        assert_eq!(
+            super::ranking_fact(&fused),
+            ("Ranked by rrf · highest score first".to_owned(), None)
+        );
+    }
+
     use serde_json::json;
     use studio_ui::value_text;
 
@@ -1037,7 +1109,8 @@ mod tests {
         };
         let committed = WriteEffect::of(&mutation(commit("published")));
         assert_eq!(committed.title(), "Committed to main");
-        assert_eq!(committed.note(1, 0), "Committed · 1 nodes, 0 edges");
+        assert_eq!(committed.note(1, 0), "Committed · 1 node, 0 edges");
+        assert_eq!(committed.note(2, 1), "Committed · 2 nodes, 1 edge");
         assert_eq!(committed.commit(), Some(("01JCOMMITAAAA", "Graph commit")));
         let unchanged = WriteEffect::of(&mutation(Value::Null));
         assert_eq!(unchanged.title(), "Nothing changed on main");

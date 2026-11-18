@@ -350,13 +350,14 @@ const DIFF_CHANGE_CAP: usize = graph_store::REVIEW_CHANGE_CAP;
 /// How many changes one page of the diff asks for.
 const DIFF_PAGE: usize = 8_192;
 
-/// The colour a kind of change is drawn in: green for what the branch has that the target
-/// does not (an added row, a changed cell's new value), red for what it lost. A changed row is
-/// said by its cells, old value struck in red beside the new in green, as the review's rows
-/// say it; it carries no wash of its own.
+/// The colour a kind of change is drawn in, as everywhere Studio shows a change (spec 033):
+/// added green, changed the modified colour, removed red, for the row's gutter bar and an
+/// added or removed row's wash. A changed row is said by its cells, old value struck on the red
+/// mark beside the new on the green, as the review's rows say it; it carries no wash.
 fn change_color(net: NetChange) -> Color {
     match net {
-        NetChange::Added | NetChange::Changed => Color::Created,
+        NetChange::Added => Color::Created,
+        NetChange::Changed => Color::Modified,
         NetChange::Removed => Color::Deleted,
     }
 }
@@ -483,21 +484,12 @@ impl TypeTable {
             plural(changed, "row", "rows"),
             plural(removed, "row", "rows"),
         );
-        let count = |n: usize, sign: &str, color: Color| {
-            (n > 0).then(|| {
-                studio_ui::ds::text::meta(format!("{sign}{n}"))
-                    .color(color)
-                    .into_any_element()
-            })
-        };
+        // The counts as every change's are drawn (spec 033).
         Some(
-            h_flex()
+            div()
                 .id("diff-counts")
-                .gap(px(space::SM))
                 .tip(studio_ui::ds::tooltip(tooltip))
-                .children(count(added, "+", Color::Created))
-                .children(count(changed, "~", Color::Muted))
-                .children(count(removed, "−", Color::Deleted))
+                .child(studio_ui::change_counts(added, changed, removed))
                 .into_any_element(),
         )
     }
@@ -998,6 +990,9 @@ pub struct Opening {
     pub layout: ColumnLayout,
     /// The saved view the tab is (spec 024), by id: what it saves to and is named by.
     pub view: Option<String>,
+    /// The tab's own key, for a filtered table opened beside the type's own (spec 032): it is
+    /// not the type's table, which stays as the person has it.
+    pub own_key: Option<String>,
 }
 
 /// A relationship's direction, as filters and the Group menu show it.
@@ -1235,6 +1230,8 @@ pub struct TypeTable {
     _subscriptions: Vec<Subscription>,
     /// The saved view this tab is (spec 024), by id; `None` is the type's own table.
     view_id: Option<String>,
+    /// The key of a filtered table opened beside the type's own (spec 032).
+    own_key: Option<String>,
     /// How often the table drew, for the test that moving through the offers draws it and
     /// leaves the grid alone.
     #[cfg(test)]
@@ -1257,6 +1254,32 @@ impl Focusable for TypeTable {
 impl Item for TypeTable {
     fn thing(&self, _cx: &App) -> Option<studio_actions::Thing> {
         Some(studio_actions::Thing::Type(self.type_name.clone()))
+    }
+
+    /// An edge table, which has no view strip, is a table too.
+    fn view_kind(&self, _cx: &App) -> Option<ViewKind> {
+        Some(ViewKind::Table)
+    }
+
+    fn held_at(&self, _cx: &App) -> Option<String> {
+        self.at_commit.clone()
+    }
+
+    /// The rows picked, or else the row under the cursor, by id (spec 032).
+    fn selected_ids(&self, _cx: &App) -> Option<studio_workspace::SelectedIds> {
+        let ids: Vec<String> = if self.selection.is_empty() {
+            self.cursor_row()
+                .map(|row| row.id.clone())
+                .into_iter()
+                .collect()
+        } else {
+            self.selection.iter().cloned().collect()
+        };
+        (!ids.is_empty()).then(|| studio_workspace::SelectedIds {
+            type_name: Some(self.type_name.clone()),
+            ids,
+            root: None,
+        })
     }
 
     /// The row under the cursor, with the values the table holds of it.
@@ -1333,6 +1356,9 @@ impl Item for TypeTable {
     }
 
     fn dedupe_key(&self, _cx: &App) -> Option<SharedString> {
+        if let (Some(key), None) = (&self.own_key, &self.view_id) {
+            return Some(key.clone().into());
+        }
         Some(
             match &self.view_id {
                 Some(view) => crate::view_key(view, self.at_commit.as_deref()),
@@ -1359,6 +1385,7 @@ impl Item for TypeTable {
                 "order": self.layout.order,
                 "widths": self.layout.widths,
                 "view": self.view_id,
+                "own_key": self.own_key,
             }),
         })
     }
@@ -1610,6 +1637,7 @@ impl TypeTable {
             diff_task: None,
             _subscriptions: subscriptions,
             view_id: opening.view,
+            own_key: opening.own_key,
             #[cfg(test)]
             renders: 0,
             #[cfg(test)]
@@ -2218,6 +2246,8 @@ impl TypeTable {
     /// Makes this tab the saved view `id`: one saved from it as a new view.
     pub(crate) fn become_view(&mut self, id: String, cx: &mut Context<Self>) {
         self.view_id = Some(id);
+        // A filtered table saved as a view is that view's tab, found by the view's key.
+        self.own_key = None;
         cx.emit(ItemEvent::UpdateTab);
         cx.notify();
     }
@@ -6214,6 +6244,7 @@ impl TypeTable {
                 via: Some(builder::relationship_key(&back)),
                 preview: false,
                 filters: None,
+                separate: false,
             }),
             cx,
         );
@@ -6761,7 +6792,7 @@ impl TypeTable {
 
     fn confirm_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.words_editor.focus_handle(cx).is_focused(window) {
-            self.run_words(cx);
+            self.run_words(window, cx);
             return;
         }
         if self.fill.is_some() && self.fill_editor.focus_handle(cx).is_focused(window) {
@@ -8634,14 +8665,13 @@ impl TypeTable {
                 draft._suggest_task = None;
             }
             Some(SuggestSource::Nodes(type_name)) => {
-                let Some(schema) = schema else {
+                if schema.is_none() {
                     draft.offers.clear();
                     draft.answers = Some(text);
                     return;
-                };
+                }
                 let needle = suggest::needle(&text, list);
-                let search =
-                    suggest::search_nodes(&session, &schema, &type_name, &needle, snapshot, cx);
+                let search = suggest::search_nodes(&session, &type_name, &needle, snapshot, cx);
                 draft._suggest_task = Some(cx.spawn(async move |this, cx| {
                     let result = search.await;
                     this.update(cx, |this, cx| {
@@ -8653,7 +8683,7 @@ impl TypeTable {
                         }
                         // A failed search offers nothing, not what an earlier one found.
                         match result {
-                            Ok(rows) => draft.offers.set(suggest::from_node_rows(&rows), typed),
+                            Ok(hits) => draft.offers.set(suggest::from_hits(&hits), typed),
                             Err(_) => draft.offers.clear(),
                         }
                         draft.answers = Some(text);
@@ -8968,7 +8998,7 @@ impl TypeTable {
     }
 
     /// ↵ in the sentence field: the sentence goes to the model, once the task is allowed.
-    fn run_words(&mut self, cx: &mut Context<Self>) {
+    fn run_words(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let sentence = self.words_editor.read(cx).text(cx).trim().to_owned();
         if sentence.is_empty() || matches!(self.words, WordsState::Running { .. }) {
             return;
@@ -8978,10 +9008,16 @@ impl TypeTable {
             cx.notify();
             return;
         };
-        self.start_words(models, sentence, cx);
+        self.start_words(models, sentence, window, cx);
     }
 
-    fn start_words(&mut self, models: Entity<Models>, sentence: String, cx: &mut Context<Self>) {
+    fn start_words(
+        &mut self,
+        models: Entity<Models>,
+        sentence: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let choices = self.words_choices();
         let offered = self.view_choices();
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
@@ -9007,7 +9043,7 @@ impl TypeTable {
             schema: words::schema_with(&choices, &offered, reach),
         };
         let call = models.read(cx).call::<words::Answer>(request, cx);
-        let task = cx.spawn(async move |this, cx| {
+        let task = cx.spawn_in(window, async move |this, cx| {
             let answer = match call.await {
                 Ok(answer) => answer,
                 Err(error) => {
@@ -9027,8 +9063,11 @@ impl TypeTable {
             let (mut filters, filters_refused) = words::filters_with(answer.value, &choices, reach);
             refused.extend(filters_refused);
             // A `related_to` names a record; the name becomes its id through the node search
-            // the filter's own value field uses, the first match taken, and the pill shows it.
+            // the filter's own value field uses, only when one node is named (spec 031): the
+            // only match, or the only one the name is exactly. When several are, the person
+            // picks among them in the filter's value field; when none, the sentence says so.
             let mut labels: Vec<(String, String)> = Vec::new();
+            let mut to_pick: Option<(String, String, String, Vec<suggest::Suggestion>)> = None;
             for filter in &mut filters {
                 if filter.op != FilterOp::RelatedTo {
                     continue;
@@ -9042,10 +9081,9 @@ impl TypeTable {
                     .and_then(|choice| choice.other_type.clone());
                 let search = this
                     .read_with(cx, |this, cx| {
-                        let (other, schema) = (other.as_deref()?, this.schema.clone()?);
+                        let other = other.as_deref()?;
                         Some(suggest::search_nodes(
                             &this.session,
-                            &schema,
                             other,
                             &name,
                             this.paging.pinned.clone(),
@@ -9054,26 +9092,30 @@ impl TypeTable {
                     })
                     .ok()
                     .flatten();
-                let found = match search {
-                    Some(search) => search
-                        .await
-                        .ok()
-                        .and_then(|rows| suggest::from_node_rows(&rows).into_iter().next()),
-                    None => None,
+                let other = other.unwrap_or_default();
+                let named = match search {
+                    Some(search) => search.await.map(|hits| suggest::named(&hits)),
+                    None => Ok(suggest::Named::None),
                 };
-                match found {
-                    Some(node) => {
+                filter.value = Value::Null;
+                match named {
+                    Ok(suggest::Named::One(node)) => {
                         if let Some(label) = node.label {
                             labels.push((node.value.clone(), label));
                         }
                         filter.value = Value::String(node.value);
                     }
-                    None => {
-                        refused.push(format!(
-                            "no {} matching \"{name}\"",
-                            other.unwrap_or_default()
-                        ));
-                        filter.value = Value::Null;
+                    Ok(suggest::Named::None) => {
+                        refused.push(format!("no {other} matching \"{name}\""));
+                    }
+                    Ok(suggest::Named::Several(offers)) if to_pick.is_none() => {
+                        to_pick = Some((filter.property.clone(), name.clone(), other, offers));
+                    }
+                    Ok(suggest::Named::Several(offers)) => {
+                        refused.push(suggest::pick_note(false, &other, &name, &offers));
+                    }
+                    Err(error) => {
+                        refused.push(format!("{other} could not be searched ({error})"));
                     }
                 }
             }
@@ -9096,7 +9138,7 @@ impl TypeTable {
                 }
             }
             let filters = judged;
-            this.update(cx, |this, cx| {
+            this.update_in(cx, |this, window, cx| {
                 this.node_labels.extend(labels);
                 // The last sentence's filters go; ones added by hand stay.
                 let made = std::mem::take(&mut this.words_made);
@@ -9106,8 +9148,18 @@ impl TypeTable {
                 // What the sentence says of the order, the grouping and the columns replaces
                 // the table's; what it does not say stays as it is.
                 this.apply_words_view(view, cx);
-                let note =
+                let mut note =
                     (!refused.is_empty()).then(|| format!("Could not use: {}", refused.join("; ")));
+                if let Some((key, name, other, offers)) = to_pick {
+                    // The note says what the person sees: the choices in the filter when it
+                    // opened, else the choices themselves and what to do instead.
+                    let opened = this.ask_to_pick(key, name.clone(), offers.clone(), window, cx);
+                    let ask = suggest::pick_note(opened, &other, &name, &offers);
+                    note = Some(match note {
+                        Some(note) => format!("{ask} {note}"),
+                        None => ask,
+                    });
+                }
                 this.words = WordsState::Typing(note);
                 this.reload(true, cx);
                 cx.notify();
@@ -9116,6 +9168,44 @@ impl TypeTable {
         });
         self.words = WordsState::Running { _call: task };
         cx.notify();
+    }
+
+    /// A sentence's "related to" named several nodes (spec 031): its filter opens as a draft,
+    /// the name in its value field and the nodes it names offered, best first, for the person
+    /// to pick one. Nothing is filtered by it until they do. Whether the draft opened: a key
+    /// the filter bar cannot test "related to" on (one reached through a relationship's
+    /// group) opens none, and the caller says so.
+    fn ask_to_pick(
+        &mut self,
+        key: String,
+        name: String,
+        offers: Vec<suggest::Suggestion>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.ops_for(&key).contains(&FilterOp::RelatedTo) {
+            return false;
+        }
+        self.set_draft_property(key.clone(), window, cx);
+        if self
+            .filter_draft
+            .as_ref()
+            .is_none_or(|draft| draft.property != key)
+        {
+            return false;
+        }
+        self.filter_editor.update(cx, |editor, cx| {
+            editor.set_text(name.clone(), window, cx);
+            editor.set_placeholder_text(filter_placeholder(FilterOp::RelatedTo), window, cx);
+        });
+        if let Some(draft) = &mut self.filter_draft {
+            draft.op = FilterOp::RelatedTo;
+            draft.offers.set(offers, true);
+            draft.answers = Some(name);
+        }
+        self.redraw_offers(cx);
+        cx.notify();
+        true
     }
 
     /// A key was stored or removed, or the keychain answered: the sentence field says whether
@@ -11313,46 +11403,33 @@ impl TypeTable {
             .collect();
         let fit = chips_that_fit(&labels, count, available);
         let more = count - fit as i64;
-        // The count stays in view; the tags give way, whole.
-        let cell = h_flex()
-            .w_full()
-            .min_w_0()
-            .gap(px(space::XS))
-            .child(
-                h_flex()
-                    .min_w_0()
-                    .gap(px(space::XS))
-                    .overflow_hidden()
-                    .children(
-                        labels[..fit]
-                            .iter()
-                            .map(|label| studio_ui::ds::tag(label.to_string(), cx)),
-                    ),
-            )
-            .when(more > 0, |cell| {
-                cell.child(
-                    div().flex_none().child(
-                        studio_ui::cell_text(
-                            if fit == 0 {
-                                studio_ui::group_count(count)
-                            } else {
-                                format!("+{}", studio_ui::group_count(more))
-                            },
-                            cx,
-                        )
-                        .color(Color::Muted.color(cx))
-                        .hug(),
-                    ),
-                )
-            });
+        // The count stays in view; the tags give way, whole. One element lays out and paints
+        // them all: as boxes, each tag was two layout nodes and the cell three more, in every
+        // relationship cell of every frame.
+        let cell = studio_ui::tags(
+            labels[..fit]
+                .iter()
+                .map(|label| SharedString::from(label.to_string())),
+            (more > 0).then(|| {
+                SharedString::from(if fit == 0 {
+                    studio_ui::group_count(count)
+                } else {
+                    format!("+{}", studio_ui::group_count(more))
+                })
+            }),
+            cx,
+        );
         if self.frame_pointer != Some((ix, col)) {
             return cell.into_any_element();
         }
         // The other type is the column's, looked up when the tooltip shows.
         let table = cx.weak_entity();
-        cell.id(ElementId::NamedInteger("relation".into(), id))
-            .debug_selector(move || format!("relation-tip-{ix}-{col}"))
-            .tip_fn(move |_, cx| {
+        // The box that carries the tooltip fills the cell, as the tags do in every other cell,
+        // so they do not move when the pointer comes; the tooltip hangs under them, where it
+        // hung under the row of boxes.
+        cell.tip_fn(
+            ElementId::NamedInteger("relation".into(), id),
+            move |_, cx| {
                 let other = table.upgrade().and_then(|table| {
                     let group = table.read(cx).columns.get(col)?.relationship()?;
                     Some(group.other_type.clone())
@@ -11365,8 +11442,10 @@ impl TypeTable {
                     ),
                     cx,
                 )
-            })
-            .into_any_element()
+            },
+        )
+        .debug_selector(move || format!("relation-tip-{ix}-{col}"))
+        .into_any_element()
     }
 
     /// A Blob cell: "Blob" while it is read, then its size and "Preview" (a click opens the
@@ -13457,6 +13536,72 @@ mod tests {
                 "in the order named"
             );
             assert_eq!(table.sort, Some(by_name), "an order not said stays");
+        });
+    }
+
+    /// A sentence whose "related to" names several nodes filters by none of them: the filter
+    /// opens as a draft, the name in its value field and the nodes offered, best first, for
+    /// the person to pick one (spec 031).
+    #[gpui::test]
+    async fn a_name_that_names_several_nodes_asks_which(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let schema = "node Person {\n  slug: String @key\n  name: String\n}\n\
+            node Org {\n  slug: String @key\n  name: String\n}\n\
+            edge WorksAt: Person -> Org\n";
+        let session = session(schema, cx);
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session,
+                "Person".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let key = table.read_with(cx, |table, _| {
+            let schema = table.schema.clone().unwrap();
+            let group = schema
+                .relationships_of("Person")
+                .iter()
+                .find(|group| group.other_type == "Org")
+                .cloned()
+                .unwrap();
+            builder::relationship_key(&group)
+        });
+        let offers = vec![
+            suggest::Suggestion {
+                value: "acme.com".into(),
+                label: Some("ACME Corp".into()),
+            },
+            suggest::Suggestion {
+                value: "acme-labs.ai".into(),
+                label: Some("Acme Labs".into()),
+            },
+        ];
+        let opened = table.update_in(cx, |table, window, cx| {
+            table.ask_to_pick(key.clone(), "Acme".into(), offers.clone(), window, cx)
+        });
+        assert!(opened);
+        table.read_with(cx, |table, cx| {
+            let draft = table.filter_draft.as_ref().expect("the filter is a draft");
+            assert_eq!(draft.property, key);
+            assert_eq!(draft.op, FilterOp::RelatedTo);
+            assert_eq!(draft.offers.len(), 2);
+            assert_eq!(table.filter_editor.read(cx).text(cx), "Acme");
+            assert!(table.filters.is_empty(), "nothing filtered until a pick");
+        });
+
+        // A key the bar cannot test "related to" on opens no draft, and says so: the caller's
+        // note then lists the choices instead (`suggest::pick_note`).
+        table.update_in(cx, |table, window, cx| {
+            table.cancel_filter_draft(window, cx);
+            assert!(!table.ask_to_pick("name".into(), "Acme".into(), offers.clone(), window, cx));
+            assert!(table.filter_draft.is_none());
         });
     }
 
@@ -15971,6 +16116,79 @@ mod tests {
                 "{table}"
             );
         });
+    }
+
+    /// A page's group still being read when its neighbours' type is named otherwise lands
+    /// named by the new choice: the names are read again as it lands, as a table's cells are.
+    /// Before, it kept the names its read was built with for good (review of #111).
+    #[gpui::test]
+    async fn a_group_read_out_when_nodes_are_named_otherwise_lands_renamed(
+        cx: &mut TestAppContext,
+    ) {
+        const CODED: &str = "node Person {\n  slug: String @key\n  name: String\n}\nnode Company {\n  slug: String @key\n  name: String\n  code: String?\n}\nedge WorksAt: Person -> Company\nedge Founded: Person -> Company\nedge Knows: Person -> Person\nedge Likes: Person -> Person\n";
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+            cx.set_global(studio_settings::StudioSettings::default());
+        });
+        let graph = std::sync::Arc::new(circle());
+        let (session, _writer, served) = crate::test_support::session_served(
+            CODED,
+            move |read| {
+                match read["name"].as_str() {
+                Some("studio_node_labels") => serde_json::Value::Array(
+                    read["params"]["ids"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|id| serde_json::json!({ "id": id, "label": format!("Code {}", id.as_str().unwrap()) }))
+                        .collect(),
+                ),
+                _ => graph.answer(read),
+            }
+            },
+            cx,
+        );
+        // Ada's companies are read, and held until the choice has changed.
+        let release = served.hold(|read| {
+            read["name"] == "studio_neighbours"
+                && read["query"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("worksAt")
+        });
+        let page_session = session.clone();
+        let (page, cx) = cx.add_window_view(move |_, cx| {
+            crate::peek::NodePeek::page(page_session, "Person".into(), "p1".into(), None, cx)
+        });
+        cx.run_until_parked();
+        let company = |page: &crate::peek::NodePeek| {
+            page.groups_shown()
+                .into_iter()
+                .find(|(key, ..)| key == "out:WorksAt")
+                .unwrap()
+                .3
+        };
+        assert_eq!(
+            page.read_with(cx, |page, _| company(page)),
+            None,
+            "still out"
+        );
+
+        let key = session.read_with(cx, |session, _| session.overrides_key());
+        cx.update(|_, cx| {
+            cx.update_global::<studio_settings::StudioSettings, _>(|settings, _| {
+                settings.set_label(&key, "Company", Some("code".into()))
+            })
+        });
+        cx.run_until_parked();
+        release.send(()).ok();
+        cx.run_until_parked();
+        assert_eq!(
+            page.read_with(cx, |page, _| company(page)),
+            Some(vec![Some("Code c1".to_owned())]),
+            "named by the new choice"
+        );
     }
 
     /// The ledger's measure of opening a table, a row's page and then the row's peek (spec

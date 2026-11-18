@@ -14,6 +14,11 @@ mod menus;
 mod open_graph;
 mod organizations;
 mod settings_view;
+mod ui_tools;
+#[cfg(test)]
+mod ui_tools_canvas_tests;
+#[cfg(test)]
+mod ui_tools_tests;
 mod update_status;
 
 use std::collections::HashSet;
@@ -58,6 +63,8 @@ pub fn init(cx: &mut App) {
     review::init(cx);
     history::init(cx);
     agent_panel::init(cx);
+    // The UI tools and their server (spec 032). Nothing starts here.
+    ui_tools::init(cx);
 
     #[cfg(debug_assertions)]
     studio_workspace::register_item_kind(cx, "design-system", |_, workspace, window, cx| {
@@ -186,6 +193,23 @@ pub fn init(cx: &mut App) {
         workspace.register_action(|workspace, _: &OpenSettings, window, cx| {
             open_settings(workspace, window, cx);
         });
+        workspace.register_action(|_, _: &studio_actions::workspace::ToggleMcpServer, _, cx| {
+            studio_settings::update(cx, |settings| {
+                settings.agent.outside_agents = !settings.agent.outside_agents
+            });
+        });
+        workspace.register_action(
+            |_, _: &studio_actions::workspace::ReplaceMcpToken, window, cx| {
+                ui_tools::replace_agent_token(window, cx);
+            },
+        );
+        workspace.register_action(
+            |workspace, _: &studio_actions::workspace::OpenAgentSettings, window, cx| {
+                if let Some(view) = open_settings(workspace, window, cx) {
+                    view.update(cx, |view, cx| view.show_section("Agent", window, cx));
+                }
+            },
+        );
         if let Some(updater) = Updater::global(cx) {
             let status = cx.new(|cx| update_status::UpdateStatus::new(updater.clone(), cx));
             workspace.add_status_item(
@@ -239,7 +263,11 @@ fn open_design_system(workspace: &mut Workspace, window: &mut Window, cx: &mut C
 }
 
 /// Opens the settings tab, offering the workspace's graph as a scope.
-fn open_settings(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+fn open_settings(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Option<Entity<settings_view::SettingsView>> {
     let session = workspace.session().cloned();
     let graph = session
         .as_ref()
@@ -257,7 +285,9 @@ fn open_settings(workspace: &mut Workspace, window: &mut Window, cx: &mut Contex
             view.set_session(session.map(|session| session.downgrade()), cx);
             view.follow(&workspace, window, cx);
         });
+        return Some(view);
     }
+    None
 }
 
 /// A window's options, at `bounds` or else where the last moved window was.
@@ -710,7 +740,7 @@ pub fn open_link(link: &str, cx: &mut App) {
 }
 
 /// Opens a link from `omnigraph studio`, which names a CLI target: the target's server, once
-/// the digests the link carries match what this Mac's CLI reports for the target (its
+/// the digests the link carries match what this computer's CLI reports for the target (its
 /// `binding`, of what the name resolves to, and `home`, of the operator file it was read
 /// from), so a link made elsewhere, or before the target changed, opens nothing. The check
 /// asks the CLI, off the main thread; a start's window waits for it as for any link.
@@ -1362,7 +1392,7 @@ mod start_tests {
     }
 
     /// A link from `omnigraph studio` names a CLI target; once the digests it carries are what
-    /// this Mac's CLI reports for the target, its server opens, on the graph the link names,
+    /// this computer's CLI reports for the target, its server opens, on the graph the link names,
     /// else the target's default graph. The check runs after the link is parsed, so a start's
     /// window waits for it as for any link.
     #[gpui::test]
@@ -1390,7 +1420,7 @@ mod start_tests {
         });
     }
 
-    /// A link whose digests are not the CLI's here (made on another Mac, or before the target
+    /// A link whose digests are not the CLI's here (made on another computer, or before the target
     /// changed), or whose target the CLI does not list, opens nothing and says which differs.
     #[gpui::test]
     fn a_link_from_the_cli_is_refused_when_its_digests_differ(cx: &mut TestAppContext) {

@@ -26,7 +26,12 @@
   "agent": {
     "command": [],
     "env": {},
-    "ask_before_writes": false
+    "ask_before_writes": false,
+    "outside_agents": true,
+    "keep_address": true,
+    "ui_tools_port": 24187,
+    "panel_ui_tools": true,
+    "raise_window": false
   },
   "models": {
     "fast": "anthropic/claude-haiku-5.5",

@@ -8,11 +8,11 @@ use gpui::{
 use graph_client::api::CommitOutput;
 use studio_actions::graph::OpenCommit;
 use studio_ui::ds::{self, Tipped as _, size, space};
-use studio_ui::{change_counts, now_micros, relative_time, short_commit_id, utc_date_time};
+use studio_ui::{now_micros, relative_time, short_commit_id, utc_date_time};
 use ui::prelude::*;
 
 use crate::commit_view::{branch_fact, is_first_commit};
-use crate::counts::Counts;
+use crate::counts::Learnt;
 
 /// A fact this short sits in a value box as a property's value does; a longer one (a held
 /// commit's place) is read as text.
@@ -22,17 +22,12 @@ pub(crate) struct CommitNote {
     commit: CommitOutput,
     /// The branches whose head the commit is.
     heads: Vec<String>,
-    /// Its changes counted, once History has read them, and whether they are only the first
-    /// page's.
-    counts: Option<(Counts, bool)>,
+    /// Its changes counted, once History has read them, or why there are none.
+    counts: Option<Learnt>,
 }
 
 impl CommitNote {
-    pub(crate) fn new(
-        commit: CommitOutput,
-        heads: Vec<String>,
-        counts: Option<(Counts, bool)>,
-    ) -> Self {
+    pub(crate) fn new(commit: CommitOutput, heads: Vec<String>, counts: Option<Learnt>) -> Self {
         Self {
             commit,
             heads,
@@ -42,7 +37,7 @@ impl CommitNote {
 
     /// Takes what History has learnt of the commit since: its counts, read once its row was
     /// drawn, and the branches at it. Says whether anything changed.
-    pub(crate) fn learn(&mut self, heads: &[String], counts: Option<(Counts, bool)>) -> bool {
+    pub(crate) fn learn(&mut self, heads: &[String], counts: Option<Learnt>) -> bool {
         if self.heads == heads && self.counts == counts {
             return false;
         }
@@ -53,8 +48,12 @@ impl CommitNote {
 
     /// The commit's id, and what the note says of its changes, for a test.
     #[cfg(test)]
-    pub(crate) fn read(&self) -> (&str, &[String], Option<(Counts, bool)>) {
-        (&self.commit.graph_commit_id, &self.heads, self.counts)
+    pub(crate) fn read(&self) -> (&str, &[String], Option<(crate::counts::Counts, bool)>) {
+        (
+            &self.commit.graph_commit_id,
+            &self.heads,
+            self.counts.as_ref().and_then(Learnt::totals),
+        )
     }
 }
 
@@ -150,23 +149,21 @@ impl Render for CommitNote {
                     .into_any_element(),
             ));
         }
-        // The first commit has nothing before it to count against; the others say their
-        // counts once History has read them, which it does for the rows it draws.
-        let changes: Option<AnyElement> = if is_first_commit(commit) {
-            Some(ds::text::meta("first commit").into_any_element())
-        } else {
-            self.counts.map(|((added, changed, removed), partial)| {
-                if added + changed + removed == 0 {
-                    ds::text::meta("no changes").into_any_element()
-                } else {
-                    h_flex()
-                        .gap(px(space::XS))
-                        .child(change_counts(added, changed, removed))
-                        .when(partial, |counts| counts.child(ds::text::meta("+ more")))
-                        .into_any_element()
-                }
-            })
-        };
+        // What it changed, as every list of commits says it, then by type (spec 033); the
+        // first commit and one across a schema change say why there is nothing to count.
+        let first = is_first_commit(commit).then(|| Learnt {
+            counts: change_cards::CommitCounts::First,
+            by_type: std::sync::Arc::from([]),
+        });
+        let changes: Option<AnyElement> = first.or_else(|| self.counts.clone()).map(|learnt| {
+            v_flex()
+                .gap(px(space::XS))
+                .child(change_cards::commit_counts("note-counts", &learnt.counts))
+                .when(!learnt.by_type.is_empty(), |value| {
+                    value.child(change_cards::summary_line(&learnt.by_type, cx))
+                })
+                .into_any_element()
+        });
         if let Some(changes) = changes {
             facts.push(fact(IconName::Pencil, "Changes", changes));
         }

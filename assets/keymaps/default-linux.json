@@ -12,6 +12,7 @@
       "ctrl-k": "studio::ToggleCommandPalette",
       "ctrl-p": "studio::GoTo",
       "ctrl-,": "studio::OpenSettings",
+      "ctrl-alt-,": "studio::OpenAgentSettings",
       "ctrl-shift-b": "studio::SwitchBranch",
       "ctrl-shift-n": "studio::NewWindow",
       "alt-left": "studio::GoBack",
@@ -347,6 +348,7 @@
       "space": "studio::ToggleInspector",
       "ctrl-enter": "studio_canvas::OpenSelectedPage",
       "f": "studio_canvas::FocusSelected",
+      "alt-enter": "studio_canvas::FollowRelationship",
       "[": "studio_canvas::WalkBack",
       "]": "studio_canvas::WalkForward",
       "r": "studio_canvas::ResetLayout",
@@ -425,6 +427,7 @@
   {
     "context": "Review",
     "bindings": {
+      "ctrl-enter": "studio_changes::OpenChanged",
       "ctrl-y": "studio_review::AcceptAndNext",
       "alt-ctrl-z": "studio_review::RevertAndNext",
       "ctrl-shift-enter": "studio_review::Merge",
@@ -444,7 +447,13 @@
     "context": "CommitView",
     "bindings": {
       "b": "studio_history::NewBranchHere",
-      "ctrl-alt-n": "studio_history::LoadMoreChanges"
+      "ctrl-alt-n": "studio_history::LoadMoreChanges",
+      "j": "menu::SelectNext",
+      "down": "menu::SelectNext",
+      "k": "menu::SelectPrevious",
+      "up": "menu::SelectPrevious",
+      "space": "studio_changes::ToggleChange",
+      "ctrl-enter": "studio_changes::OpenChanged"
     }
   },
   {

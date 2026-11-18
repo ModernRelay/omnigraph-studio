@@ -310,6 +310,22 @@ impl Anchor {
             .inset_0()
     }
 
+    /// Records `bounds` as the control's, for an element that knows better than its box where
+    /// the tooltip should hang ([`crate::Tags`]).
+    pub(crate) fn record(&self, bounds: Bounds<Pixels>) {
+        self.0.set(Some(bounds));
+    }
+
+    /// `host` with the tooltip `build` makes, hung from this anchor. No recorder is added: an
+    /// element inside `host` records the anchor itself ([`Anchor::record`]).
+    pub(crate) fn tip_fn(
+        &self,
+        host: Stateful<Div>,
+        build: impl Fn(&mut Window, &mut App) -> AnyView + 'static,
+    ) -> Stateful<Div> {
+        host.tooltip(self.builder_fn(build))
+    }
+
     /// Where the tooltip hangs: under the control's left edge, a gap below it, or over the
     /// control when `lines` of it would not fit under. `None` before the control was laid out,
     /// when GPUI's place stands.

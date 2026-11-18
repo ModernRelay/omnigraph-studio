@@ -57,6 +57,13 @@ open a table filtered to this node; ⌥→ expand every relationship of
 this node; ⌥← collapse the subtree; F re-root here (the old path becomes the breadcrumb); G show
 on the canvas. Typing filters the visible rows.
 
+⌥→ asks before it opens past 50 nodes or 500 reads (since 2026-11-14, spec 006 "Expand all
+asks past a size"; `Exploration::opening`). On the tree it opens one node, so it asks only by
+reads, about two per relationship (the count, unless held, and the first list), and almost
+never: the 500 are reached only by a node with about 250 relationships, while a Person of the
+personal graph has 92 (184 reads at most). The bound is kept so the tree and the canvas share
+one measure, and a schema of very many relationships still asks.
+
 ### Data
 
 - Group counts: one count per relationship of the node's type, pinned to the tree's snapshot
@@ -189,6 +196,8 @@ on the canvas. Typing filters the visible rows.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-11-15 | What the Expand all bound means on the tree (review of #111) | `graph_store` `expanding_many_nodes_is_asked_first`: one node and every relationship of it, 20 groups, is 1 node and 40 reads (its counts and first lists), against bounds of 50 nodes and 500 reads | Noted under Keys: ⌥→ opens one node, about two reads per relationship, so it asks only past about 250 relationships; the code is kept as it is. Documentation only; the measure itself is the test's |
+| 2026-11-15 | An answer queued for a read started again since is not taken (review of #111) | `graph_store` `an_answer_queued_for_a_read_started_again_is_not_taken`: Knows searched for "ann", its page left landed in the queue (the executor ticked until it was), then searched for "bo"; failing with the check removed | Before: the list read `ann-1, ann-2, bo-1, bo-2`, marked read while the second search was out: since answers wait in a queue (#111), dropping a read's task no longer stopped an answer already in it. Now an answer is taken only while its target's read is the one it answers (`Exploration::finished`), as before the queue; a new search, order, filter or grouping, a read ahead left and Refresh all start or drop the read. Each batched count has its own target and number, so counts are judged alike; `counts_landing_together_are_taken_in_one_walk` and the other 297 `graph_store` tests pass |
 | 2026-11-14 | A new node name renames the tree in place | `graph_store` `a_new_choice_of_name_renames_what_is_shown_in_place` (a walk of 141 people: one `studio_node_labels`, every change views hear the same 161 rows and none loading; choosing the key, no read) and `reads_out_under_the_old_name_are_sent_again_under_the_new` (a list out under names sent again under titles; a searched relationship read again), each failing with the old reading again; `a_parked_graph_reads_under_new_names_only_when_shown` (now the root's name alone); offscreen frames of a tree at `topic-00325`, Expand all, then Topic named by category, through a 700 ms proxy | Before: the walk let go of everything and read the root and 20 lists again (21 reads in the test, the counts from the session's memo); on screen the tree was the root over "Reading…" at +1.6 s, the groups back with Broader still reading at +2.2 s. After: every row stays; one read runs, and at +1.8 s "Branch Retrieval" reads "method" in its place |
 | 2026-11-09 | With relationships with none left out, one not counted yet does not show until it is known to have some, and one seen with some keeps its row while counted again | `relationship_tree` `rows::tests::empty_groups_hide_with_their_rows_when_asked` | Pass. Not yet checked in the running app |
 | 2026-11-01 | Relationships with none are hidden until asked for; the filter field sits on the toolbar's edge | `relationship_tree` `the_rows_fit_the_dock_and_the_selected_row_shows` (now shows the empty groups first); offscreen snapshot of the Source tree with a node expanded and "tit" typed | An expanded Source shows ChangeEvidence and DesignationEvidence only, the eye toggle slashed; the field's left edge is the view strip's |
@@ -259,7 +268,9 @@ on the canvas. Typing filters the visible rows.
   type's table filtered to "related to" this node (spec 004's relationship filter); the eye
   toggle (or `h`) shows groups with none, hidden by default (decided 2026-11-01); with text typed, a
   group not read in full offers "Find “text” among N", which reads that group again on the
-  server narrowed to ids starting with or labels containing the text (Esc clears both).
+  server narrowed to ids starting with or labels containing the text (Esc clears both). Since
+  2026-11-16 (spec 031) each word is matched on its own, in four spellings, in the id or any
+  searched property (the name, the name chosen in Settings, an email or website).
   `OpenNode` from the table, palette or canvas now reaches the tree: the table's handler
   propagates, so Explore shows and the tree reveals the node. A node row's hover card shows
   its label, type and key, then under the relationship that led to it (`→ WorksAt`) every

@@ -24,7 +24,9 @@ studio_ui = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+semver = { workspace = true }
 smol = { workspace = true }
+unicode-normalization = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]

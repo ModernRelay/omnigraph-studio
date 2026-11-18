@@ -301,26 +301,17 @@ what was last saved at most every 250 ms rather than serializing every tab on ev
   panel does (`studio_graph::OpenStoredQuery`). Tab
   (bound under `CommandPalette > Editor`, so it outranks the editor's) dismisses the palette
   and sends `studio_agent::Ask`; with no agent chosen, the agent tab says the question waits.
-  Node search tries the text as typed, lowercase and capitalized, because `contains` is
-  exact on 0.13 ("ada" finds "Ada Turing"). GQ has no node alternatives, so a search is one
-  read per node type, five rows each. A pause reads at most eight types
-  (`TYPES_PER_SEARCH`, as many as a connection has on the wire at once, so the reads go out
-  together rather than 120 of them queueing behind every other view's on a graph of 120
-  types): those a property names first, since a name is what a person types, then those
-  found by id alone, types the counts say are empty last, each in schema order. When types
-  are left, a last row "Search N more types" reads the next eight and keeps the palette open.
-  Each type's rows show as it answers, below the rows already shown, which keep their place
-  whichever type answers first (constitution V); in All they follow the ranked rows instead
-  of being ranked among them, so a node that lands never pushes down the row under the
-  cursor. New text stops the reads for the old. Typing on is mostly free: when a type's
-  answer came back under five rows and the new text only narrows the old (each spelling of
-  the new text starts with one of the old, `gq_language::builder::search_narrows`), its rows
-  are filtered in the palette by the query's own predicate (`search_matches`); text typed
-  back to after a backspace shows its answer again. Earlier node rows the new text's
-  predicate refuses go at once; the others stay until their type answers. From the keystroke
-  until every type read has answered, a turning circle (`ds::spinner`) sits at the end of the
-  search field in All and Nodes, an empty list reads "Searching nodes…" instead of "No node
-  matches", and the footer leaves out its count until something has come back.
+  ~~Node search tries the text as typed, lowercase and capitalized, … reads at most eight
+  types (`TYPES_PER_SEARCH`) … "Search N more types" … narrowed in the palette by
+  `search_narrows` …~~ Since 2026-11-16 node search is spec 031's: every type is searched, a
+  type of at most 5,000 nodes is matched in memory from its name index (read once per commit),
+  regardless of case, accents and word order, and ranked exact, prefix, word start, anywhere; a
+  larger type is searched on the server. Each type shows its best five, with "More in <Type>…"
+  for more, and a type whose search failed shows with Retry. Rows already shown keep their place
+  as answers land (constitution V); in All they follow the ranked rows. From the keystroke until
+  every type has answered, a turning circle (`ds::spinner`) sits at the end of the search field
+  in All and Nodes, an empty list reads "Searching nodes…" instead of "No node matches", and
+  the footer leaves out its count until something has come back.
 - Opens in one frame with no animation (constitution VII).
 - Landed 2026-10-12: ⌘K and ⌘⇧P (Ctrl elsewhere), bound by the default keymaps, so a person's
   keymap can unbind them. Rows are humanized action names (`studio_graph::OpenType` → "Graph:
@@ -1079,6 +1070,7 @@ opens a link from inside Studio.
 ## Validation log
 
 | Date | Claim | Check | Result |
+| 2026-11-15 | A page's group still being read when its neighbours' type is named otherwise lands renamed (review of #111) | `type_table` `a_group_read_out_when_nodes_are_named_otherwise_lands_renamed`: Ada's page, her companies' read held, Company named by `code`, then the read let go; failing with the check removed | Before: the group showed "Analytical Engines" for good, since only groups already read were renamed. Now a group's first read and its next page carry the schema they were built under, and land renamed when it names their type by another property than the view's (`NodePeek::rename_if_named_otherwise`), as a table's relationship cells do. The next page goes the same way; it has no test of its own |
 | 2026-11-14 | A new node name renames what views show in place ("Node names") | `type_table` `naming_nodes_otherwise_renames_them_in_place` (a Person table and Ada's page, Company named by `code`: at once every cell and group as it was, then renamed; 2 reads, one a view, nothing else), failing with the old reading again (the table's cell gone at once); `graph_store` tests in spec 005's log; offscreen frames on the dense graph through a 700 ms proxy, Topic named by category, of an Artifact table and Topic `topic-00325`'s page | Before: the table's topic chips gave way to bare counts with 4 reads running, back renamed at +2.2 s; the page's relationship list grew from 4 groups to 9 as empty ones came back unread, Broader closed, 6 reads running. After: the chips and groups stay; one read each, the names changing in place, and the page's title at once from the values held |
 | 2026-11-14 | Open history leaves the graph on the branch it reads, on a toast and in the activity log; Undo moves it to the delete's branch | `studio_workspace` `a_toasts_follow_up_acts_on_the_graph_and_branch_written_to` (an unknown outcome on `fix`, then the graph moved to main: the press opens `OpenBranchHistory` for `fix` and the graph is still on main; a commit on `fix` opened from main by View commit, the graph still on main; a delete on `fix`, then the graph moved to main and another graph shown: Undo shows the graph, on `fix`) and `outcomes_described_alike_are_toasted_each_with_its_own_follow_up` (the toast's action names the branch); `studio` `activity::tests::an_unknown_outcome_opens_its_branchs_history` (the row's press opens `fix`'s history with the window on main) | Passed. Before, each press called `set_branch` first; the tests said so and were rewritten |
 | 2026-11-14 | The text-size keys move the interface's and the editor's sizes together within the settings page's range, keep them, and act app-wide | `studio_settings` `text_sizes_step_together_and_stop_at_the_limits` (a step each way, the top and the bottom limit, and `FONT_SIZES` held to the two settings' ranges) and `the_text_size_steps_change_the_settings_in_effect` (two steps up, one down, a reset, and forty steps stopping at 24 with the two sizes as far apart); `studio` `tests/keymaps.rs` (the three actions bound on every platform); offscreen on `script/dev-server`, with a `settings.json` holding a comment: ⌘= twice wrote 17 and 16 and drew larger text over rows of the same height, ⌘− three times wrote 14 and 13, ⌘0 took both keys out again, and the comment stayed each time | Passed. Not run on Linux or Windows, and the View menu's three items were not pressed |

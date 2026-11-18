@@ -36,6 +36,9 @@ struct BranchDetail {
     head: String,
     created_at: i64,
     actor: Option<String>,
+    /// When the branch was made, and what from, where the server details its branches
+    /// (Omnigraph 0.15, `graph_store::ServerFeature::DetailedBranchList`); `None` else.
+    started: Option<(i64, Option<String>)>,
 }
 
 /// The "Branches" sidebar section.
@@ -177,12 +180,17 @@ impl BranchList {
             let task = cx.spawn(async move |this, cx| {
                 let head = read.await;
                 this.update(cx, |this, cx| {
+                    let started = this.session.as_ref().and_then(|session| {
+                        let detail = session.read(cx).branch_detail(&branch)?;
+                        Some((detail.created_at?, detail.from.clone()))
+                    });
                     match head {
                         Ok(Some(head)) => {
                             let detail = BranchDetail {
                                 head: head.graph_commit_id,
                                 created_at: head.created_at,
                                 actor: head.actor_id,
+                                started,
                             };
                             this.details.insert(branch, detail);
                         }
@@ -207,10 +215,21 @@ impl BranchList {
     ) -> impl IntoElement + use<> {
         let detail = self.details.get(&branch).map(|d| {
             let actor = d.actor.clone().unwrap_or_else(|| "unknown actor".into());
-            let when = relative_time(d.created_at, now_micros());
+            let now = now_micros();
+            let when = relative_time(d.created_at, now);
+            let started = match &d.started {
+                Some((at, Some(from))) => {
+                    format!(" · made {} from {from}", relative_time(*at, now))
+                }
+                Some((at, None)) => format!(" · made {}", relative_time(*at, now)),
+                None => String::new(),
+            };
             (
                 when.clone(),
-                format!("Head {} · {actor} · {when}", short_commit_id(&d.head)),
+                format!(
+                    "Head {} · {actor} · {when}{started}",
+                    short_commit_id(&d.head)
+                ),
             )
         });
         let session = self.session.clone();

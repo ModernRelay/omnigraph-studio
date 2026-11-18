@@ -1,6 +1,6 @@
 # Omnigraph Studio privacy notice
 
-Last updated: 15 November 2026
+Last updated: 18 November 2026
 
 This notice covers the Omnigraph Studio desktop app ("Studio"). It says where your graphs go;
 what Studio sends to us, which from version 0.4.7 is no report of any kind; which requests
@@ -40,13 +40,13 @@ and your IP address under [GitHub's privacy statement](https://docs.github.com/s
 We receive nothing from these checks. With **Update automatically** off in Settings, Studio
 checks only when you ask it to.
 
-**The list of AI models, in versions 0.3.0 to 0.4.7.** When one of these versions starts and
+**The list of AI models, in versions 0.3.0 to 0.4.10.** When one of these versions starts and
 its copy of the list is more than a day old, it reads the list of AI models and their prices
 from [OpenRouter](https://openrouter.ai), whether or not you use an AI feature. The request
 holds no key and nothing about you or your graphs. OpenRouter receives your IP address and
 Studio's user agent (`Omnigraph-Studio/<version>`) under
 [OpenRouter's privacy policy](https://openrouter.ai/privacy). We receive nothing from it.
-Versions after 0.4.7 read the list only once you have stored an OpenRouter key, as described
+Versions after 0.4.10 read the list only once you have stored an OpenRouter key, as described
 [below](#features-you-set-up-yourself).
 
 ## Features you set up yourself
@@ -74,7 +74,7 @@ OpenRouter, at most once a day, to fill the model choices in Settings. That requ
 key and nothing about you or your graphs; OpenRouter receives your IP address and Studio's
 user agent (`Omnigraph-Studio/<version>`).
 
-Without a key, no AI feature sends anything and, in versions after 0.4.7, Studio sends
+Without a key, no AI feature sends anything and, in versions after 0.4.10, Studio sends
 nothing to OpenRouter at all. Removing the key in Settings stops all of it.
 
 **The agent panel, with an agent you choose.** The agent panel runs the agent program you name

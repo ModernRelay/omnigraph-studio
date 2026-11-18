@@ -19,6 +19,7 @@ serde_json = { workspace = true }
 pulldown-cmark = { workspace = true }
 markdown = { workspace = true }
 unicode-segmentation = { workspace = true }
+smallvec = "1"
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

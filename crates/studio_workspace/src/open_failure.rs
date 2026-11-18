@@ -116,6 +116,13 @@ fn says(
              for access."
                 .to_owned(),
         ),
+        SchemaFailure::NotAdmitted => (
+            IconName::UserCheck,
+            format!("{server} has not admitted this sign-in"),
+            "The server accepts the sign-in but admits no one for it, so signing in again will \
+             not help. Ask the server's operator to admit you, or open another graph."
+                .to_owned(),
+        ),
         SchemaFailure::Unreachable => (
             IconName::Server,
             format!("Could not reach {server}"),

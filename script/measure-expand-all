@@ -19,10 +19,14 @@
 # Prints the measured step, the wall time from the menu click until the step settled (the
 # reads runner adds its 1 s quiet window to that), and writes <out.json> plus <out>.png.
 set -euo pipefail
+# Portable across Linux and macOS: no GNU-only `realpath -m`, `date +%N` or `\|` in grep;
+# paths and clocks come from python3, which the reads table below needs anyway.
+absolute() { python3 -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "$1"; }
+now() { python3 -c 'import time; print(time.time())'; }
 BIN=${1:?usage: measure-expand-all <snapshot-binary> <out.json>}
 OUT=${2:?usage: measure-expand-all <snapshot-binary> <out.json>}
-BIN=$(realpath "$BIN")
-OUT=$(realpath -m "$OUT")
+BIN=$(absolute "$BIN")
+OUT=$(absolute "$OUT")
 
 if ! curl -sf -o /dev/null http://127.0.0.1:8788/healthz; then
   echo "no server at http://127.0.0.1:8788; start script/dense-server first" >&2
@@ -46,16 +50,16 @@ MARK=(key:ctrl-a key:f click:852,467,right)
 EXPAND=click:896,507
 # The question's "Expand N nodes" button, in a build that asks (spec 006).
 CONFIRM=click:857,319
-clock() { echo "run:date +%s.%N > $work/$1"; }
+clock() { echo "run:python3 -c 'import time; print(time.time())' > $work/$1"; }
 
-start=$(date +%s.%N)
+start=$(now)
 "$BIN" "${OUT%.json}.png" "reads:$OUT" "$ROOT" \
   "${MARK[@]}" "$EXPAND" \
   "${MARK[@]}" "$EXPAND" \
   "${MARK[@]}" "$EXPAND" \
   "${MARK[@]}" "$(clock t0)" "$EXPAND" "$CONFIRM" "$(clock t1)" \
-  2>&1 | grep -v '^snapshot data\|\.png$' > "$work/log"
-end=$(date +%s.%N)
+  2>&1 | { grep -Ev '^snapshot data|\.png$' || true; } > "$work/log"
+end=$(now)
 
 python3 - "$OUT" "$work" "$start" "$end" <<'EOF'
 import json, sys
