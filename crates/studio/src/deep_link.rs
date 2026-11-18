@@ -91,7 +91,7 @@ pub enum DeepLink {
         target: Target,
         text: String,
     },
-    /// A link from `omnigraph studio`, opened once its digests match this Mac's.
+    /// A link from `omnigraph studio`, opened once its digests match this computer's.
     Open(CliLink),
     /// A link from `omnigraph studio` for a managed target: a cluster by what its control plane
     /// names it, opened once that control plane answers for it.
@@ -116,15 +116,15 @@ impl DeepLink {
 pub fn verify(link: &CliLink, binding: &str, home: &str) -> Result<(), String> {
     if link.binding != binding {
         return Err(format!(
-            "The link's target {} is not this Mac's: its binding digest differs, so the name \
-             resolves to another server or credential here. Make the link again with \
-             `omnigraph studio --target {0}` on this Mac.",
+            "The link's target {} is not this computer's: its binding digest differs, so the \
+             name resolves to another server or credential here. Make the link again with \
+             `omnigraph studio --target {0}` on this computer.",
             link.target
         ));
     }
     if link.home != home {
         return Err(format!(
-            "The link was made from another operator file than this Mac's CLI reads: its home \
+            "The link was made from another operator file than this computer's CLI reads: its home \
              digest differs. Make the link again with `omnigraph studio --target {}` here.",
             link.target
         ));
