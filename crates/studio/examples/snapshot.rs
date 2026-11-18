@@ -9,7 +9,7 @@
 //! the previous one settles. `type:<text>` types text into the focused editor (`\n` is a new
 //! line); it is `editor::HandleInput` with the text. `click:<x>,<y>` clicks at a point in
 //! window pixels (half the PNG's, which is drawn at 2x), with `,cmd` or `,shift` held when
-//! added, `,right` for the secondary button and `,double` for a double click; `hover:<x>,<y>` moves the pointer there and rests; `key:<keystroke>` presses keys as the keymap sees them (`key:tab`, `key:cmd-4`);
+//! added, `,right` for the secondary button and `,double` for a double click; `hover:<x>,<y>` moves the pointer there and rests; `scroll:<dx>,<dy>[,at=<x>:<y>]` scrolls once by that many pixels at the window's centre (or at that point) and rests, to set a case up without measuring; `key:<keystroke>` presses keys as the keymap sees them (`key:tab`, `key:cmd-4`);
 //! `drag:<x1>,<y1>,<x2>,<y2>` presses at
 //! the first point, moves to the second in steps, and releases (`,shift` or `,cmd` held); `wait:<ms>` lets that long pass
 //! (for a write from outside to land between steps); `shot:<path>` saves the window as it
@@ -985,6 +985,38 @@ fn main() {
                 );
             })
             .expect("move the pointer");
+            rest(&mut cx, handle, &mut recorder, step_wait);
+            continue;
+        }
+        if let Some(rest_of) = spec.strip_prefix("scroll:") {
+            let mut parts = rest_of.split(',').map(str::trim);
+            let mut number = |what: &str| -> f32 {
+                parts
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or_else(|| panic!("scroll:<dx>,<dy>[,at=<x>:<y>]: {what}"))
+            };
+            let (dx, dy) = (number("dx"), number("dy"));
+            let position = match parts.next().and_then(|p| p.strip_prefix("at=")) {
+                Some(at) => {
+                    let (x, y) = at.split_once(':').expect("at=<x>:<y>");
+                    point(px(x.parse().expect("at x")), px(y.parse().expect("at y")))
+                }
+                None => point(px(width / 2.), px(height / 2.)),
+            };
+            cx.update_window(handle, |_, window, cx| {
+                window.dispatch_event(
+                    PlatformInput::Scroll(ScrollEvent {
+                        position,
+                        delta: ScrollDelta::Pixels(point(px(dx), px(dy))),
+                        modifiers: Modifiers::default(),
+                        touch_phase: TouchPhase::Moved,
+                        source: ScrollSource::Pointer,
+                    }),
+                    cx,
+                );
+            })
+            .expect("scroll");
             rest(&mut cx, handle, &mut recorder, step_wait);
             continue;
         }
