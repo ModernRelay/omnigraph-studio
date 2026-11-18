@@ -215,7 +215,7 @@ pub mod workspace {
             /// Connect to a server or open a graph.
             OpenGraph,
             /// Read the open graph's schema, branches and counts again, and the view in
-            /// focus.
+            /// focus; connect again to a server that did not answer.
             Refresh,
             /// Make text one size larger, in the interface and the query editor, and keep it:
             /// zoom in. Rows, columns and panels keep their size.

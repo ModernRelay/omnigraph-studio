@@ -3950,7 +3950,19 @@ impl Workspace {
                 )
             })
             .collect();
-        let mut tooltip = connection_tooltip(&url, &state, actor.as_deref());
+        // The chip says only that the server did not answer; its tooltip says why, and its
+        // menu connects again.
+        let unreachable = self.session.as_ref().and_then(|session| {
+            match &session.read(cx).connection.read(cx).state {
+                ConnectionState::Unreachable(why) => Some(why.clone()),
+                _ => None,
+            }
+        });
+        let said = match &unreachable {
+            Some(why) => format!("{state}: {}", studio_ui::clause(why)),
+            None => state.clone(),
+        };
+        let mut tooltip = connection_tooltip(&url, &said, actor.as_deref());
         if let Some(reason) = &unavailable {
             tooltip = format!(
                 "This graph is unavailable: {}. Reads resume when it is ready. · {tooltip}",
@@ -4025,6 +4037,7 @@ impl Workspace {
                 })
                 .child(studio_ui::ds::icon::meta(IconName::ChevronUpDown)),
         );
+        let connect_again = unreachable.is_some();
         PopoverMenu::new("graph-switcher-menu")
             .anchor(gpui::Anchor::TopLeft)
             .attach(gpui::Anchor::BottomLeft)
@@ -4050,12 +4063,15 @@ impl Workspace {
                             },
                         );
                     }
-                    menu.separator()
-                        .action(
-                            "Open Another Graph…",
-                            Box::new(studio_actions::workspace::OpenGraph),
-                        )
-                        .action("Close Graph", Box::new(CloseGraph))
+                    menu = menu.separator();
+                    if connect_again {
+                        menu = menu.action("Connect Again", Box::new(Refresh));
+                    }
+                    menu.action(
+                        "Open Another Graph…",
+                        Box::new(studio_actions::workspace::OpenGraph),
+                    )
+                    .action("Close Graph", Box::new(CloseGraph))
                 }))
             })
     }
