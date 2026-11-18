@@ -3260,10 +3260,13 @@ impl TypeTable {
                 .label_hidden(self.compact_toolbar())
                 .disabled(self.all_columns.len() < 2)
                 .when(!open, |button| {
-                    button.tip(studio_ui::ds::tooltip(self.chip_tip(
-                        "Columns",
-                        "Show or hide columns · drag a column's header to move it",
-                    )))
+                    // Off, it says why rather than what it would do (constitution VI).
+                    let about = if self.all_columns.len() < 2 {
+                        format!("{} has one column", self.type_name)
+                    } else {
+                        "Show or hide columns · drag a column's header to move it".to_owned()
+                    };
+                    button.tip(studio_ui::ds::tooltip(self.chip_tip("Columns", &about)))
                 }),
             )
             .menu(move |window, cx| {
@@ -3353,10 +3356,16 @@ impl TypeTable {
                 .label_hidden(self.compact_toolbar())
                 .disabled(choices.is_empty())
                 .when(!open, |button| {
-                    button.tip(studio_ui::ds::tooltip(self.chip_tip(
-                        "Group",
-                        "Group the rows by a property, a relationship or a property of a neighbour",
-                    )))
+                    let about = if choices.is_empty() {
+                        format!(
+                            "No property or relationship of {} groups its rows",
+                            self.type_name
+                        )
+                    } else {
+                        "Group the rows by a property, a relationship or a property of a neighbour"
+                            .to_owned()
+                    };
+                    button.tip(studio_ui::ds::tooltip(self.chip_tip("Group", &about)))
                 }),
             )
             .menu(move |window, cx| {
@@ -3504,10 +3513,16 @@ impl TypeTable {
                     .label_hidden(self.compact_toolbar())
                     .disabled(choices.is_empty())
                     .when(!open, |button| {
-                        button.tip(studio_ui::ds::tooltip(self.chip_tip(
-                            "Sort",
-                            "Order the rows by a property · a column's header orders by it too",
-                        )))
+                        let about = if choices.is_empty() {
+                            format!(
+                                "{} has no property its rows can be ordered by",
+                                self.type_name
+                            )
+                        } else {
+                            "Order the rows by a property · a column's header orders by it too"
+                                .to_owned()
+                        };
+                        button.tip(studio_ui::ds::tooltip(self.chip_tip("Sort", &about)))
                     }),
             )
             .menu(move |window, cx| {
