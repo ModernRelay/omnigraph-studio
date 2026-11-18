@@ -202,9 +202,9 @@ fn scroll_event(position: gpui::Point<gpui::Pixels>, dx: f32, dy: f32) -> Platfo
 }
 
 /// The point an `at=<x>:<y>` option names, in window pixels.
-fn at_point(at: &str) -> (f32, f32) {
+fn at_point(at: &str) -> gpui::Point<gpui::Pixels> {
     let (x, y) = at.split_once(':').expect("at=<x>:<y>");
-    (x.parse().expect("at x"), y.parse().expect("at y"))
+    point(px(x.parse().expect("at x")), px(y.parse().expect("at y")))
 }
 
 /// `clicks` clicks at `position`, as the platform delivers them: move, then a press and a
@@ -797,7 +797,7 @@ fn main() {
             let mut typing = false;
             let mut scroll: Option<(f32, f32)> = None;
             let mut drag: Option<(f32, f32)> = None;
-            let mut at: Option<(f32, f32)> = None;
+            let mut at: Option<gpui::Point<gpui::Pixels>> = None;
             let mut live = false;
             for part in parts {
                 if part == "live" {
@@ -824,10 +824,7 @@ fn main() {
             // Input goes to the window's centre, or where `at` puts it: each frame first handles
             // one scroll or one move of a held button, as a frame of a real zoom or pan does,
             // then draws.
-            let center = match at {
-                Some((x, y)) => point(px(x), px(y)),
-                None => point(px(width / 2.), px(height / 2.)),
-            };
+            let center = at.unwrap_or_else(|| point(px(width / 2.), px(height / 2.)));
             if drag.is_some() {
                 cx.update_window(handle, |_, window, cx| {
                     window.dispatch_event(
@@ -1007,10 +1004,7 @@ fn main() {
             };
             let (dx, dy) = (number("dx"), number("dy"));
             let position = match parts.next().and_then(|p| p.strip_prefix("at=")) {
-                Some(at) => {
-                    let (x, y) = at_point(at);
-                    point(px(x), px(y))
-                }
+                Some(at) => at_point(at),
                 None => point(px(width / 2.), px(height / 2.)),
             };
             cx.update_window(handle, |_, window, cx| {
