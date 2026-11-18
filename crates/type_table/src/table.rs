@@ -16706,6 +16706,11 @@ mod tests {
         cx.run_until_parked();
         let frames = table.read_with(cx, |table, _| table.frames_rows_drawn.clone());
         let first = frames.first().expect("the widened grid is drawn");
+        assert_eq!(
+            first.len(),
+            21,
+            "the frame's list asked for its lines: {frames:?}"
+        );
         assert!(
             past_the_edge.iter().all(|&col| first[col]),
             "the frame that widens the grid draws what it uncovers: {first:?} of {frames:?}"
