@@ -384,9 +384,10 @@ form for the `studio` server, and shows the result's words instead: "Opened Proj
 
 ### Outside agents
 
-Off by default (2026-11-18): as in 0.4.8, the only release with the setting. On `main` it was
-on from 2026-11-17, which no release carries. Off, no agent outside Studio is let in, and with
-no conversation started no server runs. The switches are in Settings, under Agent:
+On by default (2026-11-16, at Ragnor's request; kept on 2026-11-18). Since 2026-11-18 the
+server starts only when an agent is let in, so with this switch off, and no conversation
+started, no server runs, no keychain item is read and no token file is written. The switches are
+in Settings, under Agent:
 
 - **Let agents outside Studio show things in Studio.** When on, Studio writes
   `<data dir>/ui-tools/endpoint.json` (mode 0600, with `studio_settings::write_atomic`) with
@@ -481,7 +482,7 @@ records the tool's name, the window id and the outcome.
 | Check each tool's precondition, then report what changed | Rely on `is_action_available`; return as soon as the action is dispatched; wait for a frame | An available action can still do nothing (no session), and a dispatch says nothing. What changed is known as soon as the deferred dispatch has run, with no frame, so a frame wait would only add a timeout to handle |
 | Streamable HTTP on loopback with a bearer token, for both kinds of agent | A Unix socket; stdio through `omnigraph-studio mcp-proxy`; the gateway's HTTPS | Both adapters and both CLIs connected over plain HTTP in live runs. A socket needs a relay. A stdio relay starts the 490 MB executable once per client. The gateway's self-signed certificate would not be trusted |
 | Plain JSON answers, no server stream | SSE answers and a GET stream | Both clients take JSON, and Claude Code goes on when GET gets 405. A stream would only matter for progress on long calls, and no tool is long |
-| Off by default for outside agents, with a kept address and token once on (2026-11-18, at Andrew's request; on by default from 2026-11-17, in #127 and in no release; off in 0.4.8) | On by default | On, every Studio listened on 24187, kept a token in the keychain and wrote it to a file at each start, for people who connect no agent. Off, such a person has no listener, no keychain item and no token file. One who turns it on keeps what 2026-11-17 gave: the address and token are kept, so a command copied once keeps working. What protects them then is unchanged: the token file is 0600 in a 0700 folder; the server listens on loopback only and refuses a non-null `Origin`; no tool writes; the first call of a run shows the notice with Turn off; New token refuses every copy of the old one |
+| On by default for outside agents, with a kept address and token (2026-11-16, at Ragnor's request; 0.4.8 had it off). On 2026-11-18 Andrew proposed off by default, since on, every Studio listened on 24187, kept a token in the keychain and wrote it to a file at each start; Ragnor kept it on | Off by default | A command copied once keeps working across restarts, and an agent the person points at Studio connects without a trip to Settings. A person who wants none of it turns it off once: then there is no listener, no keychain item and no token file. What protects a person while it is on: the token file is 0600 in a 0700 folder; the server listens on loopback only and refuses a non-null `Origin`; no tool writes; the first call of a run shows the notice with Turn off; New token refuses every copy of the old one |
 | The tools in one crate at layer 5; the workspace and the views with seams named for no caller (2026-11-18) | The list and the adapter in `studio_workspace`; hooks named `agent_*` that take a tool's name | The window frame is under every feature, so what sits in it is everyone's. A view that matches tool names holds a second copy of the list, which nothing keeps in step |
 | A view's refusal is a fact, worded by the tool crate | The view writes the agent's words | The words name tools ("use graph_show_node_on_canvas"), and a tool's name is the tool crate's alone |
 | A view's action dispatched on its tab | Give the view the keyboard for the dispatch and put it back after | The view held the keyboard for the call's wait, up to 15 s, and the person's keys drove it |

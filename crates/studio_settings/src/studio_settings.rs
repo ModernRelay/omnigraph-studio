@@ -453,7 +453,7 @@ pub struct AgentSettings {
     // Spec 032.
     /// Claude Code, Codex and other agents on this computer may open tables, pages, canvases
     /// and queries in Studio's windows, walk a canvas or a tree, and read which tabs are open,
-    /// through Studio's tool server. They never write. Off, Studio lets none of them in.
+    /// through Studio's tool server. They never write.
     #[schemars(title = "Let agents outside Studio show things in Studio")]
     pub outside_agents: bool,
     /// Studio asks for the same port at each start and keeps the token in the system keychain,
@@ -491,7 +491,7 @@ impl Default for AgentSettings {
             command: Vec::new(),
             env: BTreeMap::new(),
             ask_before_writes: false,
-            outside_agents: false,
+            outside_agents: true,
             keep_address: true,
             ui_tools_port: DEFAULT_UI_TOOLS_PORT,
             panel_ui_tools: true,
@@ -1740,14 +1740,12 @@ mod tests {
         assert_eq!(documented, actual, "default.json names every setting");
     }
 
-    /// Spec 032's settings: a kept address on the default port and the panel's agent's tools
-    /// are on; agents outside Studio and bringing the window to the front are off, so a person
-    /// who never turns them on has no server waiting for one (amended 2026-11-18).
+    /// Spec 032's settings: agents outside Studio, a kept address on the default port and the
+    /// panel's agent's tools are on; bringing the window to the front is off.
     #[test]
     fn the_agents_window_settings_default_as_the_person_asked() {
         let agent = StudioSettings::default().agent;
-        assert!(!agent.outside_agents, "nobody is let in unasked");
-        assert!(agent.keep_address && agent.panel_ui_tools);
+        assert!(agent.outside_agents && agent.keep_address && agent.panel_ui_tools);
         assert!(!agent.raise_window);
         assert_eq!(agent.ui_tools_port, DEFAULT_UI_TOOLS_PORT);
         assert!(
@@ -1757,9 +1755,6 @@ mod tests {
         // An older file without them takes them as defaults.
         let read = StudioSettings::read("{ \"agent\": { \"outside_agents\": false } }").unwrap();
         assert!(!read.settings.agent.outside_agents && read.settings.agent.keep_address);
-        // A person who turned it on keeps it on.
-        let read = StudioSettings::read("{ \"agent\": { \"outside_agents\": true } }").unwrap();
-        assert!(read.settings.agent.outside_agents);
     }
 
     #[test]
