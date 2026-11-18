@@ -10,7 +10,7 @@ what agents change before it merges.
 
 | Platform | File | Needs |
 |---|---|---|
-| macOS, Apple silicon | [Omnigraph-Studio-arm64.dmg](https://github.com/ModernRelay/omnigraph-studio/releases/latest/download/Omnigraph-Studio-arm64.dmg) | macOS 11 or later |
+| macOS, Apple silicon | [Omnigraph-Studio-arm64.dmg](https://github.com/ModernRelay/omnigraph-studio/releases/latest/download/Omnigraph-Studio-arm64.dmg) | macOS 12 or later |
 | Windows, x86_64 | [omnigraph-studio-windows-x86_64-setup.exe](https://github.com/ModernRelay/omnigraph-studio/releases/latest/download/omnigraph-studio-windows-x86_64-setup.exe) (installer) or [.zip](https://github.com/ModernRelay/omnigraph-studio/releases/latest/download/omnigraph-studio-windows-x86_64.zip) | Windows 10 1809 or later |
 | Linux, x86_64 | [omnigraph-studio-linux-x86_64.tar.gz](https://github.com/ModernRelay/omnigraph-studio/releases/latest/download/omnigraph-studio-linux-x86_64.tar.gz) | glibc 2.35 or later |
 | Linux, arm64 | [omnigraph-studio-linux-aarch64.tar.gz](https://github.com/ModernRelay/omnigraph-studio/releases/latest/download/omnigraph-studio-linux-aarch64.tar.gz) | glibc 2.35 or later |

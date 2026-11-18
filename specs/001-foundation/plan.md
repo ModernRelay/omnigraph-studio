@@ -83,7 +83,7 @@ schema, the agent skill's `upstream/`).
 ### Shipping (after 002)
 
 - macOS: `script/bundle-mac` builds `Omnigraph Studio.app` (identifier
-  `com.modernrelay.omnigraph-studio`, minimum macOS 11) and a DMG in `target/bundle`. With
+  `com.modernrelay.omnigraph-studio`, minimum macOS 12, since Zed `v1.27.0`) and a DMG in `target/bundle`. With
   `STUDIO_SIGN_IDENTITY` it signs the app and DMG with a Developer ID, the hardened runtime and
   a secure timestamp; with `STUDIO_NOTARY_PROFILE` it notarizes with `notarytool` and staples.
   Without them the app is signed ad hoc. Entitlements (`resources/macos/studio.entitlements`)
