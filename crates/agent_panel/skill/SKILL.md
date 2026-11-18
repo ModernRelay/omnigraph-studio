@@ -4,7 +4,7 @@ description: Read and change this Omnigraph graph from Omnigraph Studio with the
 license: GPL-3.0-or-later; GUIDE.md and references/ are MIT (see LICENSE)
 metadata:
   author: Omnigraph Studio
-  guide-version: "0.14.0"
+  guide-version: "0.15.0"
   http-contract: "0.14"
 ---
 
@@ -30,6 +30,13 @@ conversation's CLI.
   to the person instead.
 - Branch statements (`branch create|delete|merge` inside a query) are refused; use the
   `branch` commands.
+- Save a new node with the edges its type needs (an edge type `From -> To @card(1..)` or any
+  minimum above 0) in the same `mutate` or NDJSON load: from Omnigraph 0.15 the server checks
+  the minimum on every write that inserts or updates such a node, so a node sent first and its
+  edges later is refused, and so is an update of a node already below its minimum until the
+  same mutation adds its edges. The refusal reads `@card violation on edge …` and states
+  `effects: unknown` though nothing was written; check `commit list` as for any unknown
+  outcome, then send the node with its edges.
 - An outcome of `effects: unknown` means the answer was lost. Check
   `commit list --branch <your branch>` before trying again; never repeat a write blindly. A
   Studio refusal says "Nothing was sent": nothing was written.
