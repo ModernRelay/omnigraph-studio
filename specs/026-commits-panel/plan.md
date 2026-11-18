@@ -70,6 +70,7 @@ commit's tab, a double click keeps it.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-11-18 | The panel says how many branches it does not read | `history` `commits_panel::tests::rows_are_every_branchs_newest_commits_once_each` (extended: 3 and 1 branches past the cap) | A last row: "3 branches past the first 20 are not read here; a branch's History shows its commits" (constitution IX). Before, the branches past the 20th were left out and nothing said so, under an empty state that promises "any branch" |
 | 2026-11-09 | The panel lists the newest commits of every branch once each, newest first, and a branch that could not be read after them | `history` `commits_panel::tests::rows_are_every_branchs_newest_commits_once_each` | Pass. Not yet checked in the running app |
 | 2026-11-09 | History and the panel read change counts through one `RowCounts`: the drawn rows', once, never the first commit's | `history` `the_first_commits_changes_are_never_asked_for` (History's rows, through `RowCounts`) | Pass. The panel's counts not yet checked in the running app |
 
