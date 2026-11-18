@@ -287,8 +287,8 @@
       "right": "studio_tree::Expand",
       "left": "studio_tree::Collapse",
       "enter": "studio_tree::OpenSelected",
-      "alt-right": "studio_tree::ExpandAll",
-      "alt-left": "studio_tree::CollapseAll",
+      "shift-right": "studio_tree::ExpandAll",
+      "shift-left": "studio_tree::CollapseAll",
       "ctrl-enter": "studio_tree::OpenPage",
       "alt-enter": "studio_tree::OpenTable"
     }
