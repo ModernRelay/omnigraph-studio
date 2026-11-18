@@ -426,7 +426,9 @@ pub type Opening = Arc<Mutex<Vec<mpsc::UnboundedSender<HostEvent>>>>;
 /// An agent's error in words a person reads: its message, then the reason in its data when it
 /// gives one (a string, or the `data` or `message` of an object). Fields the protocol library
 /// adds for its own debugging, such as where in its source it failed (`spawned_at`), are left
-/// out, as is a bare "Internal error" ahead of a reason.
+/// out, as is a bare "Internal error" ahead of a reason. Every error an agent answers is shown
+/// in these words: a turn, an option, a deletion or a listing that failed, as an exit or a
+/// sign-in.
 fn error_words(error: &agent_client_protocol::Error) -> String {
     let detail = match &error.data {
         Some(serde_json::Value::String(text)) => Some(text.clone()),
@@ -711,7 +713,7 @@ async fn connect(
                                     .block_task()
                                     .await
                                     .map(|_| ())
-                                    .map_err(|error| error.to_string())
+                                    .map_err(|error| error_words(&error))
                             };
                             reply.send(result).ok();
                             Ok(())
@@ -925,7 +927,7 @@ async fn open_session(
                     }
                     let stop = response
                         .map(|response| response.stop_reason)
-                        .map_err(|error| error.to_string());
+                        .map_err(|error| error_words(&error));
                     turns.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                     events.unbounded_send(HostEvent::TurnEnded { stop }).ok();
                     Ok(())
@@ -950,7 +952,7 @@ async fn open_session(
                     let event = match response {
                         Ok(response) => HostEvent::ConfigOptions(response.config_options),
                         Err(error) => HostEvent::ConfigOptionFailed {
-                            message: error.to_string(),
+                            message: error_words(&error),
                         },
                     };
                     events.unbounded_send(event).ok();
@@ -1227,7 +1229,7 @@ async fn list_sessions(
             .send_request(ListSessionsRequest::new().cwd(cwd.clone()).cursor(cursor))
             .block_task()
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error_words(&error))?;
         sessions.extend(page.sessions);
         match page.next_cursor {
             Some(next) => cursor = Some(next),
