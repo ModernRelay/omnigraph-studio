@@ -111,7 +111,7 @@ pub struct Scene {
     pub cap: usize,
 }
 
-/// `scene` without the nodes the person or an agent hid, nor what hangs off them: the chips
+/// `scene` without the nodes hidden (`HideNodes`), nor what hangs off them: the chips
 /// whose chain of parents reaches a hidden node (spec 032, "Hide"). The walk's root is never
 /// hidden.
 pub fn without(scene: Scene, hidden: &HashSet<NodeRef>) -> Scene {

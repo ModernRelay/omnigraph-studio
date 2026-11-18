@@ -1739,7 +1739,8 @@ pub struct Exploration {
 
 impl EventEmitter<ExplorationEvent> for Exploration {}
 
-/// A relationship group as an agent names it (spec 032): `out:WorksAt`, `in:Knows`.
+/// A relationship group by name, with its direction from the node: `out:WorksAt`, `in:Knows`
+/// (spec 032). An expansion and a view's outline name relationships this way.
 pub fn relationship_key(group: &RelationshipGroup) -> String {
     let direction = match group.direction {
         Direction::Outgoing => "out",
@@ -1748,7 +1749,7 @@ pub fn relationship_key(group: &RelationshipGroup) -> String {
     format!("{direction}:{}", group.edge)
 }
 
-/// What an expansion of several nodes opens (spec 032, `canvas_expand`): each node's path and
+/// What an expansion of several nodes opens (spec 032, `ExpandNeighbourhood`): each node's path and
 /// the paths of the relationships asked for, what that costs, and what could not be found.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ExpandPlan {
@@ -2671,7 +2672,7 @@ impl Exploration {
         self.owe_deeper(cx);
     }
 
-    /// How many reads are out: a view an agent drives waits for them before it answers.
+    /// How many reads are out: a view has not settled while any is.
     pub fn reads_out(&self) -> usize {
         self.tasks.len() + self.landed.len()
     }

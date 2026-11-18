@@ -1,18 +1,18 @@
-//! What an agent does in a relationship tree (spec 032, "The canvas and the tree"): selecting a
-//! node's row by its id, expanding several nodes' neighbourhoods and collapsing them, and what
-//! an agent reads of the tree: identifiers and the names the person sees, never a property
-//! value.
+//! The tree's actions that name their nodes by id (spec 032, "The canvas and the tree"):
+//! selecting a node's row, expanding several nodes' neighbourhoods and collapsing them. With
+//! them, what the tree says of itself to a reader that does not draw it: its outline
+//! (identifiers and the names the person sees, never a property value), whether it is still
+//! settling, and why it would not do what an action asks.
+//!
+//! Nothing here knows who asks. The palette, a key and a UI tool reach the same handlers.
 
-use serde_json::{Value, json};
+use gpui::Action;
+use serde_json::json;
 use studio_actions::NodeId;
-use studio_actions::tree::{CollapseNodes, ExpandNeighbourhood, SelectNode};
-use studio_workspace::{AgentEdge, AgentGroup, AgentNode, AgentRefusal, AgentView};
+use studio_actions::tree::{CollapseNodes, ExpandAll, ExpandNeighbourhood, SelectNode};
+use studio_workspace::{OutlineEdge, OutlineGroup, OutlineNode, Refusal, ViewOutline};
 
 use super::*;
-
-/// What a call names a node the tree does not show with.
-const NOT_SHOWN: &str =
-    "Not in this tree; expand a relationship that holds it or use graph_show_node_in_tree";
 
 fn node_ref(node: &NodeId) -> NodeRef {
     NodeRef::new(node.type_name.clone(), node.id.clone())
@@ -116,9 +116,9 @@ impl RelationshipTree {
         }
     }
 
-    /// What an agent reads of the tree: its root, the rows shown (nodes with their names, and
-    /// relationships open or not with their counts), and what is selected.
-    pub(crate) fn agent_view_of(&self, cx: &App) -> Option<AgentView> {
+    /// The tree's outline: its root, the rows shown (nodes with their names, and relationships
+    /// open or not with their counts), and what is selected.
+    pub(crate) fn outline_of(&self, cx: &App) -> Option<ViewOutline> {
         let exploration = self.exploration.read(cx);
         let state = exploration.state();
         let label = |node: &NodeRef, via: Option<&graph_store::Neighbour>| {
@@ -132,7 +132,7 @@ impl RelationshipTree {
             let entry = &self.entries[ix];
             match &entry.kind {
                 EntryKind::Node { node, via, .. } => {
-                    nodes.push(AgentNode {
+                    nodes.push(OutlineNode {
                         type_name: node.type_name.clone(),
                         id: node.id.clone(),
                         label: label(node, via.as_ref()),
@@ -146,7 +146,7 @@ impl RelationshipTree {
                             _ => None,
                         });
                     if let Some(key) = group {
-                        edges.push(AgentEdge {
+                        edges.push(OutlineEdge {
                             from: pair(&key.node),
                             to: pair(node),
                             relationship: Some(graph_store::relationship_key(&key.group)),
@@ -157,7 +157,7 @@ impl RelationshipTree {
                     key,
                     count,
                     expanded,
-                } => groups.push(AgentGroup {
+                } => groups.push(OutlineGroup {
                     node: pair(&key.node),
                     relationship: graph_store::relationship_key(&key.group),
                     other_type: key.group.other_type.clone(),
@@ -189,7 +189,7 @@ impl RelationshipTree {
             _ => None,
         });
         let root = match &self.subject {
-            Subject::Node(root) => Some(AgentNode {
+            Subject::Node(root) => Some(OutlineNode {
                 type_name: root.type_name.clone(),
                 id: root.id.clone(),
                 label: state.label(root).map(str::to_owned),
@@ -199,7 +199,7 @@ impl RelationshipTree {
         let mut facts = serde_json::Map::new();
         facts.insert("filtered".into(), json!(!self.filter.is_empty()));
         facts.insert("hides_empty_relationships".into(), json!(self.hide_empty));
-        Some(AgentView {
+        Some(ViewOutline {
             root,
             nodes,
             edges,
@@ -213,8 +213,8 @@ impl RelationshipTree {
         })
     }
 
-    /// The tree is still reading or making rows of what a call opened.
-    pub(crate) fn agent_busy_now(&self, cx: &App) -> bool {
+    /// The tree is still reading or making rows of what the last action on it opened.
+    pub(crate) fn settling_now(&self, cx: &App) -> bool {
         let exploration = self.exploration.read(cx);
         self.rebuild_owed
             || self._loaded.is_some()
@@ -222,90 +222,96 @@ impl RelationshipTree {
             || exploration.expanding()
     }
 
-    /// Whether the tree takes an agent's call: the nodes it names are shown, the relationship
-    /// named is theirs, and an expansion past what opens without asking brings its answer.
-    pub(crate) fn agent_check_call(
-        &self,
-        tool: &str,
-        input: &Value,
-        cx: &App,
-    ) -> Result<(), AgentRefusal> {
-        let named: Vec<NodeId> = input
-            .get("nodes")
-            .and_then(|nodes| serde_json::from_value(nodes.clone()).ok())
-            .unwrap_or_default();
-        if named
-            .iter()
-            .any(|node| self.row_of(&node_ref(node)).is_none())
-        {
-            return Err(AgentRefusal::not_available(NOT_SHOWN));
+    /// Does now what the tree leaves for its next draw: the reads its walk owes and the rows
+    /// of what the walk changed.
+    pub(crate) fn catch_up_now(&mut self, cx: &mut Context<Self>) {
+        if self.exploration.read(cx).owes_reads() {
+            self.exploration.update(cx, |e, cx| e.read_owed(cx));
         }
-        let ask = |opening: graph_store::Opening, again: &str| AgentRefusal {
-            outcome: "needs_confirmation",
-            says: format!(
-                "This would open {} rows and ask for {} reads, past what the tree opens without \
-                 asking the person. Nothing was opened. {again}",
-                opening.nodes, opening.reads
-            ),
-            json: json!({
-                "needs_confirmation": { "nodes": opening.nodes, "reads": opening.reads }
-            }),
-        };
-        match tool {
-            "tree_expand" | "tree_collapse" if self.target_nodes(&named).is_empty() => {
-                return Err(AgentRefusal::not_available(
-                    "Name the nodes (`nodes`), or select a node's row first",
+        if self.rebuild_owed {
+            self.rebuild(cx);
+        }
+    }
+
+    /// Why the tree would not do what `action` asks, as it stands: a node it names is not
+    /// shown, it names none and no node's row is selected, a relationship named is not the
+    /// nodes', or it would open more than the tree opens without asking. `on` is the node
+    /// whose row the action is to act on, when its caller selects one first.
+    pub(crate) fn refusal_of(
+        &self,
+        action: &dyn Action,
+        on: Option<&NodeId>,
+        cx: &App,
+    ) -> Option<Refusal> {
+        let action = action.as_any();
+        let expand = action.downcast_ref::<ExpandNeighbourhood>();
+        // The nodes the action names, when it acts on nodes.
+        let named: Option<&[NodeId]> = expand
+            .map(|action| action.expansion.nodes.as_slice())
+            .or_else(|| {
+                action
+                    .downcast_ref::<CollapseNodes>()
+                    .map(|action| action.nodes.as_slice())
+            });
+        if let Some(named) = named {
+            if named
+                .iter()
+                .any(|node| self.row_of(&node_ref(node)).is_none())
+            {
+                return Some(Refusal::NotShown(Vec::new()));
+            }
+            if self.target_nodes(named).is_empty() {
+                return Some(Refusal::Says(
+                    "Name the nodes (`nodes`), or select a node's row first".into(),
                 ));
             }
-            "tree_expand" => {
-                let expansion: studio_actions::Expansion =
-                    serde_json::from_value(input.clone()).unwrap_or_default();
-                if !(1..=2).contains(&expansion.depth) {
-                    return Err(AgentRefusal::not_available("`depth` is 1 or 2"));
-                }
-                let plan = self.exploration.read(cx).plan_expand(
-                    &self.target_nodes(&named),
-                    expansion.relationships.as_deref(),
-                );
-                if !plan.unknown.is_empty() {
-                    return Err(AgentRefusal::not_available(format!(
-                        "None of the nodes has {}",
-                        plan.unknown.join(", ")
-                    )));
-                }
-                if plan.opening.asks() && !expansion.confirm {
-                    return Err(ask(
-                        plan.opening,
-                        "Call again with confirm: true to open it.",
-                    ));
-                }
-            }
-            "tree_expand_all" => {
-                // The row the call names, else the selected one, as Expand all opens it.
-                let path = match input
-                    .get("node")
-                    .and_then(|node| serde_json::from_value::<NodeId>(node.clone()).ok())
-                {
-                    Some(node) => self
-                        .row_of(&node_ref(&node))
-                        .map(|row| self.entries[self.visible[row]].path.clone()),
-                    None => self.selected_entry().map(|entry| entry.path.clone()),
-                };
-                if let Some(path) = path {
-                    let opening = self
-                        .exploration
-                        .read(cx)
-                        .opening(std::slice::from_ref(&path), true);
-                    if opening.asks() {
-                        return Err(ask(
-                            opening,
-                            "Use tree_expand with the node and confirm: true to open it.",
-                        ));
-                    }
-                }
-            }
-            _ => {}
         }
-        Ok(())
+        if let Some(action) = expand {
+            let expansion = &action.expansion;
+            if !(1..=2).contains(&expansion.depth) {
+                return Some(Refusal::Says("`depth` is 1 or 2".into()));
+            }
+            let plan = self.exploration.read(cx).plan_expand(
+                &self.target_nodes(&expansion.nodes),
+                expansion.relationships.as_deref(),
+            );
+            if !plan.unknown.is_empty() {
+                return Some(Refusal::Says(format!(
+                    "None of the nodes has {}",
+                    plan.unknown.join(", ")
+                )));
+            }
+            if plan.opening.asks() && !expansion.confirm {
+                return Some(Refusal::AsksFirst {
+                    nodes: plan.opening.nodes,
+                    reads: plan.opening.reads,
+                    confirms: true,
+                });
+            }
+        }
+        if action.is::<ExpandAll>() {
+            // The row the caller selects first, else the selected one, as Expand all opens it.
+            let path = match on {
+                Some(node) => self
+                    .row_of(&node_ref(node))
+                    .map(|row| self.entries[self.visible[row]].path.clone()),
+                None => self.selected_entry().map(|entry| entry.path.clone()),
+            };
+            if let Some(path) = path {
+                let opening = self
+                    .exploration
+                    .read(cx)
+                    .opening(std::slice::from_ref(&path), true);
+                if opening.asks() {
+                    // Expand all carries no answer: the expansion that names its node does.
+                    return Some(Refusal::AsksFirst {
+                        nodes: opening.nodes,
+                        reads: opening.reads,
+                        confirms: false,
+                    });
+                }
+            }
+        }
+        None
     }
 }

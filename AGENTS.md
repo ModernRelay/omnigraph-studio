@@ -96,6 +96,9 @@ python3 script/test_release_files.py   # a release's version-free copies and lat
   version check, and never a guess from a missing field: decoding stays tolerant.
 - Never add a second copy of GPUI (GPUI Kit, `gpui-pre`, `gpui-ce`, crates.io `gpui`).
 - Never retry a write automatically. Never log tokens, query text or row data.
+- The UI tools stay in `ui_tool_server` (spec 032): only `studio` depends on it, in one module;
+  a view never names a tool, and says why it would not act as a fact the tool crate words; and
+  nothing of it runs until an agent is served.
 - Size nested rounded surfaces with `ds::radius::around`/`within`, never by hand: concentric
   corners, and Zed's buttons are always `radius::BUTTON` (spec 002, Visual language).
 - Keep a keystroke from drawing more than it changed (`docs/drawing.md`): no field inside a

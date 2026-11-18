@@ -14,6 +14,7 @@ mod menus;
 mod open_graph;
 mod organizations;
 mod settings_view;
+mod ui_tools;
 #[cfg(test)]
 mod ui_tools_canvas_tests;
 #[cfg(test)]
@@ -62,13 +63,8 @@ pub fn init(cx: &mut App) {
     review::init(cx);
     history::init(cx);
     agent_panel::init(cx);
-    // The UI tool server (spec 032), which the agent panel reaches through `UiToolEndpoint`.
-    ui_tool_server::init(cx);
-    if cx.has_global::<ui_tool_server::UiToolServer>() {
-        cx.set_global(studio_workspace::ui_tools::UiToolEndpoint::new(
-            ui_tool_server::UiToolServer::entry_for,
-        ));
-    }
+    // The UI tools and their server (spec 032). Nothing starts here.
+    ui_tools::init(cx);
 
     #[cfg(debug_assertions)]
     studio_workspace::register_item_kind(cx, "design-system", |_, workspace, window, cx| {
@@ -197,16 +193,14 @@ pub fn init(cx: &mut App) {
         workspace.register_action(|workspace, _: &OpenSettings, window, cx| {
             open_settings(workspace, window, cx);
         });
+        workspace.register_action(|_, _: &studio_actions::workspace::ToggleMcpServer, _, cx| {
+            studio_settings::update(cx, |settings| {
+                settings.agent.outside_agents = !settings.agent.outside_agents
+            });
+        });
         workspace.register_action(
-            |_, _: &studio_actions::workspace::ToggleOutsideAgents, _, cx| {
-                studio_settings::update(cx, |settings| {
-                    settings.agent.outside_agents = !settings.agent.outside_agents
-                });
-            },
-        );
-        workspace.register_action(
-            |_, _: &studio_actions::workspace::ReplaceAgentToken, window, cx| {
-                replace_agent_token(window, cx);
+            |_, _: &studio_actions::workspace::ReplaceMcpToken, window, cx| {
+                ui_tools::replace_agent_token(window, cx);
             },
         );
         workspace.register_action(
@@ -265,20 +259,6 @@ fn open_design_system(workspace: &mut Workspace, window: &mut Window, cx: &mut C
         window,
         cx,
         design_gallery::DesignGallery::new,
-    );
-}
-
-/// Asks, then replaces the token agents outside Studio use (spec 032). Confirmed with ↵:
-/// nothing is lost, and each agent takes the new token when its command is copied again.
-pub(crate) fn replace_agent_token(window: &mut Window, cx: &mut App) {
-    studio_workspace::confirm(
-        window,
-        cx,
-        "Replace the agents' token?",
-        "Every agent outside Studio that holds the current token is refused from now on. Copy \
-         its command again to give it the new one.",
-        "New token",
-        |_, cx| ui_tool_server::UiToolServer::replace_token(cx),
     );
 }
 

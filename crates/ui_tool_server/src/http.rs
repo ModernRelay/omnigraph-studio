@@ -10,12 +10,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::tools::{Answer, Caller, Target};
 use futures::channel::{mpsc, oneshot};
 use futures::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use gpui::SharedString;
 use serde_json::{Value, json};
 use smol::net::TcpStream;
-use studio_workspace::ui_tools::{Answer, Caller, Target};
 
 use crate::mcp::{self, Incoming};
 
@@ -547,7 +547,7 @@ pub fn announce_once(shared: &Shared, token: &str) {
 /// A call's tool name as the log may say it: one of Studio's tools, else "unknown". The name is
 /// the agent's text, which may hold anything, a query's text or ids among it.
 pub fn logged_name(name: &str) -> &str {
-    if studio_workspace::ui_tools::is_tool(name) {
+    if crate::tools::is_tool(name) {
         name
     } else {
         "unknown"

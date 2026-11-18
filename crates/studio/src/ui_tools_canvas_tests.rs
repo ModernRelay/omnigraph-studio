@@ -10,7 +10,7 @@ use gpui::{TestAppContext, VisualTestContext};
 use serde_json::{Value, json};
 use studio_settings::StudioSettings;
 use studio_workspace::Workspace;
-use studio_workspace::ui_tools::{self, Answer, Caller, Target};
+use ui_tool_server::tools::{self as ui_tools, Answer, Caller, Target};
 
 /// People on the fake server; every one works at `c0`.
 const PEOPLE: usize = 60;
@@ -356,6 +356,40 @@ async fn canvas_expand_two_levels(cx: &mut TestAppContext) {
     }
 }
 
+/// A second level that asks first is said by the expansion that stopped at it, and by no call
+/// after it. The walk holds what stopped until the next expansion, and every later call on the
+/// canvas (a zoom, a selection) repeated "call again with confirm: true", which an agent
+/// followed by expanding again.
+#[gpui::test]
+async fn only_the_expansion_says_its_second_level_asks(cx: &mut TestAppContext) {
+    let (_, cx, id) = studio(cx, None).await;
+    canvas(cx, id, "c0").await;
+    // The company's every person at the first level: the second, each of theirs, is past what
+    // opens without asking.
+    let stopped = run(
+        cx,
+        id,
+        "canvas_expand",
+        json!({ "nodes": [node("c0")], "depth": 2, "limit_per_relationship": PEOPLE }),
+    )
+    .await;
+    assert_eq!(stopped.outcome, "needs_confirmation", "{stopped:?}");
+    assert!(stopped.says.contains("second level"), "{}", stopped.says);
+    assert!(stopped.json["needs_confirmation"]["nodes"].is_u64());
+
+    for tool in ["canvas_zoom_in", "canvas_select_node"] {
+        let later = run(cx, id, tool, json!({})).await;
+        assert!(!later.is_error, "{tool}: {later:?}");
+        assert_ne!(later.outcome, "needs_confirmation", "{tool}");
+        assert!(
+            !later.says.contains("second level"),
+            "{tool}: {}",
+            later.says
+        );
+        assert!(later.json.get("needs_confirmation").is_none(), "{tool}");
+    }
+}
+
 /// A node not on the canvas is refused in the words the agent needs.
 #[gpui::test]
 async fn a_node_not_on_the_canvas_is_refused(cx: &mut TestAppContext) {
@@ -369,6 +403,38 @@ async fn a_node_not_on_the_canvas_is_refused(cx: &mut TestAppContext) {
     );
     let expanded = run(cx, id, "canvas_expand", json!({ "nodes": [node("p5")] })).await;
     assert_eq!(expanded.outcome, "not_available");
+}
+
+/// Arguments that do not fit the action say which one and why, in the action's own terms. The
+/// view is asked about the action as built, never about the call's raw input: read as raw
+/// input, a relationship given as text was answered "`depth` is 1 or 2".
+#[gpui::test]
+async fn arguments_that_do_not_fit_say_which(cx: &mut TestAppContext) {
+    let (cx, id) = walked(cx).await;
+    let answer = run(
+        cx,
+        id,
+        "canvas_expand",
+        json!({ "nodes": [node("p1")], "relationships": "out:Knows" }),
+    )
+    .await;
+    assert_eq!(answer.outcome, "invalid_input", "{answer:?}");
+    assert!(answer.is_error);
+    assert!(
+        answer.says.contains("out:Knows") && answer.says.contains("sequence"),
+        "{}",
+        answer.says
+    );
+    // A depth the expansion does not take is the view's to refuse, in its words.
+    let answer = run(
+        cx,
+        id,
+        "canvas_expand",
+        json!({ "nodes": [node("p1")], "depth": 3 }),
+    )
+    .await;
+    assert_eq!(answer.outcome, "not_available", "{answer:?}");
+    assert_eq!(answer.says, "`depth` is 1 or 2");
 }
 
 /// Canvas tools need a canvas in front.

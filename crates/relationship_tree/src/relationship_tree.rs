@@ -4,7 +4,7 @@
 //!
 //! Layer 5 (`docs/architecture.md`). Plan: `specs/005-relationship-tree/plan.md`.
 
-mod agent;
+mod by_id;
 mod neighbour_controls;
 mod rows;
 
@@ -298,21 +298,25 @@ impl Focusable for RelationshipTree {
 impl EventEmitter<ItemEvent> for RelationshipTree {}
 
 impl Item for RelationshipTree {
-    fn agent_view(&self, cx: &App) -> Option<studio_workspace::AgentView> {
-        self.agent_view_of(cx)
+    fn outline(&self, cx: &App) -> Option<studio_workspace::ViewOutline> {
+        self.outline_of(cx)
     }
 
-    fn agent_busy(&self, cx: &App) -> bool {
-        self.agent_busy_now(cx)
+    fn settling(&self, cx: &App) -> bool {
+        self.settling_now(cx)
     }
 
-    fn agent_check(
+    fn catch_up(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.catch_up_now(cx);
+    }
+
+    fn refuses(
         &self,
-        tool: &str,
-        input: &serde_json::Value,
+        action: &dyn gpui::Action,
+        on: Option<&studio_actions::NodeId>,
         cx: &App,
-    ) -> Result<(), studio_workspace::AgentRefusal> {
-        self.agent_check_call(tool, input, cx)
+    ) -> Option<studio_workspace::Refusal> {
+        self.refusal_of(action, on, cx)
     }
 
     /// The selected row's node, read as the tree reads: held at its commit, or at the commit
@@ -2036,6 +2040,43 @@ mod tests {
         assert_eq!(same, tree.read_with(cx, |tree, _| tree.exploration.clone()));
         let held = cx.update(|cx| Exploration::for_walk(&session, ada, Some("c0".into()), cx));
         assert_ne!(held, same);
+    }
+
+    /// A tree nobody draws (its window is minimized or covered) still answers a reader that
+    /// waits for it: asked to catch up, it makes the rows it left for a draw, and has settled.
+    #[gpui::test]
+    async fn a_tree_not_drawn_catches_up_when_asked(cx: &mut gpui::TestAppContext) {
+        cx.update(studio_theme::init_test);
+        let (session, _served) = followed_session(
+            "node Person {\n  slug: String @key\n  name: String\n}\nedge Knows: Person -> Person\n",
+            |_| serde_json::json!([{ "id": "p1", "label": "Ada", "n": 0 }]),
+            cx,
+        );
+        cx.run_until_parked();
+        let ada = NodeRef::new("Person", "p1");
+        let tree = cx.new(|cx| RelationshipTree::new(session, Subject::Node(ada), None, cx));
+        let before = tree.read_with(cx, |tree, _| tree.entries.clone());
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(10));
+        cx.run_until_parked();
+        tree.read_with(cx, |tree, cx| {
+            assert!(tree.rebuild_owed, "the answers are owed to the next draw");
+            assert!(tree.settling_now(cx), "so the tree has not settled");
+        });
+        // No draw comes. The reader asks, as often as it looks.
+        for _ in 0..10 {
+            tree.update(cx, |tree, cx| tree.catch_up_now(cx));
+            cx.run_until_parked();
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(40));
+            cx.run_until_parked();
+        }
+        tree.read_with(cx, |tree, cx| {
+            assert!(!tree.rebuild_owed);
+            assert!(!tree.settling_now(cx), "settled without a draw");
+            assert!(!Arc::ptr_eq(&tree.entries, &before), "the rows were made");
+        });
     }
 
     fn person_set(select: Option<&str>) -> ShowSetInTree {
