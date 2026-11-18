@@ -1,21 +1,25 @@
-//! What an agent does on a canvas walk (spec 032, "The canvas and the tree"): the actions a
-//! person reaches only by pointer before (selecting a node by its id, expanding several nodes'
-//! neighbourhoods, collapsing, showing more, hiding, pinning, starting a walk from a node), and
-//! what an agent reads of the canvas: identifiers and the names the person sees, never a
-//! property value.
+//! The canvas's actions that name their nodes by id (spec 032, "The canvas and the tree"):
+//! what a person reached only by pointer before (selecting a node, expanding several nodes'
+//! neighbourhoods, collapsing, showing more, hiding, pinning, starting a walk from a node).
+//! With them, what the canvas says of itself to a reader that does not draw it: its outline
+//! (identifiers and the names the person sees, never a property value), whether it is still
+//! settling, and why it would not do what an action asks.
+//!
+//! Nothing here knows who asks. The palette, a key and a UI tool reach the same handlers.
 
+use gpui::Action;
 use serde_json::{Value, json};
 use studio_actions::NodeId;
 use studio_actions::canvas::{
     CollapseNodes, ExpandNeighbourhood, HideNodes, PinNodes, RerootHere, SelectNode, ShowHidden,
     ShowMore, UnpinNodes,
 };
-use studio_workspace::{AgentEdge, AgentGroup, AgentNode, AgentRefusal, AgentView};
+use studio_workspace::{OutlineEdge, OutlineGroup, OutlineNode, Refusal, ViewOutline};
 
 use super::*;
 
-/// What a call names a node not on the canvas with.
-const NOT_DRAWN: &str = "Not on this canvas; expand a neighbour or use graph_show_node_on_canvas";
+/// The most hidden nodes the canvas names to a reader.
+const MOST_HIDDEN_NAMED: usize = 200;
 
 fn node_ref(node: &NodeId) -> NodeRef {
     NodeRef::new(node.type_name.clone(), node.id.clone())
@@ -229,11 +233,10 @@ impl GraphCanvas {
         );
     }
 
-    /// What an agent reads of the canvas: its nodes with the names drawn, the edges between
-    /// them by relationship, its relationships open or not, what is selected, its zoom and
-    /// whether the node cap left nodes out. A schema canvas shows types, which `studio_tabs`
-    /// and the schema tools name, and is not read here.
-    pub(crate) fn agent_view_of(&self, cx: &App) -> Option<AgentView> {
+    /// The canvas's outline: its nodes with the names drawn, the edges between them by
+    /// relationship, its relationships open or not, what is selected, its zoom and whether the
+    /// node cap left nodes out. A schema canvas shows types, not nodes, and has none.
+    pub(crate) fn outline_of(&self, cx: &App) -> Option<ViewOutline> {
         if self.schema_walk.is_some() {
             return None;
         }
@@ -247,7 +250,7 @@ impl GraphCanvas {
             .nodes
             .iter()
             .filter_map(|chip| match &chip.kind {
-                SceneKind::Node { node, .. } => Some(AgentNode {
+                SceneKind::Node { node, .. } => Some(OutlineNode {
                     type_name: node.type_name.clone(),
                     id: node.id.clone(),
                     label: Some(chip.label.clone()).filter(|label| *label != node.id),
@@ -258,12 +261,12 @@ impl GraphCanvas {
         let mut edges = Vec::new();
         for edge in &scene.edges {
             match (&scene.nodes[edge.from].kind, node_of(edge.to)) {
-                (SceneKind::Hub { key, .. }, Some(to)) => edges.push(AgentEdge {
+                (SceneKind::Hub { key, .. }, Some(to)) => edges.push(OutlineEdge {
                     from: pair(&key.node),
                     to: pair(to),
                     relationship: Some(graph_store::relationship_key(&key.group)),
                 }),
-                (SceneKind::Node { node, .. }, Some(to)) => edges.push(AgentEdge {
+                (SceneKind::Node { node, .. }, Some(to)) => edges.push(OutlineEdge {
                     from: pair(node),
                     to: pair(to),
                     relationship: None,
@@ -276,7 +279,7 @@ impl GraphCanvas {
             .iter()
             .enumerate()
             .filter_map(|(index, chip)| match &chip.kind {
-                SceneKind::Hub { key, count, open } => Some(AgentGroup {
+                SceneKind::Hub { key, count, open } => Some(OutlineGroup {
                     node: pair(&key.node),
                     relationship: graph_store::relationship_key(&key.group),
                     other_type: key.group.other_type.clone(),
@@ -309,7 +312,7 @@ impl GraphCanvas {
                 }),
             }
         });
-        let root = exploration.root().map(|root| AgentNode {
+        let root = exploration.root().map(|root| OutlineNode {
             type_name: root.type_name.clone(),
             id: root.id.clone(),
             label: exploration.state().label(root).map(str::to_owned),
@@ -335,7 +338,7 @@ impl GraphCanvas {
             .iter()
             .map(|node| json!({ "type_name": node.type_name, "id": node.id }))
             .collect();
-        hidden.truncate(studio_workspace::ui_tools::MAX_CHANGED);
+        hidden.truncate(MOST_HIDDEN_NAMED);
         facts.insert("hidden".into(), Value::Array(hidden));
         if let Some((left_out, most)) = &scene.capped {
             facts.insert(
@@ -343,7 +346,7 @@ impl GraphCanvas {
                 json!({ "cap": scene.cap, "left_out": left_out, "mostly": most }),
             );
         }
-        Some(AgentView {
+        Some(ViewOutline {
             root,
             nodes,
             edges,
@@ -357,8 +360,8 @@ impl GraphCanvas {
         })
     }
 
-    /// The canvas is still reading or laying out what a call opened.
-    pub(crate) fn agent_busy_now(&self, cx: &App) -> bool {
+    /// The canvas is still reading or laying out what the last action on it opened.
+    pub(crate) fn settling_now(&self, cx: &App) -> bool {
         let exploration = self.exploration.read(cx);
         self.layout_task.is_some()
             || self.next_layout.is_some()
@@ -369,122 +372,121 @@ impl GraphCanvas {
             || exploration.expanding()
     }
 
-    /// Whether the canvas takes an agent's call: the nodes it names are drawn, the relationship
-    /// named is theirs, and an expansion past what is opened without asking brings its answer.
-    pub(crate) fn agent_check_call(
-        &self,
-        tool: &str,
-        input: &Value,
-        cx: &App,
-    ) -> Result<(), AgentRefusal> {
-        let named: Vec<NodeId> = input
-            .get("nodes")
-            .and_then(|nodes| serde_json::from_value(nodes.clone()).ok())
-            .unwrap_or_default();
-        let missing: Vec<String> = named
-            .iter()
-            .filter(|node| self.index_of(&SceneId::Node(node_ref(node))).is_none())
-            .map(|node| format!("{} {}", node.type_name, node.id))
-            .collect();
-        if !missing.is_empty() {
-            return Err(AgentRefusal::not_available(format!(
-                "{NOT_DRAWN}: {}",
-                missing.join(", ")
-            )));
+    /// Does now what the canvas leaves for its next draw: the reads its walk owes and the
+    /// layout of what the walk changed.
+    pub(crate) fn catch_up_now(&mut self, cx: &mut Context<Self>) {
+        if self.draws_exploration() && self.exploration.read(cx).owes_reads() {
+            self.exploration.update(cx, |e, cx| e.read_owed(cx));
         }
-        let targets = || self.target_nodes(&named);
-        match tool {
-            "canvas_expand" | "canvas_collapse" | "canvas_hide_nodes" | "canvas_pin_nodes"
-            | "canvas_unpin_nodes"
-                if targets().is_empty() =>
-            {
-                return Err(AgentRefusal::not_available(
-                    "Name the nodes (`nodes`), or select or mark some first",
+        self.lay_out_owed(cx);
+    }
+
+    /// Why the canvas would not do what `action` asks, as it stands: a node it names is not
+    /// drawn, it names none and none is marked or selected, a query's result picture is asked
+    /// to expand or hide, a relationship named is not the nodes' or not open, or an expansion
+    /// would open more than the canvas opens without asking.
+    pub(crate) fn refusal_of(&self, action: &dyn Action, cx: &App) -> Option<Refusal> {
+        let action = action.as_any();
+        let expand = action.downcast_ref::<ExpandNeighbourhood>();
+        let hide = action.downcast_ref::<HideNodes>();
+        // The nodes the action names, when it acts on nodes.
+        let named: Option<&[NodeId]> = expand
+            .map(|action| action.expansion.nodes.as_slice())
+            .or_else(|| hide.map(|action| action.nodes.as_slice()))
+            .or_else(|| {
+                action
+                    .downcast_ref::<CollapseNodes>()
+                    .map(|action| action.nodes.as_slice())
+            })
+            .or_else(|| {
+                action
+                    .downcast_ref::<PinNodes>()
+                    .map(|action| action.nodes.as_slice())
+            })
+            .or_else(|| {
+                action
+                    .downcast_ref::<UnpinNodes>()
+                    .map(|action| action.nodes.as_slice())
+            });
+        if let Some(named) = named {
+            let missing: Vec<String> = named
+                .iter()
+                .filter(|node| self.index_of(&SceneId::Node(node_ref(node))).is_none())
+                .map(|node| format!("{} {}", node.type_name, node.id))
+                .collect();
+            if !missing.is_empty() {
+                return Some(Refusal::NotShown(missing));
+            }
+            if self.target_nodes(named).is_empty() {
+                return Some(Refusal::Says(
+                    "Name the nodes (`nodes`), or select or mark some first".into(),
                 ));
             }
-            "canvas_expand" | "canvas_hide_nodes" | "canvas_show_hidden"
-                if !self.draws_exploration() =>
-            {
-                return Err(AgentRefusal::not_available(
-                    "This canvas shows a query's result whole; expand or hide on a walk from a \
-                     node (graph_show_node_on_canvas)",
-                ));
-            }
-            "canvas_expand" => {
-                let expansion: studio_actions::Expansion =
-                    serde_json::from_value(input.clone()).unwrap_or_default();
-                if !(1..=2).contains(&expansion.depth) {
-                    return Err(AgentRefusal::not_available("`depth` is 1 or 2"));
-                }
-                let plan = self
-                    .exploration
-                    .read(cx)
-                    .plan_expand(&targets(), expansion.relationships.as_deref());
-                if !plan.unknown.is_empty() {
-                    let schema = self.session.read(cx).schema_model();
-                    let theirs: Vec<String> = targets()
-                        .iter()
-                        .flat_map(|node| {
-                            schema
-                                .as_ref()
-                                .map(|schema| {
-                                    schema
-                                        .relationships_of(&node.type_name)
-                                        .iter()
-                                        .map(graph_store::relationship_key)
-                                        .collect::<Vec<_>>()
-                                })
-                                .unwrap_or_default()
-                        })
-                        .collect::<std::collections::BTreeSet<_>>()
-                        .into_iter()
-                        .collect();
-                    return Err(AgentRefusal::not_available(format!(
-                        "None of the nodes has {}. Theirs: {}",
-                        plan.unknown.join(", "),
-                        theirs.join(", ")
-                    )));
-                }
-                if plan.opening.asks() && !expansion.confirm {
-                    return Err(AgentRefusal {
-                        outcome: "needs_confirmation",
-                        says: format!(
-                            "This would open {} nodes and ask for {} reads, past what the \
-                             canvas opens without asking the person. Nothing was opened. Call \
-                             again with confirm: true to open it.",
-                            plan.opening.nodes, plan.opening.reads
-                        ),
-                        json: json!({
-                            "needs_confirmation": {
-                                "nodes": plan.opening.nodes,
-                                "reads": plan.opening.reads,
-                            }
-                        }),
-                    });
-                }
-            }
-            "canvas_show_more" => {
-                let action: ShowMore = serde_json::from_value(input.clone()).unwrap_or_default();
-                if let Some(node) = &action.node
-                    && self.index_of(&SceneId::Node(node_ref(node))).is_none()
-                {
-                    return Err(AgentRefusal::not_available(NOT_DRAWN));
-                }
-                let Some(key) = self.more_key(&action, cx) else {
-                    return Err(AgentRefusal::not_available(
-                        "Name the node and its relationship (`out:WorksAt`), or select a \
-                         relationship or its \"+K more\" first",
-                    ));
-                };
-                if self.index_of(&SceneId::Hub(key)).is_none() {
-                    return Err(AgentRefusal::not_available(
-                        "That relationship is not open on the canvas; open it with \
-                         canvas_expand and `relationships`",
-                    ));
-                }
-            }
-            _ => {}
         }
-        Ok(())
+        let walks = expand.is_some() || hide.is_some() || action.is::<ShowHidden>();
+        if walks && !self.draws_exploration() {
+            return Some(Refusal::NotAWalk);
+        }
+        if let Some(action) = expand {
+            let expansion = &action.expansion;
+            if !(1..=2).contains(&expansion.depth) {
+                return Some(Refusal::Says("`depth` is 1 or 2".into()));
+            }
+            let targets = self.target_nodes(&expansion.nodes);
+            let plan = self
+                .exploration
+                .read(cx)
+                .plan_expand(&targets, expansion.relationships.as_deref());
+            if !plan.unknown.is_empty() {
+                let schema = self.session.read(cx).schema_model();
+                let theirs: Vec<String> = targets
+                    .iter()
+                    .flat_map(|node| {
+                        schema
+                            .as_ref()
+                            .map(|schema| {
+                                schema
+                                    .relationships_of(&node.type_name)
+                                    .iter()
+                                    .map(graph_store::relationship_key)
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default()
+                    })
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                return Some(Refusal::Says(format!(
+                    "None of the nodes has {}. Theirs: {}",
+                    plan.unknown.join(", "),
+                    theirs.join(", ")
+                )));
+            }
+            if plan.opening.asks() && !expansion.confirm {
+                return Some(Refusal::AsksFirst {
+                    nodes: plan.opening.nodes,
+                    reads: plan.opening.reads,
+                    confirms: true,
+                });
+            }
+        }
+        if let Some(action) = action.downcast_ref::<ShowMore>() {
+            if let Some(node) = &action.node
+                && self.index_of(&SceneId::Node(node_ref(node))).is_none()
+            {
+                return Some(Refusal::NotShown(Vec::new()));
+            }
+            let Some(key) = self.more_key(action, cx) else {
+                return Some(Refusal::Says(
+                    "Name the node and its relationship (`out:WorksAt`), or select a \
+                     relationship or its \"+K more\" first"
+                        .into(),
+                ));
+            };
+            if self.index_of(&SceneId::Hub(key)).is_none() {
+                return Some(Refusal::RelationshipClosed);
+            }
+        }
+        None
     }
 }

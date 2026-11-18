@@ -12,21 +12,23 @@
 //! The reads return identifiers and names only (type names, node ids, branch names, commit ids
 //! and tab titles), so an agent reads the graph's data with its own credential.
 //!
-//! Layer 4, with the workspace it reads. The server that speaks MCP is `ui_tool_server`.
+//! Layer 5, in the crate of the server that speaks MCP ([`crate::http`]). The workspace knows
+//! nothing of it: this module reads a window through what every tab and the workspace answer
+//! to anyone (`thing`, `view_kind`, `selected_ids`, `pane_tabs`), and acts through actions.
 
 use std::collections::HashSet;
-use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    App, AsyncApp, Context, EntityId, FocusHandle, Focusable as _, Global, SharedString, Window,
+    App, AsyncApp, Context, EntityId, FocusHandle, Focusable as _, SharedString, Window,
     WindowHandle,
 };
 use serde_json::{Map, Value, json};
 use studio_actions::{Thing, ViewKind};
 use studio_settings::StudioSettings;
-
-use crate::{AgentEdge, AgentGroup, AgentNode, AgentView, ToastKind, Workspace};
+use studio_workspace::{
+    ItemHandle, OutlineEdge, OutlineGroup, OutlineNode, Refusal, ToastKind, ViewOutline, Workspace,
+};
 
 /// The most node ids `studio_selection` names.
 pub const MAX_SELECTED: usize = 200;
@@ -35,9 +37,6 @@ pub const MAX_SELECTED: usize = 200;
 /// (spec 032, The server): the answer travels as text inside a JSON-RPC result, whose escapes
 /// can take more room than the JSON itself, so a tool's own answer keeps well inside it.
 pub const ANSWER_BUDGET: usize = 40 * 1024;
-
-/// How long the window shows "Opened by <agent>" after a tool opened or showed something.
-pub const OPENED_BY_FOR: Duration = Duration::from_secs(4);
 
 /// What a tool needs of the window before its action is dispatched: an available action can
 /// still do nothing, as `NewQueryWithText` does with no graph open (spec 032, "A
@@ -63,8 +62,8 @@ enum Need {
 pub enum On {
     /// The window: the workspace handles the action.
     Workspace,
-    /// The active tab, which must be this view. It takes the keyboard for the dispatch, as a
-    /// click on it would, and gives it back after (spec 032, "The canvas and the tree").
+    /// The active tab, which must be this view. The action is dispatched on the tab itself,
+    /// which need not hold the keyboard for it (spec 032, Focus).
     View(ViewKind),
 }
 
@@ -78,9 +77,6 @@ pub struct UiTool {
     /// The action it dispatches, by its registered name.
     pub action: &'static str,
     needs: &'static [Need],
-    /// The action gives what it shows the keyboard (a panel shown by its key does), which a
-    /// tool must not: focus goes back where the person had it (spec 032, Focus).
-    keeps_focus: bool,
     pub on: On,
     /// The tool takes an optional `node`, which the view selects, as a click does, before the
     /// action runs on what is selected.
@@ -88,6 +84,24 @@ pub struct UiTool {
     /// The action reads (an expansion): the answer waits for the view to have read and drawn
     /// it, at most [`WAIT`].
     pub waits: bool,
+    /// An expansion of neighbourhoods: its answer is `expanded` when nodes were added, and it
+    /// alone says that a second level asks first ([`ViewOutline::stopped`]).
+    pub expands: bool,
+    /// Called with a filter, its table opens as a tab of its own beside the type's, which is
+    /// left as the person has it (spec 032, Focus).
+    pub apart_when_filtered: bool,
+}
+
+impl UiTool {
+    const fn expanding(mut self) -> Self {
+        self.expands = true;
+        self
+    }
+
+    const fn apart_when_filtered(mut self) -> Self {
+        self.apart_when_filtered = true;
+        self
+    }
 }
 
 /// How long a tool's answer waits for what its action reads.
@@ -98,10 +112,11 @@ const fn workspace(name: &'static str, action: &'static str, needs: &'static [Ne
         name,
         action,
         needs,
-        keeps_focus: false,
         on: On::Workspace,
         node: false,
         waits: false,
+        expands: false,
+        apart_when_filtered: false,
     }
 }
 
@@ -116,10 +131,11 @@ const fn view(
         name,
         action,
         needs: &[],
-        keeps_focus: true,
         on: On::View(kind),
         node,
         waits,
+        expands: false,
+        apart_when_filtered: false,
     }
 }
 
@@ -155,7 +171,8 @@ pub static ALLOWED: &[UiTool] = &[
         "graph_open_type",
         "studio_graph::OpenType",
         &[Need::Session, Need::Type("type_name")],
-    ),
+    )
+    .apart_when_filtered(),
     workspace(
         "graph_open_node",
         "studio_graph::OpenNode",
@@ -207,14 +224,11 @@ pub static ALLOWED: &[UiTool] = &[
         "studio_graph::NewQueryWithText",
         &[Need::Session],
     ),
-    UiTool {
-        keeps_focus: true,
-        ..workspace(
-            "workspace_activate_panel",
-            "studio::ActivatePanel",
-            &[Need::Panel("id")],
-        )
-    },
+    workspace(
+        "workspace_activate_panel",
+        "studio::ActivatePanel",
+        &[Need::Panel("id")],
+    ),
     // The canvas (spec 032, "The canvas and the tree").
     canvas(
         "canvas_select_node",
@@ -227,7 +241,8 @@ pub static ALLOWED: &[UiTool] = &[
         "studio_canvas::ExpandNeighbourhood",
         false,
         true,
-    ),
+    )
+    .expanding(),
     canvas(
         "canvas_collapse",
         "studio_canvas::CollapseNodes",
@@ -377,7 +392,8 @@ pub static ALLOWED: &[UiTool] = &[
         "studio_tree::ExpandNeighbourhood",
         false,
         true,
-    ),
+    )
+    .expanding(),
     tree("tree_collapse", "studio_tree::CollapseNodes", false, false),
     tree("tree_select_next", "studio_tree::SelectNext", true, false),
     tree(
@@ -848,11 +864,17 @@ async fn target_window(
         let deadline = cx.background_executor().now() + WAIT;
         loop {
             // No redraw is asked for: a view that changed notifies, and is drawn (drawing.md).
-            let busy = handle.update(cx, |workspace, _, cx| {
+            // In a window the system is not drawing (minimized, covered, on another Space) the
+            // view would wait for a draw that does not come, so it is asked to do now what it
+            // leaves for one.
+            let busy = handle.update(cx, |workspace, window, cx| {
                 workspace
                     .all_items()
                     .find(|tab| tab.item_id() == item)
-                    .is_some_and(|tab| tab.agent_busy(cx))
+                    .is_some_and(|tab| {
+                        tab.catch_up(window, cx);
+                        tab.settling(cx)
+                    })
             });
             match busy {
                 Err(_) => return Answer::window_closed(id),
@@ -870,9 +892,8 @@ async fn target_window(
         } else {
             changed(id, tool, &before, workspace, window, cx)
         };
-        if tool.keeps_focus {
-            keep_focus(&before, workspace, window, cx);
-        }
+        // A call never takes the keyboard from where the person has it (spec 032, Focus).
+        keep_focus(&before, workspace, window, cx);
         if matches!(
             answer.outcome,
             "opened" | "shown" | "panel_shown" | "changed" | "expanded" | "cap_reached"
@@ -906,24 +927,43 @@ fn workspace_window(id: u64, cx: &App) -> Option<WindowHandle<Workspace>> {
 /// The window's front, as a call's result compares it: the active tab, every tab, and the
 /// panels shown.
 struct Front {
-    /// What had the keyboard just before the dispatch, and the panel it was in, if any.
+    /// What had the keyboard just before the dispatch, and the panel or the tab it was in, if
+    /// any.
     focus: Option<FocusHandle>,
     focus_panel: Option<SharedString>,
+    focus_tab: Option<EntityId>,
     active: Option<EntityId>,
     items: HashSet<EntityId>,
     panels: Vec<SharedString>,
     /// A view tool's tab, and what an agent read of it before the call.
     view_item: Option<EntityId>,
-    view: Option<AgentView>,
+    view: Option<ViewOutline>,
 }
 
 /// How often a call that waits looks at its view again.
 const POLL: Duration = Duration::from_millis(40);
 
+/// The tab in front of each pane: the tabs the window draws.
+fn front_tabs(workspace: &Workspace) -> impl Iterator<Item = &dyn ItemHandle> {
+    workspace.pane_tabs().into_iter().flat_map(|pane| {
+        pane.tabs
+            .into_iter()
+            .filter(|tab| tab.active)
+            .map(|tab| tab.item)
+    })
+}
+
 fn front(workspace: &Workspace, window: &Window, cx: &App) -> Front {
     Front {
-        focus: window.focused(cx),
+        // The bare window holding the keyboard is the keyboard nowhere in particular: what a
+        // call opens may take it, as when nothing holds it.
+        focus: window
+            .focused(cx)
+            .filter(|focus| *focus != workspace.focus_handle(cx)),
         focus_panel: workspace.panel_with_focus(window, cx),
+        focus_tab: front_tabs(workspace)
+            .find(|tab| tab.focus_handle(cx).contains_focused(window, cx))
+            .map(|tab| tab.item_id()),
         active: workspace.active_item().map(|item| item.item_id()),
         items: workspace.all_items().map(|item| item.item_id()).collect(),
         panels: workspace.shown_panels(),
@@ -952,8 +992,8 @@ fn dispatch(
             return Err(not_available(why));
         }
     }
-    // A view tool acts on the active tab, which must be that view, and on the node named.
-    let mut view_tab = None;
+    // A view tool acts on the active tab, which must be that view.
+    let mut view_item = None;
     if let On::View(kind) = tool.on {
         let Some(item) = workspace.active_item() else {
             return Err(not_available(no_view(kind, None)));
@@ -961,37 +1001,7 @@ fn dispatch(
         if !shows(item, kind, cx) {
             return Err(not_available(no_view(kind, Some(&describe(item, cx)))));
         }
-        if let Err(refusal) = item.agent_check(tool.name, input, cx) {
-            let mut answer = Answer::new(
-                refusal.outcome,
-                refusal.says,
-                refusal.json,
-                refusal.outcome != "needs_confirmation",
-            );
-            answer.json["window"] = json!(id);
-            answer.json["action"] = json!(tool.action);
-            return Err(answer);
-        }
-        let named = tool
-            .node
-            .then(|| input.get("node").and_then(node_id))
-            .flatten();
-        if let Some((type_name, node)) = &named {
-            let shown = item.agent_view(cx).is_some_and(|view| {
-                view.nodes
-                    .iter()
-                    .any(|n| n.type_name == *type_name && n.id == *node)
-            });
-            if !shown {
-                return Err(not_available(not_shown(kind)));
-            }
-        }
-        view_tab = Some((
-            item.item_id(),
-            item.focus_handle(cx),
-            item.agent_view(cx),
-            named,
-        ));
+        view_item = Some((kind, item));
     }
     let mut data = input.as_object().cloned().unwrap_or_default();
     data.remove("window");
@@ -1010,7 +1020,7 @@ fn dispatch(
     }
     // A filtered table opens as a tab of its own, which the person can close, and the type's
     // open table is left as the person has it (spec 032, Focus).
-    if tool.name == "graph_open_type"
+    if tool.apart_when_filtered
         && data
             .get("filter_id")
             .is_some_and(|filter| !filter.is_null())
@@ -1031,45 +1041,86 @@ fn dispatch(
             ));
         }
     };
-    let mut before = front(workspace, window, cx);
-    match &view_tab {
-        // The view takes the keyboard, as a click on it would; `keep_focus` gives it back.
-        Some((_, focus, _, _)) => window.focus(focus, cx),
-        // With nothing focused an action reaches only global handlers, so the workspace takes
-        // focus first, as a click in the window would. Focus the person has is left where it
-        // is.
-        None if window.focused(cx).is_none() => {
-            let focus = workspace.focus_handle(cx);
-            window.focus(&focus, cx);
+    // The view says whether it would act on the action as built, and on the node named.
+    let mut view_tab = None;
+    if let Some((kind, item)) = view_item {
+        let named = tool
+            .node
+            .then(|| input.get("node").and_then(node_id))
+            .flatten();
+        let on = named
+            .as_ref()
+            .map(|(type_name, id)| studio_actions::NodeId {
+                type_name: type_name.clone(),
+                id: id.clone(),
+            });
+        if let Some(refusal) = item.refuses(action.as_ref(), on.as_ref(), cx) {
+            let mut answer = refused(kind, refusal);
+            answer.json["window"] = json!(id);
+            answer.json["action"] = json!(tool.action);
+            return Err(answer);
         }
-        None => {}
+        if let Some((type_name, node)) = &named {
+            let shown = item.outline(cx).is_some_and(|view| {
+                view.nodes
+                    .iter()
+                    .any(|n| n.type_name == *type_name && n.id == *node)
+            });
+            if !shown {
+                return Err(not_available(not_shown(kind)));
+            }
+        }
+        view_tab = Some((
+            item.item_id(),
+            item.focus_handle(cx),
+            item.outline(cx),
+            named,
+        ));
     }
-    if !window.is_action_available(action.as_ref(), cx) {
-        if let Some(focus) = &before.focus {
-            window.focus(focus, cx);
-        }
+    let mut before = front(workspace, window, cx);
+    // With nothing focused an action reaches only global handlers, so the workspace takes
+    // focus first, as a click in the window would. Focus the person has is left where it is:
+    // a view's action is dispatched on its tab, which need not hold the keyboard for it.
+    if before.focus.is_none() {
+        let focus = workspace.focus_handle(cx);
+        window.focus(&focus, cx);
+    }
+    let available = match &view_tab {
+        Some((_, focus, _, _)) => window.is_action_available_in(action.as_ref(), focus),
+        None => window.is_action_available(action.as_ref(), cx),
+    };
+    if !available {
         return Err(not_available(format!(
             "{} is not available in this window now.",
             tool.name
         )));
     }
-    if let Some((item, _, view, named)) = view_tab {
-        before.view_item = Some(item);
-        before.view = view;
-        // The node named is selected first, as a click selects it.
-        if let (Some((type_name, node)), On::View(kind)) = (named, tool.on) {
+    let Some((item, focus, view, named)) = view_tab else {
+        window.dispatch_action(action, cx);
+        return Ok(before);
+    };
+    before.view_item = Some(item);
+    before.view = view;
+    // The node named is selected first, as a click selects it.
+    let select = match (named, tool.on) {
+        (Some((type_name, node)), On::View(kind)) => {
             let select = match kind {
                 ViewKind::Tree => "studio_tree::SelectNode",
                 _ => "studio_canvas::SelectNode",
             };
-            if let Ok(select) =
-                cx.build_action(select, Some(json!({ "type_name": type_name, "id": node })))
-            {
-                window.dispatch_action(select, cx);
-            }
+            cx.build_action(select, Some(json!({ "type_name": type_name, "id": node })))
+                .ok()
         }
-    }
-    window.dispatch_action(action, cx);
+        _ => None,
+    };
+    // On the tab, not on what has the keyboard, and once this update's effects are flushed,
+    // as `Window::dispatch_action` runs an action: the tab's handlers find the workspace free.
+    window.defer(cx, move |window, cx| {
+        if let Some(select) = select {
+            focus.dispatch_action(select.as_ref(), window, cx);
+        }
+        focus.dispatch_action(action.as_ref(), window, cx);
+    });
     Ok(before)
 }
 
@@ -1082,9 +1133,9 @@ fn node_id(value: &Value) -> Option<(String, String)> {
 }
 
 /// Whether `item` is the view `kind`: a query's result picture is a canvas too.
-fn shows(item: &dyn crate::ItemHandle, kind: ViewKind, cx: &App) -> bool {
+fn shows(item: &dyn ItemHandle, kind: ViewKind, cx: &App) -> bool {
     match kind {
-        ViewKind::Canvas => item.agent_view(cx).is_some_and(|_| {
+        ViewKind::Canvas => item.outline(cx).is_some_and(|_| {
             item.view_kind(cx)
                 .is_none_or(|view| view == ViewKind::Canvas)
         }),
@@ -1111,6 +1162,63 @@ fn no_view(kind: ViewKind, tab: Option<&Value>) -> String {
     }
 }
 
+/// A view's refusal ([`Refusal`]) as an agent reads it: the view states the fact, and the words
+/// here say how a tool gets past it. An expansion that asks first is not an error: the agent
+/// answers it by calling again.
+fn refused(kind: ViewKind, refusal: Refusal) -> Answer {
+    let tree = kind == ViewKind::Tree;
+    match refusal {
+        Refusal::Says(says) => Answer::new("not_available", says, json!({}), true),
+        Refusal::NotShown(nodes) => {
+            let mut says = not_shown(kind);
+            if !nodes.is_empty() {
+                says.push_str(": ");
+                says.push_str(&nodes.join(", "));
+            }
+            Answer::new("not_available", says, json!({}), true)
+        }
+        Refusal::NotAWalk => Answer::new(
+            "not_available",
+            "This canvas shows a query's result whole; expand or hide on a walk from a node \
+             (graph_show_node_on_canvas)",
+            json!({}),
+            true,
+        ),
+        Refusal::RelationshipClosed => Answer::new(
+            "not_available",
+            "That relationship is not open on the canvas; open it with canvas_expand and \
+             `relationships`",
+            json!({}),
+            true,
+        ),
+        Refusal::AsksFirst {
+            nodes,
+            reads,
+            confirms,
+        } => {
+            let (what, view) = if tree {
+                ("rows", "tree")
+            } else {
+                ("nodes", "canvas")
+            };
+            let again = if confirms {
+                "Call again with confirm: true to open it."
+            } else {
+                "Use tree_expand with the node and confirm: true to open it."
+            };
+            Answer::new(
+                "needs_confirmation",
+                format!(
+                    "This would open {nodes} {what} and ask for {reads} reads, past what the \
+                     {view} opens without asking the person. Nothing was opened. {again}"
+                ),
+                json!({ "needs_confirmation": { "nodes": nodes, "reads": reads } }),
+                false,
+            )
+        }
+    }
+}
+
 /// Why a node named is not acted on: the view does not show it.
 fn not_shown(kind: ViewKind) -> String {
     match kind {
@@ -1121,7 +1229,7 @@ fn not_shown(kind: ViewKind) -> String {
     }
 }
 
-fn node_json(node: &AgentNode) -> Value {
+fn node_json(node: &OutlineNode) -> Value {
     json!({ "type_name": node.type_name, "id": node.id, "label": node.label })
 }
 
@@ -1146,22 +1254,22 @@ fn view_changed(id: u64, tool: &UiTool, before: &Front, workspace: &Workspace, c
     };
     let tab = describe(item, cx);
     let old = before.view.clone().unwrap_or_default();
-    let new = item.agent_view(cx).unwrap_or_default();
-    let key = |node: &AgentNode| (node.type_name.clone(), node.id.clone());
+    let new = item.outline(cx).unwrap_or_default();
+    let key = |node: &OutlineNode| (node.type_name.clone(), node.id.clone());
     let old_nodes: HashSet<(String, String)> = old.nodes.iter().map(key).collect();
     let new_nodes: HashSet<(String, String)> = new.nodes.iter().map(key).collect();
-    let added: Vec<&AgentNode> = new
+    let added: Vec<&OutlineNode> = new
         .nodes
         .iter()
         .filter(|node| !old_nodes.contains(&key(node)))
         .collect();
-    let removed: Vec<&AgentNode> = old
+    let removed: Vec<&OutlineNode> = old
         .nodes
         .iter()
         .filter(|node| !new_nodes.contains(&key(node)))
         .collect();
-    let old_edges: HashSet<&AgentEdge> = old.edges.iter().collect();
-    let edges_added: Vec<&AgentEdge> = new
+    let old_edges: HashSet<&OutlineEdge> = old.edges.iter().collect();
+    let edges_added: Vec<&OutlineEdge> = new
         .edges
         .iter()
         .filter(|edge| !old_edges.contains(edge))
@@ -1171,7 +1279,7 @@ fn view_changed(id: u64, tool: &UiTool, before: &Front, workspace: &Workspace, c
         .iter()
         .map(|group| (&group.node, &group.relationship))
         .collect();
-    let closed: Vec<&AgentGroup> = new
+    let closed: Vec<&OutlineGroup> = new
         .groups
         .iter()
         .filter(|group| {
@@ -1188,15 +1296,18 @@ fn view_changed(id: u64, tool: &UiTool, before: &Front, workspace: &Workspace, c
         &closed,
         |group| json!({ "node": pair_json(&group.node), "relationship": group.relationship, "other_type": group.other_type, "count": group.count }),
     );
-    let still_reading = item.agent_busy(cx);
-    let expands = tool.name.ends_with("_expand");
+    let still_reading = item.settling(cx);
+    let expands = tool.expands;
+    // A second level that asks first is the answer of the expansion that stopped at it. The
+    // walk goes on holding it until the next expansion, and no other call repeats it.
+    let stopped = new.stopped.filter(|_| expands);
     let changed = !added.is_empty()
         || !removed.is_empty()
         || new.selected != old.selected
         || new.facts != old.facts
         || new.groups != old.groups;
     let outcome = match () {
-        _ if expands && new.stopped.is_some() => "needs_confirmation",
+        _ if stopped.is_some() => "needs_confirmation",
         _ if new.capped && (!old.capped || !added.is_empty()) => "cap_reached",
         _ if expands && !added.is_empty() => "expanded",
         _ if changed => "changed",
@@ -1216,7 +1327,7 @@ fn view_changed(id: u64, tool: &UiTool, before: &Front, workspace: &Workspace, c
     if outcome == "cap_reached" {
         says.push_str("; the node cap was reached, so the canvas stopped there");
     }
-    if let Some((nodes, reads)) = new.stopped {
+    if let Some((nodes, reads)) = stopped {
         says.push_str(&format!(
             "; the second level would open {nodes} nodes with {reads} reads: call again with \
              confirm: true to open it"
@@ -1239,7 +1350,7 @@ fn view_changed(id: u64, tool: &UiTool, before: &Front, workspace: &Workspace, c
         "cap_reached": new.capped,
         "still_reading": still_reading,
     });
-    if let Some((nodes, reads)) = new.stopped {
+    if let Some((nodes, reads)) = stopped {
         json["needs_confirmation"] = json!({ "nodes": nodes, "reads": reads });
     }
     for (key, value) in &new.facts {
@@ -1277,9 +1388,9 @@ fn view_read(id: u64, kind: ViewKind, workspace: &Workspace, cx: &App) -> Answer
         );
     }
     let tab = describe(item, cx);
-    let view = item.agent_view(cx).unwrap_or_default();
+    let view = item.outline(cx).unwrap_or_default();
     let make = |limit: usize| {
-        let nodes: Vec<&AgentNode> = view.nodes.iter().take(limit).collect();
+        let nodes: Vec<&OutlineNode> = view.nodes.iter().take(limit).collect();
         let at: std::collections::HashMap<(&str, &str), usize> = nodes
             .iter()
             .enumerate()
@@ -1412,10 +1523,11 @@ fn check(need: Need, input: &Value, workspace: &Workspace, cx: &App) -> Result<(
     }
 }
 
-/// After an action that gives what it shows the keyboard: the person keeps it where they had
-/// it, unless that was in a panel the action took the place of. Then the panel shown keeps it,
-/// or, when it took none, the active tab takes it, as when a dock hides: keys must not go on
-/// driving a panel nobody sees.
+/// A call leaves the keyboard where the person had it (spec 032, Focus): an action that gives
+/// what it opens or shows the keyboard, as opening a tab and showing a panel by its key do, has
+/// it taken back. Unless the person's place is gone, a panel the action hid or a tab it put
+/// another in front of: then what took the keyboard keeps it, or the active tab takes it, since
+/// keys must not go on driving something nobody sees.
 fn keep_focus(
     before: &Front,
     workspace: &mut Workspace,
@@ -1430,7 +1542,10 @@ fn keep_focus(
         .focus_panel
         .as_ref()
         .is_some_and(|panel| !workspace.shown_panels().contains(panel));
-    if !hidden {
+    let covered = before
+        .focus_tab
+        .is_some_and(|tab| !front_tabs(workspace).any(|front| front.item_id() == tab));
+    if !hidden && !covered {
         if now.as_ref() != Some(focus) {
             window.focus(focus, cx);
         }
@@ -1457,7 +1572,7 @@ fn changed(
             // already holds is said with it (spec 032).
             if let Some(Thing::Node { type_name, id }) = item.thing(cx) {
                 let label = item
-                    .agent_view(cx)
+                    .outline(cx)
                     .and_then(|view| view.root)
                     .filter(|root| root.type_name == type_name && root.id == id)
                     .and_then(|root| root.label)
@@ -1533,7 +1648,7 @@ fn thing_json(thing: &Thing) -> Value {
 }
 
 /// A tab as the tools describe it: what it shows, how, its title and the commit it holds.
-fn describe(item: &dyn crate::ItemHandle, cx: &App) -> Value {
+fn describe(item: &dyn ItemHandle, cx: &App) -> Value {
     json!({
         "thing": item.thing(cx).as_ref().map(thing_json),
         "view": item.view_kind(cx).map(ViewKind::label),
@@ -1585,25 +1700,21 @@ fn windows(target: Target, cx: &mut App) -> Answer {
 
 /// `studio_tabs`: the window's panes and tabs.
 fn tabs(id: u64, workspace: &Workspace, _window: &Window, cx: &App) -> Answer {
-    let active_pane = workspace.active_pane;
     let panes: Vec<Value> = workspace
-        .center
-        .panes()
+        .pane_tabs()
         .into_iter()
-        .filter_map(|pane_id| workspace.pane(pane_id))
         .map(|pane| {
             let tabs: Vec<Value> = pane
-                .items
+                .tabs
                 .iter()
-                .enumerate()
-                .map(|(index, item)| {
-                    let mut tab = describe(item.as_ref(), cx);
-                    tab["active"] = json!(index == pane.active);
-                    tab["preview"] = json!(pane.is_preview(index));
-                    tab
+                .map(|tab| {
+                    let mut described = describe(tab.item, cx);
+                    described["active"] = json!(tab.active);
+                    described["preview"] = json!(tab.preview);
+                    described
                 })
                 .collect();
-            json!({ "active": pane.id == active_pane, "tabs": tabs })
+            json!({ "active": pane.active, "tabs": tabs })
         })
         .collect();
     let count: usize = panes
@@ -1636,7 +1747,7 @@ fn selection(id: u64, workspace: &Workspace, cx: &App) -> Answer {
     let mut tab = describe(item, cx);
     // On a canvas or a tree, how much more there is to read with studio_canvas or
     // studio_tree (spec 032).
-    if let Some(view) = item.agent_view(cx) {
+    if let Some(view) = item.outline(cx) {
         tab["drawn"] = json!({
             "nodes": view.nodes.len(),
             "edges": view.edges.len(),
@@ -1687,110 +1798,20 @@ fn selection(id: u64, workspace: &Workspace, cx: &App) -> Answer {
     Answer::new("read", says, json, false)
 }
 
-/// The tool server's address, which a conversation's agent is given (spec 032, The panel's
-/// agent): `studio` sets it when the server listens, so the agent panel reaches the server
-/// without depending on it.
-#[derive(Clone)]
-pub struct UiToolEndpoint(Rc<MakeEntry>);
-
-/// Makes a conversation's entry for its window, by the window's id.
-type MakeEntry = dyn Fn(u64, &mut App) -> Option<UiToolEntry>;
-
-impl Global for UiToolEndpoint {}
-
-impl UiToolEndpoint {
-    pub fn new(entry: impl Fn(u64, &mut App) -> Option<UiToolEntry> + 'static) -> Self {
-        Self(Rc::new(entry))
-    }
-
-    /// A new entry for a conversation in the window `window`, with a token of its own bound to
-    /// that window; `None` while no server listens.
-    pub fn entry_for(window: u64, cx: &mut App) -> Option<UiToolEntry> {
-        let endpoint = cx.try_global::<Self>()?.clone();
-        (endpoint.0)(window, cx)
-    }
-}
-
-/// A conversation's way to the tool server: its address and a token bound to its window. The
-/// token stops working when the entry is dropped, as the conversation ends.
-pub struct UiToolEntry {
-    pub url: String,
-    pub token: String,
-    revoke: Option<Box<dyn FnOnce()>>,
-}
-
-impl UiToolEntry {
-    pub fn new(url: String, token: String, revoke: impl FnOnce() + 'static) -> Self {
-        Self {
-            url,
-            token,
-            revoke: Some(Box::new(revoke)),
-        }
-    }
-}
-
-impl std::fmt::Debug for UiToolEntry {
-    /// The token is never written out.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("UiToolEntry")
-            .field("url", &self.url)
-            .finish_non_exhaustive()
-    }
-}
-
-impl Drop for UiToolEntry {
-    fn drop(&mut self) {
-        if let Some(revoke) = self.revoke.take() {
-            revoke();
-        }
-    }
-}
-
-/// What every conversation's MCP server name starts with. The rest is chosen at random per
-/// conversation ([`server_name`]), so a server of the person's own config, which the agent also
-/// loads, cannot take its name.
-pub const SERVER_PREFIX: &str = "studio_";
-
-/// A conversation's server name from six random bytes: [`SERVER_PREFIX`] and six lowercase
-/// letters or digits.
-pub fn server_name(random: [u8; 6]) -> String {
-    const ALPHABET: &[u8; 36] = b"abcdefghijklmnopqrstuvwxyz0123456789";
-    let suffix: String = random
-        .iter()
-        .map(|byte| ALPHABET[usize::from(*byte) % ALPHABET.len()] as char)
-        .collect();
-    format!("{SERVER_PREFIX}{suffix}")
-}
-
-/// The tool a call's title names when it is a call to the server named `server`: the adapters
-/// title one `mcp__<server>__<tool>` (Claude) or `mcp.<server>.<tool>` (Codex).
-pub fn studio_call<'a>(title: &'a str, server: &str) -> Option<&'a str> {
-    let tool = title
-        .strip_prefix("mcp__")
-        .and_then(|rest| rest.strip_prefix(server))
-        .and_then(|rest| rest.strip_prefix("__"))
-        .or_else(|| {
-            title
-                .strip_prefix("mcp.")
-                .and_then(|rest| rest.strip_prefix(server))
-                .and_then(|rest| rest.strip_prefix('.'))
-        })?;
-    let tool = tool.split_whitespace().next().unwrap_or(tool);
-    is_tool(tool).then_some(tool)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Item, ItemEvent, SelectedIds};
     use gpui::{
         AppContext as _, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement as _,
         IntoElement, Render, TestAppContext, div,
     };
     use graph_store::{Connection, GraphSession, ServerEntry, ServerSource};
     use http_client::{AsyncBody, FakeHttpClient, Response};
+    use std::cell::RefCell;
+    use std::rc::Rc;
     use studio_actions::ViewLink;
     use studio_settings::StudioSettings;
+    use studio_workspace::{Item, ItemEvent, OPENED_BY_FOR, SelectedIds};
 
     /// What the never-a-tool test refuses: actions that write, answer the agent's own
     /// requests, open a link or a setting, sign in or out, update or quit, or move focus.
@@ -2132,8 +2153,10 @@ mod tests {
         assert_eq!(answer.json["tab"]["view"], "Map");
         handle
             .read_with(cx, |workspace, _| {
-                let pane = workspace.pane(workspace.active_pane).unwrap();
-                assert!(pane.is_preview(pane.active), "opened as the preview");
+                let panes = workspace.pane_tabs();
+                let pane = panes.iter().find(|pane| pane.active).unwrap();
+                let front = pane.tabs.iter().find(|tab| tab.active).unwrap();
+                assert!(front.preview, "opened as the preview");
                 assert_eq!(
                     workspace.opened_by().map(|agent| agent.as_ref()),
                     Some("Claude Code")
@@ -2256,6 +2279,108 @@ mod tests {
         cx.run_until_parked();
     }
 
+    /// A stand-in canvas whose zoom records what held the keyboard when it ran.
+    struct Walk {
+        focus_handle: FocusHandle,
+        held: Rc<RefCell<Vec<Option<FocusHandle>>>>,
+    }
+
+    impl EventEmitter<ItemEvent> for Walk {}
+
+    impl Focusable for Walk {
+        fn focus_handle(&self, _: &App) -> FocusHandle {
+            self.focus_handle.clone()
+        }
+    }
+
+    impl Render for Walk {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let held = self.held.clone();
+            div().track_focus(&self.focus_handle).on_action(
+                move |_: &studio_actions::canvas::ZoomIn, window, cx| {
+                    held.borrow_mut().push(window.focused(cx));
+                },
+            )
+        }
+    }
+
+    impl Item for Walk {
+        fn tab_title(&self, _: &App) -> SharedString {
+            "Canvas".into()
+        }
+
+        fn views(&self, _: &App) -> Vec<ViewLink> {
+            vec![ViewLink::current(ViewKind::Canvas)]
+        }
+
+        fn outline(&self, _: &App) -> Option<ViewOutline> {
+            Some(ViewOutline::default())
+        }
+    }
+
+    /// A view tool's action runs on its tab while the keyboard stays where the person has it:
+    /// the tab took the keyboard for the call, up to the 15 s a call waits, and what the
+    /// person typed meanwhile drove the canvas (`r` reset its layout, ⌫ collapsed a node).
+    #[gpui::test]
+    async fn a_view_tool_acts_on_its_tab_without_the_keyboard(cx: &mut TestAppContext) {
+        let handle = window(cx);
+        let id = handle.window_id().as_u64();
+        let held: Rc<RefCell<Vec<Option<FocusHandle>>>> = Rc::default();
+        let person = handle
+            .update(cx, |workspace, window, cx| {
+                let held = held.clone();
+                workspace.open_item("walk", window, cx, |_, cx| Walk {
+                    focus_handle: cx.focus_handle(),
+                    held,
+                });
+                // The keyboard is not on the tab: here, on the window itself.
+                let person = workspace.focus_handle(cx);
+                window.focus(&person, cx);
+                person
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let answer = run(cx, Target::Any, "canvas_zoom_in", json!({ "window": id })).await;
+        assert!(!answer.is_error, "{answer:?}");
+        assert_eq!(
+            *held.borrow(),
+            [Some(person.clone())],
+            "the tab's handler ran once, with the keyboard where the person had it"
+        );
+        let focused = handle
+            .update(cx, |_, window, cx| window.focused(cx))
+            .unwrap();
+        assert_eq!(focused, Some(person));
+    }
+
+    /// With the keyboard nowhere in particular (on the bare window, as after the last tab
+    /// closed), the tab a tool opens takes it, as a tab the person opens does.
+    #[gpui::test]
+    async fn a_tab_opened_with_the_keyboard_nowhere_takes_it(cx: &mut TestAppContext) {
+        let handle = window(cx);
+        let id = handle.window_id().as_u64();
+        let session = session(cx);
+        handle
+            .update(cx, |workspace, window, cx| {
+                workspace.set_session(session, window, cx);
+                let bare = workspace.focus_handle(cx);
+                window.focus(&bare, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let answer = run(cx, Target::Any, "graph_open_map", json!({ "window": id })).await;
+        assert_eq!(answer.outcome, "opened", "{answer:?}");
+        let (focused, tab) = handle
+            .update(cx, |workspace, window, cx| {
+                let tab = workspace.active_item().map(|item| item.focus_handle(cx));
+                (window.focused(cx), tab)
+            })
+            .unwrap();
+        assert!(tab.is_some());
+        assert_eq!(focused, tab, "the tab opened has the keyboard");
+    }
+
     /// A call to a window that has closed, or is another conversation's, is refused.
     #[gpui::test]
     async fn a_closed_window_or_another_conversations_is_refused(cx: &mut TestAppContext) {
@@ -2283,33 +2408,5 @@ mod tests {
         assert!(closed.is_error);
         let none = run(cx, Target::Bound(id), "studio_windows", json!({})).await;
         assert_eq!(none.json["windows"], json!([]));
-    }
-
-    #[test]
-    fn a_studio_call_is_known_by_either_title_and_its_own_name_only() {
-        let server = server_name([0, 1, 25, 26, 35, 36]);
-        assert_eq!(server, "studio_abz09a");
-        let server = server_name([7, 4, 11, 11, 14, 35]);
-        assert_eq!(server, "studio_hello9");
-        assert_eq!(
-            studio_call("mcp__studio_hello9__graph_open_type", &server),
-            Some("graph_open_type")
-        );
-        assert_eq!(
-            studio_call("mcp.studio_hello9.studio_windows", &server),
-            Some("studio_windows")
-        );
-        assert_eq!(
-            studio_call("mcp__studio_hello9__run_query", &server),
-            None,
-            "not a tool"
-        );
-        // A server of the person's own config named `studio`, or another conversation's.
-        assert_eq!(studio_call("mcp__studio__graph_open_type", &server), None);
-        assert_eq!(studio_call("mcp.studio.graph_open_type", &server), None);
-        assert_eq!(
-            studio_call("mcp__studio_hello99__graph_open_type", &server),
-            None
-        );
     }
 }

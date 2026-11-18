@@ -1008,9 +1008,9 @@ impl Focusable for OntologyPage {
 }
 
 impl Item for OntologyPage {
-    /// What an agent reads of the map (spec 032): the type in focus (none: the domains), how
-    /// far Back goes, and what is pointed at. Types, not nodes, so no node is listed.
-    fn agent_view(&self, _cx: &App) -> Option<studio_workspace::AgentView> {
+    /// The map's outline: the type in focus (none: the domains), how far Back goes, and what
+    /// is pointed at. Types, not nodes, so no node is listed.
+    fn outline(&self, _cx: &App) -> Option<studio_workspace::ViewOutline> {
         let mut facts = serde_json::Map::new();
         facts.insert("focus".into(), serde_json::json!(self.focus));
         facts.insert("back".into(), serde_json::json!(self.back.len()));
@@ -1024,7 +1024,7 @@ impl Item for OntologyPage {
                 None => serde_json::Value::Null,
             },
         );
-        Some(studio_workspace::AgentView {
+        Some(studio_workspace::ViewOutline {
             facts,
             ..Default::default()
         })

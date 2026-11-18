@@ -38,6 +38,7 @@ use crate::gateway::{Gateway, GatewayEvent, OnOutcome, Seen};
 use crate::gateway_rules::{Creates, Sandbox, WriteKind, WriteSummary};
 use crate::host::{AgentLaunch, HostCommand, HostEvent, Opened, SessionLaunch};
 use crate::sessions::{AgentSessions, Live, SessionRecord};
+use crate::ui_tools::{StudioServer, studio_call};
 
 /// Presets offered when no agent is set: the ACP crate's own preset commands.
 pub const PRESETS: &[(&str, &[&str])] = &[
@@ -821,7 +822,7 @@ impl Prepared {
         let mut random = [0u8; 6];
         getrandom::fill(&mut random)
             .map_err(|error| format!("Studio could not choose a name for its tools: {error}"))?;
-        let server = ui_tools.then(|| studio_workspace::ui_tools::server_name(random));
+        let server = ui_tools.then(|| crate::ui_tools::server_name(random));
         std::fs::create_dir_all(cwd)
             .map_err(|error| format!("Studio could not create {}: {error}", cwd.display()))?;
         let gateway = Gateway::bind().and_then(|gateway| {
@@ -935,7 +936,7 @@ pub struct AgentPanel {
     window_id: u64,
     /// The running agent's way to Studio's UI tools; its token stops working when the agent
     /// stops ([`Self::stop_host`]).
-    ui_tools: Option<studio_workspace::ui_tools::UiToolEntry>,
+    ui_tools: Option<crate::ui_tools::UiToolEntry>,
     /// The name Studio's UI tool server was passed under in the session's request, once the
     /// host has said it was ([`HostEvent::Ready`]): only calls to it are allowed unasked.
     ui_tools_server: Option<String>,
@@ -947,18 +948,17 @@ const STUDIO_CALL: &str = "Studio · ";
 /// A tool call's title as the thread shows it: a call to Studio's own UI tools, which the
 /// adapters title `mcp__<server>__<tool>` or `mcp.<server>.<tool>` for the conversation's
 /// `server`, as "Studio · <tool>".
-fn shown_title(title: String, server: Option<&str>) -> String {
-    match server.and_then(|server| studio_workspace::ui_tools::studio_call(&title, server)) {
+fn shown_title(title: String, server: Option<StudioServer<'_>>) -> String {
+    match server.and_then(|server| studio_call(&title, server)) {
         Some(tool) => format!("{STUDIO_CALL}{tool}"),
         None => title,
     }
 }
 
 /// Whether the thread's title is a call to Studio's UI tools still waiting for its words.
-fn is_studio_call(title: &str, server: Option<&str>) -> bool {
+fn is_studio_call(title: &str, server: Option<StudioServer<'_>>) -> bool {
     title.starts_with(STUDIO_CALL)
-        || server
-            .is_some_and(|server| studio_workspace::ui_tools::studio_call(title, server).is_some())
+        || server.is_some_and(|server| studio_call(title, server).is_some())
 }
 
 /// The words a UI tool's result opens with ("Opened Project · Table"): the first text of its
@@ -1352,9 +1352,9 @@ impl AgentPanel {
         self.cwd = Some(cwd.clone());
         // Studio's UI tools (spec 032), with a token of this conversation's, bound to its
         // window: the agent shows things only here.
-        let ui_tools = server.as_ref().and_then(|_| {
-            studio_workspace::ui_tools::UiToolEndpoint::entry_for(self.window_id, cx)
-        });
+        let ui_tools = server
+            .as_ref()
+            .and_then(|_| crate::ui_tools::UiToolEndpoint::entry_for(self.window_id, cx));
         let launch = SessionLaunch {
             cwd,
             resume: self.session_id.clone(),
@@ -1486,6 +1486,14 @@ impl AgentPanel {
         self.replace_on_replay = None;
         self.entries
             .extend(std::mem::take(&mut self.said_while_starting));
+    }
+
+    /// Studio's UI tool server as the thread knows it: named once the host has said it was
+    /// passed, with which names are its tools.
+    fn studio_server(&self) -> Option<StudioServer<'_>> {
+        let name = self.ui_tools_server.as_deref()?;
+        let is_tool = self.ui_tools.as_ref()?.is_tool;
+        Some(StudioServer { name, is_tool })
     }
 
     fn stop_host(&mut self) {
@@ -1763,9 +1771,9 @@ impl AgentPanel {
                     .unwrap_or_default();
                 // Only calls to the server Studio passed, under the conversation's own name: a
                 // server of the person's config is asked about as any other tool.
-                let ours = self.ui_tools_server.as_deref().is_some_and(|server| {
-                    studio_workspace::ui_tools::studio_call(title, server).is_some()
-                });
+                let ours = self
+                    .studio_server()
+                    .is_some_and(|server| studio_call(title, server).is_some());
                 if ours && let Some(allow) = allow_once(&request.options) {
                     reply
                         .send(RequestPermissionOutcome::Selected(
@@ -1910,7 +1918,7 @@ impl AgentPanel {
                 }
             }
             SessionUpdate::ToolCall(call) => {
-                let server = self.ui_tools_server.as_deref();
+                let server = self.studio_server();
                 let title = match studio_words(Some(&call.content), call.raw_output.as_ref()) {
                     Some(words) if is_studio_call(&call.title, server) => words,
                     _ => shown_title(call.title, server),
@@ -1922,8 +1930,13 @@ impl AgentPanel {
                 });
             }
             SessionUpdate::ToolCallUpdate(update) => {
-                let server = self.ui_tools_server.clone();
-                let server = server.as_deref();
+                // Owned, since the entries are changed below.
+                let name = self.ui_tools_server.clone();
+                let is_tool = self.ui_tools.as_ref().map(|entry| entry.is_tool);
+                let server = name
+                    .as_deref()
+                    .zip(is_tool)
+                    .map(|(name, is_tool)| StudioServer { name, is_tool });
                 let id = update.tool_call_id.to_string();
                 let at = self.entries.iter().rposition(
                     |entry| matches!(entry, Entry::Tool { id: existing, .. } if *existing == id),
@@ -4744,9 +4757,10 @@ mod tests {
 
         // The conversation has an entry, but the host has not said the server was passed.
         panel.update(cx, |panel, _| {
-            panel.ui_tools = Some(studio_workspace::ui_tools::UiToolEntry::new(
+            panel.ui_tools = Some(crate::ui_tools::UiToolEntry::new(
                 "http://127.0.0.1:1/mcp".into(),
                 "t".into(),
+                crate::ui_tools::tests::is_tool,
                 || {},
             ))
         });

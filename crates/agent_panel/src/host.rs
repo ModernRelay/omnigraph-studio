@@ -85,7 +85,7 @@ pub struct SessionLaunch {
 }
 
 /// The UI tool server's address, the conversation's token for it, and the name the agent is
-/// given it under, the conversation's own ([`studio_workspace::ui_tools::server_name`]).
+/// given it under, the conversation's own ([`crate::ui_tools::server_name`]).
 #[derive(Clone)]
 pub struct UiToolAccess {
     pub name: String,
