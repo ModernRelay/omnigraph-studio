@@ -451,27 +451,27 @@ pub struct AgentSettings {
     #[schemars(title = "Ask before writes")]
     pub ask_before_writes: bool,
     // Spec 032.
-    /// Claude Code, Codex and other agents on this computer may open tables, pages, canvases
-    /// and queries in Studio's windows, walk a canvas or a tree, and read which tabs are open,
-    /// through Studio's tool server. They never write.
-    #[schemars(title = "Let agents outside Studio show things in Studio")]
+    /// Claude Code, Codex and other agents on this computer can connect to Studio over MCP to
+    /// open tables, pages, canvases and queries, walk a canvas or a tree, and read which tabs
+    /// are open. They can't change a graph.
+    #[schemars(title = "Run Studio's MCP server for external agents")]
     pub outside_agents: bool,
-    /// Studio asks for the same port at each start and keeps the token in the system keychain,
-    /// so a copied command keeps working across restarts. Off: a new address and token each
-    /// start.
-    #[schemars(title = "Keep the same address between starts")]
+    /// The MCP server asks for the same port at each start and keeps its token in the system
+    /// keychain, so a copied command keeps working across restarts. Off: a new address and token
+    /// each start.
+    #[schemars(title = "Keep the server's address and token between starts")]
     pub keep_address: bool,
     /// The port Studio asks for first while it keeps its address; the nine after it are tried
     /// when it is taken. Edited in `settings.json`.
     #[schemars(extend("x-hidden" = true))]
     pub ui_tools_port: u16,
-    /// The agent in Studio's panel may open and walk things in its conversation's window, as an
-    /// agent outside Studio may. Off: it has the omnigraph CLI only.
-    #[schemars(title = "Let the agent in Studio show things in the window")]
+    /// The agent in Studio's panel can open and walk things in its conversation's window, as an
+    /// external agent can. Off: it has the omnigraph CLI only.
+    #[schemars(title = "Give the agent panel Studio's UI tools")]
     pub panel_ui_tools: bool,
     /// A window an agent opens or shows something in comes to the front. Off: it changes where
     /// it is, and says "Opened by" in its status bar.
-    #[schemars(title = "Bring the window to the front when an agent shows something")]
+    #[schemars(title = "Bring Studio to the front when an agent shows something")]
     pub raise_window: bool,
 }
 

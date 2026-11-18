@@ -32,9 +32,9 @@ pub(crate) fn replace_agent_token(window: &mut Window, cx: &mut App) {
     studio_workspace::confirm(
         window,
         cx,
-        "Replace the agents' token?",
-        "Every agent outside Studio that holds the current token is refused from now on. Copy \
-         its command again to give it the new one.",
+        "Replace the MCP server's token?",
+        "Every external agent that holds the current token is refused from now on. Copy its \
+         command again to give it the new one.",
         "New token",
         |_, cx| ui_tool_server::UiToolServer::replace_token(cx),
     );
@@ -48,8 +48,8 @@ pub(crate) fn outside_agents_row(cx: &App) -> AnyElement {
         return div()
             .pb(px(space::MD))
             .child(ds::text::muted(
-                "Studio's tool server is not running, so agents outside Studio cannot reach it. \
-                 The log says why.",
+                "Studio's MCP server is not running, so external agents cannot reach it. The \
+                 log says why.",
             ))
             .into_any_element();
     };

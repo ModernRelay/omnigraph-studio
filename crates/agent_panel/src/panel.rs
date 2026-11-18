@@ -4868,7 +4868,7 @@ mod tests {
         });
     }
 
-    /// "Let the agent in Studio show things in the window" off: the conversation names no UI
+    /// "Give the agent panel Studio's UI tools" off: the conversation names no UI
     /// tool server, so none is passed, and `AGENTS.md` says nothing of one. On: it names one of
     /// its own, which `AGENTS.md` gives.
     #[test]

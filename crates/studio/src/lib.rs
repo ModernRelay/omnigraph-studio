@@ -193,15 +193,13 @@ pub fn init(cx: &mut App) {
         workspace.register_action(|workspace, _: &OpenSettings, window, cx| {
             open_settings(workspace, window, cx);
         });
+        workspace.register_action(|_, _: &studio_actions::workspace::ToggleMcpServer, _, cx| {
+            studio_settings::update(cx, |settings| {
+                settings.agent.outside_agents = !settings.agent.outside_agents
+            });
+        });
         workspace.register_action(
-            |_, _: &studio_actions::workspace::ToggleOutsideAgents, _, cx| {
-                studio_settings::update(cx, |settings| {
-                    settings.agent.outside_agents = !settings.agent.outside_agents
-                });
-            },
-        );
-        workspace.register_action(
-            |_, _: &studio_actions::workspace::ReplaceAgentToken, window, cx| {
+            |_, _: &studio_actions::workspace::ReplaceMcpToken, window, cx| {
                 ui_tools::replace_agent_token(window, cx);
             },
         );

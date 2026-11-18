@@ -63,8 +63,8 @@ const PALETTE_ONLY: [&str; 32] = [
     "studio_update::ViewReleaseNotes",
     // Rare: the switch is in Settings, and a new token makes every outside agent copy its
     // command again (spec 032).
-    "studio::ToggleOutsideAgents",
-    "studio::ReplaceAgentToken",
+    "studio::ToggleMcpServer",
+    "studio::ReplaceMcpToken",
     // What a click, a chip's menu or ⌘-click does on a canvas or in a tree, as an action an
     // agent calls too (spec 032): rare by key, each in the palette.
     "studio_canvas::ShowHidden",
