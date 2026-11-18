@@ -28,7 +28,7 @@ pub struct CellText {
 
 /// The most of a text one line shows: a column is at most `COLUMN_MAX_WIDTH` wide, so the rest
 /// of a long value (a paragraph in a Text cell) is never copied, scanned or shaped.
-const SHOWN_CHARS: usize = 512;
+pub(crate) const SHOWN_CHARS: usize = 512;
 
 /// `text` on one line, from the start of its room, as a small label draws it. A control
 /// character (a line break, a tab) shows as its picture, as a single-line label has it.

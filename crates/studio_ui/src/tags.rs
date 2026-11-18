@@ -36,7 +36,11 @@ pub fn tags(
 ) -> Tags {
     let body = crate::cell_text("", cx);
     Tags {
-        tags: tags.into_iter().map(crate::cell_text::one_line).collect(),
+        // As a cell's text: never more than a line shows, so a long name is not shaped whole.
+        tags: tags
+            .into_iter()
+            .map(|tag| crate::cell_text::one_line(crate::shown_part(tag)))
+            .collect(),
         count,
         tag_style: crate::cell_text("", cx).meta(cx).style,
         count_style: body.color(ui::Color::Muted.color(cx)).style,
@@ -560,6 +564,20 @@ mod tests {
         let bare = plan(&[], Some(20.), 100., 16., 14., 16.);
         assert_eq!(bare.count.unwrap().x, space::XS);
         assert_eq!(bare.clip.h, 0.);
+    }
+
+    /// A tag keeps no more of its name than a line shows, as a cell's text does, so a long name
+    /// is never shaped whole; a line break shows as its picture.
+    #[gpui::test]
+    fn a_long_name_is_kept_to_what_a_line_shows(cx: &mut TestAppContext) {
+        cx.update(studio_theme::init_test);
+        let long: SharedString = "é".repeat(4000).into();
+        let element = cx.update(|cx| tags([long, "two\nlines".into()], None, cx));
+        assert_eq!(
+            element.tags[0].chars().count(),
+            crate::cell_text::SHOWN_CHARS
+        );
+        assert!(!element.tags[1].contains('\n'), "{}", element.tags[1]);
     }
 
     /// Edges land on device pixels as GPUI's layout puts them, a half toward zero.
