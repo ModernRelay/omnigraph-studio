@@ -111,23 +111,14 @@ new video in the README.
 
 ## Architecture
 
-Studio is a Cargo workspace (Rust 2024 edition) of 20 crates: 18 for the app and 2 for the
-tree-sitter grammars. A crate depends only on crates in lower layers, and feature crates never
-depend on each other. `script/check-layers.py` enforces this in CI.
-
-| Layer | Crates |
-|---|---|
-| 6 | `studio`: the binary, menus, windows, deep links |
-| 5 | `type_table`, `relationship_tree`, `graph_canvas`, `query_editor`, `review`, `history`, `agent_panel`, `command_palette` |
-| 4 | `studio_workspace`: panes, tabs, docks, modals, toasts |
-| 3 | `graph_store`: connections, graph sessions, snapshot pins, exploration |
-| 2 | `graph_client` (HTTP, no GPUI), `gq_language` (compiler wrapper, no GPUI), `studio_ui` |
-| 1 | `studio_settings`, `studio_theme` |
-| 0 | `studio_actions`: every action type |
+Studio is a Cargo workspace (Rust 2024 edition): its crates are in `crates/`, and the two
+tree-sitter grammars in `grammars/`. A crate depends only on crates in lower layers, and feature
+crates never depend on each other. [architecture.md](architecture.md) lists every crate and its
+layer, and `script/check-layers.py` enforces the same table in CI.
 
 GPUI and its crates come from git at one release tag ([zed-pin.md](zed-pin.md)). The
-tree-sitter grammars for `.gq` and `.pg` are in `grammars/`. [architecture.md](architecture.md)
-describes the data flow and the state model.
+tree-sitter grammars are for `.gq` and `.pg`. [architecture.md](architecture.md) also describes
+the data flow and the state model.
 
 How Studio uses the Omnigraph API, in full (the README has the short form):
 
