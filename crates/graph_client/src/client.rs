@@ -1888,6 +1888,20 @@ impl GraphClient {
             .await
     }
 
+    /// The branch list with each branch's head, start and times (`detailed=true`, Omnigraph
+    /// 0.15.0 and later): one request in place of a head read per branch. The server reads each
+    /// branch's newest version, never its history. Ask it only of a server that serves it; a
+    /// 0.14 server answers the names alone, without `details`.
+    pub async fn branches_detailed(&self, graph: &str) -> Result<BranchListOutput, ReadError> {
+        self.read(
+            Method::GET,
+            &["graphs", graph, "branches"],
+            &[("detailed", "true")],
+            None,
+        )
+        .await
+    }
+
     /// A page of `branch`'s history, newest first: its newest `limit` commits, or from
     /// `page_token` the next ones. The page names the head it resolved and where it goes on.
     /// The one way Studio reads a history: without `limit` the server answers the whole of it,

@@ -4068,6 +4068,7 @@ dependencies = [
  "oauth_client",
  "rcgen",
  "reqwest_client",
+ "semver",
  "serde",
  "serde_json",
  "smol",

@@ -9,6 +9,8 @@ use futures::channel::oneshot;
 use gpui::{Context, EventEmitter, Task};
 use graph_client::api::{GraphInfo, HealthOutput};
 use graph_client::{Challenge, GraphClient, ReadError, Unauthorized};
+
+use crate::server_features::ServerFeatures;
 use http_client::HttpClient;
 use studio_settings::StudioSettings;
 
@@ -134,6 +136,9 @@ pub enum ConnectionEvent {
     /// The connection knows the token its requests carry: its token source answered, or a token
     /// was given ([`Connection::token_ready`]). A graph's first reads wait for it.
     TokenReady,
+    /// A health answer reported a release that serves other features than the one before
+    /// ([`Connection::features`]): what Studio asks of the server changes from now on.
+    FeaturesChanged,
 }
 
 /// Held by whatever shows a server (a window's graph, the Open dialog): its health is checked
@@ -158,6 +163,9 @@ pub struct Connection {
     client: GraphClient,
     pub state: ConnectionState,
     pub health: Option<HealthOutput>,
+    /// What the server serves beyond contract 0.14, by the release its last health answer
+    /// reported ([`ServerFeatures`]); the oldest supported release's until one answers.
+    pub features: ServerFeatures,
     /// How long the last health check took to answer: the server's round trip, shown beside
     /// it. `None` until one answers, and after one fails.
     pub latency: Option<Duration>,
@@ -470,6 +478,7 @@ impl Connection {
             client,
             state: ConnectionState::Idle,
             health: None,
+            features: ServerFeatures::default(),
             latency: None,
             graphs: GraphListing::Unknown,
             token_unread: None,
@@ -1243,7 +1252,9 @@ impl Connection {
                         latency,
                         graphs,
                     } => {
-                        this.health = Some(health);
+                        if this.set_health(health) {
+                            cx.emit(ConnectionEvent::FeaturesChanged);
+                        }
                         this.latency = Some(latency);
                         this.graphs = graphs;
                         this.state = ConnectionState::Ready;
@@ -2150,6 +2161,27 @@ impl Connection {
         });
     }
 
+    /// Takes `features` as the server's, as a health answer of its release would: for the tests
+    /// of views that ask what the server serves without a server to connect to.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_features(&mut self, features: ServerFeatures, cx: &mut Context<Self>) {
+        if !features.serves_same(&self.features) {
+            cx.emit(ConnectionEvent::FeaturesChanged);
+        }
+        self.features = features;
+        cx.notify();
+    }
+
+    /// Keeps a health answer and the features its release serves. Whether the features served
+    /// changed: another release may serve the same ones.
+    fn set_health(&mut self, health: HealthOutput) -> bool {
+        let features = ServerFeatures::of(Some(&health.version));
+        self.health = Some(health);
+        let changed = !features.serves_same(&self.features);
+        self.features = features;
+        changed
+    }
+
     fn apply_health_check(
         &mut self,
         health: Result<graph_client::ServerHealth, ReadError>,
@@ -2175,7 +2207,15 @@ impl Connection {
             return;
         }
         let next = match served(health) {
-            Ok(_) if self.state == ConnectionState::Ready => ConnectionState::Ready,
+            // A server upgraded or replaced in place reports another release: what Studio may
+            // ask of it follows at once.
+            Ok(answer) if self.state == ConnectionState::Ready => {
+                if self.set_health(answer.health) {
+                    cx.emit(ConnectionEvent::FeaturesChanged);
+                    cx.notify();
+                }
+                ConnectionState::Ready
+            }
             // `/healthz` asks for no token, so it passes for a refused one too: probing again
             // would be refused alike, and would take the token field away while it is typed
             // in. A new token connects again; a source that could not answer is asked again,
@@ -2863,6 +2903,89 @@ mod tests {
             2,
             "read once more"
         );
+    }
+
+    /// What Studio may ask of a server follows the release each health answer reports: worked
+    /// out at the connect, and again when a check finds the server upgraded or rolled back in
+    /// place, which says so ([`ConnectionEvent::FeaturesChanged`]). An unreadable version is the
+    /// oldest supported release.
+    #[gpui::test]
+    async fn a_servers_features_follow_the_release_it_reports(cx: &mut TestAppContext) {
+        use crate::server_features::ServerFeature;
+        let version: Arc<Mutex<&'static str>> = Arc::new(Mutex::new("0.14.0"));
+        let reported = version.clone();
+        let http = FakeHttpClient::create(move |request| {
+            let health = request.uri().path().ends_with("/healthz");
+            let version = *reported.lock().unwrap();
+            async move {
+                let body = if health {
+                    serde_json::json!({ "status": "ok", "version": version,
+                        "internal_schema_version": 16 })
+                    .to_string()
+                } else {
+                    r#"{"graphs":[]}"#.to_owned()
+                };
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                    .body(AsyncBody::from(body))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let changes = Arc::new(Mutex::new(0));
+        let counted = changes.clone();
+        let _events = cx.update(|cx| {
+            cx.subscribe(&connection, move |_, event: &ConnectionEvent, _| {
+                if matches!(event, ConnectionEvent::FeaturesChanged) {
+                    *counted.lock().unwrap() += 1;
+                }
+            })
+        });
+        let _shown = connection.update(cx, |connection, cx| {
+            connection.connect(cx);
+            connection.watch(cx)
+        });
+        cx.run_until_parked();
+        let detailed = |cx: &mut TestAppContext| {
+            connection.read_with(cx, |connection, _| {
+                connection.features.has(ServerFeature::DetailedBranchList)
+            })
+        };
+        assert!(!detailed(cx), "0.14.0");
+        assert_eq!(
+            *changes.lock().unwrap(),
+            0,
+            "the oldest's, as before the connect"
+        );
+
+        *version.lock().unwrap() = "0.15.1-edge+54ced5d";
+        cx.executor().advance_clock(DEFAULT_CHECK_INTERVAL);
+        cx.run_until_parked();
+        assert!(
+            detailed(cx),
+            "upgraded in place to an edge build after 0.15.0"
+        );
+        assert_eq!(*changes.lock().unwrap(), 1);
+        connection.read_with(cx, |connection, _| {
+            assert_eq!(connection.state, ConnectionState::Ready);
+            assert_eq!(
+                connection.health.as_ref().map(|h| h.version.as_str()),
+                Some("0.15.1-edge+54ced5d")
+            );
+        });
+
+        *version.lock().unwrap() = "not a version";
+        cx.executor().advance_clock(DEFAULT_CHECK_INTERVAL);
+        cx.run_until_parked();
+        assert!(!detailed(cx), "unreadable: the oldest supported");
+        assert_eq!(*changes.lock().unwrap(), 2);
     }
 
     /// Health is checked only while something shows the server: a check that comes while

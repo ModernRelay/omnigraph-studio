@@ -72,9 +72,28 @@ Also served: unattached snapshots (`as unattached branch`; `CommitOutput.kind`,
 `GET /commits?listing=unattached`) and `ReadOutput.page` for a paged `branch diff` read. The CLI
 selects a backend with `--target` and reads an operator file of `targets` in its version-1 form
 (#1090, #1115, #1126). Studio's agent CLI follows it (spec 013), from `v0.14.0` on.
-`v0.15.0` keeps contract 0.14 and adds, all optional: a ranked read's `ReadOutput.ranking`,
-`GET /branches?detailed=true` with `BranchListOutput.details`, `AccessOutput.client_id`, and the
-403 `not_admitted` code. Studio decodes them; it says why a sign-in is not admitted and uses
-none of the rest yet. Since 2026-10-22 Studio reads no operator file for the
+Since 2026-10-22 Studio reads no operator file for the
 person's servers: it takes them and their tokens from the CLI's own commands (`target list`,
 `target inspect`, `credentials status`, `credentials export`; spec 003).
+
+## Server features by release
+
+A later release keeps contract 0.14 and adds to it: a field an answer may carry, a parameter a
+route takes, a rule a write must meet. Studio decodes every later field as optional whatever the
+server, and uses what a release adds only where the server serves it: `graph_store::ServerFeatures`
+works that out from the release `/healthz` reports, at each health answer, from this table. A
+version Studio cannot read is taken to be `v0.14.0`, and an edge build (`0.15.1-edge+…`) serves
+what the release before it does. A feature goes in this table and in `FEATURES` together; a test
+(`every_feature_is_named_in_the_docs_with_its_release`) fails when they drift.
+
+| Feature | First release | What the server does | Studio with it | Studio without it (a 0.14 server) |
+|---|---|---|---|---|
+| `RankedReadOutput` | `0.15.0` | A read ordered by `nearest`, `bm25` or `rrf()` answers `ReadOutput.ranking` (#1130) | The query editor names the search, which way it ranks and its score columns, and warns when the search was not exhaustive | Says nothing of a ranking |
+| `DetailedBranchList` | `0.15.0` | `GET /branches?detailed=true` answers each branch's head, start and times (#1012, E9) | The heads a list of branches asks for come from one request, and the branches list says when each branch was made and from which | One `GET /commits?branch=&limit=1` per branch drawn |
+| `AccessClientId` | `0.15.0` | `AccessOutput.client_id` names the OAuth client a person's token was issued to (#1196) | The connection chip's tooltip names it beside the actor | Names the actor alone |
+| `CardMinimumOnEveryWrite` | `0.15.0` | A `@card` minimum is checked on every write that inserts or updates a source node (#1212) | The new-node dialog asks for each edge the minimum needs and saves them with the node in one mutation | Saves the node alone, which the server takes |
+| `UniqueOnScalarsOnly` | `0.15.0` | A schema apply refuses `@unique` on a list or vector property (#1306) | The schema view says the server refuses any apply that keeps one | Says 0.15 will, and that no write can set such a property |
+
+`v0.15.0` also answers a valid OIDC token whose subject it admits no principal for with 403
+`not_admitted` (#1185), where 0.14 answered 401; Studio reads the code from the answer itself,
+whatever the release, and says to ask the server's operator.

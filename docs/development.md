@@ -144,10 +144,13 @@ How Studio uses the Omnigraph API, in full (the README has the short form):
   draft is kept until then.
 - **Server policy.** Authorization is the server's Cedar policy; Studio enforces no rules of its
   own. A 403 is shown as a refusal and the draft stays.
-- **Newer routes on demand.** Routes beyond 0.14 are used only when the server's OpenAPI
-  document advertises them. Engine changes Studio would use, and what it does without them, are
-  listed in [deferred-engine-changes.md](deferred-engine-changes.md) and
-  [spec 012](../specs/012-omnigraph-engine-changes/plan.md).
+- **Later releases by their features.** What a release after 0.14.0 adds (a field, a parameter,
+  a rule a write must meet) is used only where the server's release serves it:
+  `graph_store::ServerFeatures` works that out from `/healthz`'s version, and code asks
+  `features.has(…)`. The table is in
+  [deferred-engine-changes.md](deferred-engine-changes.md#server-features-by-release), beside the
+  engine changes Studio would use and what it does without them
+  ([spec 012](../specs/012-omnigraph-engine-changes/plan.md)).
 
 ## Repository
 

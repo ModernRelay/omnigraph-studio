@@ -367,6 +367,27 @@ target's tooltip names `omnigraph credentials set --target <name> --stdin`, whic
 the CLI and Studio, and a managed profile's names `omnigraph login --profile` (since 2026-10-21; before, a server sent no token was said to have refused it,
 and the tooltip named `omnigraph login`, which is managed sign-in only now).
 
+### Server features
+
+Every server Studio connects to speaks contract 0.14, from `v0.14.0` on; a later release adds to
+it without changing the header. `graph_client` decodes every later field as optional, whatever
+the server, so an answer always reads. What a later release adds that changes what Studio *asks
+for* or how it *saves* is used only where the server serves it (spec 034):
+
+- `graph_store::ServerFeatures` is worked out from `HealthOutput.version` at the connect and at
+  every health answer, and kept on the `Connection` beside the health answer. A server upgraded
+  or rolled back in place changes it at the next check, which emits
+  `ConnectionEvent::FeaturesChanged`; a session on it forgets its branch details and reads the
+  branch list again.
+- The version is semver. An edge or dev build has a prerelease, which sorts before its release:
+  Omnigraph names an edge build after the release it leads to, so `0.15.1-edge+…` serves what
+  0.15.0 serves, and `0.15.0-edge+…`, made before 0.15.0, does not. A version that does not
+  parse, or one before `0.14.0`, is taken to be `0.14.0`.
+- `FEATURES` lists each feature with its first release; `docs/deferred-engine-changes.md` lists
+  the same, with what Studio does with and without it, and a test fails when the two differ.
+- Code asks `session.features(cx).has(ServerFeature::DetailedBranchList)` (or the connection's),
+  never compares versions and never takes a missing field for a missing feature.
+
 ### Requests (`graph_client`)
 
 - Built on Zed's `http_client::HttpClient` (Apache-2.0): `reqwest_client` in the app, the fake
@@ -434,7 +455,8 @@ and the tooltip named `omnigraph login`, which is managed sign-in only now).
 | Ask the Omnigraph CLI for its targets and tokens (`target list`, `target inspect`, `credentials status`, `credentials export`) | Parse the operator file and the credential sources; ask for every token again | The CLI is how people already reach their servers, and its own code is the one reader of its formats: a copy of it in Studio stopped matching the CLI once (Corrections, 2026-10-21), and RFC 1017 says Studio keeps none |
 | Add a server as a CLI target through the CLI (`target add`, `credentials set`) | Keep Studio's own server list and keychain tokens | RFC 1017 rejects a client's own list and token copies: the CLI's targets are the one list, which the agent's CLI and the person's terminal see too |
 | One connection per address, as the first target on it by name; the others named as alternatives | A connection per target; the CLI's default target first | A graph's key is its server's address and id; `target list --json` does not say which target is the default |
-| Capabilities from `/openapi.json`, read when a route newer than the minimum server is used | Compare version strings; read the document on every connect | A server on main serves routes a release lacks; no route Studio uses needs the check today |
+| Capabilities from `/openapi.json`, read when a route newer than the minimum server is used. *Superseded 2026-11-18 (spec 034) by the server features table* | Compare version strings; read the document on every connect | A server on main serves routes a release lacks; no route Studio uses needs the check today |
+| What a later release serves, from one table of features and first releases, worked out from `/healthz`'s version (`ServerFeatures`) | Read `/openapi.json` for each; guess from a missing field; compare versions where each feature is used | 0.15 added a parameter, answer fields and write rules, and a rule (the `@card` check) is in no OpenAPI document; the health answer is already read. An edge build ahead of its version is only under-used, never misread; a missing field says nothing of a feature when the read did not call for it; one table keeps every check in one place and in step with the docs |
 | Never retry writes | Retry with backoff | A lost response may have committed; only history can tell |
 
 ## Deferred
@@ -455,6 +477,7 @@ and the tooltip named `omnigraph login`, which is managed sign-in only now).
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-11-18 | A connection serves the features of the release its health answer reports, an edge build those of the release before it, an unreadable version none | `graph_store` `server_features::tests` (four) and `connection::tests::a_servers_features_follow_the_release_it_reports`; Omnigraph's `release-edge.yml` at main (an edge build of X.Y.Z reports `X.Y.Z-edge+<commit>`, main at `0.15.1` after `v0.15.0`) | Pass: 0.14.x serves none, 0.15.0 and later all five; `0.15.1-edge+54ced5d` all, `0.14.1-edge` and `0.15.0-edge` none; `unknown`, `0.15` and `0.13.2` none. A check that finds `0.15.1-edge` after `0.14.0` emits `FeaturesChanged`, and one that finds an unreadable version takes them away |
 | 2026-11-01 | A link from `omnigraph studio` opens its target once the digests match, and is refused naming the one that differs | `studio` `deep_link::tests::an_open_link_names_a_target_and_its_digests` (target, both digests, the graph when named; a part missing or a digest that is not sha256 refused), `an_open_link_is_verified_against_the_cli_digests`, `start_tests::a_link_from_the_cli_opens_its_target_once_the_digests_match` (the default graph, then the named one, only that server asked), `a_link_from_the_cli_is_refused_when_its_digests_differ` (binding, home, a target not listed); live, offscreen (`examples/snapshot.rs` dispatching `studio::OpenLink`) with the link `omnigraph studio --target law --graph law --json` printed (CLI 0.14.1, the law server at `https://localhost:8453`) and the same link with its home digest changed | The real link opened law/law on main, with no toast; the changed one opened nothing, the window asking for a graph with the toast "The link was made from another operator file than this Mac's CLI reads: its home digest differs…". Before, every `open` link was refused as "Studio cannot open “open” links" |
 | 2026-10-28 | A token source that cannot answer now leaves a working token in use | `graph_store` `cli_tokens::tests::a_cli_that_cannot_answer_leaves_its_token_in_use` (Refresh and a connect under a busy CLI), `a_cli_that_cannot_answer_after_a_refusal_is_asked_again` (no token kept after a 401; the next health check asks), `no_credential_sends_nothing` (extended: a missing credential is not asked again by health checks), `connection::tests::a_renewal_that_cannot_be_answered_keeps_the_token_held`, the stand-in CLI tests extended to say which failures may pass (a busy turn and a stopped export do; a refusal, a missing credential, a moved target and a held lock do not) | All pass. Before, every failure dropped the token: Refresh or a reconnect while the CLI was busy with Studio's other commands, or after an upgrade whose first run XProtect stalls, showed the server refused until the person acted |
 | 2026-10-26 | A read refused for its token asks the source again, once per token, and a target's changed transport moves every holder of its client | `graph_store` `connection::tests::a_read_refused_for_its_token_asks_the_source_once` (told first, renewed once, the same token not asked twice, a typed token not asked), `registry::tests::a_renamed_cli_target_keeps_its_connection` (a moved address retires the old connection, which sends nothing; a proxy or certificate authority keeps the connection and makes one client each; an unusable transport retires it); `graph_client` `a_replaced_http_client_reaches_every_clone`; CI on PR #11 (run 40281608899), Check on macOS, Linux and Windows: `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` | All pass: 1014 passed on macOS, 1009 on Linux, 979 on Windows; 0 failed |

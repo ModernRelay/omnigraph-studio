@@ -88,6 +88,10 @@ python3 script/test_release_files.py   # a release's version-free copies and lat
   paths). Copies of upstream files stay as upstream wrote them.
 - No Omnigraph engine changes from this repo. Add the need to spec 012 with an ID, list it in
   `docs/deferred-engine-changes.md`, and design against today's API.
+- A server feature a later Omnigraph release adds goes in `graph_store::FEATURES` with its first
+  release and in the table in `docs/deferred-engine-changes.md` (a test keeps them together);
+  code asks `features.has(ServerFeature::…)` and keeps working without it. Never an ad hoc
+  version check, and never a guess from a missing field: decoding stays tolerant.
 - Never add a second copy of GPUI (GPUI Kit, `gpui-pre`, `gpui-ce`, crates.io `gpui`).
 - Never retry a write automatically. Never log tokens, query text or row data.
 - Size nested rounded surfaces with `ds::radius::around`/`within`, never by hand: concentric
