@@ -6,19 +6,39 @@
 //! - `omnigraph-studio://node?server=<url>&graph=<id>&type=<Type>&id=<key>[&branch=<name>]`
 //! - `omnigraph-studio://query?server=<url>&graph=<id>&text=<gq>[&branch=<name>]`
 //! - `omnigraph-studio://open?target=<name>&binding=sha256:<hex>&home=sha256:<hex>[&graph=<id>]`
-//!   is what `omnigraph studio` sends (Omnigraph 0.14.1, `protocols.studio` 1): a CLI target
-//!   by name, with digests of what it resolves to and of the operator file it was read from,
-//!   which Studio checks against its own `target inspect` before it opens the target's server.
+//!   is what `omnigraph studio --target NAME` sends (Omnigraph 0.15.0, `protocols.studio` 1;
+//!   ModernRelay/omnigraph#1137): a CLI server target by name, with digests of what it resolves
+//!   to and of the operator file it was read from, which Studio checks against its own `target
+//!   inspect` before it opens the target's server. The CLI asks the platform to open it: `open
+//!   -b com.modernrelay.omnigraph-studio` on macOS, the `x-scheme-handler/omnigraph-studio`
+//!   desktop entry's `Exec` on Linux, and the `omnigraph-studio` URL protocol on Windows; on
+//!   Linux and Windows the link reaches Studio as its argument ([`links_in_args`]).
 //! - `omnigraph-studio://open?api=<control plane>&organization=<org>&cluster=<id>&incarnation=<id>[&graph=<id>]`
-//!   is what `omnigraph studio` sends for a managed target: the cluster as its control plane
-//!   names it, with no target name, so no CLI target need name the cluster here (spec 021,
-//!   Reopening a cluster). The control plane must be one Studio holds and is signed in to.
+//!   opens a managed cluster as its control plane names it, with no target name, so no CLI
+//!   target need name the cluster here (spec 021, Reopening a cluster). The control plane must
+//!   be one Studio holds and is signed in to. The 0.15 CLI's `omnigraph studio` refuses managed
+//!   targets (`target_kind_unsupported`), so it sends none of these yet.
 //! - `omnigraph-studio://connect?code=<code>` was reserved for that launcher before it existed,
 //!   and is still refused with a note.
 
 use url::Url;
 
 pub const SCHEME: &str = "omnigraph-studio";
+
+/// The `omnigraph-studio://` links among a start's arguments. macOS hands Studio a link through
+/// the app's open-URL event; Linux's desktop entry (`Exec=omnigraph-studio %u`) and Windows' URL
+/// protocol (`"…\omnigraph-studio.exe" "%1"`) start Studio with the link as its argument, which
+/// GPUI does not pass on there, so `main` reads them here. Anything else is not a link.
+pub fn links_in_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Vec<String> {
+    let prefix = format!("{SCHEME}:");
+    args.into_iter()
+        .filter_map(|arg| arg.into_string().ok())
+        .filter(|arg| {
+            arg.get(..prefix.len())
+                .is_some_and(|start| start.eq_ignore_ascii_case(&prefix))
+        })
+        .collect()
+}
 
 /// The longest query text a link may fill in; a longer one is refused rather than cut.
 pub const QUERY_TEXT_MAX: usize = 64 * 1024;
@@ -224,6 +244,26 @@ pub fn parse(link: &str) -> Result<DeepLink, String> {
 
 #[cfg(test)]
 mod tests {
+    /// A link given as an argument, as Linux's desktop entry and Windows' URL protocol start
+    /// Studio with it, is read whatever the scheme's case; any other argument is not a link.
+    #[test]
+    fn a_link_is_read_from_the_arguments_studio_starts_with() {
+        let args = [
+            "omnigraph-studio://open?target=dev&binding=sha256:00&home=sha256:11",
+            "--verbose",
+            "OMNIGRAPH-STUDIO://graph?server=http://127.0.0.1:8787&graph=knowledge",
+            "https://example.com",
+            "omnigraph-studio",
+        ]
+        .map(std::ffi::OsString::from);
+        assert_eq!(
+            super::links_in_args(args),
+            [
+                "omnigraph-studio://open?target=dev&binding=sha256:00&home=sha256:11",
+                "OMNIGRAPH-STUDIO://graph?server=http://127.0.0.1:8787&graph=knowledge",
+            ]
+        );
+    }
     use super::*;
 
     fn target() -> Target {

@@ -160,8 +160,9 @@ Studio connects to running servers:
 3. A local graph is opened by serving it first (`omnigraph-server --cluster <dir>`); Studio
    does not open storage itself.
 4. A managed cluster is opened from its control plane: from the plane's list in the Open
-   dialog, or from the link `omnigraph studio` sends for a managed target, with the control
-   plane's data token (spec 021). No CLI target need name it. The window that has one of its
+   dialog, or from an `omnigraph-studio://open` link that names it (the 0.15 CLI's `omnigraph
+   studio` refuses managed targets, so it sends none yet), with the control plane's data token
+   (spec 021). No CLI target need name it. The window that has one of its
    graphs open saves the cluster as the control plane names it (`ClusterIdentity`: route,
    organization, id, incarnation) and reopens it at the next start; Studio still keeps no list
    of clusters (`specs/021-control-plane/reopening.md`).

@@ -190,8 +190,9 @@ newer version is out and link to it; 0.4.2 and later install it.
 The Windows installer ([spec 027](../specs/027-windows-installer/plan.md)) puts Studio in
 `%LOCALAPPDATA%\Programs\Omnigraph Studio` for one person, with no administrator rights, and
 adds it to the Start menu and Installed apps; uninstalling keeps the settings in
-`%APPDATA%\Omnigraph Studio`. It registers as `com.modernrelay.omnigraph-studio`, the name
-`omnigraph studio` looks up. It ships from 0.4.4. Neither Windows file is signed yet.
+`%APPDATA%\Omnigraph Studio`. It registers as `com.modernrelay.omnigraph-studio`, and from 0.4.9
+the `omnigraph-studio://` URL protocol, which `omnigraph studio` (CLI 0.15) opens a target's link
+through. It ships from 0.4.4. Neither Windows file is signed yet.
 
 ## Not built yet
 
