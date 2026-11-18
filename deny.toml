@@ -24,6 +24,7 @@ ignore = [
     { id = "RUSTSEC-2026-0398", reason = "zstd-safe 7.3 through zstd 0.13, as RUSTSEC-2026-0391; Studio never seeks in a zstd frame; fixed in 8.2, which zstd 0.13 does not allow" },
     { id = "RUSTSEC-2026-0403", reason = "zstd-safe 5.0 and 7.3 through zstd 0.11 and 0.13, as RUSTSEC-2026-0391; the legacy-frame decoder reads only Zed's protocol, unused, and Studio's own assets; fixed in 8.2" },
     { id = "RUSTSEC-2026-0459", reason = "SQLite before 3.54 bundled in libsqlite3-sys 0.30.1, through Zed's sqlez and db (editor and workspace state); Studio calls neither, and the only databases they open are Zed's own in the user's data folder, never a file another party wrote; fixed in 0.39, which Zed v1.26.2 and v1.27.0 do not allow (0.30.1)" },
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained, with no release that fixes it (no vulnerability is reported). Unlike the rest it is not Zed's alone: Zed's gpui, ui, workspace, client, scheduler and zlog depend on it, and so do arrow-array, arrow-cast and arrow-json through omnigraph-compiler, so Studio's own uses (agent_panel, graph_store, gq_language, relationship_tree, type_table) cannot take it out of the build. Drop it when both Zed and omnigraph-compiler move past chrono, and move Studio's own uses to a maintained crate then" },
 ]
 
 [licenses]

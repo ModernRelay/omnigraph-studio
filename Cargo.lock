@@ -176,7 +176,7 @@ dependencies = [
 
 [[package]]
 name = "agent_panel"
-version = "0.4.7"
+version = "0.4.10"
 dependencies = [
  "agent-client-protocol",
  "chrono",
@@ -1381,11 +1381,13 @@ dependencies = [
 
 [[package]]
 name = "change_cards"
-version = "0.4.7"
+version = "0.4.10"
 dependencies = [
  "gpui",
  "gq_language",
  "graph_store",
+ "serde_json",
+ "studio_actions",
  "studio_ui",
  "ui",
 ]
@@ -1651,9 +1653,10 @@ dependencies = [
 
 [[package]]
 name = "command_palette"
-version = "0.4.7"
+version = "0.4.10"
 dependencies = [
  "editor",
+ "futures",
  "gpui",
  "gq_language",
  "graph_client",
@@ -1800,7 +1803,7 @@ dependencies = [
 
 [[package]]
 name = "control_client"
-version = "0.4.7"
+version = "0.4.10"
 dependencies = [
  "anyhow",
  "futures",
@@ -3041,7 +3044,7 @@ dependencies = [
 
 [[package]]
 name = "filter_words"
-version = "0.4.7"
+version = "0.4.10"
 dependencies = [
  "gq_language",
  "model",
@@ -3999,7 +4002,7 @@ dependencies = [
 
 [[package]]
 name = "gq_language"
-version = "0.4.7"
+version = "0.4.10"
 dependencies = [
  "chrono",
  "omnigraph-compiler",
@@ -4019,7 +4022,7 @@ dependencies = [
 
 [[package]]
 name = "graph_canvas"
-version = "0.4.7"
+version = "0.4.10"
 dependencies = [
  "gpui",
  "gq_language",
@@ -4036,7 +4039,7 @@ dependencies = [
 
 [[package]]
 name = "graph_client"
-version = "0.4.7"
+version = "0.4.10"
 dependencies = [
  "anyhow",
  "futures",
@@ -4051,7 +4054,7 @@ dependencies = [
 
 [[package]]
 name = "graph_store"
-version = "0.4.7"
+version = "0.4.10"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4066,11 +4069,13 @@ dependencies = [
  "oauth_client",
  "rcgen",
  "reqwest_client",
+ "semver",
  "serde",
  "serde_json",
  "smol",
  "studio_settings",
  "studio_ui",
+ "unicode-normalization",
  "url",
  "zed-reqwest",
 ]
@@ -4219,7 +4224,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "history"
-version = "0.4.7"
+version = "0.4.10"
 dependencies = [
  "change_cards",
  "editor",
@@ -5957,7 +5962,7 @@ dependencies = [
 
 [[package]]
 name = "model"
-version = "0.4.7"
+version = "0.4.10"
 dependencies = [
  "futures",
  "http_client",
@@ -6390,7 +6395,7 @@ dependencies = [
 
 [[package]]
 name = "oauth_client"
-version = "0.4.7"
+version = "0.4.10"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -6714,8 +6719,8 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-compiler"
-version = "0.14.0"
-source = "git+https://github.com/ModernRelay/omnigraph?tag=v0.14.0#60bfd19db780fdff3a5178f959c1204143420114"
+version = "0.15.0"
+source = "git+https://github.com/ModernRelay/omnigraph?tag=v0.15.0#373834b4c1c4b29cf0ddd64bee9565f98c60cc26"
 dependencies = [
  "ahash",
  "arrow-array",
@@ -7727,7 +7732,7 @@ dependencies = [
 
 [[package]]
 name = "query_editor"
-version = "0.4.7"
+version = "0.4.10"
 dependencies = [
  "anyhow",
  "clock",
@@ -8177,7 +8182,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "relationship_tree"
-version = "0.4.7"
+version = "0.4.10"
 dependencies = [
  "chrono",
  "editor",
@@ -8276,7 +8281,7 @@ dependencies = [
 
 [[package]]
 name = "review"
-version = "0.4.7"
+version = "0.4.10"
 dependencies = [
  "change_cards",
  "editor",
@@ -9499,7 +9504,7 @@ dependencies = [
 
 [[package]]
 name = "studio"
-version = "0.4.7"
+version = "0.4.10"
 dependencies = [
  "agent_panel",
  "command_palette",
@@ -9535,13 +9540,14 @@ dependencies = [
  "theme",
  "type_table",
  "ui",
+ "ui_tool_server",
  "url",
  "zlog",
 ]
 
 [[package]]
 name = "studio_actions"
-version = "0.4.7"
+version = "0.4.10"
 dependencies = [
  "gpui",
  "schemars 1.0.4",
@@ -9551,7 +9557,7 @@ dependencies = [
 
 [[package]]
 name = "studio_settings"
-version = "0.4.7"
+version = "0.4.10"
 dependencies = [
  "futures",
  "getrandom 0.3.4",
@@ -9567,7 +9573,7 @@ dependencies = [
 
 [[package]]
 name = "studio_theme"
-version = "0.4.7"
+version = "0.4.10"
 dependencies = [
  "assets",
  "gpui",
@@ -9583,13 +9589,14 @@ dependencies = [
 
 [[package]]
 name = "studio_ui"
-version = "0.4.7"
+version = "0.4.10"
 dependencies = [
  "gpui",
  "markdown",
  "menu",
  "pulldown-cmark",
  "serde_json",
+ "smallvec",
  "studio_settings",
  "studio_theme",
  "theme",
@@ -9599,7 +9606,7 @@ dependencies = [
 
 [[package]]
 name = "studio_update"
-version = "0.4.7"
+version = "0.4.10"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -9621,7 +9628,7 @@ dependencies = [
 
 [[package]]
 name = "studio_workspace"
-version = "0.4.7"
+version = "0.4.10"
 dependencies = [
  "gpui",
  "gq_language",
@@ -10503,7 +10510,7 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter-gq"
-version = "0.4.7"
+version = "0.4.10"
 dependencies = [
  "cc",
  "tree-sitter",
@@ -10527,7 +10534,7 @@ source = "git+https://github.com/tree-sitter/tree-sitter?rev=803c6ebaac27d69e180
 
 [[package]]
 name = "tree-sitter-pg"
-version = "0.4.7"
+version = "0.4.10"
 dependencies = [
  "cc",
  "tree-sitter",
@@ -10570,7 +10577,7 @@ dependencies = [
 
 [[package]]
 name = "type_table"
-version = "0.4.7"
+version = "0.4.10"
 dependencies = [
  "chrono",
  "collections",
@@ -10667,6 +10674,28 @@ source = "git+https://github.com/zed-industries/zed?tag=v1.27.0#c84af5b99cbc366d
 dependencies = [
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "ui_tool_server"
+version = "0.4.10"
+dependencies = [
+ "futures",
+ "getrandom 0.3.4",
+ "gpui",
+ "graph_client",
+ "graph_store",
+ "http_client",
+ "httparse",
+ "log",
+ "schemars 1.0.4",
+ "serde_json",
+ "smol",
+ "studio_actions",
+ "studio_settings",
+ "studio_theme",
+ "studio_ui",
+ "studio_workspace",
 ]
 
 [[package]]

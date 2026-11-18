@@ -238,3 +238,4 @@ away are dropped.
 - 2026-10-20: for a token refused commits by id, History read the other branches' whole
   listings, every commit since each began. It reads the newest page of each (1,000 commits),
   and the stubs say why the commits merged are not drawn (Design).
+- 2026-11-17: a commit's tab selected nothing, so the inspector stayed empty and no change led to its node; a schema change was an error with a Try again that only repeated the refusal, and a blank in History's row; a partial count read "+100 + more". Spec 033: a commit's tab selects (J/K, Space, ⌘↵ to open the node at the commit, the inspector following), its states are shared with the review ("Schema change" names the type and offers no retry), its sections read "Existing" and "New" under a summary line by type, and every list of commits says its counts through `change_cards::commit_counts` ("…" when partial, "schema change", "first commit"). The inspector's commit adds its counts by type.

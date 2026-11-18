@@ -4,6 +4,7 @@
 //!
 //! Layer 5 (`docs/architecture.md`). Plan: `specs/005-relationship-tree/plan.md`.
 
+mod by_id;
 mod neighbour_controls;
 mod rows;
 
@@ -297,6 +298,27 @@ impl Focusable for RelationshipTree {
 impl EventEmitter<ItemEvent> for RelationshipTree {}
 
 impl Item for RelationshipTree {
+    fn outline(&self, cx: &App) -> Option<studio_workspace::ViewOutline> {
+        self.outline_of(cx)
+    }
+
+    fn settling(&self, cx: &App) -> bool {
+        self.settling_now(cx)
+    }
+
+    fn catch_up(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.catch_up_now(cx);
+    }
+
+    fn refuses(
+        &self,
+        action: &dyn gpui::Action,
+        on: Option<&studio_actions::NodeId>,
+        cx: &App,
+    ) -> Option<studio_workspace::Refusal> {
+        self.refusal_of(action, on, cx)
+    }
+
     /// The selected row's node, read as the tree reads: held at its commit, or at the commit
     /// it shows, which may be behind the head ("Newer data").
     fn inspected(&mut self, cx: &mut Context<Self>) -> Option<Inspected> {
@@ -330,6 +352,27 @@ impl Item for RelationshipTree {
         Some(match &self.subject {
             Subject::Node(root) => tree_key(graph_id, root, self.at_commit.as_deref()),
             Subject::Set(set) => set_key(graph_id, set),
+        })
+    }
+
+    fn held_at(&self, _cx: &App) -> Option<String> {
+        self.at_commit.clone()
+    }
+
+    /// The selected row's node and the node the tree walks from (spec 032).
+    fn selected_ids(&self, _cx: &App) -> Option<studio_workspace::SelectedIds> {
+        let selected = self.selected_node();
+        let root = match &self.subject {
+            Subject::Node(root) => Some((root.type_name.clone(), root.id.clone())),
+            Subject::Set(_) => None,
+        };
+        if selected.is_none() && root.is_none() {
+            return None;
+        }
+        Some(studio_workspace::SelectedIds {
+            type_name: selected.as_ref().map(|node| node.type_name.clone()),
+            ids: selected.map(|node| node.id).into_iter().collect(),
+            root,
         })
     }
 
@@ -406,6 +449,7 @@ impl Item for RelationshipTree {
                 via: None,
                 preview: false,
                 filters: set.filters.clone(),
+                separate: false,
             })),
             _ => None,
         }
@@ -751,8 +795,13 @@ impl RelationshipTree {
                     exploration.update(cx, |e, cx| e.expand_all(&path, cx));
                 };
                 if opening.asks() {
-                    let (title, description, action) = opening.question();
-                    studio_workspace::confirm(window, cx, title, description, action, expand);
+                    studio_workspace::confirm_expand(
+                        window,
+                        cx,
+                        opening.nodes,
+                        opening.reads,
+                        expand,
+                    );
                 } else {
                     expand(window, cx);
                 }
@@ -950,6 +999,7 @@ impl RelationshipTree {
                 via: None,
                 preview: false,
                 filters: None,
+                separate: false,
             },
             Some(EntryKind::Group { key, .. } | EntryKind::Bucket { key, .. }) => {
                 // Seen from the other type, the relationship runs the other way.
@@ -961,6 +1011,7 @@ impl RelationshipTree {
                     via: Some(gq_language::builder::relationship_key(&back)),
                     preview: false,
                     filters: None,
+                    separate: false,
                 }
             }
             _ => return,
@@ -1113,8 +1164,12 @@ impl RelationshipTree {
                 target,
                 loading,
             } => {
+                // Opened on the canvas, the target is the row below: named there, once.
+                let below = rows::target_shown_below(&self.entries, self.visible[row]);
+                let target = target.as_ref().filter(|_| !below);
                 let value = match target {
                     Some(target) => rows::node_text(state, &target.node),
+                    None if below => String::new(),
                     None if *loading => "…".to_owned(),
                     None => "—".to_owned(),
                 };
@@ -1445,12 +1500,35 @@ impl RelationshipTree {
         )
     }
 
-    /// The tab's toolbar: hide relationships with none, and close everything below the root.
+    /// The tab's toolbar: the views, Refresh when the branch moved, hide relationships with
+    /// none, and close everything below the root.
     fn render_toolbar(&self, cx: &mut Context<Self>) -> gpui::Div {
         let hide_empty = self.hide_empty;
+        let newer = self.exploration.read(cx).newer_available();
         let strip = studio_workspace::view_strip(Item::views(self, cx), cx);
         studio_ui::ds::toolbar(cx)
             .children(strip)
+            // Beside the views, as the table and the query put it.
+            .when(newer, |d| {
+                d.child(
+                    studio_ui::ds::button("newer", "Newer data · Refresh")
+                        .style(ButtonStyle::Tinted(ui::TintColor::Accent))
+                        .tip_fn({
+                            let focus = self.focus_handle.clone();
+                            move |_, cx| {
+                                studio_ui::ds::tooltip_for_action_in_view(
+                                    "The branch moved since this tree was read. Refresh reads it again.",
+                                    &Refresh,
+                                    &focus,
+                                    cx,
+                                )
+                            }
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.with_exploration(cx, |e, cx| e.refresh(cx));
+                        })),
+                )
+            })
             .child(div().flex_1())
             .child(
                 studio_ui::ds::toolbar_actions()
@@ -1472,11 +1550,10 @@ impl RelationshipTree {
             )
     }
 
+    /// What is typed to filter the rows, under the toolbar while there is any.
     fn render_header(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let e = self.exploration.read(cx);
-        let newer = e.newer_available();
         let filter = self.filter.clone();
-        if !newer && filter.is_empty() {
+        if filter.is_empty() {
             return None;
         }
         let field = studio_ui::ds::surface::sunken(cx);
@@ -1489,26 +1566,6 @@ impl RelationshipTree {
                 .pt(px(space::SM))
                 .pb(px(space::SM))
                 .gap(px(space::XS))
-                .when(newer, |d| {
-                    d.child(
-                        studio_ui::ds::row_button("newer", "Newer data · Refresh")
-                            .style(ButtonStyle::Tinted(ui::TintColor::Accent))
-                            .tip_fn({
-                                let focus = self.focus_handle.clone();
-                                move |_, cx| {
-                                    studio_ui::ds::tooltip_for_action_in_view(
-                                        "The branch moved since this tree was read. Refresh reads it again.",
-                                        &Refresh,
-                                        &focus,
-                                        cx,
-                                    )
-                                }
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.with_exploration(cx, |e, cx| e.refresh(cx));
-                            })),
-                    )
-                })
                 // What is typed filters the rows; it reads as a field so it is not taken for
                 // a row.
                 .when(!filter.is_empty(), |d| {
@@ -1519,19 +1576,14 @@ impl RelationshipTree {
                             .gap(px(space::SM))
                             .rounded(px(studio_ui::ds::radii(cx).sm))
                             .bg(field)
-                            .child(
-                                studio_ui::ds::icon::meta(IconName::MagnifyingGlass),
-                            )
+                            .child(studio_ui::ds::icon::meta(IconName::MagnifyingGlass))
                             .child(
                                 div()
                                     .min_w_0()
                                     .flex_1()
                                     .child(studio_ui::ds::text::body(filter).truncate()),
                             )
-                            .child(
-                                studio_ui::ds::text::meta("esc")
-                                    .color(Color::Disabled),
-                            ),
+                            .child(studio_ui::ds::text::meta("esc").color(Color::Disabled)),
                     )
                 })
                 .into_any_element(),
@@ -1675,6 +1727,9 @@ impl Render for RelationshipTree {
             .on_action(cx.listener(Self::open_table))
             .on_action(cx.listener(Self::open_page))
             .on_action(cx.listener(Self::toggle_empty_groups))
+            .on_action(cx.listener(Self::select_node))
+            .on_action(cx.listener(Self::expand_neighbourhood))
+            .on_action(cx.listener(Self::collapse_nodes))
             // ⌘R reads the tree again at the branch head, as its Newer data button does, and
             // goes on to the workspace, which reads the graph's schema, branches and counts.
             .on_action(cx.listener(|this, _: &Refresh, _, cx| {
@@ -1987,6 +2042,43 @@ mod tests {
         assert_ne!(held, same);
     }
 
+    /// A tree nobody draws (its window is minimized or covered) still answers a reader that
+    /// waits for it: asked to catch up, it makes the rows it left for a draw, and has settled.
+    #[gpui::test]
+    async fn a_tree_not_drawn_catches_up_when_asked(cx: &mut gpui::TestAppContext) {
+        cx.update(studio_theme::init_test);
+        let (session, _served) = followed_session(
+            "node Person {\n  slug: String @key\n  name: String\n}\nedge Knows: Person -> Person\n",
+            |_| serde_json::json!([{ "id": "p1", "label": "Ada", "n": 0 }]),
+            cx,
+        );
+        cx.run_until_parked();
+        let ada = NodeRef::new("Person", "p1");
+        let tree = cx.new(|cx| RelationshipTree::new(session, Subject::Node(ada), None, cx));
+        let before = tree.read_with(cx, |tree, _| tree.entries.clone());
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(10));
+        cx.run_until_parked();
+        tree.read_with(cx, |tree, cx| {
+            assert!(tree.rebuild_owed, "the answers are owed to the next draw");
+            assert!(tree.settling_now(cx), "so the tree has not settled");
+        });
+        // No draw comes. The reader asks, as often as it looks.
+        for _ in 0..10 {
+            tree.update(cx, |tree, cx| tree.catch_up_now(cx));
+            cx.run_until_parked();
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(40));
+            cx.run_until_parked();
+        }
+        tree.read_with(cx, |tree, cx| {
+            assert!(!tree.rebuild_owed);
+            assert!(!tree.settling_now(cx), "settled without a draw");
+            assert!(!Arc::ptr_eq(&tree.entries, &before), "the rows were made");
+        });
+    }
+
     fn person_set(select: Option<&str>) -> ShowSetInTree {
         ShowSetInTree {
             title: "Person, Berlin".into(),
@@ -2151,6 +2243,7 @@ mod tests {
                 via: None,
                 preview: false,
                 filters: person_set(None).filters,
+                separate: false,
             }));
             assert_eq!(
                 Item::thing(tree, cx),

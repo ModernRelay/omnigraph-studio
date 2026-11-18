@@ -103,6 +103,12 @@ the zip it already builds:
 
 ### What the CLI looks up
 
+*Superseded for the link (2026-11-18, spec 034):* the 0.15.0 CLI's `omnigraph studio` reads
+neither key below and installs nothing. It checks `HKCR\omnigraph-studio` for `URL Protocol` and
+`shell\open\command`, then opens the link with `rundll32 url.dll,FileProtocolHandler`, so the
+installer writes that URL protocol from 0.4.9 and Studio reads the link from its arguments. The
+keys below still say where Studio is installed.
+
 In this order, the first that exists:
 
 1. `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\com.modernrelay.omnigraph-studio_is1`

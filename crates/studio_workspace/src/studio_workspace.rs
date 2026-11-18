@@ -53,10 +53,10 @@ use studio_ui::window_buttons::{self, WindowButtons};
 use ui::prelude::*;
 use ui::{ButtonLike, PopoverMenu, right_click_menu};
 
-pub use confirm::{Confirm, confirm};
-use item::ItemHandle;
+pub use confirm::{Confirm, confirm, confirm_expand};
 pub use item::{
-    Inspected, InspectedNode, Item, ItemEvent, ItemStatus, KeyHint, NodeInspector,
+    Inspected, InspectedNode, Item, ItemEvent, ItemHandle, ItemStatus, KeyHint, NodeInspector,
+    OutlineEdge, OutlineGroup, OutlineNode, Refusal, SelectedIds, ViewOutline,
     register_node_inspector,
 };
 pub use open_failure::open_failure;
@@ -447,7 +447,31 @@ pub struct Workspace {
     /// toasted or passed over.
     outcomes_toasted: HashMap<EntityId, u64>,
     _item_subscriptions: Vec<(gpui::EntityId, Subscription)>,
+    /// The agent whose tool call last opened or showed something here (spec 032), shown in the
+    /// status bar as "Opened by <agent>" for [`OPENED_BY_FOR`].
+    opened_by: Option<SharedString>,
+    _opened_by: Option<Task<()>>,
 }
+
+/// One pane's tabs, as [`Workspace::pane_tabs`] lists them.
+pub struct PaneTabs<'a> {
+    /// The window's active pane.
+    pub active: bool,
+    pub tabs: Vec<PaneTab<'a>>,
+}
+
+/// One tab of a pane.
+pub struct PaneTab<'a> {
+    pub item: &'a dyn ItemHandle,
+    /// The tab in front of its pane.
+    pub active: bool,
+    /// The pane's preview tab, which the next pick takes the place of.
+    pub preview: bool,
+}
+
+/// How long the status bar says who opened or showed something in the window
+/// ([`Workspace::show_opened_by`]).
+pub const OPENED_BY_FOR: Duration = Duration::from_secs(4);
 
 /// How often, at most, the workspace's state is compared with what was last written.
 const SAVE_CHECK: Duration = Duration::from_millis(250);
@@ -735,6 +759,8 @@ impl Workspace {
             _settings_subscription: settings_subscription,
             performance: None,
             status_items: Vec::new(),
+            opened_by: None,
+            _opened_by: None,
             window_active: window.is_window_active(),
             _performance: None,
             _performance_subscription: performance_subscription,
@@ -1646,6 +1672,29 @@ impl Workspace {
 
     // ---- panes and items ----
 
+    /// The window's panes in layout order, each with its tabs in strip order: what a reader of
+    /// the window lists (a UI tool, a test).
+    pub fn pane_tabs(&self) -> Vec<PaneTabs<'_>> {
+        self.center
+            .panes()
+            .into_iter()
+            .filter_map(|id| self.pane(id))
+            .map(|pane| PaneTabs {
+                active: pane.id == self.active_pane,
+                tabs: pane
+                    .items
+                    .iter()
+                    .enumerate()
+                    .map(|(index, item)| PaneTab {
+                        item: item.as_ref(),
+                        active: index == pane.active,
+                        preview: pane.is_preview(index),
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
     fn pane(&self, id: PaneId) -> Option<&Pane<Box<dyn ItemHandle>>> {
         self.panes.iter().find(|pane| pane.id == id)
     }
@@ -2426,6 +2475,65 @@ impl Workspace {
         cx.notify();
     }
 
+    /// The panels shown now: each open dock's panel in front.
+    pub fn shown_panels(&self) -> Vec<SharedString> {
+        [&self.left, &self.right, &self.bottom]
+            .into_iter()
+            .filter(|dock| dock.open)
+            .filter_map(|dock| dock.active_id())
+            .collect()
+    }
+
+    /// Whether the window has a panel by this id, in any dock.
+    pub fn has_panel(&self, id: &str) -> bool {
+        self.dock_of(id).is_some()
+    }
+
+    /// Every panel's id, dock by dock.
+    pub fn panel_ids(&self) -> Vec<SharedString> {
+        [&self.left, &self.right, &self.bottom]
+            .into_iter()
+            .flat_map(|dock| dock.panels.iter().map(|panel| panel.id.clone()))
+            .collect()
+    }
+
+    /// A panel's title, as its header says it.
+    pub fn panel_title(&self, id: &str) -> Option<SharedString> {
+        [&self.left, &self.right, &self.bottom]
+            .into_iter()
+            .flat_map(|dock| dock.panels.iter())
+            .find(|panel| panel.id.as_ref() == id)
+            .map(|panel| panel.title.clone())
+    }
+
+    /// Says in the status bar that an agent's tool call opened or showed something here (spec
+    /// 032, Focus): "Opened by <agent>", for [`OPENED_BY_FOR`]. Another call
+    /// meanwhile starts the time again.
+    pub fn show_opened_by(
+        &mut self,
+        agent: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.opened_by.as_ref() != Some(&agent) {
+            self.opened_by = Some(agent);
+            cx.notify();
+        }
+        self._opened_by = Some(cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(OPENED_BY_FOR).await;
+            this.update(cx, |this, cx| {
+                this.opened_by = None;
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// The agent the status bar says opened something, while it says so.
+    pub fn opened_by(&self) -> Option<&SharedString> {
+        self.opened_by.as_ref()
+    }
+
     /// Whether the inspector is shown: its dock open, with the inspector in front. Zoom and
     /// focus mode, which draw no dock for a while, leave this as it is.
     pub fn inspector_shown(&self) -> bool {
@@ -3018,6 +3126,17 @@ impl Workspace {
             .ok();
         })
         .detach();
+    }
+
+    /// Whether the active tab is its pane's preview, which the next preview replaces: for the
+    /// tests of crates that open tabs from a tab.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn active_tab_is_preview(&self) -> bool {
+        self.pane(self.active_pane).is_some_and(|pane| {
+            pane.active_item()
+                .and_then(|item| pane.position(item.tab_id()))
+                .is_some_and(|index| pane.is_preview(index))
+        })
     }
 
     /// The text of each toast shown, oldest first: for the tests of crates that show toasts.
@@ -3716,9 +3835,29 @@ impl Workspace {
         })
     }
 
+    /// The panel whose body or focus target holds the keyboard, as the frame drawn last says.
+    pub fn panel_with_focus(&self, window: &Window, cx: &App) -> Option<SharedString> {
+        [&self.left, &self.right, &self.bottom]
+            .into_iter()
+            .flat_map(|dock| dock.panels.iter())
+            .find(|panel| {
+                let in_body = self
+                    .dock_hosts
+                    .get(&panel.view.entity_id())
+                    .is_some_and(|host| host.read(cx).focus_handle.contains_focused(window, cx));
+                in_body
+                    || panel
+                        .focus
+                        .as_ref()
+                        .and_then(|focus| focus(cx))
+                        .is_some_and(|focus| focus.contains_focused(window, cx))
+            })
+            .map(|panel| panel.id.clone())
+    }
+
     /// Gives the keyboard to the active tab: the dock that had it is hidden or covered, and the
     /// keys would go on driving a panel nobody sees.
-    fn focus_active_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn focus_active_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let index = self.pane(self.active_pane).map_or(0, |p| p.active);
         self.activate_in(self.active_pane, index, false, window, cx);
     }
@@ -3764,7 +3903,12 @@ impl Workspace {
         let (color, server, url, state, ready, actor, graph, unavailable) = match &self.session {
             Some(session) => {
                 let s = session.read(cx);
-                let actor = s.actor().map(str::to_owned);
+                // Who the credential acts as, and the OAuth client it acts through when the
+                // server names one (Omnigraph 0.15).
+                let actor = s.actor().map(|actor| match s.client_id() {
+                    Some(client) => format!("{actor} through {client}"),
+                    None => actor.to_owned(),
+                });
                 let connection = s.connection.read(cx);
                 let ready = connection.state == ConnectionState::Ready;
                 // The server's round trip from the last health check, beside its state.
@@ -4578,6 +4722,16 @@ impl Workspace {
                     .flex_none()
                     .child(studio_ui::ds::spinner())
                     .child(studio_ui::ds::text::meta(text).single_line())
+            }))
+            .children(self.opened_by.clone().map(|agent| {
+                // Rare, and a sign something moved: it comes in with a short fade (VII).
+                studio_ui::ds::chip(format!("Opened by {agent}"), cx)
+                    .id("opened-by")
+                    .with_animation(
+                        "opened-by-arrives",
+                        studio_ui::motion::arrival(studio_ui::motion::ENTER),
+                        |chip, delta| chip.opacity(delta),
+                    )
             }))
             .children(status.end)
             // The tab's keys, behind one button: the bar names facts, not shortcuts.

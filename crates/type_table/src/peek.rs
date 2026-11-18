@@ -1075,6 +1075,25 @@ impl NodePeek {
         self._renaming.insert(id, task);
     }
 
+    /// Group `index`'s neighbours, read under `read_under`, landed: when the schema names their
+    /// type by another property since (spec 002, "Node names"), their names are read again
+    /// under it, as a table's relationship cells are. A group still loading, or a next page
+    /// out, when the choice changed would otherwise show the old names for good.
+    fn rename_if_named_otherwise(
+        &mut self,
+        index: usize,
+        read_under: Option<&SchemaModel>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(group) = self.groups.get(index) else {
+            return;
+        };
+        let other = group.group.other_type.clone();
+        if names_by(read_under, &other) != names_by(self.schema.as_deref(), &other) {
+            self.rename_neighbours(&std::collections::BTreeSet::from([other]), cx);
+        }
+    }
+
     /// The connection's token changed ([`SessionEvent::CredentialChanged`]): the new one may
     /// see less than the old, so nothing the old one read stays shown (the node, its
     /// relationships, its Blob values and what the table read of it) and the reads still out
@@ -2396,6 +2415,11 @@ impl NodePeek {
         group.neighbours = Loadable::Loading;
         group.read_at = snapshot.clone();
         let relationship = group.group.clone();
+        // The schema its neighbours are named under ([`Self::rename_if_named_otherwise`]).
+        let read_under = self.schema.clone();
+        let Some(group) = self.groups.get_mut(index) else {
+            return;
+        };
         group._task = Some(cx.spawn(async move |this, cx| {
             if debounce {
                 cx.background_executor().timer(COUNT_DELAY).await;
@@ -2426,6 +2450,7 @@ impl NodePeek {
                                 group.expanded = opens;
                             }
                         }
+                        this.rename_if_named_otherwise(index, read_under.as_deref(), cx);
                     }
                     Err(error) => this.group_refused(
                         index,
@@ -2618,6 +2643,7 @@ impl NodePeek {
                         Err(error) => group.neighbours = Loadable::Failed(error.to_string()),
                     }
                 }
+                this.rename_if_named_otherwise(index, Some(&schema), cx);
                 cx.notify();
             })
             .ok();
@@ -3494,9 +3520,9 @@ impl NodePeek {
 
     /// Reads the other type's nodes matching what is typed, eight at a time, after a pause.
     fn search(&mut self, cx: &mut Context<Self>) {
-        let Some(schema) = self.schema.clone() else {
+        if self.schema.is_none() {
             return;
-        };
+        }
         let Some(adding) = self.adding.as_mut() else {
             return;
         };
@@ -3505,15 +3531,15 @@ impl NodePeek {
         };
         let text = adding.editor.read(cx).text(cx).trim().to_owned();
         let other = &group.group.other_type;
-        let search = suggest::search_nodes(&self.session, &schema, other, &text, None, cx);
+        let search = suggest::search_nodes(&self.session, other, &text, None, cx);
         adding._search = Some(cx.spawn(async move |this, cx| {
             let result = search.await;
             this.update(cx, |this, cx| {
                 if let Some(adding) = this.adding.as_mut() {
                     // A failed search offers nothing, not what an earlier one found.
                     match result {
-                        Ok(rows) => {
-                            adding.offers.set(suggest::from_node_rows(&rows), true);
+                        Ok(hits) => {
+                            adding.offers.set(suggest::from_hits(&hits), true);
                             adding.found = Loadable::Loaded(());
                         }
                         Err(error) => {
@@ -4989,6 +5015,7 @@ impl NodePeek {
                             via: None,
                             preview: false,
                             filters: None,
+                            separate: false,
                         }),
                         cx,
                     );

@@ -429,6 +429,7 @@ mod tests {
             rows: rows.into(),
             graph_commit_id: Some("c1".into()),
             page: None,
+            ranking: None,
         }
     }
 

@@ -209,7 +209,7 @@ mutating route is needed: edits, loads, merges, branch and commit control alread
 | E6 | `GET /graphs/{id}/diff?from=&to=&kind=&type=&op=&page_token=&limit=` → paged entity changes with optional before/after images | `diff_between`, plus a paged variant with images | Both ends resolve once; page tokens pin commit ids, never branch names; bounded pages | 008 | Fold the change feed from the fork, capped at 20,000 changes, "Partial" when capped |
 | E7 | `GET /graphs/{id}/merge-base?a=&b=` | Commit lineage (`generation` on graph commits) | Pure read of `__manifest` lineage | 008 | Walk `GET /commits` parents |
 | E8 | `POST /graphs/{id}/branches/merge/preview {source, target}` → outcome, merge base, conflicts, change summary | A merge-planning step that stops before staging | Must stage nothing durable, not even a detached commit; `read` on both branches. If the engine can only answer by staging, keep `as_commit` as the preview | 008 | Merge on request; a 409 lists conflicts and nothing moved |
-| E9 | `GET /graphs/{id}/branches?detail=true` → name, head, fork commit, creator, created and updated times | Branch refs and lineage | Derived from `__manifest`; no shadow branch table | 002, 008 | Derive from `GET /commits?branch=` |
+| E9 | `GET /graphs/{id}/branches?detail=true` → name, head, fork commit, creator, created and updated times. *Landed in `v0.15.0`* as `?detailed=true` (#1012), without the creator | Branch refs and lineage | Derived from `__manifest`; no shadow branch table | 002, 008 | From a 0.15 server, one detailed list answers a list's heads (`ServerFeature::DetailedBranchList`, spec 034); from a 0.14 server, `GET /commits?branch=` per branch |
 | E10 | `GET /graphs/{id}/commits?branch=&limit=&before=` | Bounded lineage walk, keyset on generation and id | Cost scales with the page, not history | 009 | Landed as `limit` and `page_token` (#1013); adopted in History (a page at a time), the snapshot picker (one page) and Review (down to the fork) |
 | E11 | Typed columns in `ReadOutput` (`columns: [{name, type, nullable}]`) or Arrow IPC (RFC 0051) | The result's Arrow schema | Additive DTO field; regenerate `openapi.json` | 004, 007 | `describe_query_operation` in `omnigraph-compiler` |
 | E12 | `POST /graphs/{id}/query?profile=true` | `query_inspected`, made a supported API | Exposes plan internals; gate on `read` or a new `inspect` action | 007 | Plans only, through `explain query …` |
@@ -230,7 +230,7 @@ in-process.
 them. *Waits:* E17. *Today:* `grammars/` in this repository.
 
 **E19. Publish `omnigraph-compiler` to crates.io again.** crates.io stops at 0.8.0; the repo is
-at 0.13. *Waits:* 001. *Today:* git dependency on tag `v0.13.0`.
+at 0.15. *Waits:* 001. *Today:* git dependency on tag `v0.15.0`.
 
 ### Agent identity
 
@@ -331,6 +331,16 @@ of changes is worked out whole before the server answers, and the server sets no
 until these land Studio waits up to five minutes for a read of changes
 (`graph_client::CHANGE_READ_TIMEOUT`), and a review says when the server is still working.
 
+`v0.15.0` (2026-11-09) resolves part of this. Diffs and reviews over several commits of one
+history, with no merge between them, read only the changed rows (#1201, closing #969); a merge
+reads only the fragments each side changed and deletes by the row ids it read (#1229, #1301); a
+branch's ref is one storage request instead of three (#1229); and reads no longer wait for a
+write on the same handle (#1228). E35 is partly resolved, E36, E37 and E38 are not (#970, #972
+and #1157 are open on 2026-11-18). Studio keeps every wait and page size below: a 0.14 server
+still costs what was measured, a 0.15 one still compares both tables across a merge or between
+two moved branches, and a longer timeout or a larger page costs nothing when the server answers
+sooner (spec 034).
+
 **E35. Diff cost that follows the changes, not the tables.**
 [ModernRelay/omnigraph#969](https://github.com/ModernRelay/omnigraph/issues/969). `GET /diff` and
 `GET /branches/diff` read both full tables of every type the two endpoints differ in, unless the
@@ -341,8 +351,11 @@ what the branch changed. The diff from a branch's merge base to its head,
 to 9.6 s. The draft RFC [ModernRelay/omnigraph#1171](https://github.com/ModernRelay/omnigraph/pull/1171)
 proposes finding the changed rows by fragment identity, as branch merge does, so the cost follows
 the change. Engine rule: a diff stays pinned to the two commits it resolved, and a page stays
-bounded by its `limit` and byte budget. *Waits:* 008. *Today:* a review's reads of changes wait
-up to five minutes, and after 10 s it says the server is still working out the changes.
+bounded by its `limit` and byte budget. *Partly landed in `v0.15.0`* (#1201): a window of one
+history with no merge reads only the changed rows; across a merge commit, or between two branches
+that both moved, the diff still compares both tables. *Waits:* 008. *Today:* a review's reads of
+changes wait up to five minutes, and after 10 s it says the server is still working out the
+changes, from every server: its waits are for the diffs 0.15 did not change too.
 
 **E36. A change page that resumes its work.**
 [ModernRelay/omnigraph#970](https://github.com/ModernRelay/omnigraph/issues/970). Every page of
@@ -375,6 +388,19 @@ budget is spent, would keep each answer short and let a client show progress; RF
 commit-ceiling parameter and a work ceiling to the feed. Engine rule: a page
 still ends on a whole commit and its cursor resumes after it. *Waits:* 008. *Today:* the feed is
 read in pages of up to 8,192 changes, each waited for up to five minutes.
+
+**E54. A validation refusal that says nothing was written.** A mutation refused in validation,
+before it stages anything, answers 400 `bad_request` with `disposition: {effects: unknown,
+action: reconcile}`: an `@card` bound (`@card violation on edge MemberOf: source 'bo' has 0 edges
+(min 1)`) and a missing endpoint (`__dst 'nobody' not found in Team`) alike, on `v0.14.0` and
+`v0.15.0` (sent to both on 2026-11-18, spec 034). 0.15 checks a `@card` minimum on every write
+that inserts or updates a source node (#1212), so a client that saves a node before its edges now
+meets this on an ordinary insert. `effects: none, action: fix`, with the violation as a typed
+detail (`ErrorOutput.cardinality_violation`: edge, source, count, bound), would let a client
+call it a refusal and say which bound in its own words. Engine rule: report `none` only for a
+refusal made before any staging. *Waits:* 004, 034. *Today:* Studio judges it unknown, as the
+disposition says, names the bound from the server's words (`graph_store::CardViolation`), and
+saves a new node with the edges its minimum needs in one mutation on a 0.15 server.
 
 **E39. A page of a wide type that reads only what it returns.**
 A sorted page reads every column of every row before it keeps the page's rows, and a filtered
@@ -430,12 +456,31 @@ type, the property, and whether the query returns that variable's `@id`, would m
 property cells editable as a `.gq` file's are. Engine rule: no query text is exposed; the
 descriptor is the compiler's. *Waits:* 024. *Today:* stored-query views are read-only.
 
+**E52. A commit's schema change.** A commit that changed the schema cannot be compared with its
+parent: `GET /commits/{id}/changes` refuses it (409, `change_diff_refusal.reason`
+`schema_boundary`, naming one type), and `GET /graphs/{id}/schema` answers only the head's
+schema, so Studio cannot read the schema at a commit to compare it itself. The schema at a
+commit (`GET /graphs/{id}/schema?commit=`), or a commit's schema diff (types and properties
+added, changed and removed), would let a commit's tab show what a schema change did, as it
+shows a data change. Engine rule: the same `read` gate as the commit's changes.
+*Waits:* 033. *Today:* "Schema change", the type the refusal names, and no retry.
+
+**E53. A merge conflict's two sides.** A merge's conflicts (`MergeConflictOutput`, from a dry
+run or a 409) name the kind, the type, the entity and a message, but not the values: Studio
+holds the branch's side from its review and nothing of what the target did. The base's, the
+source's and the target's images of the conflicting entity (or the conflicting properties' three
+values) would let a card say what each branch did to it. Engine rule: the dry run stays free of
+effects; the images are read at the commits the merge resolved.
+*Waits:* 033. *Today:* the conflict's kind in words and the server's message, on the card and in
+the conflicts list.
+
 **E44. A commit's change counts in its listing.**
 A commit's change counts are read from its changes (`GET /graphs/{id}/commits/{id}/changes`), one
 page of up to 100 per listed commit, each change carrying its before and after images, only to
 count them; a commit with more shows a partial count. `CommitOutput` in `GET /commits` and
 `GET /commits/{id}` giving the entities the commit added, changed and removed, counted when the
-commit is made, would make the counts of History and the Commits panel one field each and exact.
+commit is made, would make the counts of History and the Commits panel one field each and exact;
+counted by type too, they would give the inspector's summary line (spec 033) without a read.
 *Waits:* 009, 026. *Today:* one changes page per drawn row, kept per commit, partial past 100.
 
 ### First run
@@ -475,6 +520,44 @@ type). [#1397](https://github.com/ModernRelay/omnigraph/issues/1397).
 unbound; the write path's `@card` recount refuses one that would leave a dependent behind, and
 a row changed elsewhere since it was read may still be deleted.
 
+### Finding nodes (spec 031)
+
+Measured on 2026-11-16 against the ModernRelay operating graph (read-only) and three local
+graphs; the numbers are in spec 031's validation log.
+
+**E49. A substring test that ignores case and accents.** GQ's `contains` and `starts_with` are
+exact and case-sensitive (`references/queries.md`, "Filter Operators"), and neither 0.14, 0.15
+nor main (`query.pest` at `4f7c2076`) has `lower()`, `icontains` or `ilike`. A search for
+"bluequill" therefore misses "BlueQuill" unless the client guesses its spelling. Add
+`icontains`/`istarts_with` (Unicode case folding, and a variant that also folds accents), or
+`lower()` and `fold()` usable in filters, which E40's string functions would cover. Engine rule:
+folding is the same on every platform and every server, and is documented with its Unicode
+version. *Waits:* 031. *Today:* a type of at most 5,000 nodes is matched in Studio's memory,
+from a name index read once per commit; a larger type is searched on the server with each word
+in four spellings (as typed, lowercase, Capitalized, UPPERCASE), so "mcAllister" still misses
+"McAllister" there.
+
+**E50. One request that finds nodes across types.** A node search reads each node type on its
+own, one request per type: 36 on the ModernRelay operating graph for a first search, then one
+per type whenever its nodes change. A route (or a GQ form) that takes a text and returns ranked
+matches per type, with a limit per type and the property each matched, would make a search one
+request, and let the server rank across types. Engine rule: the same read permission as a query
+of each type; a type the caller may not read is left out, not refused. *Waits:* 031. *Today:*
+one index read per type and commit, at most 8 at once (`READ_CONCURRENCY`), and the ranking is
+Studio's.
+
+**E51. Full-text search without declaring an index, and inside words.** `search`, `fuzzy`,
+`match_text` and `bm25` fold case and stem words, but only on a String with a one-column
+`@index` or `@key` (`T27` otherwise): on the ModernRelay operating graph `Org.name`,
+`Person.name`, `Opportunity.title` and `Meeting.title` have none, so the engine's search cannot
+be used for what people most often type. Full-text also matches whole words only: "llist" never
+finds "McAllister". Let the label-like properties be searchable without a declaration per
+property (a schema-level default, or a scan with the same analyzer when no index exists), and
+add an n-gram analyzer or a substring mode so one call finds a word's middle too. Engine rule:
+results of a scan and of an index are the same. *Waits:* 031. *Today:* Studio runs the engine's
+search only on properties that declare an index, merges its hits after its own matches, and
+leaves out a property whose search fails.
+
 ### In 0.14, not in 0.13.0
 
 Studio's minimum server serves these, so it uses them without asking the server's OpenAPI
@@ -504,13 +587,17 @@ Studio's own work first, for what landed:
 Then engine changes still open:
 
 3. E11 typed columns: additive, used everywhere.
-4. E9 branch details (#1012, open): the review surface.
+4. E9 branch details: landed in `v0.15.0` (#1012); Studio uses them where a server serves them
+   (spec 034).
 5. E1 to E5 launcher: the one-command local experience.
 6. E20 delegated credentials (an RFC), which retires spec 013's gateway rules.
 7. E16 neighbourhood counts.
 8. E12, E13, E14, E17, E18, E19 as the matching Studio work starts.
-9. E35 to E38, which make a large graph's review take seconds rather than a minute; E37 is the
-   smallest.
+9. E35 to E38, which make a large graph's review take seconds rather than a minute; E35 partly
+   landed in `v0.15.0` (#1201), and E37 is the smallest of the rest. E54 with them: it is one
+   disposition.
+10. E49 to E51, which would make finding a node one request and right on every type, however
+    large; E49 is the smallest.
 
 ## Decisions
 
@@ -524,6 +611,8 @@ Then engine changes still open:
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-11-18 | What `v0.15.0` resolves, and a validation refusal's disposition (E9, E35 to E38, E54) | `docs/releases/v0.15.0.md` at the tag; `gh issue view` 969, 970, 972, 1157; mutations sent with curl to `v0.14.0` and `v0.15.0` release servers serving `script/dev-server`'s cluster plus a `MemberOf: Member -> Team @card(1..)` edge | E9 landed (#1012); E35 partly (#1201, #969 closed); #970, #972, #1157 open. A lone `Member` insert: 0.14 commits it, 0.15 answers 400 `@card violation … (min 1)` with `effects: unknown, action: reconcile`; with its `MemberOf` in the same mutation both commit. Deleting a required edge and an edge to a missing node answer the same disposition on both releases: E54 |
+| 2026-11-17 | Omnigraph `v0.15.0` needs no engine change from Studio | `openapi.json` at `v0.15.0` diffed with `v0.14.0`'s; the release notes (`gh release view v0.15.0`) | Contract still 0.14; no path, field or enum value removed; new fields (`ranking`, `details`, `client_id`) optional, one new error code (`not_admitted`). No new ID |
 | 2026-11-06 | A page of a wide, large type costs the server what it holds, not what it returns (E39) | `script/dev-big-server` (`v0.14.0`, `Account`: 95 columns, 100,000 rows), each read sent with curl, then Studio's snapshot tool with `OMNIGRAPH_STUDIO_TRACE` (`docs/perf/20261106-report.md`) | `order { $n.@id } limit 100` returning `$n`: 0.91 s; returning `$n.slug`: 0.08 s; `$n` unordered: 0.03 s; `$n.@id = $id`: 0.43 s; `$n.@id in $ids` (101): 0.46 s. Studio's first page: 947 ms of which 3.5 ms decoding. Filed as E39 |
 | 2026-10-26 | A review's reads of changes take most of a minute on the personal graph, for reasons in the engine (E35 to E38) | The readings of 2026-10-25 in spec 008's validation log; issues #969, #970, #972 and #1157 and the draft RFC #1171 (`gh issue view`, `gh pr view`, all open on 2026-10-27); Omnigraph `7711e4a`: `changes/model.rs:36`, `handlers.rs:4862` and `CHANGE_FEED_PARAMS`, `db/omnigraph.rs` `prepare_diff` and `reopen_diff_continuation` | Filed as E35 (#969), E36 (#970), E37 (#972) and E38 (#1157, filed after: the feed's 128-commit page has no HTTP parameter). Studio waits five minutes for a read of changes and says the server is still working (spec 008) |
 | 2026-10-22 | The first published build whose CLI reads Studio's home is `edge-20261022-7fff9df` | `git ls-remote --tags` of ModernRelay/omnigraph (`edge-20261021-888223b`, then `edge-20261022-7fff9df` at `7fff9dfd`); `git merge-base --is-ancestor ff542202 7fff9dfd`; the installed `0.14.0-edge+7fff9df`'s `version --json` and `config validate --operator-config` on a file with a loopback server target of `auth: {provider: anonymous}`, beside `0.14.0-edge+888223b`'s | `7fff9dfd` contains `ff542202`. `7fff9df` reports protocols `target` 1, `credential` 1, `access` 1 and passes the file; `888223b` reports the same protocols and refuses it (`invalid type: string "anonymous", expected internally tagged enum StrictAuthProfile`) |

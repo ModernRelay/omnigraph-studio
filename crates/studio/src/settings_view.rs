@@ -225,6 +225,20 @@ impl SettingsView {
         this
     }
 
+    /// Shows one section, clearing a search: what `OpenAgentSettings` opens at.
+    pub fn show_section(
+        &mut self,
+        section: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.section = Some(section);
+        self.scope = Scope::All;
+        self.search
+            .update(cx, |search, cx| search.clear(window, cx));
+        cx.notify();
+    }
+
     /// Each text field shows its setting's value in the current scope, unless it holds typing
     /// not yet written: a control pressed while a field has focus draws the values before the
     /// field hears it lost focus and writes.
@@ -1104,6 +1118,12 @@ impl Render for SettingsView {
                                 control,
                                 reset,
                             );
+                            // The outside-agent switch, when on, shows how to add Studio to
+                            // each agent (spec 032, Outside agents).
+                            let row = match outside_agents(field, values, cx) {
+                                Some(commands) => v_flex().child(row).child(commands),
+                                None => v_flex().child(row),
+                            };
                             if index + 1 < count {
                                 row.border_b_1().dotted(cx)
                             } else {
@@ -1191,6 +1211,17 @@ impl Render for SettingsView {
                     .child(body),
             )
     }
+}
+
+/// Under the outside-agent switch, while it is on: the address and the commands that add
+/// Studio to an agent ([`crate::ui_tools::outside_agents_row`]).
+fn outside_agents(field: &SettingField, values: &SettingsValues, cx: &App) -> Option<AnyElement> {
+    if field.path.join(".") != "agent.outside_agents"
+        || values.at(&field.path) != &Value::Bool(true)
+    {
+        return None;
+    }
+    Some(crate::ui_tools::outside_agents_row(cx))
 }
 
 /// Whether the scope switch shows: where it changes something, a section with a setting a graph

@@ -7,7 +7,7 @@
 use editor::scroll::Autoscroll;
 use editor::{Editor, MultiBufferOffset, SelectionEffects};
 use gpui::{App, Context, Entity, EventEmitter, FocusHandle, Focusable, Render, SharedString};
-use graph_store::{GraphSession, Loadable, SessionEvent};
+use graph_store::{GraphSession, Loadable, ServerFeature, SessionEvent};
 use studio_actions::graph::OpenMap;
 use studio_actions::{ViewKind, ViewLink};
 use studio_ui::ds::Tipped;
@@ -29,6 +29,8 @@ pub struct SchemaView {
     reveal: Option<String>,
     /// The session reads under a newer schema than the one shown.
     newer: bool,
+    /// Why a schema apply would refuse the source shown ([`gq_language::admission_refusal`]).
+    refused: Option<String>,
     _subscription: gpui::Subscription,
 }
 
@@ -108,6 +110,7 @@ impl SchemaView {
             shown: None,
             reveal: None,
             newer: false,
+            refused: None,
             _subscription: subscription,
         };
         if let Some(language) = language(Syntax::Pg, cx)
@@ -137,6 +140,7 @@ impl SchemaView {
             self.editor
                 .update(cx, |editor, cx| editor.set_text(source, window, cx));
             self.shown = Some(schema.source.clone());
+            self.refused = gq_language::admission_refusal(&schema.source);
         }
         if let Some(type_name) = self.reveal.take()
             && let Some(name) = declaration(&schema.source, &type_name)
@@ -223,14 +227,68 @@ impl Render for SchemaView {
                         ),
                 )
             })
+            .children(self.refused.as_deref().map(|refused| {
+                let refuses = self
+                    .session
+                    .read(cx)
+                    .features(cx)
+                    .has(ServerFeature::UniqueOnScalarsOnly);
+                h_flex()
+                    .px(px(studio_ui::ds::space::MD))
+                    .pb(px(studio_ui::ds::space::XS))
+                    .debug_selector(|| "schema-refused".into())
+                    .child(
+                        studio_ui::ds::text::body(refused_note(refused, refuses))
+                            .color(Color::Warning),
+                    )
+            }))
             .child(self.editor.clone())
             .into_any_element()
     }
 }
 
+/// What the schema view says of a schema the server holds but a schema apply would refuse:
+/// `refuses` when the server is a release that refuses it (Omnigraph 0.15,
+/// [`ServerFeature::UniqueOnScalarsOnly`]); an older one still applies it, though no write can
+/// satisfy the constraint.
+fn refused_note(refused: &str, refuses: bool) -> String {
+    let refused = studio_ui::clause(refused);
+    if refuses {
+        format!(
+            "This server refuses any schema change that keeps this: {refused}. Drop the \
+             constraint in the schema you apply."
+        )
+    } else {
+        format!(
+            "Omnigraph 0.15 refuses any schema change that keeps this: {refused}. No write can \
+             set such a property; drop the constraint before you upgrade."
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::declaration;
+    use super::{declaration, refused_note};
+
+    /// A schema an apply would refuse says so, in words that follow what the server serves.
+    #[test]
+    fn a_refused_schema_says_what_the_server_does_with_it() {
+        let refused = gq_language::admission_refusal(
+            "node D {\n  slug: String @key\n  tags: [String]?\n  @unique(tags)\n}\n",
+        )
+        .expect("refused");
+        let on_015 = refused_note(&refused, true);
+        assert!(
+            on_015.starts_with("This server refuses any schema change"),
+            "{on_015}"
+        );
+        assert!(
+            on_015.contains("@unique is not supported on list property D.tags"),
+            "{on_015}"
+        );
+        let on_014 = refused_note(&refused, false);
+        assert!(on_014.starts_with("Omnigraph 0.15 refuses"), "{on_014}");
+    }
 
     #[test]
     fn a_type_is_found_at_its_declaration_and_not_in_a_comment_or_a_longer_name() {

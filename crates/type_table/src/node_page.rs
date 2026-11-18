@@ -167,6 +167,19 @@ impl Item for NodePage {
         }
     }
 
+    fn held_at(&self, _cx: &App) -> Option<String> {
+        self.at_commit.clone()
+    }
+
+    /// The page's node (spec 032).
+    fn selected_ids(&self, _cx: &App) -> Option<studio_workspace::SelectedIds> {
+        Some(studio_workspace::SelectedIds {
+            type_name: Some(self.type_name.clone()),
+            ids: vec![self.id.clone()],
+            root: None,
+        })
+    }
+
     fn thing(&self, _cx: &App) -> Option<studio_actions::Thing> {
         Some(studio_actions::Thing::Node {
             type_name: self.type_name.clone(),
