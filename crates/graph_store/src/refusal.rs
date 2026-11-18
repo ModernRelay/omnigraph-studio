@@ -77,7 +77,7 @@ mod tests {
 /// `@card` bound allows, as the engine words it (`@card violation on edge Works: source 'ada'
 /// has 0 edges (min 1)`). Omnigraph 0.15 checks a minimum on every write that inserts or
 /// updates a source node, so a node saved without the edges it needs is refused with this.
-/// The answer states `effects: unknown` though nothing was written (spec 012, E52), so a
+/// The answer states `effects: unknown` though nothing was written (spec 012, E54), so a
 /// write's view still settles it from history; this only says why in words.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CardViolation {

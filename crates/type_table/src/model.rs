@@ -1058,7 +1058,7 @@ pub enum SaveResult {
 pub const UNKNOWN_MESSAGE: &str = "Check History before trying again; your changes are still here";
 
 /// What a write whose outcome is unknown says. A refusal for an `@card` bound says which, in
-/// words: Omnigraph answers one with `effects: unknown` though it wrote nothing (spec 012, E52),
+/// words: Omnigraph answers one with `effects: unknown` though it wrote nothing (spec 012, E54),
 /// so the outcome stays unknown, but the person learns what to change.
 pub(crate) fn unknown_notice(reason: &str) -> Notice {
     match graph_store::CardViolation::find(reason) {
@@ -1845,7 +1845,7 @@ mod tests {
             SaveResult::Unknown(Notice::new(Tone::Unknown, UNKNOWN_MESSAGE))
         );
         // A refusal for an `@card` bound, which the server answers with `effects: unknown`
-        // (spec 012, E52): still unknown, but it says which bound, so the person knows what to add.
+        // (spec 012, E54): still unknown, but it says which bound, so the person knows what to add.
         assert_eq!(
             save_result(
                 &WriteOutcome::Unknown {

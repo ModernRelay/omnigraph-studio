@@ -318,6 +318,14 @@ impl InsertForm for InsertRowModal {
             if id.is_empty() {
                 required.endpoint.error = Some(format!("Pick a {}.", required.endpoint.type_name));
                 valid = false;
+            } else if ends.contains(&(required.edge.clone(), id.clone())) {
+                // A minimum above 1 counts distinct edges: the same end twice is one edge (or
+                // two parallel ones), so it would not meet the minimum.
+                required.endpoint.error = Some(format!(
+                    "Pick another {}: each {} needs its own.",
+                    required.endpoint.type_name, required.edge
+                ));
+                valid = false;
             }
             ends.push((required.edge.clone(), id));
         }
@@ -2087,7 +2095,9 @@ mod tests {
         node Member {\n  slug: String @key\n  name: String\n}\n\
         node Note {\n  text: String\n}\n\
         edge MemberOf: Member -> Team @card(1..)\n\
-        edge About: Note -> Team @card(1..)\n";
+        edge About: Note -> Team @card(1..)\n\
+        node Pair {\n  slug: String @key\n}\n\
+        edge Joins: Pair -> Team @card(2..)\n";
 
     /// A new node's required edge: a server that checks `@card` minimums on every write
     /// (Omnigraph 0.15) gets the node and its edge in one mutation, and the dialog asks for the
@@ -2148,6 +2158,39 @@ mod tests {
                     note.blocked
                 );
             });
+
+            // A minimum of two asks for two different ends.
+            let pair = open("Pair", cx);
+            pair.read_with(cx, |pair, _| {
+                assert_eq!(pair.required.len(), if checks { 2 } else { 0 }, "{version}");
+            });
+            if checks {
+                pair.update_in(cx, |pair, window, cx| {
+                    pair.fields[0]
+                        .editor
+                        .update(cx, |editor, cx| editor.set_text("p1", window, cx));
+                    for required in &pair.required {
+                        required
+                            .endpoint
+                            .editor
+                            .update(cx, |editor, cx| editor.set_text("core", window, cx));
+                    }
+                });
+                cx.run_until_parked();
+                pair.update_in(cx, |pair, window, cx| pair.submit(window, cx));
+                cx.run_until_parked();
+                pair.read_with(cx, |pair, _| {
+                    assert_eq!(pair.required[0].endpoint.error, None);
+                    assert_eq!(
+                        pair.required[1].endpoint.error.as_deref(),
+                        Some("Pick another Team: each Joins needs its own.")
+                    );
+                });
+                assert!(
+                    sent.lock().unwrap().is_empty(),
+                    "nothing sent for the same end twice"
+                );
+            }
 
             let modal = open("Member", cx);
             modal.read_with(cx, |modal, _| {
