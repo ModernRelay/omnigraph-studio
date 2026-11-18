@@ -124,6 +124,12 @@ for ((round = 1; round <= ROUNDS; round++)); do
     # measures nothing says why (an action renamed or removed, a server not answering).
     output=$("$SNAPSHOT" "$OUT/frame.png" "${parts[@]:1}" 2>&1 || true)
     line=$(grep '^measure' <<<"$output" | tail -1 || true)
+    # Every measure step prints a line; one missing means a later step failed, and a setup
+    # line must not stand for it.
+    steps=$(printf '%s\n' "${parts[@]:1}" | grep -c '^measure:' || true)
+    if [[ $(grep -c '^measure' <<<"$output" || true) -lt $steps ]]; then
+      line=""
+    fi
     if [[ -z "$line" ]]; then
       echo "$name: $(grep -v '^snapshot data\|frame\.png$\|^note: ' <<<"$output" | grep . | tail -1)" >&2
     fi
