@@ -66,7 +66,9 @@ python3 script/test_release_files.py   # a release's version-free copies and lat
   way needs `script/sign-dev` after it. Make the identity once with
   `script/sign-dev --make-identity`; `script/bundle-mac` uses the same
   identity when no Developer ID is set. The `omnigraph` CLI keeps its sign-in session in the
-  Keychain too and is signed ad hoc: after a CLI update, `script/sign-dev --cli`.
+  Keychain too: its 0.15 and later release and edge builds carry a Developer ID and need
+  nothing; one signed ad hoc (built from source, or older) needs `script/sign-dev --cli` after
+  each update, which leaves a Developer ID build alone.
 - Write files with `studio_settings::write_atomic`, never by truncating in place.
 - A function used on one platform carries the same `cfg` as its caller, so the other platforms
   still build.
