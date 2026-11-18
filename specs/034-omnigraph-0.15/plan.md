@@ -56,6 +56,7 @@ feature or its release is missing there. Spec 003 ("Server features") and `docs/
 | `DetailedBranchList` | 0.15.0 | A list's heads in one request |
 | `AccessClientId` | 0.15.0 | The OAuth client in the connection tooltip |
 | `CardMinimumOnEveryWrite` | 0.15.0 | A new node is saved with the edges its minimum needs |
+| `NotAdmittedCode` | 0.15.0 | A 403 `not_admitted` says so at the connect; a 401 to a held sign-in is its token refused |
 | `UniqueOnScalarsOnly` | 0.15.0 | The schema view's note on a refused constraint |
 
 `RankedReadOutput` and `AccessClientId` are read from the answer (the field is there or not);
@@ -82,6 +83,19 @@ A refused write's notice names the bound: `graph_store::CardViolation` reads the
 says "The server answered that bo would have 0 edges of MemberOf, and the schema allows each one
 at least 1, but not whether anything was saved. Check History before trying again; your changes
 are still here." It stays an unknown outcome: the server answers `effects: unknown` (E54).
+
+**Not admitted, for the whole server.** 0.15 answers an identity it admits no principal for
+with 403 `not_admitted` on every authenticated route (`require_bearer_auth`), the graph list
+included, where 0.14 answered 401. The connection read that 403 as "may not list graphs", so a
+person signed in but not admitted saw "Connected" and an empty Open dialog. The connection now
+owns the decision: a 403 `not_admitted` to the connect's graph list (or discovery) leaves it
+`Unauthorized` and not admitted (`Connection::not_admitted`), labelled "Not admitted", with the
+Open dialog's not-admitted text and its Sign in as someone else and Sign out, and none of a 401's
+token handling. On a server with `NotAdmittedCode`, a 401 to a sign-in held reads as its token
+refused (`HeldRefusal::Refused`, "Sign-in refused"), which a new sign-in may replace; from a 0.14
+server it reads as before. A graph or read refused with `not_admitted` mid-session (the server's
+admission snapshot can drop a principal at any time) keeps its own words (`SchemaFailure`, the
+query editor).
 
 **Schema diagnostics.** Studio has no `.pg` diagnostics; its schema view is read-only. It now
 runs the compiler's admission parser over the served schema (`gq_language::admission_refusal`;
@@ -119,7 +133,10 @@ only one signed ad hoc (built from source, or older); `AGENTS.md` says so.
 - **Detailed branch list.** `GraphSession::head_commit`, which the branches list and History
   call for each branch they draw, joins one `GET /branches?detailed=true` on a server with
   `DetailedBranchList`: its answer gives every branch's head (kept in the head memo, as reads
-  alone were) and its start and times (`GraphSession::branch_detail`). A head forgotten since (a
+  alone were) and its start and times (`GraphSession::branch_detail`). It fills the memo through
+  a `memo::Fill` opened before it is sent, so a head forgotten while it was out (a commit landed
+  on its branch) is not put back from an answer that may predate the commit, by the memo's own
+  rule that a late answer changes nothing. A head forgotten since (a
   commit landed on its branch), a branch the details leave out, and a Refresh read one branch
   alone, as before; a 0.14 server reads each alone. The branches list's tooltip adds "made 3 days
   ago from main". The top bar's branch switcher shows names only and reads nothing per branch.
@@ -160,7 +177,9 @@ display is spec 033's (#130, merged 2026-11-18); this plan changed only the data
 |---|---|---|
 | One table of features by first release, from `/healthz`'s version | `/openapi.json` per feature; a field's absence; version checks where used | The `@card` rule is in no OpenAPI document; a missing field says nothing when the read did not call for it; one table stays in step with the docs (spec 003) |
 | An edge build serves the release before it | Treat it as its release; read its OpenAPI | Its name says the release it leads to, not what it has yet; under-using one is safe, misreading one is not |
-| The dialog requires a new node's edges only on a 0.15 server | Always; never | 0.14 takes the node alone, as before; 0.15 refuses it |
+| The dialog requires a new node's edges only on a 0.15 server | Always; never | 0.14 takes the node alone, as before, which this plan keeps for every 0.14 server. The cost, from review: a node saved alone on 0.14 is below its minimum after an upgrade, so 0.15 refuses its next edit until the same mutation adds its edges; that refusal names the bound |
+| A minimum above 1 refuses the same end picked twice | Send it and let the server answer | Two picks of one node make one edge (or two parallel ones), which a 0.15 server refuses as an unknown outcome |
+| Not admitted is the connection's, from the 403 at the connect | Each surface's own 403 handling | One owner for a fact about the identity at the server; every surface reads it |
 | A `@card` refusal stays unknown | Call it a refusal from its words | The disposition says `unknown`; III settles that from history (E54 asks for `none`) |
 | Keep every change-read limit | Shorten timeouts or pages on 0.15 | An upper bound costs nothing when the server is fast, and 0.15 did not make every diff fast |
 | Keep the agent's `table` output | `toon` as default | 4 % smaller, and refused by a 0.14 CLI |
@@ -182,4 +201,6 @@ display is spec 033's (#130, merged 2026-11-18); this plan changed only the data
 | Date | Claim | Check | Result |
 |---|---|---|---|
 | 2026-11-18 | A 0.15 server refuses a node saved without its required edge, and takes it with the edge in the same mutation; a 0.14 server takes both | `curl` to `v0.14.0` and `v0.15.0` release servers (`/tmp` copy of `script/dev-server`'s cluster plus `MemberOf … @card(1..)`) | 0.14: both commit. 0.15: the lone node answers 400 `@card violation on edge MemberOf: source 'bo' has 0 edges (min 1)`, `effects: unknown, action: reconcile`; with the edge it commits |
+| 2026-11-18 | A late detailed branch list does not bring back a forgotten head | `graph_store` `session::tests::a_late_detailed_list_does_not_bring_back_a_forgotten_head` and `memo::tests::a_fill_keeps_nothing_forgotten_since_it_opened`; the session test run with the fill's forgotten check turned off | Pass; with the check off it fails at "not put back", as review found (B2) |
+| 2026-11-18 | A server that admits no one for the token says so at the connect, and a 0.15 401 to a sign-in held is its token refused | `graph_store` `connection::tests::a_server_that_admits_no_one_for_the_token_says_so_at_the_connect` (every route 403 `not_admitted`, decoded through the client) and `a_401_to_a_sign_in_held_is_read_by_the_servers_release` | Pass: `Unauthorized`, "Not admitted", `HeldRefusal::NotAdmitted`; a policy's 403 stays ready with no list; a 401 reads `Refused` on 0.15.0, `NotAdmitted` on 0.14.0 (B1) |
 | 2026-11-18 | The agent's default output is already compact | `omnigraph query --format table|json|toon|jsonl` (CLI 0.15.0) on 40 `Person` rows of six columns | 5,538 / 5,346 / 5,323 / 5,146 bytes |
