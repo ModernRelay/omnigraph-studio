@@ -124,6 +124,8 @@ for ((round = 1; round <= ROUNDS; round++)); do
   for case in "${cases[@]}"; do
     IFS='|' read -r -a parts <<<"$case"
     name=${parts[0]}
+    # Bash before 4.4 (macOS's /bin/bash is 3.2) calls an empty array unbound under `set -u`,
+    # so it is expanded only when it holds something.
     size=()
     if [[ ${parts[1]} == size=* ]]; then
       size=("SNAPSHOT_SIZE=${parts[1]#size=}")
@@ -132,7 +134,7 @@ for ((round = 1; round <= ROUNDS; round++)); do
     # A case that measures nothing says why (an action renamed or removed, a server not
     # answering): the tool ends with an error status when any step fails, after its measure
     # line or before it.
-    if output=$(env "${size[@]}" "$SNAPSHOT" "$OUT/frame.png" "${parts[@]:1}" 2>&1); then
+    if output=$(env ${size[@]+"${size[@]}"} "$SNAPSHOT" "$OUT/frame.png" "${parts[@]:1}" 2>&1); then
       line=$(grep '^measure' <<<"$output" | tail -1 || true)
     else
       line=""
