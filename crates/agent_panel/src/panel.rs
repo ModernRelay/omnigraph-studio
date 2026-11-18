@@ -1828,7 +1828,7 @@ impl AgentPanel {
                         error: false,
                     }),
                     Ok(other) => self.entries.push(Entry::Notice {
-                        text: format!("The agent ended its turn: {other:?}."),
+                        text: stop_words(other),
                         error: false,
                     }),
                     Err(error) => self.entries.push(Entry::Notice {
@@ -4619,9 +4619,46 @@ impl AgentPanel {
     }
 }
 
+/// Why the agent ended a turn it did not finish, and what the person can do: a limit of the
+/// agent's goes on when asked to, and a refusal leaves the message out of what the agent reads
+/// next (the protocol asks that the panel say so).
+fn stop_words(reason: StopReason) -> String {
+    match reason {
+        StopReason::MaxTokens => {
+            "The agent reached the most it writes in one reply. Send “continue” to have it go on."
+                .into()
+        }
+        StopReason::MaxTurnRequests => {
+            "The agent reached the most steps it takes in one turn. Send “continue” to have it go on."
+                .into()
+        }
+        StopReason::Refusal => {
+            "The agent declined this message, and leaves it out of the rest of the conversation."
+                .into()
+        }
+        other => format!("The agent ended its turn: {other:?}."),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A turn the agent did not finish says why in words, and what to do next: never the
+    /// protocol's name for the reason.
+    #[test]
+    fn a_turn_the_agent_did_not_finish_says_why() {
+        for reason in [
+            StopReason::MaxTokens,
+            StopReason::MaxTurnRequests,
+            StopReason::Refusal,
+        ] {
+            let said = stop_words(reason);
+            assert!(!said.contains(&format!("{reason:?}")), "{said}");
+        }
+        assert!(stop_words(StopReason::MaxTokens).contains("Send “continue”"));
+        assert!(stop_words(StopReason::Refusal).contains("leaves it out"));
+    }
 
     /// The presets name the command that signs in to their account; another agent is asked to
     /// sign in its own way (spec 029).
