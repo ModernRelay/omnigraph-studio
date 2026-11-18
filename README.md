@@ -35,10 +35,12 @@ omnigraph studio --target <server> --graph <graph>
 ```
 
 `omnigraph studio` (CLI 0.15 or later) launches Studio through an `omnigraph-studio://` link.
-The link names the target and graph but carries no token; Studio gets the token from the CLI
-itself. Without `--target` it uses your default target. It works for server targets, not for
-a local storage path or a managed target. On Linux, the link reaches Studio once its desktop
-entry handles the scheme: copy `share/applications/omnigraph-studio.desktop` from the tarball to
+For a server target the link names the target and graph. Studio gets the token from the CLI.
+Without `--target` the command uses your default target. The released 0.15.0 CLI opens server
+targets. A CLI that supports managed targets opens them with your Studio sign-in, even when both
+apps know the cluster. If Studio asks you to sign in to the control plane, sign in and open the
+link again. If Studio says it cannot open “open-cluster” links, update Studio and retry. On Linux,
+the link reaches Studio once its desktop entry handles the scheme: copy `share/applications/omnigraph-studio.desktop` from the tarball to
 `~/.local/share/applications`, put `omnigraph-studio` on your `PATH`, then run
 `xdg-mime default omnigraph-studio.desktop x-scheme-handler/omnigraph-studio`. The Windows
 installer registers the scheme itself.

@@ -562,6 +562,10 @@ impl Access {
 }
 
 impl OAuthSource {
+    pub(crate) fn same_sign_in(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     /// Whether the sign-in ended: signed out, or its grant ended by the service, so it gives no
     /// token again (spec 029: the plane holding it offers a sign-in).
     pub(crate) fn has_ended(&self) -> bool {

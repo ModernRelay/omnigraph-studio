@@ -73,6 +73,31 @@ pub enum Organizations {
     Failed(ControlError),
 }
 
+/// One cluster lookup and the Studio sign-in that made it. The UI consumes the answer in
+/// the same turn in which it selects the connection.
+pub struct ClusterRead {
+    source: OAuthSource,
+    result: Result<Envelope<ClusterDetail>, ControlError>,
+}
+
+impl ClusterRead {
+    /// Discards an answer delivered after sign-out or a change of account.
+    pub fn into_current(
+        self,
+        plane: &ControlPlane,
+    ) -> Option<Result<Envelope<ClusterDetail>, ControlError>> {
+        plane
+            .oauth
+            .as_ref()
+            .filter(|held| held.same_sign_in(&self.source) && !held.has_ended())?;
+        Some(self.result)
+    }
+}
+
+/// The sign-in that authorizes a plane's data connections changed.
+pub(crate) struct PlaneSignInChanged;
+impl gpui::EventEmitter<PlaneSignInChanged> for ControlPlane {}
+
 pub struct ControlPlane {
     /// Its origin: `owner.route` as the CLI says it, or the `omnigraph_cloud` setting.
     pub route: String,
@@ -156,11 +181,15 @@ impl ControlPlane {
     }
 
     /// Holds `source` as its sign-in, for itself and its clusters' token sources.
-    fn hold(&mut self, source: Option<OAuthSource>) {
+    fn hold(&mut self, source: Option<OAuthSource>, cx: &mut Context<Self>) {
+        if self.oauth.is_none() && source.is_none() {
+            return;
+        }
         if let Some(handle) = &self.handle {
             handle.hold(source.clone());
         }
         self.oauth = source;
+        cx.emit(PlaneSignInChanged);
     }
 
     /// Whether it is Omnigraph Cloud's default.
@@ -285,7 +314,7 @@ impl ControlPlane {
                             account: subject,
                         };
                         this.service = Some(service);
-                        this.hold(Some(source));
+                        this.hold(Some(source), cx);
                     }
                     Err(refusal) => {
                         this.sign_in = SignIn::Offered {
@@ -391,7 +420,7 @@ impl ControlPlane {
                 cx.notify();
                 let (before, done) = context.turns.next(&key);
                 let previous = this.oauth.clone();
-                this.hold(None);
+                this.hold(None, cx);
                 (before, done, previous)
             }) else {
                 return;
@@ -419,7 +448,7 @@ impl ControlPlane {
                     service: service.host(),
                     account,
                 };
-                this.hold(Some(source.clone()));
+                this.hold(Some(source.clone()), cx);
                 // What was listed was another account's.
                 this.organizations = None;
                 this.listings.clear();
@@ -462,7 +491,7 @@ impl ControlPlane {
         self.reading = None;
         self.organizations = None;
         self.listings.clear();
-        self.hold(None);
+        self.hold(None, cx);
         let service = oauth_client::host_of(&self.route);
         self.sign_in = SignIn::Offered {
             why: Some(format!("Your sign-in at {service} ended. Sign in again.")),
@@ -478,7 +507,7 @@ impl ControlPlane {
         self.organizations = None;
         self.listings.clear();
         let held = self.oauth.clone();
-        self.hold(None);
+        self.hold(None, cx);
         if let Some(source) = held {
             let before = self
                 .context
@@ -713,18 +742,19 @@ impl ControlPlane {
         organization: &str,
         cluster_id: &str,
         cx: &App,
-    ) -> Option<Task<Result<Envelope<ClusterDetail>, ControlError>>> {
+    ) -> Option<Task<ClusterRead>> {
         let source = self.oauth.clone()?;
         let http = self.context.as_ref()?.elsewhere.clone();
         let route = self.route.clone();
         let organization = organization.to_owned();
         let id = cluster_id.to_owned();
         Some(cx.background_executor().spawn(async move {
-            with_access(&http, &route, &source, Some(&organization), |client| {
+            let result = with_access(&http, &route, &source, Some(&organization), |client| {
                 let id = id.clone();
                 async move { client.cluster(&id).await }
             })
-            .await
+            .await;
+            ClusterRead { source, result }
         }))
     }
 }
@@ -1410,6 +1440,18 @@ mod tests {
         let refused = smol::block_on(elsewhere.token(Arc::default())).unwrap_err();
         assert!(refused.why.contains("another address"), "{}", refused.why);
 
+        // A shared endpoint cannot distinguish two clusters that name the same incarnation.
+        let other_cluster = ControlTokenSource::of_plane(
+            None,
+            OTHER.into(),
+            handle.clone(),
+            "another".into(),
+            "01I".into(),
+            "https://beta.graphs.test".into(),
+        );
+        let refused = smol::block_on(other_cluster.token(Arc::default())).unwrap_err();
+        assert!(refused.why.contains("different cluster"), "{}", refused.why);
+
         // So is a token for another incarnation: the cluster deleted and made again under its
         // id is not the one a saved window or a CLI target named. Without the check the
         // source hands out its token.
@@ -1436,6 +1478,58 @@ mod tests {
         let token = smol::block_on(source.token(Arc::default())).unwrap();
         assert_eq!(token.into_string(), "from-the-cli");
         assert!(source.waits_for_server_sign_in());
+    }
+
+    /// The data connection and any link response it may still receive belong to the same
+    /// Studio sign-in. A different sign-in on the plane invalidates both, even on one route.
+    #[gpui::test]
+    async fn a_plane_connection_and_link_follow_the_sign_in_that_opened_them(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let served = Arc::new(Mutex::new(Served::default()));
+        let (plane, _) = kept(&served, cx);
+        let read = |cx: &mut TestAppContext| {
+            plane
+                .read_with(cx, |p, cx| p.read_cluster(OTHER, "02C", cx))
+                .unwrap()
+        };
+        let first = read(cx).await;
+        let detail = plane
+            .read_with(cx, |p, _| first.into_current(p))
+            .unwrap()
+            .unwrap();
+        let (registry, _) = cx.update(crate::ConnectionRegistry::init_for_tests);
+        let data = registry
+            .update(cx, |r, cx| {
+                r.open_cluster(&plane, OTHER, &detail.data.cluster, cx)
+            })
+            .unwrap();
+        data.update(cx, |c, cx| c.connect(cx));
+        until(cx, "the plane's data token", |cx| {
+            data.read_with(cx, |c, _| c.has_token())
+        });
+
+        let stale = read(cx).await;
+        let (other, _) = kept(&served, cx);
+        let other_source = other.read_with(cx, |p, _| p.oauth.clone()).unwrap();
+        plane.update(cx, |p, cx| p.hold(Some(other_source), cx));
+        assert!(plane.read_with(cx, |p, _| stale.into_current(p)).is_none());
+        cx.run_until_parked();
+        plane.update(cx, |p, cx| p.sign_out(cx));
+        cx.run_until_parked();
+        data.update(cx, |c, cx| {
+            assert!(
+                !c.has_token(),
+                "the previous account's bearer survived sign-out"
+            );
+            assert!(
+                !c.asks_token(),
+                "a managed link must use the plane for sign-in"
+            );
+            c.set_token(Some("typed".into()), cx);
+            assert!(!c.has_token());
+        });
     }
 
     #[gpui::test]

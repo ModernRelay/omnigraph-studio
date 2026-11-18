@@ -242,6 +242,9 @@ pub struct SavedGraph {
     /// that is no managed cluster, and in a file an earlier Studio wrote.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster: Option<graph_store::ClusterIdentity>,
+    /// This window used Studio’s sign-in to the cluster’s control plane.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub plane_owned: bool,
 }
 
 /// A window to reopen at the next start: its graphs and where it was.
@@ -616,6 +619,7 @@ mod tests {
             graph: name.into(),
             branch: "main".into(),
             cluster: None,
+            plane_owned: false,
         }
     }
 
@@ -667,6 +671,7 @@ mod tests {
         };
         let on_cluster = SavedGraph {
             cluster: Some(cluster),
+            plane_owned: true,
             ..graph("crm")
         };
         let text = serde_json::to_string(&on_cluster).unwrap();
@@ -675,6 +680,10 @@ mod tests {
             serde_json::from_str::<SavedGraph>(&text).unwrap(),
             on_cluster
         );
+        let legacy = text.replace(r#","plane_owned":true"#, "");
+        let restored = serde_json::from_str::<SavedGraph>(&legacy).unwrap();
+        assert!(!restored.plane_owned);
+        assert_eq!(restored.cluster, on_cluster.cluster);
         let before =
             r#"{"target":"example","url":"https://example.test","graph":"crm","branch":"main"}"#;
         assert_eq!(

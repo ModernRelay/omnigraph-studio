@@ -967,6 +967,7 @@ impl Workspace {
                         url: server.url.clone(),
                         graph: session.graph_id.clone(),
                         branch: session.branch.clone(),
+                        plane_owned: server.source == graph_store::ServerSource::ControlPlane,
                         cluster: registry.as_ref().and_then(|registry| {
                             registry.read(cx).cluster_identity(&session.connection, cx)
                         }),
@@ -1352,8 +1353,8 @@ impl Workspace {
     }
 
     /// The session this window has open for `graph` on the server at `url`. A graph open is
-    /// matched by its server's address, as a link and the Open dialog name it: an address is
-    /// one connection, which a target renamed on it keeps, so the graph stays the same one.
+    /// matched by its server's address. A caller selecting a credential checks the returned
+    /// session's connection before reusing it.
     pub fn open_session_for(
         &self,
         url: &str,
@@ -1365,7 +1366,9 @@ impl Workspace {
             .chain(self.parked.iter().map(|parked| &parked.session))
             .find(|open| {
                 let open = open.read(cx);
-                open.graph_id == graph && open.connection.read(cx).server.url == url
+                open.graph_id == graph
+                    && open.connection.read(cx).server.url.trim_end_matches('/')
+                        == url.trim_end_matches('/')
             })
             .cloned()
     }
