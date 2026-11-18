@@ -39,10 +39,11 @@ Measured against Zed v1.23.2 (`crates/gpui/src/window.rs`, `view.rs`):
   empty gap as wide as they are, so a line lays out a handful of cells, its header the same
   ones, and the scroll range does not change. The columns are picked as the grid draws, from
   the scroll offset and the window's width, which bounds the view's. The rows then draw the
-  cells of only those their list's own width meets, which GPUI sets before it asks for the
-  rows, in the same frame; the other columns picked are empty boxes. Beside the sidebar and
-  the inspector a grid is about half the window, and the window's width alone drew several
-  columns past its edge in every row.
+  cells of only those their scrolled strip's width meets: the header's strip tracks the same
+  horizontal scroll handle and is laid out before the rows, so GPUI has set that width for
+  this frame when the list asks for its rows. The other columns picked are empty boxes. Beside
+  the sidebar and the inspector a grid is about half the window, and the window's width alone
+  drew several columns past its edge in every row.
 - The type table and the query results pick their columns with `studio_ui::columns_in_view` and
   `studio_ui::grid_places`.
 - A grid cell's plain value is `studio_ui::CellText`, not a `Label`: the cell's box is fixed by
@@ -70,7 +71,7 @@ the interaction and asserts the count:
 | --- | --- |
 | `type_table` `typing_in_a_field_leaves_the_grid_as_it_was` | The grid follows the table's `notify`; typing in the filter field or a cell does not draw it |
 | `type_table` `rows_draw_only_the_columns_in_view` | A 21-column type draws the pinned column and those in view; scrolled to the end, the last; the cursor's column always; a line lays out one gap for the rest, as wide as they are; widened, every column in the frame of the resize |
-| `type_table` `rows_draw_the_cells_their_own_view_meets` | In a grid half its window's width, rows leave the columns past its edge empty that the window's width picks; widened with the window unchanged, they draw them in that frame |
+| `type_table` `rows_draw_the_cells_their_own_view_meets` | In a grid half its window's width, rows leave the columns past its edge empty that the window's width picks; widened with the window unchanged, the first frame after it draws them |
 | `query_editor` `a_wide_result_draws_only_the_columns_in_view` | A 60-column result draws the columns in view and one gap for the rest, as wide as they are; scrolled to the end, the last |
 | `query_editor` `typing_in_the_query_leaves_the_results_as_they_were` | The result area follows the tab's `notify`; typing in the query does not draw it |
 | `query_editor` `typing_leaves_the_problems_as_they_were` | The problems strip is a cached view of its own; typing that leaves the problems unchanged does not draw it |
