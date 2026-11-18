@@ -209,7 +209,7 @@ mutating route is needed: edits, loads, merges, branch and commit control alread
 | E6 | `GET /graphs/{id}/diff?from=&to=&kind=&type=&op=&page_token=&limit=` → paged entity changes with optional before/after images | `diff_between`, plus a paged variant with images | Both ends resolve once; page tokens pin commit ids, never branch names; bounded pages | 008 | Fold the change feed from the fork, capped at 20,000 changes, "Partial" when capped |
 | E7 | `GET /graphs/{id}/merge-base?a=&b=` | Commit lineage (`generation` on graph commits) | Pure read of `__manifest` lineage | 008 | Walk `GET /commits` parents |
 | E8 | `POST /graphs/{id}/branches/merge/preview {source, target}` → outcome, merge base, conflicts, change summary | A merge-planning step that stops before staging | Must stage nothing durable, not even a detached commit; `read` on both branches. If the engine can only answer by staging, keep `as_commit` as the preview | 008 | Merge on request; a 409 lists conflicts and nothing moved |
-| E9 | `GET /graphs/{id}/branches?detail=true` → name, head, fork commit, creator, created and updated times | Branch refs and lineage | Derived from `__manifest`; no shadow branch table | 002, 008 | Derive from `GET /commits?branch=` |
+| E9 | `GET /graphs/{id}/branches?detail=true` → name, head, fork commit, creator, created and updated times. *Landed in `v0.15.0`* as `?detailed=true` (#1012), without the creator | Branch refs and lineage | Derived from `__manifest`; no shadow branch table | 002, 008 | From a 0.15 server, one detailed list answers a list's heads (`ServerFeature::DetailedBranchList`, spec 034); from a 0.14 server, `GET /commits?branch=` per branch |
 | E10 | `GET /graphs/{id}/commits?branch=&limit=&before=` | Bounded lineage walk, keyset on generation and id | Cost scales with the page, not history | 009 | Landed as `limit` and `page_token` (#1013); adopted in History (a page at a time), the snapshot picker (one page) and Review (down to the fork) |
 | E11 | Typed columns in `ReadOutput` (`columns: [{name, type, nullable}]`) or Arrow IPC (RFC 0051) | The result's Arrow schema | Additive DTO field; regenerate `openapi.json` | 004, 007 | `describe_query_operation` in `omnigraph-compiler` |
 | E12 | `POST /graphs/{id}/query?profile=true` | `query_inspected`, made a supported API | Exposes plan internals; gate on `read` or a new `inspect` action | 007 | Plans only, through `explain query …` |
@@ -331,6 +331,16 @@ of changes is worked out whole before the server answers, and the server sets no
 until these land Studio waits up to five minutes for a read of changes
 (`graph_client::CHANGE_READ_TIMEOUT`), and a review says when the server is still working.
 
+`v0.15.0` (2026-11-09) resolves part of this. Diffs and reviews over several commits of one
+history, with no merge between them, read only the changed rows (#1201, closing #969); a merge
+reads only the fragments each side changed and deletes by the row ids it read (#1229, #1301); a
+branch's ref is one storage request instead of three (#1229); and reads no longer wait for a
+write on the same handle (#1228). E35 is partly resolved, E36, E37 and E38 are not (#970, #972
+and #1157 are open on 2026-11-18). Studio keeps every wait and page size below: a 0.14 server
+still costs what was measured, a 0.15 one still compares both tables across a merge or between
+two moved branches, and a longer timeout or a larger page costs nothing when the server answers
+sooner (spec 034).
+
 **E35. Diff cost that follows the changes, not the tables.**
 [ModernRelay/omnigraph#969](https://github.com/ModernRelay/omnigraph/issues/969). `GET /diff` and
 `GET /branches/diff` read both full tables of every type the two endpoints differ in, unless the
@@ -341,8 +351,11 @@ what the branch changed. The diff from a branch's merge base to its head,
 to 9.6 s. The draft RFC [ModernRelay/omnigraph#1171](https://github.com/ModernRelay/omnigraph/pull/1171)
 proposes finding the changed rows by fragment identity, as branch merge does, so the cost follows
 the change. Engine rule: a diff stays pinned to the two commits it resolved, and a page stays
-bounded by its `limit` and byte budget. *Waits:* 008. *Today:* a review's reads of changes wait
-up to five minutes, and after 10 s it says the server is still working out the changes.
+bounded by its `limit` and byte budget. *Partly landed in `v0.15.0`* (#1201): a window of one
+history with no merge reads only the changed rows; across a merge commit, or between two branches
+that both moved, the diff still compares both tables. *Waits:* 008. *Today:* a review's reads of
+changes wait up to five minutes, and after 10 s it says the server is still working out the
+changes, from every server: its waits are for the diffs 0.15 did not change too.
 
 **E36. A change page that resumes its work.**
 [ModernRelay/omnigraph#970](https://github.com/ModernRelay/omnigraph/issues/970). Every page of
@@ -375,6 +388,19 @@ budget is spent, would keep each answer short and let a client show progress; RF
 commit-ceiling parameter and a work ceiling to the feed. Engine rule: a page
 still ends on a whole commit and its cursor resumes after it. *Waits:* 008. *Today:* the feed is
 read in pages of up to 8,192 changes, each waited for up to five minutes.
+
+**E54. A validation refusal that says nothing was written.** A mutation refused in validation,
+before it stages anything, answers 400 `bad_request` with `disposition: {effects: unknown,
+action: reconcile}`: an `@card` bound (`@card violation on edge MemberOf: source 'bo' has 0 edges
+(min 1)`) and a missing endpoint (`__dst 'nobody' not found in Team`) alike, on `v0.14.0` and
+`v0.15.0` (sent to both on 2026-11-18, spec 034). 0.15 checks a `@card` minimum on every write
+that inserts or updates a source node (#1212), so a client that saves a node before its edges now
+meets this on an ordinary insert. `effects: none, action: fix`, with the violation as a typed
+detail (`ErrorOutput.cardinality_violation`: edge, source, count, bound), would let a client
+call it a refusal and say which bound in its own words. Engine rule: report `none` only for a
+refusal made before any staging. *Waits:* 004, 034. *Today:* Studio judges it unknown, as the
+disposition says, names the bound from the server's words (`graph_store::CardViolation`), and
+saves a new node with the edges its minimum needs in one mutation on a 0.15 server.
 
 **E39. A page of a wide type that reads only what it returns.**
 A sorted page reads every column of every row before it keeps the page's rows, and a filtered
@@ -561,13 +587,15 @@ Studio's own work first, for what landed:
 Then engine changes still open:
 
 3. E11 typed columns: additive, used everywhere.
-4. E9 branch details (#1012, open): the review surface.
+4. E9 branch details: landed in `v0.15.0` (#1012); Studio uses them where a server serves them
+   (spec 034).
 5. E1 to E5 launcher: the one-command local experience.
 6. E20 delegated credentials (an RFC), which retires spec 013's gateway rules.
 7. E16 neighbourhood counts.
 8. E12, E13, E14, E17, E18, E19 as the matching Studio work starts.
-9. E35 to E38, which make a large graph's review take seconds rather than a minute; E37 is the
-   smallest.
+9. E35 to E38, which make a large graph's review take seconds rather than a minute; E35 partly
+   landed in `v0.15.0` (#1201), and E37 is the smallest of the rest. E54 with them: it is one
+   disposition.
 10. E49 to E51, which would make finding a node one request and right on every type, however
     large; E49 is the smallest.
 
@@ -583,6 +611,7 @@ Then engine changes still open:
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-11-18 | What `v0.15.0` resolves, and a validation refusal's disposition (E9, E35 to E38, E54) | `docs/releases/v0.15.0.md` at the tag; `gh issue view` 969, 970, 972, 1157; mutations sent with curl to `v0.14.0` and `v0.15.0` release servers serving `script/dev-server`'s cluster plus a `MemberOf: Member -> Team @card(1..)` edge | E9 landed (#1012); E35 partly (#1201, #969 closed); #970, #972, #1157 open. A lone `Member` insert: 0.14 commits it, 0.15 answers 400 `@card violation … (min 1)` with `effects: unknown, action: reconcile`; with its `MemberOf` in the same mutation both commit. Deleting a required edge and an edge to a missing node answer the same disposition on both releases: E54 |
 | 2026-11-17 | Omnigraph `v0.15.0` needs no engine change from Studio | `openapi.json` at `v0.15.0` diffed with `v0.14.0`'s; the release notes (`gh release view v0.15.0`) | Contract still 0.14; no path, field or enum value removed; new fields (`ranking`, `details`, `client_id`) optional, one new error code (`not_admitted`). No new ID |
 | 2026-11-06 | A page of a wide, large type costs the server what it holds, not what it returns (E39) | `script/dev-big-server` (`v0.14.0`, `Account`: 95 columns, 100,000 rows), each read sent with curl, then Studio's snapshot tool with `OMNIGRAPH_STUDIO_TRACE` (`docs/perf/20261106-report.md`) | `order { $n.@id } limit 100` returning `$n`: 0.91 s; returning `$n.slug`: 0.08 s; `$n` unordered: 0.03 s; `$n.@id = $id`: 0.43 s; `$n.@id in $ids` (101): 0.46 s. Studio's first page: 947 ms of which 3.5 ms decoding. Filed as E39 |
 | 2026-10-26 | A review's reads of changes take most of a minute on the personal graph, for reasons in the engine (E35 to E38) | The readings of 2026-10-25 in spec 008's validation log; issues #969, #970, #972 and #1157 and the draft RFC #1171 (`gh issue view`, `gh pr view`, all open on 2026-10-27); Omnigraph `7711e4a`: `changes/model.rs:36`, `handlers.rs:4862` and `CHANGE_FEED_PARAMS`, `db/omnigraph.rs` `prepare_diff` and `reopen_diff_continuation` | Filed as E35 (#969), E36 (#970), E37 (#972) and E38 (#1157, filed after: the feed's 128-commit page has no HTTP parameter). Studio waits five minutes for a read of changes and says the server is still working (spec 008) |
