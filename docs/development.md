@@ -77,7 +77,7 @@ CLI too (`omnigraph target add`, and `credentials set` for its token).
 | `OMNIGRAPH_STUDIO_GRAPH` | Opens this graph on that server at launch |
 | `OMNIGRAPH_STUDIO_BRANCH` | The branch to open (default `main`) |
 | `OMNIGRAPH_STUDIO_OAUTH_CLIENT` | The client ID Studio signs in with at any sign-in service, for development (spec 016) |
-| `OMNIGRAPH_STUDIO_DATA` | Directory of `settings.json`, `keymap.json` and the session (default `~/Library/Application Support/Omnigraph Studio`, `%APPDATA%\Omnigraph Studio` on Windows, or `$XDG_CONFIG_HOME/omnigraph-studio`) |
+| `OMNIGRAPH_STUDIO_DATA` | Directory of `settings.json`, `keymap.json` and the session (default `~/Library/Application Support/Omnigraph Studio`, `%APPDATA%\Omnigraph Studio` on Windows, or `$XDG_CONFIG_HOME/omnigraph-studio`, `~/.config` when that is unset; a build run from `target/`, as `cargo run` and `script/dev` run it, uses `Omnigraph Studio Dev`, or `omnigraph-studio-dev` on Linux, so it never rewrites the installed app's) |
 
 ## Checks
 
