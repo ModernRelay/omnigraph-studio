@@ -558,6 +558,49 @@ results of a scan and of an index are the same. *Waits:* 031. *Today:* Studio ru
 search only on properties that declare an index, merges its hits after its own matches, and
 leaves out a property whose search fails.
 
+### Galleries of Blob values (spec 035)
+
+A gallery shows a type's rows as tiles of one of their files. Contract 0.14 reads a Blob one
+cell at a time, as its whole bytes or one range, and says nothing else of it; checked against a
+`v0.15.0` release server on 2026-11-18 (spec 035's validation log).
+
+**E55. A preview of a Blob cell made by the server.** `GET /graphs/{id}/blob` with a preview
+parameter (an edge length; a format) answering a small image of a picture, or of a PDF's first
+page, cacheable by the Blob's content (E57). A screen of 24 photos of about 3 MB costs a client
+today about 48 requests and 72 MB, all decoded by the client; with a preview, 24 requests and
+well under a megabyte. Engine rule: a preview is derived and never stored as graph data; a value
+the server cannot preview answers its kind and no image. *Waits:* 035. *Today:* Studio reads a
+tile's file whole up to 8 MiB and 40 megapixels, decodes and scales it to 480 px off the main
+thread, and holds at most 64 MiB of previews; a PDF's first page is drawn on macOS only.
+
+**E56. A Blob's metadata in GQ.** A projection of a Blob cell's metadata (`$n.file.@size`,
+`.@kind`, `.@digest`) and a test of whether it holds a value (`$n.file is not null`, refused
+today with `T7: blob comparisons in filters are not supported`). One page would then say what
+each tile holds, a gallery could leave out rows without a file, and the type table's Blob
+column would need no `HEAD` per cell. Engine rule: the bytes are still never projected.
+*Waits:* 035, 004. *Today:* one `HEAD` per drawn tile or cell, shared at a commit by the
+table, the peek and the gallery; a gallery pages through rows without a file.
+
+**E57. A validator that names a Blob's bytes.** A strong validator stable across commits that
+did not change the value: a content digest in `HEAD` and `GET` (`Repr-Digest`, or a `digest`
+field in `blob stat`). Today an `ETag` names the type's table version: after a write to another
+row's title an unchanged value answers a new `ETag`. *Waits:* 035. *Today:* a preview is kept
+only at the commit it was read at, and read again when the gallery's pin moves.
+
+**E58. A media type and an image's size kept with a Blob.** `PUT /blob` taking the body's
+`Content-Type` (or a `media_type` field on a load) and `HEAD` answering it, with an image's
+pixel size. Today every value answers `application/octet-stream`. *Waits:* 035. *Today:*
+Studio judges a value by its first bytes (`blob::value_kind`) and reads an image's size from its
+header in the first 64 KiB; it lays tiles out in a uniform grid, since a justified layout would
+need every row's first bytes before placing a tile.
+
+**E59. Diff images that describe a Blob instead of carrying it.** `GET /diff`,
+`GET /branches/diff` and the change feed carry a changed Blob whole, as `base64:` text, in both
+the `before` and the `after` image, so a page of changes to photos is megabytes and a client
+holds both sides. A description (size, digest; the commit to read each side at) would keep a
+page to what changed. *Waits:* 035, 008. *Today:* Studio reads the diff as it comes and marks a
+tile whose file changed; the target's side is read from the Blob route at the merge base.
+
 ### In 0.14, not in 0.13.0
 
 Studio's minimum server serves these, so it uses them without asking the server's OpenAPI
@@ -598,6 +641,8 @@ Then engine changes still open:
    disposition.
 10. E49 to E51, which would make finding a node one request and right on every type, however
     large; E49 is the smallest.
+11. E56 and E58, which let one page say what every Blob cell holds; then E55 and E57, which
+    make a gallery's screen cost what it shows; E59 with E35, since both weigh down a diff.
 
 ## Decisions
 
@@ -611,6 +656,7 @@ Then engine changes still open:
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-11-18 | What a gallery of Blob values cannot ask contract 0.14 (E55 to E59) | The `v0.15.0` OpenAPI document's `blobGet` and `blobStat`; `HEAD`, ranged `GET`, a write to another row, a `T7` filter and a branch diff sent with curl to a `v0.15.0` release server on `script/dev-server`'s cluster (spec 035's validation log) | No preview, listing or batch route; `content-type: application/octet-stream` always; an unchanged value's ETag moved after another row's write; `is not null` on a Blob refused with `T7`; a changed Blob carried whole in both diff images. Filed as E55 to E59 |
 | 2026-11-18 | What `v0.15.0` resolves, and a validation refusal's disposition (E9, E35 to E38, E54) | `docs/releases/v0.15.0.md` at the tag; `gh issue view` 969, 970, 972, 1157; mutations sent with curl to `v0.14.0` and `v0.15.0` release servers serving `script/dev-server`'s cluster plus a `MemberOf: Member -> Team @card(1..)` edge | E9 landed (#1012); E35 partly (#1201, #969 closed); #970, #972, #1157 open. A lone `Member` insert: 0.14 commits it, 0.15 answers 400 `@card violation … (min 1)` with `effects: unknown, action: reconcile`; with its `MemberOf` in the same mutation both commit. Deleting a required edge and an edge to a missing node answer the same disposition on both releases: E54 |
 | 2026-11-17 | Omnigraph `v0.15.0` needs no engine change from Studio | `openapi.json` at `v0.15.0` diffed with `v0.14.0`'s; the release notes (`gh release view v0.15.0`) | Contract still 0.14; no path, field or enum value removed; new fields (`ranking`, `details`, `client_id`) optional, one new error code (`not_admitted`). No new ID |
 | 2026-11-06 | A page of a wide, large type costs the server what it holds, not what it returns (E39) | `script/dev-big-server` (`v0.14.0`, `Account`: 95 columns, 100,000 rows), each read sent with curl, then Studio's snapshot tool with `OMNIGRAPH_STUDIO_TRACE` (`docs/perf/20261106-report.md`) | `order { $n.@id } limit 100` returning `$n`: 0.91 s; returning `$n.slug`: 0.08 s; `$n` unordered: 0.03 s; `$n.@id = $id`: 0.43 s; `$n.@id in $ids` (101): 0.46 s. Studio's first page: 947 ms of which 3.5 ms decoding. Filed as E39 |

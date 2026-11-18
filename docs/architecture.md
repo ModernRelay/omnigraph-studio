@@ -114,9 +114,9 @@ write that matched nothing, or a 412, reopens the draft.
   what is selected (`Item::inspected`) while the inspector is shown; it keeps one view per tab.
   A new window shows the inspector, and only its toggle, ⌘⌥B or Space hides it. Bottom dock:
   Activity.
-- Center: panes of tabs, each one view of one thing (type table, page, tree, canvas, map, source,
-  query editor, review, history, commit), with a view strip to its thing's other views. Each pane's
-  tab strip starts with its own Back and Forward.
+- Center: panes of tabs, each one view of one thing (type table, gallery, page, tree, canvas, map,
+  source, query editor, review, history, commit), with a view strip to its thing's other views.
+  Each pane's tab strip starts with its own Back and Forward.
 - Status bar, after Zed's: the sidebar toggle, the left dock's panel buttons, the
   tab's few facts, running work, a keyboard button listing the tab's keys, and memory and CPU when
   `studio.show_performance` is on. A button's right-click menu moves its panel to another dock

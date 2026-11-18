@@ -49,6 +49,11 @@ it goes through Omnigraph's own RFC process.
 | E52 | The schema at a commit, or a commit's schema diff | 033 | A schema change's tab says "Schema change" and the type the refusal names, with no retry |
 | E53 | A merge conflict's base, source and target images | 033 | The conflict's kind in words and the server's message, on its card and in the conflicts list |
 | E54 | A write refused in validation, before any effect (an `@card` bound, a missing endpoint), states `effects: none` and the violation as a typed detail; 0.14 and 0.15 answer 400 `bad_request` with `effects: unknown, action: reconcile` | 004, 034 | Judges it unknown, as the disposition says, and names the `@card` bound from the server's words; the new-node dialog sends a node with the edges its minimum needs so a 0.15 server does not refuse it |
+| E55 | A preview of a Blob cell made by the server: a small image of a picture or of a PDF's first page, at a size asked for, cacheable by content (E57) | 035 | Reads each tile's file whole up to 8 MiB and decodes and scales it off the main thread; a PDF's page is drawn on macOS only |
+| E56 | A Blob's metadata in GQ: whether a cell holds a value, its size, kind and digest, in a projection and a filter (`$n.file is not null` is `T7` today) | 035 | One `HEAD` per tile drawn; a gallery pages through rows without a file, as no read can leave them out |
+| E57 | A Blob validator that names its bytes, stable across commits that did not change them (today's `ETag` names the type's table version) | 035 | Keeps a tile's preview only at the commit it was read at, and reads it again after the gallery's pin moves |
+| E58 | A media type and, for an image, its pixel size kept with a Blob and answered by its `HEAD` (`Content-Type` is always `application/octet-stream`) | 035 | Judges a file by its first 64 KiB and reads an image's size from its header; a uniform grid, since a justified layout would need every row's first bytes before placing a tile |
+| E59 | Diff and change-feed images that describe a Blob by size and digest instead of carrying it whole as `base64:` text | 035, 008 | Reads a branch's diff as it comes, both sides of every changed Blob inline, and marks the tile whose file changed |
 
 Every server Studio supports serves these (checked against `v0.14.0`'s OpenAPI document, 2026-10-24):
 
