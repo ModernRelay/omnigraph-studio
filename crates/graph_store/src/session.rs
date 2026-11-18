@@ -1121,6 +1121,13 @@ impl GraphSession {
         self.access.actor()
     }
 
+    /// The OAuth client the credential acts through for its person, once the access route has
+    /// named it (Omnigraph 0.15); `None` from an earlier server and for a token not issued to
+    /// a client. Opaque text the client chose.
+    pub fn client_id(&self) -> Option<&str> {
+        self.access.client()
+    }
+
     /// Reads what the credential may do for `scope`, unless that was read or is being read
     /// since the credential last may have changed; [`SessionEvent::AccessChanged`] says when an
     /// answer lands. A read that fails is asked again the next time, and one answered after the

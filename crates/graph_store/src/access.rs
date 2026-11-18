@@ -116,6 +116,15 @@ impl Access {
             .find_map(|answer| answer.actor_id.as_deref())
     }
 
+    /// The OAuth client a signed-in person's credential was issued to, from any answer that
+    /// names it (Omnigraph 0.15, `AccessOutput.client_id`); none from an earlier server, and for
+    /// a static or data token.
+    pub(crate) fn client(&self) -> Option<&str> {
+        self.answers
+            .values()
+            .find_map(|answer| answer.client_id.as_deref())
+    }
+
     /// Whether `scope` is to be read: neither answered nor asked. When it is, it counts as
     /// asked, and the generation to land its answer with is returned.
     pub(crate) fn wants(&mut self, scope: &AccessScope) -> Option<u64> {
@@ -175,6 +184,25 @@ mod tests {
             actions: actions.to_vec(),
             client_id: None,
         }
+    }
+
+    /// The OAuth client a 0.15 server names comes from any answer; a 0.14 server names none.
+    #[test]
+    fn the_client_comes_from_an_answer_that_names_it() {
+        let mut access = Access::default();
+        let main = AccessScope::branch("main");
+        let generation = access.wants(&main).unwrap();
+        assert!(access.landed(main, generation, Some(answer(Some("main"), &[], &[]))));
+        assert_eq!(access.actor(), Some("act-ada"));
+        assert_eq!(access.client(), None, "a 0.14 answer");
+        let fix = AccessScope::branch("fix");
+        let generation = access.wants(&fix).unwrap();
+        let named = AccessOutput {
+            client_id: Some("studio-desktop".into()),
+            ..answer(Some("fix"), &[], &[])
+        };
+        assert!(access.landed(fix, generation, Some(named)));
+        assert_eq!(access.client(), Some("studio-desktop"));
     }
 
     /// An action is allowed on every branch by the graph-wide list, on one by its own answer,
