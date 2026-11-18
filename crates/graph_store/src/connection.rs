@@ -27,7 +27,7 @@ pub enum ServerSource {
     /// `OMNIGRAPH_STUDIO_SERVER` in the environment, for development and tests; its token,
     /// `OMNIGRAPH_STUDIO_TOKEN`, lasts the run.
     Environment,
-    /// A managed cluster that no CLI target names, opened from its control plane: from the
+    /// A managed cluster opened with Studio’s control-plane sign-in: from the
     /// plane's list, from a link that names it, or again at a start by the window that had it
     /// open (spec 021); its data token is the control plane's.
     ControlPlane,
@@ -1139,6 +1139,9 @@ impl Connection {
     /// person's Refresh, or a change to the CLI) or a new source. Requests made after this use
     /// it, and a connection in use checks again; one not yet used connects when it is.
     pub fn set_token(&mut self, token: Option<String>, cx: &mut Context<Self>) {
+        if self.server.source == ServerSource::ControlPlane {
+            return;
+        }
         let was_ready = self.token_ready();
         self.token_given = true;
         // Its lease was the token replaced's: no renewal of that one, under way or owed,
@@ -1831,7 +1834,8 @@ impl Connection {
     /// kept before anything else is asked). One sent that never arrived is not asked for: a token
     /// typed would be dropped the same way.
     pub fn asks_token(&self) -> bool {
-        self.state == ConnectionState::Unauthorized
+        self.server.source != ServerSource::ControlPlane
+            && self.state == ConnectionState::Unauthorized
             && !self.token_not_received()
             && self.sign_in == SignIn::NotOffered
             && self.signing_in.is_none()
@@ -1873,6 +1877,15 @@ impl Connection {
         }
         let login = self.standby.take();
         self.take_token_from(login, cx);
+    }
+
+    /// A control-plane connection follows the sign-in at its own plane. Discard the previous
+    /// data token and its outstanding requests before asking under the new identity.
+    pub(crate) fn plane_sign_in_changed(&mut self, cx: &mut Context<Self>) {
+        if self.client.set_token(None) {
+            cx.emit(ConnectionEvent::CredentialChanged);
+        }
+        self.take_token_from(self.token_source.clone(), cx);
     }
 
     /// Whether a sign-in is held, whatever the sign-in state says: one a sign-in as someone else

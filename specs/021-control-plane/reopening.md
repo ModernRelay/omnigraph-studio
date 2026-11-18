@@ -65,12 +65,17 @@ managed cluster with a known organization: one opened from a control plane, or a
 by the target's profile. It is absent otherwise, and in a file an earlier Studio wrote, which
 reads as before.
 
+When the graph uses a connection opened through Studio’s control plane, the window also
+saves `plane_owned: true`. A manually selected CLI target and older saved windows omit it.
+
 `target` and `url` are saved as before, and what Studio saves of a graph stays filed under
 `<target>@<url>/<graph>` (spec 002).
 
 ### Reopening
 
-At a start, once the CLI's targets are listed, each saved graph finds its server in this order
+At startup a graph marked `plane_owned` reopens through the saved control plane, organization,
+cluster ID, incarnation and endpoint. A new CLI target at that address cannot take over the
+window. The remaining saved graphs use the previous lookup order
 (`ConnectionRegistry::connection_for_saved`):
 
 1. The server named `target` at `url`, as before.
@@ -86,13 +91,15 @@ that address, and a cluster of a control plane Studio no longer holds.
 Nothing is read from the control plane to reopen a window, so it opens at once, as a CLI
 target's does, with or without the network. The control plane decides when the first data
 token is asked for, in the cluster's organization: it checks the person's membership and
-admission and that the cluster exists. Its answer must name the saved address as `endpoint`,
-and, where `meta.incarnation` is answered, the saved incarnation. Otherwise the token is
+admission and that the cluster exists. Its answer must name the saved address as `endpoint`.
+When the response supplies `meta.cluster_id` or `meta.incarnation`, each supplied field must
+match the saved identity. Otherwise the token is
 dropped and the connection says why:
 
 | The control plane answered | The connection says |
 |---|---|
 | A token for another address | As before (`ControlError::EndpointMismatch`) |
+| A token for another cluster ID | The connection reports that the control plane issued the token for a different cluster |
 | A token for another incarnation | "The control plane's token is for a newer cluster with this id: the one opened here was deleted and made again. Open it again from its organization's clusters" |
 | 403, 404 | "The control plane gave no data token:" and its words (plan, Errors) |
 | No sign-in held | "Sign in to the organization's control plane to reach this cluster"; it takes the plane's token when the plane signs in |
@@ -101,7 +108,7 @@ The incarnation check holds for every managed cluster, a CLI target's included, 
 target pins one.
 
 A control plane reads the sign-in its keychain item kept as it is made, off the main thread.
-A start that reopens a window by step 3 waits for that read first, 5 s at most for all of them
+A start that reopens a control-plane window waits for that read first, 5 s at most for all of them
 (`ControlPlane::when_kept_read`), so the cluster is asked for the plane's token and not, in the
 meantime, for a sign-in of its own. Past 5 s the window reopens anyway and takes the token when
 the sign-in is held. A start with no such window waits for nothing more than before.
@@ -111,11 +118,13 @@ the sign-in is held. A start with no such window waits for nothing more than bef
 `omnigraph studio --target NAME`, for a managed cluster target, sends:
 
 ```
-omnigraph-studio://open?api=<route>&organization=<org>&cluster=<id>&incarnation=<id>[&graph=<id>]
+omnigraph-studio://open-cluster?api=<route>&organization=<org>&cluster=<id>&incarnation=<id>[&graph=<id>]
 ```
 
-- It names no `target`. A link that names one is a server target's (spec 002), whatever else
-  it names.
+- `open-cluster` requires all four managed identity fields. It rejects a named CLI target.
+  Studio releases through 0.4.10 refuse this route. The earlier managed `open?api=…&cluster=…`
+  form also enters the corrected receiver in this release. The server-target `open?target=…`
+  route still verifies its CLI digests (spec 002).
 - `api` is the control plane's address: HTTP or HTTPS, with no user, query or fragment. The
   three ids are letters, digits, `_` and `-`, 128 at most. Anything else is refused as it is
   read.
@@ -123,12 +132,16 @@ omnigraph-studio://open?api=<route>&organization=<org>&cluster=<id>&incarnation=
   target here, so the link carries the default.
 - The control plane must be one Studio holds, with a sign-in held. A link adds no control
   plane and signs in to none.
-- A server that reaches the cluster already opens the graph, and the control plane is asked
-  nothing. Otherwise Studio reads `GET /v1/clusters/{id}` in the organization, once (10 s,
-  2 MiB), and opens the cluster as from the list. The answer's incarnation must be the link's,
-  and it must have a data endpoint.
-- With no graph named, the first graph known on the server opens; with none known, "Open a
-  graph" shows with the server chosen.
+- Every link reads `GET /v1/clusters/{id}` once in the named organization (10 s, 2 MiB),
+  including when a CLI target or a window already knows the cluster. Studio checks that the
+  answer has the link’s cluster ID and incarnation and supplies a data endpoint. It reuses
+  only a control-plane connection for that identity at that endpoint.
+- A named graph opens on that connection. If the graph is already open at that endpoint
+  through a different connection, Studio asks the person to close it first. The existing
+  graph keeps its drafts and any writes in progress.
+- With no graph named, the first graph known on that connection opens; with none known,
+  “Open a graph” offers the graphs on that connection. The general Open dialog waits for a
+  person to select a managed CLI target before connecting it.
 
 | What is wrong | Shown |
 |---|---|
@@ -194,11 +207,17 @@ A CLI target is a label a cluster may have, not what keeps it.
 | 2026-11-10 | A managed target's link is read, and refused when malformed | `cargo test -p studio an_open_link_names_a_managed_cluster` | The CLI's own test link reads, its address percent-encoded; a missing part, an id with a path or header byte, and an address with a user or query are refused; with a `target` it is a server target's link |
 | 2026-11-10 | A link opens its cluster, or says why not | `cargo test -p studio a_link_from_the_cli_opens_a_managed_cluster` | Refused for a control plane not held and with no sign-in; another incarnation, no data endpoint and a failed read each say so and open nothing; a matching answer opens the server; then the link opens the graph and asks the control plane nothing |
 | 2026-11-10 | The CLI sends this link for a managed target | In ModernRelay/omnigraph#1343, `cargo test -p omnigraph-cli studio_opens_a_managed_cluster_target_by_its_identity`, by reading | The link names `api`, `organization`, `cluster`, `incarnation` and the graph, built from the operator file alone; Studio's parser test reads that test's link |
+| 2026-11-18 | A matching CLI target or graph cannot take over a managed link | `cargo test -p studio a_link_from_the_cli_opens_a_managed_cluster` | Listing the CLI target kept it idle. A signed-out link opened nothing. The graph picker and explicit graph used the resolved connection. A graph already open through the CLI kept its session and Studio reported why. |
+| 2026-11-18 | Signing out during a cluster read or after connecting cannot reuse the old sign-in | `cargo test -p graph_store a_plane_connection_and_link_follow_the_sign_in_that_opened_them` | The pending read was dropped and the old data credential cleared. The connection rejected a typed token. |
 
-Not checked yet: a real start of Studio against Omnigraph Cloud (a window on a cluster no CLI
-target names, quit and started again), and `omnigraph studio --target` on a managed target
-opening the installed Studio. Both need the built app and a person at the keychain prompt.
+The 2026-11-10 checks did not exercise a real start against Omnigraph Cloud or a managed
+`omnigraph studio --target` opening the installed Studio.
 
 ## Corrections
 
-None yet.
+- **2026-11-18, credential selection for a managed link.** Matching a saved CLI target or
+  an existing graph by endpoint could reuse its credential while Studio was signed out. The
+  link now resolves through Studio’s sign-in, keeps the selected connection through graph
+  opening, and records that source when saving the window. A sign-out or account switch
+  invalidates the old data credential and any pending cluster lookup under the previous
+  sign-in. The CLI-backed connection remains available when the person selects that target.
