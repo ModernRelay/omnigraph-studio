@@ -2319,6 +2319,7 @@ pub fn chip(label: impl Into<SharedString>, cx: &App) -> Div {
 /// label, since every cell of a column of them draws one, and a truncating label is shaped
 /// again on every pass of every frame.
 fn tag_box(text: impl IntoElement, cx: &App) -> Div {
+    let (fill, radius) = tag_look(cx);
     div()
         .flex_none()
         .max_w(px(TAG_MAX_WIDTH))
@@ -2326,9 +2327,15 @@ fn tag_box(text: impl IntoElement, cx: &App) -> Div {
         .px(px(space::SM))
         .flex()
         .items_center()
-        .rounded(px(radii(cx).xs))
-        .bg(surface::tag(cx))
+        .rounded(radius)
+        .bg(fill)
         .child(text)
+}
+
+/// The fill and corner of a [`tag`]'s pill, which [`crate::Tags`] paints too: one place to
+/// change them for both. The sizes are [`size::TAG`], [`space::SM`] and [`TAG_MAX_WIDTH`].
+pub(crate) fn tag_look(cx: &App) -> (Hsla, Pixels) {
+    (surface::tag(cx), px(radii(cx).xs))
 }
 
 /// A menu opened at `position`, where the right click was: drawn over everything else, and

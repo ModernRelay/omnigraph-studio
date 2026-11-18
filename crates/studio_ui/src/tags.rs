@@ -38,6 +38,7 @@ pub fn tags(
     cx: &App,
 ) -> Tags {
     let body = crate::cell_text("", cx);
+    let (background, radius) = crate::ds::tag_look(cx);
     Tags {
         // As a cell's text: never more than a line shows, so a long name is not shaped whole.
         tags: tags
@@ -47,8 +48,8 @@ pub fn tags(
         count,
         tag_style: crate::cell_text("", cx).meta(cx).style,
         count_style: body.color(ui::Color::Muted.color(cx)).style,
-        background: crate::ds::surface::tag(cx),
-        radius: px(crate::ds::radii(cx).xs),
+        background,
+        radius,
         anchor: None,
     }
 }
