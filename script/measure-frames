@@ -120,17 +120,13 @@ for ((round = 1; round <= ROUNDS; round++)); do
   for case in "${cases[@]}"; do
     IFS='|' read -r -a parts <<<"$case"
     name=${parts[0]}
-    # The last measure step is the case's; the steps before it set the case up. A case that
-    # measures nothing says why (an action renamed or removed, a server not answering).
-    output=$("$SNAPSHOT" "$OUT/frame.png" "${parts[@]:1}" 2>&1 || true)
-    line=$(grep '^measure' <<<"$output" | tail -1 || true)
-    # Every measure step prints a line; one missing means a later step failed, and a setup
-    # line must not stand for it.
-    steps=$(printf '%s\n' "${parts[@]:1}" | grep -c '^measure:' || true)
-    if [[ $(grep -c '^measure' <<<"$output" || true) -lt $steps ]]; then
+    # A case that measures nothing says why (an action renamed or removed, a server not
+    # answering): the tool ends with an error status when any step fails, after its measure
+    # line or before it.
+    if output=$("$SNAPSHOT" "$OUT/frame.png" "${parts[@]:1}" 2>&1); then
+      line=$(grep '^measure' <<<"$output" | tail -1 || true)
+    else
       line=""
-    fi
-    if [[ -z "$line" ]]; then
       echo "$name: $(grep -v '^snapshot data\|frame\.png$\|^note: ' <<<"$output" | grep . | tail -1)" >&2
     fi
     median=$(sed -n 's/.*cpu median \([^,]*\),.*/\1/p' <<<"$line")
