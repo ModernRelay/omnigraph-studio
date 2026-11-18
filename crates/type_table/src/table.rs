@@ -11377,9 +11377,10 @@ impl TypeTable {
         }
         // The other type is the column's, looked up when the tooltip shows.
         let table = cx.weak_entity();
-        // The cell's height, as a text cell's tooltip takes.
+        // As high as the tags and the count, as the row of them was, so the tooltip stands
+        // where it did, under them.
         h_flex()
-            .size_full()
+            .w_full()
             .min_w_0()
             .child(cell)
             .id(ElementId::NamedInteger("relation".into(), id))
