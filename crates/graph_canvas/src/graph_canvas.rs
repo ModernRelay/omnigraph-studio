@@ -14,6 +14,8 @@ mod by_id;
 mod domains;
 mod layout;
 mod model;
+#[cfg(test)]
+mod motion_tests;
 mod ontology;
 mod paint;
 mod schema_walk;
@@ -51,7 +53,7 @@ use ui::prelude::*;
 use layout::{LayoutKind, LayoutNode, Vec2};
 use model::{HUB_STEP, Scene, SceneId, SceneKind, SceneNode};
 use studio_ui::menu::ContextMenu;
-use studio_ui::motion::{self, Ease, Lerp, Tween};
+use studio_ui::motion::{self, Glide, Glides};
 
 /// The closest the view zooms in.
 const MAX_ZOOM: f32 = 2.;
@@ -227,19 +229,35 @@ struct Camera {
     zoom: f32,
 }
 
-impl Lerp for Camera {
-    /// Zoom blends on a log scale, so a glide zooms at an even pace.
-    fn lerp(&self, to: &Self, t: f32) -> Self {
+impl Glides for Camera {
+    /// Zoom moves on a log scale, so a glide zooms at an even pace and changes of zoom add up
+    /// as factors.
+    type Delta = (Vec2, f32);
+    fn toward(&self, to: &Self) -> (Vec2, f32) {
+        (to.center - self.center, (to.zoom / self.zoom).ln())
+    }
+    fn moved(&self, (center, zoom): (Vec2, f32), t: f32) -> Self {
         Camera {
-            center: self.center.lerp(&to.center, t),
-            zoom: self.zoom.ln().lerp(&to.zoom.ln(), t).exp(),
+            center: self.center + center * t,
+            zoom: self.zoom * (zoom * t).exp(),
         }
+    }
+    fn unseen((center, zoom): (Vec2, f32)) -> bool {
+        center.length() < 0.01 && zoom.abs() < 1e-4
     }
 }
 
-impl Lerp for Vec2 {
-    fn lerp(&self, to: &Self, t: f32) -> Self {
-        Vec2::new(self.x.lerp(&to.x, t), self.y.lerp(&to.y, t))
+impl Glides for Vec2 {
+    type Delta = Vec2;
+    fn toward(&self, to: &Self) -> Vec2 {
+        *to - *self
+    }
+    fn moved(&self, by: Vec2, t: f32) -> Self {
+        *self + by * t
+    }
+    /// Half a world unit: less than a pixel at any zoom a chip is drawn whole at.
+    fn unseen(delta: Vec2) -> bool {
+        delta.length() <= 0.5
     }
 }
 
@@ -402,10 +420,11 @@ pub(crate) struct GraphCanvas {
     center: Vec2,
     zoom: f32,
     /// The view on its way to `center` and `zoom` (spec 006: the view glides to what it
-    /// centres on).
-    glide: Option<Tween<Camera>>,
-    /// Nodes on their way to their places: new ones grow out of the node they came from.
-    appear: HashMap<usize, Tween<Vec2>>,
+    /// centres on). Its target is always `center` and `zoom`.
+    glide: Option<Glide<Camera>>,
+    /// Nodes on their way to their places: new ones grow out of the node they came from. Each
+    /// glide's target is the node's place in `positions`.
+    appear: HashMap<usize, Glide<Vec2>>,
     /// The person moved the view by hand since the last fit: a resize then leaves it alone.
     camera_touched: bool,
     /// The canvas's size at the last fit, to fit again when it changes.
@@ -415,6 +434,9 @@ pub(crate) struct GraphCanvas {
     drawn_size: Option<Size<Pixels>>,
     fit_zoom: f32,
     fit_pending: bool,
+    /// The fit pending is of a walk already drawn (Reset layout): the chips glide to their new
+    /// places and the view to the fit, where a new walk's first fit is drawn at once.
+    fit_glides: bool,
     center_on: Option<SceneId>,
     /// A schema canvas's expansion under way: once laid out, the view moves just enough to
     /// show what it opened.
@@ -838,6 +860,7 @@ impl GraphCanvas {
             center: Vec2::default(),
             zoom: 1.,
             glide: None,
+            fit_glides: false,
             appear: HashMap::new(),
             camera_touched: false,
             fitted_size: None,
@@ -944,7 +967,7 @@ impl GraphCanvas {
     pub(crate) fn show_type(&mut self, name: &str, cx: &mut Context<Self>) {
         let id = SceneId::Node(schema_walk::type_ref(name));
         if let Some(index) = self.index_of(&id) {
-            let from = self.camera_now(Instant::now());
+            let from = self.camera_now(motion::now(cx));
             self.center = self.positions[index];
             self.zoom = self.zoom.max(1.);
             self.camera_touched = true;
@@ -1097,6 +1120,7 @@ impl GraphCanvas {
                 self.known_root = key.1.clone();
             }
             self.fit_pending = true;
+            self.fit_glides = false;
             self.layout_key = Some(key);
         }
         self.layout_generation += 1;
@@ -1303,8 +1327,10 @@ impl GraphCanvas {
         let known = &self.known;
         self.marked.retain(|id| known.contains_key(id));
         // Every node glides from where it is drawn now to its new place; a new one from where
-        // the node it hangs off is drawn, so expanding reads as growing.
-        let now = Instant::now();
+        // the node it hangs off is drawn, so expanding reads as growing. A node already on its
+        // way is sent on from where it is, keeping the motion it has (`Glide::retarget`): pages
+        // landing one after another neither stop it nor start it over.
+        let now = motion::now(cx);
         let drawn: HashMap<SceneId, Vec2> = self
             .scene
             .nodes
@@ -1312,24 +1338,34 @@ impl GraphCanvas {
             .enumerate()
             .map(|(index, node)| (node.id.clone(), self.drawn_position(index, now)))
             .collect();
-        self.appear.clear();
-        if motion::enabled(cx) && !self.fit_pending {
+        let mut under_way: HashMap<SceneId, Glide<Vec2>> = self
+            .appear
+            .drain()
+            .filter_map(|(index, glide)| Some((self.scene.nodes.get(index)?.id.clone(), glide)))
+            .collect();
+        if motion::enabled(cx) && (!self.fit_pending || self.fit_glides) {
             for (index, node) in scene.nodes.iter().enumerate() {
                 let to = positions[index];
-                let from = drawn.get(&node.id).copied().or_else(|| {
-                    let parent = node.parent?;
-                    drawn
-                        .get(&scene.nodes.get(parent)?.id)
-                        .copied()
-                        .or_else(|| positions.get(parent).copied())
-                });
-                if let Some(from) = from
-                    && (from - to).length() > 0.5
-                {
-                    self.appear.insert(
-                        index,
-                        Tween::glide(from, to, motion::GLIDE, Ease::OutCubic, now),
-                    );
+                let glide = match under_way.remove(&node.id) {
+                    Some(mut glide) => {
+                        glide.retarget(to, now);
+                        glide
+                    }
+                    None => {
+                        let Some(from) = drawn.get(&node.id).copied().or_else(|| {
+                            let parent = node.parent?;
+                            drawn
+                                .get(&scene.nodes.get(parent)?.id)
+                                .copied()
+                                .or_else(|| positions.get(parent).copied())
+                        }) else {
+                            continue;
+                        };
+                        Glide::new(from, to, now)
+                    }
+                };
+                if glide.is_running(now) {
+                    self.appear.insert(index, glide);
                 }
             }
         }
@@ -1470,21 +1506,30 @@ impl GraphCanvas {
     }
 
     /// Glides the view from `from` (where it was drawn) to the camera just set.
+    /// A glide under way is sent on to it from where it is drawn, keeping its motion, so a key
+    /// pressed again mid-glide (`=` `=` `=`) neither stops the view nor starts it over.
     fn glide_from(&mut self, from: Camera, cx: &App) {
         let to = Camera {
             center: self.center,
             zoom: self.zoom,
         };
-        self.glide = (motion::enabled(cx) && from != to)
-            .then(|| Tween::glide(from, to, motion::GLIDE, Ease::InOutCubic, Instant::now()));
+        if !motion::enabled(cx) {
+            self.glide = None;
+            return;
+        }
+        let now = motion::now(cx);
+        match self.glide.as_mut() {
+            Some(glide) if glide.is_running(now) => glide.retarget(to, now),
+            _ => self.glide = Some(Glide::new(from, to, now)).filter(|g| g.is_running(now)),
+        }
     }
 
     /// The person takes the camera: a glide under way stops where it is drawn, and a node still
     /// to be centred on once drawn is let go, so the view does not move off on its own later.
-    fn settle_camera(&mut self) {
+    fn settle_camera(&mut self, cx: &App) {
         self.center_on = None;
         if let Some(glide) = self.glide.take() {
-            let now = Instant::now();
+            let now = motion::now(cx);
             if glide.is_running(now) {
                 let at = glide.value(now);
                 self.center = at.center;
@@ -1557,8 +1602,15 @@ impl GraphCanvas {
             y - y.clamp(-reach_y, reach_y),
         );
         if over_x != 0. || over_y != 0. {
-            self.glide = None;
             self.center = self.center + Vec2::new(over_x / self.zoom, over_y / self.zoom);
+            // A glide under way goes on, moved with the view: snapping it to its end would
+            // jump.
+            if let Some(glide) = self.glide.as_mut() {
+                glide.shift_to(Camera {
+                    center: self.center,
+                    zoom: self.zoom,
+                });
+            }
         }
     }
 
@@ -1929,11 +1981,15 @@ impl GraphCanvas {
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus_handle, cx);
         self.context_menu = None;
-        self.settle_camera();
+        self.settle_camera(cx);
         let hit = self.hit(event.position);
+        // Chips are taken from where they are drawn: one still gliding to its place stays
+        // under the pointer, rather than jumping to where it was going.
+        let now = motion::now(cx);
         let node = hit
             .filter(|index| pin_key(&self.scene.nodes[*index].id).is_some())
-            .and_then(|index| Some((index, *self.positions.get(index)?)));
+            .filter(|index| *index < self.positions.len())
+            .map(|index| (index, self.drawn_position(index, now)));
         // A marked chip moves with every other marked chip; any chip moves with its pills.
         let followers = match node {
             Some((index, _)) if self.is_marked(index) && self.marked.len() > 1 => {
@@ -1941,13 +1997,14 @@ impl GraphCanvas {
                 moving.retain(|other| *other != index);
                 let mut followers: Vec<(usize, Vec2)> = moving
                     .iter()
-                    .filter_map(|ix| Some((*ix, *self.positions.get(*ix)?)))
+                    .filter(|ix| **ix < self.positions.len())
+                    .map(|ix| (*ix, self.drawn_position(*ix, now)))
                     .collect();
                 moving.push(index);
-                followers.extend(self.followers(&moving));
+                followers.extend(self.followers(&moving, now));
                 followers
             }
-            Some((index, _)) => self.followers(&[index]),
+            Some((index, _)) => self.followers(&[index], now),
             None => Vec::new(),
         };
         self.drag = Some(Drag {
@@ -2015,7 +2072,8 @@ impl GraphCanvas {
 
     /// The chips that move with the dragged ones (`owners`), from where they are, each once: a
     /// node's relationship pills, unless placed by hand, and each pill's "+K more".
-    fn followers(&self, owners: &[usize]) -> Vec<(usize, Vec2)> {
+    /// Each from where it is drawn at `now`.
+    fn followers(&self, owners: &[usize], now: Instant) -> Vec<(usize, Vec2)> {
         // Each chip's children, found once: with every chip marked, a drag starts at once.
         let mut children: HashMap<usize, Vec<usize>> = HashMap::new();
         for (child, node) in self.scene.nodes.iter().enumerate() {
@@ -2038,11 +2096,8 @@ impl GraphCanvas {
                     SceneKind::More { .. } | SceneKind::Note { .. } => true,
                     SceneKind::Node { .. } => false,
                 };
-                if follows
-                    && taken.insert(child)
-                    && let Some(at) = self.positions.get(child)
-                {
-                    out.push((child, *at));
+                if follows && taken.insert(child) && child < self.positions.len() {
+                    out.push((child, self.drawn_position(child, now)));
                     stack.push(child);
                 }
             }
@@ -2256,7 +2311,7 @@ impl GraphCanvas {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle, cx);
-        self.settle_camera();
+        self.settle_camera(cx);
         let hit = self.hit(event.position);
         let group = hit.is_some_and(|index| self.is_marked(index)) && self.marked.len() > 1;
         if let Some(index) = hit
@@ -2770,7 +2825,7 @@ impl GraphCanvas {
     }
 
     fn scroll(&mut self, event: &ScrollEvent, window: &mut Window, cx: &mut Context<Self>) {
-        self.settle_camera();
+        self.settle_camera(cx);
         self.camera_touched = true;
         self.view_moved_by_hand();
         let delta = event.delta.pixel_delta(window.line_height());
@@ -2780,7 +2835,7 @@ impl GraphCanvas {
     }
 
     fn pinch(&mut self, event: &PinchEvent, window: &mut Window, cx: &mut Context<Self>) {
-        self.settle_camera();
+        self.settle_camera(cx);
         self.camera_touched = true;
         self.view_moved_by_hand();
         self.zoom_around(1. + event.delta, Some(event.position), window);
@@ -2799,12 +2854,15 @@ impl GraphCanvas {
         self.known.clear();
         self.hub_limits.clear();
         self.fit_pending = true;
+        // The chips drawn glide to their new places and the view to the fit (spec 006,
+        // Motion); a walk not drawn yet is fitted at once.
+        self.fit_glides = !self.scene.nodes.is_empty();
         cx.emit(ItemEvent::UpdateTab);
         self.rebuild(cx);
     }
 
     fn fit_to_window(&mut self, _: &FitToWindow, window: &mut Window, cx: &mut Context<Self>) {
-        let from = self.camera_now(Instant::now());
+        let from = self.camera_now(motion::now(cx));
         let viewport = self.viewport(window);
         self.fit(viewport);
         // Fitted on request: a resize fits again until the view is moved by hand.
@@ -2815,7 +2873,7 @@ impl GraphCanvas {
     }
 
     fn zoom_in(&mut self, _: &ZoomIn, window: &mut Window, cx: &mut Context<Self>) {
-        let from = self.camera_now(Instant::now());
+        let from = self.camera_now(motion::now(cx));
         self.zoom_around(ZOOM_STEP, None, window);
         self.camera_touched = true;
         self.view_moved_by_hand();
@@ -2824,7 +2882,7 @@ impl GraphCanvas {
     }
 
     fn zoom_out(&mut self, _: &ZoomOut, window: &mut Window, cx: &mut Context<Self>) {
-        let from = self.camera_now(Instant::now());
+        let from = self.camera_now(motion::now(cx));
         self.zoom_around(1. / ZOOM_STEP, None, window);
         self.camera_touched = true;
         self.view_moved_by_hand();
@@ -2902,7 +2960,7 @@ impl GraphCanvas {
             return;
         };
         if let Some(position) = self.positions.get(index).copied() {
-            let from = self.camera_now(Instant::now());
+            let from = self.camera_now(motion::now(cx));
             self.center = position;
             self.zoom = self.zoom.clamp(1.25, 2.);
             self.camera_touched = true;
@@ -3108,12 +3166,18 @@ impl GraphCanvas {
         };
         if let Some(next) = next {
             self.select(Some(next), cx);
+            // The view keeps the chip the keys reached in sight, at once: an arrow key is
+            // pressed many times a minute, which never animates (constitution VII).
+            if let Some(viewport) = self.bounds.get() {
+                self.keep_selected_in(viewport);
+            }
         }
     }
 
     // ---- painting ----
 
-    fn render_canvas(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Draws the canvas as it is at `now`, the frame's one reading of the clock.
+    fn render_canvas(&self, now: Instant, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = paint::Palette {
             text: Color::Default.color(cx),
             muted: Color::Muted.color(cx),
@@ -3132,7 +3196,6 @@ impl GraphCanvas {
         };
         let scene = self.scene.clone();
         let texts = self.texts.clone();
-        let now = Instant::now();
         let positions: Arc<Vec<Vec2>> = if self.appear.is_empty() {
             self.positions.clone()
         } else {
@@ -3630,7 +3693,7 @@ impl Render for GraphCanvas {
             ),
             Loadable::Loaded(_) => None,
         };
-        let now = Instant::now();
+        let now = motion::now(cx);
         // The view or the chips moved under a pointer resting on a chip (a fit, a zoom key, a
         // glide, a layout): the chip under it is found again once this frame is painted, as a
         // pointer move would find it. A drag keeps its own.
@@ -3644,8 +3707,9 @@ impl Render for GraphCanvas {
             });
         }
         self.drawn = Some(drawn);
-        self.appear.retain(|_, tween| tween.is_running(now));
-        if self.glide.as_ref().is_some_and(|g| !g.is_running(now)) {
+        // What has come to rest is forgotten, so nothing asks for another frame for it.
+        self.appear.retain(|_, glide| glide.settle(now));
+        if self.glide.as_mut().is_some_and(|glide| !glide.settle(now)) {
             self.glide = None;
         }
         // The fit waits for the canvas's own bounds, known once it has been painted, and
@@ -3661,8 +3725,15 @@ impl Render for GraphCanvas {
                 if self.fit_pending {
                     self.camera_touched = false;
                 }
+                // A fit after Reset layout glides there from where the view is drawn; a new
+                // walk's first fit, and a fit that follows the canvas's size, are at once.
+                let from = self.camera_now(now);
+                let glides = fit && std::mem::take(&mut self.fit_glides);
                 self.glide = None;
                 self.fit(viewport);
+                if glides {
+                    self.glide_from(from, cx);
+                }
             } else if self.drawn_size.is_some_and(|size| size != viewport.size) {
                 // The person placed the view, so it is not fitted again; what is selected
                 // stays in sight, as when the inspector opens beside the canvas.
@@ -3671,7 +3742,7 @@ impl Render for GraphCanvas {
             self.drawn_size = Some(viewport.size);
         }
         let background = studio_ui::ds::surface::canvas(cx);
-        let canvas = self.render_canvas(cx).into_any_element();
+        let canvas = self.render_canvas(now, cx).into_any_element();
         let overlay = self.render_overlay(cx).into_any_element();
         // The area being drawn: a tinted rectangle from where the drag began to the pointer.
         let area = self
@@ -4756,7 +4827,7 @@ mod tests {
         settle(cx);
         canvas.update_in(cx, |canvas, window, cx| {
             canvas.center_on = None;
-            // Glides run on the wall clock, which the test's does not move.
+            // Fitted at once: the chips' places are checked, not a glide to them.
             canvas.glide = None;
             canvas.appear.clear();
             canvas.fit(canvas.viewport(window));
@@ -5060,7 +5131,7 @@ mod tests {
                 cx,
             );
             let followers: Vec<usize> = canvas
-                .followers(&[0])
+                .followers(&[0], motion::now(cx))
                 .into_iter()
                 .map(|(index, _)| index)
                 .collect();
