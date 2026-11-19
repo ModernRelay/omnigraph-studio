@@ -202,7 +202,10 @@
     "bindings": {
       "cmd-n": "studio_graph::NewQuery",
       "cmd-shift-o": "studio_graph::OpenMap",
-      "cmd-shift-r": "studio_graph::ReviewBranch"
+      "cmd-shift-r": "studio_graph::ReviewBranch",
+      "cmd-alt-shift-r": "studio_graph::CompareBranches",
+      "cmd-alt-shift-b": "studio_graph::RefreshBranches",
+      "cmd-alt-shift-g": "studio_graph::ToggleBranchGrouping"
     }
   },
   {
@@ -432,7 +435,8 @@
       "alt-cmd-z": "studio_review::RevertAndNext",
       "cmd-shift-enter": "studio_review::Merge",
       "cmd-shift-m": "studio_review::Summarize",
-      "cmd-shift-v": "studio_review::SwitchLayout"
+      "cmd-shift-v": "studio_review::SwitchLayout",
+      "cmd-shift-x": "studio_review::SwapSides"
     }
   },
   {

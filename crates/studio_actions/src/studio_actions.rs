@@ -347,6 +347,12 @@ pub mod graph {
             CreateBranch,
             /// Delete the current branch.
             DeleteBranch,
+            /// Compare the current branch with another branch or a commit, side by side.
+            CompareBranches,
+            /// Read the branch list again, with each branch's head and whether it is merged.
+            RefreshBranches,
+            /// Group the branches by who wrote them, or by the prefix of their name.
+            ToggleBranchGrouping,
         ]
     );
 
@@ -615,6 +621,18 @@ pub mod graph {
     #[action(namespace = studio_graph)]
     pub struct OpenBranch {
         pub branch: String,
+        /// Open as the pane's preview tab, which the next preview replaces.
+        #[serde(default)]
+        pub preview: bool,
+    }
+
+    /// Compare two branches, or a branch and a commit: what `to` holds that `from` does not,
+    /// as a review's cards (spec 043). Read-only; a side that is not a branch is a commit id.
+    #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = studio_graph)]
+    pub struct OpenCompare {
+        pub from: String,
+        pub to: String,
         /// Open as the pane's preview tab, which the next preview replaces.
         #[serde(default)]
         pub preview: bool,
@@ -932,6 +950,8 @@ pub mod review {
             ToggleChange,
             /// Switch the review between its feed of types and one record at a time.
             SwitchLayout,
+            /// Swap the two sides of a comparison of branches.
+            SwapSides,
         ]
     );
 }

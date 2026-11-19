@@ -102,6 +102,27 @@ impl ReviewLayout {
     }
 }
 
+/// How the Branches panel groups a graph's branches (spec 043).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BranchGrouping {
+    /// By the part of the name before its first `/` (`agent/`, `tentative/`), where two or
+    /// more branches share it.
+    #[default]
+    Prefix,
+    /// By who wrote each branch's newest commit, where the server lists every branch's head.
+    Author,
+}
+
+impl BranchGrouping {
+    pub fn other(self) -> Self {
+        match self {
+            Self::Prefix => Self::Author,
+            Self::Author => Self::Prefix,
+        }
+    }
+}
+
 /// Where the bottom panel spans, as Zed's `bottom_dock_layout`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -183,6 +204,10 @@ pub struct StudioOptions {
     /// listed beside one record at a time.
     #[schemars(title = "Review layout", extend("x-section" = "Browsing"))]
     pub review_layout: ReviewLayout,
+    /// How the Branches panel groups branches: by the prefix of their name, or by who wrote
+    /// each one's newest commit.
+    #[schemars(title = "Group branches by", extend("x-section" = "Browsing"))]
+    pub branch_grouping: BranchGrouping,
     /// Seconds between checks that the server still answers.
     #[schemars(
         title = "Health check interval",
@@ -210,6 +235,7 @@ impl Default for StudioOptions {
             tree_page_size: 50,
             canvas_max_nodes: 2000,
             review_layout: ReviewLayout::default(),
+            branch_grouping: BranchGrouping::default(),
             health_check_seconds: 30,
             show_performance: true,
             auto_update: true,

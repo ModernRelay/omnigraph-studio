@@ -1,11 +1,16 @@
-//! Branches (spec 008): the sidebar list, switching, and the create and delete dialogs.
+//! Branches (spec 008): the sidebar list, switching, and the create and delete dialogs; and
+//! the list as lanes of work (spec 043): grouped by the prefix of their names or by who wrote
+//! them, each marked merged into main or with how many commits it is ahead, and a Refresh.
 //!
-//! Omnigraph's `GET /branches` returns names only (E9 waits on branch details), so each
-//! branch's last commit comes from its own `GET /commits?branch=`, for the branches the list
-//! draws: none while it is hidden, and those in view while it is shown.
+//! A 0.14 server's `GET /branches` returns names only, so each branch's last commit comes from
+//! its own `GET /commits?branch=` (a 0.15 server details every head in one read), for the
+//! branches the list draws: none while it is hidden, and those in view while it is shown. A
+//! drawn branch's lane (merged, or how far ahead) is its merge base with main and, when it is
+//! not merged, one page of its history.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::rc::Rc;
 
 use editor::{Editor, EditorEvent};
 use gpui::{
@@ -14,10 +19,14 @@ use gpui::{
 };
 use graph_client::WriteOutcome;
 use graph_client::api::{BranchStartRefusalOutput, BranchStartRefusalReason, CommitOutput};
-use graph_store::{AccessAction, AccessScope, BranchStart, GraphSession, SessionEvent};
-use studio_actions::graph::{
-    CreateBranch, CreateBranchAt, DeleteBranch, OpenBranch, OpenBranchHistory, ReviewBranch,
+use graph_store::{
+    AccessAction, AccessScope, BranchStart, GraphSession, ServerFeature, SessionEvent,
 };
+use studio_actions::graph::{
+    CompareBranches, CreateBranch, CreateBranchAt, DeleteBranch, OpenBranch, OpenBranchHistory,
+    OpenCompare, RefreshBranches, ReviewBranch, ToggleBranchGrouping,
+};
+use studio_settings::{BranchGrouping, StudioSettings};
 use studio_ui::ds::Tipped;
 use studio_ui::menu::{ContextMenu, ContextMenuEntry};
 use studio_ui::{ds, now_micros, relative_time, short_commit_id};
@@ -25,13 +34,14 @@ use studio_workspace::{Workspace, WorkspaceEvent};
 use ui::prelude::*;
 use ui::right_click_menu;
 
+use crate::compare::{CompareModal, open_compare};
 use crate::view::{open_review, open_review_with};
 use studio_workspace::ModalView;
 
 /// The branch every review and merge targets.
 pub const TARGET: &str = "main";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct BranchDetail {
     head: String,
     created_at: i64,
@@ -41,11 +51,202 @@ struct BranchDetail {
     started: Option<(i64, Option<String>)>,
 }
 
+/// How many of a branch's commits its lane reads to count those ahead of main: one page.
+pub(crate) const AHEAD_PAGE: u32 = 100;
+
+/// Where a branch stands against [`TARGET`], as its row marks it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Lane {
+    /// Its head is in main: deleting it loses nothing.
+    Merged,
+    /// It holds commits main does not: how many, or that there are more than a page counts.
+    Ahead { commits: usize, more: bool },
+    /// The merge base was read, the history was not: not merged, by how much is not known.
+    Unmerged,
+}
+
+/// How many of `commits` (a branch's history, newest first) are not in main: those down to the
+/// merge base `base`, or to the first commit written on main, which main still holds. Past the
+/// page, there may be more.
+pub(crate) fn ahead_of(commits: &[CommitOutput], base: &str, page_ended: bool) -> Lane {
+    let stop = commits
+        .iter()
+        .position(|commit| commit.graph_commit_id == base || commit.graph_branch.is_none());
+    match stop {
+        Some(commits) => Lane::Ahead {
+            commits,
+            more: false,
+        },
+        None => Lane::Ahead {
+            commits: commits.len(),
+            more: !page_ended,
+        },
+    }
+}
+
+/// One row of the list: a branch, a group's header, or "New branch…" after the last.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ListRow {
+    /// The branch at `index` of the session's list, named from byte `shown_from` on (a grouped
+    /// branch drops its group's prefix), and indented under its group's header when grouped.
+    Branch {
+        index: usize,
+        shown_from: usize,
+        grouped: bool,
+    },
+    Group(usize),
+    NewBranch,
+}
+
+/// A group of branches: the prefix their names share, or who wrote their newest commits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BranchGroup {
+    /// What the list keeps folded by: the grouping and the prefix or the author.
+    pub key: String,
+    pub label: String,
+    pub branches: usize,
+    pub open: bool,
+}
+
+/// The list's rows, made again only when the branches, the grouping, a fold or the authors
+/// change: a draw reads the rows in view from it.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Layout {
+    pub rows: Vec<ListRow>,
+    pub groups: Vec<BranchGroup>,
+}
+
+/// The part of `branch` before its first `/`, when something follows it.
+fn prefix_of(branch: &str) -> Option<&str> {
+    branch
+        .split_once('/')
+        .filter(|(prefix, rest)| !prefix.is_empty() && !rest.is_empty())
+        .map(|(prefix, _)| prefix)
+}
+
+/// Lays the branches out (spec 043): [`TARGET`] first, then, by prefix, the branches whose
+/// prefix no other branch shares, then a group for each shared prefix, its branches named
+/// without it; by author, a group for each author, in order of their names, the branches whose
+/// author is not known last. A folded group keeps its header. "New branch…" is the last row.
+pub(crate) fn lay_out(
+    branches: &[String],
+    grouping: BranchGrouping,
+    author: impl Fn(&str) -> Option<String>,
+    folded: &HashSet<String>,
+) -> Layout {
+    let mut layout = Layout::default();
+    let mut rest: Vec<usize> = Vec::new();
+    for (index, branch) in branches.iter().enumerate() {
+        if branch == TARGET {
+            layout.rows.push(ListRow::Branch {
+                index,
+                shown_from: 0,
+                grouped: false,
+            });
+        } else {
+            rest.push(index);
+        }
+    }
+    // Each group's key, its label and its branches, in the list's order.
+    let mut groups: Vec<(String, String, Vec<usize>)> = Vec::new();
+    match grouping {
+        BranchGrouping::Prefix => {
+            let mut shared: HashMap<&str, usize> = HashMap::new();
+            for &index in &rest {
+                if let Some(prefix) = prefix_of(&branches[index]) {
+                    *shared.entry(prefix).or_default() += 1;
+                }
+            }
+            for &index in &rest {
+                match prefix_of(&branches[index]).filter(|prefix| shared[prefix] > 1) {
+                    Some(prefix) => {
+                        let key = format!("prefix:{prefix}");
+                        match groups.iter_mut().find(|(k, ..)| *k == key) {
+                            Some((.., members)) => members.push(index),
+                            None => groups.push((key, format!("{prefix}/"), vec![index])),
+                        }
+                    }
+                    None => layout.rows.push(ListRow::Branch {
+                        index,
+                        shown_from: 0,
+                        grouped: false,
+                    }),
+                }
+            }
+            groups.sort_by(|a, b| a.1.cmp(&b.1));
+        }
+        BranchGrouping::Author => {
+            for &index in &rest {
+                let author = author(&branches[index]);
+                let key = format!("author:{}", author.as_deref().unwrap_or_default());
+                match groups.iter_mut().find(|(k, ..)| *k == key) {
+                    Some((.., members)) => members.push(index),
+                    None => groups.push((
+                        key,
+                        author.unwrap_or_else(|| UNKNOWN_AUTHOR.to_owned()),
+                        vec![index],
+                    )),
+                }
+            }
+            // By name, the branches nobody is known to have written last.
+            groups.sort_by(|a, b| {
+                let unknown = |key: &str| key == "author:";
+                unknown(&a.0).cmp(&unknown(&b.0)).then(a.1.cmp(&b.1))
+            });
+        }
+    }
+    for (key, label, members) in groups {
+        let open = !folded.contains(&key);
+        let shown_from = match grouping {
+            BranchGrouping::Prefix => label.len(),
+            BranchGrouping::Author => 0,
+        };
+        layout.rows.push(ListRow::Group(layout.groups.len()));
+        layout.groups.push(BranchGroup {
+            key,
+            label,
+            branches: members.len(),
+            open,
+        });
+        if open {
+            layout
+                .rows
+                .extend(members.into_iter().map(|index| ListRow::Branch {
+                    index,
+                    shown_from,
+                    grouped: true,
+                }));
+        }
+    }
+    layout.rows.push(ListRow::NewBranch);
+    layout
+}
+
+/// The group of branches whose newest commit's author is not known: the server did not detail
+/// them (one the credential may not read).
+const UNKNOWN_AUTHOR: &str = "Author not known";
+
 /// The "Branches" sidebar section.
 pub struct BranchList {
     workspace: WeakEntity<Workspace>,
     session: Option<Entity<GraphSession>>,
     details: HashMap<String, BranchDetail>,
+    /// Each drawn branch's lane, kept while it is read again: a row's mark changes only when
+    /// the new answer lands.
+    lanes: HashMap<String, Lane>,
+    /// The branches whose lane has been asked for since it last could have changed: a commit
+    /// to the branch or to main asks again for those drawn.
+    lanes_asked: HashSet<String>,
+    lane_reads: HashMap<String, Task<()>>,
+    unread_lanes: Vec<String>,
+    /// The rows, made again when the branches, the grouping, a fold or the authors change.
+    layout: Option<Rc<Layout>>,
+    /// The groups folded to their header, by [`BranchGroup::key`].
+    folded: HashSet<String>,
+    /// The grouping the layout was made with, as the settings last said.
+    grouping: BranchGrouping,
+    /// The detailed branch list a grouping by author waits for.
+    _authors_read: Option<Task<()>>,
     /// The branches whose head has been asked for since it last could have moved: read, or
     /// being read. A commit to one, or a change of the list, asks again for those drawn.
     asked: HashSet<String>,
@@ -60,8 +261,13 @@ pub struct BranchList {
     /// How many rows the list has built, for the test that it builds only those in view.
     #[cfg(test)]
     rows_drawn: usize,
+    /// How many times a lane landing asked the list to draw, for the test that lanes read again
+    /// to the same answers draw nothing.
+    #[cfg(test)]
+    lane_draws: usize,
     _workspace_subscription: Option<Subscription>,
     _session_subscription: Option<Subscription>,
+    _settings_subscription: Option<Subscription>,
 }
 
 impl BranchList {
@@ -73,10 +279,32 @@ impl BranchList {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let grouping = cx
+            .try_global::<StudioSettings>()
+            .map_or_else(BranchGrouping::default, |settings| {
+                settings.studio.branch_grouping
+            });
+        let settings_subscription = cx.try_global::<StudioSettings>().is_some().then(|| {
+            cx.observe_global::<StudioSettings>(|this: &mut Self, cx| {
+                let grouping = StudioSettings::get(cx).studio.branch_grouping;
+                if grouping != this.grouping {
+                    this.grouping = grouping;
+                    this.relayout(cx);
+                }
+            })
+        });
         let mut this = Self {
             workspace: workspace.clone(),
             session: None,
             details: HashMap::new(),
+            lanes: HashMap::new(),
+            lanes_asked: HashSet::new(),
+            lane_reads: HashMap::new(),
+            unread_lanes: Vec::new(),
+            layout: None,
+            folded: HashSet::new(),
+            grouping,
+            _authors_read: None,
             asked: HashSet::new(),
             reads: HashMap::new(),
             unread: Vec::new(),
@@ -84,8 +312,11 @@ impl BranchList {
             scroll: UniformListScrollHandle::new(),
             #[cfg(test)]
             rows_drawn: 0,
+            #[cfg(test)]
+            lane_draws: 0,
             _workspace_subscription: None,
             _session_subscription: None,
+            _settings_subscription: settings_subscription,
         };
         if let Some(workspace) = workspace.upgrade() {
             this._workspace_subscription = Some(cx.subscribe_in(
@@ -114,12 +345,22 @@ impl BranchList {
                 |this, session, event: &SessionEvent, cx| match event {
                     SessionEvent::BranchesChanged => this.branches_changed(&session, cx),
                     // The session forgot the branch's head: a read still out answers for before.
+                    // Its lane is asked for again; a commit to main may have merged any branch,
+                    // or moved its merge base, so every drawn lane is.
                     SessionEvent::Committed { branch } => {
                         this.asked.remove(branch);
                         this.reads.remove(branch);
+                        this.lane_moved(branch);
                         cx.notify();
                     }
-                    SessionEvent::BranchChanged => cx.notify(),
+                    SessionEvent::HeadMoved { branch, .. } if branch == TARGET => {
+                        this.lane_moved(branch);
+                        cx.notify();
+                    }
+                    // A server that details its branches now, or no longer, can group by author.
+                    SessionEvent::BranchChanged | SessionEvent::CredentialChanged => {
+                        this.relayout(cx)
+                    }
                     _ => {}
                 },
             )
@@ -132,6 +373,104 @@ impl BranchList {
         self.asked.clear();
         self.reads.clear();
         self.unread.clear();
+        self.lanes.clear();
+        self.lanes_asked.clear();
+        self.lane_reads.clear();
+        self.unread_lanes.clear();
+        self.folded.clear();
+        self._authors_read = None;
+        self.relayout(cx);
+    }
+
+    /// `branch` moved: its lane is asked for again when next drawn, and every lane when it is
+    /// main. The marks shown stay until the answers land.
+    fn lane_moved(&mut self, branch: &str) {
+        if branch == TARGET {
+            self.lanes_asked.clear();
+            self.lane_reads.clear();
+        } else {
+            self.lanes_asked.remove(branch);
+            self.lane_reads.remove(branch);
+        }
+    }
+
+    /// The grouping the list draws: by author only where the server details every branch's
+    /// head (`ServerFeature::DetailedBranchList`), so the groups are known in one read; else
+    /// by prefix.
+    fn grouping_shown(&self, cx: &App) -> BranchGrouping {
+        match (self.grouping, &self.session) {
+            (BranchGrouping::Author, Some(session))
+                if session
+                    .read(cx)
+                    .features(cx)
+                    .has(ServerFeature::DetailedBranchList) =>
+            {
+                BranchGrouping::Author
+            }
+            _ => BranchGrouping::Prefix,
+        }
+    }
+
+    /// The rows are made again at the next draw: the branches, the grouping, a fold or the
+    /// authors changed. A grouping by author whose authors are not read yet reads them first.
+    fn relayout(&mut self, cx: &mut Context<Self>) {
+        self.layout = None;
+        if self.grouping_shown(cx) == BranchGrouping::Author {
+            self.read_authors(cx);
+        }
+        cx.notify();
+    }
+
+    /// Reads every branch's head in one detailed list, for a grouping by author, unless the
+    /// session holds that list's answer for the branches it lists.
+    fn read_authors(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.session.clone() else {
+            return;
+        };
+        let Some(read) = session.update(cx, |session, cx| session.read_branch_details(cx)) else {
+            return;
+        };
+        self._authors_read = Some(cx.spawn(async move |this, cx| {
+            read.await;
+            this.update(cx, |this, cx| {
+                this._authors_read = None;
+                this.layout = None;
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// The layout of the branches the session lists, made now if it is not held.
+    fn layout(&mut self, cx: &App) -> Option<Rc<Layout>> {
+        if let Some(layout) = &self.layout {
+            return Some(layout.clone());
+        }
+        let session = self.session.as_ref()?.read(cx);
+        let branches = session.branches.loaded()?;
+        let grouping = self.grouping_shown(cx);
+        let details = &self.details;
+        let layout = Rc::new(lay_out(
+            branches,
+            grouping,
+            |branch| {
+                session
+                    .branch_detail(branch)
+                    .map(|detail| detail.head.actor_id.clone())
+                    .or_else(|| details.get(branch).map(|detail| detail.actor.clone()))
+                    .flatten()
+            },
+            &self.folded,
+        ));
+        self.layout = Some(layout.clone());
+        Some(layout)
+    }
+
+    fn toggle_group(&mut self, key: String, cx: &mut Context<Self>) {
+        if !self.folded.remove(&key) {
+            self.folded.insert(key);
+        }
+        self.layout = None;
         cx.notify();
     }
 
@@ -144,7 +483,10 @@ impl BranchList {
         self.details.retain(|branch, _| listed(branch));
         self.reads.retain(|branch, _| listed(branch));
         self.asked.clear();
-        cx.notify();
+        self.lanes.retain(|branch, _| listed(branch));
+        self.lane_reads.retain(|branch, _| listed(branch));
+        self.lanes_asked.clear();
+        self.relayout(cx);
     }
 
     /// Notes the branches of `drawn` whose head is still to be asked for, to read once the
@@ -155,8 +497,15 @@ impl BranchList {
             if !self.asked.contains(branch) && !self.unread.contains(branch) {
                 self.unread.push(branch.clone());
             }
+            if branch != TARGET
+                && !self.lanes_asked.contains(branch)
+                && !self.unread_lanes.contains(branch)
+            {
+                self.unread_lanes.push(branch.clone());
+            }
         }
-        if !self.unread.is_empty() && !std::mem::replace(&mut self.unread_due, true) {
+        let due = !self.unread.is_empty() || !self.unread_lanes.is_empty();
+        if due && !std::mem::replace(&mut self.unread_due, true) {
             cx.defer_in(window, |this, _, cx| {
                 this.unread_due = false;
                 this.read_drawn(cx);
@@ -171,6 +520,11 @@ impl BranchList {
         let Some(session) = self.session.clone() else {
             return;
         };
+        for branch in std::mem::take(&mut self.unread_lanes) {
+            if self.lanes_asked.insert(branch.clone()) {
+                self.read_lane(&session, branch, cx);
+            }
+        }
         for branch in unread {
             if !self.asked.insert(branch.clone()) {
                 continue;
@@ -184,7 +538,7 @@ impl BranchList {
                         let detail = session.read(cx).branch_detail(&branch)?;
                         Some((detail.created_at?, detail.from.clone()))
                     });
-                    match head {
+                    let changed = match head {
                         Ok(Some(head)) => {
                             let detail = BranchDetail {
                                 head: head.graph_commit_id,
@@ -192,13 +546,18 @@ impl BranchList {
                                 actor: head.actor_id,
                                 started,
                             };
-                            this.details.insert(branch, detail);
+                            this.details.insert(branch, detail.clone()) != Some(detail)
                         }
-                        _ => {
-                            this.details.remove(&branch);
+                        _ => this.details.remove(&branch).is_some(),
+                    };
+                    // A head read again to the same commit leaves the list as it was drawn.
+                    if changed {
+                        // Grouped by author, the groups may have changed with it.
+                        if this.grouping_shown(cx) == BranchGrouping::Author {
+                            this.layout = None;
                         }
+                        cx.notify();
                     }
-                    cx.notify();
                 })
                 .ok();
             });
@@ -206,13 +565,106 @@ impl BranchList {
         }
     }
 
+    /// Reads `branch`'s lane: its merge base with main, then, when its head is not in main, a
+    /// page of its history to count the commits main does not hold. A read that fails leaves
+    /// the row unmarked.
+    fn read_lane(
+        &mut self,
+        session: &Entity<GraphSession>,
+        branch: String,
+        cx: &mut Context<Self>,
+    ) {
+        let base = session.update(cx, |session, cx| session.merge_base(&branch, TARGET, cx));
+        let key = branch.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let lane = match base.await {
+                Ok(base) if base.merge_base.graph_commit_id == base.source_commit_id => {
+                    Some(Lane::Merged)
+                }
+                Ok(base) => {
+                    let page = this
+                        .update(cx, |this, cx| {
+                            this.session.as_ref().map(|session| {
+                                session.update(cx, |session, cx| {
+                                    session.commit_page(&branch, AHEAD_PAGE, None, cx)
+                                })
+                            })
+                        })
+                        .ok()
+                        .flatten();
+                    match page {
+                        Some(page) => Some(match page.await {
+                            Ok(list) => ahead_of(
+                                &list.commits,
+                                &base.merge_base.graph_commit_id,
+                                list.next_page_token.is_none(),
+                            ),
+                            Err(_) => Lane::Unmerged,
+                        }),
+                        None => return,
+                    }
+                }
+                Err(_) => None,
+            };
+            this.update(cx, |this, cx| {
+                this.lane_reads.remove(&branch);
+                let shown = match lane {
+                    Some(lane) => this.lanes.insert(branch.clone(), lane) != Some(lane),
+                    None => this.lanes.remove(&branch).is_some(),
+                };
+                // A lane read again to the same answer leaves the list as it was drawn.
+                if shown {
+                    #[cfg(test)]
+                    {
+                        this.lane_draws += 1;
+                    }
+                    cx.notify();
+                }
+            })
+            .ok();
+        });
+        self.lane_reads.insert(key, task);
+    }
+
+    /// The end of a branch's row for its lane, and what its tooltip adds.
+    fn lane_words(lane: Option<Lane>) -> (Option<String>, Option<String>) {
+        match lane {
+            Some(Lane::Merged) => (None, Some(format!("merged into {TARGET}"))),
+            Some(Lane::Ahead { commits: 0, .. }) | Some(Lane::Unmerged) | None => (None, None),
+            Some(Lane::Ahead { commits, more }) => {
+                let count = if more {
+                    format!("{commits}+")
+                } else {
+                    commits.to_string()
+                };
+                (
+                    Some(format!("{count} ahead")),
+                    Some(format!(
+                        "{} not in {TARGET}",
+                        if more {
+                            format!("{commits} or more commits")
+                        } else {
+                            studio_ui::plural(commits, "commit", "commits")
+                        }
+                    )),
+                )
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn render_branch(
         &self,
         index: usize,
         branch: String,
+        shown_from: usize,
+        grouped: bool,
         current: bool,
         lit: bool,
     ) -> impl IntoElement + use<> {
+        let lane = self.lanes.get(&branch).copied();
+        let merged = lane == Some(Lane::Merged);
+        let (ahead, lane_tip) = Self::lane_words(lane);
         let detail = self.details.get(&branch).map(|d| {
             let actor = d.actor.clone().unwrap_or_else(|| "unknown actor".into());
             let now = now_micros();
@@ -232,6 +684,25 @@ impl BranchList {
                 ),
             )
         });
+        // A grouped branch's name is said whole in its tooltip, first.
+        let tooltip = {
+            let mut lines: Vec<String> = Vec::new();
+            if shown_from > 0 {
+                lines.push(branch.clone());
+            }
+            let mut facts: Vec<String> = detail.iter().map(|(_, facts)| facts.clone()).collect();
+            facts.extend(lane_tip);
+            if !facts.is_empty() {
+                lines.push(facts.join(" · "));
+            }
+            (!lines.is_empty()).then(|| lines.join("\n"))
+        };
+        let shown_name: SharedString = branch
+            .get(shown_from..)
+            .filter(|rest| !rest.is_empty())
+            .unwrap_or(&branch)
+            .to_owned()
+            .into();
         let session = self.session.clone();
         let workspace = self.workspace.clone();
         let name = branch.clone();
@@ -239,16 +710,52 @@ impl BranchList {
         right_click_menu(("branch-menu", index))
             .trigger({
                 let session = session.clone();
-                move |_, _, _| {
-                    let (when, tooltip) = detail.clone().unzip();
+                let workspace = workspace.clone();
+                move |_, _, cx| {
+                    let when = detail.clone().map(|(when, _)| when);
+                    // A merged branch says so in place of its time; one with commits of its own
+                    // says how many in its place.
+                    let delete_refused = session.as_ref().and_then(|session| {
+                        session
+                            .read(cx)
+                            .refusal(AccessAction::BranchDelete, &AccessScope::branch(&name))
+                    });
                     // Opening a branch leaves the window on the one it reads; moving the window
                     // is this button, the top bar's popover or the row's menu (spec 020).
                     let end = h_flex()
                         .gap(px(studio_ui::ds::space::XS))
-                        .children(when.map(studio_ui::ds::sidebar_count))
+                        .when(merged, |end| end.child(studio_ui::ds::tag("merged", cx)))
+                        // How far ahead takes the time's place, which the tooltip still says:
+                        // the sidebar has room for one fact beside a branch's name.
+                        .children(ahead.clone().map(studio_ui::ds::sidebar_count))
+                        .when(!merged && ahead.is_none(), |end| {
+                            end.children(when.map(studio_ui::ds::sidebar_count))
+                        })
                         .map(|end| {
                             if current {
                                 end.child(studio_ui::ds::text::meta("current"))
+                            } else if merged {
+                                // Merged, nothing is lost with it: Delete asks with ↵.
+                                let session = session.clone();
+                                let workspace = workspace.clone();
+                                let name = name.clone();
+                                let refused = delete_refused.clone();
+                                end.child(
+                                    studio_ui::ds::row_button(("delete", index), "Delete")
+                                        .disabled(refused.is_some())
+                                        .tip(studio_ui::ds::tooltip(refused.unwrap_or_else(|| {
+                                            format!(
+                                                "Everything on it is in {TARGET}: \
+                                                     deleting it loses nothing"
+                                            )
+                                        })))
+                                        .on_click(move |_, window, cx| {
+                                            cx.stop_propagation();
+                                            if let Some(session) = session.clone() {
+                                                open_delete(&workspace, session, &name, window, cx);
+                                            }
+                                        }),
+                                )
                             } else {
                                 let session = session.clone();
                                 let name = name.clone();
@@ -266,15 +773,16 @@ impl BranchList {
                                 )
                             }
                         });
-                    let row = studio_ui::ds::SidebarRow::new(("branch", index), name.clone())
+                    let row = studio_ui::ds::SidebarRow::new(("branch", index), shown_name.clone())
                         .icon(IconName::GitBranch)
                         .selected(lit)
+                        .muted(merged)
                         .end(end);
-                    let row = match tooltip {
+                    let row = match tooltip.clone() {
                         Some(tooltip) => row.tip(studio_ui::ds::tooltip(tooltip)),
                         None => row,
                     };
-                    row.on_click({
+                    let row = row.on_click({
                         let name = name.clone();
                         move |event, window, cx| {
                             window.dispatch_action(
@@ -285,7 +793,11 @@ impl BranchList {
                                 cx,
                             )
                         }
-                    })
+                    });
+                    // Under its group's header, a branch is inset by the header's chevron.
+                    div()
+                        .when(grouped, |row| row.pl(px(ds::space::LG)))
+                        .child(row)
                 }
             })
             .menu(move |window, cx| {
@@ -349,6 +861,17 @@ impl BranchList {
                                 .ok();
                         }
                     };
+                    // Compared with another branch or a commit, read-only (spec 043).
+                    let compare = {
+                        let workspace = workspace.clone();
+                        let session = session.clone();
+                        let name = name.clone();
+                        move |window: &mut Window, cx: &mut App| {
+                            if let Some(session) = session.clone() {
+                                open_compare_dialog(&workspace, session, name.clone(), window, cx);
+                            }
+                        }
+                    };
                     menu.header(name.clone())
                         .entry("Switch to this branch", None, switch)
                         .item(
@@ -356,6 +879,7 @@ impl BranchList {
                                 .disabled(is_target)
                                 .handler(review),
                         )
+                        .item(ContextMenuEntry::new("Compare with…").handler(compare))
                         .item(
                             ContextMenuEntry::new(match &merge_refused {
                                 Some(reason) if !is_target => {
@@ -401,9 +925,44 @@ impl BranchList {
             .on_click(|_, window, cx| window.dispatch_action(Box::new(CreateBranch), cx))
     }
 
-    /// The rows in `range` of the list: the branches it reaches, each with its right-click menu
-    /// (built only when it opens), then "New branch…" after the last. The heads of the branches
-    /// drawn are read after the frame ([`Self::note_drawn`]).
+    /// The header of a group of branches: a chevron that folds it, its prefix or author, and
+    /// how many branches it holds.
+    fn render_group(
+        &self,
+        index: usize,
+        group: &BranchGroup,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let key = group.key.clone();
+        let tip = match group.key.split_once(':') {
+            Some(("author", "")) => {
+                "Branches the server does not say who wrote: one the credential may not read"
+                    .to_owned()
+            }
+            Some(("author", author)) => format!("Branches whose newest commit {author} wrote"),
+            _ => format!("Branches named {}…", group.label),
+        };
+        let row = studio_ui::ds::SidebarRow::new(("branch-group", index), group.label.clone())
+            .start(studio_ui::ds::icon::meta(if group.open {
+                IconName::ChevronDown
+            } else {
+                IconName::ChevronRight
+            }))
+            .muted(true)
+            .end(studio_ui::ds::sidebar_count(group.branches.to_string()))
+            .tip(studio_ui::ds::tooltip(format!(
+                "{tip}. Click to {} them.",
+                if group.open { "fold" } else { "show" }
+            )))
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_group(key.clone(), cx)));
+        // As wide as the branch rows, so its count lines up with theirs.
+        div().w_full().child(row).into_any_element()
+    }
+
+    /// The rows in `range` of the list: the branches and group headers it reaches, each branch
+    /// with its right-click menu (built only when it opens), then "New branch…" after the last.
+    /// The heads and lanes of the branches drawn are read after the frame
+    /// ([`Self::note_drawn`]).
     fn render_rows(
         &mut self,
         range: Range<usize>,
@@ -417,11 +976,10 @@ impl BranchList {
         let Some(session) = self.session.clone() else {
             return Vec::new();
         };
-        let session = session.read(cx);
-        let Some(branches) = session.branches.loaded() else {
+        let Some(layout) = self.layout(cx) else {
             return Vec::new();
         };
-        let current = session.branch.as_str();
+        let current = session.read(cx).branch.clone();
         // The branch the active tab shows is the lit row; the one the window reads says so.
         let active = self
             .workspace
@@ -431,22 +989,41 @@ impl BranchList {
                 studio_actions::Thing::Branch(branch) => Some(branch),
                 _ => None,
             });
-        let rows = range
-            .clone()
-            .map(|index| match branches.get(index) {
-                Some(branch) => self
-                    .render_branch(
-                        index,
-                        branch.clone(),
-                        *branch == current,
-                        active.as_deref() == Some(branch.as_str()),
-                    )
-                    .into_any_element(),
-                None => Self::render_new_branch(current).into_any_element(),
-            })
-            .collect();
-        let end = range.end.min(branches.len());
-        let drawn = branches[range.start.min(end)..end].to_vec();
+        let mut drawn = Vec::new();
+        let mut rows = Vec::with_capacity(range.len());
+        for at in range {
+            let Some(row) = layout.rows.get(at) else {
+                continue;
+            };
+            let element = match row {
+                ListRow::Branch {
+                    index,
+                    shown_from,
+                    grouped,
+                } => {
+                    let Some(branch) = session
+                        .read(cx)
+                        .branches
+                        .loaded()
+                        .and_then(|branches| branches.get(*index))
+                        .cloned()
+                    else {
+                        continue;
+                    };
+                    drawn.push(branch.clone());
+                    let is_current = branch == current;
+                    let lit = active.as_deref() == Some(branch.as_str());
+                    self.render_branch(*index, branch, *shown_from, *grouped, is_current, lit)
+                        .into_any_element()
+                }
+                ListRow::Group(group) => match layout.groups.get(*group) {
+                    Some(info) => self.render_group(*group, info, cx),
+                    None => continue,
+                },
+                ListRow::NewBranch => Self::render_new_branch(&current).into_any_element(),
+            };
+            rows.push(element);
+        }
         self.note_drawn(&drawn, window, cx);
         rows
     }
@@ -457,8 +1034,15 @@ impl Render for BranchList {
         let Some(session) = self.session.clone() else {
             return v_flex().into_any_element();
         };
+        // Grouped by author, the rows wait for the detailed list that names every author, so no
+        // branch moves to its group as its head lands.
+        let authors_pending = self._authors_read.is_some();
+        let rows = if authors_pending {
+            None
+        } else {
+            self.layout(cx).map(|layout| layout.rows.len())
+        };
         let s = session.read(cx);
-        let rows = s.branches.loaded().map(|branches| branches.len() + 1);
         let failed = match &s.branches {
             graph_store::Loadable::Failed(error) => Some(error.clone()),
             _ => None,
@@ -485,6 +1069,9 @@ impl Render for BranchList {
                 .child(studio_ui::ds::text::error_note(format!(
                     "Branches could not be read: {error}"
                 ))),
+            None if authors_pending && s.branches.loaded().is_some() => {
+                studio_ui::ds::sidebar_note("Reading who wrote each branch…")
+            }
             None => studio_ui::ds::sidebar_note("Reading branches…"),
         };
         v_flex()
@@ -1068,8 +1655,166 @@ impl Render for DeleteBranchModal {
     }
 }
 
+/// Opens the delete dialog for `branch`, which reads again whether it is merged.
+fn open_delete(
+    workspace: &WeakEntity<Workspace>,
+    session: Entity<GraphSession>,
+    branch: &str,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let branch = branch.to_owned();
+    workspace
+        .update(cx, |workspace, cx| {
+            workspace.toggle_modal(window, cx, |window, cx| {
+                DeleteBranchModal::new(session, branch, window, cx)
+            })
+        })
+        .ok();
+}
+
+/// Opens the dialog that picks what `from` is compared with (spec 043).
+fn open_compare_dialog(
+    workspace: &WeakEntity<Workspace>,
+    session: Entity<GraphSession>,
+    from: String,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    workspace
+        .update(cx, |workspace, cx| {
+            workspace.show_modal(window, cx, |window, cx| {
+                CompareModal::new(session, from, window, cx)
+            })
+        })
+        .ok();
+}
+
+/// The buttons on the Branches panel's title line: compare, the grouping, and Refresh.
+pub struct BranchesActions {
+    list: WeakEntity<BranchList>,
+    _observe: Subscription,
+}
+
+impl BranchesActions {
+    pub fn new(list: &Entity<BranchList>, cx: &mut Context<Self>) -> Self {
+        Self {
+            list: list.downgrade(),
+            _observe: cx.observe(list, |_, _, cx| cx.notify()),
+        }
+    }
+}
+
+impl Render for BranchesActions {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let (grouping, author_offered) = self
+            .list
+            .upgrade()
+            .map(|list| {
+                let list = list.read(cx);
+                let offered = list.session.as_ref().is_none_or(|session| {
+                    session
+                        .read(cx)
+                        .features(cx)
+                        .has(ServerFeature::DetailedBranchList)
+                });
+                (list.grouping_shown(cx), offered)
+            })
+            .unwrap_or((BranchGrouping::Prefix, true));
+        let button = |id: &'static str, icon: IconName| {
+            studio_ui::ds::row_icon_button(id, icon).icon_color(Color::Muted)
+        };
+        let (group_icon, group_tip) = match grouping {
+            BranchGrouping::Prefix => (IconName::Person, "Group the branches by who wrote them"),
+            BranchGrouping::Author => (
+                IconName::ListTree,
+                "Group the branches by the prefix of their names",
+            ),
+        };
+        h_flex()
+            .gap(px(studio_ui::ds::space::XXS))
+            .child(
+                button("branches-compare", IconName::Split)
+                    .tip_fn(|_, cx| {
+                        studio_ui::ds::tooltip_for_action_view(
+                            "Compare the current branch with another",
+                            &CompareBranches,
+                            cx,
+                        )
+                    })
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(CompareBranches), cx)
+                    }),
+            )
+            .child(
+                button("branches-group", group_icon)
+                    .disabled(!author_offered)
+                    .tip_fn(move |_, cx| {
+                        if author_offered {
+                            studio_ui::ds::tooltip_for_action_view(
+                                group_tip,
+                                &ToggleBranchGrouping,
+                                cx,
+                            )
+                        } else {
+                            studio_ui::ds::tooltip(
+                                "Grouping by author needs a server that lists every branch's \
+                                 head (Omnigraph 0.15 or later)",
+                            )
+                            .into_view(cx)
+                        }
+                    })
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(ToggleBranchGrouping), cx)
+                    }),
+            )
+            .child(
+                button("branches-refresh", IconName::RotateCw)
+                    .tip_fn(|_, cx| {
+                        studio_ui::ds::tooltip_for_action_view(
+                            "Read the branches again",
+                            &RefreshBranches,
+                            cx,
+                        )
+                    })
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(RefreshBranches), cx)
+                    }),
+            )
+    }
+}
+
 /// Registers the branch actions on a workspace.
 pub fn register(workspace: &mut Workspace) {
+    // Compares the window's branch with one picked, or a commit (spec 043).
+    workspace.register_action(|workspace, _: &CompareBranches, window, cx| {
+        let Some(session) = workspace.session().cloned() else {
+            return;
+        };
+        let from = session.read(cx).branch.clone();
+        workspace.show_modal(window, cx, |window, cx| {
+            CompareModal::new(session, from, window, cx)
+        });
+    });
+    workspace.register_action(|workspace, action: &OpenCompare, window, cx| {
+        open_compare(
+            workspace,
+            action.from.clone(),
+            action.to.clone(),
+            action.preview,
+            window,
+            cx,
+        );
+    });
+    workspace.register_action(|workspace, _: &RefreshBranches, _, cx| {
+        if let Some(session) = workspace.session().cloned() {
+            session.update(cx, |session, cx| session.refresh_branches(cx));
+        }
+    });
+    workspace.register_action(|_, _: &ToggleBranchGrouping, _, cx| {
+        let grouping = StudioSettings::get(cx).studio.branch_grouping.other();
+        studio_settings::update(cx, |settings| settings.studio.branch_grouping = grouping);
+    });
     // A merge is made from the review, which holds it.
     workspace.register_action(|workspace, _: &ReviewBranch, window, cx| {
         let Some(session) = workspace.session() else {
@@ -1645,5 +2390,419 @@ mod tests {
             assert_eq!(session.branch, "then");
             assert_eq!(session.head("then"), Some("c9"));
         });
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    /// What a layout's rows say, as the list draws them: a branch by the name it shows,
+    /// inset under its group; a group by its label and count.
+    fn rows_of(layout: &Layout, branches: &[String]) -> Vec<String> {
+        layout
+            .rows
+            .iter()
+            .map(|row| match row {
+                ListRow::Branch {
+                    index,
+                    shown_from,
+                    grouped,
+                } => format!(
+                    "{}{}",
+                    if *grouped { "  " } else { "" },
+                    &branches[*index][*shown_from..]
+                ),
+                ListRow::Group(group) => {
+                    let group = &layout.groups[*group];
+                    format!("{} ({})", group.label, group.branches)
+                }
+                ListRow::NewBranch => "New branch…".to_owned(),
+            })
+            .collect()
+    }
+
+    /// By prefix (spec 043): main first, then the branches whose prefix no other shares, then
+    /// a group for each prefix two or more share, its branches named without it; a folded group
+    /// keeps its header and hides its branches.
+    #[test]
+    fn branches_group_by_the_prefix_two_or_more_share() {
+        let branches = names(&[
+            "main",
+            "agent/notes-oct-14",
+            "agent/slack-oct-14",
+            "fix-titles",
+            "plan/sharing-v2",
+            "tentative/ingest-1117",
+            "tentative/scout-helix",
+        ]);
+        let layout = lay_out(&branches, BranchGrouping::Prefix, |_| None, &HashSet::new());
+        assert_eq!(
+            rows_of(&layout, &branches),
+            [
+                "main",
+                "fix-titles",
+                "plan/sharing-v2",
+                "agent/ (2)",
+                "  notes-oct-14",
+                "  slack-oct-14",
+                "tentative/ (2)",
+                "  ingest-1117",
+                "  scout-helix",
+                "New branch…",
+            ]
+        );
+        let folded = HashSet::from(["prefix:agent".to_owned()]);
+        let layout = lay_out(&branches, BranchGrouping::Prefix, |_| None, &folded);
+        assert_eq!(
+            rows_of(&layout, &branches)[3..6],
+            ["agent/ (2)", "tentative/ (2)", "  ingest-1117"]
+        );
+        assert!(!layout.groups[0].open);
+    }
+
+    /// By author: a group for each author, by name, every branch in one, those whose author is
+    /// not known last; main stays first.
+    #[test]
+    fn branches_group_by_author_with_the_unknown_last() {
+        let branches = names(&["main", "agent/a", "agent/b", "plan/x", "secret"]);
+        let author = |branch: &str| match branch {
+            "agent/a" | "plan/x" => Some("act-notes-bot".to_owned()),
+            "agent/b" => Some("act-alice".to_owned()),
+            _ => None,
+        };
+        let layout = lay_out(&branches, BranchGrouping::Author, author, &HashSet::new());
+        assert_eq!(
+            rows_of(&layout, &branches),
+            [
+                "main",
+                "act-alice (1)",
+                "  agent/b",
+                "act-notes-bot (2)",
+                "  agent/a",
+                "  plan/x",
+                "Author not known (1)",
+                "  secret",
+                "New branch…",
+            ]
+        );
+    }
+
+    /// A branch's commits ahead of main stop at the merge base or at the first commit written
+    /// on main; past a full page, there may be more.
+    #[test]
+    fn a_branch_is_ahead_by_its_commits_down_to_main() {
+        let commit = |id: &str, branch: Option<&str>| {
+            serde_json::from_value::<CommitOutput>(json!({ "graph_commit_id": id, "graph_manifest_version": 1, "kind": "published", "created_at": 0, "graph_branch": branch })).unwrap()
+        };
+        let own = [
+            commit("s3", Some("spike")),
+            commit("s2", Some("spike")),
+            commit("s1", Some("spike")),
+        ];
+        let mut history = own.to_vec();
+        history.push(commit("m1", None));
+        assert_eq!(
+            ahead_of(&history, "m1", true),
+            Lane::Ahead {
+                commits: 3,
+                more: false
+            }
+        );
+        // From a branch of a branch: the other branch's commits count until main's.
+        assert_eq!(
+            ahead_of(&history, "x", true),
+            Lane::Ahead {
+                commits: 3,
+                more: false
+            }
+        );
+        // Merged once at s2: only what came after.
+        assert_eq!(
+            ahead_of(&history, "s2", true),
+            Lane::Ahead {
+                commits: 1,
+                more: false
+            }
+        );
+        assert_eq!(
+            ahead_of(&own, "m1", false),
+            Lane::Ahead {
+                commits: 3,
+                more: true
+            }
+        );
+    }
+
+    /// A server whose `feature` is merged into main and whose `spike` has two commits of its
+    /// own; every request is logged.
+    fn laned_server(
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        Entity<GraphSession>,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let commit = |id: &str, branch: Option<&str>| json!({ "graph_commit_id": id, "graph_manifest_version": 1, "kind": "published", "created_at": 0, "graph_branch": branch, "actor_id": "act-agent" });
+        fake_server(
+            move |path, query, _| {
+                let side = |name: &str| {
+                    query
+                        .split('&')
+                        .find_map(|pair| pair.strip_prefix(&format!("{name}=")))
+                        .unwrap_or_default()
+                        .to_owned()
+                };
+                if path.ends_with("/branches/merge-base") {
+                    let (base, head) = match side("source").as_str() {
+                        "feature" => ("f1", "f1"),
+                        _ => ("m1", "s2"),
+                    };
+                    (
+                        200,
+                        json!({ "merge_base": commit(base, None), "source": side("source"), "source_commit_id": head, "target": "main", "target_commit_id": "m2" }),
+                    )
+                } else if path.ends_with("/commits") {
+                    let commits = match side("branch").as_str() {
+                        "spike" => vec![
+                            commit("s2", Some("spike")),
+                            commit("s1", Some("spike")),
+                            commit("m1", None),
+                        ],
+                        "feature" => vec![commit("f1", Some("feature"))],
+                        _ => vec![commit("m2", None)],
+                    };
+                    (200, json!({ "commits": commits }))
+                } else if path.ends_with("/branches") {
+                    (200, json!({ "branches": ["main", "feature", "spike"] }))
+                } else {
+                    (404, json!({ "error": "not here" }))
+                }
+            },
+            cx,
+        )
+    }
+
+    fn requests(asked: &std::sync::Mutex<Vec<String>>, part: &str) -> usize {
+        asked
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.contains(part))
+            .count()
+    }
+
+    /// Each drawn branch's lane (spec 043): a branch whose head is in main is merged, one with
+    /// commits of its own is ahead by them; main has none. A commit to main asks every drawn
+    /// lane again, and answers alike do not draw the list again.
+    #[gpui::test]
+    async fn drawn_branches_are_marked_merged_or_ahead_and_read_again_when_main_moves(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(studio_theme::init_test);
+        let (session, asked) = laned_server(cx);
+        cx.run_until_parked();
+        struct Dock(Entity<BranchList>);
+        impl Render for Dock {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().w(px(260.)).h(px(320.)).child(self.0.clone())
+            }
+        }
+        let held = session.clone();
+        let (dock, cx) = cx.add_window_view(|window, cx| {
+            Dock(cx.new(|cx| BranchList::new(WeakEntity::new_invalid(), Some(held), window, cx)))
+        });
+        cx.run_until_parked();
+        let list = dock.read_with(cx, |dock, _| dock.0.clone());
+        list.read_with(cx, |list, _| {
+            assert_eq!(list.lanes.get("feature"), Some(&Lane::Merged));
+            assert_eq!(
+                list.lanes.get("spike"),
+                Some(&Lane::Ahead {
+                    commits: 2,
+                    more: false
+                })
+            );
+            assert_eq!(list.lanes.get("main"), None);
+        });
+        assert_eq!(requests(&asked, "merge-base?"), 2, "{asked:?}");
+        assert_eq!(requests(&asked, "source=main"), 0);
+        // Merged, a branch's history is not read for its lane.
+        assert_eq!(requests(&asked, "branch=feature&limit=100"), 0, "{asked:?}");
+        assert_eq!(requests(&asked, "branch=spike&limit=100"), 1, "{asked:?}");
+
+        list.read_with(cx, |list, _| {
+            assert_eq!(list.lane_draws, 2, "one draw a new mark")
+        });
+        session.update(cx, |_, cx| {
+            cx.emit(SessionEvent::Committed {
+                branch: TARGET.to_owned(),
+            })
+        });
+        cx.run_until_parked();
+        assert_eq!(requests(&asked, "merge-base?"), 4, "both read again");
+        list.read_with(cx, |list, _| {
+            assert_eq!(list.lane_draws, 2, "the same answers draw nothing")
+        });
+    }
+
+    /// The panel's Refresh reads the branch list again, and every drawn branch's head and lane,
+    /// so a branch an agent made shows without waiting for the poll.
+    #[gpui::test]
+    async fn refresh_reads_the_branches_their_heads_and_lanes_again(cx: &mut gpui::TestAppContext) {
+        cx.update(studio_theme::init_test);
+        let (session, asked) = laned_server(cx);
+        cx.run_until_parked();
+        struct Dock(Entity<BranchList>);
+        impl Render for Dock {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().w(px(260.)).h(px(320.)).child(self.0.clone())
+            }
+        }
+        let held = session.clone();
+        let (_dock, cx) = cx.add_window_view(|window, cx| {
+            Dock(cx.new(|cx| BranchList::new(WeakEntity::new_invalid(), Some(held), window, cx)))
+        });
+        cx.run_until_parked();
+        let lists = requests(&asked, "/branches? ");
+        let heads = requests(&asked, "&limit=1 ") + requests(&asked, "limit=1&");
+        let lanes = requests(&asked, "merge-base?");
+        session.update(cx, |session, cx| session.refresh_branches(cx));
+        cx.run_until_parked();
+        assert_eq!(requests(&asked, "/branches? "), lists + 1, "{asked:?}");
+        assert!(
+            requests(&asked, "&limit=1 ") + requests(&asked, "limit=1&") > heads,
+            "heads read again: {asked:?}"
+        );
+        assert_eq!(requests(&asked, "merge-base?"), lanes + 2, "{asked:?}");
+    }
+
+    /// Grouped, the list still builds only the rows in view (`docs/drawing.md`): of 2,000
+    /// branches under four prefixes, a screenful, and reads the lanes of those alone.
+    #[gpui::test]
+    async fn a_grouped_list_builds_only_the_rows_in_view(cx: &mut gpui::TestAppContext) {
+        cx.update(studio_theme::init_test);
+        let names: Vec<String> = std::iter::once("main".to_owned())
+            .chain((1..2_000).map(|i| {
+                let prefix = ["agent", "capture", "intake", "tentative"][i % 4];
+                format!("{prefix}/run-{i:04}")
+            }))
+            .collect();
+        let (session, asked) = fake_server(
+            move |path, _, _| {
+                if path.ends_with("/branches") {
+                    (200, json!({ "branches": names }))
+                } else {
+                    (404, json!({ "error": "not here" }))
+                }
+            },
+            cx,
+        );
+        cx.run_until_parked();
+        struct Dock(Entity<BranchList>);
+        impl Render for Dock {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().w(px(260.)).h(px(320.)).child(self.0.clone())
+            }
+        }
+        let (dock, cx) = cx.add_window_view(|window, cx| {
+            Dock(cx.new(|cx| BranchList::new(WeakEntity::new_invalid(), Some(session), window, cx)))
+        });
+        cx.run_until_parked();
+        let list = dock.read_with(cx, |dock, _| dock.0.clone());
+        list.update(cx, |list, cx| {
+            list.rows_drawn = 0;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let (drawn, rows, groups) = list.read_with(cx, |list, _| {
+            let layout = list.layout.clone().unwrap();
+            (list.rows_drawn, layout.rows.len(), layout.groups.len())
+        });
+        assert_eq!(groups, 4);
+        assert_eq!(
+            rows,
+            2_000 + 4 + 1,
+            "every branch, four headers, New branch…"
+        );
+        assert!(drawn > 0 && drawn < 100, "{drawn} rows built of {rows}");
+        let lanes = requests(&asked, "merge-base?");
+        assert!(lanes > 0 && lanes < 100, "{lanes} lanes read");
+    }
+
+    /// Grouping by author needs every head at once, which only a server that details its
+    /// branches answers in one read (Omnigraph 0.15): elsewhere the list groups by prefix and
+    /// asks for no detailed list. Where it is served, the rows wait for that list, then group
+    /// by who wrote each branch's newest commit.
+    #[gpui::test]
+    async fn grouping_by_author_waits_for_one_detailed_list_where_it_is_served(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(studio_theme::init_test);
+        let detail = |name: &str, actor: &str| json!({ "name": name, "updated_at": 0, "head": { "graph_commit_id": format!("{name}-1"), "graph_manifest_version": 1, "kind": "published", "created_at": 0, "actor_id": actor } });
+        let details = json!([
+            detail("main", "act-admin"),
+            detail("agent/a", "act-notes-bot"),
+            detail("agent/b", "act-slack-bot"),
+            detail("plan/x", "act-notes-bot"),
+        ]);
+        let (session, asked) = fake_server(
+            move |path, query, _| {
+                if path.ends_with("/branches") {
+                    let mut list = json!({ "branches": ["main", "agent/a", "agent/b", "plan/x"] });
+                    if query.contains("detailed=true") {
+                        list["details"] = details.clone();
+                    }
+                    (200, list)
+                } else {
+                    (404, json!({ "error": "not here" }))
+                }
+            },
+            cx,
+        );
+        cx.run_until_parked();
+        struct Dock(Entity<BranchList>);
+        impl Render for Dock {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().w(px(260.)).h(px(320.)).child(self.0.clone())
+            }
+        }
+        let held = session.clone();
+        let (dock, cx) = cx.add_window_view(|window, cx| {
+            Dock(cx.new(|cx| BranchList::new(WeakEntity::new_invalid(), Some(held), window, cx)))
+        });
+        cx.run_until_parked();
+        let list = dock.read_with(cx, |dock, _| dock.0.clone());
+        let labels = |cx: &mut gpui::VisualTestContext| {
+            list.update(cx, |list, cx| {
+                list.layout(cx)
+                    .map(|layout| layout.groups.iter().map(|g| g.label.clone()).collect())
+                    .unwrap_or_else(Vec::<String>::new)
+            })
+        };
+        list.update(cx, |list, cx| {
+            list.grouping = BranchGrouping::Author;
+            list.relayout(cx);
+            assert_eq!(
+                list.grouping_shown(cx),
+                BranchGrouping::Prefix,
+                "a 0.14 server"
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(labels(cx), ["agent/"], "by prefix");
+        // Heads read alone as rows are drawn, never the detailed list.
+        assert_eq!(requests(&asked, "detailed=true"), 0, "{asked:?}");
+
+        let connection = session.read_with(cx, |session, _| session.connection.clone());
+        connection.update(cx, |connection, cx| {
+            connection.set_features(graph_store::ServerFeatures::of(Some("0.15.0")), cx)
+        });
+        session.update(cx, |session, cx| session.reload_branches(cx));
+        cx.run_until_parked();
+        list.update(cx, |list, cx| {
+            assert_eq!(list.grouping_shown(cx), BranchGrouping::Author);
+            assert!(list._authors_read.is_none(), "read");
+        });
+        assert_eq!(labels(cx), ["act-notes-bot", "act-slack-bot"]);
+        assert!(requests(&asked, "detailed=true") >= 1, "{asked:?}");
     }
 }

@@ -31,7 +31,7 @@ use studio_actions::changes::OpenChanged;
 use studio_actions::graph::OpenNodePage;
 use studio_actions::review::{
     AcceptAndNext, EditChange, Merge, NextChange, PreviousChange, RevertAndNext, Summarize,
-    SwitchLayout, ToggleChange,
+    SwapSides, SwitchLayout, ToggleChange,
 };
 use studio_actions::workspace::Refresh;
 use studio_actions::{ViewKind, ViewLink};
@@ -295,6 +295,8 @@ struct ReviewData {
     /// stopped the read: `commits` are the branch's own read, so their count and authors are
     /// not all known.
     commits_capped: Option<Capped>,
+    /// A comparison of two branches (spec 043): the newest commit both hold, their merge base.
+    compare_base: Option<String>,
 }
 
 /// The model's summary of the branch (spec 019): none asked, under way, done, or failed with
@@ -509,12 +511,52 @@ fn revert_checks(
         .collect()
 }
 
+/// Which sides of a comparison are branches (spec 043): one is read at its head, watched, and
+/// offers Refresh when it moves; one that is not is a commit id, which never moves. `None`
+/// until the session's branch list says: a comparison opened again with the window may be
+/// made before the list is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CompareSides {
+    pub from_branch: Option<bool>,
+    pub to_branch: Option<bool>,
+}
+
+impl CompareSides {
+    /// Each side as the session's branch list says, once it is read.
+    fn of(session: &GraphSession, from: &str, to: &str) -> Self {
+        let listed = |side: &str| {
+            session
+                .branches
+                .loaded()
+                .map(|branches| branches.iter().any(|branch| branch == side))
+        };
+        Self {
+            from_branch: listed(from),
+            to_branch: listed(to),
+        }
+    }
+
+    fn both_branches(self) -> bool {
+        self.from_branch == Some(true) && self.to_branch == Some(true)
+    }
+}
+
+/// Why a comparison changes nothing: its cards say what differs, and a branch is changed from
+/// its own review.
+pub(crate) fn compare_read_only(to: &str) -> String {
+    format!("A comparison is read-only: change {to} from its own review")
+}
+
 /// A branch's review against its target (spec 008): its changes as cards, fixed and merged
 /// from here.
 pub struct ReviewView {
     session: Entity<GraphSession>,
     branch: String,
     target: String,
+    /// A comparison of two branches or commits (spec 043), read-only: `target` is the side
+    /// compared from and `branch` the side compared to, its cards what `branch` holds that
+    /// `target` does not. `None` for a review of a branch against its target.
+    compare: Option<CompareSides>,
     /// `None` reviews everything since the fork; `Some` one commit of the branch.
     scope: Option<String>,
     /// Narrows the cards to those whose id, type or values contain the text.
@@ -611,7 +653,8 @@ pub struct ReviewView {
     head_moved_while_writing: bool,
     /// The session asks after the reviewed branch's head while the review is open.
     _head_watch: Option<HeadWatch>,
-    _target_watch: HeadWatch,
+    /// The target's head, watched while the review is open; a compared commit has none.
+    _target_watch: Option<HeadWatch>,
     /// The dry run is for heads that moved (a fix landed, the target moved) and is read again
     /// once no fix or merge is out.
     preview_again: bool,
@@ -627,6 +670,8 @@ pub struct ReviewView {
     /// Marks the review being read as slow once [`SLOW_READ`] has passed.
     _slow_task: Option<Task<()>>,
     _names_task: Option<Task<()>>,
+    /// A comparison's merge base, read once its sides are known to be branches.
+    _base_task: Option<Task<()>>,
     _preview_task: Option<Task<()>>,
     _merge_task: Option<Task<()>>,
     _search_task: Option<Task<()>>,
@@ -658,7 +703,13 @@ impl Item for ReviewView {
     }
 
     fn tab_title(&self, _cx: &App) -> SharedString {
-        format!("Review {} → {}", self.branch, self.target).into()
+        match self.compare {
+            Some(_) => {
+                let (from, to) = self.compare_names();
+                format!("Compare {from} · {to}").into()
+            }
+            None => format!("Review {} → {}", self.branch, self.target).into(),
+        }
     }
 
     fn tab_icon(&self, _cx: &App) -> Option<IconName> {
@@ -670,6 +721,10 @@ impl Item for ReviewView {
     }
 
     fn views(&self, _cx: &App) -> Vec<ViewLink> {
+        // A comparison is between two things: no one thing's other views follow it.
+        if self.compare.is_some() {
+            return Vec::new();
+        }
         vec![
             ViewLink::current(ViewKind::Review),
             ViewLink::to(ViewKind::History),
@@ -686,10 +741,19 @@ impl Item for ReviewView {
     }
 
     fn dedupe_key(&self, _cx: &App) -> Option<SharedString> {
-        Some(review_key(&self.branch, &self.target).into())
+        Some(match self.compare {
+            Some(_) => compare_key(&self.target, &self.branch).into(),
+            None => review_key(&self.branch, &self.target).into(),
+        })
     }
 
     fn serialize(&self, _cx: &App) -> Option<SavedItem> {
+        if self.compare.is_some() {
+            return (!self.branch_deleted).then(|| SavedItem {
+                kind: "compare".into(),
+                data: serde_json::json!({ "from": self.target, "to": self.branch }),
+            });
+        }
         (!self.branch_deleted).then(|| SavedItem {
             kind: "review".into(),
             data: serde_json::json!({ "branch": self.branch, "target": self.target }),
@@ -706,11 +770,41 @@ pub fn review_key(branch: &str, target: &str) -> String {
     format!("review:{branch}->{target}")
 }
 
+/// The dedupe key of a comparison's tab: one tab for each ordered pair.
+pub fn compare_key(from: &str, to: &str) -> String {
+    format!("compare:{from}..{to}")
+}
+
 impl ReviewView {
     pub fn new(
         session: Entity<GraphSession>,
         branch: String,
         target: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::build(session, branch, target, None, window, cx)
+    }
+
+    /// A comparison of `from` with `to` (spec 043): what `to` holds that `from` does not, read
+    /// as one diff between their heads. A side the session does not list as a branch is a
+    /// commit id. Nothing is fixed or merged from it.
+    pub fn compare(
+        session: Entity<GraphSession>,
+        from: String,
+        to: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let sides = CompareSides::of(session.read(cx), &from, &to);
+        Self::build(session, to, from, Some(sides), window, cx)
+    }
+
+    fn build(
+        session: Entity<GraphSession>,
+        branch: String,
+        target: String,
+        compare: Option<CompareSides>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -730,6 +824,18 @@ impl ReviewView {
                 SessionEvent::HeadMoved { branch, .. } if *branch == this.branch => {
                     this.compare_head(cx)
                 }
+                // A compared branch that moves offers Refresh, whichever side it is.
+                SessionEvent::HeadMoved { branch, head }
+                    if this.compare.is_some() && *branch == this.target =>
+                {
+                    let shown = this.data.as_ref().and_then(|data| data.fork.as_deref());
+                    if !this.newer
+                        && matches!(this.load, LoadState::Ready)
+                        && shown.is_some_and(|shown| shown != head)
+                    {
+                        this.mark_newer(cx);
+                    }
+                }
                 // The dry run merged into the target as it was. It is read again when the review
                 // is next drawn: a review behind another tab asks the server nothing meanwhile.
                 SessionEvent::HeadMoved { branch, head }
@@ -746,6 +852,7 @@ impl ReviewView {
                 SessionEvent::BranchesChanged => this.branches_changed(cx),
                 // Merge, and deleting the branch with it, follow what the credential may do. An
                 // answer dropped (a 403, a new token) is read again; one held asks nothing.
+                SessionEvent::AccessChanged if this.compare.is_some() => cx.notify(),
                 SessionEvent::AccessChanged => {
                     let scope = AccessScope::branch_into(&this.branch, &this.target);
                     this.session
@@ -754,17 +861,29 @@ impl ReviewView {
                 }
                 _ => {}
             });
-        let head_watch = session.update(cx, |session, cx| session.watch_head(&branch, cx));
+        let (watch_branch, watch_target) = match compare {
+            Some(sides) => (
+                sides.to_branch == Some(true),
+                sides.from_branch == Some(true),
+            ),
+            None => (true, true),
+        };
+        let head_watch =
+            watch_branch.then(|| session.update(cx, |session, cx| session.watch_head(&branch, cx)));
         // What the credential may do with the branch and its target, merging included: read
-        // once per credential, so a review opened again asks nothing.
-        session.update(cx, |session, cx| {
-            session.read_access(AccessScope::branch_into(&branch, &target), cx)
-        });
-        let target_watch = session.update(cx, |session, cx| session.watch_head(&target, cx));
+        // once per credential, so a review opened again asks nothing. A comparison does neither.
+        if compare.is_none() {
+            session.update(cx, |session, cx| {
+                session.read_access(AccessScope::branch_into(&branch, &target), cx)
+            });
+        }
+        let target_watch =
+            watch_target.then(|| session.update(cx, |session, cx| session.watch_head(&target, cx)));
         let mut view = Self {
             session,
             branch,
             target,
+            compare,
             scope: None,
             search,
             searched: Searched::default(),
@@ -811,7 +930,7 @@ impl ReviewView {
             fix_out: false,
             fixes_in_flight: HashMap::new(),
             head_moved_while_writing: false,
-            _head_watch: Some(head_watch),
+            _head_watch: head_watch,
             _target_watch: target_watch,
             preview_again: false,
             preview_owed: false,
@@ -820,6 +939,7 @@ impl ReviewView {
             _load_task: None,
             _slow_task: None,
             _names_task: None,
+            _base_task: None,
             _preview_task: None,
             _merge_task: None,
             _search_task: None,
@@ -836,7 +956,7 @@ impl ReviewView {
         // and may still land, sent from a review closed since or open elsewhere, is where this
         // one starts, from the session's log.
         view.owe_read(cx);
-        view.logged_merge_held = view.logged_merge_may_land(cx);
+        view.logged_merge_held = view.compare.is_none() && view.logged_merge_may_land(cx);
         view
     }
 
@@ -854,6 +974,10 @@ impl ReviewView {
     /// the log's newest merge of these branches, so the review draws again when what it says
     /// changes, and a fix refused while it might land may be asked for again.
     fn activity_changed(&mut self, cx: &mut Context<Self>) {
+        // A comparison merges nothing: no merge of its sides is its to settle.
+        if self.compare.is_some() {
+            return;
+        }
         let mut settled = false;
         if let MergeState::Unknown {
             landed: landed @ (Check::NotReached | Check::Unread),
@@ -887,6 +1011,10 @@ impl ReviewView {
     /// its name: another branch, whose head is watched and whose review is read afresh, as the
     /// tab is reused for it.
     fn branches_changed(&mut self, cx: &mut Context<Self>) {
+        if self.compare.is_some() {
+            self.compare_sides_listed(cx);
+            return;
+        }
         let Some(listed) = self
             .session
             .read(cx)
@@ -1084,7 +1212,9 @@ impl ReviewView {
         // history did not settle is settled by reading that history again, never by merging
         // again (constitution III); so is the newest merge of these branches the session's log
         // holds, sent by a review closed since or open elsewhere, when it may still land.
-        if !self.merging() {
+        if self.compare.is_some() {
+            self.merge = MergeState::Idle;
+        } else if !self.merging() {
             if self.merge_unsettled() {
                 self.settle_merge(cx);
             } else if let Some((reason, sent)) = self.logged_lost_merge(cx) {
@@ -1102,8 +1232,12 @@ impl ReviewView {
         let branch = self.branch.clone();
         let target = self.target.clone();
         let scope = self.scope.clone();
+        let compare = self.compare;
         self._load_task = Some(cx.spawn(async move |this, cx| {
-            let result = read_review(session, branch, target, scope, held, this.clone(), cx).await;
+            let result = match compare {
+                Some(sides) => read_compare(session, target, branch, sides, this.clone(), cx).await,
+                None => read_review(session, branch, target, scope, held, this.clone(), cx).await,
+            };
             // The search's matches among the changes read, found off the main thread too.
             let searched = match &result {
                 Ok(data) => {
@@ -1187,6 +1321,7 @@ impl ReviewView {
                 }
                 // A schema that arrived while this was read groups it again.
                 self.regroup(cx);
+                self.read_compare_base(cx);
             }
             Err(error) => self.load = LoadState::Failed(error.into()),
         }
@@ -1267,7 +1402,7 @@ impl ReviewView {
     /// The heads the dry run merged moved: it is read again for them, once no fix or merge is
     /// out; a review being read reads its own.
     fn preview_moved(&mut self, cx: &mut Context<Self>) {
-        if !matches!(self.load, LoadState::Ready) {
+        if !matches!(self.load, LoadState::Ready) || self.compare.is_some() {
             return;
         }
         // The cards show a head another writer has moved past: a dry run now would merge
@@ -1912,6 +2047,9 @@ impl ReviewView {
     /// branch alone: Revert and Edit are disabled with it as their reason, and their keys are
     /// not registered.
     fn change_refusal(&self, cx: &App) -> Option<String> {
+        if self.compare.is_some() {
+            return Some(compare_read_only(&self.branch));
+        }
         let session = self.session.read(cx);
         session
             .refusal(
@@ -2203,6 +2341,15 @@ impl ReviewView {
 
     /// The review in a sentence: what changed, in how many commits, by whom.
     fn summary_of(&self, data: &ReviewData) -> String {
+        if self.compare.is_some() {
+            let entities = data.folded.entity_count();
+            let relationships = data.folded.relationship_count();
+            return match (entities, relationships) {
+                (0, 0) => "They hold the same data".to_owned(),
+                _ => summary_sentence(entities, relationships, None, &[])
+                    .replace(" changed", " differ"),
+            };
+        }
         // The commits in scope: all since the fork, or the one chosen.
         let in_scope: Vec<&ReviewCommit> = data
             .commits
@@ -2227,7 +2374,7 @@ impl ReviewView {
     /// How many commits the review holds and who made them ("5 commits by act-dev"), beside
     /// the summary line; empty when the commits are not all known.
     fn made_by_of(&self, data: &ReviewData) -> String {
-        if self.scope.is_some() || data.commits_capped.is_some() {
+        if self.scope.is_some() || data.commits_capped.is_some() || self.compare.is_some() {
             return String::new();
         }
         let mut actors: Vec<String> = data
@@ -2425,6 +2572,9 @@ impl ReviewView {
     /// Why the credential may not merge the branch into the target, once the access route said
     /// so (spec 002): Merge is disabled with it and its key not registered.
     fn merge_refusal(&self, cx: &App) -> Option<String> {
+        if self.compare.is_some() {
+            return Some(compare_read_only(&self.branch));
+        }
         self.session.read(cx).refusal(
             AccessAction::BranchMerge,
             &AccessScope::branch_into(&self.branch, &self.target),
@@ -2641,12 +2791,204 @@ impl ReviewView {
         cx.notify();
     }
 
+    /// The branch list was read: a comparison's sides not known yet are known now, and a branch
+    /// side is watched. A compared branch no longer listed was deleted: its comparison is not
+    /// opened again with the window.
+    fn compare_sides_listed(&mut self, cx: &mut Context<Self>) {
+        let Some(held) = self.compare else { return };
+        let listed = CompareSides::of(self.session.read(cx), &self.target, &self.branch);
+        let sides = CompareSides {
+            from_branch: held.from_branch.or(listed.from_branch),
+            to_branch: held.to_branch.or(listed.to_branch),
+        };
+        if sides.to_branch == Some(true) && self._head_watch.is_none() {
+            let branch = self.branch.clone();
+            self._head_watch = Some(
+                self.session
+                    .update(cx, |session, cx| session.watch_head(&branch, cx)),
+            );
+        }
+        if sides.from_branch == Some(true) && self._target_watch.is_none() {
+            let target = self.target.clone();
+            self._target_watch = Some(
+                self.session
+                    .update(cx, |session, cx| session.watch_head(&target, cx)),
+            );
+        }
+        self.compare = Some(sides);
+        self.read_compare_base(cx);
+        let gone = |was: Option<bool>, now: Option<bool>| was == Some(true) && now == Some(false);
+        self.branch_deleted =
+            gone(sides.from_branch, listed.from_branch) || gone(sides.to_branch, listed.to_branch);
+        if sides != held {
+            cx.emit(ItemEvent::UpdateTab);
+        }
+        cx.notify();
+    }
+
+    /// Read by name before its sides were known, a comparison of two branches shows no shared
+    /// commit: their merge base names it, kept when it answers for the heads the cards show.
+    fn read_compare_base(&mut self, cx: &mut Context<Self>) {
+        if !self.compare.is_some_and(CompareSides::both_branches) || self._base_task.is_some() {
+            return;
+        }
+        let Some((from_head, to_head)) = self
+            .data
+            .as_ref()
+            .filter(|data| data.compare_base.is_none())
+            .and_then(|data| Some((data.fork.clone()?, data.head.clone()?)))
+        else {
+            return;
+        };
+        let (branch, target) = (self.branch.clone(), self.target.clone());
+        let read = self
+            .session
+            .update(cx, |session, cx| session.merge_base(&branch, &target, cx));
+        self._base_task = Some(cx.spawn(async move |this, cx| {
+            let base = read.await;
+            this.update(cx, |this, cx| {
+                this._base_task = None;
+                let Ok(base) = base else { return };
+                if base.target_commit_id != from_head || base.source_commit_id != to_head {
+                    return;
+                }
+                if let Some(data) = this.data.as_mut() {
+                    data.compare_base = Some(base.merge_base.graph_commit_id);
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+    }
+
+    /// A comparison's sides as its words name them, the side compared from first: a branch by
+    /// its name, a commit by its short id. A review's branch and target, as they are.
+    fn compare_names(&self) -> (String, String) {
+        let name = |side: &str, branch: Option<bool>| {
+            if branch == Some(false) {
+                short_commit_id(side)
+            } else {
+                side.to_owned()
+            }
+        };
+        match self.compare {
+            Some(sides) => (
+                name(&self.target, sides.from_branch),
+                name(&self.branch, sides.to_branch),
+            ),
+            None => (self.target.clone(), self.branch.clone()),
+        }
+    }
+
+    /// Swaps a comparison's sides (spec 043): what was compared from is compared to, read
+    /// again. The tab stays, named for the new order.
+    fn swap_sides(&mut self, cx: &mut Context<Self>) {
+        let Some(sides) = self.compare else {
+            return;
+        };
+        std::mem::swap(&mut self.branch, &mut self.target);
+        std::mem::swap(&mut self._head_watch, &mut self._target_watch);
+        self.compare = Some(CompareSides {
+            from_branch: sides.to_branch,
+            to_branch: sides.from_branch,
+        });
+        // The marks were of the other direction's changes.
+        for card in &mut self.cards {
+            card.reviewed = false;
+        }
+        self.reviewed_keys.clear();
+        self.expanded.clear();
+        self.collapsed_runs.clear();
+        self.folded_large = false;
+        self.reload(cx);
+    }
+
+    fn render_swap_button(&self, cx: &mut Context<Self>) -> AnyElement {
+        let focus = self.focus_handle.clone();
+        studio_ui::ds::chip_button("compare-swap", IconName::ArrowLeft, "Swap", None)
+            .tip_fn(move |_, cx| {
+                studio_ui::ds::tooltip_for_action_in_view(
+                    "Compare the other way round",
+                    &SwapSides,
+                    &focus,
+                    cx,
+                )
+            })
+            .on_click(cx.listener(|this, _, _, cx| this.swap_sides(cx)))
+            .into_any_element()
+    }
+
+    /// A comparison's facts under its heading: what each mark means, each side's commit, and
+    /// the commit two branches share.
+    fn compare_facts(&self, data: &ReviewData, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let (from, to) = self.compare_names();
+        let mut facts = vec![
+            studio_ui::ds::text::meta(format!("+ only on {to} · − only on {from} · ~ differs"))
+                .into_any_element(),
+        ];
+        for (id, side, commit) in [
+            ("compare-from", &self.target, &data.fork),
+            ("compare-to", &self.branch, &data.head),
+        ] {
+            let Some(commit) = commit else { continue };
+            let named_by_commit = side == commit;
+            let label = if named_by_commit {
+                short_commit_id(commit)
+            } else {
+                format!("{side} at {}", short_commit_id(commit))
+            };
+            facts.push(
+                div()
+                    .id(id)
+                    .tip(studio_ui::ds::tooltip(format!("Read at {commit}")))
+                    .child(studio_ui::ds::meta_code(
+                        if named_by_commit {
+                            IconName::GitCommit
+                        } else {
+                            IconName::GitBranch
+                        },
+                        label,
+                        cx,
+                    ))
+                    .into_any_element(),
+            );
+        }
+        if let Some(base) = &data.compare_base {
+            facts.push(
+                div()
+                    .id("compare-base")
+                    .tip(studio_ui::ds::tooltip(format!(
+                        "The newest commit both hold: {base}"
+                    )))
+                    .child(studio_ui::ds::meta_code(
+                        IconName::GitCommit,
+                        format!("both from {}", short_commit_id(base)),
+                        cx,
+                    ))
+                    .into_any_element(),
+            );
+        }
+        facts
+    }
+
     // ---- rendering ----
 
     fn render_header(&self, cx: &mut Context<Self>) -> AnyElement {
         let focus = self.focus_handle.clone();
         let sentence = match (&self.load, &self.data) {
             (LoadState::Ready, Some(_)) => self.summary.clone(),
+            (LoadState::Loading { folded }, _) if self.compare.is_some() => {
+                let (from, to) = self.compare_names();
+                let mut text = if *folded == 0 {
+                    format!("Comparing {from} with {to}…")
+                } else {
+                    format!("Comparing {from} with {to}… {folded} differences so far")
+                };
+                if self.reading_slowly {
+                    text.push_str(" On a large graph this can take a few minutes.");
+                }
+                text
+            }
             (LoadState::Loading { folded }, _) => {
                 let mut text = if *folded == 0 {
                     format!("Reading what {} changed…", self.branch)
@@ -2660,6 +3002,9 @@ impl ReviewView {
                     text.push_str(" On a large graph this can take a few minutes.");
                 }
                 text
+            }
+            (LoadState::Failed(error), _) if self.compare.is_some() => {
+                format!("The comparison could not be read: {error}")
             }
             (LoadState::Failed(error), _) => {
                 format!("The review could not be read: {error}")
@@ -2743,7 +3088,11 @@ impl ReviewView {
         } else if !sentence.is_empty() {
             facts.push(studio_ui::ds::text::meta(sentence).into_any_element());
         }
-        if let Some(data) = self.data.as_ref().filter(|_| ready) {
+        let compared = self.compare.is_some();
+        if let Some(data) = self.data.as_ref().filter(|_| ready && compared) {
+            facts.extend(self.compare_facts(data, cx));
+        }
+        if let Some(data) = self.data.as_ref().filter(|_| ready && !compared) {
             match (&data.fork, &data.head) {
                 (Some(fork), Some(_)) => {
                     let fork_tooltip = if data.merged_in {
@@ -2785,24 +3134,36 @@ impl ReviewView {
                             .gap(px(space::INLINE))
                             .items_center()
                             .children(studio_workspace::view_strip(Item::views(self, cx), cx))
+                            // A comparison is no one branch's view: it is named, not stripped.
+                            .when(compared, |row| {
+                                row.child(studio_ui::ds::icon::meta(IconName::Split))
+                                    .child(studio_ui::ds::text::meta("Compare"))
+                            })
                             .child(div().flex_1())
                             .child(
                                 h_flex()
                                     .gap(px(space::CONTROLS))
                                     .items_center()
                                     .child(search)
-                                    .child(studio_ui::ds::control_chip(
-                                        "review-scope-chip",
-                                        scope_menu,
-                                    ))
-                                    .when(ready, |row| row.child(self.render_summarize_button(cx)))
+                                    .when(!compared, |row| {
+                                        row.child(studio_ui::ds::control_chip(
+                                            "review-scope-chip",
+                                            scope_menu,
+                                        ))
+                                    })
+                                    .when(ready && !compared, |row| {
+                                        row.child(self.render_summarize_button(cx))
+                                    })
+                                    .when(compared, |row| row.child(self.render_swap_button(cx)))
                                     .child(layouts),
                             ),
                     )
-                    .child(studio_ui::ds::text::heading(format!(
-                        "{} → {}",
-                        self.branch, self.target
-                    )))
+                    .child(studio_ui::ds::text::heading(if compared {
+                        let (from, to) = self.compare_names();
+                        format!("{from} ↔ {to}")
+                    } else {
+                        format!("{} → {}", self.branch, self.target)
+                    }))
                     .when(!facts.is_empty(), |header| {
                         header.child(studio_ui::ds::meta_row(facts).flex_wrap())
                     })
@@ -2860,7 +3221,14 @@ impl ReviewView {
                 Some(refresh("refresh-own", cx)),
             ));
         }
-        if self.newer && !matches!(self.merge, MergeState::Moved { .. }) {
+        if self.newer && self.compare.is_some() {
+            let (from, to) = self.compare_names();
+            notices.push(notice(
+                Severity::Info,
+                format!("Newer data: {from} or {to} changed after this comparison was read."),
+                Some(refresh("refresh-newer", cx)),
+            ));
+        } else if self.newer && !matches!(self.merge, MergeState::Moved { .. }) {
             notices.push(notice(
                 Severity::Info,
                 format!(
@@ -2879,7 +3247,7 @@ impl ReviewView {
     /// Under the changes, the merge: what it would do now, by the dry run read with the
     /// review, whether it deletes the branch, and the button.
     fn render_footer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if self.data.is_none() || !matches!(self.load, LoadState::Ready) {
+        if self.data.is_none() || !matches!(self.load, LoadState::Ready) || self.compare.is_some() {
             return None;
         }
         let focus = self.focus_handle.clone();
@@ -3407,8 +3775,12 @@ impl ReviewView {
 
     /// The section a run opens, in the view's words, above the run's row.
     fn section_title(&self, run: &GroupRun) -> Option<String> {
-        run.section
-            .map(|section| change_cards::section_words(section).to_owned())
+        run.section.map(|section| match (self.compare, section) {
+            // Compared, what exists on the side compared from, and what only the other holds.
+            (Some(_), GroupSection::Existing) => format!("On {}", self.compare_names().0),
+            (Some(_), GroupSection::Added) => format!("Only on {}", self.compare_names().1),
+            (None, section) => change_cards::section_words(section).to_owned(),
+        })
     }
 
     /// The feed's row for a run of one type: a status dot, "1 changed in Task", and when; it
@@ -4153,6 +4525,82 @@ fn build_rows(data: &ReviewData, matched: Option<&[bool]>) -> (Vec<Row>, Vec<Gro
     })
 }
 
+/// Reads a comparison of `from` with `to` (spec 043): the net diff between their heads
+/// (`GET /diff`, E6), page by page up to the cap. Two branches are read with their merge base
+/// first, which names both heads and the commit they share in one read; any other pair is
+/// named to the diff as it is (a branch or a commit id; the merge base takes branches only), and
+/// its first page names the commits it resolved, which the later pages' token holds to.
+async fn read_compare(
+    session: Entity<GraphSession>,
+    from: String,
+    to: String,
+    sides: CompareSides,
+    this: WeakEntity<ReviewView>,
+    cx: &mut AsyncApp,
+) -> Result<ReviewData, String> {
+    let (ends, base) = if sides.both_branches() {
+        let base = session
+            .update(cx, |session, cx| session.merge_base(&to, &from, cx))
+            .await
+            .map_err(|e| e.to_string())?;
+        (
+            (base.target_commit_id, base.source_commit_id),
+            Some(base.merge_base.graph_commit_id),
+        )
+    } else {
+        ((from.clone(), to.clone()), None)
+    };
+    let resolved = std::cell::RefCell::new(None::<(String, String)>);
+    let (fold, partial) = if base.is_some() && ends.0 == ends.1 {
+        *resolved.borrow_mut() = Some(ends.clone());
+        (ChangeFold::new(), false)
+    } else {
+        fold_pages(
+            &this,
+            cx,
+            async |token: Option<String>, limit: u32, cx: &mut AsyncApp| {
+                let page = session
+                    .update(cx, |session, cx| {
+                        session.diff(&ends.0, &ends.1, token, limit, cx)
+                    })
+                    .await
+                    .map_err(|e| change_read_failure(&e))?;
+                let to_head = resolved
+                    .borrow_mut()
+                    .get_or_insert_with(|| (page.from_commit_id.clone(), page.to_commit_id.clone()))
+                    .1
+                    .clone();
+                // The diff names no commit: each difference is the compared head's.
+                let block = ChangeBlockOutput {
+                    cause: ChangeCauseOutput {
+                        graph_commit_id: to_head,
+                        authored_branch: to.clone(),
+                        authored_at: 0,
+                        parent_commit_id: None,
+                        merged_parent_commit_id: None,
+                        actor_id: None,
+                    },
+                    changes: page.changes,
+                };
+                Ok((block, page.next_page_token))
+            },
+        )
+        .await?
+    };
+    let (from_head, to_head) = resolved.into_inner().unwrap_or(ends);
+    let fed = Fed {
+        fold,
+        commits: Vec::new(),
+        partial,
+        moved_while_reading: false,
+    };
+    let mut data = fed
+        .into_review(&session, Some(from_head), Some(to_head), false, cx)
+        .await;
+    data.compare_base = base;
+    Ok(data)
+}
+
 /// Reads what the branch changed since its merge base with the target: the base and the head
 /// from `branches/merge-base`, then the branch's change feed after the base, folded up to the
 /// head and the change cap. A review of one commit, and a base the feed refuses as a start
@@ -4205,6 +4653,7 @@ async fn read_review(
                 moved_while_reading: false,
                 merged_in: false,
                 commits_capped: None,
+                compare_base: None,
             });
         }
         let start = format!("after:{fork}");
@@ -4297,6 +4746,7 @@ impl Fed {
             moved_while_reading: self.moved_while_reading,
             merged_in: false,
             commits_capped: None,
+            compare_base: None,
         }
     }
 }
@@ -4903,6 +5353,15 @@ impl Render for ReviewView {
         let header = self.render_header(cx);
         let body = match (&self.load, &self.data) {
             (LoadState::Ready, Some(_)) if self.show_conflicts => self.render_conflicts(cx),
+            (LoadState::Ready, Some(data))
+                if data.folded.changes.is_empty() && self.compare.is_some() =>
+            {
+                change_cards::no_changes_state({
+                    let (from, to) = self.compare_names();
+                    format!("{from} and {to} hold the same data.")
+                })
+                .into_any_element()
+            }
             (LoadState::Ready, Some(data)) if data.folded.changes.is_empty() => {
                 change_cards::no_changes_state(if data.commits.is_empty() {
                     format!("{} has no commits of its own.", self.branch)
@@ -4937,7 +5396,12 @@ impl Render for ReviewView {
                 }
             }
             (LoadState::Failed(error), _) => {
-                studio_ui::ds::error_state("The review could not be read", error.clone())
+                let title = if self.compare.is_some() {
+                    "The comparison could not be read"
+                } else {
+                    "The review could not be read"
+                };
+                studio_ui::ds::error_state(title, error.clone())
                     .child(
                         studio_ui::ds::state_action(
                             "refresh-failed",
@@ -4985,7 +5449,12 @@ impl Render for ReviewView {
             })
             // Unfolding a change and summarizing the review write nothing: they work whatever
             // the credential may merge, as their buttons and row clicks do.
-            .on_action(cx.listener(|this, _: &Summarize, _, cx| this.summarize(cx)))
+            .when(self.compare.is_none(), |view| {
+                view.on_action(cx.listener(|this, _: &Summarize, _, cx| this.summarize(cx)))
+            })
+            .when(self.compare.is_some(), |view| {
+                view.on_action(cx.listener(|this, _: &SwapSides, _, cx| this.swap_sides(cx)))
+            })
             .on_action(cx.listener(|this, _: &ToggleChange, _, cx| this.toggle_selected(cx)))
             // The shared name a commit's tab answers to works here too, so one binding of it
             // unfolds a change in both (spec 033).
@@ -5104,6 +5573,33 @@ pub fn open_review_with(
     });
 }
 
+/// Opens the comparison of `from` with `to` (spec 043), or the tab that already shows it.
+pub fn open_compare(
+    workspace: &mut Workspace,
+    from: String,
+    to: String,
+    preview: bool,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(session) = workspace.session().cloned() else {
+        return;
+    };
+    let (from, to) = (from.trim().to_owned(), to.trim().to_owned());
+    if from.is_empty() || to.is_empty() || from == to {
+        workspace.show_toast(
+            studio_workspace::ToastKind::Info,
+            "Pick two different branches or commits to compare.",
+            cx,
+        );
+        return;
+    }
+    let key = compare_key(&from, &to);
+    workspace.open_item_with::<ReviewView>(key, preview, window, cx, |window, cx| {
+        ReviewView::compare(session, from, to, window, cx)
+    });
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use graph_client::api::{ChangeImageOutput, EntityKind};
@@ -5186,6 +5682,7 @@ pub(crate) mod tests {
             moved_while_reading: false,
             merged_in: false,
             commits_capped: None,
+            compare_base: None,
         };
         let shown = |query: &str| {
             let matched = data.search.matches(query);
@@ -7980,5 +8477,242 @@ pub(crate) mod tests {
             " Not confirmed: the newest 10,000 commits of main's history do not show it, and \
              Studio read no further; open History to check."
         );
+    }
+
+    /// A server holding two agents' branches, `agent/a` at `a1` and `agent/b` at `b1`, both
+    /// from `main` at `m1`: their diff is one claim each holds otherwise and one only `b` has.
+    fn compared_server(
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        Entity<GraphSession>,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        compared_server_listing(std::sync::Arc::new(true.into()), cx)
+    }
+
+    /// [`compared_server`], its branch list refused (500) while `listed` is false.
+    fn compared_server_listing(
+        listed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        Entity<GraphSession>,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let commit = |id: &str| json!({ "graph_commit_id": id, "graph_manifest_version": 1, "kind": "published", "created_at": 0 });
+        fake_server(
+            move |path, query, _| {
+                if path.ends_with("/branches/merge-base") {
+                    let side = |name: &str| {
+                        query
+                            .split('&')
+                            .find_map(|pair| pair.strip_prefix(&format!("{name}=")))
+                            .unwrap_or_default()
+                            .replace("%2F", "/")
+                    };
+                    let head = |branch: &str| match branch {
+                        "agent/a" => "a1",
+                        "agent/b" => "b1",
+                        _ => "m1",
+                    };
+                    let (source, target) = (side("source"), side("target"));
+                    (
+                        200,
+                        json!({ "merge_base": commit("m1"), "source": source, "source_commit_id": head(&source), "target": target, "target_commit_id": head(&target) }),
+                    )
+                } else if path.ends_with("/diff") {
+                    let changed = json!({ "kind": "node", "type": { "id": "Claim", "name": "Claim" }, "id": "claim-1", "op": "update", "before": { "properties": { "slug": "claim-1", "status": "proposed" } }, "after": { "properties": { "slug": "claim-1", "status": "rejected" } } });
+                    let added = json!({ "kind": "node", "type": { "id": "Claim", "name": "Claim" }, "id": "claim-2", "op": "insert", "before": null, "after": { "properties": { "slug": "claim-2" } } });
+                    let (from, to) =
+                        if query.contains("from=a1") || query.contains("from=agent%2Fa") {
+                            ("a1", "b1")
+                        } else {
+                            ("b1", "a1")
+                        };
+                    (
+                        200,
+                        json!({ "from_commit_id": from, "to_commit_id": to, "changes": [changed, added] }),
+                    )
+                } else if path.ends_with("/commits") {
+                    let branch = query
+                        .split('&')
+                        .find_map(|pair| pair.strip_prefix("branch="))
+                        .unwrap_or_default()
+                        .replace("%2F", "/");
+                    let head = if branch == "agent/a" { "a1" } else { "b1" };
+                    (200, json!({ "commits": [commit(head)] }))
+                } else if path.ends_with("/branches") {
+                    if listed.load(std::sync::atomic::Ordering::SeqCst) {
+                        (200, json!({ "branches": ["main", "agent/a", "agent/b"] }))
+                    } else {
+                        (500, json!({ "error": "not yet" }))
+                    }
+                } else {
+                    (404, json!({ "error": "not here" }))
+                }
+            },
+            cx,
+        )
+    }
+
+    /// A comparison of two agents' branches (spec 043) reads their merge base once, which names
+    /// both heads and the commit they share, then the diff from one head to the other: never a
+    /// branch's feed, never a dry run of a merge. It is read-only: Edit, Revert and Merge are
+    /// refused with why, and it has no merge strip. Swapped, it reads the diff the other way.
+    #[gpui::test]
+    async fn a_comparison_reads_one_diff_between_two_heads_and_changes_nothing(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, asked) = compared_server(cx);
+        session.update(cx, |session, cx| session.reload_branches(cx));
+        cx.run_until_parked();
+        asked.lock().unwrap().clear();
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            ReviewView::compare(session, "agent/a".into(), "agent/b".into(), window, cx)
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            assert!(matches!(view.load, LoadState::Ready));
+            let data = view.data.as_ref().unwrap();
+            assert_eq!(data.fork.as_deref(), Some("a1"));
+            assert_eq!(data.head.as_deref(), Some("b1"));
+            assert_eq!(data.compare_base.as_deref(), Some("m1"));
+            assert_eq!(data.folded.changes.len(), 2);
+            assert_eq!(view.summary, "2 entities differ");
+            assert_eq!(view.tab_title(cx).as_ref(), "Compare agent/a · agent/b");
+            assert_eq!(
+                view.dedupe_key(cx).as_deref(),
+                Some("compare:agent/a..agent/b")
+            );
+            let read_only = compare_read_only("agent/b");
+            assert_eq!(view.change_refusal(cx), Some(read_only.clone()));
+            assert_eq!(view.merge_refusal(cx), Some(read_only));
+            assert!(view.render_footer(cx).is_none(), "no merge strip");
+            assert!(view.views(cx).is_empty(), "no one branch's views");
+            let saved = view.serialize(cx).unwrap();
+            assert_eq!(saved.kind, "compare");
+            assert_eq!(saved.data, json!({ "from": "agent/a", "to": "agent/b" }));
+        });
+        let sent = asked.lock().unwrap().clone();
+        let count = |part: &str| sent.iter().filter(|r| r.contains(part)).count();
+        assert_eq!(count("/branches/merge-base?"), 1, "{sent:?}");
+        assert_eq!(count("/diff?from=a1&to=b1"), 1, "{sent:?}");
+        assert_eq!(count("/changes?"), 0, "no feed: {sent:?}");
+        assert_eq!(count("/branches/merge?"), 0, "no dry run: {sent:?}");
+
+        asked.lock().unwrap().clear();
+        view.update(cx, |view, cx| view.swap_sides(cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            let data = view.data.as_ref().unwrap();
+            assert_eq!(data.fork.as_deref(), Some("b1"));
+            assert_eq!(data.head.as_deref(), Some("a1"));
+            assert_eq!(view.tab_title(cx).as_ref(), "Compare agent/b · agent/a");
+        });
+        let sent = asked.lock().unwrap().clone();
+        assert!(
+            sent.iter().any(|r| r.contains("/diff?from=b1&to=a1")),
+            "{sent:?}"
+        );
+    }
+
+    /// A side the graph does not list as a branch is a commit id (spec 043): both are named to
+    /// the diff as they are, never to the merge base, which takes branches only, and the diff's
+    /// first page names the heads the comparison shows.
+    #[gpui::test]
+    async fn a_comparison_with_a_commit_names_both_sides_to_the_diff(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, asked) = compared_server(cx);
+        session.update(cx, |session, cx| session.reload_branches(cx));
+        cx.run_until_parked();
+        asked.lock().unwrap().clear();
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            ReviewView::compare(session, "a1".into(), "agent/b".into(), window, cx)
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.compare,
+                Some(CompareSides {
+                    from_branch: Some(false),
+                    to_branch: Some(true)
+                })
+            );
+            assert_eq!(view.compare_names().0, short_commit_id("a1"));
+            let data = view.data.as_ref().unwrap();
+            assert_eq!(data.fork.as_deref(), Some("a1"));
+            assert_eq!(data.head.as_deref(), Some("b1"));
+            assert_eq!(data.compare_base, None);
+        });
+        let sent = asked.lock().unwrap().clone();
+        assert!(sent.iter().all(|r| !r.contains("merge-base")), "{sent:?}");
+        assert!(
+            sent.iter()
+                .any(|r| r.contains("/diff?from=a1&to=agent%2Fb")),
+            "{sent:?}"
+        );
+    }
+
+    /// A comparison opened again with the window before its branch list is read knows neither
+    /// side: it watches nothing, names both as given, and reads by name; once the list is read
+    /// its sides are known, and its branches watched.
+    #[gpui::test]
+    async fn a_comparison_made_before_the_branches_are_read_learns_its_sides(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let listed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (session, _) = compared_server_listing(listed.clone(), cx);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            ReviewView::compare(
+                session.clone(),
+                "agent/a".into(),
+                "agent/b".into(),
+                window,
+                cx,
+            )
+        });
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.compare,
+                Some(CompareSides {
+                    from_branch: None,
+                    to_branch: None
+                })
+            );
+            assert!(view._head_watch.is_none() && view._target_watch.is_none());
+        });
+        listed.store(true, std::sync::atomic::Ordering::SeqCst);
+        session.update(cx, |session, cx| session.reload_branches(cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.compare,
+                Some(CompareSides {
+                    from_branch: Some(true),
+                    to_branch: Some(true)
+                })
+            );
+            assert!(view._head_watch.is_some() && view._target_watch.is_some());
+            assert!(matches!(view.load, LoadState::Ready));
+            assert!(!view.branch_deleted);
+            let data = view.data.as_ref().unwrap();
+            assert_eq!(
+                data.compare_base.as_deref(),
+                Some("m1"),
+                "the shared commit"
+            );
+        });
     }
 }

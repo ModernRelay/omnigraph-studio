@@ -1797,6 +1797,20 @@ impl GraphSession {
         }));
     }
 
+    /// Whether the branch list is being read: a reader that asked for it again waits until it
+    /// is back (an agent naming a branch Studio has not listed yet, spec 043).
+    pub fn branches_reading(&self) -> bool {
+        self.branches_reading
+    }
+
+    /// The Branches panel's Refresh (spec 043): every branch's newest commit held is forgotten,
+    /// so the next list that asks reads them again (from a 0.15 server, in one detailed read),
+    /// and the branch list is read again. What is shown stays until the answers replace it.
+    pub fn refresh_branches(&mut self, cx: &mut Context<Self>) {
+        self.head_commits.clear();
+        self.reload_branches(cx);
+    }
+
     /// Reads the branch list again. One held stays while it is read, and stays if it cannot
     /// be read.
     pub fn reload_branches(&mut self, cx: &mut Context<Self>) {
@@ -3929,6 +3943,20 @@ impl GraphSession {
     /// asked for its heads, and for `main`'s start.
     pub fn branch_detail(&self, branch: &str) -> Option<&BranchDetailOutput> {
         self.branch_details.get(branch)
+    }
+
+    /// Reads the detailed branch list (`ServerFeature::DetailedBranchList`) for every branch's
+    /// head at once, unless its answer for the branches listed is held: a list grouped by who
+    /// wrote each branch waits for it (spec 043). `None` when it is held, or when the server
+    /// does not detail its branches.
+    pub fn read_branch_details(&mut self, cx: &mut Context<Self>) -> Option<Task<()>> {
+        if self.details_answered || !self.features(cx).has(ServerFeature::DetailedBranchList) {
+            return None;
+        }
+        let read = self.detailed_branches(cx);
+        Some(cx.spawn(async move |_, _| {
+            read.await.ok();
+        }))
     }
 
     /// The detailed branch list, one read for every head a list asks for: the one under way, or
