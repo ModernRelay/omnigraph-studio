@@ -471,8 +471,26 @@ holds the branch's side from its review and nothing of what the target did. The 
 source's and the target's images of the conflicting entity (or the conflicting properties' three
 values) would let a card say what each branch did to it. Engine rule: the dry run stays free of
 effects; the images are read at the commits the merge resolved.
-*Waits:* 033. *Today:* the conflict's kind in words and the server's message, on the card and in
-the conflicts list.
+*Waits:* 033, 039. *Today:* the conflict's kind in words and the server's message, on the card
+and in the conflicts list; since spec 039, the target's and the branch's images read by Studio
+at their heads (one read per type at each), the fork's from the review's changes, and who set
+the target's from its change feed since the fork, filtered by type.
+
+**E61. A merge that takes a side for named entities.** Filed as
+[ModernRelay/omnigraph#1471](https://github.com/ModernRelay/omnigraph/issues/1471).
+`BranchMergeRequest` (`source`, `target`, `delete_branch`, `dry_run`, `as_commit`, `settings`)
+has no way to resolve a conflict: a conflicting row stops the merge with a 409 until the two
+branches hold it alike, and the merge classifies a row whole (`run_three_way_classification`,
+`exec/merge.rs` at `v0.15.0`). So keeping the branch's version of a row the target also changed
+means writing the branch's values onto the target first, a commit on the target made before the
+merge that takes them. A merge that takes a side for the entities it names (`prefer: source` or
+`target`, with a list of `(type, id)`), bound to the heads its dry run read (E28), would make
+"Keep this branch's" part of the merge itself: one commit, on the target, made by the merge.
+Engine rule: a resolution names entities the dry run reported, and a merge whose heads moved
+since is refused, as a write bound to a commit is. *Waits:* 039. *Today:* "Keep main's" writes
+the target's values onto the branch, bound to the head the review's fixes bind to; "Keep this
+branch's" writes the branch's onto the target once the person confirms it, bound to the target
+head the sides were read at, and the merge is checked again.
 
 **E44. A commit's change counts in its listing.**
 A commit's change counts are read from its changes (`GET /graphs/{id}/commits/{id}/changes`), one
@@ -598,6 +616,8 @@ Then engine changes still open:
    disposition.
 10. E49 to E51, which would make finding a node one request and right on every type, however
     large; E49 is the smallest.
+11. E53 and E61 with E28, which would make a conflict's three sides one answer and keeping the
+    branch's side one merge bound to the heads reviewed (spec 039).
 
 ## Decisions
 

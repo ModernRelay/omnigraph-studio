@@ -216,7 +216,10 @@ place), X (designed on 0.13; the better routes are deferred).
 - A 409 opens a conflicts view: one row per conflict with its kind in words ("Changed on both
   branches", "Deleted on main, changed here", "Relationship points to a deleted node"), the
   entity, and the message. Resolution happens on the source branch with ordinary edits; then
-  merge again.
+  merge again. Since 2026-11-19 each conflict is a card of its three sides (the fork, the
+  target now and who set it, this branch) with Keep main's, Keep this branch's and Edit…, and a
+  `@card` conflict lists each side's relationships with Remove on its side
+  ([spec 039](../039-three-sided-conflicts/plan.md)).
 - After merging, Studio confirms the target's history contains the merge (a verified
   merge), reading it a page at a time from its head for at most its newest 10,000 commits, and
   only down to the target's head as Studio checked it just before sending the merge: a merge
@@ -255,7 +258,7 @@ place), X (designed on 0.13; the better routes are deferred).
 | Review from the change feed | Wait for a diff route | Works on 0.13; the route is deferred |
 | Stat cards removed from the header | Stat cards above the changes | They read as cluttered in an earlier design |
 | A node's card carries its relationship changes, mirrored at the other end | Sections by type with edges in their own; a relationship on one card only | A reader joined a node and its edges by hand, from keys alone; a mirror lets either end tell the whole story while each change is counted and reverted once |
-| Conflicts resolved by editing the source branch | Ours/theirs buttons | 0.13 has no resolution API; edits are ordinary writes |
+| Conflicts resolved by editing the source branch | Ours/theirs buttons | 0.13 has no resolution API; edits are ordinary writes. Superseded 2026-11-19 by spec 039: the buttons are ordinary writes too, one side's row written onto the other |
 | Reads of changes wait five minutes | Keep 60 s for every read; retry a read that timed out; no limit | On the personal graph one page took 37 to 60 s, so 60 s failed about as often as it answered. A read that timed out is not sent again by itself: the person's Refresh asks once more. Five minutes matches a write, and still ends a read whose server stopped answering |
 | A branch its target was merged into is diffed to its head named by commit id | Name the branch (`to=<branch>`, or `GET /branches/diff`) and check the commit the first page resolved against the pinned head | Naming the branch saves 6 to 9 s a page (E37), but cannot keep the review exact for free. A page token binds every later page to the sides as the first page spelled them (its `sides` digest, Omnigraph `7711e4a` `prepare_diff`), so a branch that moved before the first page resolved it can be caught only by reading that page again by commit id: a whole page more (37 to 60 s) exactly when the review must stay exact. Taking the newer head instead would pair it with a merge base, commits since the fork and a fix binding read for the old head. `GET /branches/diff` reads the merge base again, which the review holds. Revisit if #972 stays open |
 

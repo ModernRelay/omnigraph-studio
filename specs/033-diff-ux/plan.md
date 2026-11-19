@@ -206,7 +206,8 @@ whole id). Feature crates still share nothing directly.
     type the refusal names.
   - **E53** a merge conflict with both sides' values and the base's, so a card can show what the
     target did beside what the branch did (J4). Today: the conflict's kind in words and the
-    server's message.
+    server's message; since spec 039 the conflicts list reads the sides itself and offers a
+    decision.
   - **E44**, extended: a commit's counts by type in its listing, so History, the panel and the
     inspector need not read a page of changes. Today: one page of 100 per drawn commit.
 - In Studio: the summary line's types as links to their runs; an edge's own page from a

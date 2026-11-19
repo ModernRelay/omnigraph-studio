@@ -47,8 +47,9 @@ it goes through Omnigraph's own RFC process.
 | E50 | One request that finds nodes across types, ranked, with a limit per type and the property each matched | 031 | One name-index read per type and commit, at most 8 at once; Studio ranks across types |
 | E51 | Full-text search on label-like properties without a per-property `@index`, and a substring (n-gram) mode that finds a word's middle | 031 | Runs `search`/`bm25` only where an index is declared, merges its hits after its own matches, and leaves out a property whose search fails |
 | E52 | The schema at a commit, or a commit's schema diff | 033 | A schema change's tab says "Schema change" and the type the refusal names, with no retry |
-| E53 | A merge conflict's base, source and target images | 033 | The conflict's kind in words and the server's message, on its card and in the conflicts list |
+| E53 | A merge conflict's base, source and target images | 033, 039 | Reads the target's and the branch's images itself at their heads, and the fork's from the review's changes; who set the target's from its change feed since the fork, filtered by type |
 | E54 | A write refused in validation, before any effect (an `@card` bound, a missing endpoint), states `effects: none` and the violation as a typed detail; 0.14 and 0.15 answer 400 `bad_request` with `effects: unknown, action: reconcile` | 004, 034 | Judges it unknown, as the disposition says, and names the `@card` bound from the server's words; the new-node dialog sends a node with the edges its minimum needs so a 0.15 server does not refuse it |
+| E61 | A merge that takes a side for named entities (`prefer: source` for the listed ids), bound to the heads its dry run read ([#1471](https://github.com/ModernRelay/omnigraph/issues/1471)) | 039 | "Keep main's" writes the target's values onto the branch; "Keep this branch's" writes the branch's onto the target once confirmed, then the merge is checked again |
 
 Every server Studio supports serves these (checked against `v0.14.0`'s OpenAPI document, 2026-10-24):
 
