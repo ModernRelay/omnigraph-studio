@@ -198,6 +198,19 @@ pub fn relationship_line(
     rows: &CardRows,
     mirror_note: &'static str,
 ) -> RelationshipLine {
+    relationship_line_with(entry, folded, schema, rows, mirror_note, None)
+}
+
+/// [`relationship_line`], with what tells its other end apart beside its name (`facts`, spec
+/// 042) on a line below it.
+pub fn relationship_line_with(
+    entry: RelationshipEntry,
+    folded: &FoldedChanges,
+    schema: Option<&SchemaModel>,
+    rows: &CardRows,
+    mirror_note: &'static str,
+    facts: Option<&str>,
+) -> RelationshipLine {
     let kind = entry.net.map(|net| kind_of(Some(net)));
     let id = if kind.is_some() {
         ("relationship", entry.change)
@@ -224,9 +237,12 @@ pub fn relationship_line(
         None => Rc::from([]),
     };
     let (other, note) = other_end(&entry, mirror_note);
-    let line = RelationshipLine::new(id, kind, entry.words, entry.outgoing, other)
+    let mut line = RelationshipLine::new(id, kind, entry.words, entry.outgoing, other)
         .other_detail(entry.other_type)
         .rows(rows);
+    if let Some(facts) = facts.filter(|facts| !facts.is_empty()) {
+        line = line.other_facts(facts.to_owned());
+    }
     match note {
         Some(note) => line.note(note),
         None => line,
@@ -659,6 +675,92 @@ pub fn run_row(
         .into_any_element()
 }
 
+/// A change as a graph (spec 042), what a change's canvas draws: every node the change touched
+/// (its own change, or none for an anchor: a node it left as it was that one of its changed
+/// relationships reaches), and every relationship it changed, between two of those nodes. A
+/// node is named as its card names it; an anchor by the name read for it (`names`), else its
+/// id. With them, how many changes it cannot draw: relationships with no end to stand under,
+/// whose types the schema does not name.
+pub fn change_graph(
+    folded: &FoldedChanges,
+    groups: &EntityGroups,
+    schema: Option<&SchemaModel>,
+    names: &NodeNames,
+) -> (
+    Vec<studio_actions::graph::ChangeNode>,
+    Vec<studio_actions::graph::ChangeLink>,
+    usize,
+) {
+    use studio_actions::graph::{ChangeLink, ChangeMark, ChangeNode};
+    let mark = |net: Option<NetChange>| match net {
+        Some(NetChange::Added) => ChangeMark::Added,
+        Some(NetChange::Removed) => ChangeMark::Removed,
+        _ => ChangeMark::Changed,
+    };
+    let mut nodes: Vec<ChangeNode> = Vec::new();
+    let mut at: HashMap<(String, String), usize> = HashMap::new();
+    let mut not_drawn = 0;
+    for (ix, group) in groups.groups.iter().enumerate() {
+        if group.is_edge {
+            not_drawn += 1;
+            continue;
+        }
+        let (_, name, _) = identity(groups, folded, ix, schema, names);
+        at.entry((group.type_name.clone(), group.id.clone()))
+            .or_insert_with(|| {
+                nodes.push(ChangeNode {
+                    type_name: group.type_name.clone(),
+                    id: group.id.clone(),
+                    label: Some(name),
+                    change: group.change.map(|own| mark(folded.changes[own].net())),
+                });
+                nodes.len() - 1
+            });
+    }
+    let mut links = Vec::new();
+    for group in groups.groups.iter().filter(|group| !group.is_edge) {
+        let here = at[&(group.type_name.clone(), group.id.clone())];
+        for relationship in &group.relationships {
+            let end = (
+                relationship.other_type.clone(),
+                relationship.other_id.clone(),
+            );
+            let there = *at.entry(end).or_insert_with(|| {
+                let key = (
+                    relationship.other_type.clone(),
+                    relationship.other_id.clone(),
+                );
+                nodes.push(ChangeNode {
+                    label: Some(names.get(&key).cloned().unwrap_or_else(|| key.1.clone())),
+                    type_name: key.0,
+                    id: key.1,
+                    change: None,
+                });
+                nodes.len() - 1
+            });
+            let edge = &folded.changes[relationship.change];
+            let words = match schema.and_then(|s| s.edge(&edge.type_name)) {
+                Some(edge_type) => {
+                    graph_store::relationship_words(&edge_type.name, &edge_type.from, &edge_type.to)
+                }
+                None => edge.type_name.clone(),
+            };
+            let (from, to) = if relationship.direction == gq_language::Direction::Outgoing {
+                (here, there)
+            } else {
+                (there, here)
+            };
+            links.push(ChangeLink {
+                from,
+                to,
+                words,
+                change: mark(edge.net()),
+            });
+        }
+    }
+    (nodes, links, not_drawn)
+}
+
 /// What an entity's row names: what happened to it, its name (a relationship's ends), and its
 /// id when the name is not it; a node standing unchanged for its relationships, the name read
 /// for it (`names`).
@@ -1009,6 +1111,107 @@ fn fingerprint(value: &Value) -> String {
 mod tests {
     use super::*;
 
+    /// A review's change as a graph (spec 042): every node it changed, marked, each changed
+    /// relationship between its source and target, and the nodes those reach that it left as
+    /// they were, unmarked and named as the review read them, each once; a relationship with
+    /// no end to stand under is counted as not drawn.
+    #[test]
+    fn a_change_is_a_graph_of_its_nodes_their_anchors_and_its_relationships() {
+        use graph_client::api::{ChangeImageOutput, EntityKind};
+        use studio_actions::graph::ChangeMark;
+        let schema = SchemaModel::parse(
+            "node Meeting {\n  slug: String @key\n  title: String?\n}\n\
+             node Deal {\n  slug: String @key\n  name: String?\n}\n\
+             node Person {\n  slug: String @key\n  name: String?\n}\n\
+             edge MeetingAboutDeal: Meeting -> Deal\n\
+             edge Attended: Person -> Meeting\n",
+        )
+        .unwrap();
+        let image = |properties: serde_json::Value, ends: Option<(&str, &str)>| {
+            Some(ChangeImageOutput {
+                properties: properties.as_object().unwrap().clone(),
+                endpoints: ends.map(|(from, to)| serde_json::json!({"from": from, "to": to})),
+            })
+        };
+        let change = |kind, type_name: &str, id: &str, before, after| FoldedChange {
+            kind,
+            type_id: format!("t-{type_name}"),
+            type_name: type_name.into(),
+            id: id.into(),
+            before,
+            after,
+            commits: vec!["c1".into()],
+        };
+        let folded = FoldedChanges {
+            raw_changes: 4,
+            changes: vec![
+                change(
+                    EntityKind::Node,
+                    "Meeting",
+                    "m1",
+                    None,
+                    image(
+                        serde_json::json!({"slug": "m1", "title": "Margin deep-dive"}),
+                        None,
+                    ),
+                ),
+                change(
+                    EntityKind::Edge,
+                    "MeetingAboutDeal",
+                    "e1",
+                    None,
+                    image(serde_json::json!({}), Some(("m1", "d1"))),
+                ),
+                change(
+                    EntityKind::Edge,
+                    "Attended",
+                    "e2",
+                    None,
+                    image(serde_json::json!({}), Some(("p1", "m1"))),
+                ),
+                change(
+                    EntityKind::Edge,
+                    "Unknown",
+                    "e3",
+                    None,
+                    image(serde_json::json!({}), Some(("x", "y"))),
+                ),
+            ],
+        };
+        let groups = EntityGroups::new(&folded, Some(&schema));
+        let mut names = NodeNames::default();
+        names.insert(("Deal".into(), "d1".into()), "Helix Series A".into());
+        let (nodes, links, not_drawn) = change_graph(&folded, &groups, Some(&schema), &names);
+        let drawn: Vec<(&str, &str, Option<ChangeMark>)> = nodes
+            .iter()
+            .map(|n| (n.id.as_str(), n.label.as_deref().unwrap_or(""), n.change))
+            .collect();
+        assert_eq!(drawn.len(), 3, "{drawn:?}");
+        assert!(drawn.contains(&("m1", "Margin deep-dive", Some(ChangeMark::Added))));
+        assert!(
+            drawn.contains(&("d1", "Helix Series A", None)),
+            "an anchor, named"
+        );
+        assert!(
+            drawn.contains(&("p1", "p1", None)),
+            "an anchor with no name read"
+        );
+        let at = |id: &str| nodes.iter().position(|n| n.id == id).unwrap();
+        let mut ends: Vec<(usize, usize, &str)> = links
+            .iter()
+            .map(|link| (link.from, link.to, link.words.as_str()))
+            .collect();
+        ends.sort();
+        let mut expected = vec![
+            (at("m1"), at("d1"), "about"),
+            (at("p1"), at("m1"), "attended"),
+        ];
+        expected.sort();
+        assert_eq!(ends, expected);
+        assert!(links.iter().all(|link| link.change == ChangeMark::Added));
+        assert_eq!(not_drawn, 1, "the relationship the schema does not name");
+    }
+
     /// A type's row names no properties: each entity's row says which of its changed, so a
     /// type's row says only how many nodes a run of unchanged entities holds, which has no
     /// counts of its own.
@@ -1140,6 +1343,8 @@ mod tests {
             outgoing: false,
             other: "Bob".into(),
             other_type: "Person".into(),
+            other_id: "bob".into(),
+            other_change: None,
             other_is_new: false,
             replaces: None,
             other_was: other_was.map(Into::into),

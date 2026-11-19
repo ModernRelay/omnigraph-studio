@@ -817,6 +817,7 @@ pub struct RelationshipLine {
     outgoing: bool,
     other: SharedString,
     other_detail: Option<SharedString>,
+    other_facts: Option<SharedString>,
     note: Option<SharedString>,
     rows: Rc<[PropertyRow]>,
     status: Option<(SharedString, Color)>,
@@ -842,6 +843,7 @@ impl RelationshipLine {
             outgoing,
             other: other.into(),
             other_detail: None,
+            other_facts: None,
             note: None,
             rows: Rc::from([]),
             status: None,
@@ -856,6 +858,15 @@ impl RelationshipLine {
     /// Shown muted after the other end: its type.
     pub fn other_detail(mut self, detail: impl Into<SharedString>) -> Self {
         self.other_detail = Some(detail.into());
+        self
+    }
+
+    /// What tells the other end apart beside its name, after its type on the same line, cut to
+    /// the room left and whole in its tooltip (spec 042): "stage: in-diligence · confidence:
+    /// 0.6". On the line, so facts landing after the card is drawn move nothing (constitution
+    /// V).
+    pub fn other_facts(mut self, facts: impl Into<SharedString>) -> Self {
+        self.other_facts = Some(facts.into());
         self
     }
 
@@ -954,7 +965,19 @@ impl RenderOnce for RelationshipLine {
                     .children(
                         self.other_detail
                             .map(|detail| crate::ds::text::meta(detail).single_line()),
-                    ),
+                    )
+                    .children(self.other_facts.map(|facts| {
+                        div()
+                            .id("other-facts")
+                            .min_w_0()
+                            .flex_shrink(1.)
+                            .tip(crate::ds::tooltip(facts.clone()))
+                            .child(
+                                crate::ds::text::meta(format!("· {facts}"))
+                                    .single_line()
+                                    .truncate(),
+                            )
+                    })),
             )
             .children(self.note.map(crate::ds::text::meta))
             .children(

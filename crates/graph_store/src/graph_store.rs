@@ -46,8 +46,8 @@ pub use connection::{
 pub use control_plane::{ClusterIdentity, ClusterRead, ControlPlane, Listing, Organizations};
 pub use degrees::page_counts;
 pub use entity_groups::{
-    EntityGroup, EntityGroups, GroupRelationship, GroupRun, GroupSection, NodeNames,
-    RelationshipEntry, RelationshipLines, entity_name, relationship_words,
+    EntityGroup, EntityGroups, GroupRelationship, GroupRun, GroupSection, NodeFacts, NodeNames,
+    RelationshipEntry, RelationshipLines, entity_name, facts_of, image_facts, relationship_words,
 };
 pub use exploration::*;
 pub use fixes::{RevertUnavailable, revert_query};

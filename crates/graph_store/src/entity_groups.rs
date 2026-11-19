@@ -105,6 +105,65 @@ impl EntityGroup {
 /// Names of nodes the review knows only by id, by `(type, id)`, as read from the graph.
 pub type NodeNames = HashMap<(String, String), String>;
 
+/// What tells nodes apart beside their names, by `(type, id)`, as a relationship line shows
+/// it of its other end (spec 042): "stage: in-diligence · confidence: 0.6".
+pub type NodeFacts = HashMap<(String, String), String>;
+
+/// The longest a fact's value shows, in characters, before it is cut with "…".
+pub const FACT_CHARS: usize = 48;
+
+/// A read row's facts in words: each of `properties` that has a value, in order, as
+/// "name: value", joined by " · ". The row holds each in its `builder::field_column`.
+pub fn facts_of(row: &serde_json::Value, properties: &[String]) -> String {
+    let mut parts = Vec::new();
+    for name in properties {
+        let value = match row.get(gq_language::builder::field_column(name)) {
+            None | Some(serde_json::Value::Null) => continue,
+            Some(serde_json::Value::String(text)) => {
+                // One line: a long text's first line, cut.
+                let line = text.lines().find(|line| !line.trim().is_empty());
+                let Some(line) = line else { continue };
+                cut(line.trim(), FACT_CHARS)
+            }
+            Some(other) => cut(&other.to_string(), FACT_CHARS),
+        };
+        parts.push(format!("{name}: {value}"));
+    }
+    parts.join(" · ")
+}
+
+/// What a changed node's own image says of `properties` (spec 042): its values after the
+/// change, or before it for a node the change removed, in the words [`facts_of`] uses.
+pub fn image_facts(change: &FoldedChange, properties: &[String]) -> String {
+    let Some(image) = change.after.as_ref().or(change.before.as_ref()) else {
+        return String::new();
+    };
+    let row: serde_json::Map<String, serde_json::Value> = properties
+        .iter()
+        .filter_map(|name| {
+            let value = image.properties.get(name)?.clone();
+            Some((gq_language::builder::field_column(name), value))
+        })
+        .collect();
+    facts_of(&serde_json::Value::Object(row), properties)
+}
+
+/// `text` cut to `chars` characters, at the last space before them when there is one, with
+/// "…" when it was longer.
+fn cut(text: &str, chars: usize) -> String {
+    match text.char_indices().nth(chars) {
+        Some((at, next)) => {
+            let kept = &text[..at];
+            let kept = match kept.rfind(char::is_whitespace) {
+                Some(space) if !next.is_whitespace() && space > 0 => &kept[..space],
+                _ => kept,
+            };
+            format!("{}…", kept.trim_end())
+        }
+        None => text.to_owned(),
+    }
+}
+
 /// A run of consecutive groups of one type, as a list shows them under one header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupRun {
@@ -134,6 +193,10 @@ pub struct RelationshipEntry {
     /// The other end's name, else its id.
     pub other: String,
     pub other_type: String,
+    /// The other end's id.
+    pub other_id: String,
+    /// The other end's own change in the review, when the branch changed it too.
+    pub other_change: Option<usize>,
     /// The branch added the other end.
     pub other_is_new: bool,
     /// For a relationship moved to another end ([`EntityGroup::repoints`]): the removed
@@ -658,10 +721,8 @@ impl EntityGroups {
         let earlier_name = |end: &EarlierEnd| end_name(&end.type_name, &end.id, end.group);
         let entry = |relationship: &GroupRelationship, mirror: bool| {
             let edge = &folded.changes[relationship.change];
-            let other = relationship
-                .other_group
-                .and_then(|g| self.groups[g].change)
-                .map(|c| &folded.changes[c]);
+            let other_change = relationship.other_group.and_then(|g| self.groups[g].change);
+            let other = other_change.map(|c| &folded.changes[c]);
             let replaces = (!mirror)
                 .then(|| {
                     group
@@ -690,6 +751,8 @@ impl EntityGroups {
                 outgoing: relationship.direction == Direction::Outgoing,
                 other: other_name(relationship),
                 other_type: relationship.other_type.clone(),
+                other_id: relationship.other_id.clone(),
+                other_change,
                 other_is_new: other.and_then(FoldedChange::net) == Some(NetChange::Added),
                 replaces,
                 other_was: relationship.other_was.as_ref().map(earlier_name),
@@ -824,6 +887,43 @@ mod tests {
             after,
             commits: vec!["c1".into()],
         }
+    }
+
+    /// A node's facts in words (spec 042): each property with a value, in the order asked, as
+    /// "name: value"; a long text's first line, cut; nothing for a node with none. From a read
+    /// row, and from a change's own image, its values after the change or before a removal.
+    #[test]
+    fn facts_read_as_names_and_values_cut_to_a_line() {
+        let properties = [
+            "stage".to_owned(),
+            "confidence".to_owned(),
+            "quote".to_owned(),
+        ];
+        let long = format!("\n{}\nsecond line", "word ".repeat(20));
+        let row = json!({
+            "id": "d1",
+            "v_stage": "in-diligence",
+            "v_confidence": 0.6,
+            "v_quote": long,
+        });
+        assert_eq!(
+            facts_of(&row, &properties),
+            "stage: in-diligence · confidence: 0.6 · \
+             quote: word word word word word word word word word…"
+        );
+        assert_eq!(
+            facts_of(&json!({"id": "d1", "v_stage": null}), &properties),
+            ""
+        );
+        let mut removed = node("Deal", "d1", NetChange::Removed);
+        removed.before = image(json!({"stage": "lost"}), None);
+        assert_eq!(image_facts(&removed, &properties), "stage: lost");
+        let mut added = node("Deal", "d2", NetChange::Added);
+        added.after = image(json!({"stage": "sourced", "confidence": 1}), None);
+        assert_eq!(
+            image_facts(&added, &properties),
+            "stage: sourced · confidence: 1"
+        );
     }
 
     fn folded(changes: Vec<FoldedChange>) -> FoldedChanges {

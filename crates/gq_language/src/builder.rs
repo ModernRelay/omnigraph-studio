@@ -3300,6 +3300,47 @@ pub fn node_labels(
     }))
 }
 
+/// The most properties a relationship line shows of its other end (spec 042).
+pub const FACT_PROPERTIES: usize = 3;
+
+/// Endings of a property's name that mark it as bookkeeping (when and by whom a node was
+/// written), which says nothing of whether a relationship to it is right.
+const BOOKKEEPING_ENDINGS: [&str; 4] = ["_at", "At", "_by", "By"];
+
+/// The properties that tell a node apart beside its name, which a review's relationship line
+/// shows of its other end (spec 042, "Facts"): its enumerations first (a phase, a stage, a
+/// status), then its numbers and flags (a value, a confidence), then its dates, then its text
+/// (a quote), each class in schema order, at most [`FACT_PROPERTIES`]. Never the key or the
+/// name, which the line shows already; never a list, a Blob or a vector, nor bookkeeping (a
+/// name ending `_at`, `At`, `_by` or `By`).
+pub fn fact_properties(node: &NodeType) -> Vec<&Property> {
+    let label = node.label_property();
+    let class = |property: &Property| match property.kind {
+        _ if property.enum_values.is_some() => 0,
+        ScalarKind::Bool | ScalarKind::Integer | ScalarKind::Float => 1,
+        ScalarKind::Date | ScalarKind::DateTime => 2,
+        _ => 3,
+    };
+    let mut facts: Vec<&Property> = node
+        .properties
+        .iter()
+        .filter(|property| {
+            !property.is_key
+                && Some(property.name.as_str()) != node.key.as_deref()
+                && Some(property.name.as_str()) != label
+                && !property.list
+                && property.projectable()
+                && !BOOKKEEPING_ENDINGS
+                    .iter()
+                    .any(|ending| property.name.ends_with(ending))
+        })
+        .collect();
+    // A stable sort keeps schema order within each class.
+    facts.sort_by_key(|property| class(property));
+    facts.truncate(FACT_PROPERTIES);
+    facts
+}
+
 /// The most text properties a node search reads and matches of one type
 /// ([`searched_properties`]).
 pub const SEARCHED_PROPERTIES: usize = 4;
@@ -3995,6 +4036,30 @@ mod tests {
     use super::*;
     use crate::check::check;
     use crate::schema::tests::dev;
+
+    /// What a relationship line shows of its other end (spec 042): its enumerations, then its
+    /// numbers, then its dates, then its text, each in schema order, three at most; never its
+    /// key, its name, a list or bookkeeping.
+    #[test]
+    fn a_nodes_facts_are_its_enumerations_numbers_dates_then_text() {
+        let schema = SchemaModel::parse(
+            "node Claim {\n  slug: String @key\n  name: String\n  quote: String?\n  \
+             confidence: F64?\n  status: enum(open, verified)?\n  created_at: DateTime?\n  \
+             tags: [String]?\n  said_on: Date?\n  updated_by: String?\n}\n\
+             node Tag {\n  slug: String @key\n  name: String\n}\n\
+             node Quote {\n  slug: String @key\n  name: String\n  text: String?\n}\n",
+        )
+        .unwrap();
+        let facts = |type_name: &str| -> Vec<String> {
+            fact_properties(schema.node(type_name).unwrap())
+                .into_iter()
+                .map(|property| property.name.clone())
+                .collect()
+        };
+        assert_eq!(facts("Claim"), ["status", "confidence", "said_on"]);
+        assert!(facts("Tag").is_empty(), "its key and name only");
+        assert_eq!(facts("Quote"), ["text"]);
+    }
 
     /// A view as a stored query (spec 024): its filters' values become parameters named after
     /// their properties, it keeps its order, has no page or limit, and type-checks.

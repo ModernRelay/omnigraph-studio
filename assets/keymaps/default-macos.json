@@ -421,7 +421,8 @@
       "down": "studio_review::NextChange",
       "k": "studio_review::PreviousChange",
       "up": "studio_review::PreviousChange",
-      "space": "studio_review::ToggleChange"
+      "space": "studio_review::ToggleChange",
+      "g": "studio_graph::OpenAsCanvas"
     }
   },
   {

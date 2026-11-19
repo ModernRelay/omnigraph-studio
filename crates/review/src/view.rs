@@ -23,7 +23,7 @@ use graph_store::fixes::revert_deletes;
 use graph_store::{
     AccessAction, AccessScope, ChangeFold, EntityGroup, EntityGroups, FoldedChange, FoldedChanges,
     ForkSearch, GraphSession, GroupRun, GroupSection, HeadWatch, MergeSent, MergeSettled,
-    NodeNames, OutcomeEntry, OutcomeKind, REVIEW_CHANGE_CAP, SessionEvent, TypeCounts,
+    NodeFacts, NodeNames, OutcomeEntry, OutcomeKind, REVIEW_CHANGE_CAP, SessionEvent, TypeCounts,
     contains_merge_of, revert_query, summary_sentence,
 };
 use serde_json::Value;
@@ -541,6 +541,12 @@ pub struct ReviewView {
     /// The head whose names `names` hold, once a read of them there was answered in full: a
     /// review read at another head reads them again, and one whose read failed reads it again.
     names_at: Option<String>,
+    /// What tells the nodes the review knows only by id apart beside their names (spec 042,
+    /// "Facts"), read at the reviewed head with their names: a relationship line shows them of
+    /// its other end.
+    facts: NodeFacts,
+    /// The head whose facts `facts` hold, as `names_at` is for names.
+    facts_at: Option<String>,
     /// How many relationship lines each card shows.
     card_lines: CardLines,
     list_state: ListState,
@@ -627,6 +633,7 @@ pub struct ReviewView {
     /// Marks the review being read as slow once [`SLOW_READ`] has passed.
     _slow_task: Option<Task<()>>,
     _names_task: Option<Task<()>>,
+    _facts_task: Option<Task<()>>,
     _preview_task: Option<Task<()>>,
     _merge_task: Option<Task<()>>,
     _search_task: Option<Task<()>>,
@@ -669,20 +676,37 @@ impl Item for ReviewView {
         Some(studio_actions::Thing::Branch(self.branch.clone()))
     }
 
+    /// The review, its change as a graph (spec 042) once it is read and holds one, and the
+    /// branch's commits.
     fn views(&self, _cx: &App) -> Vec<ViewLink> {
+        let canvas = match (&self.load, &self.data) {
+            (LoadState::Ready, Some(data)) if data.groups.groups.is_empty() => {
+                ViewLink::disabled_because(ViewKind::Canvas, "No changes to draw")
+            }
+            (LoadState::Ready, Some(_)) => ViewLink {
+                says: Some("The change as a graph, with what it attaches to".into()),
+                ..ViewLink::to(ViewKind::Canvas)
+            },
+            _ => ViewLink::disabled_because(ViewKind::Canvas, "The changes are still being read"),
+        };
         vec![
             ViewLink::current(ViewKind::Review),
+            canvas,
             ViewLink::to(ViewKind::History),
         ]
     }
 
     fn view_action(&self, kind: ViewKind, _cx: &App) -> Option<Box<dyn gpui::Action>> {
-        (kind == ViewKind::History).then(|| {
-            Box::new(studio_actions::graph::OpenBranchHistory {
+        match kind {
+            ViewKind::History => Some(Box::new(studio_actions::graph::OpenBranchHistory {
                 branch: self.branch.clone(),
                 preview: true,
-            }) as Box<dyn gpui::Action>
-        })
+            })),
+            ViewKind::Canvas => self
+                .change_on_canvas()
+                .map(|action| Box::new(action) as Box<dyn gpui::Action>),
+            _ => None,
+        }
     }
 
     fn dedupe_key(&self, _cx: &App) -> Option<SharedString> {
@@ -777,6 +801,8 @@ impl ReviewView {
             selected: None,
             inspected: None,
             names: NodeNames::default(),
+            facts: NodeFacts::default(),
+            facts_at: None,
             names_at: None,
             card_lines: CardLines::default(),
             list_state: ListState::new(0, ListAlignment::Top, px(800.)),
@@ -820,6 +846,7 @@ impl ReviewView {
             _load_task: None,
             _slow_task: None,
             _names_task: None,
+            _facts_task: None,
             _preview_task: None,
             _merge_task: None,
             _search_task: None,
@@ -968,6 +995,9 @@ impl ReviewView {
         }
         self.names.clear();
         self._names_task = None;
+        self.facts.clear();
+        self.facts_at = None;
+        self._facts_task = None;
         self.preview = Preview::Unread;
         self._preview_task = None;
         // A read under way is the old token's: landing, it would show its cards.
@@ -1032,6 +1062,7 @@ impl ReviewView {
                 let ends = data.groups.unnamed_ends();
                 let head = data.head.clone();
                 this.lay_out_in_place();
+                this.read_facts(ends.clone(), head.clone(), cx);
                 this.read_names(ends, head, cx);
                 cx.notify();
             })
@@ -1174,6 +1205,7 @@ impl ReviewView {
                 if typed_since {
                     self.search_after(None, cx);
                 }
+                self.read_facts(ends.clone(), head.clone(), cx);
                 self.read_names(ends, head, cx);
                 self.preview = Preview::Unread;
                 self._preview_task = None;
@@ -1238,6 +1270,97 @@ impl ReviewView {
             })
             .ok();
         }));
+    }
+
+    /// Reads what tells the nodes the review knows only by id apart (spec 042, "Facts"), at the
+    /// head it read, as [`Self::read_names`] reads their names: once per head, the facts shown
+    /// staying until new ones replace them, and a read that failed read again at the next ask.
+    fn read_facts(
+        &mut self,
+        ends: Vec<(String, String)>,
+        head: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let moved = self.facts_at != head;
+        let missing: Vec<_> = ends
+            .iter()
+            .filter(|end| moved || !self.facts.contains_key(*end))
+            .cloned()
+            .collect();
+        if missing.is_empty() {
+            self._facts_task = None;
+            return;
+        }
+        let shown: Option<HashSet<(String, String)>> = moved.then(|| ends.into_iter().collect());
+        let facts = self.session.update(cx, |session, cx| {
+            session.node_facts(missing, head.clone(), cx)
+        });
+        self._facts_task = Some(cx.spawn(async move |this, cx| {
+            let (facts, answered) = facts.await;
+            this.update(cx, |this, cx| {
+                if let Some(shown) = shown {
+                    this.facts.retain(|end, _| shown.contains(end));
+                }
+                if answered {
+                    this.facts_at = head;
+                }
+                this.facts.extend(facts);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// What a relationship line shows of its other end beside its name (spec 042, "Facts"):
+    /// from the end's own change when the branch changed it too, else as read at the reviewed
+    /// head. None for a mirror, whose other end is the card it is reviewed on.
+    fn line_facts(
+        &self,
+        data: &ReviewData,
+        entry: &graph_store::RelationshipEntry,
+    ) -> Option<String> {
+        entry.net?;
+        match entry.other_change {
+            Some(own) => {
+                let schema = data.schema.as_deref()?;
+                let properties: Vec<String> =
+                    gq_language::builder::fact_properties(schema.node(&entry.other_type)?)
+                        .into_iter()
+                        .map(|property| property.name.clone())
+                        .collect();
+                Some(graph_store::image_facts(
+                    &data.folded.changes[own],
+                    &properties,
+                ))
+            }
+            None => self
+                .facts
+                .get(&(entry.other_type.clone(), entry.other_id.clone()))
+                .cloned(),
+        }
+    }
+
+    /// The review's change as a graph, for its canvas (spec 042): `None` until it is read.
+    fn change_on_canvas(&self) -> Option<studio_actions::graph::ShowChangeOnCanvas> {
+        let data = self
+            .data
+            .as_ref()
+            .filter(|_| matches!(self.load, LoadState::Ready))?;
+        let (nodes, links, not_drawn) = change_cards::change_graph(
+            &data.folded,
+            &data.groups,
+            data.schema.as_deref(),
+            &self.names,
+        );
+        Some(studio_actions::graph::ShowChangeOnCanvas {
+            branch: self.branch.clone(),
+            target: self.target.clone(),
+            at_commit: data.head.clone(),
+            fork: data.fork.clone(),
+            nodes,
+            links,
+            not_drawn,
+        })
     }
 
     /// Asks what a merge would do now, by a dry run: the branch reads as merging cleanly, or
@@ -3770,13 +3893,15 @@ impl ReviewView {
                 let change = entry.change;
                 let mirror = entry.net.is_none();
                 let moved_from = entry.replaces.as_ref().map(|(removed, _)| *removed);
+                let facts = self.line_facts(data, &entry);
                 // A mirror's other end is the group it is reviewed on.
-                let mut line = change_cards::relationship_line(
+                let mut line = change_cards::relationship_line_with(
                     entry,
                     &data.folded,
                     schema,
                     &data.card_rows,
                     "reviewed there",
+                    facts.as_deref(),
                 )
                 .on_click(cx.listener(move |this, _, _, cx| this.select(change, cx)));
                 if mirror {
@@ -6384,6 +6509,135 @@ pub(crate) mod tests {
                 .iter()
                 .any(|request| request.contains("/mutate"))
         );
+    }
+
+    /// A review's change as a graph (spec 042). Until its changes are read the view strip's
+    /// Canvas says why it cannot open; read, it asks for the change's nodes (the note the
+    /// branch added, marked, and the person it hangs on, unmarked and named as read), the
+    /// relationship between them, the reviewed head the canvas holds and the fork. The card's
+    /// relationship line shows what its other end is beside its name, read at the reviewed head
+    /// with the names.
+    #[gpui::test]
+    async fn the_change_opens_as_a_graph_and_its_lines_say_what_they_reach(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use studio_actions::graph::{ChangeMark, ShowChangeOnCanvas};
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let block = |id: &str, parent: &str, change: Value| json!({ "cause": { "graph_commit_id": id, "parent_commit_id": parent, "authored_branch": "feature", "authored_at": 0, "actor_id": "act-dev" }, "changes": [change] });
+        let note = json!({ "kind": "node", "type": { "id": "Note", "name": "Note" }, "id": "n1", "op": "insert", "before": null, "after": { "properties": { "slug": "n1", "title": "Dinner with Theo" } } });
+        let about = json!({ "kind": "edge", "type": { "id": "NoteAboutPerson", "name": "NoteAboutPerson" }, "id": "e1", "op": "insert", "before": null, "after": { "properties": {}, "endpoints": { "from": "n1", "to": "maya" } } });
+        let feed = json!({ "blocks": [block("f1", "m1", note), block("f2", "f1", about)], "cursor": "c", "caught_up": true });
+        let rows = |name: &str, rows: Value| {
+            (
+                200,
+                json!({ "query_name": name, "target": { "branch": "feature" }, "row_count": rows.as_array().map_or(0, Vec::len), "rows": rows, "graph_commit_id": "f2" }),
+            )
+        };
+        let (session, _) = review_server_with(
+            None,
+            false,
+            Some(feed),
+            "f2",
+            |_| (500, json!({})),
+            move |path, _, sent| {
+                if path.ends_with("/schema") {
+                    return Some((
+                        200,
+                        json!({ "schema_source": "node Person {\n  slug: String @key\n  name: String?\n  role: enum(partner, analyst)?\n}\nnode Note {\n  slug: String @key\n  title: String?\n}\nedge NoteAboutPerson: Note -> Person\n" }),
+                    ));
+                }
+                if !path.ends_with("/query") {
+                    return None;
+                }
+                let asked: Value = serde_json::from_str(sent).ok()?;
+                match asked["name"].as_str()? {
+                    "studio_node_labels" => Some(rows(
+                        "studio_node_labels",
+                        json!([{ "id": "maya", "label": "Maya Lin" }]),
+                    )),
+                    "studio_nodes_fields" => Some(rows(
+                        "studio_nodes_fields",
+                        json!([{ "id": "maya", "v_role": "partner" }]),
+                    )),
+                    _ => None,
+                }
+            },
+            cx,
+        );
+        // Not read yet: Canvas says why it waits.
+        let (_blank, cx) = cx.add_window_view(|_, _| gpui::EmptyView);
+        let unread = cx.update(|window, cx| {
+            let session = session.clone();
+            cx.new(|cx| ReviewView::new(session, "feature".into(), "main".into(), window, cx))
+        });
+        unread.read_with(cx, |view, cx| {
+            let canvas = Item::views(view, cx)
+                .into_iter()
+                .find(|link| link.kind == ViewKind::Canvas)
+                .expect("the strip offers Canvas");
+            assert_eq!(canvas.disabled, Some("The changes are still being read"));
+            assert!(Item::view_action(view, ViewKind::Canvas, cx).is_none());
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            ReviewView::new(session, "feature".into(), "main".into(), window, cx)
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(matches!(view.load, LoadState::Ready));
+            let canvas = Item::views(view, cx)
+                .into_iter()
+                .find(|link| link.kind == ViewKind::Canvas)
+                .expect("the strip offers Canvas");
+            assert_eq!(canvas.disabled, None);
+            let action = Item::view_action(view, ViewKind::Canvas, cx).expect("Canvas opens");
+            let action = action
+                .as_any()
+                .downcast_ref::<ShowChangeOnCanvas>()
+                .expect("the change on a canvas");
+            assert_eq!(
+                (action.branch.as_str(), action.target.as_str()),
+                ("feature", "main")
+            );
+            assert_eq!(action.at_commit.as_deref(), Some("f2"), "the reviewed head");
+            assert_eq!(action.fork.as_deref(), Some("m1"));
+            let nodes: Vec<(&str, Option<&str>, Option<ChangeMark>)> = action
+                .nodes
+                .iter()
+                .map(|n| (n.id.as_str(), n.label.as_deref(), n.change))
+                .collect();
+            assert_eq!(nodes.len(), 2, "{nodes:?}");
+            assert!(nodes.contains(&("n1", Some("Dinner with Theo"), Some(ChangeMark::Added))));
+            assert!(
+                nodes.contains(&("maya", Some("Maya Lin"), None)),
+                "{nodes:?}"
+            );
+            let at = |id: &str| action.nodes.iter().position(|n| n.id == id).unwrap();
+            assert_eq!(action.links.len(), 1);
+            let link = &action.links[0];
+            assert_eq!((link.from, link.to), (at("n1"), at("maya")));
+            assert_eq!(link.words, "about");
+            assert_eq!(link.change, ChangeMark::Added);
+            // The note's card names what its relationship reaches.
+            let data = view.data.as_ref().unwrap();
+            let note = data
+                .groups
+                .groups
+                .iter()
+                .position(|g| g.id == "n1")
+                .expect("the note's card");
+            let lines =
+                data.groups
+                    .lines(&data.folded, note, data.schema.as_deref(), &view.names, 20);
+            let entry = lines.entries.first().expect("its relationship");
+            assert_eq!(entry.other, "Maya Lin");
+            assert_eq!(
+                view.line_facts(data, entry).as_deref(),
+                Some("role: partner")
+            );
+        });
     }
 
     /// A name read for a node the review knows only by id is kept while the review is read at

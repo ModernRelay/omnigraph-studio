@@ -3562,6 +3562,71 @@ impl GraphSession {
         })
     }
 
+    /// What tells each node `ends` lists apart beside its name (spec 042, "Facts"): its
+    /// [`builder::fact_properties`] with a value, read at `snapshot` (the session's branch when
+    /// `None`) in one read per type of at most [`NAME_BATCH`] ids, the first [`NAME_LIMIT`]
+    /// ends only, each as "name: value" joined by " · ", a long value cut. A node with no such
+    /// value, or that a read did not find, is left out, as is every node of a read that failed.
+    /// With them, whether every read answered.
+    pub fn node_facts(
+        &mut self,
+        ends: Vec<(String, String)>,
+        snapshot: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<(crate::NodeFacts, bool)> {
+        let Some(schema) = self.schema_model() else {
+            return Task::ready((crate::NodeFacts::default(), false));
+        };
+        let mut by_type: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (type_name, id) in ends.into_iter().take(NAME_LIMIT) {
+            by_type.entry(type_name).or_default().push(id);
+        }
+        let mut reads = Vec::new();
+        for (type_name, ids) in by_type {
+            let Some(node) = schema.node(&type_name) else {
+                continue;
+            };
+            let properties: Vec<String> = builder::fact_properties(node)
+                .into_iter()
+                .map(|property| property.name.clone())
+                .collect();
+            if properties.is_empty() {
+                continue;
+            }
+            for chunk in ids.chunks(NAME_BATCH) {
+                if let Ok(query) =
+                    builder::nodes_fields_by_id(&schema, &type_name, chunk, &properties)
+                {
+                    reads.push((
+                        type_name.clone(),
+                        properties.clone(),
+                        self.read(&query, snapshot.clone(), cx),
+                    ));
+                }
+            }
+        }
+        cx.spawn(async move |_, _| {
+            let mut facts = crate::NodeFacts::default();
+            let mut answered = true;
+            for (type_name, properties, read) in reads {
+                let Ok(output) = read.await else {
+                    answered = false;
+                    continue;
+                };
+                for row in output.rows.as_array().into_iter().flatten() {
+                    let Some(id) = row.get("id").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let said = crate::entity_groups::facts_of(row, &properties);
+                    if !said.is_empty() {
+                        facts.insert((type_name.clone(), id.to_owned()), said);
+                    }
+                }
+            }
+            (facts, answered)
+        })
+    }
+
     /// What `memo` keeps for `key`: its answer, the read under way that someone still waits
     /// for, or a new read `start` begins, given the ticket the memo files it under. Every
     /// asker's task files the answer under the read it shared, and `answered` runs when one is
