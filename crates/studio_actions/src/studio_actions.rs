@@ -932,6 +932,15 @@ pub mod review {
             ToggleChange,
             /// Switch the review between its feed of types and one record at a time.
             SwitchLayout,
+            /// Show the conflicts a merge would stop on, each with what the fork, the target
+            /// and this branch hold; or the changes again.
+            ShowConflicts,
+            /// Resolve the selected conflict with the target's version: write it onto the
+            /// reviewed branch.
+            KeepTarget,
+            /// Resolve the selected conflict with this branch's version: write it onto the
+            /// target, once confirmed.
+            KeepSource,
         ]
     );
 }

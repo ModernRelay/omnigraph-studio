@@ -432,7 +432,10 @@
       "alt-ctrl-z": "studio_review::RevertAndNext",
       "ctrl-shift-enter": "studio_review::Merge",
       "ctrl-shift-m": "studio_review::Summarize",
-      "ctrl-shift-v": "studio_review::SwitchLayout"
+      "ctrl-shift-v": "studio_review::SwitchLayout",
+      "ctrl-alt-c": "studio_review::ShowConflicts",
+      "ctrl-alt-shift-left": "studio_review::KeepTarget",
+      "ctrl-alt-shift-right": "studio_review::KeepSource"
     }
   },
   {

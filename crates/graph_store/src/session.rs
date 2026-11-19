@@ -4161,6 +4161,33 @@ impl GraphSession {
         )
     }
 
+    /// One page of `branch`'s change feed of the types `types` only, from `start` or from
+    /// `page_token` to continue: a review reads who set the target's side of a conflict with it
+    /// (spec 039), the feed having no filter by entity (E62).
+    pub fn typed_changes(
+        &mut self,
+        branch: &str,
+        start: &str,
+        page_token: Option<String>,
+        types: Vec<String>,
+        limit: u32,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<ChangeFeedOutput, ReadError>> {
+        let (client, graph, branch) = (self.client(cx), self.graph_id.clone(), branch.to_owned());
+        let start = start.to_owned();
+        self.counted_read(
+            "changes",
+            async move {
+                let at = match &page_token {
+                    Some(token) => FeedAt::Page(token),
+                    None => FeedAt::Start(&start),
+                };
+                client.changes(&graph, &branch, at, &types, limit).await
+            },
+            cx,
+        )
+    }
+
     /// One page of the net changes from commit `from` to commit `to`.
     pub fn diff(
         &mut self,

@@ -1,7 +1,8 @@
 //! Edit from the review (spec 008, "Act in place"): a form of a changed node's editable
 //! properties, filled with what the review shows it holding. Saving sends only the fields typed
 //! in, as one statement on the reviewed branch bound to the values shown, sent bound to the
-//! reviewed head like a revert.
+//! reviewed head like a revert. Opened from a merge conflict (spec 039), each field shows the
+//! target's value beside it, with Use to take it.
 
 use editor::Editor;
 use gpui::{
@@ -23,6 +24,8 @@ struct Field {
     editor: Entity<Editor>,
     /// The value the branch holds, which the save is bound to.
     current: Value,
+    /// The target's value, when the form was opened from a conflict and it holds the node.
+    other: Option<Value>,
     error: Option<String>,
 }
 
@@ -35,6 +38,8 @@ pub(crate) struct EditModal {
     /// confirmation names it, since two windows can both be on `main`.
     scope: String,
     fields: Vec<Field>,
+    /// The branch whose values show beside the fields, and whether it holds the node.
+    beside: Option<(String, bool)>,
     /// Why the edit was not sent, shown while the form stays open.
     refused: Option<String>,
     focus_handle: FocusHandle,
@@ -76,6 +81,7 @@ impl EditModal {
                     property,
                     editor,
                     current,
+                    other: None,
                     error: None,
                 }
             })
@@ -86,9 +92,40 @@ impl EditModal {
             title: title.into(),
             scope,
             fields,
+            beside: None,
             refused: None,
             focus_handle: cx.focus_handle(),
         }
+    }
+
+    /// Shows `branch`'s values beside the fields, from its image of the node, `None` where it
+    /// does not hold it (spec 039).
+    pub(crate) fn beside(
+        mut self,
+        beside: Option<(String, Option<serde_json::Map<String, Value>>)>,
+    ) -> Self {
+        let Some((branch, image)) = beside else {
+            return self;
+        };
+        for field in &mut self.fields {
+            field.other = image
+                .as_ref()
+                .and_then(|image| image.get(&field.property.name).cloned());
+        }
+        self.beside = Some((branch, image.is_some()));
+        self
+    }
+
+    /// Puts the other branch's value of field `at` in its input.
+    fn use_other(&mut self, at: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(field) = self.fields.get(at) else {
+            return;
+        };
+        let text = edit_text(field.other.as_ref().unwrap_or(&Value::Null));
+        field
+            .editor
+            .update(cx, |editor, cx| editor.set_text(text, window, cx));
+        cx.notify();
     }
 
     fn save(&mut self, cx: &mut Context<Self>) {
@@ -145,7 +182,49 @@ impl Render for EditModal {
             )
             .child(
                 ds::modal_body()
-                    .children(self.fields.iter().map(|field| {
+                    .children(self.beside.clone().and_then(|(branch, holds)| {
+                        (!holds).then(|| {
+                            studio_ui::ds::text::meta(format!(
+                                "{branch} no longer holds this node."
+                            ))
+                        })
+                    }))
+                    .children(self.fields.iter().enumerate().map(|(at, field)| {
+                        let beside =
+                            self.beside
+                                .as_ref()
+                                .filter(|(_, holds)| *holds)
+                                .map(|(branch, _)| {
+                                    let value = field.other.clone().unwrap_or(Value::Null);
+                                    let same = same_value(&value, &field.current);
+                                    h_flex()
+                                        .gap(px(ds::space::INLINE))
+                                        .child(
+                                            div().min_w_0().child(
+                                                studio_ui::ds::text::meta(format!(
+                                                    "{branch}: {}",
+                                                    match &value {
+                                                        Value::Null => "—".to_owned(),
+                                                        other => studio_ui::value_text(other),
+                                                    }
+                                                ))
+                                                .truncate(),
+                                            ),
+                                        )
+                                        .when(!same, |row| {
+                                            row.child(
+                                                ds::row_button(("use-other", at), "Use")
+                                                    .tip(ds::tooltip(format!(
+                                                        "Put {branch}'s value in the field"
+                                                    )))
+                                                    .on_click(cx.listener(
+                                                        move |this, _, window, cx| {
+                                                            this.use_other(at, window, cx)
+                                                        },
+                                                    )),
+                                            )
+                                        })
+                                });
                         ds::field(
                             field.property.name.clone(),
                             v_flex()
@@ -154,6 +233,7 @@ impl Render for EditModal {
                                     ds::field_frame(field.error.is_some(), cx)
                                         .child(ds::field_input(field.editor.clone())),
                                 )
+                                .children(beside)
                                 .children(field.error.clone().map(studio_ui::ds::text::error_note)),
                         )
                     }))

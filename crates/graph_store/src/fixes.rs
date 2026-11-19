@@ -165,6 +165,99 @@ fn revert_edge(
     }
 }
 
+/// What one side of a merge conflict holds of an entity (spec 039): its properties as read, a
+/// property a read could not return (a Blob, a vector) left out, which is not a null.
+pub type SideImage = Map<String, Value>;
+
+/// The mutation that makes the branch `have` was read on hold what the other side holds of
+/// entity `id` (`want`), so the merge finds the two sides alike and takes it (spec 039,
+/// "Keep main's" and "Keep this branch's"). Omnigraph compares a conflicting row whole, so the
+/// row is made alike, not only the properties both sides changed.
+///
+/// - Both hold it: set every property whose values differ, bound to each value `have` holds,
+///   so a row changed since is left alone whole (zero affected rows), never set in part.
+/// - Only `want` holds it: insert it with its values; a node without a key cannot be, since it
+///   would come back under another id. An edge cannot be either: an insert cannot give it its
+///   id (E26).
+/// - Only `have` holds it: delete it.
+///
+/// Properties held by one image and not the other (outside one side's schema, or not read) are
+/// not compared. A differing value a mutation cannot set (a Blob, a vector) makes it
+/// unavailable, with why.
+pub fn take_side(
+    schema: &SchemaModel,
+    is_edge: bool,
+    type_name: &str,
+    id: &str,
+    want: Option<&SideImage>,
+    have: Option<&SideImage>,
+) -> Result<BuiltQuery, RevertUnavailable> {
+    let unavailable = |error: gq_language::BuildError| RevertUnavailable(error.to_string());
+    if is_edge {
+        let Some(edge) = schema.edge(type_name) else {
+            return Err(RevertUnavailable(format!(
+                "The current schema has no relationship {type_name}."
+            )));
+        };
+        return match (want, have) {
+            (None, Some(_)) => delete_edge(schema, &edge.name, id).map_err(unavailable),
+            (None, None) => Err(RevertUnavailable("Neither side holds it.".into())),
+            (Some(_), _) => Err(RevertUnavailable(
+                "A relationship cannot be changed or brought back under its own id: \
+                 remove it on one side instead."
+                    .into(),
+            )),
+        };
+    }
+    let Some(node) = schema.node(type_name) else {
+        return Err(RevertUnavailable(format!(
+            "The current schema has no type {type_name}."
+        )));
+    };
+    match (want, have) {
+        (None, None) => Err(RevertUnavailable("Neither side holds it.".into())),
+        (None, Some(_)) => delete_node(schema, &node.name, id).map_err(unavailable),
+        (Some(_), None) if node.key.is_none() => Err(RevertUnavailable(format!(
+            "{} has no key, so it would come back under another id.",
+            node.name
+        ))),
+        (Some(want), None) => {
+            let values = restorable(&node.properties, want)?;
+            insert_node(schema, &node.name, &values).map_err(unavailable)
+        }
+        (Some(want), Some(have)) => {
+            let mut cells = Vec::new();
+            for property in &node.properties {
+                let (Some(wanted), Some(held)) =
+                    (want.get(&property.name), have.get(&property.name))
+                else {
+                    continue;
+                };
+                if gq_language::input::same_value(wanted, held) {
+                    continue;
+                }
+                if !property.editable_in_cell() {
+                    return Err(RevertUnavailable(format!(
+                        "{} cannot be set from the review.",
+                        property.name
+                    )));
+                }
+                cells.push((property.name.clone(), held.clone(), wanted.clone()));
+            }
+            if cells.is_empty() {
+                return Err(RevertUnavailable(
+                    "Both sides already hold the same values.".into(),
+                ));
+            }
+            let row = RowEdit {
+                id: id.to_owned(),
+                cells,
+            };
+            update_rows(schema, &node.name, &[row]).map_err(unavailable)
+        }
+    }
+}
+
 /// Joins mutations into one, renaming each part's parameters `$name` to `$name_<i>` so they
 /// cannot collide. A single part is returned unchanged.
 ///
@@ -357,6 +450,73 @@ mod tests {
         );
         assert!(!revert_deletes(&c));
         assert!(!revert_deletes(&one));
+    }
+
+    /// A conflict's side is taken by making the other side's row alike (spec 039): every
+    /// differing property set in one statement bound to the values held, a row only one side
+    /// holds inserted or deleted, and a relationship only removed.
+    #[test]
+    fn taking_a_side_makes_the_other_rows_alike() {
+        let image = |v: Value| v.as_object().unwrap().clone();
+        let main = image(json!({"slug": "ada", "name": "Ada", "title": "CTO", "tags": ["x"]}));
+        let here = image(json!({"slug": "ada", "name": "Ada", "title": "CEO", "tags": ["y"]}));
+        let query = take_side(&schema(), false, "Person", "ada", Some(&main), Some(&here)).unwrap();
+        assert_compiles(&query);
+        assert_eq!(
+            query.text.matches("update Person").count(),
+            1,
+            "{}",
+            query.text
+        );
+        assert!(
+            query.text.contains("set { title: $new0_0, tags: $new0_1 }"),
+            "{}",
+            query.text
+        );
+        assert!(
+            query
+                .text
+                .contains("where @id = $id0 and title = $old0_0\n"),
+            "{}",
+            query.text
+        );
+        assert_eq!(query.params["new0_0"], json!("CTO"));
+        assert_eq!(query.params["old0_0"], json!("CEO"));
+        assert_eq!(query.params["new0_1"], json!(["x"]));
+
+        // A property one side did not read is not compared, and one alike asks for nothing.
+        let partial = image(json!({"slug": "ada", "name": "Ada"}));
+        assert!(
+            take_side(
+                &schema(),
+                false,
+                "Person",
+                "ada",
+                Some(&partial),
+                Some(&here)
+            )
+            .is_err()
+        );
+
+        // Only the wanted side holds it: inserted with its values; only the other: deleted.
+        let insert = take_side(&schema(), false, "Person", "ada", Some(&main), None).unwrap();
+        assert_compiles(&insert);
+        assert!(insert.text.contains("insert Person"), "{}", insert.text);
+        let delete = take_side(&schema(), false, "Person", "ada", None, Some(&here)).unwrap();
+        assert_compiles(&delete);
+        assert!(
+            delete.text.contains("delete Person where @id = $id"),
+            "{}",
+            delete.text
+        );
+
+        // A relationship is only removed.
+        let edge = image(json!({"role": "x"}));
+        let remove = take_side(&schema(), true, "WorksAt", "e1", None, Some(&edge)).unwrap();
+        assert_compiles(&remove);
+        let refused = take_side(&schema(), true, "WorksAt", "e1", Some(&edge), Some(&edge));
+        assert!(refused.unwrap_err().0.contains("remove it on one side"));
+        assert!(take_side(&schema(), false, "Nobody", "x", None, Some(&here)).is_err());
     }
 
     #[test]

@@ -30,8 +30,8 @@ use serde_json::Value;
 use studio_actions::changes::OpenChanged;
 use studio_actions::graph::OpenNodePage;
 use studio_actions::review::{
-    AcceptAndNext, EditChange, Merge, NextChange, PreviousChange, RevertAndNext, Summarize,
-    SwitchLayout, ToggleChange,
+    AcceptAndNext, EditChange, Merge, NextChange, PreviousChange, RevertAndNext, ShowConflicts,
+    Summarize, SwitchLayout, ToggleChange,
 };
 use studio_actions::workspace::Refresh;
 use studio_actions::{ViewKind, ViewLink};
@@ -40,7 +40,6 @@ use studio_ui::ds::Tipped;
 use studio_ui::ds::{radii, space};
 use studio_ui::{
     ChangeKind, RelationshipLine, TextFolds, change_counts, group_digits, short_commit_id,
-    type_swatch,
 };
 use studio_workspace::models::{self, Error as ModelError, Models, Request as ModelRequest};
 use studio_workspace::{
@@ -50,6 +49,8 @@ use ui::prelude::*;
 use ui::{KeyBinding, PopoverMenu, Severity};
 
 use crate::conflicts::{conflict_wording, resolution_hint};
+
+mod resolve;
 use crate::scope_menu::ScopeMenu;
 use crate::summary;
 
@@ -157,6 +158,8 @@ impl From<MergeSettled> for Check {
 /// two never drift apart (spec 033).
 #[derive(Debug, Clone)]
 struct Conflicts {
+    /// This list's identity: the sides read for its conflicts are for it alone (spec 039).
+    id: u64,
     list: Vec<MergeConflictOutput>,
     by_entity: HashMap<(String, String), usize>,
 }
@@ -173,7 +176,11 @@ impl Conflicts {
                 ))
             })
             .collect();
-        Self { list, by_entity }
+        Self {
+            id: resolve::next_list_id(),
+            list,
+            by_entity,
+        }
     }
 
     /// The conflict at the entity `id` of type `type_name`, if there is one.
@@ -590,6 +597,11 @@ pub struct ReviewView {
     /// Whether the merge deletes the branch once it lands; on unless the person turns it off.
     delete_branch: bool,
     show_conflicts: bool,
+    /// The conflicts' sides, the one selected, and the decisions taken (spec 039).
+    resolve: resolve::Resolve,
+    /// The conflicts list, a view of its own drawn cached (`docs/drawing.md`), as the changes'
+    /// list is.
+    conflicts_view: Entity<resolve::ConflictRows>,
     /// Someone else wrote to the branch after this review was read.
     newer: bool,
     /// The review being read has been read for longer than [`SLOW_READ`]: it says the server is
@@ -803,6 +815,8 @@ impl ReviewView {
             preview: Preview::Unread,
             delete_branch: true,
             show_conflicts: false,
+            resolve: resolve::Resolve::default(),
+            conflicts_view: resolve::ConflictRows::new(cx),
             newer: false,
             reading_slowly: false,
             schema_moved_while_loading: false,
@@ -1441,10 +1455,16 @@ impl ReviewView {
     }
 
     fn select_next(&mut self, _: &NextChange, _: &mut Window, cx: &mut Context<Self>) {
+        if self.show_conflicts {
+            return self.step_conflict(true, cx);
+        }
         self.step(true, cx);
     }
 
     fn select_previous(&mut self, _: &PreviousChange, _: &mut Window, cx: &mut Context<Self>) {
+        if self.show_conflicts {
+            return self.step_conflict(false, cx);
+        }
         self.step(false, cx);
     }
 
@@ -2020,6 +2040,19 @@ impl ReviewView {
     }
 
     fn open_edit(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_edit_beside(ix, None, window, cx);
+    }
+
+    /// [`Self::open_edit`], with another branch's values beside each field when `beside` names
+    /// one: a conflict's Edit… shows the target's (spec 039), `None` where the target does not
+    /// hold the node.
+    fn open_edit_beside(
+        &mut self,
+        ix: usize,
+        beside: Option<(String, Option<graph_store::fixes::SideImage>)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // As the button is: a card fixed already shows values its fix replaced, an edit during a
         // merge could land on either side of it, and a credential refused changes writes none.
         if self.merge_may_land(cx)
@@ -2044,6 +2077,7 @@ impl ReviewView {
         workspace.update(cx, |workspace, cx| {
             workspace.toggle_modal(window, cx, move |window, cx| {
                 crate::edit::EditModal::new(view, key, title, scope, values, window, cx)
+                    .beside(beside)
             })
         });
     }
@@ -2163,6 +2197,7 @@ impl ReviewView {
         );
         let unknown = matches!(fix, FixState::Unknown);
         // Found by the change's key: a Refresh while the fix was out may have moved its card.
+        self.conflict_fix_finished(key, &fix, cx);
         if let Some(card) = self.card_of(key).and_then(|ix| self.cards.get_mut(ix)) {
             if matches!(fix, FixState::Reverted { .. }) {
                 card.reviewed = true;
@@ -2936,7 +2971,7 @@ impl ReviewView {
             ),
             Preview::Conflicts(conflicts) => (
                 format!(
-                    "{} {} a merge into {}. Fix each on the branch, then merge.",
+                    "{} {} a merge into {}. Resolve each, then merge.",
                     studio_ui::plural(conflicts.len(), "conflict", "conflicts"),
                     if conflicts.len() == 1 {
                         "stops"
@@ -2959,6 +2994,11 @@ impl ReviewView {
                 },
             )
             .style(ButtonStyle::Outlined)
+            .tip(studio_ui::ds::tooltip_for_action_in(
+                "Each conflict with what the fork, the target and this branch hold",
+                &ShowConflicts,
+                &self.focus_handle,
+            ))
             .on_click(cx.listener(|this, _, _, cx| this.toggle_conflicts(cx)))
         });
         let delete_refused = self.delete_refusal(cx);
@@ -3297,85 +3337,6 @@ impl ReviewView {
             ),
         };
         Some(notice(severity, text, action))
-    }
-
-    fn render_conflicts(&self, cx: &mut Context<Self>) -> AnyElement {
-        let count = self.conflicts().map_or(0, |conflicts| conflicts.len());
-        // A merge's own conflicts, or a dry run's read again, replace the list shown.
-        if self.conflict_list.item_count() != count {
-            self.conflict_list.reset(count);
-        }
-        v_flex()
-            .flex_1()
-            .min_h_0()
-            .pt(px(space::XL))
-            .gap(px(space::MD))
-            .child(div().px(px(space::XL)).child(studio_ui::ds::text::muted(
-                if matches!(self.merge, MergeState::Conflicts(_)) {
-                    format!("Conflicts merging {} into {}", self.branch, self.target)
-                } else {
-                    format!(
-                        "Conflicts a merge of {} into {} would stop on",
-                        self.branch, self.target
-                    )
-                },
-            )))
-            .child(
-                list(
-                    self.conflict_list.clone(),
-                    cx.processor(|this, ix, _, cx| this.render_conflict(ix, cx)),
-                )
-                .flex_1()
-                .min_h_0(),
-            )
-            .into_any_element()
-    }
-
-    /// One conflict of the list, made only while it is on screen.
-    fn render_conflict(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
-        let Some(conflict) = self.conflicts().and_then(|conflicts| conflicts.get(ix)) else {
-            return div().into_any_element();
-        };
-        // What the branch did to the conflict's entity.
-        let here = conflict.entity_id.as_deref().and_then(|id| {
-            let data = self.data.as_ref()?;
-            data.folded.changes[data.change_to(&conflict.type_name, id)?].net()
-        });
-        let words = conflict_wording(conflict.kind, here, &self.target);
-        let entity = conflict.entity_id.clone().unwrap_or_else(|| "—".into());
-        div()
-            .px(px(space::XL))
-            .pb(px(space::MD))
-            .child(
-                studio_ui::ds::lifted(h_flex().id(("conflict", ix)), cx)
-                    .w_full()
-                    .gap(px(space::LG))
-                    .px(px(space::LG))
-                    .py(px(space::MD))
-                    .rounded(px(radii(cx).md))
-                    .bg(studio_ui::ds::surface::document(cx))
-                    .child(Icon::new(IconName::GitMergeConflict).color(Color::Conflict))
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .child(studio_ui::ds::text::plain(words).color(Color::Conflict))
-                            .child(
-                                h_flex()
-                                    .gap(px(space::MD))
-                                    .child(type_swatch(&conflict.type_name, cx))
-                                    .child(studio_ui::ds::text::muted(conflict.type_name.clone()))
-                                    .child(studio_ui::ds::text::body(entity).buffer_font(cx)),
-                            )
-                            .child(studio_ui::ds::text::meta(conflict.message.clone())),
-                    )
-                    .when(here.is_some(), |d| {
-                        d.cursor_pointer()
-                            .child(studio_ui::ds::text::meta("Show change").color(Color::Accent))
-                            .on_click(cx.listener(move |this, _, _, cx| this.open_conflict(ix, cx)))
-                    }),
-            )
-            .into_any_element()
     }
 
     fn render_row(
@@ -4900,9 +4861,17 @@ impl Render for ReviewView {
         if std::mem::take(&mut self.read_owed) {
             cx.defer_in(window, |this, _, cx| this.reload(cx));
         }
+        // The conflicts shown are read side by side once the frame is out (spec 039).
+        if self.show_conflicts {
+            self.sides_owed(window, cx);
+        }
         let header = self.render_header(cx);
         let body = match (&self.load, &self.data) {
-            (LoadState::Ready, Some(_)) if self.show_conflicts => self.render_conflicts(cx),
+            (LoadState::Ready, Some(_)) if self.show_conflicts => {
+                AnyView::from(self.conflicts_view.clone())
+                    .cached(StyleRefinement::default().size_full())
+                    .into_any_element()
+            }
             (LoadState::Ready, Some(data)) if data.folded.changes.is_empty() => {
                 change_cards::no_changes_state(if data.commits.is_empty() {
                     format!("{} has no commits of its own.", self.branch)
@@ -4971,13 +4940,26 @@ impl Render for ReviewView {
             // as their buttons are enabled (constitution VIII).
             .when(self.change_refusal(cx).is_none(), |view| {
                 view.on_action(cx.listener(Self::revert_and_next))
-                    .on_action(cx.listener(|this, _: &EditChange, window, cx| {
-                        if this.cards_shown()
+                    .on_action(cx.listener(|this, action: &EditChange, window, cx| {
+                        if this.show_conflicts {
+                            this.edit_selected_conflict(action, window, cx);
+                        } else if this.cards_shown()
                             && let Some(ix) = this.selected
                         {
                             this.open_edit(ix, window, cx);
                         }
                     }))
+            })
+            // The conflicts list and its decisions are there only while a merge or its dry run
+            // has conflicts; each decision's button says why it is off when it is.
+            .when(self.conflicts().is_some(), |view| {
+                view.on_action(cx.listener(|this, action: &ShowConflicts, _, cx| {
+                    this.show_conflicts_action(action, cx)
+                }))
+            })
+            .when(self.show_conflicts && self.conflicts().is_some(), |view| {
+                view.on_action(cx.listener(Self::keep_target))
+                    .on_action(cx.listener(Self::keep_source))
             })
             // Merge is registered only while the credential may merge (constitution VIII).
             .when(self.merge_refusal(cx).is_none(), |view| {

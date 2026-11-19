@@ -29,11 +29,10 @@ pub fn conflict_wording(kind: MergeConflictKind, here: Option<NetChange>, target
     }
 }
 
-/// What to do about conflicts, after the list.
+/// What to do about conflicts, after the list (spec 039): each conflict's card offers the
+/// decisions.
 pub fn resolution_hint(source: &str, target: &str) -> String {
-    format!(
-        "Fix each entity on {source} with ordinary edits so it agrees with {target}, then merge."
-    )
+    format!("Show conflicts to keep {target}'s or {source}'s version of each, then merge again.")
 }
 
 #[cfg(test)]

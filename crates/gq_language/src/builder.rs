@@ -2266,6 +2266,73 @@ pub fn edge_page_without(
     })
 }
 
+/// Which edges of one type [`edges_of`] reads.
+#[derive(Debug, Clone, Copy)]
+pub enum EdgesOf<'a> {
+    /// Those whose `@id` is one of these.
+    Ids(&'a [String]),
+    /// Those from the node with this `@id`.
+    From(&'a str),
+}
+
+/// Edges of one type by their ids or their source, in one read, with [`edge_page_without`]'s
+/// columns: `edge_id`, `from_id`, `to_id`, then each property a projection can read in its
+/// [`edge_property_column`]; at most `limit` rows. A merge conflict's sides are read with it
+/// (spec 039): the edges a branch and its target hold of the conflict, each at its own head.
+pub fn edges_of(
+    schema: &SchemaModel,
+    edge_name: &str,
+    of: EdgesOf<'_>,
+    limit: u32,
+) -> Result<BuiltQuery, BuildError> {
+    let edge = edge(schema, edge_name)?;
+    let mut params = Params::new();
+    let mut clauses = vec![
+        format!("$a: {}", edge.from),
+        format!("$a {EDGE_VAR}:{} $b", edge.traversal()),
+    ];
+    clauses.push(match of {
+        EdgesOf::Ids(ids) => {
+            let ids = params.add("ids", "[String]", Value::from(ids.to_vec()));
+            format!("{EDGE_VAR}.@id in {ids}")
+        }
+        EdgesOf::From(id) => {
+            let id = params.add("from", "String", Value::String(id.to_owned()));
+            format!("$a.@id = {id}")
+        }
+    });
+    let mut columns = vec![
+        format!("{EDGE_VAR}.@id as edge_id"),
+        "$a.@id as from_id".to_owned(),
+        "$b.@id as to_id".to_owned(),
+    ];
+    for property in edge.properties.iter().filter(|p| p.projectable()) {
+        columns.push(format!(
+            "{EDGE_VAR}.{} as {}",
+            property.name,
+            edge_property_column(&property.name)
+        ));
+    }
+    let text = format!(
+        "query studio_edges_of({sig}) {{\n  match {{\n    {clauses}\n  }}\n  return {{ {columns} }}\n  order {{ {EDGE_VAR}.@id }}\n  limit {limit}\n}}\n",
+        sig = params.signature(),
+        clauses = clauses.join("\n    "),
+        columns = columns.join(", "),
+        limit = limit.max(1),
+    );
+    Ok(BuiltQuery {
+        name: "studio_edges_of".into(),
+        text,
+        params: params.values,
+        depends: Depends::Types {
+            nodes: vec![edge.from.clone(), edge.to.clone()],
+            edges: vec![edge.name.clone()],
+        },
+        seeds: None,
+        empty_without: None,
+    })
+}
+
 /// How many edges of a type match the filters. An edge binding cannot be counted bare, so this
 /// counts its `@id`.
 pub fn edge_count(
@@ -4152,6 +4219,27 @@ mod tests {
             value: json!("1 = 1"),
         }];
         assert!(neighbour_count(&schema, "Person", &works_at, "x", &condition).is_err());
+    }
+
+    /// A conflict's edges are read by their ids or from their source, with the edge's id and
+    /// both ends, and the queries type-check (spec 039).
+    #[test]
+    fn edges_are_read_by_id_or_from_their_source() {
+        let schema = dev();
+        let ids = ["e1".to_owned(), "e2".to_owned()];
+        let by_id = edges_of(&schema, "WorksAt", EdgesOf::Ids(&ids), 2).unwrap();
+        assert_compiles(&by_id);
+        assert!(by_id.text.contains("$e.@id in $ids"), "{}", by_id.text);
+        assert_eq!(by_id.params["ids"], json!(["e1", "e2"]));
+        let from = edges_of(&schema, "WorksAt", EdgesOf::From("ada"), 50).unwrap();
+        assert_compiles(&from);
+        assert!(from.text.contains("$a.@id = $from"), "{}", from.text);
+        assert!(
+            from.text
+                .contains("$e.@id as edge_id, $a.@id as from_id, $b.@id as to_id")
+        );
+        assert!(from.text.contains("limit 50"));
+        assert!(edges_of(&schema, "Nope", EdgesOf::From("ada"), 1).is_err());
     }
 
     fn assert_compiles(query: &BuiltQuery) {

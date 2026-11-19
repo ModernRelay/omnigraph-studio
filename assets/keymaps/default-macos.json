@@ -432,7 +432,10 @@
       "alt-cmd-z": "studio_review::RevertAndNext",
       "cmd-shift-enter": "studio_review::Merge",
       "cmd-shift-m": "studio_review::Summarize",
-      "cmd-shift-v": "studio_review::SwitchLayout"
+      "cmd-shift-v": "studio_review::SwitchLayout",
+      "alt-cmd-c": "studio_review::ShowConflicts",
+      "alt-cmd-[": "studio_review::KeepTarget",
+      "alt-cmd-]": "studio_review::KeepSource"
     }
   },
   {
