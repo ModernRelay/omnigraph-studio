@@ -49,6 +49,8 @@ it goes through Omnigraph's own RFC process.
 | E52 | The schema at a commit, or a commit's schema diff | 033 | A schema change's tab says "Schema change" and the type the refusal names, with no retry |
 | E53 | A merge conflict's base, source and target images | 033 | The conflict's kind in words and the server's message, on its card and in the conflicts list |
 | E54 | A write refused in validation, before any effect (an `@card` bound, a missing endpoint), states `effects: none` and the violation as a typed detail; 0.14 and 0.15 answer 400 `bad_request` with `effects: unknown, action: reconcile` | 004, 034 | Judges it unknown, as the disposition says, and names the `@card` bound from the server's words; the new-node dialog sends a node with the edges its minimum needs so a 0.15 server does not refuse it |
+| E60 | A commit's operation (the stored query's name, `mutate`, `load`, `merge`, `blob put`) and an optional message in `CommitOutput` and the feed's cause; the actor who created a branch in E9's details ([#1470](https://github.com/ModernRelay/omnigraph/issues/1470)) | 040 | History says Studio's own words for the writes it made or sent for the agent this session, else the node a commit changed |
+| E62 | The commits that changed one entity, paged, merged-in commits with their own actors ([#1472](https://github.com/ModernRelay/omnigraph/issues/1472)) | 040 | A node's History reads windows of the branch's newest 200 commits from the change feed filtered to the node's types, with "Read the 200 commits before"; a merge is its merger's change |
 
 Every server Studio supports serves these (checked against `v0.14.0`'s OpenAPI document, 2026-10-24):
 

@@ -71,7 +71,10 @@ from Zed with notices).
   between the commit and its parent names the type at it, and no other reason claims a schema
   change (since 2026-10-21; before, every 409 was said to be a schema change).
 - Search by id prefix or actor with an i/N counter; ↵ and ⇧↵ step through the matches, and
-  typing in the field never moves the selection.
+  typing in the field never moves the selection. Since spec 040 (2026-11-19) it also finds a
+  node a commit's counted changes touched and Studio's own words for a commit, and a row says
+  what its commit was (Studio's words, a merge's branch, or the node it changed) between its
+  tags and its actor; a node's own history is a tab of its own (spec 040).
 - Any commit can open a type table or query editor pinned to it (read-only chip): the commit
   detail's Table menu (the commit's types first) dispatches `OpenType { at_commit }`, its Query
   button `OpenQueryAt`. A pinned table reads that snapshot for every page and count, ignores the

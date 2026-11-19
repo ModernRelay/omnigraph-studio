@@ -61,6 +61,9 @@ pub struct PropertyRow {
     before: Option<SharedString>,
     after: Option<SharedString>,
     body: Body,
+    /// Who set the value, at the row's end, and what its tooltip says of it (spec 040): drawn
+    /// only on a card whose values more than one actor set.
+    by: Option<(SharedString, SharedString)>,
 }
 
 /// How a row reads what changed.
@@ -120,7 +123,19 @@ impl PropertyRow {
             before: before_text,
             after: after_text,
             body,
+            by: None,
         }
+    }
+
+    /// Names who set the value (`who`), with `detail` (the commit and when) in its tooltip.
+    pub fn set_by(mut self, who: impl Into<SharedString>, detail: impl Into<SharedString>) -> Self {
+        self.by = Some((who.into(), detail.into()));
+        self
+    }
+
+    /// Who set the value, when the row names it.
+    pub fn by(&self) -> Option<&SharedString> {
+        self.by.as_ref().map(|(who, _)| who)
     }
 
     pub fn name(&self) -> &SharedString {
@@ -360,6 +375,16 @@ pub fn property_row(
                 .child(name),
         )
         .child(property_body(row, kind, folds, cx))
+        .children(row.by.as_ref().map(|(who, detail)| {
+            let detail = detail.clone();
+            div()
+                .id(SharedString::from(format!("set-by-{}", row.name)))
+                .flex_none()
+                .max_w(px(crate::ds::TAG_MAX_WIDTH))
+                .pt(px(space::XXS))
+                .tip(crate::ds::tooltip(detail))
+                .child(crate::ds::text::meta(who.clone()).single_line().truncate())
+        }))
 }
 
 /// What a row shows of its value: before → after on one line when both are short, a list's

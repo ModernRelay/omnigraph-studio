@@ -111,6 +111,10 @@ The inconsistencies, by kind:
   ("100 added, counted from its first 100 changes; it has more"). One function reads a refused
   read of a commit's changes (`history::counts::lasting`), for the commit's tab and every list
   alike, so they cannot say two things of one commit.
+- **Who set a value** (since spec 040). A card whose shown values more than one actor set ends
+  each property row with the actor that set it last (`change_cards::rows_of`,
+  `FoldedChange::set_by`), the commit and time in its tooltip; a card set by one actor names
+  none.
 - **Summary line** (`change_cards::summary_line`). Under the heading of a review and a commit,
   and in the inspector's commit: each type with a change, its mark, name and counts, node types
   before relationship types, wrapping. Its tooltip says the counts in words. The review's facts

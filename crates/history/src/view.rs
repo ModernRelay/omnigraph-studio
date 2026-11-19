@@ -405,7 +405,8 @@ impl Item for HistoryView {
             Some(note) => note.clone(),
             None => {
                 let (heads, counts) = self.learnt_of(commit);
-                let note = CommitNote::new(commit.clone(), heads.to_vec(), counts);
+                let subject = self.subject_of(commit, counts.as_ref(), cx);
+                let note = CommitNote::new(commit.clone(), heads.to_vec(), counts, subject);
                 let note = cx.new(|_| note);
                 self.commit_note = Some(note.clone());
                 note
@@ -530,7 +531,7 @@ impl HistoryView {
             cx.subscribe(&session, |this, _, event, cx| this.session_event(event, cx));
         let search = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text("Find a commit by id or actor", window, cx);
+            editor.set_placeholder_text("Find a commit by id, actor or node", window, cx);
             editor.set_text_style_refinement(studio_ui::ds::field_text(cx));
             editor
         });
@@ -1338,10 +1339,24 @@ impl HistoryView {
         self.matches = if query.is_empty() {
             Vec::new()
         } else {
+            // Besides a commit's id and actor, the nodes its changes touched, once read, and
+            // Studio's own words for it (spec 040).
+            let session = self.session.read(cx);
             self.commit_texts
                 .iter()
                 .enumerate()
-                .filter(|(_, text)| text.matches(&query))
+                .filter(|(ix, text)| {
+                    text.matches(&query)
+                        || self.commits.get(*ix).is_some_and(|commit| {
+                            self.counts
+                                .learnt
+                                .get(&commit.graph_commit_id)
+                                .is_some_and(|learnt| learnt.touches(&query))
+                                || session
+                                    .own_words(&commit.graph_commit_id)
+                                    .is_some_and(|words| words.to_lowercase().contains(&query))
+                        })
+                })
                 .map(|(ix, _)| ix)
                 .collect()
         };
@@ -1383,6 +1398,22 @@ impl HistoryView {
         (heads, self.counts.learnt(commit))
     }
 
+    /// What `commit` was, in a few words ([`commit_subject`]).
+    fn subject_of(
+        &self,
+        commit: &CommitOutput,
+        learnt: Option<&crate::counts::Learnt>,
+        cx: &App,
+    ) -> Option<String> {
+        let session = self.session.read(cx);
+        commit_subject(
+            commit,
+            session.own_words(&commit.graph_commit_id),
+            &self.heads,
+            learnt,
+        )
+    }
+
     /// Tells the workspace when another commit is selected, or none: called whenever the view
     /// notifies, so every way the selection and the list move is seen (a click, a key, a
     /// search, commits read again). While the same commit stays selected, what is learnt of it
@@ -1396,8 +1427,9 @@ impl HistoryView {
             cx.emit(ItemEvent::Selected);
         } else if let (Some(note), Some(commit)) = (&self.commit_note, commit) {
             let (heads, counts) = self.learnt_of(commit);
+            let subject = self.subject_of(commit, counts.as_ref(), cx);
             note.update(cx, |note, cx| {
-                if note.learn(heads, counts) {
+                if note.learn(heads, counts, subject) {
                     cx.notify();
                 }
             });
@@ -1558,13 +1590,20 @@ impl HistoryView {
                     .clone()
                     .unwrap_or_else(|| "main".to_owned());
                 let id = commit.graph_commit_id.clone();
-                let learnt = self.counts.learnt(commit).map(|learnt| learnt.counts);
+                let learnt_all = self.counts.learnt(commit);
+                let subject = commit_subject(
+                    commit,
+                    self.session.read(cx).own_words(&id),
+                    &self.heads,
+                    learnt_all.as_ref(),
+                );
+                let learnt = learnt_all.map(|learnt| learnt.counts);
                 let heads = self.heads.get(&id).cloned().unwrap_or_default();
                 let selected = self.selected == Some(ix);
                 // A commit on a merged branch's lane reads quieter than the branch's own.
                 let aside = row.color != 0;
                 let actor = commit.actor_id.clone();
-                let card = commit_card(commit, learnt.clone(), &heads, now);
+                let card = commit_card(commit, learnt.clone(), &heads, subject.clone(), now);
                 let menu_commit = commit.clone();
                 let menu_session = self.session.clone();
                 let menu_focus = self.focus_handle.clone();
@@ -1639,7 +1678,14 @@ impl HistoryView {
                                         })
                                         .child(studio_ui::ds::icon::meta(IconName::PullRequest)),
                                 )
-                            }),
+                            })
+                            // What it was, as a sentence's middle: Studio's own words for its
+                            // writes, a merge's branch, else the node it changed (spec 040).
+                            .children(subject.map(|subject| {
+                                div().min_w_0().child(
+                                    studio_ui::ds::text::muted(subject).single_line().truncate(),
+                                )
+                            })),
                     )
                     .child(
                         div()
@@ -1858,6 +1904,27 @@ impl CommitText {
     }
 }
 
+/// What a listed commit was, in a few words (spec 040), as its row and the inspector say it:
+/// Studio's own words when Studio made it this session (`own`), else a merge's branch when a
+/// branch's head is the commit merged, else the node it changed, once its changes are read.
+/// Omnigraph keeps no operation or message with a commit (E60).
+pub(crate) fn commit_subject(
+    commit: &CommitOutput,
+    own: Option<&str>,
+    heads: &HashMap<String, Vec<String>>,
+    learnt: Option<&crate::counts::Learnt>,
+) -> Option<String> {
+    if let Some(own) = own {
+        return Some(own.to_owned());
+    }
+    if let Some(merged) = &commit.merged_parent_commit_id
+        && let Some(branch) = heads.get(merged).and_then(|names| names.first())
+    {
+        return Some(format!("Merge {branch}"));
+    }
+    learnt.and_then(crate::counts::Learnt::about)
+}
+
 /// The lanes' colors by branch index: the branch's own in the accent, merged branches' in
 /// their own hues, the last of which the rest share.
 fn lane_colors(cx: &App) -> Vec<Hsla> {
@@ -1876,11 +1943,14 @@ fn commit_card(
     commit: &CommitOutput,
     counts: Option<change_cards::CommitCounts>,
     heads: &[String],
+    subject: Option<String>,
     now: i64,
 ) -> studio_ui::ds::TipContent {
     let who = commit.actor_id.clone().unwrap_or_else(|| "—".into());
     let when = relative_time(commit.created_at, now);
-    let what = if crate::commit_view::is_first_commit(commit) {
+    let what = if let Some(subject) = subject {
+        subject
+    } else if crate::commit_view::is_first_commit(commit) {
         "First commit".to_owned()
     } else if commit.merged_parent_commit_id.is_some() {
         format!(
@@ -2460,6 +2530,29 @@ mod tests {
     }
 
     /// The toolbar's counts are grouped as every count Studio writes.
+    /// A listed commit reads as a sentence's middle (spec 040): Studio's own words for a commit
+    /// it made, a merge's branch where a branch's head is the commit merged, else the node it
+    /// changed once its changes are read.
+    #[test]
+    fn a_commit_says_what_it_was() {
+        let plain: CommitOutput =
+            serde_json::from_value(commit("c2", 2, Some("c1"), None)).unwrap();
+        let merge: CommitOutput =
+            serde_json::from_value(commit("c3", 3, Some("c2"), Some("b1"))).unwrap();
+        let heads = HashMap::from([("b1".to_owned(), vec!["agent/close-acl".to_owned()])]);
+        let none = HashMap::new();
+        assert_eq!(
+            commit_subject(&plain, Some("Set priority of lk-acl"), &none, None).as_deref(),
+            Some("Set priority of lk-acl")
+        );
+        assert_eq!(
+            commit_subject(&merge, None, &heads, None).as_deref(),
+            Some("Merge agent/close-acl")
+        );
+        assert_eq!(commit_subject(&merge, None, &none, None), None);
+        assert_eq!(commit_subject(&plain, None, &none, None), None);
+    }
+
     #[test]
     fn the_summary_groups_its_counts() {
         assert_eq!(summary(1, 0, true), "1 commit");

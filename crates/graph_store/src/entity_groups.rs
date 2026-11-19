@@ -805,6 +805,7 @@ mod tests {
             before,
             after,
             commits: vec!["c1".into()],
+            set_by: Default::default(),
         }
     }
 
@@ -823,6 +824,7 @@ mod tests {
             before,
             after,
             commits: vec!["c1".into()],
+            set_by: Default::default(),
         }
     }
 

@@ -5123,6 +5123,7 @@ pub(crate) mod tests {
                 endpoints: None,
             }),
             commits: vec!["c1".into()],
+            set_by: Default::default(),
         }
     }
 

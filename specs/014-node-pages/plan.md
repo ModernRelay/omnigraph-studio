@@ -117,8 +117,8 @@ Four parts, built in this order; each lands on its own.
   - ↵ is the surface's own action, as today: edit in a table, open in the tree, expand on the
     canvas.
   - ⌘↵ opens the node page, from a table row, a tree node and a canvas node; the inspector's
-    header opens the node it shows as a Page, a Tree or a Canvas, and the footer's key hints
-    read "⌘↵ Open". On a tree's
+    header opens the node it shows as a Page, a Tree or a Canvas (and, since spec 040, its
+    History), and the footer's key hints read "⌘↵ Open". On a tree's
     relationship group, which has no page, ⌘↵ opens its table as before; "Open in table" for a
     node moves to ⌥↵ (the tree has no row menu).
   - On a page a neighbour is selected by a click and opened by a second, or by ⌘-click. In

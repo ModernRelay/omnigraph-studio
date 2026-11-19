@@ -29,7 +29,23 @@ pub(crate) type Counts = (usize, usize, usize);
 pub(crate) struct Learnt {
     pub(crate) counts: CommitCounts,
     pub(crate) by_type: Arc<[TypeCounts]>,
+    /// The nodes the page changed, or the ends of the relationships it changed when it changed
+    /// no node, the first [`TOUCHED_KEPT`] of them; what a row says the commit was about, and
+    /// what a search for a node's id finds (spec 040).
+    pub(crate) touched: Arc<[Touched]>,
+    /// How many nodes the page touched in all.
+    pub(crate) touched_count: usize,
 }
+
+/// A node a commit changed, as its row names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Touched {
+    pub(crate) type_name: Option<String>,
+    pub(crate) id: String,
+}
+
+/// Nodes a listed commit keeps by name: a row names one, and a search matches the rest.
+pub(crate) const TOUCHED_KEPT: usize = 24;
 
 impl Learnt {
     /// What one page of a commit's changes says: counted by type, and in all, partial when
@@ -39,6 +55,7 @@ impl Learnt {
         let (added, changed, removed) = by_type.iter().fold((0, 0, 0), |(a, c, r), t| {
             (a + t.added, c + t.changed, r + t.removed)
         });
+        let (touched, touched_count) = touched_by(changes);
         Learnt {
             counts: CommitCounts::Counted {
                 added,
@@ -47,7 +64,30 @@ impl Learnt {
                 partial,
             },
             by_type: by_type.into(),
+            touched: touched.into(),
+            touched_count,
         }
+    }
+
+    /// What the commit was about, in a few words (spec 040): the node it changed ("Issue
+    /// lk-acl"), the first of several ("Issue lk-acl and 2 more"), or none.
+    pub(crate) fn about(&self) -> Option<String> {
+        let first = self.touched.first()?;
+        let named = match &first.type_name {
+            Some(type_name) => format!("{type_name} {}", first.id),
+            None => first.id.clone(),
+        };
+        Some(match self.touched_count {
+            0 | 1 => named,
+            n => format!("{named} and {} more", n - 1),
+        })
+    }
+
+    /// Whether the commit touched a node whose id holds `query` (lowercase).
+    pub(crate) fn touches(&self, query: &str) -> bool {
+        self.touched
+            .iter()
+            .any(|touched| touched.id.to_lowercase().contains(query))
     }
 
     /// What a lasting refusal, or the graph's first commit, says in place of counts.
@@ -55,6 +95,8 @@ impl Learnt {
         Learnt {
             counts,
             by_type: Arc::from([]),
+            touched: Arc::from([]),
+            touched_count: 0,
         }
     }
 
@@ -71,6 +113,50 @@ impl Learnt {
             _ => None,
         }
     }
+}
+
+/// The nodes a page of changes touched, in the order they come, the first [`TOUCHED_KEPT`]
+/// kept, and how many there are: the nodes it changed, or, when it changed none, the ends of
+/// the relationships it changed, which name no type.
+fn touched_by(changes: &[EntityChangeOutput]) -> (Vec<Touched>, usize) {
+    fn take<'a>(
+        seen: &mut HashSet<(Option<&'a str>, &'a str)>,
+        kept: &mut Vec<Touched>,
+        type_name: Option<&'a str>,
+        id: &'a str,
+    ) {
+        if seen.insert((type_name, id)) && kept.len() < TOUCHED_KEPT {
+            kept.push(Touched {
+                type_name: type_name.map(str::to_owned),
+                id: id.to_owned(),
+            });
+        }
+    }
+    let mut seen = HashSet::new();
+    let mut kept = Vec::new();
+    for change in changes {
+        if matches!(change.kind, EntityKind::Node) {
+            take(
+                &mut seen,
+                &mut kept,
+                Some(&change.entity_type.name),
+                &change.id,
+            );
+        }
+    }
+    if seen.is_empty() {
+        for change in changes {
+            let image = change.after.as_ref().or(change.before.as_ref());
+            let ends = image
+                .and_then(|image| image.endpoints.as_ref())
+                .and_then(|ends| Some((ends.get("from")?.as_str()?, ends.get("to")?.as_str()?)));
+            if let Some((from, to)) = ends {
+                take(&mut seen, &mut kept, None, from);
+                take(&mut seen, &mut kept, None, to);
+            }
+        }
+    }
+    (kept, seen.len())
 }
 
 /// A page's changes counted by type, in the order they come, node types before relationships'.
@@ -282,5 +368,44 @@ impl RowCounts {
             });
             self.tasks.insert(key, task);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn change(value: serde_json::Value) -> EntityChangeOutput {
+        serde_json::from_value(value).unwrap()
+    }
+
+    /// A commit's row names the node it changed, or the first of several; a commit that changed
+    /// only relationships names their ends. A search finds a commit by a node it touched (spec
+    /// 040; beads B2: "lk-acl" found nothing).
+    #[test]
+    fn a_counted_commit_names_the_nodes_it_touched() {
+        let node = |id: &str| {
+            change(
+                json!({ "kind": "node", "type": { "id": "t1", "name": "Issue" }, "id": id,
+                "op": "update", "before": { "properties": { "status": "open" } },
+                "after": { "properties": { "status": "closed" } } }),
+            )
+        };
+        let one = Learnt::counted(&[node("lk-acl")], false);
+        assert_eq!(one.about().as_deref(), Some("Issue lk-acl"));
+        assert!(one.touches("lk-acl") && one.touches("acl") && !one.touches("lk-share"));
+        let three = Learnt::counted(&[node("lk-acl"), node("lk-share"), node("lk-acl")], false);
+        assert_eq!(three.about().as_deref(), Some("Issue lk-acl and 1 more"));
+        let edge = change(
+            json!({ "kind": "edge", "type": { "id": "t2", "name": "CommentOn" },
+            "id": "e1", "op": "insert",
+            "after": { "properties": {}, "endpoints": { "from": "c-1", "to": "lk-acl" } } }),
+        );
+        let linked = Learnt::counted(&[edge], false);
+        assert_eq!(linked.about().as_deref(), Some("c-1 and 1 more"));
+        assert!(linked.touches("lk-acl"));
+        assert_eq!(Learnt::said(CommitCounts::First).about(), None);
     }
 }

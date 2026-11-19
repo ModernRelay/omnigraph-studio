@@ -228,7 +228,7 @@ fn every_destination_has_a_key() {
                 "{platform}: the {panel} panel has no key"
             );
         }
-        for index in 0..3 {
+        for index in 0..4 {
             for beside in [false, true] {
                 assert!(
                     bound.iter().any(|action| action[0] == "studio::OpenViewAt"

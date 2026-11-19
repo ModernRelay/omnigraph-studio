@@ -296,6 +296,7 @@ mod tests {
             before: before.map(image),
             after: after.map(image),
             commits: vec!["c1".into()],
+            set_by: Default::default(),
         }
     }
 

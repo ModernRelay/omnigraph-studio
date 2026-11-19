@@ -35,6 +35,7 @@ use crate::ledger::{
     Answered, Asker, Origin, ReadEvent, ReadLedger, ReadView, Sending, Status, Target,
 };
 use crate::memo::{Held, Memo};
+use crate::node_history;
 use crate::scope::{ReadScope, Scope, ScopeSince};
 use crate::server_features::{ServerFeature, ServerFeatures};
 
@@ -4161,6 +4162,121 @@ impl GraphSession {
         )
     }
 
+    /// A window of node `scope`'s history on `branch` (spec 040): the newest
+    /// [`node_history::NODE_HISTORY_COMMITS`] first-parent commits, or the ones before a window
+    /// read already, read from the branch's change feed filtered to the node's types. Two to a
+    /// few reads; the feed's pages are read and filtered off the main thread.
+    pub fn node_history(
+        &mut self,
+        branch: &str,
+        scope: node_history::NodeScope,
+        window: node_history::NodeHistoryWindow,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<node_history::NodeHistoryPage, ReadError>> {
+        use node_history::{
+            NODE_HISTORY_COMMITS, NODE_HISTORY_FEED_PAGES, NodeHistoryFold, NodeHistoryPage,
+            NodeHistoryWindow, OlderWindow,
+        };
+        let (client, graph, branch) = (self.client(cx), self.graph_id.clone(), branch.to_owned());
+        self.counted_read(
+            "node_history",
+            async move {
+                let (token, head, before) = match window {
+                    NodeHistoryWindow::Newest => (None, None, None),
+                    NodeHistoryWindow::Older { head, window } => {
+                        (Some(window.page_token), Some(head), Some(window.until))
+                    }
+                };
+                let listing = client
+                    .commit_page(&graph, &branch, NODE_HISTORY_COMMITS, token.as_deref())
+                    .await?;
+                let head = head
+                    .or(listing.head_commit_id.clone())
+                    .or_else(|| listing.commits.first().map(|c| c.graph_commit_id.clone()))
+                    .unwrap_or_default();
+                let Some(oldest) = listing.commits.last() else {
+                    return Ok(NodeHistoryPage {
+                        head,
+                        entries: Vec::new(),
+                        commits: 0,
+                        older: None,
+                        stopped: None,
+                    });
+                };
+                let start = match &oldest.parent_commit_id {
+                    Some(parent) => format!("after:{parent}"),
+                    None => "beginning".to_owned(),
+                };
+                let older = listing
+                    .next_page_token
+                    .clone()
+                    .map(|page_token| OlderWindow {
+                        page_token,
+                        until: oldest.graph_commit_id.clone(),
+                    });
+                // The first window ends at the head the listing resolved; an older one before
+                // the window above it.
+                let last = before.is_none().then(|| head.clone());
+                let types = scope.types();
+                let mut fold = NodeHistoryFold::new(scope, last, before);
+                let mut next = Some(FeedNext::Start(start));
+                let mut stopped = None;
+                for _ in 0..NODE_HISTORY_FEED_PAGES {
+                    let Some(at) = next.take() else {
+                        break;
+                    };
+                    match client
+                        .changes(
+                            &graph,
+                            &branch,
+                            at.at(),
+                            &types,
+                            node_history::NODE_HISTORY_FEED_LIMIT,
+                        )
+                        .await
+                    {
+                        Ok(page) => {
+                            let ChangeFeedOutput {
+                                blocks,
+                                next_page_token,
+                                cursor,
+                                caught_up,
+                            } = page;
+                            if fold.page(blocks) {
+                                break;
+                            }
+                            next = match (next_page_token, cursor, caught_up) {
+                                (Some(token), ..) => Some(FeedNext::Page(token)),
+                                (None, _, Some(true)) | (None, None, _) => None,
+                                (None, Some(cursor), _) => Some(FeedNext::Cursor(cursor)),
+                            };
+                        }
+                        // Nothing read yet: the read failed.
+                        Err(error) if fold.is_empty() => return Err(error),
+                        Err(error) => {
+                            stopped = Some(error.to_string());
+                            break;
+                        }
+                    }
+                }
+                if stopped.is_none() && !fold.done() && next.is_some() {
+                    stopped = Some(format!(
+                        "Studio stopped after {NODE_HISTORY_FEED_PAGES} pages of changes"
+                    ));
+                }
+                let (entries, commits) = fold.finish();
+                Ok(NodeHistoryPage {
+                    head,
+                    entries,
+                    commits,
+                    older,
+                    stopped,
+                })
+            },
+            cx,
+        )
+    }
+
     /// One page of the net changes from commit `from` to commit `to`.
     pub fn diff(
         &mut self,
@@ -4599,6 +4715,24 @@ impl GraphSession {
             merge,
         });
         self.outcomes_logged += 1;
+    }
+
+    /// What Studio wrote in commit `commit`, in its own words, when it made the commit this
+    /// session: one of its writes, or one it sent for the agent's CLI (spec 040). Omnigraph keeps
+    /// no operation or message with a commit (E60), so another writer's commit has none.
+    pub fn own_words(&self, commit: &str) -> Option<&str> {
+        self.outcomes
+            .iter()
+            .rev()
+            .find_map(|entry| match &entry.outcome {
+                OutcomeKind::Committed { commit: Some(made) } if made == commit => {
+                    Some(entry.description.as_str())
+                }
+                OutcomeKind::Held { commit: made, .. } if made == commit => {
+                    Some(entry.description.as_str())
+                }
+                _ => None,
+            })
     }
 
     /// The newest merge of `source` into `target` the log holds: its entry says whether that
@@ -5599,6 +5733,9 @@ mod tests {
         cx.run_until_parked();
         session.read_with(cx, |session, _| {
             assert!(matches!(session.counts, Loadable::Loaded(_)), "still shown");
+            // What Studio wrote in a commit it made is found by the commit (spec 040).
+            assert_eq!(session.own_words("c3"), Some("w"));
+            assert_eq!(session.own_words("c1"), None, "another writer's");
         });
         assert_eq!(snapshots.load(Ordering::SeqCst), read + 1);
 

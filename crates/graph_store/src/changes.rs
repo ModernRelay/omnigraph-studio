@@ -7,7 +7,7 @@
 //! from the merge base instead, and finds the branch's commits since its fork from both
 //! branches' `GET /commits`, read a page at a time ([`ForkSearch`]).
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use gq_language::SchemaModel;
 use graph_client::api::{
@@ -147,9 +147,38 @@ pub struct FoldedChange {
     pub after: Option<ChangeImageOutput>,
     /// The commits that touched the entity, in feed order.
     pub commits: Vec<String>,
+    /// Who set each property last, by its name (spec 040): the commit, and its actor, whose
+    /// change of the property is the last the fold took. Empty for a change read from a diff,
+    /// which names no commit.
+    pub set_by: BTreeMap<String, SetBy>,
+}
+
+/// The commit that set a property last, as a folded change keeps it (spec 040).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetBy {
+    pub commit: String,
+    pub actor: Option<String>,
+    /// Unix microseconds.
+    pub at: i64,
 }
 
 impl FoldedChange {
+    /// Who set `property` last, when the fold read the commits that changed it and the card's
+    /// properties were not all set by one actor: a card names who set each of its properties
+    /// only where more than one did (spec 040). The actors compared are those of the
+    /// properties the card shows (`shown`).
+    pub fn mixed_setter<'a>(&'a self, shown: &[&str], property: &str) -> Option<&'a SetBy> {
+        let mut actors = shown
+            .iter()
+            .filter_map(|name| self.set_by.get(*name))
+            .map(|by| by.actor.as_deref());
+        let first = actors.next()?;
+        if actors.all(|actor| actor == first) {
+            return None;
+        }
+        self.set_by.get(property)
+    }
+
     pub fn is_edge(&self) -> bool {
         matches!(self.kind, EntityKind::Edge)
     }
@@ -248,6 +277,26 @@ impl FoldedChange {
     }
 }
 
+/// The properties one change set: those whose value differs between its two images, every
+/// property with a value when it inserts, and none when it deletes.
+fn set_properties(
+    before: Option<&ChangeImageOutput>,
+    after: Option<&ChangeImageOutput>,
+) -> Vec<String> {
+    let Some(after) = after.map(|image| &image.properties) else {
+        return Vec::new();
+    };
+    let before = before.map(|image| &image.properties);
+    after
+        .iter()
+        .filter(|(name, value)| match before {
+            Some(before) => before.get(*name) != Some(*value),
+            None => !value.is_null(),
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
 /// `(from, to)` from a change image's endpoints.
 pub(crate) fn endpoints_of(value: &Value) -> Option<(String, String)> {
     let text = |key: &str| match value.get(key)? {
@@ -310,9 +359,18 @@ impl ChangeFold {
             entity_type.id.clone(),
             id.clone(),
         );
+        let set = SetBy {
+            commit: cause.graph_commit_id.clone(),
+            actor: cause.actor_id.clone(),
+            at: cause.authored_at,
+        };
+        let set_now = set_properties(before.as_ref(), after.as_ref());
         match self.index.get(&key) {
             Some(&ix) => {
                 let entry = &mut self.entries[ix];
+                for name in set_now {
+                    entry.set_by.insert(name, set.clone());
+                }
                 entry.after = after;
                 entry.type_name = entity_type.name;
                 if entry.commits.last() != Some(&cause.graph_commit_id) {
@@ -329,6 +387,10 @@ impl ChangeFold {
                     before,
                     after,
                     commits: vec![cause.graph_commit_id.clone()],
+                    set_by: set_now
+                        .into_iter()
+                        .map(|name| (name, set.clone()))
+                        .collect(),
                 });
             }
         }
@@ -530,6 +592,67 @@ mod tests {
 
     fn ids(commits: &[CommitOutput]) -> Vec<&str> {
         commits.iter().map(|c| c.graph_commit_id.as_str()).collect()
+    }
+
+    /// A fold keeps who set each property last (spec 040): beads B4, where an admin set the
+    /// priority and an agent closed the issue, the two in one card. A card names the setter of
+    /// each value only when more than one actor set its values.
+    #[test]
+    fn a_fold_keeps_who_set_each_property_last() {
+        let mut fold = ChangeFold::new();
+        fold.add(
+            &cause("c1", "act-admin"),
+            node(
+                "Issue",
+                "lk-acl",
+                ChangeOp::Update,
+                image(json!({"priority": 1, "status": "open"})),
+                image(json!({"priority": 0, "status": "open"})),
+            ),
+        );
+        fold.add(
+            &cause("c2", "act-writer"),
+            node(
+                "Issue",
+                "lk-acl",
+                ChangeOp::Update,
+                image(json!({"priority": 0, "status": "open"})),
+                image(json!({"priority": 0, "status": "closed"})),
+            ),
+        );
+        let folded = fold.finish();
+        let change = &folded.changes[0];
+        let by = |name: &str| change.set_by[name].actor.as_deref();
+        assert_eq!(by("priority"), Some("act-admin"));
+        assert_eq!(by("status"), Some("act-writer"));
+        assert_eq!(change.set_by["status"].commit, "c2");
+        let shown = ["priority", "status"];
+        assert_eq!(
+            change
+                .mixed_setter(&shown, "priority")
+                .and_then(|by| by.actor.as_deref()),
+            Some("act-admin")
+        );
+        assert!(
+            change.mixed_setter(&["status"], "status").is_none(),
+            "one actor: the card's header says who"
+        );
+
+        // An insert sets every property it gives a value.
+        let mut fold = ChangeFold::new();
+        fold.add(
+            &cause("c3", "act-writer"),
+            node(
+                "Issue",
+                "lk-new",
+                ChangeOp::Insert,
+                None,
+                image(json!({"title": "New", "notes": null})),
+            ),
+        );
+        let folded = fold.finish();
+        let set: Vec<&String> = folded.changes[0].set_by.keys().collect();
+        assert_eq!(set, ["title"]);
     }
 
     #[test]

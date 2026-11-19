@@ -341,7 +341,8 @@ pub mod graph {
             OpenAsSource,
             /// Show this branch's review against main.
             OpenAsReview,
-            /// Show this branch's commits.
+            /// Show the history of what the active tab shows: a branch's commits, or the
+            /// commits that changed a node.
             OpenAsHistory,
             /// Create a branch from the current branch.
             CreateBranch,
@@ -604,6 +605,18 @@ pub mod graph {
         /// Read at this commit, read-only; `None` reads the branch head.
         #[serde(default)]
         pub at_commit: Option<String>,
+        /// Open as the pane's preview tab, which the next preview replaces.
+        #[serde(default)]
+        pub preview: bool,
+    }
+
+    /// Show a node's history: the recent commits that changed it or its relationships, who
+    /// made each and what it did (spec 040).
+    #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = studio_graph)]
+    pub struct ShowNodeHistory {
+        pub type_name: String,
+        pub id: String,
         /// Open as the pane's preview tab, which the next preview replaces.
         #[serde(default)]
         pub preview: bool,
@@ -889,6 +902,9 @@ pub mod history {
             NewBranchHere,
             /// Read the commit's next changes, or try again a read of them that failed.
             LoadMoreChanges,
+            /// Read a node's history further back: the commits before those read, or try again
+            /// a read of them that failed (spec 040).
+            ReadOlderCommits,
         ]
     );
 }

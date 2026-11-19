@@ -1323,7 +1323,21 @@ impl Item for TypeTable {
             }
             None => ViewLink::disabled_because(ViewKind::Canvas, "Select a row to walk from it"),
         };
-        vec![ViewLink::current(ViewKind::Table), tree, canvas]
+        // The cursor's node's history, at the branch head (spec 040).
+        let history = match self.cursor_row() {
+            _ if self.at_commit.is_some() => ViewLink::disabled_because(
+                ViewKind::History,
+                "A table held at a commit has no history; open the commit's tab instead",
+            ),
+            Some(row) => {
+                let name = self.row_label(row, cx).unwrap_or_else(|| row.id.clone());
+                ViewLink::to(ViewKind::History).saying(format!("Changes to {name}"))
+            }
+            None => {
+                ViewLink::disabled_because(ViewKind::History, "Select a row to see its history")
+            }
+        };
+        vec![ViewLink::current(ViewKind::Table), tree, canvas, history]
     }
 
     fn view_action(&self, kind: ViewKind, cx: &App) -> Option<Box<dyn gpui::Action>> {
@@ -1335,6 +1349,14 @@ impl Item for TypeTable {
                     type_name: self.type_name.clone(),
                     id: row.id.clone(),
                     at_commit: self.at_commit.clone(),
+                    preview: true,
+                }))
+            }
+            ViewKind::History if self.at_commit.is_none() => {
+                let row = self.cursor_row()?;
+                Some(Box::new(studio_actions::graph::ShowNodeHistory {
+                    type_name: self.type_name.clone(),
+                    id: row.id.clone(),
                     preview: true,
                 }))
             }
@@ -13180,11 +13202,18 @@ mod tests {
             let views = Item::views(table, cx);
             assert_eq!(
                 views.iter().map(|link| link.kind).collect::<Vec<_>>(),
-                [ViewKind::Table, ViewKind::Tree, ViewKind::Canvas]
+                [
+                    ViewKind::Table,
+                    ViewKind::Tree,
+                    ViewKind::Canvas,
+                    ViewKind::History
+                ]
             );
             assert_eq!(views[1].disabled, None);
             assert_eq!(views[2].disabled, Some("Select a row to walk from it"));
+            assert_eq!(views[3].disabled, Some("Select a row to see its history"));
             assert!(Item::view_action(table, ViewKind::Canvas, cx).is_none());
+            assert!(Item::view_action(table, ViewKind::History, cx).is_none());
             let all = Item::view_action(table, ViewKind::Tree, cx).expect("the rows");
             let all = all
                 .as_any()
@@ -13203,6 +13232,17 @@ mod tests {
                 type_name: "Person".into(),
                 id: "p2".into(),
                 at_commit: None,
+                preview: true,
+            }));
+            // The History holds the row under the cursor too (spec 040).
+            assert_eq!(
+                Item::views(table, cx)[3].says.as_deref(),
+                Some("Changes to Grace")
+            );
+            let history = Item::view_action(table, ViewKind::History, cx).expect("its history");
+            assert!(history.partial_eq(&studio_actions::graph::ShowNodeHistory {
+                type_name: "Person".into(),
+                id: "p2".into(),
                 preview: true,
             }));
 

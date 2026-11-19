@@ -141,6 +141,15 @@ impl Item for NodePage {
             ViewLink::current(ViewKind::Page),
             ViewLink::to(ViewKind::Tree),
             ViewLink::to(ViewKind::Canvas),
+            // The node's history follows its branch; a page held at a commit has the commits'
+            // own tabs instead (spec 040).
+            match self.at_commit {
+                Some(_) => ViewLink::disabled_because(
+                    ViewKind::History,
+                    "A page held at a commit has no history; open its node at the branch head",
+                ),
+                None => ViewLink::to(ViewKind::History),
+            },
         ]
     }
 
@@ -163,6 +172,13 @@ impl Item for NodePage {
                 at_commit,
                 preview: true,
             })),
+            ViewKind::History if at_commit.is_none() => {
+                Some(Box::new(studio_actions::graph::ShowNodeHistory {
+                    type_name,
+                    id,
+                    preview: true,
+                }))
+            }
             _ => None,
         }
     }

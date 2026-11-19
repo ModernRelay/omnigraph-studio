@@ -49,6 +49,8 @@
       "ctrl-alt-shift-2": ["studio::OpenViewAt", { "index": 1, "beside": true }],
       "ctrl-alt-3": ["studio::OpenViewAt", { "index": 2 }],
       "ctrl-alt-shift-3": ["studio::OpenViewAt", { "index": 2, "beside": true }],
+      "ctrl-alt-4": ["studio::OpenViewAt", { "index": 3 }],
+      "ctrl-alt-shift-4": ["studio::OpenViewAt", { "index": 3, "beside": true }],
       "shift-escape": "studio::ToggleZoom",
       "ctrl-alt-enter": "studio::ToggleFocusMode",
       "ctrl-w": "studio::CloseActiveItem",
@@ -454,6 +456,12 @@
       "up": "menu::SelectPrevious",
       "space": "studio_changes::ToggleChange",
       "ctrl-enter": "studio_changes::OpenChanged"
+    }
+  },
+  {
+    "context": "NodeHistory",
+    "bindings": {
+      "ctrl-alt-n": "studio_history::ReadOlderCommits"
     }
   },
   {

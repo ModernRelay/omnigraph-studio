@@ -483,6 +483,36 @@ commit is made, would make the counts of History and the Commits panel one field
 counted by type too, they would give the inspector's summary line (spec 033) without a read.
 *Waits:* 009, 026. *Today:* one changes page per drawn row, kept per commit, partial past 100.
 
+### Why something changed (spec 040)
+
+Filed from the cookbook study (`docs/ux/2026-11-18-cookbook-study.md`, 2026-11-18), where seven of
+eight teams asked who changed a node and why, and Studio could answer only with an actor and a
+count.
+
+**E60. A commit's operation and message, and who created a branch.**
+[ModernRelay/omnigraph#1470](https://github.com/ModernRelay/omnigraph/issues/1470). A write's
+receipt names the stored query it ran (`ChangeOutput.query_name`), but the commit keeps none of
+it: `CommitOutput` and the feed's `ChangeCauseOutput` carry the actor and time alone. The
+operation (the stored query's name, or `mutate`, `load`, `merge`, `blob put`) and an optional
+message the writer supplies, in both, would let History read "act-writer · close · Issue lk-acl"
+for any writer's commit, and E9's branch details naming the actor who created a branch would say
+whose a branch is (the study's proposal "Agent work as lanes"). Engine rule: both are recorded
+when the commit is made and never change; a message is the writer's text, bounded in length.
+*Waits:* 040. *Today:* Studio's own words for the writes it made or sent for the agent this
+session (`GraphSession::own_words`), else the node a commit changed, once its changes are read.
+
+**E62. The commits that changed one entity.**
+[ModernRelay/omnigraph#1472](https://github.com/ModernRelay/omnigraph/issues/1472). No route takes
+an entity id: a node's history means reading a branch's commits and keeping those that touched
+it. The commits that changed one entity, paged newest first, each with its change (an `id` filter
+on `GET /commits/{id}/changes` or on the change feed, or a route of its own), and including the
+commits a merge brought in with their own actors, would make a node's History one request with no
+window, and a merged change would name who made it on its branch rather than who merged it.
+Engine rule: the answer is pinned to one head, as a feed page is. *Waits:* 040. *Today:* windows
+of a branch's newest 200 first-parent commits, read from the change feed filtered to the node's
+type and the relationship types that end at it (about two requests a window), with "Read the 200
+commits before"; a merge is its merger's change.
+
 ### First run
 
 **E45. A direct `cluster apply` that leaves no lock behind.** Filed as
@@ -598,6 +628,8 @@ Then engine changes still open:
    disposition.
 10. E49 to E51, which would make finding a node one request and right on every type, however
     large; E49 is the smallest.
+11. E60 and E62, which would let History and a node's History say what each commit did and read
+    one node's commits in one request; E60 is the smaller.
 
 ## Decisions
 
@@ -611,6 +643,7 @@ Then engine changes still open:
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-11-19 | A commit keeps no operation or message, no route reads one entity's commits, and a merge reads as its merger's change in the feed (E60, E62) | `omnigraph-0.15.0.json` (`CommitOutput`, `ChangeCauseOutput`, the parameters of `/changes` and `/commits/{id}/changes`); the beads cookbook on a `v0.15.0` server (spec 040, Validation log); issues #1470 and #1472 open | As stated. Filed as E60 (#1470) and E62 (#1472) |
 | 2026-11-18 | What `v0.15.0` resolves, and a validation refusal's disposition (E9, E35 to E38, E54) | `docs/releases/v0.15.0.md` at the tag; `gh issue view` 969, 970, 972, 1157; mutations sent with curl to `v0.14.0` and `v0.15.0` release servers serving `script/dev-server`'s cluster plus a `MemberOf: Member -> Team @card(1..)` edge | E9 landed (#1012); E35 partly (#1201, #969 closed); #970, #972, #1157 open. A lone `Member` insert: 0.14 commits it, 0.15 answers 400 `@card violation … (min 1)` with `effects: unknown, action: reconcile`; with its `MemberOf` in the same mutation both commit. Deleting a required edge and an edge to a missing node answer the same disposition on both releases: E54 |
 | 2026-11-17 | Omnigraph `v0.15.0` needs no engine change from Studio | `openapi.json` at `v0.15.0` diffed with `v0.14.0`'s; the release notes (`gh release view v0.15.0`) | Contract still 0.14; no path, field or enum value removed; new fields (`ranking`, `details`, `client_id`) optional, one new error code (`not_admitted`). No new ID |
 | 2026-11-06 | A page of a wide, large type costs the server what it holds, not what it returns (E39) | `script/dev-big-server` (`v0.14.0`, `Account`: 95 columns, 100,000 rows), each read sent with curl, then Studio's snapshot tool with `OMNIGRAPH_STUDIO_TRACE` (`docs/perf/20261106-report.md`) | `order { $n.@id } limit 100` returning `$n`: 0.91 s; returning `$n.slug`: 0.08 s; `$n` unordered: 0.03 s; `$n.@id = $id`: 0.43 s; `$n.@id in $ids` (101): 0.46 s. Studio's first page: 947 ms of which 3.5 ms decoding. Filed as E39 |

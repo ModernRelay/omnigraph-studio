@@ -8,12 +8,14 @@ mod commits_panel;
 mod counts;
 mod lanes;
 mod merged;
+mod node_view;
 mod view;
 
 use gpui::{App, AppContext as _};
-use studio_actions::graph::{OpenBranchHistory, OpenCommit, OpenHistory};
+use studio_actions::graph::{OpenBranchHistory, OpenCommit, OpenHistory, ShowNodeHistory};
 use studio_workspace::Workspace;
 
+use node_view::{NodeHistoryView, node_history_key};
 use view::{HistoryView, history_key};
 
 /// Registers this surface with every new workspace.
@@ -44,6 +46,21 @@ pub fn init(cx: &mut App) {
             window,
             cx,
             |_, cx| commit_view::CommitView::when_shown(session, id, cx),
+        );
+    });
+    studio_workspace::register_item_kind(cx, "node_history", |data, workspace, window, cx| {
+        let text = |key: &str| data.get(key).and_then(|v| v.as_str()).map(str::to_owned);
+        let (Some(session), Some(type_name), Some(id)) =
+            (workspace.session().cloned(), text("type_name"), text("id"))
+        else {
+            return;
+        };
+        let label = text("label");
+        workspace.open_item::<NodeHistoryView>(
+            node_history_key(&type_name, &id),
+            window,
+            cx,
+            |_, cx| NodeHistoryView::new(session, type_name, id, label, cx),
         );
     });
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
@@ -82,6 +99,20 @@ pub fn init(cx: &mut App) {
                 window,
                 cx,
                 |window, cx| HistoryView::new(session, branch, window, cx),
+            );
+        });
+        // A node's history (spec 040), beside its page, tree and canvas.
+        workspace.register_action(|workspace, action: &ShowNodeHistory, window, cx| {
+            let Some(session) = workspace.session().cloned() else {
+                return;
+            };
+            let (type_name, id) = (action.type_name.clone(), action.id.clone());
+            workspace.open_item_with::<NodeHistoryView>(
+                node_history_key(&type_name, &id),
+                action.preview,
+                window,
+                cx,
+                |_, cx| NodeHistoryView::new(session, type_name, id, None, cx),
             );
         });
         // A commit named by its id alone (a toast's, a parent link's): its tab reads it beside

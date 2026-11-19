@@ -25,7 +25,9 @@ use graph_store::{
 };
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use serde_json::{Map, Value};
-use studio_actions::graph::{OpenBlob, OpenNodePage, ShowNodeInTree, ShowNodeOnCanvas};
+use studio_actions::graph::{
+    OpenBlob, OpenNodePage, ShowNodeHistory, ShowNodeInTree, ShowNodeOnCanvas,
+};
 use studio_actions::node::{CancelField, ExpandField, SaveField, SaveNodeDrafts};
 use studio_actions::table::{SelectNextSuggestion, SelectPreviousSuggestion};
 use studio_ui::ds::Tipped;
@@ -5746,6 +5748,11 @@ impl NodePeek {
                             at_commit: at_commit.clone(),
                             preview: true,
                         };
+                        let history = (is_node && at_commit.is_none()).then(|| ShowNodeHistory {
+                            type_name: type_name.clone(),
+                            id: id.clone(),
+                            preview: true,
+                        });
                         h_flex()
                             .gap(px(space::XXS))
                             .child(
@@ -5772,6 +5779,18 @@ impl NodePeek {
                                         window.dispatch_action(Box::new(canvas.clone()), cx)
                                     }),
                             )
+                            // Its history follows the branch: none for a node held at a
+                            // commit (spec 040).
+                            .children(history.map(|history| {
+                                studio_ui::ds::button("peek-open-history", "History")
+                                    .style(ButtonStyle::Subtle)
+                                    .tip(studio_ui::ds::tooltip(
+                                        "The commits that changed this node, and who made them",
+                                    ))
+                                    .on_click(move |_, window, cx| {
+                                        window.dispatch_action(Box::new(history.clone()), cx)
+                                    })
+                            }))
                     })),
             )
             .child({

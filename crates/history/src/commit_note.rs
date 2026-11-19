@@ -24,25 +24,39 @@ pub(crate) struct CommitNote {
     heads: Vec<String>,
     /// Its changes counted, once History has read them, or why there are none.
     counts: Option<Learnt>,
+    /// What it was, in a few words, when History knows (spec 040).
+    subject: Option<String>,
 }
 
 impl CommitNote {
-    pub(crate) fn new(commit: CommitOutput, heads: Vec<String>, counts: Option<Learnt>) -> Self {
+    pub(crate) fn new(
+        commit: CommitOutput,
+        heads: Vec<String>,
+        counts: Option<Learnt>,
+        subject: Option<String>,
+    ) -> Self {
         Self {
             commit,
             heads,
             counts,
+            subject,
         }
     }
 
     /// Takes what History has learnt of the commit since: its counts, read once its row was
     /// drawn, and the branches at it. Says whether anything changed.
-    pub(crate) fn learn(&mut self, heads: &[String], counts: Option<Learnt>) -> bool {
-        if self.heads == heads && self.counts == counts {
+    pub(crate) fn learn(
+        &mut self,
+        heads: &[String],
+        counts: Option<Learnt>,
+        subject: Option<String>,
+    ) -> bool {
+        if self.heads == heads && self.counts == counts && self.subject == subject {
             return false;
         }
         self.heads = heads.to_vec();
         self.counts = counts;
+        self.subject = subject;
         true
     }
 
@@ -102,8 +116,12 @@ impl Render for CommitNote {
             Some(actor) => said(actor.clone(), cx),
             None => ds::text::muted("—").into_any_element(),
         };
-        let mut facts = vec![
-            fact(IconName::Person, "By", by),
+        let mut facts = vec![fact(IconName::Person, "By", by)];
+        // What it was: Studio's own words, a merge's branch or the node it changed (spec 040).
+        if let Some(subject) = &self.subject {
+            facts.push(fact(IconName::Pencil, "What", said(subject.clone(), cx)));
+        }
+        facts.extend([
             // The row says how long ago; here, when. The two wrap where the panel is narrow.
             fact(
                 IconName::Clock,
@@ -117,7 +135,7 @@ impl Render for CommitNote {
                     )))
                     .into_any_element(),
             ),
-        ];
+        ]);
         if let Some((icon, branch)) = branch_fact(Some(commit), None, false) {
             facts.push(fact(icon, "Branch", said(branch, cx)));
         }
@@ -154,6 +172,8 @@ impl Render for CommitNote {
         let first = is_first_commit(commit).then(|| Learnt {
             counts: change_cards::CommitCounts::First,
             by_type: std::sync::Arc::from([]),
+            touched: std::sync::Arc::from([]),
+            touched_count: 0,
         });
         let changes: Option<AnyElement> = first.or_else(|| self.counts.clone()).map(|learnt| {
             v_flex()

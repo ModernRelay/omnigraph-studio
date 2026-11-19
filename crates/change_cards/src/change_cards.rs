@@ -147,11 +147,42 @@ pub fn change_rows(
     rows: &CardRows,
 ) -> Rc<[PropertyRow]> {
     let change = &folded.changes[ix];
-    rows.get(ix, || {
-        let mut rows = moved_end_rows(change);
-        rows.extend(property_rows(change, schema));
-        rows
-    })
+    rows.get(ix, || rows_of(change, schema))
+}
+
+/// One change's property rows: the ends a lone relationship moved, then its changed
+/// properties, each naming who set it where more than one actor set the card's values (spec
+/// 040).
+pub fn rows_of(change: &FoldedChange, schema: Option<&SchemaModel>) -> Vec<PropertyRow> {
+    let mut rows = moved_end_rows(change);
+    let properties = property_rows(change, schema);
+    let shown: Vec<&str> = properties.iter().map(|row| row.name().as_ref()).collect();
+    let setters: Vec<Option<(String, String)>> = shown
+        .iter()
+        .map(|name| change.mixed_setter(&shown, name).map(set_by_words))
+        .collect();
+    rows.extend(
+        properties
+            .into_iter()
+            .zip(setters)
+            .map(|(row, by)| match by {
+                Some((who, detail)) => row.set_by(who, detail),
+                None => row,
+            }),
+    );
+    rows
+}
+
+/// Who set a value, as its row's end says it, and its tooltip: the actor, then the commit and
+/// when.
+fn set_by_words(by: &graph_store::SetBy) -> (String, String) {
+    let who = by.actor.clone().unwrap_or_else(|| "no actor".to_owned());
+    let detail = format!(
+        "Set by {who} in commit {} · {}",
+        studio_ui::short_commit_id(&by.commit),
+        studio_ui::utc_date_time(by.at)
+    );
+    (who, detail)
 }
 
 /// What a change did to its entity, as a card says it.

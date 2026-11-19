@@ -18,6 +18,7 @@ mod exploration;
 pub mod fixes;
 pub mod ledger;
 mod memo;
+pub mod node_history;
 pub mod node_search;
 mod refusal;
 mod registry;
@@ -37,7 +38,7 @@ use gpui::App;
 pub use access::{AccessScope, Allowed};
 pub use changes::{
     ChangeFold, FoldedChange, FoldedChanges, ForkSearch, NetChange, PropertyDiff,
-    REVIEW_CHANGE_CAP, TypeCounts, contains_merge_of, summary_sentence,
+    REVIEW_CHANGE_CAP, SetBy, TypeCounts, contains_merge_of, summary_sentence,
 };
 pub use connection::{
     Connection, ConnectionEvent, ConnectionState, ConnectionWatch, GraphListing, HeldRefusal,
