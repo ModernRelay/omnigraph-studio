@@ -182,6 +182,18 @@ pub(super) enum Decision {
     Unavailable(String),
 }
 
+impl Decision {
+    /// A decision that took, or may have: none is offered again for the conflict. An unknown
+    /// outcome may have landed, so it is settled from the branch's history, never sent again
+    /// (constitution III).
+    fn settles(&self) -> bool {
+        matches!(
+            self,
+            Decision::Writing(_) | Decision::Wrote(..) | Decision::Unknown(_)
+        )
+    }
+}
+
 /// A conflict list's resolution state, kept by the review.
 pub(super) struct Resolve {
     /// The conflicts list the sides are for ([`super::Conflicts::id`]).
@@ -583,10 +595,12 @@ impl ReviewView {
     /// the target once the person confirms it, since it changes what the target holds before
     /// any merge.
     fn decide(&mut self, ix: usize, choice: Choice, window: &mut Window, cx: &mut Context<Self>) {
-        if matches!(
-            self.resolve.decisions.get(&ix),
-            Some(Decision::Writing(_) | Decision::Wrote(..))
-        ) {
+        if self
+            .resolve
+            .decisions
+            .get(&ix)
+            .is_some_and(Decision::settles)
+        {
             return;
         }
         let on_target = match &choice {
@@ -617,9 +631,17 @@ impl ReviewView {
         if !on_target {
             // Sent with the key of the review's change of the entity when it holds one, so its
             // card turns fixed too and offers no fix from the values the decision replaced.
+            let card = self.change_of(ix);
+            // The card a fix already holds offers nothing more until Refresh.
+            if card.is_some_and(|card| self.cards.get(card).is_none_or(|card| card.fix.done())) {
+                return;
+            }
             let key = self
                 .change_key_of(ix)
                 .unwrap_or_else(|| conflict_key(list, ix));
+            if let Some(card) = card.and_then(|card| self.cards.get_mut(card)) {
+                card.fix = FixState::Saving;
+            }
             self.resolve.pending.insert(key.clone(), ix);
             self.resolve
                 .decisions
@@ -838,10 +860,15 @@ impl ReviewView {
 
     /// The key of the review's change of the conflict's entity, when the review holds one.
     fn change_key_of(&self, ix: usize) -> Option<String> {
+        let change = self.change_of(ix)?;
+        Some(self.data.as_ref()?.folded.changes[change].key())
+    }
+
+    /// The review's change of the conflict's entity, by its index, when it holds one.
+    fn change_of(&self, ix: usize) -> Option<usize> {
         let conflict = self.conflicts()?.get(ix)?;
         let data = self.data.as_ref()?;
-        let change = data.change_to(&conflict.type_name, conflict.entity_id.as_deref()?)?;
-        Some(data.folded.changes[change].key())
+        data.change_to(&conflict.type_name, conflict.entity_id.as_deref()?)
     }
 
     /// The conflict's entity in a few words: its type and name, else its id.
@@ -1227,7 +1254,7 @@ impl ReviewView {
         let branch_refused = partial.clone().or_else(|| self.branch_write_refusal(cx));
         let decided = matches!(
             self.resolve.decisions.get(&ix),
-            Some(Decision::Writing(_) | Decision::Wrote(..))
+            Some(decision) if decision.settles()
         );
         let mut list = v_flex()
             .gap(px(space::XS))
@@ -1318,7 +1345,7 @@ impl ReviewView {
             });
         };
         let readable = target.known() && source.known();
-        let busy = matches!(decision, Some(Decision::Writing(_) | Decision::Wrote(..)));
+        let busy = decision.as_ref().is_some_and(Decision::settles);
         let focus = self.focus_handle.clone();
         let branch_refused = self.branch_write_refusal(cx);
         let target_refused = self.target_write_refusal(cx);
@@ -2287,6 +2314,24 @@ mod tests {
                 Some(Decision::Unavailable(why)) if why.contains("moved while you confirmed")
             ));
         });
+        cx.run_until_parked();
+        let asked = sent.lock().unwrap().clone();
+        assert!(!asked.iter().any(|r| r.contains("/mutate")), "{asked:?}");
+    }
+
+    /// A decision whose outcome is unknown may have landed: neither its key nor its button sends
+    /// it, or the other side's, again (constitution III).
+    #[gpui::test]
+    async fn an_unknown_decision_is_not_sent_again(cx: &mut TestAppContext) {
+        let (view, sent, cx) = review_with_conflicts(divergent_deal(), cx);
+        view.update(cx, |view, _| {
+            view.resolve
+                .decisions
+                .insert(0, Decision::Unknown(Choice::Target));
+        });
+        sent.lock().unwrap().clear();
+        cx.dispatch_action(KeepTarget);
+        cx.dispatch_action(KeepSource);
         cx.run_until_parked();
         let asked = sent.lock().unwrap().clone();
         assert!(!asked.iter().any(|r| r.contains("/mutate")), "{asked:?}");

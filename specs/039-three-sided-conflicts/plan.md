@@ -234,3 +234,9 @@ changes' list is (`docs/drawing.md`): keys in the review's search draw it no tim
     (`a_conflict_shows_three_sides_and_keeps_mains`).
   - Use in Edit… put the target's value in the field as text, which cannot tell an empty string
     from null. The form now saves the value Use took while the field still reads it.
+- 2026-11-19, review of #151 (Cursor Bugbot):
+  - A decision whose outcome was unknown was offered again. It may have landed, so it now
+    settles the conflict as a landed one does: no decision is sent for it again
+    (`an_unknown_decision_is_not_sent_again`).
+  - Keep main's sent under the card's key left the card idle while it was out, offering Revert
+    and Edit behind it. The card now shows it saving, and a card a fix holds offers no decision.
