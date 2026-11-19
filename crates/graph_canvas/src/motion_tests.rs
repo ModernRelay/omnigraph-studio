@@ -224,9 +224,19 @@ async fn a_node_sent_on_mid_glide_continues_and_comes_to_rest(cx: &mut gpui::Tes
 #[gpui::test]
 async fn pages_landing_mid_glide_do_not_hold_a_node_back(cx: &mut gpui::TestAppContext) {
     let (canvas, cx) = walk_in_window(cx);
-    land(&canvas, &["A", "B"], vec![Vec2::default(), Vec2::new(0., 100.)], cx);
+    land(
+        &canvas,
+        &["A", "B"],
+        vec![Vec2::default(), Vec2::new(0., 100.)],
+        cx,
+    );
     until_rest(cx);
-    land(&canvas, &["A", "B"], vec![Vec2::default(), Vec2::new(300., 100.)], cx);
+    land(
+        &canvas,
+        &["A", "B"],
+        vec![Vec2::default(), Vec2::new(300., 100.)],
+        cx,
+    );
     let mut frames = 0;
     for page in 0..4 {
         for _ in 0..3 {
@@ -243,7 +253,10 @@ async fn pages_landing_mid_glide_do_not_hold_a_node_back(cx: &mut gpui::TestAppC
     while drawn(&canvas, 1, cx) != Vec2::new(300., 100.) {
         frame(cx);
         frames += 1;
-        assert!(frames <= one_glide(), "B held back by the pages: {frames} frames");
+        assert!(
+            frames <= one_glide(),
+            "B held back by the pages: {frames} frames"
+        );
     }
 }
 
