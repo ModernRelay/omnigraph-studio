@@ -230,8 +230,12 @@ pub(crate) fn chip_text_marked(
         }
         // "+ about →": what the branch did, the relationship, and which way it runs from the
         // chip it hangs off.
-        SceneKind::Link { outgoing } => {
-            let arrow = if *outgoing { "→" } else { "←" };
+        SceneKind::Link { outgoing, itself } => {
+            let arrow = match (*itself, *outgoing) {
+                (true, _) => "↻",
+                (false, true) => "→",
+                (false, false) => "←",
+            };
             let mut row: Vec<(SharedString, Role)> = Vec::new();
             if let Some(mark) = mark {
                 row.push((mark_symbol(mark).into(), Role::Mark(mark)));

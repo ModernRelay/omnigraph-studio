@@ -62,8 +62,9 @@ pub enum SceneKind {
     /// read (with Retry), or none.
     Note { node: NodeRef, note: Note },
     /// A relationship a branch changed, as a pill between its two ends (spec 042). `outgoing`
-    /// when the chip it hangs off is the edge's source.
-    Link { outgoing: bool },
+    /// when the chip it hangs off is the edge's source; `itself` for one from a node to itself,
+    /// which hangs off it alone.
+    Link { outgoing: bool, itself: bool },
 }
 
 impl Note {
@@ -288,9 +289,12 @@ pub fn change_scene(nodes: &[ChangeNode], links: &[ChangeLink], cap: usize) -> S
     };
     let mut touching: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
     for (index, link) in links.iter().enumerate() {
-        if link.from < nodes.len() && link.to < nodes.len() && link.from != link.to {
+        if link.from < nodes.len() && link.to < nodes.len() {
             touching[link.from].push(index);
-            touching[link.to].push(index);
+            // A relationship to itself is one of its node's, once.
+            if link.to != link.from {
+                touching[link.to].push(index);
+            }
         }
     }
     // Where the walks start: the nodes the most changed relationships meet, then the changed
@@ -338,6 +342,7 @@ pub fn change_scene(nodes: &[ChangeNode], links: &[ChangeLink], cap: usize) -> S
                 }
                 let link = &links[index];
                 let outgoing = link.from == at;
+                let itself = link.from == link.to;
                 let other = if outgoing { link.to } else { link.from };
                 // A pill needs room for itself and, unless drawn, its other end.
                 let room = 1 + usize::from(placed[other].is_none());
@@ -348,7 +353,7 @@ pub fn change_scene(nodes: &[ChangeNode], links: &[ChangeLink], cap: usize) -> S
                 let pill = scene.nodes.len();
                 scene.nodes.push(SceneNode {
                     id: SceneId::Link(index),
-                    kind: SceneKind::Link { outgoing },
+                    kind: SceneKind::Link { outgoing, itself },
                     label: link.words.clone(),
                     color_key: String::new(),
                     parent: Some(here),
@@ -359,6 +364,10 @@ pub fn change_scene(nodes: &[ChangeNode], links: &[ChangeLink], cap: usize) -> S
                     from: here,
                     to: pill,
                 });
+                // A relationship to itself hangs off its node alone: its "↻" says where it leads.
+                if itself {
+                    continue;
+                }
                 let there = match placed[other] {
                     Some(there) => there,
                     None => {
@@ -381,10 +390,24 @@ pub fn change_scene(nodes: &[ChangeNode], links: &[ChangeLink], cap: usize) -> S
             scene.marks.insert(scene.nodes[*at].id.clone(), mark);
         }
     }
+    // What the cap left out: nodes, and relationships between nodes it drew (counted under
+    // their source's type, whose table Open as table offers).
     let mut left_out: HashMap<&str, usize> = HashMap::new();
     for (node, at) in nodes.iter().zip(&placed) {
         if at.is_none() {
             *left_out.entry(node.type_name.as_str()).or_default() += 1;
+        }
+    }
+    for (link, drawn) in links.iter().zip(&drawn_links) {
+        if !drawn
+            && link.from < nodes.len()
+            && link.to < nodes.len()
+            && placed[link.from].is_some()
+            && placed[link.to].is_some()
+        {
+            *left_out
+                .entry(nodes[link.from].type_name.as_str())
+                .or_default() += 1;
         }
     }
     let hidden: usize = left_out.values().sum();

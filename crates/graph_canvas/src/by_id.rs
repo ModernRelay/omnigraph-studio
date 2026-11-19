@@ -222,11 +222,13 @@ impl GraphCanvas {
         let Some(SceneId::Node(node)) = self.selected.clone() else {
             return;
         };
+        // A node a branch removed is walked at the fork, where it still is (spec 042).
+        let at_commit = self.read_at(&node);
         window.dispatch_action(
             Box::new(ShowNodeOnCanvas {
                 type_name: node.type_name,
                 id: node.id,
-                at_commit: self.held_at(),
+                at_commit,
                 preview: true,
             }),
             cx,

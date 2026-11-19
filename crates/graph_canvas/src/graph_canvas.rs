@@ -1205,7 +1205,7 @@ impl GraphCanvas {
 
     /// Where `node` is read, opened or inspected from this canvas: at the commit it holds, but a
     /// node a branch removed at the fork, as it is gone at the head a change's canvas holds.
-    fn read_at(&self, node: &NodeRef) -> Option<String> {
+    pub(crate) fn read_at(&self, node: &NodeRef) -> Option<String> {
         if let Some((_, results)) = &self.results
             && let Some(change) = &results.change
             && self.scene.marks.get(&SceneId::Node(node.clone())) == Some(&ChangeMark::Removed)
@@ -5520,6 +5520,12 @@ mod tests {
                     .borrow_mut()
                     .push((action.id.clone(), action.at_commit.clone()))
             });
+            let heard = opened.clone();
+            cx.on_action(move |action: &ShowNodeOnCanvas, _| {
+                heard
+                    .borrow_mut()
+                    .push((format!("walk {}", action.id), action.at_commit.clone()))
+            });
         });
         let change = ingest_change("h1");
         let (canvas, cx) =
@@ -5612,10 +5618,15 @@ mod tests {
             canvas.selected = Some(node("Note", "n1"));
         });
         cx.dispatch_action(OpenSelectedPage);
+        cx.dispatch_action(studio_actions::canvas::RerootHere);
         cx.run_until_parked();
         assert_eq!(
             opened.borrow().as_slice(),
-            [("n1".to_owned(), Some("f0".to_owned()))]
+            [
+                ("n1".to_owned(), Some("f0".to_owned())),
+                ("walk n1".to_owned(), Some("f0".to_owned()))
+            ],
+            "a removed node is opened and walked at the fork"
         );
         // Fitted, then pointed at and zoomed: drawn again, nothing wrapped or laid out.
         canvas.update_in(cx, |canvas, window, cx| {
@@ -5735,5 +5746,39 @@ mod tests {
         let whole = model::change_scene(&nodes, &change.links, 100);
         assert!(whole.capped.is_none());
         assert_eq!(whole.nodes.len(), 10);
+        // Every node drawn and a relationship between them left out: the banner counts it.
+        use studio_actions::graph::{ChangeLink, ChangeNode};
+        let pair = [
+            ChangeNode {
+                type_name: "Person".into(),
+                id: "ada".into(),
+                label: None,
+                change: Some(ChangeMark::Changed),
+            },
+            ChangeNode {
+                type_name: "Person".into(),
+                id: "bob".into(),
+                label: None,
+                change: None,
+            },
+        ];
+        let link = |from, to| ChangeLink {
+            from,
+            to,
+            words: "knows".into(),
+            change: ChangeMark::Added,
+        };
+        let both_ways = model::change_scene(&pair, &[link(0, 1), link(1, 0)], 3);
+        assert_eq!(both_ways.nodes.len(), 3);
+        assert_eq!(both_ways.capped, Some((1, "Person".to_owned())));
+        // A relationship to itself hangs off its node alone, marked as one.
+        let itself = model::change_scene(&pair[..1], &[link(0, 0)], 100);
+        assert_eq!(itself.nodes.len(), 2, "the node and its pill");
+        assert_eq!(itself.edges.len(), 1);
+        assert!(matches!(
+            itself.nodes[1].kind,
+            SceneKind::Link { itself: true, .. }
+        ));
+        assert!(itself.capped.is_none());
     }
 }
