@@ -544,9 +544,8 @@ impl EffectView {
             }
         }
         if entries != self.entries {
-            let old = self.list_state.item_count();
-            self.list_state.splice(0..old, entries.len());
-            self.entries = entries;
+            // Only the entries that changed: the rest keep their heights, and the scroll stays.
+            studio_ui::rows::sync(&self.list_state, &mut self.entries, entries);
         } else {
             self.list_state.remeasure();
         }
