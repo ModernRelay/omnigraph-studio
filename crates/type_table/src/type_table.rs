@@ -607,13 +607,12 @@ fn open_text_editor(
     // Opened from a view on a branch of its own, it stays on that branch whatever the window
     // does, even when the window is on it now.
     let on_branch = action.on_branch.clone();
-    let key = match &on_branch {
-        Some(branch) => format!(
-            "{}~{branch}",
-            TextEditor::key(&action.type_name, &action.id, &action.property)
-        ),
-        None => TextEditor::key(&action.type_name, &action.id, &action.property),
-    };
+    let key = TextEditor::key_on(
+        &action.type_name,
+        &action.id,
+        &action.property,
+        on_branch.as_deref(),
+    );
     let action = action.clone();
     workspace.open_item(key, window, cx, move |window, cx| {
         TextEditor::new_on(

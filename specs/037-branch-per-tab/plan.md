@@ -246,4 +246,5 @@ to <where it lands>", and its row has no hover tooltip, which covered the menu.
     is what keeps it from writing over a value that changed. Property edits are bound by value
     and join without it.
   - A text editor opened from a page on its own branch followed the window when the window was
-    on that branch too; it keeps the page's branch.
+    on that branch too; it keeps the page's branch, and its tab is one per branch
+    (`TextEditor::key_on`, `an_editor_on_a_branch_of_its_own_stays_there`).

@@ -278,6 +278,14 @@ impl TextEditor {
         format!("text:{type_name}:{id}:{property}")
     }
 
+    /// [`Self::key`] for an editor on a branch of its own (spec 037): one per branch.
+    pub fn key_on(type_name: &str, id: &str, property: &str, on_branch: Option<&str>) -> String {
+        match on_branch {
+            Some(branch) => format!("{}~{branch}", Self::key(type_name, id, property)),
+            None => Self::key(type_name, id, property),
+        }
+    }
+
     fn set_text(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
         self.editor
             .update(cx, |editor, cx| editor.set_text(text.clone(), window, cx));
@@ -645,7 +653,15 @@ impl Item for TextEditor {
     }
 
     fn dedupe_key(&self, _cx: &App) -> Option<SharedString> {
-        Some(Self::key(&self.type_name, &self.id, &self.property).into())
+        Some(
+            Self::key_on(
+                &self.type_name,
+                &self.id,
+                &self.property,
+                self.own_branch.then_some(self.branch.as_str()),
+            )
+            .into(),
+        )
     }
 
     fn set_focus_mode(&mut self, on: bool, _window: &mut Window, cx: &mut Context<Self>) {
@@ -814,6 +830,48 @@ mod tests {
     /// The property written elsewhere in Studio while the editor is open: with nothing unsaved
     /// it shows the value written, so opening it again never shows the old one; unsaved text
     /// stays, for its save to find the change.
+    /// An editor opened from a view on a branch of its own is on it (spec 037): it saves there,
+    /// stays when the window moves, is one tab per branch, and comes back on it.
+    #[gpui::test]
+    async fn an_editor_on_a_branch_of_its_own_stays_there(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let session = session_answering(PEOPLE, 200, committed("c2", "c1"), cx);
+        cx.run_until_parked();
+        let (view, cx) = cx.add_window_view({
+            let session = session.clone();
+            move |window, cx| {
+                TextEditor::new_on(
+                    session,
+                    "Person".into(),
+                    "p1".into(),
+                    "name".into(),
+                    None,
+                    None,
+                    Some("main".into()),
+                    window,
+                    cx,
+                )
+            }
+        });
+        cx.run_until_parked();
+        session.update(cx, |session, cx| session.set_branch("fix".into(), cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.branch, "main",
+                "on the page's branch, as the window was"
+            );
+            assert_eq!(
+                view.dedupe_key(cx).as_deref(),
+                Some("text:Person:p1:name~main")
+            );
+            assert_eq!(view.serialize(cx).unwrap().data["on_branch"], "main");
+        });
+    }
+
     #[gpui::test]
     async fn an_open_editor_takes_a_value_written_elsewhere(cx: &mut TestAppContext) {
         cx.update(|cx| {
