@@ -2869,14 +2869,7 @@ impl QueryEditor {
             .map(|input| input.read(cx).text(cx))
             .unwrap_or_default();
         // A list's text is its items: the last one is what is being typed.
-        let text = text
-            .trim_matches(|c| c == '[' || c == ']')
-            .rsplit(',')
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .trim_matches('"')
-            .to_owned();
+        let text = last_item(&text);
         let search = self.session.update(cx, |session, cx| {
             session.find_nodes(&type_name, &text, None, None, PICKS, cx)
         });
@@ -2908,11 +2901,14 @@ impl QueryEditor {
     }
 
     /// Puts node `id` in parameter `param`'s field: a list's gets it added.
+    /// With `typed`, a list's last item is text typed to search for the node, which the pick
+    /// takes the place of; otherwise it is an item, and the pick is added after it.
     fn pick_node(
         &mut self,
         param: &str,
         id: String,
         list: bool,
+        typed: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2920,9 +2916,12 @@ impl QueryEditor {
             return;
         };
         let value = if list {
-            // The last item is the text the menu searched for: the pick takes its place.
             let text = input.read(cx).text(cx);
-            let done = text.rsplit_once(',').map_or("", |(done, _)| done);
+            let done = match text.rsplit_once(',') {
+                _ if !typed => text.as_str(),
+                Some((done, _)) => done,
+                None => "",
+            };
             let mut items = match gq_language::param_value(param, "[String]", true, done) {
                 Ok(Some(Value::Array(items))) => items,
                 _ => Vec::new(),
@@ -2974,6 +2973,14 @@ impl QueryEditor {
                     );
                 }
                 Some(Ok(hits)) => {
+                    // The list's last item is search text, not an item, unless a node has it
+                    // for its id (one picked before, or typed whole).
+                    let last = self
+                        .params
+                        .get(&param.name)
+                        .map(|input| last_item(&input.read(cx).text(cx)))
+                        .unwrap_or_default();
+                    let typed = !last.is_empty() && !hits.iter().any(|hit| hit.id == last);
                     for hit in hits {
                         let label = match &hit.label {
                             Some(label) => format!("{label} · {}", hit.id),
@@ -2985,7 +2992,7 @@ impl QueryEditor {
                             let (name, id) = (name.clone(), id.clone());
                             editor
                                 .update(cx, |editor, cx| {
-                                    editor.pick_node(&name, id, list, window, cx)
+                                    editor.pick_node(&name, id, list, typed, window, cx)
                                 })
                                 .ok();
                         });
@@ -6277,6 +6284,17 @@ pub fn file_key(path: &std::path::Path) -> String {
     format!("query-file:{}", path.display())
 }
 
+/// The last item of a list parameter's text, the one being typed: `syn` in `lk-acl, syn`.
+fn last_item(text: &str) -> String {
+    text.trim_matches(|c| c == '[' || c == ']')
+        .rsplit(',')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .trim_matches('"')
+        .to_owned()
+}
+
 /// A type's name with its article, as a menu says what a parameter names: "a Claim", "an
 /// Issue".
 fn a_or_an(type_name: &str) -> String {
@@ -9324,13 +9342,21 @@ mod tests {
                 // The item being typed is what the menu searched for: a pick takes its place.
                 editor.params["ids"]
                     .update(cx, |input, cx| input.set_text("lk-acl, syn", window, cx));
-                editor.pick_node("ids", "lk-sync".into(), true, window, cx);
+                editor.pick_node("ids", "lk-sync".into(), true, true, window, cx);
                 assert_eq!(editor.params["ids"].read(cx).text(cx), "lk-acl, lk-sync");
-                editor.params["ids"].update(cx, |input, cx| {
-                    input.set_text("lk-acl, lk-sync, ac", window, cx)
-                });
-                editor.pick_node("ids", "lk-acl".into(), true, window, cx);
-                assert_eq!(editor.params["ids"].read(cx).text(cx), "lk-acl, lk-sync");
+                // A last item that is an id stays, and the pick goes after it, once.
+                editor.pick_node("ids", "lk-queue".into(), true, false, window, cx);
+                assert_eq!(
+                    editor.params["ids"].read(cx).text(cx),
+                    "lk-acl, lk-sync, lk-queue"
+                );
+                editor.params["ids"].update(cx, |input, cx| input.set_text("lk-acl", window, cx));
+                editor.pick_node("ids", "lk-acl".into(), true, false, window, cx);
+                assert_eq!(editor.params["ids"].read(cx).text(cx), "lk-acl");
+                editor.params["ids"]
+                    .update(cx, |input, cx| input.set_text("lk-acl, ac", window, cx));
+                editor.pick_node("ids", "lk-acl".into(), true, true, window, cx);
+                assert_eq!(editor.params["ids"].read(cx).text(cx), "lk-acl");
                 let pending = editor.pending_write.as_ref().expect("it asks first");
                 assert!(pending.prepared.write);
             });

@@ -231,6 +231,6 @@ computer's clock, spelled as the engine spells an instant) and `"actor"` for a `
   blocked the new-node dialog, which now lets it be left empty; ↵ and the row menu opened rows
   kept after a branch switch on the new branch, and now open them where they were read, as
   the inspector does; a list parameter's pick kept the text searched as an item, and now takes
-  its place; ⌥↵ opened the Actions menu on a page held at a commit, and no longer does.
+  its place, unless that last item is an id a node has (one picked before), which stays; ⌥↵ opened the Actions menu on a page held at a commit, and no longer does.
 - 2026-11-19 · A trigger's tooltip covered its own open menu ("Rows as nodes…", "Names a
   node…"); it is hidden while the menu is open, as the table's toolbar menus do.
