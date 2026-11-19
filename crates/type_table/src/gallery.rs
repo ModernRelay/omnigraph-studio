@@ -1831,8 +1831,12 @@ impl TypeGallery {
                     error.clone(),
                 )
                 .child(
-                    studio_ui::ds::state_action("gallery-retry", "Retry", &Refresh, &focus, cx)
-                        .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                    // The page that failed, again at the pin: a read from the start would move
+                    // to the branch head and forget the properties the commit lacks.
+                    div().debug_selector(|| "gallery-retry-page".into()).child(
+                        studio_ui::ds::state_action("gallery-retry", "Retry", &Refresh, &focus, cx)
+                            .on_click(cx.listener(|this, _, _, cx| this.retry_page(cx))),
+                    ),
                 )
                 .into_any_element();
             }

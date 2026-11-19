@@ -933,3 +933,65 @@ async fn a_listed_gallery_on_a_branch_marks_its_rows(cx: &mut TestAppContext) {
         assert_eq!(gallery.count_text(), "3 rows");
     });
 }
+
+/// A gallery with no row shown yet whose next page failed offers Retry, which reads that page
+/// again at the pin, keeping the commit it opened at: before, it read the set from the start at
+/// the branch head (Bugbot on #144).
+#[gpui::test]
+async fn retry_with_no_row_shown_reads_the_page_again_at_the_pin(cx: &mut TestAppContext) {
+    init(cx);
+    let schema = NOTES.replace("  title: String\n", "  title: String\n  written: Date?\n");
+    let asked: Arc<std::sync::Mutex<Vec<(String, Value)>>> = Arc::default();
+    let refused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (log, once) = (asked.clone(), refused.clone());
+    let (session, _) = session_with_files(
+        &schema,
+        move |request: &Value| {
+            let text = request["query"].as_str().unwrap_or_default().to_owned();
+            if request["name"] == "studio_page" {
+                log.lock()
+                    .unwrap()
+                    .push((text.clone(), request["snapshot"].clone()));
+            }
+            match request["name"].as_str() {
+                Some("studio_page") if text.contains("is not null") => json!([]),
+                Some("studio_page") if !once.swap(true, std::sync::atomic::Ordering::SeqCst) => {
+                    json!({ "refuse": "the server was busy" })
+                }
+                Some("studio_page") => Value::from((0..4).map(note).collect::<Vec<_>>()),
+                _ => json!([]),
+            }
+        },
+        None,
+        cx,
+    );
+    // Opened from a table that read commit c0.
+    let sorted = ShowSetInGallery {
+        sort: Some(json!({ "property": "written", "descending": false })),
+        snapshot: Some("c0".into()),
+        ..opening("Note")
+    };
+    let (gallery, cx) = open(session, sorted, cx);
+    gallery.read_with(cx, |gallery, _| {
+        assert!(gallery.rows.is_empty());
+        assert!(
+            gallery.more_error.is_some(),
+            "the rows without a date failed"
+        );
+        assert_eq!(gallery.paging.pinned.as_deref(), Some("c0"));
+    });
+    let retry = cx.debug_bounds("gallery-retry-page").expect("Retry shown");
+    cx.simulate_click(retry.center(), gpui::Modifiers::none());
+    settle(cx);
+    gallery.read_with(cx, |gallery, _| {
+        assert_eq!(gallery.rows.len(), 4);
+        assert_eq!(gallery.paging.pinned.as_deref(), Some("c0"), "still at c0");
+    });
+    let asked = asked.lock().unwrap().clone();
+    let last = asked.last().unwrap();
+    assert!(
+        last.0.contains("is null"),
+        "the failed page asked again: {last:?}"
+    );
+    assert_eq!(last.1, json!("c0"), "at the pin: {asked:?}");
+}
