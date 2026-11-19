@@ -1740,16 +1740,27 @@ impl Render for RelationshipTree {
 
         let toolbar = self.render_toolbar(cx);
         if self.entries.is_empty() {
-            return root
-                .child(toolbar)
-                .child(studio_ui::ds::sidebar_note(
+            // The rows are empty while the schema is not there: say why, as the canvas does,
+            // rather than that a set has no rows.
+            let body = match &self.session.read(cx).schema {
+                Loadable::Failed(message) => {
+                    studio_ui::ds::error_state("The schema could not be read", message.clone())
+                        .debug_selector(|| "tree-schema-failed".into())
+                        .into_any_element()
+                }
+                Loadable::NotLoaded | Loadable::Loading => {
+                    studio_ui::ds::sidebar_note("Reading the schema…").into_any_element()
+                }
+                Loadable::Loaded(_) => studio_ui::ds::sidebar_note(
                     if self.exploration.read(cx).state().set.is_some() && !self.rebuild_owed {
                         "No rows"
                     } else {
                         "Reading…"
                     },
-                ))
-                .into_any_element();
+                )
+                .into_any_element(),
+            };
+            return root.child(toolbar).child(body).into_any_element();
         }
 
         // The header (Refresh, the filter) as tall as it is; the rows take the rest of the tab.
@@ -2521,6 +2532,36 @@ mod tests {
             "the drawn tree reads its root again under the new token"
         );
         assert!(!exploration.read_with(cx, |exploration, _| exploration.owes_reads()));
+    }
+
+    /// A tree whose schema could not be read says so, as the canvas does, and not "Reading…"
+    /// for ever.
+    #[gpui::test]
+    async fn a_tree_without_its_schema_says_why(cx: &mut gpui::TestAppContext) {
+        cx.update(studio_theme::init_test);
+        let (session, _served) = followed_session(
+            "node Person {\n  slug: String @key\n  name: String\n}\n",
+            |_| serde_json::json!([]),
+            cx,
+        );
+        cx.run_until_parked();
+        session.update(cx, |session, cx| {
+            session.schema = Loadable::Failed("the server answered 500".into());
+            cx.notify();
+        });
+        let shown = session.clone();
+        let (_dock, cx) = cx.add_window_view(move |_, cx| Dock {
+            tree: cx.new(|cx| {
+                RelationshipTree::new(
+                    shown.clone(),
+                    Subject::Node(NodeRef::new("Person", "p1")),
+                    None,
+                    cx,
+                )
+            }),
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("tree-schema-failed").is_some());
     }
 
     /// The rows take what the tree's dock leaves below its header, not the window's height, so

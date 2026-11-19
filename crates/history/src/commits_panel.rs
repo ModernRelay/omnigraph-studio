@@ -29,6 +29,8 @@ pub struct CommitsPanel {
     session: Option<Entity<GraphSession>>,
     /// Each branch read, by name: its newest commits, or why they could not be read.
     pages: HashMap<String, Loadable<Vec<CommitOutput>>>,
+    /// How many of the session's branches are past [`BRANCHES`], and not read.
+    unwatched: usize,
     /// Branches to read when the panel is next drawn: a hidden panel reads nothing.
     owed: HashSet<String>,
     /// The session asks after each branch's head while its watch is held.
@@ -52,8 +54,13 @@ pub struct CommitsPanel {
 enum Row {
     Reading,
     Empty,
-    Failed { branch: String, error: String },
+    Failed {
+        branch: String,
+        error: String,
+    },
     Commit(Box<CommitOutput>),
+    /// The branches past [`BRANCHES`], which the panel does not read (constitution IX).
+    Unwatched(usize),
 }
 
 /// A commit never changes, so two of its rows are the same row.
@@ -61,6 +68,7 @@ impl PartialEq for Row {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Row::Reading, Row::Reading) | (Row::Empty, Row::Empty) => true,
+            (Row::Unwatched(a), Row::Unwatched(b)) => a == b,
             (
                 Row::Failed { branch, error },
                 Row::Failed {
@@ -75,8 +83,8 @@ impl PartialEq for Row {
 }
 
 /// The rows for the branches read: their commits once each, under the branch that made it,
-/// newest first; then the branches that could not be read.
-fn rows_of(pages: &HashMap<String, Loadable<Vec<CommitOutput>>>) -> Vec<Row> {
+/// newest first; then the branches that could not be read, and how many the panel does not read.
+fn rows_of(pages: &HashMap<String, Loadable<Vec<CommitOutput>>>, unwatched: usize) -> Vec<Row> {
     let mut seen = HashSet::new();
     let mut commits: Vec<&CommitOutput> = pages
         .values()
@@ -119,6 +127,9 @@ fn rows_of(pages: &HashMap<String, Loadable<Vec<CommitOutput>>>) -> Vec<Row> {
         rows.push(if reading { Row::Reading } else { Row::Empty });
     }
     rows.extend(failed);
+    if unwatched > 0 {
+        rows.push(Row::Unwatched(unwatched));
+    }
     rows
 }
 
@@ -150,6 +161,7 @@ impl CommitsPanel {
         let mut this = Self {
             session: None,
             pages: HashMap::new(),
+            unwatched: 0,
             owed: HashSet::new(),
             watches: Vec::new(),
             reads: HashMap::new(),
@@ -205,10 +217,14 @@ impl CommitsPanel {
         let Some(session) = self.session.clone() else {
             return;
         };
-        let branches: Vec<String> = match &session.read(cx).branches {
-            Loadable::Loaded(branches) => branches.iter().take(BRANCHES).cloned().collect(),
-            _ => vec![session.read(cx).branch.clone()],
+        let (branches, unwatched): (Vec<String>, usize) = match &session.read(cx).branches {
+            Loadable::Loaded(branches) => (
+                branches.iter().take(BRANCHES).cloned().collect(),
+                branches.len().saturating_sub(BRANCHES),
+            ),
+            _ => (vec![session.read(cx).branch.clone()], 0),
         };
+        self.unwatched = unwatched;
         self.pages.retain(|branch, _| branches.contains(branch));
         self.reads.retain(|branch, _| branches.contains(branch));
         self.owed.retain(|branch| branches.contains(branch));
@@ -320,6 +336,11 @@ impl CommitsPanel {
                 "Commits made on any branch show here as they land",
             )
             .into_any_element(),
+            Row::Unwatched(count) => ds::sidebar_note(format!(
+                "{} past the first {BRANCHES} are not read here; a branch's History shows its commits",
+                studio_ui::plural(count, "branch", "branches")
+            ))
+            .into_any_element(),
             Row::Failed { branch, error } => ds::sidebar_placeholder(
                 SharedString::from(format!("commits-failed-{branch}")),
                 IconName::Warning,
@@ -398,7 +419,7 @@ impl Render for CommitsPanel {
                 .ok();
             }));
         }
-        let rows = rows_of(&self.pages);
+        let rows = rows_of(&self.pages, self.unwatched);
         studio_ui::rows::sync(&self.list_state, &mut self.rows, rows);
         let now = now_micros();
         v_flex().key_context("CommitsPanel").size_full().child(
@@ -442,6 +463,7 @@ mod tests {
                 Row::Failed { branch, .. } => format!("failed {branch}"),
                 Row::Reading => "reading".into(),
                 Row::Empty => "empty".into(),
+                Row::Unwatched(count) => format!("{count} unwatched"),
             })
             .collect()
     }
@@ -451,9 +473,9 @@ mod tests {
     #[test]
     fn rows_are_every_branchs_newest_commits_once_each() {
         let mut pages = HashMap::new();
-        assert_eq!(ids(&rows_of(&pages)), ["reading"]);
+        assert_eq!(ids(&rows_of(&pages, 0)), ["reading"]);
         pages.insert("main".to_owned(), Loadable::Loading);
-        assert_eq!(ids(&rows_of(&pages)), ["reading"]);
+        assert_eq!(ids(&rows_of(&pages, 0)), ["reading"]);
         pages.insert(
             "main".to_owned(),
             Loadable::Loaded(vec![commit("m2", None, 20), commit("m1", None, 10)]),
@@ -467,7 +489,7 @@ mod tests {
             ]),
         );
         pages.insert("gone".to_owned(), Loadable::Failed("refused".into()));
-        let rows = rows_of(&pages);
+        let rows = rows_of(&pages, 0);
         assert_eq!(ids(&rows), ["f1", "m2", "m1", "failed gone"]);
         let Row::Commit(first) = &rows[0] else {
             panic!("a commit");
@@ -480,6 +502,12 @@ mod tests {
 
         let mut empty = HashMap::new();
         empty.insert("main".to_owned(), Loadable::Loaded(Vec::new()));
-        assert_eq!(ids(&rows_of(&empty)), ["empty"]);
+        assert_eq!(ids(&rows_of(&empty, 0)), ["empty"]);
+        // Past the branches the panel reads, it says how many it leaves out.
+        assert_eq!(ids(&rows_of(&empty, 3)), ["empty", "3 unwatched"]);
+        assert_eq!(
+            ids(&rows_of(&pages, 1)).last().map(String::as_str),
+            Some("1 unwatched")
+        );
     }
 }

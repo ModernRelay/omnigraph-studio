@@ -780,6 +780,18 @@ impl Connection {
         }
     }
 
+    /// The person's Refresh of a server that did not answer: connects at once, and, as
+    /// [`Self::refresh_token`] does, a token typed in no longer stands, so the connect asks the
+    /// token source. Otherwise a typed token that has since lapsed is sent first and refused,
+    /// though the source holds a good one.
+    pub fn connect_again(&mut self, cx: &mut Context<Self>) {
+        if self.token_source.is_some() {
+            self.token_given = false;
+            self.asked_after_refusal = false;
+        }
+        self.connect(cx);
+    }
+
     /// Takes the token from `source` from now on; every change of source comes through here. The
     /// old source's asks, a connect's among them, are answered for nobody, so they end: one
     /// answered later could put back a token that was dropped (the person's signed-out one among
@@ -3945,6 +3957,47 @@ mod tests {
             asked(),
             3,
             "the renewal asked again halfway to the token's end"
+        );
+    }
+
+    /// Connecting again to a server that did not answer asks the token source over a token
+    /// typed in, as a Refresh does: a typed token that lapsed while the server was away is not
+    /// sent first and refused while the source holds a good one.
+    #[gpui::test]
+    async fn connecting_again_asks_the_source_over_a_typed_token(cx: &mut TestAppContext) {
+        let source = Arc::new(Scripted::default());
+        let (connection, sent, _) = sourced(source.clone(), cx);
+        let _watch = connection.update(cx, |connection, cx| {
+            connection.connect(cx);
+            connection.watch(cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(source.asked.load(Ordering::SeqCst), 1);
+        connection.update(cx, |connection, cx| {
+            connection.set_token(Some("typed".into()), cx)
+        });
+        cx.run_until_parked();
+        assert!(connection.read_with(cx, |connection, _| connection.token_given()));
+
+        connection.update(cx, |connection, cx| {
+            connection.state = ConnectionState::Unreachable("away".into());
+            connection.connect_again(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            source.asked.load(Ordering::SeqCst),
+            2,
+            "the source was asked again"
+        );
+        assert_eq!(
+            sent.lock().unwrap().last().map(String::as_str),
+            Some("Bearer token 2"),
+            "the probe carried the source's token, not the typed one"
+        );
+        assert!(!connection.read_with(cx, |connection, _| connection.token_given()));
+        assert_eq!(
+            connection.read_with(cx, |connection, _| connection.state.clone()),
+            ConnectionState::Ready
         );
     }
 

@@ -351,24 +351,27 @@ impl BranchList {
                     };
                     menu.header(name.clone())
                         .entry("Switch to this branch", None, switch)
+                        // A menu entry has no tooltip: a disabled one says why in its label.
                         .item(
-                            ContextMenuEntry::new(format!("Review against {TARGET}"))
-                                .disabled(is_target)
-                                .handler(review),
+                            ContextMenuEntry::new(if is_target {
+                                format!("Review against {TARGET} (this is {TARGET})")
+                            } else {
+                                format!("Review against {TARGET}")
+                            })
+                            .disabled(is_target)
+                            .handler(review),
                         )
                         .item(
                             ContextMenuEntry::new(match &merge_refused {
-                                Some(reason) if !is_target => {
-                                    format!("Merge into {TARGET} ({})", aside(reason))
-                                }
-                                _ => format!("Merge into {TARGET}…"),
+                                _ if is_target => format!("Merge into {TARGET} (this is {TARGET})"),
+                                Some(reason) => format!("Merge into {TARGET} ({})", aside(reason)),
+                                None => format!("Merge into {TARGET}…"),
                             })
                             .disabled(is_target || merge_refused.is_some())
                             .handler(merge),
                         )
                         .separator()
                         .item(
-                            // A menu entry has no tooltip: a disabled one says why in its label.
                             ContextMenuEntry::new(match &delete_refused {
                                 _ if is_target => format!("Delete ({TARGET} cannot be deleted)"),
                                 Some(reason) => format!("Delete ({})", aside(reason)),

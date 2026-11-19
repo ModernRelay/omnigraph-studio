@@ -5305,7 +5305,7 @@ impl QueryEditor {
                 IconName::XCircle,
                 Color::Error,
                 format!("Refused ({status}): {message}"),
-                Some("Nothing was written. Your query is unchanged; fix it and run again.".into()),
+                Some(refused_write_hint(*status).into()),
                 Vec::new(),
                 diagnostic.clone(),
                 cx,
@@ -5834,11 +5834,38 @@ fn open_write_commit(commit_id: String, preview: bool, window: &mut Window, cx: 
     );
 }
 
+/// What to do after a refused write, by what refused it: the query is not at fault when the
+/// token may not write, or the server or graph is busy. Nothing was written either way.
+fn refused_write_hint(status: u16) -> &'static str {
+    match status {
+        403 => {
+            "Nothing was written. Your token may not make this change here; your query is unchanged."
+        }
+        429 | 503 => {
+            "Nothing was written. The server is busy or the graph is not serving; run it again in a moment."
+        }
+        _ => "Nothing was written. Your query is unchanged; fix it and run again.",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// A refused write says what to do by what refused it: a denial or a busy server is not
+    /// the query's fault, anything else asks for the query to be fixed.
+    #[test]
+    fn a_refused_write_says_what_to_do_next() {
+        assert!(refused_write_hint(403).contains("Your token may not"));
+        assert!(refused_write_hint(429).contains("in a moment"));
+        assert!(refused_write_hint(503).contains("in a moment"));
+        assert!(refused_write_hint(400).contains("fix it and run again"));
+        for status in [400, 403, 429, 503] {
+            assert!(refused_write_hint(status).starts_with("Nothing was written."));
+        }
+    }
 
     /// A write's commit, opened from the query's tab as a preview, keeps that tab: a query
     /// previewed in the pane is not replaced by the commit (review of #130).

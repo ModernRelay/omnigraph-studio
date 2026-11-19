@@ -8,4 +8,5 @@
 /dev/.dense-data
 /.claude/worktrees/
 /dev/.sign-in
+/result
 __pycache__/

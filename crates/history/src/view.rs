@@ -2138,6 +2138,20 @@ impl Render for HistoryView {
             State::Failed(error) => {
                 studio_ui::ds::error_state("History could not be read", error.clone())
                     .debug_selector(|| "history-error".into())
+                    .child(
+                        div()
+                            .debug_selector(|| "history-error-refresh".into())
+                            .child(
+                                studio_ui::ds::state_action(
+                                    "refresh-history-failed",
+                                    "Refresh",
+                                    &Refresh,
+                                    &self.focus_handle,
+                                    cx,
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                            ),
+                    )
                     .into_any_element()
             }
             State::Loading { .. } if self.commits.is_empty() => {
@@ -2741,8 +2755,9 @@ mod tests {
         );
     }
 
-    /// A first read that fails, with no commit shown, says why in the list's place; the branch
-    /// list read again reads the history from its first page.
+    /// A first read that fails, with no commit shown, says why in the list's place, with a
+    /// Refresh that reads it again; the branch list read again reads the history from its first
+    /// page too.
     #[gpui::test]
     async fn a_first_read_that_fails_says_why_in_place_of_the_list(cx: &mut TestAppContext) {
         let first_page = "branch=main&limit=200";
@@ -2761,6 +2776,18 @@ mod tests {
         });
         assert!(cx.debug_bounds("history-error").is_some());
         assert!(cx.debug_bounds("history-read-again-failed").is_none());
+        let asked = served.lock().unwrap().listings().len();
+        let refresh = cx.debug_bounds("history-error-refresh").expect("a Refresh");
+        cx.simulate_click(refresh.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            served.lock().unwrap().listings().len() > asked,
+            "read again"
+        );
+        assert!(
+            cx.debug_bounds("history-error").is_some(),
+            "and failed again"
+        );
         served.lock().unwrap().fail_listings.clear();
         view.update(cx, |view, cx| view.branches_changed(cx));
         cx.run_until_parked();

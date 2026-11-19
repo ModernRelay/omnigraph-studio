@@ -10,7 +10,7 @@ use studio_actions::query::{Save, SaveAs};
 use studio_actions::update::{CheckForUpdates, RestartToUpdate};
 use studio_actions::workspace::{
     About, ActivateNextPane, ActivatePreviousPane, CloseActiveItem, CloseAllItems, CloseOtherItems,
-    DecreaseFontSize, GoBack, GoForward, GoTo, IncreaseFontSize, NewWindow, OpenGraph,
+    CopyLink, DecreaseFontSize, GoBack, GoForward, GoTo, IncreaseFontSize, NewWindow, OpenGraph,
     OpenSettings, Quit, Refresh, ResetFontSize, RevealLog, ShowKeyBindings, SplitDown, SplitRight,
     SwitchBranch, ToggleActivity, ToggleCommandPalette, ToggleFocusMode, ToggleInspector,
     TogglePinTab, ToggleSidebar,
@@ -90,6 +90,7 @@ pub fn set(cx: &mut App) {
         Menu::new("Graph").items([
             MenuItem::action("Refresh", Refresh),
             MenuItem::action("Switch Branch…", SwitchBranch),
+            MenuItem::action("Copy Link", CopyLink),
             MenuItem::separator(),
             MenuItem::action("New Query", NewQuery),
             MenuItem::action("History", OpenHistory),
