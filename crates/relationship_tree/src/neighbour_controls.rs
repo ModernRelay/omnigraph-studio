@@ -22,7 +22,7 @@ use graph_store::{Exploration, ExplorePath};
 use studio_ui::ds::Tipped;
 use studio_ui::ds::{size, space};
 use studio_ui::menu::{ContextMenu, menu_surface};
-use studio_workspace::models::{Error as ModelError, Models, Request as ModelRequest};
+use studio_workspace::models::{self, Error as ModelError, Models, Request as ModelRequest};
 use studio_workspace::property_icon;
 use ui::prelude::*;
 use ui::{IconName, IconPosition, PopoverMenu, PopoverMenuHandle};
@@ -359,8 +359,14 @@ impl NeighbourFilters {
             })
         };
         let value = field("Value".to_owned(), window, cx);
+        // Without an OpenRouter key the sentence cannot be asked: the field says so before
+        // one is typed (spec 019).
         let sentence = field(
-            format!("Describe the {} to show", group.other_type),
+            if Models::needs_key(cx) {
+                models::WORDS_NEED_KEY.to_owned()
+            } else {
+                format!("Describe the {} to show", group.other_type)
+            },
             window,
             cx,
         );
@@ -733,11 +739,15 @@ impl Render for NeighbourFilters {
             Words::Failed(why) => (false, Some(why.clone()), None),
             Words::Typing(note) => (false, None, note.clone()),
         };
-        let about = format!(
-            "Filter in words (↵): {} go to {}",
-            words::TASK.sends,
-            Models::model_for(words::TASK.tier, cx)
-        );
+        let about = if Models::needs_key(cx) {
+            models::needs_key_tip("Filter in words")
+        } else {
+            format!(
+                "Filter in words (↵): {} go to {}",
+                words::TASK.sends,
+                Models::model_for(words::TASK.tier, cx)
+            )
+        };
         // The sentence, in the grey footer as a card's actions are (`ds::card_footer`).
         let footer = v_flex()
             .px(px(space::MD))

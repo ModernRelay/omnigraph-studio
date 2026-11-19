@@ -274,6 +274,13 @@ pub trait Item: Render + Focusable + EventEmitter<ItemEvent> {
         false
     }
 
+    /// The item holds work that the next preview must not take the place of (spec 020): by
+    /// default its unsaved work. Asked when a preview would replace the tab, and when the tab
+    /// says its state changed ([`ItemEvent::UpdateTab`]), which keeps it.
+    fn keeps_preview(&self, cx: &App) -> bool {
+        self.is_dirty(cx)
+    }
+
     /// The item reads an older commit than the branch head.
     fn is_stale(&self, _cx: &App) -> bool {
         false
@@ -333,6 +340,7 @@ pub trait ItemHandle: 'static {
     ) -> Option<Refusal>;
     fn inspected(&self, cx: &mut App) -> Option<Inspected>;
     fn is_dirty(&self, cx: &App) -> bool;
+    fn keeps_preview(&self, cx: &App) -> bool;
     fn is_stale(&self, cx: &App) -> bool;
     fn focus_handle(&self, cx: &App) -> FocusHandle;
     fn serialize(&self, cx: &App) -> Option<SavedItem>;
@@ -414,6 +422,10 @@ impl<T: Item> ItemHandle for Entity<T> {
 
     fn is_dirty(&self, cx: &App) -> bool {
         self.read(cx).is_dirty(cx)
+    }
+
+    fn keeps_preview(&self, cx: &App) -> bool {
+        self.read(cx).keeps_preview(cx)
     }
 
     fn is_stale(&self, cx: &App) -> bool {

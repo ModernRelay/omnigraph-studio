@@ -3,7 +3,7 @@
 //! an empty centre and a one-line error in the Data panel.
 
 use gpui::{AnyElement, App, Entity};
-use graph_store::{Connection, GraphListing, GraphSession, SchemaFailure};
+use graph_store::{Connection, GraphSession, SchemaFailure};
 use ui::prelude::*;
 
 /// How many of a server's graphs the page for a missing one offers, as buttons.
@@ -42,8 +42,9 @@ pub fn open_failure(session: &Entity<GraphSession>, cx: &App) -> Option<AnyEleme
             })
     });
     let graphs = (failure == SchemaFailure::NotFound)
-        .then(|| listed(connection))
+        .then(|| connection.listed_graph_ids())
         .flatten()
+        .map(|listed| others(&listed, &graph))
         .unwrap_or_default();
     let url = connection.server.url.clone();
     let offered = graphs
@@ -95,13 +96,7 @@ fn says(
         SchemaFailure::NotFound => (
             IconName::Folder,
             format!("No graph named “{graph}” on {server}"),
-            match listed(connection) {
-                Some(ids) if ids.is_empty() => "This server lists no graphs.".to_owned(),
-                Some(ids) => format!("It has: {}.", ids.join(", ")),
-                None => "This server does not list its graphs. Check the id, or open another \
-                         graph."
-                    .to_owned(),
-            },
+            it_has(connection.listed_graph_ids().as_deref(), graph),
         ),
         SchemaFailure::Unauthorized => (
             IconName::UserCheck,
@@ -151,11 +146,32 @@ fn says(
     }
 }
 
-/// The graphs the server says the token reaches, when it says.
-fn listed(connection: &Connection) -> Option<Vec<String>> {
-    match &connection.graphs {
-        GraphListing::Listed(_) | GraphListing::Discovered(_) => Some(connection.graph_ids()),
-        _ => None,
+/// The graphs a server listed, without the one that would not open: the page says what the
+/// server has and offers it, and the graph it just refused is neither.
+fn others(listed: &[String], missing: &str) -> Vec<String> {
+    listed
+        .iter()
+        .filter(|id| id.as_str() != missing)
+        .cloned()
+        .collect()
+}
+
+/// The line under "No graph named …": what the server says it has. `listed` is the server's
+/// own answer ([`Connection::listed_graph_ids`]), `None` when it lists nothing to this
+/// credential. An id Studio only remembers is not in it: before, the graph that was missing,
+/// remembered when it was asked for, was named as one the server has and offered again.
+fn it_has(listed: Option<&[String]>, missing: &str) -> String {
+    let Some(listed) = listed else {
+        return "This server does not list its graphs. Check the id, or open another graph."
+            .to_owned();
+    };
+    let others = others(listed, missing);
+    if listed.is_empty() {
+        "This server lists no graphs.".to_owned()
+    } else if others.is_empty() {
+        "This server lists no other graph.".to_owned()
+    } else {
+        format!("It has: {}.", others.join(", "))
     }
 }
 
@@ -172,6 +188,37 @@ fn graph_link(url: &str, graph: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The page for a missing graph says what the server listed, and never the graph that is
+    /// missing: Studio remembers it once it is asked for, but the server does not have it.
+    #[test]
+    fn a_missing_graph_is_not_said_to_be_on_the_server() {
+        let listed = ["knowledge".to_owned(), "notes".to_owned()];
+        assert_eq!(
+            it_has(Some(&listed), "knowlege"),
+            "It has: knowledge, notes."
+        );
+        assert_eq!(others(&listed, "knowlege"), ["knowledge", "notes"]);
+
+        // A server that lists a graph it then cannot find names the others alone.
+        assert_eq!(it_has(Some(&listed), "notes"), "It has: knowledge.");
+        assert_eq!(others(&listed, "notes"), ["knowledge"]);
+        let only = ["notes".to_owned()];
+        assert_eq!(
+            it_has(Some(&only), "notes"),
+            "This server lists no other graph."
+        );
+        assert!(others(&only, "notes").is_empty());
+
+        assert_eq!(
+            it_has(Some(&[]), "knowlege"),
+            "This server lists no graphs."
+        );
+        assert_eq!(
+            it_has(None, "knowlege"),
+            "This server does not list its graphs. Check the id, or open another graph."
+        );
+    }
 
     #[test]
     fn a_graph_link_carries_its_server_encoded() {

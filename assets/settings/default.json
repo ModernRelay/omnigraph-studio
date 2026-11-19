@@ -35,6 +35,7 @@
   },
   "models": {
     "fast": "anthropic/claude-haiku-5.5",
+    "filter": "google/gemini-3.8-flash",
     "careful": "anthropic/claude-sonnet-5.5",
     "key_stored": false
   },

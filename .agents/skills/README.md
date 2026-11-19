@@ -3,16 +3,29 @@
 Skills that coding agents load when they work in this repository. Codex reads `.agents/skills/`;
 `.claude/skills` is a symlink to it, so Claude Code reads the same files.
 
-## make-interfaces-feel-better
+## jakubkrehel/skills
 
-`make-interfaces-feel-better/` is a copy of the skill of that name, unmodified:
-`skills/make-interfaces-feel-better/` and `LICENSE` from
-[jakubkrehel/make-interfaces-feel-better](https://github.com/jakubkrehel/make-interfaces-feel-better)
-at commit `1a2aa9695487dc6d2a59af28e34db9b1490ab181` (2026-11-16). It is MIT-licensed;
-`make-interfaces-feel-better/LICENSE` is its license.
+Every folder here is a copy of a skill of that name, unmodified: `skills/` from
+[jakubkrehel/skills](https://github.com/jakubkrehel/skills) at commit
+`547d415dc10a23e66088eba5aa6664e6e772432c` (2026-11-18). They are MIT-licensed;
+`LICENSE-jakubkrehel-skills` is their license.
 
-Use it when building or reviewing a view: radius, alignment, elevation, motion, icons, numbers
-and hit areas. Its examples are CSS, Tailwind and React. Studio is GPUI, so:
+| Skill | Use it for |
+|---|---|
+| `better-interface` | A review of a view across all the skills below, as one ranked report |
+| `better-ui` | Polish: radius, optical alignment, elevation, icons, motion |
+| `better-layout` | Grouping, alignment, reading order, room for longer text |
+| `better-typography` | Type scale, spacing, truncation, numbers |
+| `better-colors` | Palettes, semantic tokens, contrast |
+| `better-accessibility` | Keyboard and focus, accessible names, motion, zoom |
+| `better-writing` | Labels, errors, empty states, confirmations |
+| `interface-review` | The interface problems a branch or PR introduced (user-invoked) |
+| `explain-interface` | How a site or effect was built, from a URL or a screenshot (user-invoked) |
+| `build-design` | Building a view from a Figma file or an image |
+| `break`, `state-machine`, `variant` | A component under every scenario, every state, or several variants (user-invoked) |
+| `afk`, `upskill` | Unattended improvement passes; skills and hooks from past sessions (user-invoked) |
+
+Their examples are CSS, Tailwind and React, and some render on a web page. Studio is GPUI, so:
 
 - Express each fix in GPUI and Studio's design tokens, never in a second styling system.
 - Where Studio already has a rule, Studio's rule wins: nested corners through
@@ -20,7 +33,11 @@ and hit areas. Its examples are CSS, Tailwind and React. Studio is GPUI, so:
   colours and sizes as tokens only (`script/check-design-tokens.py`), and what a keystroke may
   draw (`docs/drawing.md`).
 - Advice that only applies to a browser (`will-change`, `text-wrap`, `-webkit-font-smoothing`,
-  the browser's Animations panel) has no GPUI counterpart; skip it.
+  the browser's Animations panel, ARIA) has no GPUI counterpart; skip it, or use its GPUI
+  equivalent where one exists.
+- Where a skill renders a component on a throwaway web page (`break`, `state-machine`,
+  `variant`), draw it in a GPUI test or an offscreen snapshot instead
+  (`crates/studio/examples/snapshot.rs`).
 
-To move to a newer upstream version, replace the folder with that commit's
-`skills/make-interfaces-feel-better/` and its `LICENSE`, and update the commit and date above.
+To move to a newer upstream version, replace these folders with that commit's `skills/` and its
+`LICENSE`, and update the commit and date above.

@@ -11,24 +11,17 @@ use gq_language::builder::{
 };
 use gq_language::input::parse_scalar;
 use gq_language::schema::Property;
-use model::{Limits, Task as ModelTask, Tier};
+use model::{Task as ModelTask, Tier};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 pub static TASK: ModelTask = ModelTask {
     name: "table-filter",
     sends: "The type's property names, its enum values and your sentence",
-    tier: Tier::Fast,
-    // A wide type with many relationships describes itself in more than the tier's cap; the
-    // call is still one short answer. The personal graph's widest type, Artifact, with its
-    // order, grouping and columns, comes to about 33 KB. The answer names the filters, the
-    // order, the grouping and the columns shown, which for a wide type ("every column but the
-    // notes") runs past the tier's 300 tokens: cut off, the whole answer would be lost.
-    limits: Limits {
-        input_bytes: 48 * 1024,
-        output_tokens: 1000,
-        time: std::time::Duration::from_secs(20),
-    },
+    // The filter has a tier and a model setting of its own: on 73 labelled sentences a
+    // stronger model than the fast tier's was right far more often (spec 019, 2026-11-16).
+    tier: Tier::Filter,
+    limits: Tier::Filter.limits(),
 };
 
 pub const INSTRUCTIONS: &str = "Turn the request into filters on a table of rows of one type. \
@@ -835,7 +828,14 @@ fn build_group(
         .map(|(_, items)| items.as_slice())
         .unwrap_or_default();
     for filter in mine {
+        // A model often names a group's test as it names a filter outside a group, with the
+        // relationship first (`out:WorksAt.city` in a group on `out:WorksAt`). It means the
+        // related record's property, which is what the group tests.
         let name = filter.property.trim();
+        let name = name
+            .strip_prefix(key)
+            .and_then(|own| own.strip_prefix('.'))
+            .unwrap_or(name);
         let op = FilterOp::from_key(&filter.op);
         if name == builder::ID_FILTER {
             match (op, filter.value.first()) {
@@ -1174,6 +1174,58 @@ mod tests {
         );
         assert!(made.is_empty());
         assert_eq!(refused.len(), 1);
+    }
+
+    /// A test in a group that is named with the group's relationship, as a filter outside a
+    /// group is, tests the related record's property. Before, the whole name was looked up on
+    /// the related type and not found, so the test was dropped and the group kept: "works at
+    /// a company in Berlin" came out as "works at some company", with a note. On 2026-11-16
+    /// Claude Haiku 5.5 named its grouped tests this way in 5 of 73 sentences (spec 019).
+    #[test]
+    fn a_groups_test_named_with_its_relationship_is_read() {
+        let model = gq_language::SchemaModel::parse(HOPS).unwrap();
+        let reach = Reach {
+            schema: &model,
+            type_name: "Person",
+        };
+        let (made, refused) = filters_with(
+            Answer {
+                filters: vec![
+                    in_group("g1", "out:WorksAt.city", "eq", "Berlin"),
+                    in_group("g1", "out:WorksAt.@role", "eq", "CTO"),
+                    in_group("g2", "out:LocatedIn.country", "eq", "Germany"),
+                    // Another relationship's name is no property of the company.
+                    in_group("g1", "out:LocatedIn.country", "eq", "France"),
+                ],
+                groups: vec![
+                    group_item("g1", "", "out:WorksAt", "any"),
+                    group_item("g2", "g1", "out:LocatedIn", ""),
+                ],
+                predicate: None,
+                sort: Vec::new(),
+                group_by: Vec::new(),
+                columns: Vec::new(),
+            },
+            &[],
+            Some(reach),
+        );
+        assert_eq!(made.len(), 1, "{made:?} {refused:?}");
+        let (key, group) = builder::as_group(&made[0]).unwrap();
+        assert_eq!(key, "out:WorksAt");
+        let tested: Vec<(&str, &Value)> = group
+            .tests
+            .iter()
+            .map(|test| (test.property.as_str(), &test.value))
+            .collect();
+        assert_eq!(
+            tested,
+            [
+                ("city", &json!("Berlin")),
+                ("@role", &json!("CTO")),
+                ("out:LocatedIn.country", &json!("Germany")),
+            ]
+        );
+        assert_eq!(refused, ["Company has no property out:LocatedIn.country"]);
     }
 
     /// The schema allows only the keys and operators offered, and the answer's filters are

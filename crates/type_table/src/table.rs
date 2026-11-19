@@ -47,7 +47,7 @@ use studio_ui::ds::space;
 use studio_ui::menu::{ContextMenu, ContextMenuEntry};
 use studio_ui::plural;
 use studio_ui::{ColumnDrag, ColumnResize, GridPlace, ROW_HEIGHT, columns_in_view, grid_places};
-use studio_workspace::models::{Error as ModelError, Models, Request as ModelRequest};
+use studio_workspace::models::{self, Error as ModelError, Models, Request as ModelRequest};
 use studio_workspace::{
     Inspected, Item, ItemEvent, ItemStatus, KeyHint, SavedItem, ToastKind, Workspace,
 };
@@ -576,6 +576,16 @@ const COMPACT_TOOLBAR_BELOW: f32 = 1000.;
 /// The least the toolbar's sentence field is squeezed to before the chips after it are cut.
 const WORDS_FIELD_MIN: f32 = 140.;
 
+/// What the sentence field shows while it is empty: its name, or, while no OpenRouter key is
+/// stored, that it needs one, so nobody types a sentence to learn it (spec 019).
+fn words_placeholder(needs_key: bool) -> &'static str {
+    if needs_key {
+        models::WORDS_NEED_KEY
+    } else {
+        "Filter in words…"
+    }
+}
+
 use studio_workspace::property_icon;
 
 /// One row's neighbours through one relationship: how many, and the first few by id (as many
@@ -1041,6 +1051,9 @@ pub struct TypeTable {
     frame_looks: Rc<RefCell<HashMap<usize, RowLook>>>,
     /// The places this frame's lines draw.
     frame_places: Rc<[GridPlace]>,
+    /// The columns this frame's rows draw cells in: those the rows' own view meets
+    /// ([`Self::rows_drawn`]). Every other place of [`Self::frame_places`] is an empty box.
+    frame_rows_drawn: Vec<bool>,
     /// The cells this frame draws may be changed: the table reads the branch, and the
     /// credential may change it. Found once a frame, not for every cell.
     frame_writable: bool,
@@ -1050,6 +1063,10 @@ pub struct TypeTable {
     /// The columns the last drawn rows drew.
     #[cfg(test)]
     frame_drawn: Vec<bool>,
+    /// For each frame the table rendered, the columns its rows drew cells in
+    /// ([`Self::frame_rows_drawn`] as the frame's last call for lines left it), oldest first.
+    #[cfg(test)]
+    frames_rows_drawn: Vec<Vec<bool>>,
     /// A column being dragged wider or narrower: its key, and where the pointer and the column's
     /// width were when the drag began.
     resizing: Option<ColumnResize<String>>,
@@ -1089,6 +1106,9 @@ pub struct TypeTable {
     words_editor: Entity<Editor>,
     words: WordsState,
     words_made: Vec<Filter>,
+    /// No OpenRouter key is stored: the sentence field and the fill say so before they are
+    /// used, and follow the key when one is stored or removed.
+    needs_key: bool,
     /// Fill a column (spec 019): the instruction field and the fill under way, in the bulk bar.
     fill_editor: Entity<Editor>,
     fill: Option<FillState>,
@@ -1441,9 +1461,10 @@ impl TypeTable {
             editor.set_text_style_refinement(studio_ui::ds::field_text(cx));
             editor
         });
+        let needs_key = Models::needs_key(cx);
         let words_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text("Filter in words…", window, cx);
+            editor.set_placeholder_text(words_placeholder(needs_key), window, cx);
             editor.set_text_style_refinement(studio_ui::ds::field_text(cx));
             editor
         });
@@ -1464,7 +1485,7 @@ impl TypeTable {
             editor
         });
         let grid = TableGrid::new(cx);
-        let subscriptions = vec![
+        let mut subscriptions = vec![
             // The inspector shows the row under the cursor (spec 020): the workspace is told
             // when that is another row, however the cursor or the rows came to change.
             cx.observe_self(|this, cx| this.report_selection(cx)),
@@ -1500,6 +1521,12 @@ impl TypeTable {
                 },
             ),
         ];
+        // The sentence field says whether a key is stored, and follows the key.
+        if let Some(models) = Models::try_global(cx) {
+            subscriptions.push(cx.observe_in(&models, window, |this, _, window, cx| {
+                this.key_changed(window, cx)
+            }));
+        }
         let branch = session.read(cx).branch.clone();
         let table_state = cx.new(|cx| TableInteractionState::new(cx));
         let scope = at_commit.is_none().then(|| new_scope(&session, cx));
@@ -1534,10 +1561,13 @@ impl TypeTable {
             frame_line_count: 0,
             frame_looks: Rc::default(),
             frame_places: Rc::from([]),
+            frame_rows_drawn: Vec::new(),
             frame_writable: false,
             frame_pointer: None,
             #[cfg(test)]
             frame_drawn: Vec::new(),
+            #[cfg(test)]
+            frames_rows_drawn: Vec::new(),
             frame_now: chrono::Local::now(),
             frame_minute: 0,
             grid,
@@ -1555,6 +1585,7 @@ impl TypeTable {
             filter_editor,
             words_editor,
             words: WordsState::Typing(None),
+            needs_key,
             words_made: Vec::new(),
             fill_editor,
             fill: None,
@@ -3053,12 +3084,16 @@ impl TypeTable {
                         format!("Fill {}", studio_ui::plural(count, "row", "rows")),
                     )
                     .style(ButtonStyle::Tinted(TintColor::Accent))
-                    .tip(studio_ui::ds::tooltip(format!(
-                        "{} go to {}. Each answer lands as the cell's draft; save the drafts \
-                         to write them",
-                        fill::TASK.sends,
-                        Models::model_for(fill::TASK.tier, cx)
-                    )))
+                    .tip(studio_ui::ds::tooltip(if self.needs_key {
+                        models::needs_key_tip("Fill with a model")
+                    } else {
+                        format!(
+                            "{} go to {}. Each answer lands as the cell's draft; save the \
+                             drafts to write them",
+                            fill::TASK.sends,
+                            Models::model_for(fill::TASK.tier, cx)
+                        )
+                    }))
                     .on_click(cx.listener(|this, _, _, cx| this.run_fill(cx))),
                 );
             }
@@ -9183,20 +9218,42 @@ impl TypeTable {
         true
     }
 
-    /// The toolbar's sentence field (spec 019): a search field with the model's mark, its
-    /// spinner while the call is out, and the field's red line when the call failed; the
-    /// answer's filters are the bar's pills. ↵ asks, Esc leaves.
-    fn render_words_field(&self, cx: &mut Context<Self>) -> AnyElement {
-        let running = matches!(self.words, WordsState::Running { .. });
-        let failed = matches!(self.words, WordsState::Failed(_));
-        let about = match &self.words {
+    /// A key was stored or removed, or the keychain answered: the sentence field says whether
+    /// it can be used, and the table draws again only when that changed.
+    fn key_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let needs_key = Models::needs_key(cx);
+        if needs_key == self.needs_key {
+            return;
+        }
+        self.needs_key = needs_key;
+        self.words_editor.update(cx, |editor, cx| {
+            editor.set_placeholder_text(words_placeholder(needs_key), window, cx)
+        });
+        cx.notify();
+    }
+
+    /// What the sentence field's tooltip says: why the last call failed, else that the field
+    /// needs a key while none is stored, else what a sentence sends and to which model.
+    fn words_about(&self, cx: &App) -> String {
+        match &self.words {
             WordsState::Failed(why) => why.clone(),
+            _ if self.needs_key => models::needs_key_tip("Filter in words"),
             _ => format!(
                 "Filter in words (↵): {} go to {}",
                 words::TASK.sends,
                 Models::model_for(words::TASK.tier, cx)
             ),
-        };
+        }
+    }
+
+    /// The toolbar's sentence field (spec 019): a search field with the model's mark, its
+    /// spinner while the call is out, and the field's red line when the call failed; the
+    /// answer's filters are the bar's pills. ↵ asks, Esc leaves. Without a key it says so,
+    /// empty, and in its tooltip, before a sentence is typed.
+    fn render_words_field(&self, cx: &mut Context<Self>) -> AnyElement {
+        let running = matches!(self.words, WordsState::Running { .. });
+        let failed = matches!(self.words, WordsState::Failed(_));
+        let about = self.words_about(cx);
         studio_ui::ds::pill_field("filter-words", failed, cx)
             .key_context("FilterWords")
             // As wide as a search field where there is room, and the first to give way where
@@ -10232,6 +10289,8 @@ impl TypeTable {
         let menu_open = self.header_menu.is_some();
         // The header and every line draw the same places: the columns in view and gaps.
         let drawn = Rc::new(self.drawn_columns(window, cx));
+        #[cfg(test)]
+        self.frames_rows_drawn.push(Vec::new());
         let column_widths: Vec<Pixels> = self
             .columns
             .iter()
@@ -10440,10 +10499,14 @@ impl TypeTable {
                     // out, for the rows these lines show, not every row between their first
                     // and last: grouped, a folded section's rows are on no line.
                     this.frame_line_range = Some(range.clone());
+                    this.frame_rows_drawn = this.rows_drawn(&drawn, window, cx);
                     this.drawn(window, cx);
                     #[cfg(test)]
                     {
                         this.frame_drawn = drawn.to_vec();
+                        if let Some(frame) = this.frames_rows_drawn.last_mut() {
+                            *frame = this.frame_rows_drawn.clone();
+                        }
                     }
                     let Some(lines) = this.frame_lines.clone() else {
                         if this.more_error.is_none()
@@ -11598,6 +11661,9 @@ impl TypeTable {
                         cell.child(self.render_row_check(ix, &row.id, cx))
                     })
                     .into_any_element(),
+                GridPlace::Column(col) if self.frame_rows_drawn.get(col) == Some(&false) => {
+                    div().into_any_element()
+                }
                 GridPlace::Column(col) => self.render_cell(ix, col, row, window, cx),
                 GridPlace::Gap(_) => div().into_any_element(),
             })
@@ -11703,24 +11769,63 @@ impl TypeTable {
         cx.notify();
     }
 
-    /// The columns rows draw this frame: the pinned first, those in the horizontal view with
-    /// one either side, the cursor's and the edited cell's. A row lays out each cell it draws,
-    /// so a wide type would otherwise pay for every column on every scroll
-    /// (`docs/drawing.md`). Worked out as the frame is drawn, so the header draws the same.
+    /// The columns this frame's header and lines have places for, and the reads ask about:
+    /// the pinned first, those the window's width would show with one either side, the
+    /// cursor's and the edited cell's. A row lays out each cell it draws, so a wide type would
+    /// otherwise pay for every column on every scroll (`docs/drawing.md`); the rows draw the
+    /// cells of only those of these their own strip meets ([`Self::rows_drawn`]). Worked out
+    /// as the frame is drawn, before the grid is laid out, so the header draws the same.
     fn drawn_columns(&self, window: &Window, cx: &App) -> Vec<bool> {
+        self.drawn_columns_within(window.viewport_size().width, cx)
+    }
+
+    /// Of the columns `drawn` for the frame ([`Self::drawn_columns`]), those whose cells the
+    /// rows draw: the ones the scrolled part of the rows meets, by its width in this frame.
+    /// The window's width bounds the grid's before the grid is laid out, so the header and the
+    /// reads pick from it; but beside the sidebar and the inspector the grid is about half the
+    /// window, and every row drew the cells of several columns past its edge (with the
+    /// relationship columns there, a sixth of a scroll frame). The header's scrolled strip
+    /// tracks the table's horizontal scroll handle and comes before the rows in the view
+    /// ([`Self::render_header_row`], then the table), so GPUI has set the handle's bounds to
+    /// this frame's width of the scrolled part before the list asks for the lines to draw, also
+    /// when a dock closes beside the grid. The width read here is the part every row scrolls,
+    /// with the pinned column already left out. The header and every line keep the same
+    /// places; a column the rows leave out is an empty box as wide as it is, as a gap is.
+    fn rows_drawn(&self, drawn: &[bool], window: &Window, cx: &App) -> Vec<bool> {
+        let view = self
+            .table_state
+            .read(cx)
+            .horizontal_scroll_handle
+            .bounds()
+            .size
+            .width;
+        if view <= Pixels::ZERO || view >= window.viewport_size().width {
+            return drawn.to_vec();
+        }
+        let within = self.drawn_columns_within(view, cx);
+        drawn
+            .iter()
+            .zip(within)
+            .map(|(drawn, within)| *drawn && within)
+            .collect()
+    }
+
+    /// The columns drawn when the scrolled part of the grid is `width` wide: the pinned first,
+    /// those in view with one either side, the cursor's and the edited cell's.
+    fn drawn_columns_within(&self, width: Pixels, cx: &App) -> Vec<bool> {
         if self.columns.is_empty() {
             return Vec::new();
         }
         let handle = &self.table_state.read(cx).horizontal_scroll_handle;
-        // The scrolled part is never wider than the window, whose width is this frame's, also
-        // in the frame that resizes it; the offset is this frame's too, as a scroll draws again.
+        // `width` is this frame's: the window's, also in the frame that resizes it, or the
+        // scrolled strip's ([`Self::rows_drawn`]); the offset is this frame's too, as a scroll
+        // draws again.
         let scrolled: Vec<Pixels> = self
             .columns
             .iter()
             .skip(1)
             .map(|column| px(self.layout.width(column)))
             .collect();
-        let width = window.viewport_size().width;
         let content = scrolled.iter().fold(Pixels::ZERO, |sum, w| sum + *w);
         let shown_left = studio_ui::scrolled_within(-handle.offset().x, content, width);
         let shown = shown_left..shown_left + width;
@@ -13356,6 +13461,72 @@ mod tests {
             assert_eq!(table.paging.pinned.as_deref(), Some("c2"));
             assert!(table.editing.is_some(), "the edit stays");
         });
+    }
+
+    /// Without an OpenRouter key the sentence field says so before a sentence is typed: in the
+    /// empty field and in its tooltip. It follows the key when one is stored or removed.
+    /// Before, it read "Filter in words…" and named what a sentence sends, and said it needed
+    /// a key only once a sentence had been typed and sent.
+    #[gpui::test]
+    async fn the_sentence_field_says_it_needs_a_key_before_a_sentence_is_typed(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+            studio_settings::init_test(cx);
+            studio_settings::keep_changes_in_memory(cx);
+        });
+        // A model service nothing reaches: no call is made here.
+        let models = cx.update(|cx| {
+            Models::init_for_tests(Arc::new(http_client::BlockedHttpClient), None, cx)
+        });
+        let schema = "node Person {\n  slug: String @key\n  name: String\n}\n";
+        let session = session(schema, cx);
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session,
+                "Person".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let says = |cx: &mut VisualTestContext| {
+            table.update(cx, |table, cx| {
+                let empty = table
+                    .words_editor
+                    .update(cx, |editor, cx| editor.placeholder_text(cx));
+                (empty.unwrap_or_default(), table.words_about(cx))
+            })
+        };
+        let needs = (
+            "OpenRouter key needed · Filter in words".to_owned(),
+            "Filter in words needs an OpenRouter key. Add one in Settings, under Models."
+                .to_owned(),
+        );
+        assert_eq!(says(cx), needs, "no key is stored");
+
+        models
+            .update(cx, |models, cx| models.set_key("sk-or-test".into(), cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        let (empty, about) = says(cx);
+        assert_eq!(empty, "Filter in words…", "a key is stored");
+        assert!(
+            about.starts_with("Filter in words (↵): ") && about.contains(" go to "),
+            "{about}"
+        );
+
+        models
+            .update(cx, |models, cx| models.set_key(String::new(), cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(says(cx), needs, "the key is removed");
     }
 
     /// A sentence's order, grouping and columns are taken as a saved view's are: the columns it
@@ -16547,6 +16718,107 @@ mod tests {
             "every column fits now: {:?}",
             rows_drew(cx)
         );
+    }
+
+    /// The table in a narrower box than its window, as beside the sidebar and the inspector.
+    struct NarrowHost {
+        table: Entity<TypeTable>,
+        width: Pixels,
+    }
+
+    impl Render for NarrowHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .child(div().w(self.width).h_full().child(self.table.clone()))
+        }
+    }
+
+    /// Rows draw the cells of the columns their own view meets, not of every column the
+    /// window's width would show: in a grid half the window's width, the columns past its
+    /// edge are empty boxes in each row. When the grid widens with the window unchanged (a
+    /// dock closing beside it), the rows draw the columns it uncovers in that same frame.
+    #[gpui::test]
+    async fn rows_draw_the_cells_their_own_view_meets(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let properties: String = (1..=20).map(|i| format!("  p{i:02}: String?\n")).collect();
+        let schema = format!("node Person {{\n  slug: String @key\n{properties}}}\n");
+        let session = session(&schema, cx);
+        let (host, cx) = cx.add_window_view(|window, cx| {
+            let table = cx.new(|cx| {
+                TypeTable::new(
+                    WeakEntity::new_invalid(),
+                    session,
+                    "Person".into(),
+                    None,
+                    window,
+                    cx,
+                )
+            });
+            NarrowHost {
+                table,
+                width: px(600.),
+            }
+        });
+        cx.run_until_parked();
+        let table = host.read_with(cx, |host, _| host.table.clone());
+        let frame = |cx: &mut gpui::VisualTestContext| {
+            table.read_with(cx, |table, _| {
+                (table.frame_drawn.clone(), table.frame_rows_drawn.clone())
+            })
+        };
+        let (picked, rows) = frame(cx);
+        assert_eq!(picked.len(), 21);
+        assert!(
+            rows[0] && rows[1],
+            "the pinned column and the first: {rows:?}"
+        );
+        let past_the_edge: Vec<usize> = (0..21).filter(|&col| picked[col] && !rows[col]).collect();
+        assert!(
+            !past_the_edge.is_empty(),
+            "the window's width picks columns past the grid's edge: {picked:?} {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .zip(&picked)
+                .all(|(row, picked)| !row || *picked),
+            "the rows draw only columns the frame picked"
+        );
+        // A row's places stay the header's; a column it leaves out is an empty box.
+        table.read_with(cx, |table, _| {
+            let columns = table
+                .frame_places
+                .iter()
+                .filter(|place| matches!(place, GridPlace::Column(_)))
+                .count();
+            assert_eq!(columns, picked.iter().filter(|drawn| **drawn).count());
+        });
+
+        // The grid widens to the window's width, the window unchanged. The rows of the first
+        // frame after it draw what it uncovers: the reads it starts draw the grid again, and
+        // that later frame must not be what makes them right.
+        table.update(cx, |table, _| table.frames_rows_drawn.clear());
+        host.update(cx, |host, cx| {
+            host.width = px(6000.);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let frames = table.read_with(cx, |table, _| table.frames_rows_drawn.clone());
+        let first = frames.first().expect("the widened grid is drawn");
+        assert_eq!(
+            first.len(),
+            21,
+            "the frame's list asked for its lines: {frames:?}"
+        );
+        assert!(
+            past_the_edge.iter().all(|&col| first[col]),
+            "the frame that widens the grid draws what it uncovers: {first:?} of {frames:?}"
+        );
+        let (picked, rows) = frame(cx);
+        assert_eq!(rows, picked);
     }
 
     /// A row put in or taken out moves the rows after it: the places drawn hold other rows

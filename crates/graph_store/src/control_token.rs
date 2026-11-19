@@ -50,11 +50,9 @@ impl PlaneHandle {
     }
 }
 
-/// A managed cluster's token source: the control plane's data token while it holds a sign-in,
-/// else the CLI's. While the plane holds a sign-in it is preferred over the cluster's own, so one
-/// sign-in serves every organization's clusters (spec 021); without one it is the managed
-/// target's login, as the CLI's is, and the cluster's own sign-in is preferred where its 401
-/// offers one (spec 016).
+/// A managed cluster's data token from Studio's sign-in to its control plane. A manually
+/// selected CLI target can also supply its own credential when the plane is signed out
+/// (specs 016, 021).
 pub(crate) struct ControlTokenSource {
     /// The CLI's export for the target, when a CLI target names the cluster.
     cli: Option<Arc<dyn TokenSource>>,
@@ -117,6 +115,11 @@ impl ControlTokenSource {
             incarnation,
             endpoint,
         )
+    }
+
+    /// A refusal of the previous account's token does not delay the new account's first ask.
+    pub(crate) fn forget_refusal(&self) {
+        self.refused.store(false, Ordering::SeqCst);
     }
 
     fn with(
@@ -185,6 +188,14 @@ impl TokenSource for ControlTokenSource {
                 why: format!("The control plane gave no data token: {error}"),
                 passing: error.is_passing(),
             })?;
+            if let Some(answered) = &answer.meta.cluster_id
+                && *answered != cluster_id
+            {
+                return Err(NoToken {
+                    why: "The control plane gave a data token for a different cluster".into(),
+                    passing: false,
+                });
+            }
             // The answer names the incarnation its token is for. Another one is the cluster made
             // again under its id: not the one opened, so its token is dropped, as one for
             // another endpoint is.
@@ -198,11 +209,11 @@ impl TokenSource for ControlTokenSource {
         .boxed()
     }
 
-    /// Held back as a managed login is, whether or not a profile names it, only while the
-    /// control plane holds no sign-in: then a cluster whose 401 offers its own sign-in is signed
-    /// in to instead (spec 016). With one, the plane's data token is taken at once (spec 021).
+    /// A manually selected CLI target may use the server’s sign-in when the plane has none.
+    /// A control-plane connection always asks the plane and sends nothing to the data server
+    /// when Studio has no sign-in there.
     fn waits_for_server_sign_in(&self) -> bool {
-        self.plane.held().is_none()
+        self.cli.is_some() && self.plane.held().is_none()
     }
 
     fn login_profile(&self) -> Option<String> {
