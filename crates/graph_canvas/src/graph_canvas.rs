@@ -1854,6 +1854,9 @@ impl GraphCanvas {
         if let Some(start) = self.positions.first() {
             self.center = *start;
         }
+        // The view is a place, not a fit: a resize (the inspector opening) keeps it, as it
+        // keeps a view the person placed.
+        self.camera_touched = true;
     }
 
     /// Moves the view just enough to show the selected chip whole in `viewport`, at the zoom
@@ -4027,12 +4030,16 @@ impl Render for GraphCanvas {
             // still shows the one it replaces.
             let fit = self.fit_pending && self.layout_task.is_none();
             if fit || (resized && !self.camera_touched) {
-                if self.fit_pending {
+                let asked = self.fit_pending;
+                if asked {
                     self.camera_touched = false;
                 }
                 self.glide = None;
                 self.fit(viewport);
-                self.keep_change_readable();
+                // Only the fit a new layout asked for: a resize refits as it fits.
+                if asked {
+                    self.keep_change_readable();
+                }
             } else if self.drawn_size.is_some_and(|size| size != viewport.size) {
                 // The person placed the view, so it is not fitted again; what is selected
                 // stays in sight, as when the inspector opens beside the canvas.
@@ -5712,6 +5719,56 @@ mod tests {
                 Item::tab_title(canvas, cx).as_ref(),
                 "Change: tentative/ingest @ h2"
             );
+        });
+    }
+
+    /// A change's outline, which the UI tools read (spec 032), names each changed relationship
+    /// between its ends, one from a node to itself too; and the first view, made readable,
+    /// stays where it is when the canvas is resized, as a view the person placed does.
+    #[gpui::test]
+    async fn a_changes_outline_names_every_relationship(cx: &mut gpui::TestAppContext) {
+        cx.update(studio_theme::init_test);
+        let (session, _served) = graph_store::test_server::followed_session(
+            "node Person {\n  slug: String @key\n  name: String\n}\n",
+            |_| serde_json::json!([]),
+            cx,
+        );
+        cx.run_until_parked();
+        let mut change = ingest_change("h1");
+        change.links.push(studio_actions::graph::ChangeLink {
+            from: 1,
+            to: 1,
+            words: "follows up".into(),
+            change: ChangeMark::Added,
+        });
+        let (canvas, cx) =
+            cx.add_window_view(|_, cx| GraphCanvas::with_change(session, &change, cx));
+        settle(cx);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        canvas.read_with(cx, |canvas, cx| {
+            let outline = canvas.outline_of(cx).expect("an outline");
+            let meeting = ("Meeting".to_owned(), "m1".to_owned());
+            assert_eq!(outline.edges.len(), 5, "{:?}", outline.edges);
+            assert!(
+                outline
+                    .edges
+                    .iter()
+                    .any(|edge| edge.from == meeting && edge.to == meeting),
+                "the meeting's relationship to itself"
+            );
+            assert!(canvas.camera_touched || !canvas.fit_pending);
+        });
+        // A view made readable is kept through a resize; a fitted one is fitted again.
+        let kept = canvas.update(cx, |canvas, _| {
+            canvas.zoom = CHANGE_MIN_ZOOM;
+            canvas.camera_touched = true;
+            (canvas.zoom, canvas.center)
+        });
+        cx.simulate_resize(gpui::size(px(700.), px(500.)));
+        settle(cx);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        canvas.read_with(cx, |canvas, _| {
+            assert_eq!((canvas.zoom, canvas.center), kept, "the view stays");
         });
     }
 

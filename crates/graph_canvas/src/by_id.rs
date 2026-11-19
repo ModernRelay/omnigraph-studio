@@ -262,6 +262,17 @@ impl GraphCanvas {
             .collect();
         let mut edges = Vec::new();
         for edge in &scene.edges {
+            // A changed relationship to itself hangs off its node alone (spec 042).
+            if let (Some(node), SceneKind::Link { itself: true, .. }) =
+                (node_of(edge.from), &scene.nodes[edge.to].kind)
+            {
+                edges.push(OutlineEdge {
+                    from: pair(node),
+                    to: pair(node),
+                    relationship: None,
+                });
+                continue;
+            }
             match (&scene.nodes[edge.from].kind, node_of(edge.to)) {
                 (SceneKind::Hub { key, .. }, Some(to)) => edges.push(OutlineEdge {
                     from: pair(&key.node),
