@@ -167,6 +167,9 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
   and kept until a commit lands on the branch or the branch changes; then read again only
   while the picker is open, which shows them as they come. A tab that never opens it reads no
   commits. A commit pins reads (`QueryRequest.snapshot`) and refuses writes; the head unpins.
+  Since spec 037 it also lists the other branches ("Read on another branch"): one chosen puts
+  the tab on it, reading its head and writing there whatever the window's branch, and the
+  window's ("main · the window's") puts it back.
 - Hover goes through Zed's `SemanticsProvider` (`query_editor::hover`), the rest of which
   answers that it has nothing, with `gq_language::hover`: `$p: Person · node`, `$name: String
   · parameter`, `Person.born: Date?`, `node Person · 6 properties`, `worksAt: Person →

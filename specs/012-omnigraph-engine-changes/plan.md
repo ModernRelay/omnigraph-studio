@@ -286,6 +286,18 @@ new branch's first manifest names that commit's table pins and lineage, publishe
 009. *Today:* History opens a read-only query or table at a commit; a branch starts from a
 branch head.
 
+**E63. Which branches the policy protects.** Filed as
+[ModernRelay/omnigraph#1473](https://github.com/ModernRelay/omnigraph/issues/1473). A graph's
+policy names its `protected_branches` (every cookbook's `graph.policy.yaml` declares `[main]`),
+but `AccessOutput` (`actor_id`, `graph_wide`, `branch`, `target_branch`, `actions`, `client_id`
+at `v0.15.0`) and `GET /branches` (names, or `?detailed=true` details) say nothing of it, so a
+client cannot tell a branch edits should not go to directly from any other. Say which branches
+are protected, in `AccessOutput` (a `protected_branches` list, or `protected: bool` with
+`branch`) or in each detailed branch entry. Engine rule: it states what the installed policy
+declares and changes no decision; it is read with the same `read` gate as the access route.
+*Waits:* 037. *Today:* Studio treats `main` as protected in a window's session while the graph's
+`propose_changes` setting is on (the default), and an edit there starts a proposal branch.
+
 ### Writes
 
 **E25. A mutation that both adds and removes.** Rule D2 keeps one mutation constructive
@@ -611,6 +623,7 @@ Then engine changes still open:
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-11-19 | The access route and the branch list do not say which branches a policy protects (E63) | `crates/graph_client/openapi/omnigraph-0.15.0.json`: `AccessOutput`'s properties and `GET /graphs/{graph_id}/branches`; the eight cookbooks' graph policies (`policies/*.policy.yaml`) at ModernRelay/omnigraph-cookbooks `ce31d40` | `AccessOutput` has `actions`, `actor_id`, `branch`, `client_id`, `graph_id`, `graph_wide`, `target_branch`; the branch list names or details branches; all eight declare `protected_branches: [main]`. Filed as #1473 |
 | 2026-11-18 | What `v0.15.0` resolves, and a validation refusal's disposition (E9, E35 to E38, E54) | `docs/releases/v0.15.0.md` at the tag; `gh issue view` 969, 970, 972, 1157; mutations sent with curl to `v0.14.0` and `v0.15.0` release servers serving `script/dev-server`'s cluster plus a `MemberOf: Member -> Team @card(1..)` edge | E9 landed (#1012); E35 partly (#1201, #969 closed); #970, #972, #1157 open. A lone `Member` insert: 0.14 commits it, 0.15 answers 400 `@card violation … (min 1)` with `effects: unknown, action: reconcile`; with its `MemberOf` in the same mutation both commit. Deleting a required edge and an edge to a missing node answer the same disposition on both releases: E54 |
 | 2026-11-17 | Omnigraph `v0.15.0` needs no engine change from Studio | `openapi.json` at `v0.15.0` diffed with `v0.14.0`'s; the release notes (`gh release view v0.15.0`) | Contract still 0.14; no path, field or enum value removed; new fields (`ranking`, `details`, `client_id`) optional, one new error code (`not_admitted`). No new ID |
 | 2026-11-06 | A page of a wide, large type costs the server what it holds, not what it returns (E39) | `script/dev-big-server` (`v0.14.0`, `Account`: 95 columns, 100,000 rows), each read sent with curl, then Studio's snapshot tool with `OMNIGRAPH_STUDIO_TRACE` (`docs/perf/20261106-report.md`) | `order { $n.@id } limit 100` returning `$n`: 0.91 s; returning `$n.slug`: 0.08 s; `$n` unordered: 0.03 s; `$n.@id = $id`: 0.43 s; `$n.@id in $ids` (101): 0.46 s. Studio's first page: 947 ms of which 3.5 ms decoding. Filed as E39 |

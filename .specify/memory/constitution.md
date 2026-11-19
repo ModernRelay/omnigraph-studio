@@ -1,8 +1,8 @@
 # Omnigraph Studio constitution
 
-Version 1.5.2 · ratified 2026-10-11 · amended 2026-10-17 (IV: ↵ and Undo for what Studio can
+Version 1.6.0 · ratified 2026-10-11 · amended 2026-10-17 (IV: ↵ and Undo for what Studio can
 put back) · amended 2026-10-18 (IV: ↵ for what loses no data) · amended 2026-10-22 (I: the
-updater's requests) · amended 2026-10-24 (X: Omnigraph `v0.14.0` and later) · amended 2026-10-30 (I: model calls) · amended 2026-11-01 (XIII: one rule for what a pick does) · amended 2026-11-05 (I: control-plane calls) · amended 2026-11-10 (II, V: a view in front may take new data itself) · amended 2026-11-11 (I: telemetry's uploads) · amended 2026-11-14 (I: telemetry removed)
+updater's requests) · amended 2026-10-24 (X: Omnigraph `v0.14.0` and later) · amended 2026-10-30 (I: model calls) · amended 2026-11-01 (XIII: one rule for what a pick does) · amended 2026-11-05 (I: control-plane calls) · amended 2026-11-10 (II, V: a view in front may take new data itself) · amended 2026-11-11 (I: telemetry's uploads) · amended 2026-11-14 (I: telemetry removed) · amended 2026-11-19 (XIII: a tab on a branch of its own)
 
 Omnigraph Studio is a native desktop app for exploring and changing Omnigraph graphs: type
 tables, a relationship tree, a graph canvas, a `.gq` query editor, branches, review, merge and
@@ -104,12 +104,14 @@ with the machine and the data size.
 ## XIII. One rule for what a pick does
 
 The sidebar lists things, a tab is one view of one thing, and everything around the tab follows it.
-The top says which server, graph and branch; the left lists what there is; the center shows it; the
-right describes what is selected there; the bottom reports what ran.
+The top says which server and graph, and the window's branch, which a new tab takes; the left lists
+what there is; the center shows it; the right describes what is selected there; the bottom reports
+what ran. A tab opened from something on another branch is on that branch: it says so in its own
+header, and it reads and edits there.
 
 *In practice:* a sidebar row names a thing, never a view. A view holds only what can answer its
 question: Table a set, Tree a set or one node, Canvas and Page one node. A view is a tab, opened from
-the view strip of the tab it comes from, which stays. A view opened from a tab holding a commit holds that commit. A
+the view strip of the tab it comes from, which stays. A view opened from a tab holding a commit holds that commit, and one opened from a tab on a branch of its own is on that branch (spec 037). A
 new "how" control is a tab if it has state, selection or reads of its own, and a toggle only if it
 redraws the same state. Plan: `specs/020-ui-unification/plan.md`.
 
