@@ -358,6 +358,22 @@ pub(crate) fn session_recording_writes(
     (session, sent)
 }
 
+/// As [`session_routing`], every write's request body recorded, in order.
+pub(crate) fn session_routing_recording_writes(
+    schema: &str,
+    answer: impl Fn(&Value) -> Value + Send + Sync + 'static,
+    cx: &mut TestAppContext,
+) -> (Entity<GraphSession>, Arc<Mutex<Vec<Value>>>) {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let log = sent.clone();
+    let writes: Writes = Arc::new(move |request: &Value| {
+        log.lock().unwrap().push(request.clone());
+        (200, committed("c2", "c1"))
+    });
+    let session = serve_with(schema, Arc::new(answer), writes, None, cx);
+    (session, sent)
+}
+
 /// As [`session_recording_writes`], with another writer committing on the branch.
 pub(crate) fn session_followed_recording_writes(
     schema: &str,

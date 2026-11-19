@@ -1111,6 +1111,8 @@ impl RelationshipTree {
                 let key = (label.is_some() && (root || selected)).then(|| node.id.clone());
                 // One short edge value, right-aligned like a count; the tooltip has them all.
                 let hint = via.as_ref().and_then(|via| rows::edge_hint(&via.edge));
+                // What the node's type shows after its name (spec 044): `24.5 kg · estimated`.
+                let line = state.line(node).map(str::to_owned);
                 h_flex()
                     .min_w_0()
                     .flex_1()
@@ -1131,6 +1133,12 @@ impl RelationshipTree {
                                 .truncate(),
                         ),
                     )
+                    .children(line.map(|line| {
+                        div()
+                            .min_w(px(studio_ui::ds::size::SHORT_LABEL))
+                            .flex_shrink(1.)
+                            .child(studio_ui::ds::text::muted(line).truncate())
+                    }))
                     .children(key.map(|key| {
                         div()
                             .min_w(px(studio_ui::ds::size::SHORT_LABEL))
@@ -1207,6 +1215,14 @@ impl RelationshipTree {
                 let other = match key.group.direction {
                     gq_language::Direction::Outgoing => key.group.other_type.clone(),
                     gq_language::Direction::Incoming => format!("from {}", key.group.other_type),
+                    gq_language::Direction::Both => format!("with {}", key.group.other_type),
+                };
+                // The person's name for the relationship, "Blocks" (spec 044), with the type it
+                // reaches; else the edge and the way it runs.
+                let layout = state.layouts.get(&key.node.type_name);
+                let (title, other) = match graph_store::layout::group_title(layout, &key.group) {
+                    (name, true) => (name, key.group.other_type.clone()),
+                    (_, false) => (key.group.edge.clone(), other),
                 };
                 let count_label = match count {
                     Loadable::Loaded(n) => n.to_string(),
@@ -1232,7 +1248,7 @@ impl RelationshipTree {
                     .gap(px(space::SM))
                     .child(
                         div().min_w_0().flex_shrink(1.).child(
-                            studio_ui::ds::text::body(key.group.edge.clone())
+                            studio_ui::ds::text::body(title)
                                 .color(text_color)
                                 .truncate(),
                         ),
@@ -1380,6 +1396,9 @@ impl RelationshipTree {
                                     gq_language::Direction::Outgoing => key.group.edge.clone(),
                                     gq_language::Direction::Incoming => {
                                         format!("{} from {}", key.group.edge, key.group.other_type)
+                                    }
+                                    gq_language::Direction::Both => {
+                                        format!("{} with {}", key.group.edge, key.group.other_type)
                                     }
                                 })
                             }

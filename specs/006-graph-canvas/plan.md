@@ -315,6 +315,9 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
 
 ## Corrections
 
+- 2026-11-19 · Fit drew a wide walk as marks (the cookbook study's dev D2). It now stops where
+  chips still say their names, and Fit again shows the whole walk; a chip shows its type's line
+  under its name, and a hub the person's name for its relationship (spec 044).
 - 2026-10-13 · A resize redrew the whole window on the next frame (`window.refresh`), which
   turns off every cached tab and dock, on each frame of a dock's glide. It now asks for the
   canvas view alone (`request_animation_frame`).

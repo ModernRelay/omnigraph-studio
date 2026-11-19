@@ -8,8 +8,11 @@ use gpui::{
 use graph_store::GraphSession;
 use serde_json::json;
 use studio_actions::{ViewKind, ViewLink};
+use studio_ui::ds::Tipped as _;
+use studio_ui::menu::ContextMenu;
 use studio_workspace::{Inspected, InspectedNode, Item, ItemEvent, SavedItem};
 use ui::prelude::*;
+use ui::{PopoverMenu, PopoverMenuHandle};
 
 use crate::peek::NodePeek;
 
@@ -29,7 +32,11 @@ pub struct NodePage {
     toolbar: (bool, bool),
     /// The related node selected on the page as the inspector was last told of it.
     selected: Option<InspectedNode>,
+    /// The menu that shapes how the node's type reads (spec 044).
+    layout_menu: PopoverMenuHandle<ContextMenu>,
+    session: Entity<GraphSession>,
     _subscription: Subscription,
+    _layout: Subscription,
 }
 
 impl NodePage {
@@ -43,8 +50,15 @@ impl NodePage {
     ) -> Self {
         let view = {
             let (type_name, id, at_commit) = (type_name.clone(), id.clone(), at_commit.clone());
+            let session = session.clone();
             cx.new(|cx| NodePeek::page(session, type_name, id, at_commit, cx))
         };
+        // The layout menu's checks follow the type's layout.
+        let layout = cx.subscribe(&session, |_, _, event, cx| {
+            if let graph_store::SessionEvent::LayoutChanged { .. } = event {
+                cx.notify();
+            }
+        });
         // The tab's title is the node's label once it is read, and its dot says newer data:
         // the tab is told when either changes, not at each change of the view, which draws
         // itself.
@@ -80,7 +94,10 @@ impl NodePage {
             tab: (String::new(), false),
             toolbar: (true, false),
             selected: None,
+            layout_menu: PopoverMenuHandle::default(),
+            session,
             _subscription: subscription,
+            _layout: layout,
         };
         page.tab = (page.title(cx), page.view.read(cx).is_newer());
         page.toolbar = page.toolbar_state(cx);
@@ -227,6 +244,7 @@ impl NodePage {
             .child(div().flex_1())
             .child(
                 studio_ui::ds::toolbar_actions()
+                    .child(self.render_layout_menu())
                     // The eye shows only when it changes something, as on a tree.
                     .when(hide_empty || any_empty, |row| {
                         row.child(
@@ -246,11 +264,161 @@ impl NodePage {
     }
 }
 
+impl NodePage {
+    /// The menu that shapes how the node's type reads (spec 044): the property its page leads
+    /// with, what its rows show after their names, and whether its table reads as cards. Each
+    /// choice is the type's in this graph, wherever it shows.
+    fn render_layout_menu(&self) -> impl IntoElement {
+        let open = self.layout_menu.is_deployed();
+        let session = self.session.clone();
+        let type_name = self.type_name.clone();
+        PopoverMenu::new("node-page-layout")
+            .anchor(gpui::Anchor::TopRight)
+            .with_handle(self.layout_menu.clone())
+            .trigger(
+                studio_ui::ds::row_icon_button("node-page-layout-button", IconName::Reader)
+                    .icon_color(Color::Muted)
+                    .toggle_state(open)
+                    .when(!open, |button| {
+                        let tip = format!("Shape how {} reads", self.type_name);
+                        button.tip_fn(move |_, cx| {
+                            studio_ui::ds::tooltip_for_action_view(
+                                tip.clone(),
+                                &studio_actions::node::ShapeType,
+                                cx,
+                            )
+                        })
+                    }),
+            )
+            .menu(move |window, cx| {
+                let (session, type_name) = (session.clone(), type_name.clone());
+                let schema = session.read(cx).schema_model()?;
+                let node = schema.node(&type_name)?.clone();
+                let layout = session
+                    .read(cx)
+                    .layout(&type_name)
+                    .cloned()
+                    .unwrap_or_default();
+                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                    layout_menu(menu, &session, &node, &layout)
+                }))
+            })
+    }
+
+    fn shape_type(
+        &mut self,
+        _: &studio_actions::node::ShapeType,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.layout_menu.toggle(window, cx);
+    }
+}
+
+/// The entries of the menu that shapes how `node`'s type reads, as `layout` has it.
+pub(crate) fn layout_menu(
+    menu: ContextMenu,
+    session: &Entity<GraphSession>,
+    node: &gq_language::NodeType,
+    layout: &studio_settings::TypeLayout,
+) -> ContextMenu {
+    let (weak, type_name) = (session.downgrade(), node.name.clone());
+    let change = move |change: Box<dyn Fn(&mut studio_settings::TypeLayout)>| {
+        let (session, type_name) = (weak.clone(), type_name.clone());
+        let change: std::rc::Rc<dyn Fn(&mut studio_settings::TypeLayout)> = change.into();
+        move |_: &mut Window, cx: &mut App| {
+            let change = change.clone();
+            if let Some(session) = session.upgrade() {
+                GraphSession::change_layout(&session, &type_name, move |layout| change(layout), cx);
+            }
+        }
+    };
+    let shown: Vec<String> = node
+        .properties
+        .iter()
+        .filter(|p| p.projectable() && !p.is_key)
+        .map(|p| p.name.clone())
+        .collect();
+    let (lead, line) = (layout.lead.clone(), layout.line.clone());
+    let lead_choices = shown.clone();
+    let line_choices = shown;
+    let lead_change = change.clone();
+    let line_change = change.clone();
+    let table_change = change.clone();
+    let reading = layout.reading;
+    menu.header(format!("How {} reads", node.name))
+        .submenu("Lead its page with", move |mut menu, _, _| {
+            menu = menu.toggleable_entry(
+                "Its properties in schema order",
+                lead.is_none(),
+                IconPosition::Start,
+                None,
+                lead_change(Box::new(|layout| layout.lead = None)),
+            );
+            for property in &lead_choices {
+                let chosen = property.clone();
+                menu = menu.toggleable_entry(
+                    property.clone(),
+                    lead.as_ref() == Some(property),
+                    IconPosition::Start,
+                    None,
+                    lead_change(Box::new(move |layout| layout.lead = Some(chosen.clone()))),
+                );
+            }
+            menu
+        })
+        .submenu("Show after its rows' names", move |mut menu, _, _| {
+            menu = menu.toggleable_entry(
+                "Nothing",
+                line.is_empty(),
+                IconPosition::Start,
+                None,
+                line_change(Box::new(|layout| layout.line.clear())),
+            );
+            for property in &line_choices {
+                let toggled = property.clone();
+                menu = menu.toggleable_entry(
+                    property.clone(),
+                    line.contains(property),
+                    IconPosition::Start,
+                    None,
+                    line_change(Box::new(move |layout| layout.toggle_line(&toggled))),
+                );
+            }
+            menu.keep_open_on_confirm(true)
+        })
+        .submenu("Its table reads as", move |menu, _, _| {
+            menu.toggleable_entry(
+                "A grid",
+                !reading,
+                IconPosition::Start,
+                None,
+                table_change(Box::new(|layout| layout.reading = false)),
+            )
+            .toggleable_entry(
+                "Cards",
+                reading,
+                IconPosition::Start,
+                None,
+                table_change(Box::new(|layout| layout.reading = true)),
+            )
+        })
+        .separator()
+        .item(
+            studio_ui::menu::ContextMenuEntry::new(format!("Reset how {} reads", node.name))
+                .disabled(layout.is_empty())
+                .handler(change(Box::new(|layout| {
+                    *layout = studio_settings::TypeLayout::default()
+                }))),
+        )
+}
+
 impl Render for NodePage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .id("node-page")
             .key_context("NodePage")
+            .on_action(cx.listener(Self::shape_type))
             .size_full()
             .bg(studio_ui::ds::surface::document(cx))
             .child(self.render_toolbar(cx))

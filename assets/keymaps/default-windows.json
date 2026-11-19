@@ -276,7 +276,8 @@
       "ctrl-alt-backspace": "studio_table::ClearFilters",
       "ctrl-alt-s": "studio_table::SaveView",
       "ctrl-shift-s": "studio_table::SaveViewAsNew",
-      "ctrl-alt-z": "studio_table::RevertView"
+      "ctrl-alt-z": "studio_table::RevertView",
+      "ctrl-alt-r": "studio_table::ToggleReadingLayout"
     }
   },
   {
@@ -319,7 +320,10 @@
   {
     "context": "NodePage && !Editor",
     "bindings": {
-      "space": "studio::ToggleInspector"
+      "space": "studio::ToggleInspector",
+      "alt-up": "studio_node::MoveRelationshipUp",
+      "alt-down": "studio_node::MoveRelationshipDown",
+      "ctrl-alt-l": "studio_node::ShapeType"
     }
   },
   {

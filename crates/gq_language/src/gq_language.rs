@@ -10,6 +10,7 @@ pub mod check;
 pub mod complete;
 pub mod input;
 pub mod lex;
+pub mod line;
 pub mod params;
 pub mod parts;
 pub mod schema;
@@ -21,6 +22,7 @@ pub use lex::{
     Declaration, Outline, Statement, Token, TokenKind, looks_like_mutation, outline, outline_of,
     problem_range, tokenize,
 };
+pub use line::line_text;
 pub use params::param_value;
 pub use parts::{PartKind, QueryPart, operator_parts, query_parts};
 pub use schema::{

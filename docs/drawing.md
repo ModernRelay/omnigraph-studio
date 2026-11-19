@@ -71,6 +71,7 @@ the interaction and asserts the count:
 | --- | --- |
 | `type_table` `typing_in_a_field_leaves_the_grid_as_it_was` | The grid follows the table's `notify`; typing in the filter field or a cell does not draw it |
 | `type_table` `rows_draw_only_the_columns_in_view` | A 21-column type draws the pinned column and those in view; scrolled to the end, the last; the cursor's column always; a line lays out one gap for the rest, as wide as they are; widened, every column in the frame of the resize |
+| `type_table` `a_type_read_as_cards_draws_its_rows_as_cards` | A type read as cards (spec 044) draws them in the grid's cached part: typing in the filter field draws no card |
 | `type_table` `rows_draw_the_cells_their_own_view_meets` | In a grid half its window's width, rows leave the columns past its edge empty that the window's width picks; widened with the window unchanged, the first frame after it draws them |
 | `query_editor` `a_wide_result_draws_only_the_columns_in_view` | A 60-column result draws the columns in view and one gap for the rest, as wide as they are; scrolled to the end, the last |
 | `query_editor` `typing_in_the_query_leaves_the_results_as_they_were` | The result area follows the tab's `notify`; typing in the query does not draw it |

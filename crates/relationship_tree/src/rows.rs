@@ -274,7 +274,7 @@ pub fn bucket_row_text(
                 gq_language::builder::parse_relationship_key(&within.by.property)?;
             let edge = schema?.edge(edge)?;
             Some(match direction {
-                Direction::Outgoing => edge.to.clone(),
+                Direction::Outgoing | Direction::Both => edge.to.clone(),
                 Direction::Incoming => edge.from.clone(),
             })
         });

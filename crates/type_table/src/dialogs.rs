@@ -1836,6 +1836,116 @@ impl Render for SaveViewModal {
     }
 }
 
+/// What a node type's pages and trees call one of its relationships (spec 044): "Blocks" for
+/// `blockedBy ← Issue`. Kept for this graph in the person's settings; an empty name lets the
+/// schema's name back.
+pub struct NameRelationshipModal {
+    session: Entity<GraphSession>,
+    type_name: String,
+    key: String,
+    schema_title: String,
+    name: Entity<Editor>,
+    _subscription: Subscription,
+}
+
+impl EventEmitter<DismissEvent> for NameRelationshipModal {}
+
+impl ModalView for NameRelationshipModal {}
+
+impl Focusable for NameRelationshipModal {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.name.focus_handle(cx)
+    }
+}
+
+impl NameRelationshipModal {
+    pub fn new(
+        session: Entity<GraphSession>,
+        type_name: String,
+        key: String,
+        schema_title: String,
+        current: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let name = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Name, for example Blocks", window, cx);
+            if let Some(current) = &current {
+                editor.set_text(current.clone(), window, cx);
+                editor.select_all(&editor::actions::SelectAll, window, cx);
+            }
+            editor
+        });
+        let subscription = cx.subscribe(&name, |_, _, event: &EditorEvent, cx| {
+            if let EditorEvent::BufferEdited = event {
+                cx.notify();
+            }
+        });
+        Self {
+            session,
+            type_name,
+            key,
+            schema_title,
+            name,
+            _subscription: subscription,
+        }
+    }
+
+    fn entered(&self, cx: &App) -> String {
+        self.name.read(cx).text(cx).trim().to_owned()
+    }
+
+    fn submit(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let (name, key) = (self.entered(cx), self.key.clone());
+        GraphSession::change_layout(
+            &self.session,
+            &self.type_name,
+            move |layout| layout.rename(&key, &name),
+            cx,
+        );
+        cx.emit(DismissEvent);
+    }
+}
+
+impl Render for NameRelationshipModal {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let name = self.entered(cx);
+        modal(cx)
+            .key_context("NameRelationshipModal")
+            .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| this.submit(window, cx)))
+            .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
+            .child(
+                ModalHeader::new(format!("Name {}", self.schema_title))
+                    .description(SharedString::from(format!(
+                        "What {}'s pages and trees call it, in your words. Kept for this graph \
+                         in your settings; left empty, it is called {} again.",
+                        self.type_name, self.schema_title
+                    )))
+                    .on_close(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
+            )
+            .child(modal_body().child(field_box(&self.name, false, cx)))
+            .child(
+                modal_footer(cx)
+                    .child(
+                        cancel_button("cancel-name")
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
+                    )
+                    .child(
+                        action_button(
+                            "save-name",
+                            if name.is_empty() {
+                                "Use the schema's"
+                            } else {
+                                "Name it"
+                            },
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
+                    ),
+            )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

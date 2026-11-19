@@ -39,6 +39,7 @@ use studio_actions::table::{
     ExpandCell, FillColumn, FilterBySelection, FilterInWords, InsertRow, MoveDown, MoveLeft,
     MoveRight, MoveUp, OpenRowPage, RefreshTable, RevertView, SaveDrafts, SaveView, SaveViewAsNew,
     SelectNextSuggestion, SelectPreviousSuggestion, ShowRowOnCanvas, StageEdit,
+    ToggleReadingLayout,
 };
 use studio_actions::workspace::ToggleInspector;
 use studio_actions::{ViewKind, ViewLink};
@@ -1000,6 +1001,8 @@ fn direction_icon(direction: gq_language::Direction) -> IconName {
     match direction {
         gq_language::Direction::Outgoing => IconName::ArrowRight,
         gq_language::Direction::Incoming => IconName::ArrowLeft,
+        // A table filters and groups by the schema's relationships, each one way.
+        gq_language::Direction::Both => IconName::ArrowRight,
     }
 }
 
@@ -1067,6 +1070,9 @@ pub struct TypeTable {
     /// ([`Self::frame_rows_drawn`] as the frame's last call for lines left it), oldest first.
     #[cfg(test)]
     frames_rows_drawn: Vec<Vec<bool>>,
+    /// How many times the cards' lines were asked for (spec 044), for the drawing guard.
+    #[cfg(test)]
+    cards_drawn: usize,
     /// A column being dragged wider or narrower: its key, and where the pointer and the column's
     /// width were when the drag began.
     resizing: Option<ColumnResize<String>>,
@@ -1568,6 +1574,8 @@ impl TypeTable {
             frame_drawn: Vec::new(),
             #[cfg(test)]
             frames_rows_drawn: Vec::new(),
+            #[cfg(test)]
+            cards_drawn: 0,
             frame_now: chrono::Local::now(),
             frame_minute: 0,
             grid,
@@ -1735,6 +1743,8 @@ impl TypeTable {
             }
             SessionEvent::DraftsChanged => self.drafts_changed(cx),
             SessionEvent::CredentialChanged => self.credential_changed(cx),
+            // The type reads as cards, or as a grid again (spec 044).
+            SessionEvent::LayoutChanged { .. } => cx.notify(),
             SessionEvent::PropertiesWritten {
                 branch,
                 parent,
@@ -3608,6 +3618,10 @@ impl TypeTable {
                 let views = views.clone();
                 let active = active.clone();
                 let table = table.clone();
+                let cards_table = table.clone();
+                let reads_as_cards = table
+                    .upgrade()
+                    .is_some_and(|table| table.read(cx).cards_chosen(cx));
                 let graph = graph.clone();
                 let type_name = type_name.clone();
                 let names = names.clone();
@@ -3658,6 +3672,24 @@ impl TypeTable {
                         menu = menu.separator().submenu("Name rows by", move |menu, _, _| {
                             studio_ui::node_names::add_to(menu, &names)
                         });
+                        let table = cards_table.clone();
+                        menu = menu.toggleable_entry(
+                            "Read as cards",
+                            reads_as_cards,
+                            IconPosition::Start,
+                            Some(Box::new(ToggleReadingLayout)),
+                            move |window, cx| {
+                                table
+                                    .update(cx, |table, cx| {
+                                        table.toggle_reading_layout(
+                                            &ToggleReadingLayout,
+                                            window,
+                                            cx,
+                                        )
+                                    })
+                                    .ok();
+                            },
+                        );
                     }
                     menu
                 }))
@@ -8023,6 +8055,11 @@ impl TypeTable {
     }
 
     fn on_edit(&mut self, _: &EditCell, window: &mut Window, cx: &mut Context<Self>) {
+        // A card has no cell to edit: ↵ opens its node's page, where every value edits.
+        if self.reads_as_cards(cx) {
+            self.on_open_row_page(&OpenRowPage, window, cx);
+            return;
+        }
         let Some(cursor) = self
             .cursor
             .or_else(|| (!self.rows.is_empty()).then_some(Cursor { row: 0, col: 0 }))
@@ -10187,6 +10224,152 @@ impl TypeTable {
         )
     }
 
+    /// Whether the person chose to read this node type as cards (spec 044).
+    fn cards_chosen(&self, cx: &App) -> bool {
+        self.kind == TableKind::Node
+            && self
+                .session
+                .read(cx)
+                .layout(&self.type_name)
+                .is_some_and(|layout| layout.reading)
+    }
+
+    /// Whether the rows draw as cards: chosen, and the table not grouped, whose sections are a
+    /// grid's.
+    fn reads_as_cards(&self, cx: &App) -> bool {
+        self.grouping.is_none() && self.cards_chosen(cx)
+    }
+
+    /// Reads the type's rows as cards, or as a grid again, wherever the type's table shows.
+    fn toggle_reading_layout(
+        &mut self,
+        _: &ToggleReadingLayout,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.kind != TableKind::Node {
+            return;
+        }
+        GraphSession::change_layout(
+            &self.session,
+            &self.type_name,
+            |layout| layout.reading = !layout.reading,
+            cx,
+        );
+    }
+
+    /// The rows as cards (spec 044): each node's name and line, its text wrapped over a few
+    /// lines rather than cut at a column's edge, then its short values. A card is the height of
+    /// [`CARD_LINES`] of text, so the list stays uniform and scrolls as the grid does; the
+    /// cursor's row is the selected card, and ↵ or a double click opens the node's page.
+    fn render_cards(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let _ = window;
+        let count = self.rows.len();
+        let scroll = self.table_state.read(cx).scroll_handle.clone();
+        gpui::uniform_list(
+            "type-table-cards",
+            count,
+            cx.processor(move |this, range: Range<usize>, _window: &mut Window, cx| {
+                #[cfg(test)]
+                {
+                    this.cards_drawn += 1;
+                }
+                if this.more_error.is_none()
+                    && this
+                        .paging
+                        .wants_more(this.rows.len(), range.end, this.loading_more)
+                {
+                    cx.defer_in(_window, |this, _, cx| this.load_more(cx));
+                }
+                range.map(|ix| this.render_card(ix, cx)).collect()
+            }),
+        )
+        .track_scroll(&scroll)
+        .size_full()
+        .into_any_element()
+    }
+
+    /// Row `ix` as a card.
+    fn render_card(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let Some(row) = self.rows.get(ix) else {
+            return div().into_any_element();
+        };
+        let schema = self.schema.clone();
+        let node = schema
+            .as_deref()
+            .and_then(|schema| schema.node(&self.type_name));
+        let layout = self.session.read(cx).layout(&self.type_name).cloned();
+        let card = card_parts(node, layout.as_ref(), row);
+        let selected = self.cursor.is_some_and(|cursor| cursor.row == ix);
+        let selected_bg = studio_ui::ds::surface::selected_document(cx);
+        let hover_bg = studio_ui::ds::surface::hover(cx);
+        let line_height = card_line(cx);
+        v_flex()
+            .id(("type-table-card", ix))
+            .h(px(card_height(cx)))
+            .w_full()
+            .overflow_hidden()
+            .px(px(space::PAGE))
+            .py(px(space::MD))
+            .gap(px(space::XS))
+            .border_b_1()
+            .border_color(studio_ui::ds::surface::rule(cx))
+            .hover(move |style| style.bg(hover_bg))
+            .when(selected, |card| card.bg(selected_bg))
+            .when(row.dimmed, |card| {
+                card.opacity(studio_ui::ds::opacity::DIMMED)
+            })
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                let col = this.cursor.map_or(0, |cursor| cursor.col);
+                this.set_cursor(Cursor { row: ix, col }, cx);
+                if event.click_count() >= 2 {
+                    this.open_row_page(ix, window, cx);
+                }
+            }))
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .gap(px(space::SM))
+                    .child(studio_ui::type_swatch(&self.type_name, cx))
+                    .child(
+                        div().min_w_0().flex_shrink(1.).child(
+                            studio_ui::ds::text::body(card.title)
+                                .weight(studio_ui::ds::text::weight::HEADING)
+                                .truncate(),
+                        ),
+                    )
+                    .children(card.line.map(|line| {
+                        div()
+                            .min_w_0()
+                            .flex_shrink(1.)
+                            .child(studio_ui::ds::text::muted(line).truncate())
+                    })),
+            )
+            .children(card.text.map(|text| {
+                div()
+                    .w_full()
+                    .h(px(line_height * CARD_LINES as f32))
+                    .overflow_hidden()
+                    .text_size(studio_ui::ds::text::body_size(cx))
+                    .line_height(px(line_height))
+                    .child(studio_ui::ds::text::body(text).line_clamp(CARD_LINES))
+            }))
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .gap(px(space::LG))
+                    .overflow_hidden()
+                    .children(card.values.into_iter().map(|(name, value)| {
+                        h_flex()
+                            .flex_none()
+                            .gap(px(space::XS))
+                            .child(studio_ui::ds::text::meta(name).single_line())
+                            .child(studio_ui::ds::text::body(value).single_line())
+                    })),
+            )
+            .into_any_element()
+    }
+
     fn render_body(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         self.frame_now = chrono::Local::now();
         self.frame_minute = self.frame_now.timestamp().div_euclid(60);
@@ -10261,6 +10444,9 @@ impl TypeTable {
                 )
             };
             return state.into_any_element();
+        }
+        if self.reads_as_cards(cx) {
+            return self.render_cards(window, cx);
         }
         let grid = self.render_grid(window, cx);
         // A column's edge dragged anywhere over the grid resizes it until released. The grid
@@ -12514,6 +12700,9 @@ impl Render for TypeTable {
             )
             .on_action(cx.listener(Self::on_cancel))
             .on_action(cx.listener(Self::on_open_row_page))
+            .when(self.kind == TableKind::Node, |table| {
+                table.on_action(cx.listener(Self::toggle_reading_layout))
+            })
             .on_action(cx.listener(Self::on_explore))
             .on_action(cx.listener(|this, _: &RefreshTable, window, cx| this.refresh(window, cx)))
             .on_action(cx.listener(Self::on_copy))
@@ -12599,6 +12788,113 @@ impl Render for TypeTable {
                     .as_ref()
                     .map(|(menu, position, _)| studio_ui::ds::menu_at(menu.clone(), *position)),
             )
+    }
+}
+
+/// How many lines of a card's text show before it is cut with "…" (spec 044).
+const CARD_LINES: usize = 3;
+
+/// A line of a card's text, in pixels: the body size, spaced for reading.
+fn card_line(cx: &App) -> f32 {
+    studio_ui::ds::text::body_line(cx)
+}
+
+/// A card's height: its name, [`CARD_LINES`] of text and a line of values, with its padding.
+fn card_height(cx: &App) -> f32 {
+    card_line(cx) * (CARD_LINES as f32 + 2.) + space::MD * 2. + space::XS * 2. + 1.
+}
+
+/// What a card shows of a row (spec 044).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CardParts {
+    /// Its node's name, else its id.
+    pub title: String,
+    /// What its type's rows show after their names.
+    pub line: Option<String>,
+    /// Its text, at length: the property the type leads with, else its first text with words
+    /// to wrap at.
+    pub text: Option<String>,
+    /// Its other short values, by property, in schema order: those with a value, at most
+    /// [`CARD_VALUES`].
+    pub values: Vec<(String, String)>,
+}
+
+/// The most short values a card lists after its text.
+const CARD_VALUES: usize = 6;
+
+/// What a card of `row` shows, its type `node` read as `layout` says.
+pub(crate) fn card_parts(
+    node: Option<&gq_language::NodeType>,
+    layout: Option<&studio_settings::TypeLayout>,
+    row: &Row,
+) -> CardParts {
+    let title = node
+        .and_then(|node| crate::model::node_label(node, &row.values))
+        .unwrap_or_else(|| row.id.clone());
+    let Some(node) = node else {
+        return CardParts {
+            title,
+            line: None,
+            text: None,
+            values: Vec::new(),
+        };
+    };
+    let line = layout
+        .filter(|layout| !layout.line.is_empty())
+        .and_then(|layout| {
+            let values: Vec<(String, Value)> = layout
+                .line
+                .iter()
+                .map(|name| (name.clone(), row.value(name).clone()))
+                .collect();
+            gq_language::line_text(node, &values)
+        });
+    let label = node.label_property();
+    let lead = layout.and_then(|layout| layout.lead.as_deref());
+    let long = |property: &&gq_language::Property| {
+        reads_as_markdown(property)
+            && row
+                .value(&property.name)
+                .as_str()
+                .is_some_and(|text| text.contains(char::is_whitespace))
+    };
+    let text_property = lead.and_then(|lead| node.property(lead)).or_else(|| {
+        node.properties
+            .iter()
+            .filter(|p| !p.is_key && Some(p.name.as_str()) != label)
+            .find(long)
+    });
+    let text = text_property
+        .and_then(|property| row.value(&property.name).as_str())
+        .map(studio_ui::text::plain_run)
+        .filter(|text| !text.is_empty());
+    let shown_in_line =
+        |name: &str| layout.is_some_and(|layout| layout.line.iter().any(|l| l == name));
+    let values = node
+        .properties
+        .iter()
+        .filter(|p| {
+            p.projectable()
+                && !p.is_key
+                && Some(p.name.as_str()) != label
+                && Some(&p.name) != text_property.map(|t| &t.name)
+                && !shown_in_line(&p.name)
+                && !long(p)
+        })
+        .filter_map(|p| {
+            let value = row.value(&p.name);
+            if value.is_null() || value.as_array().is_some_and(Vec::is_empty) {
+                return None;
+            }
+            Some((p.name.clone(), crate::model::display_value(Some(p), value)))
+        })
+        .take(CARD_VALUES)
+        .collect();
+    CardParts {
+        title,
+        line,
+        text,
+        values,
     }
 }
 
@@ -13942,6 +14238,99 @@ mod tests {
     /// Typing in the filter field or in a cell, or moving through the filter's offered values,
     /// draws the grid no more: the field and its offers draw over it or beside it. Anything the
     /// table announces draws it again.
+    /// A type read as cards (spec 044, the study's company C1) draws its rows as cards: the
+    /// name and line, the text it leads with wrapped over a few lines, then its short values;
+    /// ↵ opens the row's page, a card having no cell to edit. The cards are the grid's part of
+    /// the table, so typing in the filter field draws none of them.
+    #[gpui::test]
+    async fn a_type_read_as_cards_draws_its_rows_as_cards(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_settings::init_test(cx);
+            studio_settings::keep_changes_in_memory(cx);
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let schema = "node Claim {\n  slug: String @key\n  title: String\n  statement: String?\n  status: enum(proposed, verified)?\n}\n";
+        let session = crate::test_support::session_reading(
+            schema,
+            serde_json::json!([
+                {"n": {"@id": "c1", "slug": "c1", "title": "Card fees", "status": "proposed",
+                       "statement": "We charge 2.9% on every card payment and 0.5% more on international cards."}},
+                {"n": {"@id": "c2", "slug": "c2", "title": "Refunds", "status": "verified",
+                       "statement": "Refunds settle in five days."}},
+            ]),
+            cx,
+        );
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session.clone(),
+                "Claim".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let card = table.read_with(cx, |table, cx| {
+            assert!(!table.reads_as_cards(cx), "a grid until chosen");
+            let node = table
+                .schema
+                .as_ref()
+                .unwrap()
+                .node("Claim")
+                .unwrap()
+                .clone();
+            card_parts(Some(&node), None, &table.rows[0])
+        });
+        assert_eq!(card.title, "Card fees");
+        assert_eq!(
+            card.text.as_deref(),
+            Some("We charge 2.9% on every card payment and 0.5% more on international cards."),
+            "the whole text, to wrap"
+        );
+        assert_eq!(card.values, [("status".to_owned(), "proposed".to_owned())]);
+
+        table.update_in(cx, |table, window, cx| {
+            table.toggle_reading_layout(&ToggleReadingLayout, window, cx)
+        });
+        cx.run_until_parked();
+        let drawn = table.read_with(cx, |table, cx| {
+            assert!(table.reads_as_cards(cx), "chosen for the type");
+            table.cards_drawn
+        });
+        assert!(drawn > 0, "the cards drew");
+
+        // Typing in the filter field draws no card.
+        table.update_in(cx, |table, window, cx| table.open_filter_draft(window, cx));
+        cx.simulate_input("A");
+        cx.run_until_parked();
+        let before = table.read_with(cx, |table, _| table.cards_drawn);
+        cx.simulate_input("d");
+        cx.run_until_parked();
+        assert_eq!(
+            table.read_with(cx, |table, _| table.cards_drawn),
+            before,
+            "the filter field drew the cards"
+        );
+        table.update_in(cx, |table, window, cx| {
+            table.cancel_filter_draft(window, cx);
+            table.set_cursor(Cursor { row: 1, col: 0 }, cx);
+        });
+        cx.run_until_parked();
+        // ↵ opens the page of the card under the cursor.
+        let opened: Rc<std::cell::RefCell<Vec<String>>> = Rc::default();
+        let seen = opened.clone();
+        cx.update(|_, cx| {
+            cx.on_action(move |open: &studio_actions::graph::OpenNodePage, _| {
+                seen.borrow_mut().push(open.id.clone())
+            });
+        });
+        table.update_in(cx, |table, window, cx| table.on_edit(&EditCell, window, cx));
+        cx.run_until_parked();
+        assert_eq!(*opened.borrow(), ["c2"]);
+    }
+
     #[gpui::test]
     async fn typing_in_a_field_leaves_the_grid_as_it_was(cx: &mut TestAppContext) {
         cx.update(|cx| {

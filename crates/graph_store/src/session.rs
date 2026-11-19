@@ -298,6 +298,12 @@ pub enum SessionEvent {
     /// token a read was refused under, which is read again alike. A parked graph says so when
     /// shown again.
     CredentialChanged,
+    /// The person shaped how some type reads (spec 044, [`GraphSession::layout`]): views draw
+    /// again in its order and names. `lines` are the types whose rows show other values after
+    /// their names, which a view showing such rows reads again ([`GraphSession::node_lines`]).
+    LayoutChanged {
+        lines: Arc<std::collections::BTreeSet<String>>,
+    },
 }
 
 /// How many answers to reads pinned to a commit, and Blob cells at a commit, a session keeps. A
@@ -891,6 +897,8 @@ pub struct GraphSession {
     /// The property chosen to name each type's nodes in this graph (spec 002, "Node names"),
     /// as the settings held it when the schema was last named by it.
     labels: BTreeMap<String, String>,
+    /// How each type reads in this graph (spec 044), as the settings hold it.
+    layouts: BTreeMap<String, studio_settings::TypeLayout>,
     _settings: Option<Subscription>,
     _schema_task: Option<Task<()>>,
     _branches_task: Option<Task<()>>,
@@ -1043,6 +1051,7 @@ impl GraphSession {
             schema_recheck: None,
             recheck_schema_again: false,
             labels: BTreeMap::new(),
+            layouts: BTreeMap::new(),
             _settings: None,
             _schema_task: None,
             _branches_task: None,
@@ -1077,6 +1086,7 @@ impl GraphSession {
             },
         ));
         session.labels = session.chosen_labels(cx);
+        session.layouts = session.chosen_layouts(cx);
         session._settings = Some(
             cx.observe_global::<studio_settings::StudioSettings>(|this, cx| {
                 this.labels_changed(cx)
@@ -1653,6 +1663,60 @@ impl GraphSession {
     fn labels_changed(&mut self, cx: &mut Context<Self>) {
         let labels = self.chosen_labels(cx);
         self.take_labels(labels, cx);
+        let layouts = self.chosen_layouts(cx);
+        self.take_layouts(layouts, cx);
+    }
+
+    /// How each type reads in this graph, in the settings (spec 044).
+    fn chosen_layouts(&self, cx: &App) -> BTreeMap<String, studio_settings::TypeLayout> {
+        match cx.try_global::<studio_settings::StudioSettings>() {
+            Some(settings) => settings.layouts_for(&self.overrides_key()),
+            None => BTreeMap::new(),
+        }
+    }
+
+    /// Takes how each type reads; views hear it at once ([`SessionEvent::LayoutChanged`]). A
+    /// layout changes no data, so a parked graph's views hear it too, and draw it when shown.
+    pub(crate) fn take_layouts(
+        &mut self,
+        layouts: BTreeMap<String, studio_settings::TypeLayout>,
+        cx: &mut Context<Self>,
+    ) {
+        if layouts == self.layouts {
+            return;
+        }
+        let lines = crate::layout::lines_changed(&self.layouts, &layouts);
+        self.layouts = layouts;
+        cx.emit(SessionEvent::LayoutChanged {
+            lines: Arc::new(lines),
+        });
+        cx.notify();
+    }
+
+    /// How `type_name` reads in this graph (spec 044): its page's lead, its relationships'
+    /// order, names and folds, its rows' line, its table's cards. `None` until the person
+    /// shapes it.
+    pub fn layout(&self, type_name: &str) -> Option<&studio_settings::TypeLayout> {
+        self.layouts.get(type_name)
+    }
+
+    /// How each type reads in this graph, where the person shaped it (spec 044).
+    pub fn layouts(&self) -> &BTreeMap<String, studio_settings::TypeLayout> {
+        &self.layouts
+    }
+
+    /// Changes how `type_name` reads in this graph, in the settings: every view of the graph,
+    /// in every window, takes it.
+    pub fn change_layout(
+        this: &Entity<Self>,
+        type_name: &str,
+        change: impl FnOnce(&mut studio_settings::TypeLayout) + 'static,
+        cx: &mut App,
+    ) {
+        let (graph, type_name) = (this.read(cx).overrides_key(), type_name.to_owned());
+        studio_settings::update(cx, move |settings| {
+            settings.update_layout(&graph, &type_name, change)
+        });
     }
 
     /// Names each type's nodes by `labels`. Views hear it at once, and read what they show
@@ -3559,6 +3623,68 @@ impl GraphSession {
                 }
             }
             (names, answered)
+        })
+    }
+
+    /// What the rows of the nodes `ends` lists, `(type, id)`, show after their names (spec 044):
+    /// the values of the properties each type's layout names, read at `snapshot` (the session's
+    /// branch when `None`), one read per type of at most [`NAME_BATCH`] ids, the first
+    /// [`NAME_LIMIT`] ends only. A type with no line is not read, and a node a read did not find
+    /// is left out. With them, whether every read answered.
+    pub fn node_lines(
+        &mut self,
+        ends: Vec<(String, String)>,
+        snapshot: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<(crate::layout::NodeLines, bool)> {
+        let Some(schema) = self.schema_model() else {
+            return Task::ready((Default::default(), false));
+        };
+        let mut by_type: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (type_name, id) in ends.into_iter().take(NAME_LIMIT) {
+            by_type.entry(type_name).or_default().push(id);
+        }
+        let mut reads = Vec::new();
+        for (type_name, ids) in by_type {
+            let Some(line) = self
+                .layouts
+                .get(&type_name)
+                .map(|layout| layout.line.clone())
+                .filter(|line| !line.is_empty())
+            else {
+                continue;
+            };
+            for chunk in ids.chunks(NAME_BATCH) {
+                if let Ok(Some(query)) = builder::node_lines(&schema, &type_name, chunk, &line) {
+                    let read = self.read(&query, snapshot.clone(), cx);
+                    reads.push((type_name.clone(), line.clone(), read));
+                }
+            }
+        }
+        cx.spawn(async move |_, _| {
+            let mut lines = crate::layout::NodeLines::default();
+            let mut answered = true;
+            for (type_name, line, read) in reads {
+                let Ok(output) = read.await else {
+                    answered = false;
+                    continue;
+                };
+                for row in output.rows.as_array().into_iter().flatten() {
+                    let Some(id) = row.get("id").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let values = line
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, name)| {
+                            row.get(builder::line_column(index))
+                                .map(|value| (name.clone(), value.clone()))
+                        })
+                        .collect();
+                    lines.insert((type_name.clone(), id.to_owned()), values);
+                }
+            }
+            (lines, answered)
         })
     }
 

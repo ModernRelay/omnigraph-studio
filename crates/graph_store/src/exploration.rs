@@ -489,6 +489,11 @@ pub struct ExploreState {
     pub selection: Option<ExplorePath>,
     /// The rows of a tree holding a set; none for a walk from one node.
     pub set: Option<SetRoots>,
+    /// How each type reads (spec 044): its relationships in the person's order, those to
+    /// itself read both ways folded into one.
+    pub layouts: Arc<BTreeMap<String, crate::layout::TypeLayout>>,
+    /// What each node's row shows after its name (spec 044), once read: `24.5 kg · estimated`.
+    pub lines: HashMap<NodeRef, String>,
 }
 
 impl Default for ExploreState {
@@ -507,6 +512,8 @@ impl Default for ExploreState {
             values: HashMap::new(),
             selection: None,
             set: None,
+            layouts: Arc::default(),
+            lines: HashMap::new(),
         }
     }
 }
@@ -555,6 +562,28 @@ impl ExploreState {
 
     pub fn label(&self, node: &NodeRef) -> Option<&str> {
         self.labels.get(node).and_then(|label| label.as_deref())
+    }
+
+    /// The relationship groups of a node of `type_name` as the walk shows them: in the order
+    /// the person set for the type, those to itself read both ways folded into one (spec 044).
+    pub fn groups_of<'a>(
+        &self,
+        schema: &'a SchemaModel,
+        type_name: &str,
+    ) -> std::borrow::Cow<'a, [RelationshipGroup]> {
+        match self.layouts.get(type_name) {
+            Some(layout) => std::borrow::Cow::Owned(crate::layout::shown_groups(
+                schema,
+                type_name,
+                Some(layout),
+            )),
+            None => std::borrow::Cow::Borrowed(schema.relationships_of(type_name)),
+        }
+    }
+
+    /// What `node`'s row shows after its name, once read (spec 044).
+    pub fn line(&self, node: &NodeRef) -> Option<&str> {
+        self.lines.get(node).map(String::as_str)
     }
 
     /// A bucket's label: grouped by a relationship, the name of the node it stands for.
@@ -663,7 +692,7 @@ impl ExploreState {
         }
         let node = path.node(&root).clone();
         self.expanded.insert(path.clone());
-        for group in schema.relationships_of(&node.type_name) {
+        for group in self.groups_of(schema, &node.type_name).iter() {
             if !is_field(schema, group) {
                 self.expand(&path.child_group(group));
             }
@@ -708,7 +737,7 @@ impl ExploreState {
             if !self.expanded.contains(path) {
                 opening.nodes += 1;
             }
-            for group in schema.relationships_of(&node.type_name) {
+            for group in self.groups_of(schema, &node.type_name).iter() {
                 let key = GroupKey::new(node.clone(), group.clone());
                 if is_field(schema, group) {
                     if !self.expanded.contains(path) {
@@ -739,6 +768,7 @@ impl ExploreState {
         self.counts.clear();
         self.neighbours.clear();
         self.values.clear();
+        self.lines.clear();
         self.seed_listed_labels();
     }
 
@@ -934,7 +964,7 @@ impl ExploreState {
         out: &mut Vec<Entry>,
     ) {
         let index = out.len();
-        let groups = schema.relationships_of(&node.type_name);
+        let groups = self.groups_of(schema, &node.type_name);
         let expanded = self.expanded.contains(&path);
         out.push(Entry {
             path: path.clone(),
@@ -979,7 +1009,7 @@ impl ExploreState {
             return;
         }
         ancestors.push((node.clone(), index));
-        for group in groups {
+        for group in groups.iter() {
             let key = GroupKey::new(node.clone(), group.clone());
             let group_path = path.child_group(group);
             let list = self.neighbours.get(&key);
@@ -1322,8 +1352,8 @@ impl ExploreState {
         };
         if path.ends_at_node() {
             let node = path.node(root);
-            return schema
-                .relationships_of(&node.type_name)
+            return self
+                .groups_of(schema, &node.type_name)
                 .iter()
                 .filter_map(|group| {
                     let key = GroupKey::new(node.clone(), group.clone());
@@ -1483,7 +1513,8 @@ impl ExploreState {
             .map(String::as_str)
             .collect();
         let other_type = key.group.other_type.clone();
-        let page: Vec<Neighbour> = rows(output)
+        let both = key.group.direction == Direction::Both;
+        let mut page: Vec<Neighbour> = rows(output)
             .iter()
             .filter_map(|row| {
                 let id = row.get("id")?.as_str()?.to_owned();
@@ -1501,6 +1532,12 @@ impl ExploreState {
                 })
             })
             .collect();
+        // A page is as long as the rows read: read both ways, a node related in either
+        // direction comes once an edge (spec 044), and the walk shows it once.
+        let read = page.len();
+        if both {
+            page.dedup_by(|next, kept| next.node == kept.node);
+        }
         for neighbour in &page {
             self.labels
                 .insert(neighbour.node.clone(), neighbour.label.clone());
@@ -1511,7 +1548,7 @@ impl ExploreState {
             .last()
             .map(|row| row.get("sort_value").cloned().unwrap_or(Value::Null));
         let list = self.neighbours.entry(key).or_default();
-        let short = (page.len() as u32) < page_size;
+        let short = (read as u32) < page_size;
         if sorted {
             let in_nulls = matches!(list.start, Some(PageStart::Nulls { .. }));
             // The run with values ended: the rows without one come next, from their start.
@@ -1734,6 +1771,9 @@ pub struct Exploration {
     deeper_owed: Option<Task<()>>,
     /// How many neighbours of each relationship an expansion asked to be drawn.
     expansion_limits: HashMap<GroupKey, usize>,
+    /// The nodes whose rows' lines were asked for (spec 044), so each is read once a walk.
+    lines_asked: HashSet<NodeRef>,
+    _line_reads: Vec<Task<()>>,
     _subscription: Subscription,
 }
 
@@ -1745,6 +1785,7 @@ pub fn relationship_key(group: &RelationshipGroup) -> String {
     let direction = match group.direction {
         Direction::Outgoing => "out",
         Direction::Incoming => "in",
+        Direction::Both => "both",
     };
     format!("{direction}:{}", group.edge)
 }
@@ -1834,7 +1875,9 @@ impl Exploration {
             let mut exploration = Exploration::new(session.clone(), cx);
             exploration.held = at_commit;
             exploration.pin = exploration.held.clone();
+            let layouts = exploration.state.layouts.clone();
             *exploration.state = ExploreState::of_set(set);
+            exploration.state.layouts = layouts;
             exploration.request_missing(cx);
             exploration
         })
@@ -1911,11 +1954,26 @@ impl Exploration {
             {
                 this.compare_head(cx)
             }
+            // The person shaped how some type reads (spec 044): the walk is flattened again in
+            // its order and fold, and the rows of the types in `lines` read their lines again.
+            SessionEvent::LayoutChanged { lines } => {
+                this.state.layouts = Arc::new(session.read(cx).layouts().clone());
+                this.state
+                    .lines
+                    .retain(|node, _| !lines.contains(&node.type_name));
+                this.lines_asked
+                    .retain(|node| !lines.contains(&node.type_name));
+                this.request_missing(cx);
+                this.want_lines(cx);
+                this.changed(cx);
+            }
             _ => {}
         });
+        let mut state = Flattened::default();
+        state.deref_mut().layouts = Arc::new(session.read(cx).layouts().clone());
         Self {
             session,
-            state: Flattened::default(),
+            state,
             held: None,
             pin: None,
             at_tip: false,
@@ -1939,8 +1997,86 @@ impl Exploration {
             deeper_stopped: None,
             deeper_owed: None,
             expansion_limits: HashMap::new(),
+            lines_asked: HashSet::new(),
+            _line_reads: Vec::new(),
             _subscription: subscription,
         }
+    }
+
+    /// Reads what the rows shown say after their names (spec 044), for the nodes of types with
+    /// a line not asked for yet, at the walk's commit: one read per type a turn.
+    fn want_lines(&mut self, cx: &mut Context<Self>) {
+        if self
+            .state
+            .layouts
+            .values()
+            .all(|layout| layout.line.is_empty())
+        {
+            return;
+        }
+        let layouts = self.state.layouts.clone();
+        let mut ends: Vec<(String, String)> = Vec::new();
+        for entry in self.entries().iter() {
+            let node = match &entry.kind {
+                EntryKind::Node { node, .. } | EntryKind::Cycle { node, .. } => node,
+                EntryKind::Field {
+                    target: Some(target),
+                    ..
+                } => &target.node,
+                _ => continue,
+            };
+            if node.id.is_empty()
+                || layouts
+                    .get(&node.type_name)
+                    .is_none_or(|layout| layout.line.is_empty())
+                || !self.lines_asked.insert(node.clone())
+            {
+                continue;
+            }
+            ends.push((node.type_name.clone(), node.id.clone()));
+        }
+        if ends.is_empty() {
+            return;
+        }
+        let at = self.pin.clone();
+        let generation = self.generation;
+        // What the lines say is what the walk shows: a head move that changes those types'
+        // nodes reads them again ([`Self::compare_head`]).
+        let types: BTreeSet<String> = ends
+            .iter()
+            .map(|(type_name, _)| type_name.clone())
+            .collect();
+        let depends = gq_language::builder::Depends::Types {
+            nodes: types.into_iter().collect(),
+            edges: Vec::new(),
+        };
+        let scope = self.scope.clone();
+        let read = self.session.update(cx, |session, cx| {
+            session.note_in(&scope, depends, None);
+            session.node_lines(ends, at, cx)
+        });
+        self._line_reads.push(cx.spawn(async move |this, cx| {
+            let (lines, _) = read.await;
+            this.update(cx, |this, cx| {
+                // Read for a walk since started over: its rows are asked for again.
+                if this.generation != generation {
+                    return;
+                }
+                let Some(schema) = this.schema.clone() else {
+                    return;
+                };
+                this.state
+                    .unseen()
+                    .lines
+                    .extend(lines.into_iter().filter_map(|((type_name, id), values)| {
+                        let line = gq_language::line_text(schema.node(&type_name)?, &values)?;
+                        Some((NodeRef::new(type_name, id), line))
+                    }));
+                cx.emit(ExplorationEvent::Loaded);
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     /// Offers Refresh when the branch head is not the commit the exploration shows, unless
@@ -2028,6 +2164,9 @@ impl Exploration {
         // The root keeps the name it was read with until it is read again, so a tab behind
         // another, which reads nothing until it is shown, is not named by the node's id.
         let label = self.state.labels.get(&node).cloned();
+        let layouts = self.state.layouts.clone();
+        self.lines_asked.clear();
+        self._line_reads.clear();
         // A set stays the set: its rows are read again, with nothing open.
         *self.state = match self.state.set.take() {
             Some(set) => ExploreState::of_set(set),
@@ -2039,6 +2178,7 @@ impl Exploration {
         self.state.grouping = grouping;
         self.state.filters = filters;
         self.state.sorts = sorts;
+        self.state.layouts = layouts;
         if self.held.is_none() {
             self.state.forget_set_total();
         }
@@ -2380,6 +2520,8 @@ impl Exploration {
     /// change.
     fn forget_at_head(&mut self, cx: &mut Context<Self>) {
         self.reset_reads(cx);
+        self.lines_asked.clear();
+        self._line_reads.clear();
         self.at_tip = true;
         self.state.clear_loaded();
         if self.held.is_none() {
@@ -2395,6 +2537,8 @@ impl Exploration {
     fn read_again(&mut self, cx: &mut Context<Self>) {
         self.generation += 1;
         self.tasks.clear();
+        self.lines_asked.clear();
+        self._line_reads.clear();
         self.drop_landed();
         self.ahead = None;
         self.prune_at = KEPT_READS;
@@ -2711,7 +2855,7 @@ impl Exploration {
                 continue;
             };
             plan.paths.push(path.clone());
-            for group in schema.relationships_of(&node.type_name) {
+            for group in self.state.groups_of(&schema, &node.type_name).iter() {
                 let key = relationship_key(group);
                 if let Some(wanted) = relationships
                     && !wanted.contains(&key)
@@ -3309,6 +3453,7 @@ impl Exploration {
         }
         if shown {
             self.request_missing(cx);
+            self.want_lines(cx);
             cx.emit(ExplorationEvent::Loaded);
             cx.notify();
         }
@@ -3450,6 +3595,57 @@ mod tests {
 
     fn person(id: &str) -> NodeRef {
         NodeRef::new("Person", id)
+    }
+
+    /// A walk shows a node's relationships in the order its type's layout sets, one from
+    /// the type to itself read both ways as one group (spec 044); a page of that group lists
+    /// each node once, however many edges reach it, and is as long as the rows it read.
+    #[test]
+    fn a_walk_reads_its_types_layout() {
+        let schema = SchemaModel::parse(
+            "node Person {\n  slug: String @key\n  name: String\n}\nnode Place {\n  slug: String @key\n}\nedge Knows: Person -> Person\nedge LivesIn: Person -> Place\n",
+        )
+        .unwrap();
+        let mut state = ExploreState::rooted(person("theo"));
+        state.root_status = Loadable::Loaded(());
+        let mut layout = crate::layout::TypeLayout::default();
+        layout.set_both_ways("Knows", true);
+        layout.to_top("out:LivesIn");
+        state.layouts = Arc::new(BTreeMap::from([("Person".to_owned(), layout)]));
+        let keys: Vec<String> = state
+            .groups_of(&schema, "Person")
+            .iter()
+            .map(relationship_key)
+            .collect();
+        assert_eq!(keys, ["out:LivesIn", "both:Knows"]);
+        let shown: Vec<String> = state
+            .entries(&schema)
+            .iter()
+            .filter_map(|entry| match &entry.kind {
+                EntryKind::Group { key, .. } | EntryKind::Field { key, .. } => {
+                    Some(relationship_key(&key.group))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            ["out:LivesIn", "both:Knows"],
+            "flattened in that order"
+        );
+        let both = state.groups_of(&schema, "Person")[1].clone();
+        let key = GroupKey::new(person("theo"), both);
+        state.apply_page(
+            key.clone(),
+            &output(
+                &["id", "edge_id"],
+                json!([{"id": "maya", "edge_id": "e1"}, {"id": "maya", "edge_id": "e2"}]),
+            ),
+            2,
+        );
+        let list = &state.neighbours[&key];
+        assert_eq!(list.rows.len(), 1, "Maya once");
+        assert!(!list.exhausted, "a full page of rows: more may follow");
     }
 
     fn output(columns: &[&str], rows: Value) -> ReadOutput {

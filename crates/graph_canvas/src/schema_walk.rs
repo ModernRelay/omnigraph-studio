@@ -217,6 +217,7 @@ pub(crate) fn schema_scene(
         let index = scene.nodes.len();
         type_at.insert(name.to_owned(), index);
         scene.nodes.push(SceneNode {
+            line: None,
             id: SceneId::Node(type_ref(name)),
             kind: SceneKind::Node {
                 node: type_ref(name),
@@ -264,6 +265,7 @@ pub(crate) fn schema_scene(
                 );
                 let pill = scene.nodes.len();
                 scene.nodes.push(SceneNode {
+                    line: None,
                     id: SceneId::Hub(key.clone()),
                     kind: SceneKind::Hub {
                         key,
@@ -292,6 +294,7 @@ pub(crate) fn schema_scene(
             if groups.len() > limit && scene.nodes.len() < cap {
                 let hidden = groups.len() - limit;
                 scene.nodes.push(SceneNode {
+                    line: None,
                     id: SceneId::More(more.clone()),
                     kind: SceneKind::More {
                         key: more,

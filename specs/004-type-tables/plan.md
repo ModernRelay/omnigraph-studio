@@ -704,6 +704,8 @@ kept answers.
 
 ## Corrections
 
+- 2026-11-19 · A text-heavy type can read as cards in place of the grid (spec 044, ⌘⌥R): each
+  row's name, line, text over three lines and short values, one height, on the grid's scroll.
 - 2026-10-22 · "Reading" still gave what `dab901f` and the snapshot's commit changed. Its sketch
   put the `$after` cursor on every page; the first page has none. It said the next page was read
   once the view passed 80% of the rows read; it is read a page ahead. It said a page's

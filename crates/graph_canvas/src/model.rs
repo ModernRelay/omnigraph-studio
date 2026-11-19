@@ -86,6 +86,9 @@ pub struct SceneNode {
     pub id: SceneId,
     pub kind: SceneKind,
     pub label: String,
+    /// What a node's chip shows under its name (spec 044): the values its type's layout names,
+    /// `24.5 kg · estimated`.
+    pub line: Option<String>,
     /// The type or edge name that picks the color.
     pub color_key: String,
     /// The node this one hangs off, for layout.
@@ -226,6 +229,7 @@ pub fn results_scene(
         .iter()
         .take(cap)
         .map(|(node, label)| SceneNode {
+            line: None,
             id: SceneId::Node(node.clone()),
             kind: SceneKind::Node {
                 node: node.clone(),
@@ -259,6 +263,16 @@ pub fn results_scene(
         edges,
         capped,
         cap,
+    }
+}
+
+/// What a hub says before its count: the person's name for the relationship (spec 044),
+/// "Blocks", else its edge and the way it runs, "← BlockedBy".
+fn hub_name(state: &ExploreState, key: &GroupKey, arrow: &str) -> String {
+    let layout = state.layouts.get(&key.node.type_name);
+    match graph_store::layout::group_title(layout, &key.group) {
+        (name, true) => name,
+        (_, false) => format!("{arrow} {}", key.group.edge),
     }
 }
 
@@ -357,6 +371,7 @@ pub fn explore_scene(
                     &mut scene,
                     &mut by_id,
                     SceneNode {
+                        line: state.line(node).map(str::to_owned),
                         id,
                         kind: SceneKind::Node {
                             node: node.clone(),
@@ -427,14 +442,16 @@ pub fn explore_scene(
                         .map(|list| list.rows.len() as u64),
                     false => count.loaded().copied(),
                 };
+                let name = hub_name(state, key, arrow);
                 let label = match count_value {
-                    Some(count) => format!("{arrow} {} · {count}", key.group.edge),
-                    None => format!("{arrow} {} · …", key.group.edge),
+                    Some(count) => format!("{name} · {count}"),
+                    None => format!("{name} · …"),
                 };
                 let hub = add(
                     &mut scene,
                     &mut by_id,
                     SceneNode {
+                        line: None,
                         id,
                         kind: SceneKind::Hub {
                             key: key.clone(),
@@ -480,13 +497,14 @@ pub fn explore_scene(
                             &mut scene,
                             &mut by_id,
                             SceneNode {
+                                line: None,
                                 id: hub_id,
                                 kind: SceneKind::Hub {
                                     key: key.clone(),
                                     count: Some(1),
                                     open,
                                 },
-                                label: format!("{arrow} {} · 1", key.group.edge),
+                                label: format!("{} · 1", hub_name(state, key, arrow)),
                                 color_key: key.group.edge.clone(),
                                 parent: Some(owner),
                                 path: Some(entry.path.clone()),
@@ -579,6 +597,7 @@ pub fn explore_scene(
                 None => format!("+{} more", total - drawn),
             };
             let more = SceneNode {
+                line: None,
                 id: SceneId::More(key.clone()),
                 kind: SceneKind::More {
                     key: key.clone(),
@@ -622,6 +641,7 @@ pub fn explore_scene(
         }
         let node = node.clone();
         let chip = SceneNode {
+            line: None,
             id: SceneId::Note(node.clone()),
             label: note.of_relationships().to_owned(),
             color_key: node.type_name.clone(),

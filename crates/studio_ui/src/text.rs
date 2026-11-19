@@ -107,6 +107,43 @@ pub fn first_line(text: &str) -> String {
     line
 }
 
+/// The value as plain text on one run, its markup removed and its lines and blocks joined by a
+/// space: what a card wraps over its lines (spec 044).
+pub fn plain_run(text: &str) -> String {
+    let mut run = String::new();
+    let gap = |run: &mut String| {
+        if !run.is_empty() && !run.ends_with(' ') {
+            run.push(' ');
+        }
+    };
+    if is_plain(text) {
+        for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            gap(&mut run);
+            run.push_str(line);
+        }
+        return run;
+    }
+    for event in Parser::new_ext(text, PARSE_OPTIONS) {
+        match event {
+            Event::Text(part) | Event::Code(part) => {
+                for (n, piece) in part.split('\n').enumerate() {
+                    if n > 0 {
+                        gap(&mut run);
+                    }
+                    run.push_str(piece);
+                }
+            }
+            Event::SoftBreak
+            | Event::HardBreak
+            | Event::End(
+                TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::Item | TagEnd::CodeBlock,
+            ) => gap(&mut run),
+            _ => {}
+        }
+    }
+    run.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Whether text held in pieces, `len` bytes in all (an editor's buffer, chunk by chunk), is
 /// `text`: compared where it lies, so a keystroke copies none of it.
 pub fn pieces_are<'a>(len: usize, pieces: impl IntoIterator<Item = &'a str>, text: &str) -> bool {
@@ -125,6 +162,15 @@ pub fn pieces_are<'a>(len: usize, pieces: impl IntoIterator<Item = &'a str>, tex
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_card_reads_a_text_as_one_run() {
+        assert_eq!(super::plain_run("one\n\ntwo  "), "one two");
+        assert_eq!(
+            super::plain_run("## Heading\nSome **bold** text.\n\n- a\n- b"),
+            "Heading Some bold text. a b"
+        );
+    }
+
     use super::*;
 
     #[test]

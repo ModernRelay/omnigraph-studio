@@ -429,6 +429,7 @@ pub fn relationship_key(group: &RelationshipGroup) -> String {
     let direction = match group.direction {
         Direction::Outgoing => "out",
         Direction::Incoming => "in",
+        Direction::Both => "both",
     };
     format!("{direction}:{}", group.edge)
 }
@@ -443,6 +444,7 @@ pub fn parse_relationship_key(key: &str) -> Option<(Direction, &str)> {
     let direction = match direction {
         "out" => Direction::Outgoing,
         "in" => Direction::Incoming,
+        "both" => Direction::Both,
         _ => return None,
     };
     Some((direction, edge))
@@ -531,6 +533,7 @@ pub fn relationship_label(key: &str) -> Option<String> {
     Some(match direction {
         Direction::Outgoing => format!("{name} →"),
         Direction::Incoming => format!("← {name}"),
+        Direction::Both => format!("{name} ↔"),
     })
 }
 
@@ -1245,7 +1248,7 @@ pub fn path_end<'a>(
         let (direction, edge_name) = parse_relationship_key(relationship)?;
         let edge = schema.edge(edge_name)?;
         let (near, far) = match direction {
-            Direction::Outgoing => (&edge.from, &edge.to),
+            Direction::Outgoing | Direction::Both => (&edge.from, &edge.to),
             Direction::Incoming => (&edge.to, &edge.from),
         };
         if *near != at.name {
@@ -1393,6 +1396,7 @@ pub fn as_group(filter: &Filter) -> Option<(String, Group)> {
     let key = match direction {
         Direction::Outgoing => format!("out:{edge}"),
         Direction::Incoming => format!("in:{edge}"),
+        Direction::Both => format!("both:{edge}"),
     };
     // "Is empty" on a neighbour's property means no neighbour holds a value.
     let (quantifier, op) = if filter.op == FilterOp::IsEmpty {
@@ -1480,7 +1484,7 @@ fn group_clause(
         edge.traversal()
     };
     let far_type = match direction {
-        Direction::Outgoing => &edge.to,
+        Direction::Outgoing | Direction::Both => &edge.to,
         Direction::Incoming => &edge.from,
     };
     let far_node = node(schema, far_type)?;
@@ -2154,7 +2158,7 @@ fn hop<'a>(
     far: &str,
 ) -> (&'a str, &'a str, String) {
     let (near_type, far_type) = match direction {
-        Direction::Outgoing => (&edge.from, &edge.to),
+        Direction::Outgoing | Direction::Both => (&edge.from, &edge.to),
         Direction::Incoming => (&edge.to, &edge.from),
     };
     (
@@ -2183,6 +2187,14 @@ fn oriented(direction: Direction, near: &str, edge: &str, far: &str) -> String {
     match direction {
         Direction::Outgoing => format!("{near} {edge} {far}"),
         Direction::Incoming => format!("{far} {edge} {near}"),
+        // Either way, the edge in angle brackets and any `$e:` binding before them:
+        // `$n $e:<knows> $m`.
+        Direction::Both => match edge.split_once(':') {
+            Some((binding, token)) if binding.starts_with('$') => {
+                format!("{near} {binding}:<{token}> {far}")
+            }
+            _ => format!("{near} <{edge}> {far}"),
+        },
     }
 }
 
@@ -3289,6 +3301,52 @@ pub fn node_labels(
     );
     Ok(Some(BuiltQuery {
         name: "studio_node_labels".into(),
+        text,
+        params: params.values,
+        depends: Depends::Types {
+            nodes: vec![node.name.clone()],
+            edges: Vec::new(),
+        },
+        seeds: None,
+        empty_without: None,
+    }))
+}
+
+/// The column a [`node_lines`] read returns the line's `index`th property under.
+pub fn line_column(index: usize) -> String {
+    format!("l{index}")
+}
+
+/// What a row of one type shows after its name (spec 044), for nodes known by their ids: the
+/// `line` properties the type's layout names, those a query can return, in that order.
+/// Columns: `id`, then [`line_column`] for each property kept, by its place in `line`. `None`
+/// when no property of `line` can be returned.
+pub fn node_lines(
+    schema: &SchemaModel,
+    type_name: &str,
+    ids: &[String],
+    line: &[String],
+) -> Result<Option<BuiltQuery>, BuildError> {
+    let node = node(schema, type_name)?;
+    let columns: Vec<String> = line
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| node.property(name).is_some_and(Property::projectable))
+        .map(|(index, name)| format!("$n.{name} as {}", line_column(index)))
+        .collect();
+    if columns.is_empty() {
+        return Ok(None);
+    }
+    let mut params = Params::new();
+    let ids = params.add("ids", "[String]", Value::from(ids.to_vec()));
+    let text = format!(
+        "query studio_node_lines({sig}) {{\n  match {{\n    $n: {ty}\n    $n.@id in {ids}\n  }}\n  return {{ $n.@id as id, {columns} }}\n}}\n",
+        sig = params.signature(),
+        ty = node.name,
+        columns = columns.join(", "),
+    );
+    Ok(Some(BuiltQuery {
+        name: "studio_node_lines".into(),
         text,
         params: params.values,
         depends: Depends::Types {
@@ -5407,6 +5465,96 @@ mod tests {
             edge_page(&schema, "Nope", &[], None, &PageStart::First, 1),
             Err(BuildError::UnknownEdge(_))
         ));
+    }
+
+    /// A relationship from a type to itself read both ways (spec 044) is one undirected
+    /// traversal, `$n $e:<knows> $m`, in every read a group makes: its pages, its edges counted,
+    /// its neighbours counted and their first rows for a table's cell.
+    #[test]
+    fn a_relationship_read_both_ways_is_one_undirected_traversal() {
+        let schema = dev();
+        let knows = schema
+            .relationships_of("Person")
+            .iter()
+            .find(|group| group.edge == "Knows" && group.direction == Direction::Outgoing)
+            .unwrap();
+        assert!(knows.to_itself(&schema));
+        let both = knows.both_ways();
+        assert_eq!(relationship_key(&both), "both:Knows");
+        assert_eq!(
+            parse_relationship_key("both:Knows"),
+            Some((Direction::Both, "Knows"))
+        );
+        let page = neighbours(
+            &schema,
+            "Person",
+            &both,
+            "person-000000",
+            None,
+            Narrow::default(),
+            50,
+        )
+        .unwrap();
+        assert_compiles(&page);
+        assert!(page.text.contains("$n $e:<knows> $m"), "{}", page.text);
+        let next = neighbours(
+            &schema,
+            "Person",
+            &both,
+            "person-000000",
+            Some(After::Edge {
+                neighbour: "person-000001",
+                edge: "e-1",
+            }),
+            Narrow::default(),
+            50,
+        )
+        .unwrap();
+        assert_compiles(&next);
+        let edges = edge_degree(&schema, "Person", &both, "person-000000").unwrap();
+        assert_compiles(&edges);
+        let counted = page_degrees(&schema, "Person", &both, &["person-000000".into()]).unwrap();
+        assert_compiles(&counted);
+        assert!(counted.text.contains("$n <knows> $m"), "{}", counted.text);
+        // A works-at relationship has two ends of two types: it is never read both ways.
+        let works = schema
+            .relationships_of("Person")
+            .iter()
+            .find(|group| group.edge != "Knows")
+            .unwrap();
+        assert!(!works.to_itself(&schema));
+    }
+
+    /// What a row shows after its name is read for nodes by id, the properties a query can
+    /// return, each under its place in the line (spec 044).
+    #[test]
+    fn a_types_line_is_read_for_nodes_by_id() {
+        let schema = dev();
+        let node = schema.node("Person").unwrap();
+        let text: Vec<String> = node
+            .properties
+            .iter()
+            .filter(|p| p.projectable() && !p.is_key)
+            .take(2)
+            .map(|p| p.name.clone())
+            .collect();
+        let line = vec![text[0].clone(), "no_such".into(), text[1].clone()];
+        let read = node_lines(&schema, "Person", &["person-000000".into()], &line)
+            .unwrap()
+            .unwrap();
+        assert_compiles(&read);
+        assert!(
+            read.text.contains(&format!("$n.{} as l0", text[0]))
+                && read.text.contains(&format!("$n.{} as l2", text[1]))
+                && !read.text.contains("no_such"),
+            "{}",
+            read.text
+        );
+        assert!(
+            node_lines(&schema, "Person", &[], &["no_such".into()])
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

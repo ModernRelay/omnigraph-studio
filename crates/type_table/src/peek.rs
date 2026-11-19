@@ -98,6 +98,9 @@ enum Item {
     Group(usize),
     /// The row the groups with no neighbours fold into.
     Empty,
+    /// On a page whose every relationship is counted empty, and hidden: says so, and offers to
+    /// show them, to add one.
+    NoneShown,
 }
 
 /// Where a relationship group's row sits in the list.
@@ -223,6 +226,9 @@ struct EdgeReads {
     first: BuiltQuery,
     count: Result<BuiltQuery, String>,
     limit: u32,
+    /// The group is read both ways (spec 044): it lists, and counts, each related node once,
+    /// however many edges reach it.
+    distinct: bool,
 }
 
 /// A group's first edges as the view lists them, and how many it has.
@@ -334,8 +340,9 @@ struct AddEdge {
 enum EdgeChange {
     /// To the node with this id.
     Add(String),
-    /// The edge with this id.
-    Remove(String),
+    /// The edges with these ids: one, or each edge between this node and one related both
+    /// ways (spec 044).
+    Remove(Vec<String>),
 }
 
 /// One write of a relationship change ([`NodePeek::write_edge`]): a replace is the removal of
@@ -516,6 +523,19 @@ pub struct NodePeek {
     next_renaming: u64,
     /// Takes the copied mark down; a refresh keeps it, and a second copy starts it again.
     _copied: Option<Task<()>>,
+    /// What a related node's row shows after its name (spec 044), by `(type, id)`, read once
+    /// its group's neighbours are in, at the commit they were read at.
+    lines: HashMap<(String, String), Vec<(String, Value)>>,
+    /// The rows whose lines were asked for, so each is read once.
+    lines_asked: HashSet<(String, String)>,
+    _line_reads: Vec<Task<()>>,
+    /// The groups are made again under a new fold of the type's layout once the relationship
+    /// writes out land: those writes name their group by its place.
+    regroup_owed: bool,
+    /// A relationship group's menu (spec 044), where it was asked for.
+    group_menu: Option<(Entity<ContextMenu>, gpui::Point<Pixels>, Subscription)>,
+    /// The type's relationships in the person's order, by key, as its layout last said.
+    layout_order: Vec<String>,
     _subscription: Subscription,
     /// The view's keyboard: ⌘S saves its drafts while it, or a field in it, has it. A page hands
     /// its focus here ([`crate::node_page::NodePage`]), so the keys reach the view with no field
@@ -619,6 +639,12 @@ impl NodePeek {
             }
             if let SessionEvent::CredentialChanged = event {
                 this.credential_changed(cx);
+                return;
+            }
+            // The person shaped how a type reads (spec 044): this node's relationships fold
+            // otherwise, or its related nodes' rows show other values.
+            if let SessionEvent::LayoutChanged { lines } = event {
+                this.layout_changed(lines, cx);
                 return;
             }
             // A view made before the schema was read (a page restored at start) reads its node
@@ -795,6 +821,12 @@ impl NodePeek {
             _renaming: HashMap::new(),
             next_renaming: 0,
             _copied: None,
+            lines: HashMap::new(),
+            lines_asked: HashSet::new(),
+            _line_reads: Vec::new(),
+            regroup_owed: false,
+            group_menu: None,
+            layout_order: Vec::new(),
             _subscription: subscription,
         };
         match values {
@@ -2266,11 +2298,20 @@ impl NodePeek {
         let Some(schema) = self.schema.clone() else {
             return;
         };
-        self.groups = schema
-            .relationships_of(&type_name)
-            .iter()
+        let layout = self.session.read(cx).layout(&type_name).cloned();
+        self.layout_order = layout
+            .as_ref()
+            .map(|layout| layout.order.clone())
+            .unwrap_or_default();
+        self.regroup_owed = false;
+        // Every row's line is read again with the groups.
+        self.lines.clear();
+        self.lines_asked.clear();
+        self._line_reads.clear();
+        self.groups = graph_store::layout::folded_groups(&schema, &type_name, layout.as_ref())
+            .into_iter()
             .map(|group| Group {
-                group: group.clone(),
+                group,
                 count: Loadable::NotLoaded,
                 as_drawn: true,
                 drawn: false,
@@ -2312,6 +2353,7 @@ impl NodePeek {
                 group.neighbours = Loadable::Loaded(first);
                 group.expanded = opens;
             }
+            self.read_lines(index, cx);
         }
         cx.notify();
     }
@@ -2451,6 +2493,7 @@ impl NodePeek {
                             }
                         }
                         this.rename_if_named_otherwise(index, read_under.as_deref(), cx);
+                        this.read_lines(index, cx);
                     }
                     Err(error) => this.group_refused(
                         index,
@@ -2486,13 +2529,20 @@ impl NodePeek {
             limit + 1,
             &self.groups_absent,
         );
+        let distinct = group.group.direction == Direction::Both;
         Some(first.map_err(|error| error.to_string()).map(|first| {
-            let count = builder::edge_degree(schema, type_name, &group.group, id)
-                .map_err(|error| error.to_string());
+            // Both ways, the related nodes are counted, each once ([`builder::page_degrees`]).
+            let count = if distinct {
+                builder::page_degrees(schema, type_name, &group.group, std::slice::from_ref(id))
+            } else {
+                builder::edge_degree(schema, type_name, &group.group, id)
+            }
+            .map_err(|error| error.to_string());
             EdgeReads {
                 first,
                 count,
                 limit,
+                distinct,
             }
         }))
     }
@@ -2644,6 +2694,7 @@ impl NodePeek {
                     }
                 }
                 this.rename_if_named_otherwise(index, Some(&schema), cx);
+                this.read_lines(index, cx);
                 cx.notify();
             })
             .ok();
@@ -3663,22 +3714,23 @@ impl NodePeek {
         }
     }
 
-    /// The first click on a neighbour's × asks; the second removes the relationship.
+    /// The first click on a neighbour's × asks; the second removes the relationship: its edge,
+    /// or each of its edges in a group read both ways.
     fn press_remove(
         &mut self,
         index: usize,
-        edge_id: String,
+        edge_ids: Vec<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.edge_write_refusal(index).is_some() {
             return;
         }
-        if self.removing.as_deref() == Some(edge_id.as_str()) {
+        if self.removing.as_deref() == edge_ids.first().map(String::as_str) {
             self.removing = None;
-            self.write_edge(index, EdgeChange::Remove(edge_id), None, window, cx);
+            self.write_edge(index, EdgeChange::Remove(edge_ids), None, window, cx);
         } else {
-            self.removing = Some(edge_id);
+            self.removing = edge_ids.first().cloned();
             cx.notify();
         }
     }
@@ -3727,7 +3779,8 @@ impl NodePeek {
         queries.push(match &change {
             EdgeChange::Add(other) => {
                 let (from, to) = match group.direction {
-                    Direction::Outgoing => (id.as_str(), other.as_str()),
+                    // Both ways, a new one is written from this node, as the person reads it.
+                    Direction::Outgoing | Direction::Both => (id.as_str(), other.as_str()),
                     Direction::Incoming => (other.as_str(), id.as_str()),
                 };
                 let step = if first.is_some() {
@@ -3740,8 +3793,11 @@ impl NodePeek {
                     step,
                 )
             }
-            EdgeChange::Remove(edge_id) => (
-                builder::delete_edge(&schema, &group.edge, edge_id),
+            EdgeChange::Remove(edge_ids) => (
+                match edge_ids.as_slice() {
+                    [edge_id] => builder::delete_edge(&schema, &group.edge, edge_id),
+                    _ => builder::delete_edges(&schema, &group.edge, edge_ids),
+                },
                 EdgeStep::Remove,
             ),
         });
@@ -3855,6 +3911,11 @@ impl NodePeek {
                     this.group_notices.insert(index, notice);
                 }
                 this.reload_group(index, read_at, cx);
+                // A fold the person chose while the writes were out: the groups are made again
+                // now, each read once drawn.
+                if this.edge_writes.is_empty() && this.regroup_owed {
+                    this.regroup(cx);
+                }
                 if !this.writes_out() {
                     this.compare_head(cx);
                 }
@@ -4233,22 +4294,20 @@ impl NodePeek {
                 return studio_ui::ds::text::muted("Reading…").into_any_element();
             }
         };
-        let properties = self
-            .schema
-            .as_deref()
-            .map(|schema| listed_properties(schema, &self.subject))
-            .unwrap_or_default();
-        let (rows, texts): (Vec<_>, Vec<_>) =
-            properties
-                .into_iter()
-                .enumerate()
-                .partition(|(_, property)| {
-                    !self.reads_long(property, values.get(&property.name).unwrap_or(&NULL))
-                });
+        let schema = self.schema.clone();
+        let (lead, rows, texts) = self.property_order(schema.as_deref(), values, cx);
+        let lead = lead.map(|(index, property)| {
+            if self.reads_long(property, values.get(&property.name).unwrap_or(&NULL)) {
+                self.render_long_text(index, property, window, cx)
+            } else {
+                self.render_property(index, property, window, cx)
+            }
+        });
         // Pulled out by the rows' hover inset, as a relationship group's rows are.
         v_flex()
             .mx(px(-space::XS))
             .gap(px(space::XXS))
+            .children(lead)
             .children(
                 rows.into_iter()
                     .map(|(index, property)| self.render_property(index, property, window, cx)),
@@ -4259,6 +4318,34 @@ impl NodePeek {
                     .map(|(index, property)| self.render_long_text(index, property, window, cx)),
             )
             .into_any_element()
+    }
+
+    /// The properties in the order the view lists them, each with its place in the schema:
+    /// the one the type leads with (spec 044) first, a long text at the full width as any is (a
+    /// note's body, a claim's statement); then the rows; then the long texts.
+    #[expect(clippy::type_complexity)]
+    fn property_order<'a>(
+        &self,
+        schema: Option<&'a SchemaModel>,
+        values: &Map<String, Value>,
+        cx: &App,
+    ) -> (
+        Option<(usize, &'a gq_language::Property)>,
+        Vec<(usize, &'a gq_language::Property)>,
+        Vec<(usize, &'a gq_language::Property)>,
+    ) {
+        let properties = schema
+            .map(|schema| listed_properties(schema, &self.subject))
+            .unwrap_or_default();
+        let lead_name = self.layout(cx).and_then(|layout| layout.lead.clone());
+        let (lead, properties): (Vec<_>, Vec<_>) = properties
+            .into_iter()
+            .enumerate()
+            .partition(|(_, property)| Some(&property.name) == lead_name.as_ref());
+        let (rows, texts) = properties.into_iter().partition(|(_, property)| {
+            !self.reads_long(property, values.get(&property.name).unwrap_or(&NULL))
+        });
+        (lead.into_iter().next(), rows, texts)
     }
 
     /// Whether a property's value is shown as a text under its name rather than boxed in a
@@ -4884,6 +4971,32 @@ impl NodePeek {
                 .is_some_and(|adding| adding.index == index)
     }
 
+    /// The person's places for the type's relationships, by key.
+    fn layout_ranks(&self) -> HashMap<String, usize> {
+        self.layout_order
+            .iter()
+            .enumerate()
+            .map(|(rank, key)| (key.clone(), rank))
+            .collect()
+    }
+
+    /// Under the heading of a page whose relationships are all hidden as empty: none yet, and
+    /// the eye's action to show them, each with its "+".
+    fn render_none_shown(&self, cx: &mut Context<Self>) -> AnyElement {
+        h_flex()
+            .h(px(studio_ui::ds::size::SIDEBAR_ROW))
+            .gap(px(space::SM))
+            .child(studio_ui::ds::text::meta("No relationships yet"))
+            .child(
+                studio_ui::ds::row_button("peek-show-empty", "Show all to add one")
+                    .tip(studio_ui::ds::tooltip(
+                        "Show the relationships with none, each with its +",
+                    ))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_empty(cx))),
+            )
+            .into_any_element()
+    }
+
     /// The row the groups with no neighbours fold into, with how many; a click shows them.
     fn render_empty_row(&self, cx: &mut Context<Self>) -> AnyElement {
         let folded = (0..self.groups.len())
@@ -4909,15 +5022,9 @@ impl NodePeek {
     /// go to, and a group may hold many.
     fn render_group(&self, index: usize, cx: &mut Context<Self>) -> Div {
         let group = &self.groups[index];
-        let arrow = match group.group.direction {
-            Direction::Outgoing => "→",
-            Direction::Incoming => "←",
-        };
-        let title = format!(
-            "{} {arrow} {}",
-            gq_language::traversal_name(&group.group.edge),
-            group.group.other_type
-        );
+        // The person's name for it, "Blocks", else the schema's, "blockedBy ← Issue" (spec 044).
+        let (title, named) = graph_store::layout::group_title(self.layout(cx), &group.group);
+        let schema_title = graph_store::layout::schema_title(&group.group);
         // Until its count is read a group says nothing about what it holds.
         let count = match &group.count {
             Loadable::Loaded(n) => studio_ui::group_count(*n),
@@ -4932,10 +5039,26 @@ impl NodePeek {
         let add = self
             .edits_relationships()
             .then(|| self.render_add_button(index, header_group.clone(), cx));
+        // Its tip says what the schema calls a group the person named, and how to shape it.
+        let tip = match (failed, named) {
+            (Some(error), _) => error,
+            (None, true) => format!("{schema_title} · right-click to move or name it"),
+            (None, false) => "Right-click to move or name it".to_owned(),
+        };
         let header = studio_ui::ds::fold_row(("peek-group", index), title, group.expanded, cx)
             .group(header_group)
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_group(index, cx)))
-            .when_some(failed, |d, error| d.tip(studio_ui::ds::tooltip(error)))
+            .on_mouse_down(
+                gpui::MouseButton::Right,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.open_group_menu(index, event.position, window, cx)
+                }),
+            )
+            // Not over its own menu.
+            .when(self.group_menu.is_none(), |header| {
+                header.tip(studio_ui::ds::tooltip(tip))
+            })
             .when(self.edge_writes.contains(&index), |header| {
                 header.child(studio_ui::ds::dot(Color::Warning))
             })
@@ -5089,10 +5212,10 @@ impl NodePeek {
         &self,
         index: usize,
         n: usize,
-        edge_id: String,
+        edge_ids: Vec<String>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let asked = self.removing.as_deref() == Some(edge_id.as_str());
+        let asked = self.removing.as_deref() == edge_ids.first().map(String::as_str);
         let edge = self.groups[index].group.edge.clone();
         if asked {
             return studio_ui::ds::row_button(
@@ -5106,7 +5229,7 @@ impl NodePeek {
             )))
             .on_click(cx.listener(move |this, _, window, cx| {
                 cx.stop_propagation();
-                this.press_remove(index, edge_id.clone(), window, cx)
+                this.press_remove(index, edge_ids.clone(), window, cx)
             }))
             .into_any_element();
         }
@@ -5120,7 +5243,7 @@ impl NodePeek {
             ))
             .on_click(cx.listener(move |this, _, window, cx| {
                 cx.stop_propagation();
-                this.press_remove(index, edge_id.clone(), window, cx)
+                this.press_remove(index, edge_ids.clone(), window, cx)
             }))
             .into_any_element()
     }
@@ -5134,10 +5257,9 @@ impl NodePeek {
                 group_note(studio_ui::ds::text::meta("None at this commit"))
             }
             Loadable::Loaded(neighbours) => {
+                let rows = listed_rows(group, neighbours);
                 let more = match &group.count {
-                    Loadable::Loaded(n) if *n > neighbours.len() as i64 => {
-                        Some(*n - neighbours.len() as i64)
-                    }
+                    Loadable::Loaded(n) if *n > rows.len() as i64 => Some(*n - rows.len() as i64),
                     _ => None,
                 };
                 let other = group.group.other_type.clone();
@@ -5174,18 +5296,23 @@ impl NodePeek {
                 let removes = self.edits_relationships();
                 let on_page = self.page;
                 v_flex()
-                    .children(neighbours.iter().enumerate().map(|(n, neighbour)| {
+                    .children(rows.into_iter().map(|(n, neighbour, edge_ids)| {
                         let open = open_node(&other, &neighbour.id, at_commit.clone());
                         let label = neighbour
                             .label
                             .clone()
                             .unwrap_or_else(|| neighbour.id.clone());
+                        // Every row of a group is a node of one type: its mark says the type
+                        // (the study's beads B3), the row's name which one.
                         let row = studio_ui::ds::SidebarRow::new(
                             SharedString::from(format!("peek-neighbour-{index}-{n}")),
                             label.clone(),
                         )
                         .flush()
-                        .start(studio_ui::type_mark(&other, &label, cx));
+                        .start(studio_ui::type_swatch(&other, cx))
+                        .when_some(self.line_of(&other, &neighbour.id), |row, line| {
+                            row.detail(line)
+                        });
                         let row = if on_page {
                             // A page holds a selection, as a table and a tree do: a click
                             // selects the related node, which the inspector shows, and a second
@@ -5226,12 +5353,12 @@ impl NodePeek {
                                 window.dispatch_action(Box::new(open), cx);
                             })
                         };
-                        match neighbour.edge_id.clone().filter(|_| removes) {
+                        match edge_ids.first().cloned().filter(|_| removes) {
                             // Pressed once, "Remove" stays until it is pressed again.
-                            Some(edge_id) if self.removing.as_deref() == Some(edge_id.as_str()) => {
-                                row.end(self.render_remove(index, n, edge_id, cx))
+                            Some(first) if self.removing.as_deref() == Some(first.as_str()) => {
+                                row.end(self.render_remove(index, n, edge_ids, cx))
                             }
-                            Some(edge_id) => row.actions(self.render_remove(index, n, edge_id, cx)),
+                            Some(_) => row.actions(self.render_remove(index, n, edge_ids, cx)),
                             None => row,
                         }
                     }))
@@ -5413,7 +5540,14 @@ async fn read_first_edges(
     };
     let limit = reads.limit as usize;
     if shown.len() <= limit {
-        let count = Loadable::Loaded(shown.len() as i64);
+        let listed = if reads.distinct {
+            let mut ids: Vec<&str> = shown.iter().map(|n| n.id.as_str()).collect();
+            ids.dedup();
+            ids.len()
+        } else {
+            shown.len()
+        };
+        let count = Loadable::Loaded(listed as i64);
         return Some(Ok(FirstEdges { shown, count }));
     }
     shown.truncate(limit);
@@ -5454,6 +5588,29 @@ fn neighbours_from(rows: &Value) -> Vec<Neighbour> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The rows a group lists of the edges read, each with the ids of the edges it stands for and
+/// its place among the edges: one row an edge, but in a group read both ways one a related
+/// node, the edges to it in either direction together (spec 044), which the read lists one
+/// after the other.
+fn listed_rows<'a>(
+    group: &Group,
+    neighbours: &'a [Neighbour],
+) -> Vec<(usize, &'a Neighbour, Vec<String>)> {
+    let mut rows: Vec<(usize, &Neighbour, Vec<String>)> = Vec::new();
+    for (n, neighbour) in neighbours.iter().enumerate() {
+        let edge = neighbour.edge_id.clone();
+        if group.group.direction == Direction::Both
+            && let Some((_, last, edges)) = rows.last_mut()
+            && last.id == neighbour.id
+        {
+            edges.extend(edge);
+            continue;
+        }
+        rows.push((n, neighbour, edge.into_iter().collect()));
+    }
+    rows
 }
 
 /// A line under a relationship group in place of its rows (none, reading, a failure), on the
@@ -5558,18 +5715,41 @@ impl NodePeek {
             items.push(Item::Note("This type takes part in no relationships."));
             return items;
         }
+        // The person's order first (spec 044), each where its place allows: a page still hides
+        // one counted empty, and the peek keeps one known empty under its Empty row.
+        let ranks: Vec<Option<usize>> = {
+            let layout = self.layout_ranks();
+            self.groups
+                .iter()
+                .map(|group| {
+                    layout
+                        .get(&builder::relationship_key(&group.group))
+                        .copied()
+                })
+                .collect()
+        };
+        let mut ranked: Vec<(usize, usize)> = Vec::new();
         let (mut listed, mut as_drawn, mut folded) = (Vec::new(), Vec::new(), Vec::new());
-        for index in 0..self.groups.len() {
-            match self.place(index) {
-                Place::Listed => listed.push(Item::Group(index)),
+        for (index, rank) in ranks.into_iter().enumerate() {
+            let place = self.place(index);
+            match (place, rank) {
                 // A page hides a group once it is counted empty, as a tree does.
-                Place::AsDrawn if self.page && !self.shows_empty_group(index) => {}
-                Place::AsDrawn => as_drawn.push(Item::Group(index)),
-                Place::Folded => folded.push(index),
+                (Place::AsDrawn, _) if self.page && !self.shows_empty_group(index) => {}
+                (Place::Listed | Place::AsDrawn, Some(rank)) => ranked.push((rank, index)),
+                (Place::Listed, None) => listed.push(Item::Group(index)),
+                (Place::AsDrawn, None) => as_drawn.push(Item::Group(index)),
+                (Place::Folded, _) => folded.push(index),
             }
         }
+        ranked.sort();
+        items.extend(ranked.into_iter().map(|(_, index)| Item::Group(index)));
         items.extend(listed);
         items.extend(as_drawn);
+        // A page whose relationships are all hidden as empty says so under its heading, rather
+        // than leave the heading over nothing (the study's brain N2).
+        if self.page && items.len() == 1 && !self.show_empty {
+            items.push(Item::NoneShown);
+        }
         if !folded.is_empty() {
             // A page has no Empty row: its toolbar's eye shows or hides the groups.
             if !self.page {
@@ -5634,6 +5814,15 @@ impl NodePeek {
             })
             .on_action(cx.listener(Self::on_cancel_field))
             .on_action(cx.listener(Self::on_expand_field))
+            .when(self.page, |view| {
+                view.on_action(cx.listener(Self::on_move_up))
+                    .on_action(cx.listener(Self::on_move_down))
+            })
+            .children(
+                self.group_menu
+                    .as_ref()
+                    .map(|(menu, position, _)| studio_ui::ds::menu_at(menu.clone(), *position)),
+            )
             .size_full()
             .child(
                 list(
@@ -5680,6 +5869,7 @@ impl NodePeek {
                 self.render_group(index, cx).into_any_element()
             }
             Some(Item::Empty) => self.render_empty_row(cx),
+            Some(Item::NoneShown) => self.render_none_shown(cx),
             _ => div().into_any_element(),
         };
         // A page reads at a document's width, with its margins; the peek fills its dock.
@@ -5841,6 +6031,347 @@ pub(crate) fn absence_text(then: &PropertyThen, capital: bool) -> String {
 
 /// What a property's row or text shows of its state, and what a click on it does
 /// (`NodePeek::property_state`).
+/// What a group's menu entry does to the view.
+type MenuStep = dyn Fn(&mut NodePeek, &mut Window, &mut Context<NodePeek>);
+
+/// How the node's type reads (spec 044): the order and names of its relationships, their fold,
+/// what its related nodes' rows show, and its menus.
+impl NodePeek {
+    /// How the node's type reads in this graph, when the person shaped it.
+    fn layout<'a>(&self, cx: &'a App) -> Option<&'a studio_settings::TypeLayout> {
+        let PeekSubject::Node { type_name, .. } = &self.subject else {
+            return None;
+        };
+        self.session.read(cx).layout(type_name)
+    }
+
+    /// The person shaped how a type reads: the groups are made again when the node's own fold
+    /// changed, and the rows of the types in `lines` read their lines again.
+    fn layout_changed(
+        &mut self,
+        lines: &std::collections::BTreeSet<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let PeekSubject::Node { type_name, .. } = &self.subject else {
+            return;
+        };
+        if let Some(schema) = self.schema.clone() {
+            let layout = self.session.read(cx).layout(type_name).cloned();
+            self.layout_order = layout
+                .as_ref()
+                .map(|layout| layout.order.clone())
+                .unwrap_or_default();
+            let folded = graph_store::layout::folded_groups(&schema, type_name, layout.as_ref());
+            let held: Vec<&RelationshipGroup> = self.groups.iter().map(|g| &g.group).collect();
+            if self.values.loaded().is_some() && folded.iter().ne(held) {
+                self.regroup(cx);
+                return;
+            }
+        }
+        if !lines.is_empty() {
+            self.lines
+                .retain(|(type_name, _), _| !lines.contains(type_name));
+            self.lines_asked
+                .retain(|(type_name, _)| !lines.contains(type_name));
+            for index in 0..self.groups.len() {
+                if lines.contains(&self.groups[index].group.other_type) {
+                    self.read_lines(index, cx);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Makes the relationship groups again under the type's fold, each read once drawn; while a
+    /// relationship write is out, once it lands.
+    fn regroup(&mut self, cx: &mut Context<Self>) {
+        if !self.edge_writes.is_empty() {
+            self.regroup_owed = true;
+            return;
+        }
+        self.adding = None;
+        self.removing = None;
+        self.group_notices.clear();
+        self.group_menu = None;
+        self.load_groups(cx);
+        cx.notify();
+    }
+
+    /// Reads what the rows of group `index`'s neighbours show after their names, those not
+    /// asked for yet, when the type at its other end has a line.
+    fn read_lines(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(group) = self.groups.get(index) else {
+            return;
+        };
+        let other = group.group.other_type.clone();
+        if self
+            .session
+            .read(cx)
+            .layout(&other)
+            .is_none_or(|layout| layout.line.is_empty())
+        {
+            return;
+        }
+        let Loadable::Loaded(neighbours) = &group.neighbours else {
+            return;
+        };
+        let ends: Vec<(String, String)> = neighbours
+            .iter()
+            .map(|n| (other.clone(), n.id.clone()))
+            .filter(|end| self.lines_asked.insert(end.clone()))
+            .collect();
+        if ends.is_empty() {
+            return;
+        }
+        let at = group.read_at.clone();
+        let read = self
+            .session
+            .update(cx, |session, cx| session.node_lines(ends, at, cx));
+        self._line_reads.push(cx.spawn(async move |this, cx| {
+            let (lines, _) = read.await;
+            this.update(cx, |this, cx| {
+                this.lines.extend(lines);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// What the row of the related node `(type_name, id)` shows after its name, once read.
+    fn line_of(&self, type_name: &str, id: &str) -> Option<String> {
+        let schema = self.schema.as_deref()?;
+        let values = self.lines.get(&(type_name.to_owned(), id.to_owned()))?;
+        gq_language::line_text(schema.node(type_name)?, values)
+    }
+
+    /// The relationships as the list shows them, by key, in order: what the person's moves are
+    /// measured against.
+    fn shown_keys(&self) -> Vec<String> {
+        self.list_items()
+            .into_iter()
+            .filter_map(|item| match item {
+                Item::Group(index) => self.groups.get(index),
+                _ => None,
+            })
+            .map(|group| builder::relationship_key(&group.group))
+            .collect()
+    }
+
+    /// Changes how the node's type reads, in the settings.
+    fn change_layout(
+        &self,
+        change: impl FnOnce(&mut studio_settings::TypeLayout) + 'static,
+        cx: &mut App,
+    ) {
+        let PeekSubject::Node { type_name, .. } = &self.subject else {
+            return;
+        };
+        let type_name = type_name.clone();
+        GraphSession::change_layout(&self.session, &type_name, change, cx);
+    }
+
+    /// Moves group `index` one place earlier (`step` -1) or later (+1) among those listed.
+    pub(crate) fn move_group(&mut self, index: usize, step: isize, cx: &mut Context<Self>) {
+        let Some(group) = self.groups.get(index) else {
+            return;
+        };
+        let key = builder::relationship_key(&group.group);
+        let shown = self.shown_keys();
+        self.change_layout(move |layout| layout.step(&shown, &key, step), cx);
+    }
+
+    /// The group the page's selected related node is in, for the keys that move a group.
+    fn selected_group(&self) -> Option<usize> {
+        let (type_name, id) = self.selected.as_ref()?;
+        self.groups.iter().position(|group| {
+            group.group.other_type == *type_name
+                && group
+                    .neighbours
+                    .loaded()
+                    .is_some_and(|shown| shown.iter().any(|n| n.id == *id))
+        })
+    }
+
+    fn on_move_up(
+        &mut self,
+        _: &studio_actions::node::MoveRelationshipUp,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(index) = self.selected_group() {
+            self.move_group(index, -1, cx);
+        }
+    }
+
+    fn on_move_down(
+        &mut self,
+        _: &studio_actions::node::MoveRelationshipDown,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(index) = self.selected_group() {
+            self.move_group(index, 1, cx);
+        }
+    }
+
+    /// Group `index`'s menu at `position`: move it, name it, read it both ways.
+    fn open_group_menu(
+        &mut self,
+        index: usize,
+        position: gpui::Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(group), Some(schema)) = (self.groups.get(index), self.schema.clone()) else {
+            return;
+        };
+        let relationship = group.group.clone();
+        let key = builder::relationship_key(&relationship);
+        let layout = self.layout(cx).cloned();
+        let named = layout
+            .as_ref()
+            .and_then(|layout| layout.name_of(&key))
+            .map(str::to_owned);
+        let shown = self.shown_keys();
+        let at = shown.iter().position(|k| *k == key);
+        let last = shown.len().saturating_sub(1);
+        let folds = relationship.to_itself(&schema);
+        let both = relationship.direction == Direction::Both;
+        let schema_title = graph_store::layout::schema_title(&relationship);
+        let view = cx.weak_entity();
+        let on = move |f: Box<MenuStep>| {
+            let view = view.clone();
+            move |window: &mut Window, cx: &mut App| {
+                view.update(cx, |this, cx| f(this, window, cx)).ok();
+            }
+        };
+        let menu = ContextMenu::build(window, cx, move |menu, _, _| {
+            let (up, down, top) = (key.clone(), key.clone(), key.clone());
+            let menu = menu
+                .header(schema_title.clone())
+                .item(
+                    studio_ui::menu::ContextMenuEntry::new("Move up")
+                        .disabled(at.is_none_or(|at| at == 0))
+                        .action(Box::new(studio_actions::node::MoveRelationshipUp))
+                        .handler(on(Box::new(move |this, _, cx| {
+                            if let Some(index) = this.index_of(&up) {
+                                this.move_group(index, -1, cx)
+                            }
+                        }))),
+                )
+                .item(
+                    studio_ui::menu::ContextMenuEntry::new("Move down")
+                        .disabled(at.is_none_or(|at| at >= last))
+                        .action(Box::new(studio_actions::node::MoveRelationshipDown))
+                        .handler(on(Box::new(move |this, _, cx| {
+                            if let Some(index) = this.index_of(&down) {
+                                this.move_group(index, 1, cx)
+                            }
+                        }))),
+                )
+                .item(
+                    studio_ui::menu::ContextMenuEntry::new("Move to top")
+                        .disabled(at == Some(0))
+                        .handler(on(Box::new(move |this, _, cx| {
+                            let key = top.clone();
+                            this.change_layout(move |layout| layout.to_top(&key), cx)
+                        }))),
+                )
+                .separator();
+            let (rename, unname) = (key.clone(), key.clone());
+            let title = schema_title.clone();
+            let current = named.clone();
+            let menu = menu
+                .item(
+                    studio_ui::menu::ContextMenuEntry::new("Name…").handler(on(Box::new(
+                        move |this, window, cx| {
+                            this.open_name_dialog(
+                                rename.clone(),
+                                title.clone(),
+                                current.clone(),
+                                window,
+                                cx,
+                            )
+                        },
+                    ))),
+                )
+                .when(named.is_some(), |menu| {
+                    menu.item(
+                        studio_ui::menu::ContextMenuEntry::new(format!("Call it {schema_title}"))
+                            .handler(on(Box::new(move |this, _, cx| {
+                                let key = unname.clone();
+                                this.change_layout(move |layout| layout.rename(&key, ""), cx)
+                            }))),
+                    )
+                });
+            let edge = relationship.edge.clone();
+            menu.when(folds, |menu| {
+                menu.separator().item(
+                    studio_ui::menu::ContextMenuEntry::new(if both {
+                        "Read each way apart"
+                    } else {
+                        "Read both ways as one"
+                    })
+                    .handler(on(Box::new(move |this, _, cx| {
+                        let edge = edge.clone();
+                        this.change_layout(move |layout| layout.set_both_ways(&edge, !both), cx)
+                    }))),
+                )
+            })
+        });
+        let subscription = cx.subscribe_in(
+            &menu,
+            window,
+            |this, _, _: &gpui::DismissEvent, window, cx| {
+                this.group_menu = None;
+                window.focus(&this.focus_handle, cx);
+                cx.notify();
+            },
+        );
+        window.focus(&menu.focus_handle(cx), cx);
+        self.group_menu = Some((menu, position, subscription));
+        cx.notify();
+    }
+
+    /// The place of the group whose key is `key`.
+    fn index_of(&self, key: &str) -> Option<usize> {
+        self.groups
+            .iter()
+            .position(|group| builder::relationship_key(&group.group) == key)
+    }
+
+    /// Asks what the page calls the relationship `key`.
+    fn open_name_dialog(
+        &mut self,
+        key: String,
+        schema_title: String,
+        current: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let PeekSubject::Node { type_name, .. } = &self.subject else {
+            return;
+        };
+        let Some(workspace) = studio_workspace::workspace_for(window) else {
+            return;
+        };
+        let (session, type_name) = (self.session.clone(), type_name.clone());
+        workspace.update(cx, |workspace, cx| {
+            workspace.toggle_modal(window, cx, |window, cx| {
+                crate::dialogs::NameRelationshipModal::new(
+                    session,
+                    type_name,
+                    key,
+                    schema_title,
+                    current,
+                    window,
+                    cx,
+                )
+            });
+        });
+    }
+}
+
 struct PropertyState {
     editable: bool,
     editing: bool,
@@ -7486,13 +8017,13 @@ mod tests {
         let (view, cx) = page(session(KNOWS, cx), cx);
         view.update_in(cx, |view, window, cx| {
             assert!(!view.groups.is_empty(), "Person knows Person");
-            view.press_remove(0, "e1".into(), window, cx);
+            view.press_remove(0, vec!["e1".into()], window, cx);
             assert_eq!(view.removing.as_deref(), Some("e1"), "the first press asks");
             assert!(view.edge_writes.is_empty(), "nothing is written yet");
-            view.press_remove(0, "e1".into(), window, cx);
+            view.press_remove(0, vec!["e1".into()], window, cx);
             assert!(view.edge_writes.contains(&0), "the second press writes");
-            view.press_remove(0, "e1".into(), window, cx);
-            view.press_remove(0, "e1".into(), window, cx);
+            view.press_remove(0, vec!["e1".into()], window, cx);
+            view.press_remove(0, vec!["e1".into()], window, cx);
             assert!(view.removing.is_none(), "no press while the write is out");
             view.start_add(0, window, cx);
             assert!(view.adding.is_none(), "no add while the write is out");
@@ -9360,6 +9891,263 @@ mod tests {
                 &view.blobs[0].edit,
                 Some(BlobEdit::Failed { notice, .. }) if notice.message == refused
             ));
+        });
+    }
+
+    /// The brain cookbook's people (spec 044): who knows whom, stored both ways, where they
+    /// live, and the notes about them.
+    const BRAIN: &str = "node Person {\n  slug: String @key\n  name: String\n  brief: String?\n  relation: String?\n}\nnode Place {\n  slug: String @key\n  name: String\n}\nnode Note {\n  slug: String @key\n  name: String\n  kind: String?\n}\nedge Knows: Person -> Person\nedge LivesIn: Person -> Place\nedge NoteAboutPerson: Note -> Person\n";
+
+    /// Settings a test changes, held in memory, before the session reads them.
+    fn settings_in_memory(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_settings::init_test(cx);
+            studio_settings::keep_changes_in_memory(cx);
+        });
+    }
+
+    /// Sets how `type_name` reads in the session's graph, as the page's menus do.
+    fn shape(
+        session: &Entity<GraphSession>,
+        type_name: &str,
+        change: impl FnOnce(&mut studio_settings::TypeLayout),
+        cx: &mut VisualTestContext,
+    ) {
+        let key = session.read_with(cx, |session, _| session.overrides_key());
+        cx.update(|_, cx| {
+            cx.update_global::<studio_settings::StudioSettings, _>(|settings, _| {
+                settings.update_layout(&key, type_name, change)
+            })
+        });
+        cx.run_until_parked();
+    }
+
+    /// The keys of the groups a view lists, in order.
+    fn listed_keys(view: &NodePeek) -> Vec<String> {
+        view.list_items()
+            .into_iter()
+            .filter_map(|item| match item {
+                Item::Group(index) => Some(builder::relationship_key(&view.groups[index].group)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A page reads as its type is shaped (spec 044, the study's brain N1): the relationships
+    /// the person put first come first, a relationship named in the reader's words is called
+    /// so, and the property the type leads with comes before the others. Moving a group takes
+    /// the others' places as they were.
+    #[gpui::test]
+    async fn a_page_reads_as_its_type_is_shaped(cx: &mut TestAppContext) {
+        settings_in_memory(cx);
+        let (session, _) = session_routing(
+            BRAIN,
+            |request| match request["name"].as_str() {
+                Some("studio_node") => json!([{ "n": {
+                    "@id": "p1", "slug": "p1", "name": "Theo", "brief": "Best friend since college.",
+                    "relation": "friend"
+                } }]),
+                Some("studio_neighbours") => json!([{ "id": "x1", "edge_id": "e1", "label": "X" }]),
+                _ => json!([]),
+            },
+            cx,
+        );
+        let (view, cx) = page(session.clone(), cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                listed_keys(view),
+                ["out:Knows", "out:LivesIn", "in:Knows", "in:NoteAboutPerson"],
+                "schema order before the type is shaped"
+            );
+        });
+        shape(
+            &session,
+            "Person",
+            |layout| {
+                layout.to_top("in:NoteAboutPerson");
+                layout.rename("in:NoteAboutPerson", "Notes about them");
+                layout.lead = Some("brief".into());
+            },
+            cx,
+        );
+        view.update_in(cx, |view, _, cx| {
+            assert_eq!(
+                listed_keys(view),
+                ["in:NoteAboutPerson", "out:Knows", "out:LivesIn", "in:Knows"],
+                "the notes first"
+            );
+            let notes = &view.groups[view.index_of("in:NoteAboutPerson").unwrap()].group;
+            assert_eq!(
+                graph_store::layout::group_title(view.layout(cx), notes),
+                ("Notes about them".to_owned(), true)
+            );
+            let values = view.values.loaded().unwrap().clone();
+            let schema = view.schema.clone().unwrap();
+            let (lead, rows, _) = view.property_order(Some(&schema), &values, cx);
+            assert_eq!(
+                lead.map(|(_, p)| p.name.as_str()),
+                Some("brief"),
+                "lead first"
+            );
+            assert!(rows.iter().all(|(_, p)| p.name != "brief"), "and once");
+            // Moved down one, past "knows → Person": the others stay where they were.
+            let index = view.index_of("in:NoteAboutPerson").unwrap();
+            view.move_group(index, 1, cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                listed_keys(view),
+                ["out:Knows", "in:NoteAboutPerson", "out:LivesIn", "in:Knows"]
+            );
+        });
+    }
+
+    /// A relationship from a type to itself read both ways is one group (spec 044): one
+    /// undirected read, each related node once however many edges reach it, counted so; its ×
+    /// removes every edge between the two, in one write.
+    #[gpui::test]
+    async fn a_relationship_read_both_ways_lists_each_node_once(cx: &mut TestAppContext) {
+        settings_in_memory(cx);
+        let reads = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = reads.clone();
+        let (session, sent) = crate::test_support::session_routing_recording_writes(
+            BRAIN,
+            move |request| {
+                let query = request["query"].as_str().unwrap_or_default();
+                match request["name"].as_str() {
+                    Some("studio_node") => {
+                        json!([{ "n": { "@id": "p1", "slug": "p1", "name": "Theo" } }])
+                    }
+                    Some("studio_neighbours") if query.contains("<knows>") => {
+                        seen.lock().unwrap().push(query.to_owned());
+                        json!([
+                            { "id": "p2", "edge_id": "e1", "label": "Maya" },
+                            { "id": "p2", "edge_id": "e2", "label": "Maya" },
+                            { "id": "p3", "edge_id": "e3", "label": "Marco" },
+                        ])
+                    }
+                    _ => json!([]),
+                }
+            },
+            cx,
+        );
+        let (view, cx) = page(session.clone(), cx);
+        shape(
+            &session,
+            "Person",
+            |layout| layout.set_both_ways("Knows", true),
+            cx,
+        );
+        view.update_in(cx, |view, window, cx| {
+            let keys: Vec<String> = view
+                .groups
+                .iter()
+                .map(|group| builder::relationship_key(&group.group))
+                .collect();
+            assert_eq!(
+                keys,
+                ["both:Knows", "out:LivesIn", "in:NoteAboutPerson"],
+                "one group where the two stood"
+            );
+            assert_eq!(listed_keys(view), ["both:Knows"], "the others are empty");
+            let group = &view.groups[0];
+            assert_eq!(
+                group.count,
+                Loadable::Loaded(2),
+                "two people, not three edges"
+            );
+            let Loadable::Loaded(neighbours) = &group.neighbours else {
+                panic!("read");
+            };
+            let rows = listed_rows(group, neighbours);
+            let shown: Vec<(&str, &[String])> = rows
+                .iter()
+                .map(|(_, n, edges)| (n.id.as_str(), edges.as_slice()))
+                .collect();
+            assert_eq!(
+                shown,
+                [
+                    ("p2", ["e1".to_owned(), "e2".to_owned()].as_slice()),
+                    ("p3", ["e3".to_owned()].as_slice())
+                ]
+            );
+            view.press_remove(0, vec!["e1".into(), "e2".into()], window, cx);
+            view.press_remove(0, vec!["e1".into(), "e2".into()], window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            reads
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|q| q.contains("$n $e:<knows> $m")),
+            "{:?}",
+            reads.lock().unwrap()
+        );
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 1, "one write: {sent:?}");
+        assert_eq!(sent[0]["name"], "studio_delete_edges");
+        assert_eq!(sent[0]["params"]["ids"], json!(["e1", "e2"]));
+    }
+
+    /// A related node's row says what its type's rows show after their names (spec 044):
+    /// read once for the group's nodes, and again when the person changes it.
+    #[gpui::test]
+    async fn a_related_nodes_row_shows_its_types_line(cx: &mut TestAppContext) {
+        settings_in_memory(cx);
+        let (session, asked) = session_routing(
+            BRAIN,
+            |request| {
+                let query = request["query"].as_str().unwrap_or_default();
+                match request["name"].as_str() {
+                    Some("studio_node") => {
+                        json!([{ "n": { "@id": "p1", "slug": "p1", "name": "Theo" } }])
+                    }
+                    Some("studio_neighbours") if query.contains("noteAboutPerson") => {
+                        json!([{ "id": "n1", "edge_id": "e1", "label": "Whisky" }])
+                    }
+                    Some("studio_node_lines") => json!([{ "id": "n1", "l0": "preference" }]),
+                    _ => json!([]),
+                }
+            },
+            cx,
+        );
+        let (view, cx) = page(session.clone(), cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.line_of("Note", "n1"), None, "no line chosen");
+        });
+        shape(&session, "Note", |layout| layout.toggle_line("kind"), cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.line_of("Note", "n1").as_deref(), Some("preference"));
+        });
+        let lines = |asked: &[String]| asked.iter().filter(|a| *a == "studio_node_lines").count();
+        assert_eq!(lines(&asked.lock().unwrap()), 1, "one read for the group");
+        // Drawn again, nothing is read again.
+        view.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert_eq!(lines(&asked.lock().unwrap()), 1);
+    }
+
+    /// A page whose relationships are all counted empty says so under its heading and offers
+    /// to show them, rather than leave the heading over nothing (the study's brain N2).
+    #[gpui::test]
+    async fn a_page_with_no_relationships_says_so(cx: &mut TestAppContext) {
+        let (session, _) = session_routing(
+            BRAIN,
+            |request| match request["name"].as_str() {
+                Some("studio_node") => {
+                    json!([{ "n": { "@id": "p1", "slug": "p1", "name": "New" } }])
+                }
+                _ => json!([]),
+            },
+            cx,
+        );
+        let (view, cx) = page(session, cx);
+        view.update_in(cx, |view, _, cx| {
+            assert_eq!(view.list_items(), [Item::Head, Item::NoneShown]);
+            view.toggle_empty(cx);
+            assert!(!view.list_items().contains(&Item::NoneShown));
         });
     }
 }

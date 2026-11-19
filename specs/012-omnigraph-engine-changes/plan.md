@@ -304,8 +304,11 @@ Studio says its id changes.
 annotations other than `@description` and `@instruction` ("changing annotations beyond
 @description/@instruction is not supported in schema migration v1", `omnigraph schema plan`
 0.13.0). An annotation with no built-in behaviour (a display hint such as `@format("text")`)
-changes no data and no index, so it could apply as metadata. *Waits:* 014. *Today:* Studio
-reads every String as markdown; a hint can be declared only on a new property or type.
+changes no data and no index, so it could apply as metadata. *Waits:* 014, 044. *Today:* Studio
+reads every String as markdown; a hint can be declared only on a new property or type. A type's
+layout (spec 044: what its page leads with, the order and names of its relationships, those read
+both ways, what its rows show, whether its table reads as cards) is each person's, in their
+settings; with E27 a graph could carry it as display hints for everyone who opens it.
 
 **E28. Merge bound to the reviewed source head.** A write is bound to its target's head by
 `If-Graph-Commit`; a merge has no such binding on its source. Studio reads the source head just

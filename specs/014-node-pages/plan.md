@@ -332,6 +332,10 @@ Four parts, built in this order; each lands on its own.
 
 ## Corrections
 
+- **A page reads as its type is shaped** (spec 044, 2026-11-19). The person sets what a type's
+  page leads with, the order and names of its relationships and those read both ways as one;
+  a related node's row shows its type's line, and its mark the type's letter. A page whose
+  every relationship is counted empty says "No relationships yet" under its heading.
 - **A page hides groups found empty** (Ragnor, 2026-11-09). This design kept a group read as
   empty in its row, since hiding it pulls the next groups into view and reads them. A page now
   hides them as a tree does, so a node whose groups are mostly empty reads every count, one per

@@ -235,6 +235,140 @@ pub struct GraphOverrides {
     /// types are named by their `name`, `title` or key (spec 002, "Node names").
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
+    /// How each type's pages, rows and table read, by type, where the person shaped them
+    /// (spec 044).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub layouts: BTreeMap<String, TypeLayout>,
+}
+
+/// How one node type reads in one graph (spec 044): what its page leads with, the order and
+/// names of its relationships, the relationships to itself read both ways, what a row of it
+/// shows after its name, and whether its table reads as cards. Personal, set from the page,
+/// until a graph can carry its own (E27). Relationships are named by their key, `out:Knows`,
+/// `in:BlockedBy`, or `both:Knows` for one read both ways.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct TypeLayout {
+    /// The property a page leads with, before the others and at its full width.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lead: Option<String>,
+    /// The relationships a page lists first, in this order; the others follow as before.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub order: Vec<String>,
+    /// What a page and a tree call a relationship, by key: "Blocks" for `in:BlockedBy`.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub names: BTreeMap<String, String>,
+    /// Relationships from the type to itself that mean the same both ways (`Knows`), by edge:
+    /// a page lists them as one relationship, each related node once.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub both_ways: Vec<String>,
+    /// The properties a row of this type shows after its name, in this order: a tree's row, a
+    /// canvas chip, a related node on a page.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub line: Vec<String>,
+    /// The type's table reads as cards, its text wrapped rather than cut at the column's edge.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub reading: bool,
+}
+
+impl TypeLayout {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// What a page and a tree call the relationship `key`, when the person named it.
+    pub fn name_of(&self, key: &str) -> Option<&str> {
+        self.names.get(key).map(String::as_str)
+    }
+
+    /// Where `key` stands in the person's order, when it has a place.
+    pub fn rank_of(&self, key: &str) -> Option<usize> {
+        self.order.iter().position(|k| k == key)
+    }
+
+    /// Whether the relationship `edge` from the type to itself reads both ways.
+    pub fn both_ways(&self, edge: &str) -> bool {
+        self.both_ways.iter().any(|e| e == edge)
+    }
+
+    /// Moves `key` one place earlier (`step` -1) or later (+1) among `shown`, the relationships
+    /// in the order a page lists them now, the person's first. The order kept is `shown`'s up to
+    /// the moved one's new place, or as far as the person's order went, so moving one moves no
+    /// other; the places of relationships not shown now stay after it.
+    pub fn step(&mut self, shown: &[String], key: &str, step: isize) {
+        let Some(at) = shown.iter().position(|k| k == key) else {
+            return;
+        };
+        let to = (at as isize + step).clamp(0, shown.len() as isize - 1) as usize;
+        if to == at {
+            return;
+        }
+        let ranked = shown.iter().filter(|k| self.order.contains(k)).count();
+        let mut order: Vec<String> = shown.to_vec();
+        let moved = order.remove(at);
+        order.insert(to, moved);
+        order.truncate((to + 1).max(ranked).min(shown.len()));
+        order.extend(self.order.iter().filter(|k| !shown.contains(k)).cloned());
+        self.order = order;
+    }
+
+    /// Puts `key` first among the relationships, the person's others after it.
+    pub fn to_top(&mut self, key: &str) {
+        self.order.retain(|k| k != key);
+        self.order.insert(0, key.to_owned());
+    }
+
+    /// Names the relationship `key` `name`, or lets go of its name when `name` is empty.
+    pub fn rename(&mut self, key: &str, name: &str) {
+        let name = name.trim();
+        if name.is_empty() {
+            self.names.remove(key);
+        } else {
+            self.names.insert(key.to_owned(), name.to_owned());
+        }
+    }
+
+    /// Reads the relationship `edge` both ways, or each way apart again. Its place and name go
+    /// with it: those of its two keys are let go, and the one key both ways takes the outgoing
+    /// one's.
+    pub fn set_both_ways(&mut self, edge: &str, on: bool) {
+        let (out, back, both) = (
+            format!("out:{edge}"),
+            format!("in:{edge}"),
+            format!("both:{edge}"),
+        );
+        let (from, gone): (&str, [&str; 2]) = if on {
+            (&out, [out.as_str(), back.as_str()])
+        } else {
+            (&both, [both.as_str(), both.as_str()])
+        };
+        let to = if on { &both } else { &out };
+        let rank = self.rank_of(from);
+        let name = self.names.get(from).cloned();
+        self.order.retain(|k| !gone.contains(&k.as_str()));
+        for key in gone {
+            self.names.remove(key);
+        }
+        if let Some(rank) = rank {
+            self.order.insert(rank.min(self.order.len()), to.clone());
+        }
+        if let Some(name) = name {
+            self.names.insert(to.clone(), name);
+        }
+        self.both_ways.retain(|e| e != edge);
+        if on {
+            self.both_ways.push(edge.to_owned());
+        }
+    }
+
+    /// Shows `property` in a row's line, or takes it out.
+    pub fn toggle_line(&mut self, property: &str) {
+        if let Some(at) = self.line.iter().position(|p| p == property) {
+            self.line.remove(at);
+        } else {
+            self.line.push(property.to_owned());
+        }
+    }
 }
 
 /// A named filter, order, grouping and set of columns for one type's table (spec 004), listed
@@ -1046,6 +1180,30 @@ impl StudioSettings {
         self.graphs.retain(|_, overrides| !overrides.is_empty());
     }
 
+    /// How each type of a graph reads, where the person shaped it (spec 044).
+    pub fn layouts_for(&self, graph: &str) -> BTreeMap<String, TypeLayout> {
+        self.graphs
+            .get(graph)
+            .map(|overrides| overrides.layouts.clone())
+            .unwrap_or_default()
+    }
+
+    /// Changes how `type_name` reads in a graph; a layout left with nothing chosen goes.
+    pub fn update_layout(
+        &mut self,
+        graph: &str,
+        type_name: &str,
+        change: impl FnOnce(&mut TypeLayout),
+    ) {
+        let layouts = &mut self.graphs.entry(graph.to_owned()).or_default().layouts;
+        let layout = layouts.entry(type_name.to_owned()).or_default();
+        change(layout);
+        if layout.is_empty() {
+            layouts.remove(type_name);
+        }
+        self.graphs.retain(|_, overrides| !overrides.is_empty());
+    }
+
     /// Removes a graph's view of a type by name.
     pub fn delete_view(&mut self, graph: &str, type_name: &str, name: &str) {
         if let Some(overrides) = self.graphs.get_mut(graph) {
@@ -1501,6 +1659,71 @@ fn watch(cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A type's layout is kept under its graph, read back from the file, and goes with the
+    /// graph's overrides once nothing is chosen (spec 044).
+    #[test]
+    fn a_types_layout_is_kept_and_goes_when_empty() {
+        let mut settings = StudioSettings::default();
+        let graph = overrides_key("local", "brain");
+        settings.update_layout(&graph, "Person", |layout| {
+            layout.lead = Some("brief".into());
+            layout.rename("in:BlockedBy", "Blocks");
+            layout.set_both_ways("Knows", true);
+            layout.toggle_line("relation");
+        });
+        let text = serde_json::to_string(&settings).unwrap();
+        let read = read_clean(&text);
+        let layout = &read.layouts_for(&graph)["Person"];
+        assert_eq!(layout.lead.as_deref(), Some("brief"));
+        assert_eq!(layout.name_of("in:BlockedBy"), Some("Blocks"));
+        assert!(layout.both_ways("Knows"));
+        assert_eq!(layout.line, ["relation"]);
+        settings.update_layout(&graph, "Person", |layout| *layout = TypeLayout::default());
+        assert!(settings.graphs.is_empty());
+    }
+
+    /// Moving a relationship keeps every other where it was, and a fold carries its place and
+    /// name over to the one relationship both ways, and back.
+    #[test]
+    fn moving_and_folding_relationships_keeps_the_rest_in_place() {
+        let shown: Vec<String> = ["out:LivesIn", "out:Knows", "in:Knows", "in:NoteAboutPerson"]
+            .map(str::to_owned)
+            .to_vec();
+        let mut layout = TypeLayout::default();
+        layout.step(&shown, "in:NoteAboutPerson", -1);
+        assert_eq!(
+            layout.order,
+            ["out:LivesIn", "out:Knows", "in:NoteAboutPerson"]
+        );
+        layout.to_top("in:NoteAboutPerson");
+        assert_eq!(
+            layout.order,
+            ["in:NoteAboutPerson", "out:LivesIn", "out:Knows"]
+        );
+        layout.rename("out:Knows", "Knows");
+        layout.set_both_ways("Knows", true);
+        assert_eq!(
+            layout.order,
+            ["in:NoteAboutPerson", "out:LivesIn", "both:Knows"]
+        );
+        assert_eq!(layout.name_of("both:Knows"), Some("Knows"));
+        assert_eq!(layout.name_of("out:Knows"), None);
+        layout.set_both_ways("Knows", false);
+        assert_eq!(
+            layout.order,
+            ["in:NoteAboutPerson", "out:LivesIn", "out:Knows"]
+        );
+        assert_eq!(layout.name_of("out:Knows"), Some("Knows"));
+        assert!(layout.both_ways.is_empty());
+        // A relationship not shown now keeps its place after those moved.
+        let mut layout = TypeLayout {
+            order: vec!["in:Hidden".into()],
+            ..TypeLayout::default()
+        };
+        layout.step(&shown, "out:Knows", -1);
+        assert_eq!(layout.order, ["out:Knows", "in:Hidden"]);
+    }
 
     /// The settings of `text`, read as Studio reads its file, which must have no problem.
     fn read_clean(text: &str) -> StudioSettings {

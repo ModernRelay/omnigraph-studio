@@ -243,6 +243,10 @@ one measure, and a schema of very many relationships still asks.
 
 ## Corrections
 
+- **The walk follows the type's layout** (spec 044, 2026-11-19): a node's groups list in the
+  person's order, a relationship to the type itself can read both ways as one group (each node
+  once), a group row takes the person's name, and a node row shows its type's line after its
+  name.
 - **Group order.** `compile_schema_shape` returns edge types sorted by name, so groups list
   outgoing first, then incoming, each alphabetical, not in `.pg` source order.
 - **Counts are edges, rows are nodes.** The degree query counts edges, so parallel edges to one

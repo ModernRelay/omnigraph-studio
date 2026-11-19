@@ -1240,6 +1240,12 @@ pub mod text {
         ui::TextSize::Small.rems(cx)
     }
 
+    /// A line of body text wrapped over several, in pixels, spaced for reading: what a card's
+    /// text in a table read as cards takes a line (spec 044).
+    pub fn body_line(cx: &App) -> f32 {
+        f32::from(ui::TextSize::Small.pixels(cx)) * 1.45
+    }
+
     /// The metadata size, for text that is not a `Label`: what [`meta`] and [`code`] draw at.
     pub fn meta_size(cx: &App) -> Rems {
         ui::TextSize::XSmall.rems(cx)

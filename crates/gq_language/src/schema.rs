@@ -156,6 +156,10 @@ impl EdgeType {
 pub enum Direction {
     Outgoing,
     Incoming,
+    /// Either way: an edge from a type to itself whose two directions mean the same (`Knows`),
+    /// read as one group by an undirected traversal (`$n <knows> $m`), each neighbour once
+    /// (spec 044). The schema lists no such group; a type's layout makes it.
+    Both,
 }
 
 impl Direction {
@@ -164,6 +168,7 @@ impl Direction {
         match self {
             Self::Outgoing => Self::Incoming,
             Self::Incoming => Self::Outgoing,
+            Self::Both => Self::Both,
         }
     }
 
@@ -172,6 +177,25 @@ impl Direction {
         match self {
             Self::Outgoing => "→",
             Self::Incoming => "←",
+            Self::Both => "↔",
+        }
+    }
+}
+
+impl RelationshipGroup {
+    /// Whether the group's edges run from its type to itself, the only ones that can be read
+    /// both ways ([`Direction::Both`]).
+    pub fn to_itself(&self, schema: &SchemaModel) -> bool {
+        schema
+            .edge(&self.edge)
+            .is_some_and(|edge| edge.from == edge.to)
+    }
+
+    /// The group read both ways, for an edge from its type to itself.
+    pub fn both_ways(&self) -> Self {
+        Self {
+            direction: Direction::Both,
+            ..self.clone()
         }
     }
 }

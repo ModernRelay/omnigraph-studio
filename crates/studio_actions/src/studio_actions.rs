@@ -715,6 +715,8 @@ pub mod table {
             CopyAsStoredQuery,
             /// Show the view as it was saved, leaving what was changed in its tab.
             RevertView,
+            /// Read the node type's rows as cards, their text wrapped, or as a grid again.
+            ToggleReadingLayout,
         ]
     );
 }
@@ -750,6 +752,15 @@ pub mod node {
             SaveText,
             /// Save every unsaved change of the node shown as one commit.
             SaveNodeDrafts,
+            /// Move the relationship of the selected related node one place up on its type's
+            /// pages.
+            MoveRelationshipUp,
+            /// Move the relationship of the selected related node one place down on its type's
+            /// pages.
+            MoveRelationshipDown,
+            /// Shape how this node's type reads: what its page leads with, what its rows show
+            /// after their names, and whether its table reads as cards.
+            ShapeType,
         ]
     );
 }

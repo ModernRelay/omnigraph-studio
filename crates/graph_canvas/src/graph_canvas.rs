@@ -414,6 +414,15 @@ pub(crate) struct GraphCanvas {
     /// when the size changes, but the selected chip is kept in it ([`Self::keep_selected_in`]).
     drawn_size: Option<Size<Pixels>>,
     fit_zoom: f32,
+    /// The last fit stopped where the names still read, short of the whole walk (spec 044):
+    /// Fit again shows the whole of it.
+    fit_cut: bool,
+    /// The chips' places that fit was made for: Fit shows the whole walk only when asked again
+    /// over the same walk, so the first Fit after an expansion keeps the names.
+    fit_cut_of: Option<Arc<Vec<Vec2>>>,
+    /// The last fit was the person's Fit, not one the canvas made on its own (opening, a
+    /// resize): only theirs is asked again.
+    fit_asked: bool,
     fit_pending: bool,
     center_on: Option<SceneId>,
     /// A schema canvas's expansion under way: once laid out, the view moves just enough to
@@ -843,6 +852,9 @@ impl GraphCanvas {
             fitted_size: None,
             drawn_size: None,
             fit_zoom: 1.,
+            fit_cut: false,
+            fit_cut_of: None,
+            fit_asked: false,
             fit_pending: true,
             center_on: None,
             reveal_new: false,
@@ -1139,7 +1151,7 @@ impl GraphCanvas {
                         if self.schema_walk.is_some() =>
                     {
                         Some(match key.group.direction {
-                            gq_language::Direction::Outgoing => 1.,
+                            gq_language::Direction::Outgoing | gq_language::Direction::Both => 1.,
                             gq_language::Direction::Incoming => -1.,
                         })
                     }
@@ -1512,7 +1524,28 @@ impl GraphCanvas {
         })
     }
 
+    /// Fits the walk to `viewport`: the whole of it when `whole`, else no further out than
+    /// where its chips still say their names ([`paint::LEGIBLE_ZOOM`]), its middle in view and
+    /// the rest a pan away (spec 044; the study's dev D2, where Fit drew an incident's causal
+    /// chain as unlabelled marks).
     fn fit(&mut self, viewport: Bounds<Pixels>) {
+        self.fit_to(viewport, false);
+        self.fit_asked = false;
+    }
+
+    /// Whether the next Fit shows the whole walk: the last fit stopped where names read, and
+    /// neither the view nor the walk moved since.
+    fn fit_again_shows_all(&self) -> bool {
+        self.fit_cut
+            && self.fit_asked
+            && !self.camera_touched
+            && self
+                .fit_cut_of
+                .as_ref()
+                .is_some_and(|of| Arc::ptr_eq(of, &self.positions))
+    }
+
+    fn fit_to(&mut self, viewport: Bounds<Pixels>, whole: bool) {
         let widths = self.half_widths.clone();
         let Some((min, max)) = layout::extent(&self.positions, |index| {
             widths.get(index).copied().unwrap_or(60.)
@@ -1525,7 +1558,11 @@ impl GraphCanvas {
             .min((height - 120.) / (max.y - min.y).max(1.))
             // A fit never zooms a small walk past 1.1.
             .clamp(0.05, 1.1);
-        self.zoom = zoom;
+        let legible = paint::LEGIBLE_ZOOM.min(1.1);
+        self.fit_cut = !whole && zoom < legible;
+        self.fit_cut_of = Some(self.positions.clone());
+        self.zoom = if self.fit_cut { legible } else { zoom };
+        // Zooming out by hand still reaches the whole walk.
         self.fit_zoom = zoom;
         self.center = Vec2::new((min.x + max.x) / 2., (min.y + max.y) / 2.);
         self.fit_pending = false;
@@ -2806,7 +2843,10 @@ impl GraphCanvas {
     fn fit_to_window(&mut self, _: &FitToWindow, window: &mut Window, cx: &mut Context<Self>) {
         let from = self.camera_now(Instant::now());
         let viewport = self.viewport(window);
-        self.fit(viewport);
+        // A fit that stopped where the names read shows the whole walk when asked again.
+        let whole = self.fit_again_shows_all();
+        self.fit_to(viewport, whole);
+        self.fit_asked = true;
         // Fitted on request: a resize fits again until the view is moved by hand.
         self.camera_touched = false;
         self.view_moved_by_hand();
@@ -3370,12 +3410,20 @@ impl GraphCanvas {
                             )
                             .child(
                                 studio_ui::ds::bar_button("zoom-fit", "Fit")
-                                    .tip_fn(|_window, cx| {
-                                        studio_ui::ds::tooltip_for_action_view(
-                                            "Fit to window",
-                                            &FitToWindow,
-                                            cx,
-                                        )
+                                    .tip_fn({
+                                        // Fitted where the names read, the next Fit shows all.
+                                        let whole = self.fit_again_shows_all();
+                                        move |_window, cx| {
+                                            studio_ui::ds::tooltip_for_action_view(
+                                                if whole {
+                                                    "Fit the whole walk, names as marks"
+                                                } else {
+                                                    "Fit to window"
+                                                },
+                                                &FitToWindow,
+                                                cx,
+                                            )
+                                        }
                                     })
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.fit_to_window(&FitToWindow, window, cx)
@@ -3778,6 +3826,7 @@ mod tests {
                 nodes: names
                     .iter()
                     .map(|name| crate::model::SceneNode {
+                        line: None,
                         id: SceneId::Node(NodeRef::new("T", *name)),
                         kind: SceneKind::Node {
                             node: NodeRef::new("T", *name),
@@ -3910,6 +3959,7 @@ mod tests {
             nodes: names
                 .iter()
                 .map(|name| crate::model::SceneNode {
+                    line: None,
                     id: SceneId::Node(NodeRef::new("T", *name)),
                     kind: SceneKind::Node {
                         node: NodeRef::new("T", *name),
@@ -4720,6 +4770,50 @@ mod tests {
     /// room for each chip as tall and as wide as it is drawn. Pointing at chips and zooming
     /// then draw the canvas and wrap or lay out nothing: names are wrapped once, with the
     /// layout (docs/drawing.md).
+    /// Fit stops where the chips still say their names (spec 044, the study's dev D2): a walk
+    /// too wide for that shows its middle, and Fit again shows the whole of it, names as
+    /// marks; then names again. A walk that fits at a size that reads is fitted whole.
+    #[gpui::test]
+    async fn fit_keeps_the_names_readable_and_fit_again_shows_all(cx: &mut gpui::TestAppContext) {
+        let session = chain_session(2, cx);
+        let (canvas, cx) = cx.add_window_view(|_, cx| {
+            GraphCanvas::new(session, NodeRef::new("Person", "p1"), None, cx)
+        });
+        settle(cx);
+        let viewport = Bounds::new(point(px(0.), px(0.)), gpui::size(px(600.), px(400.)));
+        canvas.update_in(cx, |canvas, window, cx| {
+            // A walk 3,000 pixels wide at zoom 1.
+            canvas.positions = Arc::new(vec![Vec2::new(0., 0.), Vec2::new(3_000., 0.)]);
+            canvas.half_widths = Arc::new(vec![60., 60.]);
+            canvas.fit(viewport);
+            assert_eq!(canvas.zoom, paint::LEGIBLE_ZOOM, "names still read");
+            assert!(canvas.fit_cut);
+            assert_eq!(canvas.center.x, 1_500., "its middle in view");
+            canvas.bounds.set(Some(viewport));
+            // The fit the canvas made itself is not asked again: the person's first Fit keeps
+            // the names, and their second shows all.
+            canvas.fit_to_window(&FitToWindow, window, cx);
+            assert_eq!(canvas.zoom, paint::LEGIBLE_ZOOM, "the person's first Fit");
+            canvas.fit_to_window(&FitToWindow, window, cx);
+            assert!(canvas.zoom < paint::LEGIBLE_ZOOM, "the whole walk");
+            assert!(!canvas.fit_cut);
+            canvas.fit_to_window(&FitToWindow, window, cx);
+            assert_eq!(canvas.zoom, paint::LEGIBLE_ZOOM, "names again");
+            // The walk grew meanwhile (an expansion laid out): Fit keeps the names.
+            canvas.positions = Arc::new(vec![Vec2::new(0., 0.), Vec2::new(3_200., 0.)]);
+            canvas.fit_to_window(&FitToWindow, window, cx);
+            assert_eq!(
+                canvas.zoom,
+                paint::LEGIBLE_ZOOM,
+                "a new walk keeps its names"
+            );
+            // Small enough to read whole: fitted whole.
+            canvas.positions = Arc::new(vec![Vec2::new(0., 0.), Vec2::new(300., 0.)]);
+            canvas.fit(viewport);
+            assert!(canvas.zoom > paint::LEGIBLE_ZOOM && !canvas.fit_cut);
+        });
+    }
+
     #[gpui::test]
     async fn long_names_wrap_and_drawing_them_wraps_nothing(cx: &mut gpui::TestAppContext) {
         use gpui::{Modifiers, ScrollDelta};
@@ -5041,6 +5135,7 @@ mod tests {
         canvas.update(cx, |canvas, cx| {
             let mut scene = scene_of(&["Ada"]);
             scene.nodes.push(crate::model::SceneNode {
+                line: None,
                 id: SceneId::Note(ada.clone()),
                 kind: SceneKind::Note {
                     node: ada.clone(),

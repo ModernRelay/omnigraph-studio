@@ -74,6 +74,9 @@ const PILL_PAD_Y: f32 = studio_ui::ds::space::XS;
 const OPEN_CHIP_MAX_WIDTH: f32 = 320.;
 /// Below this text size a node is drawn as its mark alone, unless it is selected or pointed at.
 const MARK_ONLY_BELOW: f32 = 8.5;
+/// The furthest out a fit goes on its own (spec 044): chips still say their names, with half a
+/// pixel to spare over [`MARK_ONLY_BELOW`] for the half-pixel steps text sizes take.
+pub(crate) const LEGIBLE_ZOOM: f32 = (MARK_ONLY_BELOW + 0.5) / CHIP_TEXT;
 /// A hub's or "+K more"'s dot from afar: its radius, in screen pixels.
 const HUB_DOT: f32 = 4.;
 /// A node's letter mark from afar, across, in screen pixels.
@@ -170,12 +173,21 @@ pub(crate) fn chip_text(
             let (lines, cut) = wrap_name(&label, room, CHIP_MAX_LINES, &|text: &str| {
                 measure(text, CHIP_TEXT, role.weight())
             });
+            // What the node's type shows after its name (spec 044), muted on a row under it,
+            // one line cut to the chip's room.
+            let line = node.line.as_deref().map(|line| {
+                let (mut cut, _) = wrap_name(line, room, 1, &|text: &str| {
+                    measure(text, CHIP_TEXT, Role::Muted.weight())
+                });
+                vec![(cut.pop().unwrap_or_default().into(), Role::Muted)]
+            });
             ChipText {
                 mark: true,
                 initial,
                 rows: lines
                     .into_iter()
                     .map(|line| vec![(line.into(), role)])
+                    .chain(line)
                     .collect(),
                 size: CHIP_TEXT,
                 cut,
@@ -1388,6 +1400,7 @@ mod tests {
         use graph_store::NodeRef;
         let measure = |text: &str, _: f32, _: FontWeight| text.chars().count() as f32 * 7.;
         let chip = |label: &str| SceneNode {
+            line: None,
             id: SceneId::Node(NodeRef::new("T", label)),
             kind: SceneKind::Node {
                 node: NodeRef::new("T", label),
@@ -1428,6 +1441,7 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(i, parent)| SceneNode {
+                    line: None,
                     id: SceneId::Node(NodeRef::new("T", i.to_string())),
                     kind: SceneKind::Node {
                         node: NodeRef::new("T", i.to_string()),
