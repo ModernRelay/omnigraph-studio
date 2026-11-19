@@ -54,6 +54,9 @@ pub struct EffectView {
     list: Entity<EffectRows>,
     /// The menu of reads to run, which its key opens too.
     picker_menu: PopoverMenuHandle<ContextMenu>,
+    /// The session asks after both branches' heads while the tab is open, so a commit to
+    /// either offers Refresh (constitution II), whatever branch the window is on.
+    _head_watches: [graph_store::HeadWatch; 2],
     _subscriptions: Vec<Subscription>,
 }
 
@@ -165,6 +168,12 @@ impl EffectView {
         cx: &mut Context<Self>,
     ) -> Self {
         let effect = session.update(cx, |session, cx| session.effect(&branch, &target, cx));
+        let head_watches = session.update(cx, |session, cx| {
+            [
+                session.watch_head(&branch, cx),
+                session.watch_head(&target, cx),
+            ]
+        });
         effect.update(cx, |effect, cx| effect.want(Want::All, None, cx));
         let list = EffectRows::new(cx);
         let subscriptions = vec![cx.observe(&effect, |this, _, cx| {
@@ -182,6 +191,7 @@ impl EffectView {
             open: HashSet::new(),
             list,
             picker_menu: PopoverMenuHandle::default(),
+            _head_watches: head_watches,
             _subscriptions: subscriptions,
         }
     }
@@ -1200,6 +1210,25 @@ mod tests {
         Entity<GraphSession>,
         std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     ) {
+        effect_server_with(Scenario::default(), cx)
+    }
+
+    /// What [`effect_server`] does otherwise.
+    #[derive(Clone, Copy, Default)]
+    struct Scenario {
+        /// The branch removes main's owner edge and adds it once again: a replacement.
+        replaces: bool,
+        /// The publish's answer is lost; the commit reads as published.
+        loses_publish: bool,
+    }
+
+    fn effect_server_with(
+        scenario: Scenario,
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        Entity<GraphSession>,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
         let commit = |id: &str, kind: &str| json!({ "graph_commit_id": id, "graph_manifest_version": 1, "kind": kind, "created_at": 0, "parent_commit_id": "m2", "merged_parent_commit_id": "f2" });
         fake_server(
             move |path: &str, query: &str, sent: &str| {
@@ -1232,10 +1261,27 @@ mod tests {
                         &["b", "c"]
                     };
                     (200, rows(slugs))
-                } else if path.ends_with("/diff") && query.contains("kind=edge") {
+                } else if path.ends_with("/diff") && query.contains("op=delete") {
+                    let removed: Vec<Value> = if scenario.replaces {
+                        vec![
+                            json!({ "kind": "edge", "type": { "id": "OwnedBy", "name": "OwnedBy" }, "id": "e0", "op": "delete", "before": { "properties": {}, "endpoints": { "from": "i1", "to": "p1" } } }),
+                        ]
+                    } else {
+                        Vec::new()
+                    };
                     (
                         200,
-                        json!({ "from_commit_id": "m1", "to_commit_id": "f2", "changes": [edge.clone(), twice.clone()] }),
+                        json!({ "from_commit_id": "m1", "to_commit_id": "f2", "changes": removed }),
+                    )
+                } else if path.ends_with("/diff") && query.contains("kind=edge") {
+                    let added = if scenario.replaces {
+                        vec![edge.clone()]
+                    } else {
+                        vec![edge.clone(), twice.clone()]
+                    };
+                    (
+                        200,
+                        json!({ "from_commit_id": "m1", "to_commit_id": "f2", "changes": added }),
                     )
                 } else if path.ends_with("/query") && sent.contains("studio_edges_between") {
                     (
@@ -1247,7 +1293,12 @@ mod tests {
                         200,
                         json!({ "source": "feature", "target": "main", "outcome": "fast_forward", "commit": commit("u1", "unpublished") }),
                     )
-                } else if path.ends_with("/commits/u1/publish") {
+                } else if path.ends_with("/commits/u1/publish") && scenario.loses_publish {
+                    // A gateway's error, without the server's contract header: the outcome is
+                    // not known.
+                    (502, json!({ "error": "bad gateway" }))
+                } else if path.ends_with("/commits/u1/publish") || path.ends_with("/commits/u1") {
+                    // The publish's answer, and the commit read once it is published.
                     (200, commit("u1", "published"))
                 } else {
                     (200, json!({ "branches": ["main", "feature"] }))
@@ -1362,6 +1413,74 @@ mod tests {
             .filter(|line| line.contains("/commits/u1/publish"))
             .count();
         assert_eq!(published, 1, "published once");
+    }
+
+    /// A relationship the branch removes and adds again between the same ends replaces main's:
+    /// a merge leaves one, so Studio's check finds nothing.
+    #[gpui::test]
+    async fn a_replaced_relationship_is_no_duplicate(cx: &mut gpui::TestAppContext) {
+        init(cx);
+        let scenario = Scenario {
+            replaces: true,
+            ..Scenario::default()
+        };
+        let (session, _asked) = effect_server_with(scenario, cx);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            EffectView::new(session, "feature".into(), "main".into(), window, cx)
+        });
+        cx.run_until_parked();
+        let effect = view.read_with(cx, |view, _| view.effect.clone());
+        effect.read_with(cx, |effect, _| {
+            let builtin = &effect.reads()[0];
+            let rows = builtin.at_branch.as_ref().and_then(Side::rows).unwrap();
+            assert_eq!(rows.row_count, 0);
+            assert_eq!(effect.hold(Some("f2")), Hold::Clear);
+        });
+    }
+
+    /// A publish whose answer was lost is not sent again: Refresh reads the commit, which says
+    /// it was published.
+    #[gpui::test]
+    async fn a_lost_publish_is_settled_by_reading_its_commit(cx: &mut gpui::TestAppContext) {
+        init(cx);
+        let scenario = Scenario {
+            loses_publish: true,
+            ..Scenario::default()
+        };
+        let (session, asked) = effect_server_with(scenario, cx);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            EffectView::new(session, "feature".into(), "main".into(), window, cx)
+        });
+        cx.run_until_parked();
+        let effect = view.read_with(cx, |view, _| view.effect.clone());
+        effect.update(cx, |effect, cx| effect.check_merge_result(cx));
+        cx.run_until_parked();
+        effect.update(cx, |effect, cx| effect.publish(cx));
+        cx.run_until_parked();
+        effect.read_with(cx, |effect, _| {
+            assert!(
+                matches!(effect.merge_result(), MergeResult::Unknown { .. }),
+                "{:?}",
+                effect.merge_result()
+            )
+        });
+        effect.update(cx, |effect, cx| effect.refresh(cx));
+        cx.run_until_parked();
+        effect.read_with(cx, |effect, _| {
+            assert_eq!(
+                effect.merge_result(),
+                &MergeResult::Published {
+                    commit: "u1".into()
+                }
+            )
+        });
+        let published = asked
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.contains("/commits/u1/publish"))
+            .count();
+        assert_eq!(published, 1, "never sent again");
     }
 
     /// The list of reads is a cached view of its own: moving through the reads draws it once a

@@ -124,7 +124,10 @@ list, greyed, saying why.
 key. It pages through `GET /diff?from=<merge base>&to=<branch head>&kind=edge&op=insert` (1,000 a
 page, the first 2,000 relationships), keeps the types without a key, and asks the target's head
 for edges of each type between the same ends (`builder::edges_between`, 500 pairs a read, 5,000
-edges an answer). Each pair the target has, or the branch adds more than once, is a row:
+edges an answer). It pages the relationships the branch removed the same way: one the branch
+removes and adds again between the same ends replaces the target's, and a merge leaves one.
+Each pair a merge would leave twice or more (the target's edges, less those the branch removed,
+plus each the branch added) is a row:
 relationship, from, to, and "on main", "added 2 times here" or both. A merge keeps both edges,
 so this is the dev D4 duplicate. Past 2,000 the row says "Studio checked the first 2,000
 relationships the branch added".
@@ -189,7 +192,11 @@ unfolded, "main → the merge result" beside "main → this branch". The footer 
   merge result: … It is still held; drop it, then check again."
 - Refused merge or drop: "The server refused to <merge|drop> it: …. Nothing changed."
 - Lost answer: "The answer to the <step> was lost (…). Studio did not send it again; open
-  History to see whether it landed." Nothing is offered until a Refresh.
+  History to see whether it landed." Nothing is offered until a Refresh, which settles it by
+  reading the commit (`GET /commits/{id}`): published, still held (offered again), or gone
+  (dropped, or expired once main moved). A lost merge names no commit, so Refresh offers the
+  check again and says nothing of a commit it may have made.
+- A read marked while a result is held is read at the result too.
 
 The button is offered only when the access route does not refuse `branch_merge` into the target
 and `commit_drop` on it: a held commit the credential could not drop would stay on the server
@@ -260,6 +267,7 @@ nothing.
 | 2026-11-19 | A check with rows holds Merge behind one more press | `review` `view::tests::a_check_with_rows_holds_merge_behind_one_more_press` | With a row at `f2`: the first press sends no merge, the second sends one; with none, the first press merges |
 | 2026-11-19 | The running app against the cookbooks | Studio's offscreen tool (`crates/studio/examples/snapshot.rs`, debug build, Linux, lavapipe) on the same `v0.15.0` server as `act-writer` (company as `act-alice`); marks made with ⌘⌥E and ⌘⌥K in stored-query tabs, which wrote `graphs."environment@http://127.0.0.1:8787/beads".effect` | beads `plan/sharing-v2`: `ready` 8 → 10, "+3 −1" (lk-share, lk-share-api, lk-share-ui in, lk-acl out), `blocked` "+1 −1", the check `blocked_by_ancestor` 2 → 0, Check the merge result disabled (beads grants `branch_merge` to admins only). program `trade-optics-light`: `budget_rollup` "~2" (`dc-pl-mass` allocated 30.8 → 27.7, violated true → false; `req-lv-mass` 142.6 → 139.5), the merge result held, the same at it, then dropped, main unmoved. dev `review/dup-owner`: Studio's check, 1 row `IssueOwnedBy iss-safari-login → act-priya: on main`, under a dry run that says "Merges cleanly … as a fast-forward"; the first Merge press armed it. company `agent/notes-oct-14`: `decisions_at_risk` 0 → 1. A beads `ready` tab run, `close` of lk-acl by the CLI, run again: "+3 −1 since the last run", rows +3, +5, +6 |
 | 2026-11-19 | A stored read's tab took no key before its first rows | The same tool: a fresh `ready` tab, `studio_query::Run` dispatched | Nothing ran: the tab's focus is its result grid's, which is drawn only with rows. The result area now holds that focus whatever it shows, so ⌘↵, ⌘⌥E and ⌘⌥K work on a fresh tab (study B1) |
+| 2026-11-19 | The review bot's six findings on PR #148 | `review` `effect::tests::a_replaced_relationship_is_no_duplicate`, `a_lost_publish_is_settled_by_reading_its_commit`; reading the code for the rest | A replacement was flagged as a duplicate; a cap on main's edges was silent; a lost write left the merge result stuck; a read marked while a result was held never ran there; a capped rerun said "Same rows"; a tab opened from main watched neither head. Each fixed: the check subtracts the branch's removals and names its caps, Refresh reads the commit, `resolve` reads the result, the footer says "in the first 5,000 rows", and the tab watches both heads |
 | 2026-11-19 | The Effect's list draws once a key | `review` `effect::tests::moving_through_the_reads_draws_the_list_once_a_key` | J/K and Space draw the cached list once each (`docs/drawing.md`) |
 
 ## Corrections

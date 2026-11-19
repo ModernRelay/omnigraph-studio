@@ -4079,10 +4079,18 @@ impl QueryEditor {
                     start.push(
                         ds::meta(
                             IconName::HistoryRerun,
-                            if since.is_empty() {
-                                "Same rows as the last run".to_owned()
-                            } else {
-                                format!("{} since the last run", since.counts())
+                            match (since.is_empty(), since.capped) {
+                                (true, false) => "Same rows as the last run".to_owned(),
+                                (true, true) => format!(
+                                    "Same first {} rows as the last run",
+                                    studio_ui::group_digits(graph_store::row_diff::COMPARED_ROWS)
+                                ),
+                                (false, false) => format!("{} since the last run", since.counts()),
+                                (false, true) => format!(
+                                    "{} since the last run, in the first {} rows",
+                                    since.counts(),
+                                    studio_ui::group_digits(graph_store::row_diff::COMPARED_ROWS)
+                                ),
                             },
                         )
                         .into_any_element(),

@@ -4164,12 +4164,13 @@ impl GraphSession {
         )
     }
 
-    /// One page of the edges inserted from commit `from` to commit `to` (spec 036, the
-    /// Effect's check for an edge the target already has).
-    pub fn inserted_edges(
+    /// One page of the edges inserted (or, with another `op`, removed) from commit `from` to
+    /// commit `to` (spec 036, the Effect's check for an edge the target already has).
+    pub fn edge_changes(
         &mut self,
         from: &str,
         to: &str,
+        op: graph_client::api::ChangeOp,
         page_token: Option<String>,
         limit: u32,
         cx: &mut Context<Self>,
@@ -4177,7 +4178,7 @@ impl GraphSession {
         let (client, graph) = (self.client(cx), self.graph_id.clone());
         let (from, to) = (from.to_owned(), to.to_owned());
         self.counted_read(
-            "inserted_edges",
+            "edge_changes",
             async move {
                 client
                     .diff_of(
@@ -4185,7 +4186,7 @@ impl GraphSession {
                         &from,
                         &to,
                         Some(EntityKind::Edge),
-                        Some(graph_client::api::ChangeOp::Insert),
+                        Some(op),
                         page_token.as_deref(),
                         limit,
                     )

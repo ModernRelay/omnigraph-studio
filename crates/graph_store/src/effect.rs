@@ -13,7 +13,9 @@ use std::sync::Arc;
 
 use gpui::{App, AppContext as _, Context, Entity, Subscription, Task, WeakEntity};
 use gq_language::builder;
-use graph_client::api::{AccessAction, BranchMergeOutcome, BranchMergeOutput};
+use graph_client::api::{
+    AccessAction, BranchMergeOutcome, BranchMergeOutput, ChangeOp, CommitKind,
+};
 use graph_client::{ReadError, WriteOutcome};
 use serde_json::Value;
 use studio_settings::{EffectMark, StudioSettings};
@@ -368,13 +370,59 @@ impl Effect {
         }
     }
 
-    /// Reads it all again from the heads now: the person's Refresh.
+    /// Reads it all again from the heads now: the person's Refresh. A merge-result write whose
+    /// answer was lost is settled by reading its commit, never by sending it again.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.settle_unknown(cx);
         if self.want == Want::Nothing {
             self.heads = Loadable::NotLoaded;
             return;
         }
         self.read_heads(cx);
+    }
+
+    /// Reads what became of a merge-result write whose answer was lost (constitution III): a
+    /// merge's commit is not known, so the Effect offers the check again and History holds any
+    /// commit it made; a publish or a drop reads the commit: published, still held, or gone.
+    fn settle_unknown(&mut self, cx: &mut Context<Self>) {
+        let MergeResult::Unknown { step, commit, .. } = &self.merge_result else {
+            return;
+        };
+        let (step, commit) = (*step, commit.clone());
+        let (Some(commit), Some(session)) = (commit, self.session.upgrade()) else {
+            self.merge_result = MergeResult::None;
+            cx.notify();
+            return;
+        };
+        let read = session.update(cx, |session, cx| session.commit(&commit, cx));
+        self._write_task = Some(cx.spawn(async move |this, cx| {
+            let settled = match read.await {
+                Ok(found) => match found.kind {
+                    CommitKind::Published => Some(MergeResult::Published {
+                        commit: found.graph_commit_id,
+                    }),
+                    CommitKind::Unpublished => Some(MergeResult::Held { commit }),
+                    _ => None,
+                },
+                // Gone: dropped, or expired unpublished once the target moved.
+                Err(ReadError::Refused(summary)) if summary.status == 404 => Some(match step {
+                    ResultStep::Drop => MergeResult::Dropped,
+                    _ => MergeResult::None,
+                }),
+                Err(_) => None,
+            };
+            this.update(cx, |this, cx| {
+                if let Some(settled) = settled {
+                    let held = settled.held().is_some();
+                    this.merge_result = settled;
+                    if held {
+                        this.read_result(cx);
+                    }
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
     }
 
     /// What the checks say of a merge of the branch at `branch_head`.
@@ -597,6 +645,10 @@ impl Effect {
             ))
         });
         self.reads = reads;
+        // A read marked while a merge result is held is read there too.
+        if self.merge_result.held().is_some() {
+            self.read_result(cx);
+        }
         match &self.heads {
             Loadable::Loaded(_) => self.read_missing(cx),
             Loadable::NotLoaded if !self.reads.is_empty() && self.want != Want::Nothing => {
@@ -898,14 +950,22 @@ impl Effect {
         ) else {
             return;
         };
+        // Each read not read at the result yet: all of them after a new merge, which clears
+        // them, or one marked while the result is held.
         let mut jobs = Vec::new();
         for read in &mut self.reads {
-            if read.unrunnable.is_some() || read.is_builtin() {
+            if read.unrunnable.is_some()
+                || read.is_builtin()
+                || matches!(read.at_result, Some(Side::Rows(_) | Side::Failed(_)))
+            {
                 continue;
             }
             read.at_result = Some(Side::Reading);
             read.result_diff = None;
             jobs.push((read.key.clone(), read.source.clone()));
+        }
+        if jobs.is_empty() {
+            return;
         }
         // The reads at the target head are compared with it.
         self.want = Want::All;
@@ -1060,42 +1120,42 @@ fn side_of(answer: Result<graph_client::api::ReadOutput, ReadError>) -> Side {
     }
 }
 
-/// One relationship the branch added.
-struct Added {
+/// One relationship the branch added or removed.
+struct Changed {
     type_name: String,
     from: String,
     to: String,
 }
 
-/// The relationships the branch added, of types without a key, that the target has between
-/// the same ends or that the branch added twice, as rows: `relationship`, `from`, `to`,
-/// `already`.
-async fn duplicate_edges(
+/// The branch's changes to relationships of types without a key, of one kind (`op`), from the
+/// merge base: at most [`EDGES_CHECKED`], and whether there were more.
+async fn edge_changes(
     session: &Entity<GraphSession>,
     schema: &gq_language::SchemaModel,
     heads: &Heads,
-    target: &str,
+    op: ChangeOp,
     cx: &mut gpui::AsyncApp,
-) -> Result<Rows, String> {
-    let mut added: Vec<Added> = Vec::new();
+) -> Result<(Vec<Changed>, bool), String> {
+    let mut changed: Vec<Changed> = Vec::new();
     let mut token: Option<String> = None;
-    let mut partial = None;
     loop {
         let page = session.update(cx, |session, cx| {
-            session.inserted_edges(&heads.base, &heads.branch, token.clone(), EDGE_PAGE, cx)
+            session.edge_changes(&heads.base, &heads.branch, op, token.clone(), EDGE_PAGE, cx)
         });
         let page = page.await.map_err(|error| error.to_string())?;
         for change in page.changes {
             let unkeyed = schema
                 .edge(&change.entity_type.name)
                 .is_some_and(|edge| !edge.keyed);
-            let ends = change
-                .after
-                .as_ref()
-                .and_then(|after| after.endpoints.as_ref())
+            let image = match op {
+                ChangeOp::Delete => change.before.as_ref(),
+                _ => change.after.as_ref(),
+            };
+            let ends = image
+                .and_then(|image| image.endpoints.as_ref())
                 .and_then(endpoints_of);
             if let (true, Some((from, to))) = (unkeyed, ends) {
-                added.push(Added {
+                changed.push(Changed {
                     type_name: change.entity_type.name.clone(),
                     from,
                     to,
@@ -1103,33 +1163,62 @@ async fn duplicate_edges(
             }
         }
         token = page.next_page_token;
-        if added.len() >= EDGES_CHECKED && token.is_some() {
-            added.truncate(EDGES_CHECKED);
-            partial = Some(format!(
-                "Studio checked the first {} relationships the branch added",
-                EDGES_CHECKED
-            ));
-            break;
+        if changed.len() >= EDGES_CHECKED && token.is_some() {
+            changed.truncate(EDGES_CHECKED);
+            return Ok((changed, true));
         }
         if token.is_none() {
-            break;
+            return Ok((changed, false));
         }
     }
-    // How often the branch adds each pair, and whether the target has it.
-    let mut twice: HashMap<(String, String, String), usize> = HashMap::new();
+}
+
+/// The relationships the branch added, of types without a key, that a merge would leave twice
+/// or more between the same ends, as rows: `relationship`, `from`, `to`, `already`. The
+/// target's edges between those ends count, less those the branch removed (a relationship it
+/// replaces is not a duplicate), and so does each time the branch added one.
+async fn duplicate_edges(
+    session: &Entity<GraphSession>,
+    schema: &gq_language::SchemaModel,
+    heads: &Heads,
+    target: &str,
+    cx: &mut gpui::AsyncApp,
+) -> Result<Rows, String> {
+    type Pair = (String, String, String);
+    let mut partial: Vec<String> = Vec::new();
+    let (added, more_added) = edge_changes(session, schema, heads, ChangeOp::Insert, cx).await?;
+    if more_added {
+        partial.push(format!(
+            "Studio checked the first {EDGES_CHECKED} relationships the branch added"
+        ));
+    }
+    let pair = |edge: &Changed| (edge.type_name.clone(), edge.from.clone(), edge.to.clone());
+    let mut added_count: HashMap<Pair, usize> = HashMap::new();
     for edge in &added {
-        *twice
-            .entry((edge.type_name.clone(), edge.from.clone(), edge.to.clone()))
-            .or_default() += 1;
+        *added_count.entry(pair(edge)).or_default() += 1;
+    }
+    if added_count.is_empty() {
+        return Ok(rows_of(Vec::new(), partial));
+    }
+    let (removed, more_removed) =
+        edge_changes(session, schema, heads, ChangeOp::Delete, cx).await?;
+    if more_removed {
+        partial.push(format!(
+            "Studio read the first {EDGES_CHECKED} relationships the branch removed"
+        ));
+    }
+    let mut removed_count: HashMap<Pair, usize> = HashMap::new();
+    for edge in &removed {
+        *removed_count.entry(pair(edge)).or_default() += 1;
     }
     let mut by_type: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
-    for (type_name, from, to) in twice.keys() {
+    for (type_name, from, to) in added_count.keys() {
         by_type
             .entry(type_name.clone())
             .or_default()
             .push((from.clone(), to.clone()));
     }
-    let mut on_target: std::collections::HashSet<(String, String, String)> = Default::default();
+    let mut on_target: HashMap<Pair, usize> = HashMap::new();
     for (type_name, pairs) in by_type {
         for chunk in pairs.chunks(PAIRS_A_READ) {
             let mut from: Vec<String> = chunk.iter().map(|(from, _)| from.clone()).collect();
@@ -1144,21 +1233,32 @@ async fn duplicate_edges(
                 session.read(&query, Some(heads.target.clone()), cx)
             });
             let output = read.await.map_err(|error| error.to_string())?;
-            for row in output.rows.as_array().into_iter().flatten() {
+            let rows = output.rows.as_array().cloned().unwrap_or_default();
+            if rows.len() >= EDGES_A_READ as usize {
+                partial.push(format!(
+                    "{target} holds more than {EDGES_A_READ} {type_name} relationships between \
+                     these nodes, and Studio read only those"
+                ));
+            }
+            for row in rows {
                 let text = |key: &str| row.get(key).and_then(Value::as_str).map(str::to_owned);
                 if let (Some(from), Some(to)) = (text("from_id"), text("to_id")) {
-                    on_target.insert((type_name.clone(), from, to));
+                    *on_target.entry((type_name.clone(), from, to)).or_default() += 1;
                 }
             }
         }
     }
-    let mut keys: Vec<_> = twice.into_iter().collect();
-    keys.sort();
-    let cells: Vec<Vec<Value>> = keys
+    let mut pairs: Vec<(Pair, usize)> = added_count.into_iter().collect();
+    pairs.sort();
+    let cells: Vec<Vec<Value>> = pairs
         .into_iter()
         .filter_map(|(key, count)| {
-            let already = on_target.contains(&key);
-            let why = match (already, count > 1) {
+            let kept = on_target
+                .get(&key)
+                .copied()
+                .unwrap_or(0)
+                .saturating_sub(removed_count.get(&key).copied().unwrap_or(0));
+            let why = match (kept > 0, count > 1) {
                 (true, true) => format!("on {target}, and added {count} times here"),
                 (true, false) => format!("on {target}"),
                 (false, true) => format!("added {count} times here"),
@@ -1173,12 +1273,17 @@ async fn duplicate_edges(
             ])
         })
         .collect();
-    Ok(Rows {
+    Ok(rows_of(cells, partial))
+}
+
+/// The built-in check's rows, with what was not read in words.
+fn rows_of(cells: Vec<Vec<Value>>, partial: Vec<String>) -> Rows {
+    Rows {
         columns: ["relationship", "from", "to", "already"]
             .map(str::to_owned)
             .to_vec(),
         row_count: cells.len(),
         cells,
-        partial,
-    })
+        partial: (!partial.is_empty()).then(|| format!("{}.", partial.join("; "))),
+    }
 }
