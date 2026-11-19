@@ -631,11 +631,12 @@ impl ReviewView {
         if !on_target {
             // Sent with the key of the review's change of the entity when it holds one, so its
             // card turns fixed too and offers no fix from the values the decision replaced.
-            let card = self.change_of(ix);
-            // The card a fix already holds offers nothing more until Refresh.
-            if card.is_some_and(|card| self.cards.get(card).is_none_or(|card| card.fix.done())) {
+            // The card a fix already holds offers nothing more until Refresh, and its button
+            // says so.
+            if self.card_held(ix).is_some() {
                 return;
             }
+            let card = self.change_of(ix);
             let key = self
                 .change_key_of(ix)
                 .unwrap_or_else(|| conflict_key(list, ix));
@@ -825,7 +826,7 @@ impl ReviewView {
 
     /// Opens the conflict's entity on the branch to edit, the target's value beside each field.
     fn edit_conflict(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if self.branch_write_refusal(cx).is_some() {
+        if self.card_held(ix).is_some() || self.branch_write_refusal(cx).is_some() {
             return;
         }
         let Some((change, target)) = self.conflict_edit(ix) else {
@@ -862,6 +863,15 @@ impl ReviewView {
     fn change_key_of(&self, ix: usize) -> Option<String> {
         let change = self.change_of(ix)?;
         Some(self.data.as_ref()?.folded.changes[change].key())
+    }
+
+    /// Why the entity's card offers nothing more, when a fix already holds it.
+    fn card_held(&self, ix: usize) -> Option<String> {
+        let card = self.change_of(ix)?;
+        self.cards
+            .get(card)
+            .is_none_or(|card| card.fix.done())
+            .then(|| "Its card was fixed already: Refresh to decide again.".to_owned())
     }
 
     /// The review's change of the conflict's entity, by its index, when it holds one.
@@ -1347,7 +1357,9 @@ impl ReviewView {
         let readable = target.known() && source.known();
         let busy = decision.as_ref().is_some_and(Decision::settles);
         let focus = self.focus_handle.clone();
-        let branch_refused = self.branch_write_refusal(cx);
+        // The entity's card in the feed was fixed already: its values are no longer what the
+        // branch holds, so nothing more is written from them until Refresh.
+        let branch_refused = self.card_held(ix).or_else(|| self.branch_write_refusal(cx));
         let target_refused = self.target_write_refusal(cx);
         let unreadable = (!readable).then(|| "Not every side could be read.".to_owned());
         let keep_target = {
@@ -2332,6 +2344,26 @@ mod tests {
         sent.lock().unwrap().clear();
         cx.dispatch_action(KeepTarget);
         cx.dispatch_action(KeepSource);
+        cx.run_until_parked();
+        let asked = sent.lock().unwrap().clone();
+        assert!(!asked.iter().any(|r| r.contains("/mutate")), "{asked:?}");
+    }
+
+    /// A conflict whose entity's card a fix already holds offers no decision on the branch, and
+    /// says why: the card's values are no longer what the branch holds.
+    #[gpui::test]
+    async fn a_conflict_on_a_fixed_card_says_why_it_offers_nothing(cx: &mut TestAppContext) {
+        let (view, sent, cx) = review_with_conflicts(divergent_deal(), cx);
+        view.update(cx, |view, _| {
+            assert!(view.card_held(0).is_none());
+            let card = view.change_of(0).expect("the review's change of d1");
+            view.cards[card].fix = FixState::Edited {
+                commit: "e1".into(),
+            };
+            assert!(view.card_held(0).is_some_and(|why| why.contains("Refresh")));
+        });
+        sent.lock().unwrap().clear();
+        cx.dispatch_action(KeepTarget);
         cx.run_until_parked();
         let asked = sent.lock().unwrap().clone();
         assert!(!asked.iter().any(|r| r.contains("/mutate")), "{asked:?}");

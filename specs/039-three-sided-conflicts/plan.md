@@ -239,4 +239,6 @@ changes' list is (`docs/drawing.md`): keys in the review's search draw it no tim
     settles the conflict as a landed one does: no decision is sent for it again
     (`an_unknown_decision_is_not_sent_again`).
   - Keep main's sent under the card's key left the card idle while it was out, offering Revert
-    and Edit behind it. The card now shows it saving, and a card a fix holds offers no decision.
+    and Edit behind it. The card now shows it saving, and a card a fix holds offers no decision:
+    its conflict's Keep main's and Edit… are disabled, saying "Its card was fixed already:
+    Refresh to decide again." (constitution VI).
