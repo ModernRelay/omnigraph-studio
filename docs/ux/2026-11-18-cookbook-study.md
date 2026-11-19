@@ -298,8 +298,8 @@ The full friction log, with the step and what the person needed, is in
 Ranked by how many personas and workflows hit the problem, and how much it costs them when
 they do: a wrong merge costs more than an extra click. Engine IDs refer to
 [spec 012](../../specs/012-omnigraph-engine-changes/plan.md) and
-[deferred-engine-changes.md](../deferred-engine-changes.md). IDs from E55 on are *proposed
-here*. They are not yet in spec 012; a proposal that is adopted adds them there, as `AGENTS.md`
+[deferred-engine-changes.md](../deferred-engine-changes.md). IDs E60 to E64 are *proposed
+here* (E55 to E59 went to spec 035) and filed as Omnigraph issues #1470 to #1474. They are not yet in spec 012; a proposal that is adopted adds them there, as `AGENTS.md`
 requires.
 
 ### 1. The review shows what a branch does to the graph's own questions
@@ -365,7 +365,7 @@ built-in checks it can run itself:
 ```
 
 - *Which reads.* The person marks a zero-parameter stored read (or a saved view, spec 024) as
-  *watched* or *a check*. Studio keeps the mark per graph in settings. With E59, a check can
+  *watched* or *a check*. Studio keeps the mark per graph in settings. With E64, a check can
   come from the graph itself.
 - *Rows that changed.* Rows are matched by the node a row names (see 5) or, failing that,
   by the whole row. The same diff marks rows in any query tab that refreshes ("+4 −1 since
@@ -382,7 +382,7 @@ component in `change_cards`, settings for marks, and the R2 merge path in `revie
 
 - Works today: a stored read takes `branch` or `snapshot` in its body (checked: `omnigraph
   query decisions_at_risk --branch …` answers `target.branch`), and R2 is served.
-- Proposed **E59**: the catalog entry (`QueryCatalogEntry` today: name, description,
+- Proposed **E64**: the catalog entry (`QueryCatalogEntry` today: name, description,
   instruction, mutation, params, tool_name) carries the query's source file and tags (for
   example `@tag("check")`), so a graph can declare its checks once for every client.
 - E35 matters here: a diff across a merge reads both tables.
@@ -419,7 +419,7 @@ window.
   becomes the default for new tabs. A review's inspector and the pages opened from it are
   editable on the reviewed branch, with Remove and + on relationships. The query tab's picker
   lists branches as well as commits.
-- **Proposals.** When the window is on a branch the graph treats as protected (E58), or the
+- **Proposals.** When the window is on a branch the graph treats as protected (E63), or the
   person turns on "Propose changes", the first edit starts a proposal branch:
   `proposal/<actor>/<date>-<n>`, named from the first edit and renameable. The edit lands
   there, and the status bar shows "3 changes proposed · Review". One step opens the review.
@@ -439,7 +439,7 @@ should amend XIII rather than work around it. `GraphSession` already writes to a
 branch (spec 011), so the store's side is small; most of the work is in the views and the
 inspector.
 
-**Engine.** Proposed **E58**: `AccessOutput` (or the branch list) says which branches the
+**Engine.** Proposed **E63**: `AccessOutput` (or the branch list) says which branches the
 policy treats as protected, so Studio can offer proposals without guessing. Without it, Studio
 treats `main` as protected unless the person turns proposals off.
 
@@ -475,7 +475,7 @@ target's current value, who set it, or the base.
 
 - **Keep main's** writes main's values onto the branch, bound to the branch head. Verified in
   beads B5: once `agent/b`'s row matched main's, the dry run answered `merged`.
-- **Keep this branch's** needs the engine (E56).
+- **Keep this branch's** needs the engine (E61).
 - **Edit…** opens the row on the branch with both values in reach.
 - For an edge `@card` conflict: the competing edges and their other ends, each with Remove
   on the branch.
@@ -489,7 +489,7 @@ the target head and the branch head (three snapshot reads), which covers node co
 E53 lands. Edge conflicts need the target's edges of the named source, also one read.
 
 **Engine.** **E53**, already deferred: the images from the server, exact and in one answer.
-Proposed **E56**: a merge that takes a side for named entities (`prefer: source` for the listed
+Proposed **E61**: a merge that takes a side for named entities (`prefer: source` for the listed
 ids), so "Keep this branch's" is one merge rather than a write to `main`. The constitution's "a
 write carries the commit it was read at" still holds: the resolution is bound to the dry run's
 heads.
@@ -535,9 +535,9 @@ exit).
 
 **Engine.**
 
-- Proposed **E55**: a commit's operation (the stored query's name, or `mutate`, `load`,
+- Proposed **E60**: a commit's operation (the stored query's name, or `mutate`, `load`,
   `merge`, `blob put`) and an optional writer-supplied message, in `CommitOutput`.
-- Proposed **E57**: commits that changed one entity, paged (an `id` filter on
+- Proposed **E62**: commits that changed one entity, paged (an `id` filter on
   `GET /commits/{id}/changes`, or on the change feed).
 - **E20** (delegated credentials recorded beside the actor) answers "which agent".
 - **E44** (counts in the listing) makes the rows cheap.
@@ -595,7 +595,7 @@ column's variable. For stored queries they wait on E43.
 **Engine.**
 
 - **E43** (a stored query's result columns with their variable, type and property).
-- Proposed **E59**, extended: a mutation's descriptor names the type it writes and the
+- Proposed **E64**, extended: a mutation's descriptor names the type it writes and the
   parameter that identifies its target. Without it, Studio can offer an action only where the
   person maps it once.
 - **E40** would let a roll-up's margin be a server column.
@@ -673,7 +673,7 @@ the review's set, one-hop anchors and the change marks. Spec 006's caps apply.
 
 - Works today: **E6** `GET /diff` between any two heads; **E9** detailed branches (served by
   0.15: head, start, created and updated).
-- E9's details lack the creating actor; proposed as part of **E55**.
+- E9's details lack the creating actor; proposed as part of **E60**.
 
 ### 8. Pages and trees shaped by the type
 
@@ -760,11 +760,11 @@ them is adopted. Studio designs against today's API in every case above.
 
 | ID | Change | For | Studio without it |
 |---|---|---|---|
-| E55 | A commit's operation (stored query name, `mutate`, `load`, `merge`, `blob put`) and an optional message; the actor that created a branch in E9's details | 4, 7 | Its own writes' words where it made them; otherwise counts and actor |
-| E56 | A merge that takes a side for named entities (`prefer: source`) | 3 | "Keep main's" writes main's values onto the branch; "keep this branch's" is two steps |
-| E57 | The commits that changed one entity, paged | 4 | Walks recent commits' changes filtered by type, bounded |
-| E58 | Which branches the policy protects, in `AccessOutput` or the branch list | 2 | Treats `main` as protected unless the person turns proposals off |
-| E59 | A stored query's source file and tags in its catalog entry; a mutation's written type and target parameter | 1, 5 | Checks, watches and actions are marked by the person, per graph |
+| E60 | A commit's operation (stored query name, `mutate`, `load`, `merge`, `blob put`) and an optional message; the actor that created a branch in E9's details ([#1470](https://github.com/ModernRelay/omnigraph/issues/1470)) | 4, 7 | Its own writes' words where it made them; otherwise counts and actor |
+| E61 | A merge that takes a side for named entities (`prefer: source`) ([#1471](https://github.com/ModernRelay/omnigraph/issues/1471)) | 3 | "Keep main's" writes main's values onto the branch; "keep this branch's" is two steps |
+| E62 | The commits that changed one entity, paged ([#1472](https://github.com/ModernRelay/omnigraph/issues/1472)) | 4 | Walks recent commits' changes filtered by type, bounded |
+| E63 | Which branches the policy protects, in `AccessOutput` or the branch list ([#1473](https://github.com/ModernRelay/omnigraph/issues/1473)) | 2 | Treats `main` as protected unless the person turns proposals off |
+| E64 | A stored query's source file and tags in its catalog entry; a mutation's written type and target parameter ([#1474](https://github.com/ModernRelay/omnigraph/issues/1474)) | 1, 5 | Checks, watches and actions are marked by the person, per graph |
 
 Already deferred and cited above: E6, E9, E15, E16, E20, E27, E35, E40, E43, E44, E53, R2.
 
