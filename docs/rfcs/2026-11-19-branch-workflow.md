@@ -8,7 +8,7 @@ authors:
   - aaltshuler
 created: 2026-11-19
 updated: 2026-11-19
-discussion: null
+discussion: "https://github.com/ModernRelay/omnigraph-studio/pull/158"
 supersedes: []
 superseded_by: []
 blocked_on: []
