@@ -1,0 +1,30 @@
+switch to the canvas from the page frames moving  15  last   14
+   |#....oo........                                                              |
+expand two levels                frames moving  18  last   17
+   |.o#########ooooo..                                                                                               |
+zoom in three times, 80 ms apart frames moving  21  last   20
+   |ooooooooooo..........                        |
+fit, then zoom out 80 ms later   frames moving  17  last   16
+   |o###########ooo..                       |
+fit                              frames moving  12  last   11
+   |######ooooo.                       |
+select a node and focus on it    frames moving  14  last   17
+   |.    ############o                      |
+collapse it                      frames moving  13  last   12
+   |#oo######ooo.                            |
+expand it again                  frames moving  13  last   12
+   |#########ooo.                                              |
+hide a node, then show it        frames moving  26  last   53
+   |#ooo######oo.                            #########ooo.                                  |
+arrow keys, 80 ms apart          frames moving   6  last   25
+   |#    #    #    #    #    #                            |
+wheel zoom                       frames moving   3  last   10
+   |#    o    #                      |
+pan                              frames moving   1  last    0
+   |#                      |
+hover a chip                     frames moving  15  last   34
+   |.    ##########ooo                .                                        |
+drag the root chip away          frames moving   1  last    0
+   |o                            |
+reset layout                     frames moving  13  last   12
+   |###########o.                                              |

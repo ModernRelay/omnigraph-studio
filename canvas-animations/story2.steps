@@ -1,0 +1,64 @@
+studio_graph::OpenNodePage={"type_name":"Person","id":"person-000001"}
+studio::ToggleInspector
+record:{film},fps=60,ms=80
+mark:switch to the canvas from the page
+studio_graph::OpenAsCanvas
+wait:1200
+mark:expand two levels
+studio_canvas::ExpandNeighbourhood={"depth":2,"confirm":true}
+wait:1800
+mark:zoom in three times, 80 ms apart
+studio_canvas::ZoomIn
+studio_canvas::ZoomIn
+studio_canvas::ZoomIn
+wait:500
+mark:fit, then zoom out 80 ms later
+studio_canvas::FitToWindow
+studio_canvas::ZoomOut
+wait:500
+mark:fit
+studio_canvas::FitToWindow
+wait:500
+mark:select a node and focus on it
+studio_canvas::SelectNode={"type_name":"Person","id":"person-000033"}
+studio_canvas::FocusSelected
+wait:500
+mark:collapse it
+studio_canvas::CollapseNodes={"nodes":[{"type_name":"Person","id":"person-000033"}]}
+wait:600
+mark:expand it again
+studio_canvas::ExpandNeighbourhood={"nodes":[{"type_name":"Person","id":"person-000033"}],"confirm":true}
+wait:900
+mark:hide a node, then show it
+studio_canvas::HideNodes={"nodes":[{"type_name":"Person","id":"person-000033"}]}
+wait:600
+studio_canvas::ShowHidden
+wait:700
+mark:arrow keys, 80 ms apart
+studio_canvas::MoveDown
+studio_canvas::MoveDown
+studio_canvas::MoveDown
+studio_canvas::MoveDown
+studio_canvas::MoveDown
+studio_canvas::MoveDown
+wait:400
+mark:wheel zoom
+scroll:0,-60,at=743:416
+scroll:0,-60,at=743:416
+scroll:0,120,at=743:416
+wait:300
+mark:pan
+drag:300,700,420,640
+wait:300
+mark:hover a chip
+studio_canvas::SelectNode={"type_name":"Person","id":"person-000001"}
+studio_canvas::FocusSelected
+wait:400
+hover:743,416
+wait:600
+mark:drag the root chip away
+drag:743,416,900,560
+wait:400
+mark:reset layout
+studio_canvas::ResetLayout
+wait:900

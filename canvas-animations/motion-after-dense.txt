@@ -1,0 +1,10 @@
+expand two levels on the dense graph frames moving  24  last   23
+   |ooooooooo#######oooo....                                                                                                                                                                                                                             |
+fit                              frames moving  13  last   12
+   |#########oooo                            |
+zoom in twice, 80 ms apart       frames moving  18  last   17
+   |ooooo#ooooooooooo.                      |
+pan                              frames moving   1  last    0
+   |#                      |
+fit again                        frames moving  13  last   12
+   |#########ooo.                            |

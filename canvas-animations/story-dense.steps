@@ -1,0 +1,20 @@
+studio_graph::ShowNodeOnCanvas={"type_name":"Topic","id":"topic-00000"}
+studio::ToggleInspector
+wait:1500
+record:{film},fps=60,ms=80
+mark:expand two levels on the dense graph
+studio_canvas::ExpandNeighbourhood={"depth":2,"limit_per_relationship":12,"confirm":true}
+wait:4000
+mark:fit
+studio_canvas::FitToWindow
+wait:600
+mark:zoom in twice, 80 ms apart
+studio_canvas::ZoomIn
+studio_canvas::ZoomIn
+wait:500
+mark:pan
+drag:300,700,500,600
+wait:300
+mark:fit again
+studio_canvas::FitToWindow
+wait:600
