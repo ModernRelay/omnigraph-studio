@@ -588,14 +588,26 @@ fn reopen_window(
         let connection = connection.clone();
         connection.update(cx, |connection, cx| connection.connect_if_idle(cx));
         let (graph_id, branch) = (graph.graph.clone(), graph.branch.clone());
+        // The proposal it was on, and the person's switches, come back with it (spec 038).
+        let proposing = |session: &Entity<graph_store::GraphSession>, cx: &mut App| {
+            session.update(cx, |session, _| {
+                session.restore_proposing(
+                    graph.propose_off.clone(),
+                    graph.propose_on.clone(),
+                    graph.proposing_into.clone(),
+                )
+            })
+        };
         if index == saved.session.shown {
             let session = open_session(connection, graph_id, branch, cx);
+            proposing(&session, cx);
             workspace.update(cx, |workspace, cx| {
                 workspace.set_session(session, window, cx)
             });
         } else {
             // Parked: it sends nothing, its first reads included, until it is first shown.
             let session = open_session_behind(connection, graph_id, branch, cx);
+            proposing(&session, cx);
             workspace.update(cx, |workspace, cx| {
                 workspace.add_session_behind(session, cx)
             });

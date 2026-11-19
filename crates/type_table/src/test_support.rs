@@ -358,6 +358,37 @@ pub(crate) fn session_recording_writes(
     (session, sent)
 }
 
+/// Request bodies a fake server was sent, in order.
+pub(crate) type Sent = Arc<Mutex<Vec<Value>>>;
+
+/// As [`session_recording_writes`], every read's request body recorded too, in order.
+pub(crate) fn session_recording(
+    schema: &str,
+    cx: &mut TestAppContext,
+) -> (Entity<GraphSession>, Sent, Sent) {
+    let (reads, sent) = (
+        Arc::new(Mutex::new(Vec::new())),
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    let (read_log, write_log) = (reads.clone(), sent.clone());
+    let writes: Writes = Arc::new(move |request: &Value| {
+        write_log.lock().unwrap().push(request.clone());
+        (200, committed("c2", "c1"))
+    });
+    let rows = Arc::new(people());
+    let session = serve_with(
+        schema,
+        Arc::new(move |request: &Value| {
+            read_log.lock().unwrap().push(request.clone());
+            (*rows).clone()
+        }),
+        writes,
+        None,
+        cx,
+    );
+    (session, reads, sent)
+}
+
 /// As [`session_recording_writes`], with another writer committing on the branch.
 pub(crate) fn session_followed_recording_writes(
     schema: &str,

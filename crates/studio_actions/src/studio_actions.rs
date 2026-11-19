@@ -323,8 +323,15 @@ pub mod graph {
         [
             /// Open a new query tab.
             NewQuery,
-            /// Open the review of the current branch against main, where it is merged.
+            /// Open the review of the current branch against main, where it is merged; on a
+            /// proposal, against the branch it proposes into.
             ReviewBranch,
+            /// Turn proposals on or off for edits of the window's branch: on, the first edit
+            /// starts a proposal branch, and edits land there instead (spec 038).
+            ToggleProposeChanges,
+            /// Leave the proposal for the branch it proposes into. The proposal's branch
+            /// stays, with its edits.
+            StopProposing,
             /// Open the commit history.
             OpenHistory,
             /// Show what the active tab shows as a table.
@@ -534,6 +541,10 @@ pub mod graph {
         pub id: String,
         #[serde(default)]
         pub at_commit: Option<String>,
+        /// Read and edit this branch, whatever the window shows (spec 038); `None` follows the
+        /// window's branch.
+        #[serde(default)]
+        pub branch: Option<String>,
         /// Open as the pane's preview tab, which the next preview replaces.
         #[serde(default)]
         pub preview: bool,

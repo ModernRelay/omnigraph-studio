@@ -65,6 +65,7 @@ pub fn init(cx: &mut App) {
                 type_name,
                 id,
                 at_commit: text("at_commit"),
+                branch: text("branch"),
                 preview: false,
             };
             // Named as it was until it is shown: a page behind another tab reads nothing.
@@ -181,6 +182,7 @@ pub fn init(cx: &mut App) {
                 type_name: action.type_name.clone(),
                 id: action.id.clone(),
                 at_commit: None,
+                branch: None,
                 preview: false,
             };
             open_node_page(workspace, &page, None, window, cx);
@@ -567,6 +569,7 @@ fn node_inspector(
     };
     let holds = node.at_commit.is_some();
     let snapshot = node.at_commit.clone().or_else(|| node.snapshot.clone());
+    let branch = node.branch.clone();
     let session = session.clone();
     cx.new(|cx| {
         let mut peek = NodePeek::new(
@@ -580,6 +583,9 @@ fn node_inspector(
         );
         if holds {
             peek.hold_commit();
+        } else if let Some(branch) = branch {
+            // The tab reads a branch the window may not show: so does its inspector (spec 038).
+            peek.on_branch(branch, cx);
         }
         peek
     })
@@ -623,14 +629,25 @@ fn open_node_page(
     let Some(session) = workspace.session().cloned() else {
         return;
     };
-    let key = NodePage::key(&action.type_name, &action.id, action.at_commit.as_deref());
+    // A page named on the window's branch follows it, as one named on none does.
+    let branch = action
+        .branch
+        .clone()
+        .filter(|branch| *branch != session.read(cx).branch || action.at_commit.is_some())
+        .filter(|_| action.at_commit.is_none());
+    let key = NodePage::key(
+        &action.type_name,
+        &action.id,
+        action.at_commit.as_deref(),
+        branch.as_deref(),
+    );
     let (type_name, id, at_commit) = (
         action.type_name.clone(),
         action.id.clone(),
         action.at_commit.clone(),
     );
     workspace.open_item_with::<NodePage>(key, action.preview, window, cx, move |_window, cx| {
-        NodePage::new(session, type_name, id, at_commit, saved_label, cx)
+        NodePage::new(session, type_name, id, at_commit, branch, saved_label, cx)
     });
 }
 

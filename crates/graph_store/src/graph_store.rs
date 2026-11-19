@@ -71,7 +71,9 @@ pub mod cli {
 pub use session::{
     BranchStart, DraftEntry, DraftKey, ExternalWrite, FollowUp, GraphSession, HeadWatch, HeldAs,
     Loadable, MergeEntry, MergeSent, MergeSettled, NAME_LIMIT, OutcomeEntry, OutcomeKind,
-    SchemaFailure, SessionEvent, Wrote, nothing_sent, open_session, open_session_behind,
+    PROPOSAL_PREFIX, PROTECTED_WITHOUT_POLICY, Proposal, ProposeProtected, SchemaFailure,
+    SessionEvent, WriteTarget, Wrote, nothing_sent, open_session, open_session_behind,
+    proposal_name,
 };
 
 /// The user agent of Studio's requests.
@@ -84,4 +86,6 @@ pub fn init(cx: &mut App) {
     );
     cx.set_http_client(http.clone());
     ConnectionRegistry::init(http, cx);
+    // Edits of a protected branch become proposals unless the person says otherwise (spec 038).
+    cx.set_global(ProposeProtected(true));
 }

@@ -38,6 +38,12 @@ use crate::memo::{Held, Memo};
 use crate::scope::{ReadScope, Scope, ScopeSince};
 use crate::server_features::{ServerFeature, ServerFeatures};
 
+mod proposals;
+pub use proposals::{
+    PROPOSAL_PREFIX, PROTECTED_WITHOUT_POLICY, Proposal, ProposeProtected, WriteTarget,
+    proposal_name,
+};
+
 /// A value that loads from the server.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Loadable<T> {
@@ -290,6 +296,9 @@ pub enum SessionEvent {
     },
     /// What the credential may do was read, or is to be read again ([`GraphSession::allows`]).
     AccessChanged,
+    /// Edits of a branch were turned to proposals or back, or the window entered or left a
+    /// proposal (spec 038): what an editor says it writes to may have changed.
+    ProposingChanged,
     /// The connection's token changed, and the session reads under the new one: a view that
     /// shows what it read of the server itself (a table's rows, a node page, the storage
     /// inspector) lets it go and reads it again, at the commit it shows, since the new token
@@ -932,6 +941,20 @@ pub struct GraphSession {
     connection_ready: bool,
     /// What the credential may do was forgotten while parked: it is read when shown again.
     access_owed: bool,
+    /// The proposal the window is on (spec 038), while it is on its branch.
+    proposal: Option<Proposal>,
+    /// Edits of a protected branch are proposed by default ([`ProposeProtected`]).
+    propose_protected: bool,
+    /// Protected branches whose edits the person turned proposals off for, and other branches
+    /// they turned them on for ([`Self::proposes_on`]).
+    propose_off: HashSet<String>,
+    propose_on: HashSet<String>,
+    /// The proposal a write is making, by the branch it proposes into: writes asked meanwhile
+    /// wait for it and go there too.
+    proposal_start: Option<(String, proposals::Starting)>,
+    /// The proposals this session named, so a list read before one was made names no other
+    /// the same.
+    proposals_made: Vec<String>,
     _connection_watch: Option<ConnectionWatch>,
 }
 
@@ -940,9 +963,11 @@ impl EventEmitter<SessionEvent> for GraphSession {}
 impl GraphSession {
     /// Where a write on `branch` lands, in words: the server, the graph and the branch, which a
     /// confirmation names whole, since two windows can both be on `main` (spec 020).
+    /// A write asked of a protected branch names the proposal it lands on (spec 038).
     pub fn write_scope(&self, branch: &str, cx: &App) -> String {
         let server = self.connection.read(cx).server.name.clone();
-        format!("{server} › {} › {branch}", self.graph_id)
+        let target = self.write_target(branch).label();
+        format!("{server} › {} › {target}", self.graph_id)
     }
 
     /// A session on `graph_id` that a window shows: it reads the graph at once.
@@ -1061,6 +1086,14 @@ impl GraphSession {
             read_refused: false,
             connection_ready: false,
             access_owed: false,
+            proposal: None,
+            propose_protected: cx
+                .try_global::<ProposeProtected>()
+                .is_some_and(|propose| propose.0),
+            propose_off: HashSet::new(),
+            propose_on: HashSet::new(),
+            proposal_start: None,
+            proposals_made: Vec::new(),
             _connection_watch: None,
         };
         session.credential = session.client(cx).credential_changes();
@@ -1508,9 +1541,23 @@ impl GraphSession {
         snapshot: Option<String>,
         cx: &mut Context<Self>,
     ) -> Task<Result<ReadOutput, ReadError>> {
+        let branch = self.branch.clone();
+        self.invoke_stored_read_on(&branch, name, params, snapshot, cx)
+    }
+
+    /// Runs a stored read at `snapshot`, else at `branch`'s head, whichever branch the session
+    /// shows: a query tab on a branch of its own (spec 038).
+    pub fn invoke_stored_read_on(
+        &mut self,
+        branch: &str,
+        name: &str,
+        params: Option<Value>,
+        snapshot: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<ReadOutput, ReadError>> {
         let request = InvokeStoredQueryRequest {
             params,
-            branch: snapshot.is_none().then(|| self.branch.clone()),
+            branch: snapshot.is_none().then(|| branch.to_owned()),
             snapshot,
             expect_mutation: Some(false),
         };
@@ -1533,25 +1580,33 @@ impl GraphSession {
         description: String,
         cx: &mut Context<Self>,
     ) -> Task<WriteOutcome<ChangeOutput>> {
-        let client = self.client(cx);
-        let graph = self.graph_id.clone();
         let name = name.to_owned();
-        let request = InvokeStoredQueryRequest {
-            params,
-            branch: Some(branch.clone()),
-            snapshot: None,
-            expect_mutation: Some(true),
-        };
-        let send = async move {
-            client
-                .invoke_stored_write(&graph, &name, &request, None)
-                .await
-        };
-        self.run_write(
-            send,
-            |output: &ChangeOutput| output.commit.as_ref(),
-            move |_, _, _| WriteLog::new(branch, description),
-            |_, _, _| {},
+        let asked = branch.clone();
+        self.routed_write(
+            &asked,
+            None,
+            move |this, branch, cx| {
+                let client = this.client(cx);
+                let graph = this.graph_id.clone();
+                let request = InvokeStoredQueryRequest {
+                    params,
+                    branch: Some(branch.clone()),
+                    snapshot: None,
+                    expect_mutation: Some(true),
+                };
+                let send = async move {
+                    client
+                        .invoke_stored_write(&graph, &name, &request, None)
+                        .await
+                };
+                this.run_write(
+                    send,
+                    |output: &ChangeOutput| output.commit.as_ref(),
+                    move |_, _, _| WriteLog::new(branch, description),
+                    |_, _, _| {},
+                    cx,
+                )
+            },
             cx,
         )
     }
@@ -2069,6 +2124,14 @@ impl GraphSession {
         if self.branch == branch {
             return;
         }
+        // The window leaves its proposal when it leaves the proposal's branch (spec 038).
+        if self
+            .proposal
+            .take_if(|open| open.branch != branch)
+            .is_some()
+        {
+            cx.emit(SessionEvent::ProposingChanged);
+        }
         self.branch = branch;
         self.branch_moves += 1;
         // Not yet shown: the first show reads the graph on this branch.
@@ -2392,11 +2455,21 @@ impl GraphSession {
         cx: &mut Context<Self>,
     ) -> Task<Result<ReadOutput, ReadError>> {
         let id = scope.id;
+        // A scope on a branch the session does not show (a page on a branch of its own, spec
+        // 038) reads that branch's head.
+        let elsewhere = self
+            .scopes
+            .get(&id)
+            .map(|scope| scope.branch.clone())
+            .filter(|branch| snapshot.is_none() && *branch != self.branch);
         let entry = self
             .scopes
             .get_mut(&id)
             .map(|scope| scope.add(query.depends.clone()));
-        let read = self.asked_by(id, |this| this.read(query, snapshot, cx));
+        let read = self.asked_by(id, |this| match &elsewhere {
+            Some(branch) => this.read_on(branch, query, cx),
+            None => this.read(query, snapshot, cx),
+        });
         // The token goes with this task: dropped by the view, the read stops counting as out.
         cx.spawn(async move |this, cx| {
             let result = read.await;
@@ -4373,14 +4446,21 @@ impl GraphSession {
         description: String,
         cx: &mut Context<Self>,
     ) -> Task<WriteOutcome<graph_client::api::BlobWriteOutput>> {
-        let client = self.client(cx);
-        let (graph, sent_to) = (self.graph_id.clone(), branch.to_owned());
-        let request = async move {
-            client
-                .blob_put(&graph, &sent_to, &cell, if_match.as_deref(), bytes)
-                .await
-        };
-        self.send_blob_write(branch, description, request, cx)
+        self.routed_write(
+            branch,
+            None,
+            move |this, branch, cx| {
+                let client = this.client(cx);
+                let (graph, sent_to) = (this.graph_id.clone(), branch.clone());
+                let request = async move {
+                    client
+                        .blob_put(&graph, &sent_to, &cell, if_match.as_deref(), bytes)
+                        .await
+                };
+                this.send_blob_write(&branch, description, request, cx)
+            },
+            cx,
+        )
     }
 
     /// Sets a nullable Blob cell to null on `branch`, bound as [`Self::blob_put_on`] binds. A
@@ -4393,14 +4473,21 @@ impl GraphSession {
         description: String,
         cx: &mut Context<Self>,
     ) -> Task<WriteOutcome<graph_client::api::BlobWriteOutput>> {
-        let client = self.client(cx);
-        let (graph, sent_to) = (self.graph_id.clone(), branch.to_owned());
-        let request = async move {
-            client
-                .blob_clear(&graph, &sent_to, &cell, if_match.as_deref())
-                .await
-        };
-        self.send_blob_write(branch, description, request, cx)
+        self.routed_write(
+            branch,
+            None,
+            move |this, branch, cx| {
+                let client = this.client(cx);
+                let (graph, sent_to) = (this.graph_id.clone(), branch.clone());
+                let request = async move {
+                    client
+                        .blob_clear(&graph, &sent_to, &cell, if_match.as_deref())
+                        .await
+                };
+                this.send_blob_write(&branch, description, request, cx)
+            },
+            cx,
+        )
     }
 
     /// Runs a Blob write on `branch` as every write of the session runs ([`Self::run_write`]).
@@ -4440,7 +4527,7 @@ impl GraphSession {
             params: query.params_value(),
             branch: Some(branch.to_owned()),
         };
-        self.send_write(request, if_commit, description, follow_up, None, cx)
+        self.write_request_with(request, if_commit, description, follow_up, None, cx)
     }
 
     /// [`Self::write_on`] for a write that sets the properties `wrote` names: once it commits,
@@ -4461,9 +4548,11 @@ impl GraphSession {
             params: query.params_value(),
             branch: Some(branch.to_owned()),
         };
-        self.send_write(request, if_commit, description, None, Some(wrote), cx)
+        self.write_request_with(request, if_commit, description, None, Some(wrote), cx)
     }
 
+    /// Sends `request` once. One naming a branch goes where [`Self::write_target`] says
+    /// (spec 038); a statement names its own branches and goes as it is.
     pub fn write_request(
         &mut self,
         request: ChangeRequest,
@@ -4471,7 +4560,33 @@ impl GraphSession {
         description: String,
         cx: &mut Context<Self>,
     ) -> Task<WriteOutcome<ChangeOutput>> {
-        self.send_write(request, if_commit, description, None, None, cx)
+        self.write_request_with(request, if_commit, description, None, None, cx)
+    }
+
+    fn write_request_with(
+        &mut self,
+        request: ChangeRequest,
+        if_commit: Option<String>,
+        description: String,
+        follow_up: Option<FollowUp>,
+        wrote: Option<Wrote>,
+        cx: &mut Context<Self>,
+    ) -> Task<WriteOutcome<ChangeOutput>> {
+        let Some(asked) = request.branch.clone() else {
+            return self.send_write(request, if_commit, description, follow_up, wrote, cx);
+        };
+        self.routed_write(
+            &asked,
+            if_commit.clone(),
+            move |this, branch, cx| {
+                let request = ChangeRequest {
+                    branch: Some(branch),
+                    ..request
+                };
+                this.send_write(request, if_commit, description, follow_up, wrote, cx)
+            },
+            cx,
+        )
     }
 
     fn send_write(

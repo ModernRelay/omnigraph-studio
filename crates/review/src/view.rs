@@ -1325,10 +1325,11 @@ impl ReviewView {
     }
 
     /// The node whose card holds the selected change, as the inspector shows it (spec 020): a
-    /// change of its own, or of a relationship reviewed on its card. It is read where the
-    /// review reads it, and held there, so it is read-only as the review is: at the reviewed
-    /// head, or, for a node the branch removes, at the fork, where it last was. None for an
-    /// edge whose type the schema lacks, which has a card of its own and no node.
+    /// change of its own, or of a relationship reviewed on its card. A review of the whole
+    /// branch shows it on the branch, read at the reviewed head and edited there (spec 038);
+    /// one of a single commit, or of a branch merged and deleted, holds it at the reviewed
+    /// head, read-only. A node the branch removes is held at the fork, where it last was. None
+    /// for an edge whose type the schema lacks, which has a card of its own and no node.
     fn selected_node(&self) -> Option<InspectedNode> {
         let data = self.data.as_ref()?;
         let at = *data.groups.home.get(self.selected?)?;
@@ -1346,12 +1347,29 @@ impl ReviewView {
         } else {
             data.head.clone()
         }?;
+        if !removed && self.edits_on_branch() {
+            return Some(InspectedNode {
+                type_name: group.type_name.clone(),
+                id: group.id.clone(),
+                at_commit: None,
+                snapshot: Some(commit),
+                branch: Some(self.branch.clone()),
+            });
+        }
         Some(InspectedNode {
             type_name: group.type_name.clone(),
             id: group.id.clone(),
             at_commit: Some(commit),
             snapshot: None,
+            branch: None,
         })
+    }
+
+    /// Whether what the review opens of a node reads and edits the reviewed branch (spec
+    /// 038): a review of everything since the fork of a branch still there. One commit's
+    /// review holds that commit.
+    fn edits_on_branch(&self) -> bool {
+        self.scope.is_none() && !self.branch_deleted
     }
 
     /// Tells the workspace when the selected change's node is another one, or none: called
@@ -2276,8 +2294,9 @@ impl ReviewView {
         Some(conflict_wording(conflict.kind, here, &self.target))
     }
 
-    /// Opens the selected change's node page where the review holds it, read-only: at the
-    /// reviewed head, or at the fork for a node the branch removes ([`Self::selected_node`]).
+    /// Opens the selected change's node page where the review shows it: on the reviewed
+    /// branch, editable, or held at the reviewed head or, for a node the branch removes, at
+    /// the fork ([`Self::selected_node`]).
     fn open_selected_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(node) = self.selected_node() else {
             return;
@@ -2287,6 +2306,7 @@ impl ReviewView {
                 type_name: node.type_name,
                 id: node.id,
                 at_commit: node.at_commit,
+                branch: node.branch,
                 preview: false,
             }),
             cx,
@@ -5569,11 +5589,12 @@ pub(crate) mod tests {
         });
     }
 
-    /// The inspector shows the node whose card holds the selected change (spec 020), read where
-    /// the review reads it and held there, so it is read-only as the review is: at the reviewed
-    /// head, or, for a node the branch removes, at the fork, where it last was. The workspace
-    /// is told when the selection is another node's, and not when it stays on the same one.
-    /// Before, the inspector read "Nothing selected" beside a selected change.
+    /// The inspector shows the node whose card holds the selected change (spec 020): on the
+    /// reviewed branch, read at the reviewed head and edited there (spec 038), or, for a node
+    /// the branch removes, held at the fork, where it last was. A review of one commit holds
+    /// every node at that commit. The workspace is told when the selection is another node's,
+    /// and not when it stays on the same one. Before, the inspector read "Nothing selected"
+    /// beside a selected change, and before spec 038 it held every node, read-only.
     #[gpui::test]
     async fn the_inspector_shows_the_selected_changes_node_where_the_review_reads_it(
         cx: &mut gpui::TestAppContext,
@@ -5628,14 +5649,28 @@ pub(crate) mod tests {
             id: id.into(),
             at_commit: Some(commit.into()),
             snapshot: None,
+            branch: None,
         };
 
         select("p1", cx);
         assert_eq!(
             inspected(cx),
-            Some(node("p1", "f2")),
-            "at the reviewed head"
+            Some(InspectedNode {
+                type_name: "Person".into(),
+                id: "p1".into(),
+                at_commit: None,
+                snapshot: Some("f2".into()),
+                branch: Some("feature".into()),
+            }),
+            "on the branch, read at the reviewed head"
         );
+        view.update(cx, |view, _| view.scope = Some("f2".into()));
+        assert_eq!(
+            inspected(cx),
+            Some(node("p1", "f2")),
+            "one commit's review holds it there"
+        );
+        view.update(cx, |view, _| view.scope = None);
         let before = told.get();
         select("p2", cx);
         assert_eq!(

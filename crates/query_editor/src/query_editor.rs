@@ -211,6 +211,11 @@ pub fn init(cx: &mut App) {
             .get("at_commit")
             .and_then(|commit| commit.as_str())
             .map(str::to_owned);
+        // The branch of its own it read, whatever the window showed (spec 038).
+        let branch = data
+            .get("branch")
+            .and_then(|branch| branch.as_str())
+            .map(str::to_owned);
         let widths = saved_widths(data);
         if let Some(path) = data.get("path").and_then(|path| path.as_str()) {
             // A file tab keeps its text with the hash of the file's text it was typed over,
@@ -238,6 +243,9 @@ pub fn init(cx: &mut App) {
             {
                 editor.update(cx, |editor, cx| {
                     editor.set_column_widths(widths);
+                    if branch.is_some() {
+                        editor.set_own_branch(branch, cx);
+                    }
                     if let Some(commit) = at_commit {
                         editor.pin_to(commit, cx);
                     }
@@ -254,6 +262,9 @@ pub fn init(cx: &mut App) {
             // Its text, even emptied, is the tab's: the example does not fill it again.
             let mut editor = QueryEditor::with_text(number, session, &text, window, cx);
             editor.set_column_widths(widths);
+            if branch.is_some() {
+                editor.set_own_branch(branch, cx);
+            }
             if let Some(commit) = at_commit {
                 editor.pin_to(commit, cx);
             }
@@ -278,7 +289,18 @@ pub fn init(cx: &mut App) {
         );
         if let Some(editor) = opened {
             let widths = saved_widths(data);
-            editor.update(cx, |editor, _| editor.set_column_widths(widths));
+            let branch = text("branch");
+            let at_commit = text("at_commit");
+            editor.update(cx, |editor, cx| {
+                editor.set_column_widths(widths);
+                // On a branch of its own, then held at the commit it was held at there.
+                if branch.is_some() {
+                    editor.set_own_branch(branch, cx);
+                    if let Some(commit) = at_commit {
+                        editor.pin_to(commit, cx);
+                    }
+                }
+            });
         }
     });
     studio_workspace::register_item_kind(

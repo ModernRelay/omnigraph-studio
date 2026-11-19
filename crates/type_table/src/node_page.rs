@@ -8,6 +8,7 @@ use gpui::{
 use graph_store::GraphSession;
 use serde_json::json;
 use studio_actions::{ViewKind, ViewLink};
+use studio_ui::ds::Tipped as _;
 use studio_workspace::{Inspected, InspectedNode, Item, ItemEvent, SavedItem};
 use ui::prelude::*;
 
@@ -15,9 +16,13 @@ use crate::peek::NodePeek;
 
 pub struct NodePage {
     view: Entity<NodePeek>,
+    session: Entity<GraphSession>,
     type_name: String,
     id: String,
     at_commit: Option<String>,
+    /// The branch the page reads and edits whatever the window shows (spec 038); `None`
+    /// follows the window's.
+    branch: Option<String>,
     /// The node's label as the tab last named it, saved with the tab: a page restored behind
     /// another tab, or one whose branch changed, reads nothing until it is shown, and its tab
     /// is named by this until then.
@@ -30,6 +35,7 @@ pub struct NodePage {
     /// The related node selected on the page as the inspector was last told of it.
     selected: Option<InspectedNode>,
     _subscription: Subscription,
+    _session: Subscription,
 }
 
 impl NodePage {
@@ -38,13 +44,29 @@ impl NodePage {
         type_name: String,
         id: String,
         at_commit: Option<String>,
+        branch: Option<String>,
         saved_label: Option<String>,
         cx: &mut Context<Self>,
     ) -> Self {
+        // A page held at a commit reads no branch.
+        let branch = branch.filter(|_| at_commit.is_none());
         let view = {
-            let (type_name, id, at_commit) = (type_name.clone(), id.clone(), at_commit.clone());
-            cx.new(|cx| NodePeek::page(session, type_name, id, at_commit, cx))
+            let (session, type_name, id) = (session.clone(), type_name.clone(), id.clone());
+            let (at_commit, branch) = (at_commit.clone(), branch.clone());
+            cx.new(|cx| NodePeek::page(session, type_name, id, at_commit, branch, cx))
         };
+        // A page on a branch of its own says so while the window shows another.
+        let session_subscription = cx.subscribe(&session, |this, _, event, cx| {
+            if this.branch.is_some()
+                && matches!(
+                    event,
+                    graph_store::SessionEvent::BranchChanged
+                        | graph_store::SessionEvent::ProposingChanged
+                )
+            {
+                cx.notify();
+            }
+        });
         // The tab's title is the node's label once it is read, and its dot says newer data:
         // the tab is told when either changes, not at each change of the view, which draws
         // itself.
@@ -73,14 +95,17 @@ impl NodePage {
         });
         let mut page = Self {
             view,
+            session,
             type_name,
             id,
             at_commit,
+            branch,
             saved_label,
             tab: (String::new(), false),
             toolbar: (true, false),
             selected: None,
             _subscription: subscription,
+            _session: session_subscription,
         };
         page.tab = (page.title(cx), page.view.read(cx).is_newer());
         page.toolbar = page.toolbar_state(cx);
@@ -108,12 +133,20 @@ impl NodePage {
         (view.hides_empty(), view.any_empty())
     }
 
-    /// One page per node at the head, and one per node and commit.
-    pub fn key(type_name: &str, id: &str, at_commit: Option<&str>) -> String {
-        match at_commit {
-            Some(commit) => format!("node:{type_name}:{id}@{commit}"),
-            None => format!("node:{type_name}:{id}"),
+    /// One page per node at the window's branch head, one per node and branch of its own, and
+    /// one per node and commit.
+    pub fn key(type_name: &str, id: &str, at_commit: Option<&str>, branch: Option<&str>) -> String {
+        match (at_commit, branch) {
+            (Some(commit), _) => format!("node:{type_name}:{id}@{commit}"),
+            (None, Some(branch)) => format!("node:{type_name}:{id}#{branch}"),
+            (None, None) => format!("node:{type_name}:{id}"),
         }
+    }
+
+    /// The branch the page is on when it is not the window's: what its toolbar names.
+    fn other_branch(&self, cx: &App) -> Option<String> {
+        let own = self.branch.as_ref()?;
+        (*own != self.session.read(cx).branch).then(|| own.clone())
     }
 }
 
@@ -144,12 +177,17 @@ impl Item for NodePage {
         ]
     }
 
-    fn view_action(&self, kind: ViewKind, _cx: &App) -> Option<Box<dyn gpui::Action>> {
-        let (type_name, id, at_commit) = (
-            self.type_name.clone(),
-            self.id.clone(),
-            self.at_commit.clone(),
-        );
+    fn view_action(&self, kind: ViewKind, cx: &App) -> Option<Box<dyn gpui::Action>> {
+        // A tree and a canvas read the window's branch: from a page on another branch they
+        // hold the commit the page shows, read-only (spec 038).
+        let at_commit = match self.other_branch(cx) {
+            Some(_) => self
+                .at_commit
+                .clone()
+                .or_else(|| self.view.read(cx).shown_commit()),
+            None => self.at_commit.clone(),
+        };
+        let (type_name, id) = (self.type_name.clone(), self.id.clone());
         match kind {
             ViewKind::Tree => Some(Box::new(studio_actions::graph::ShowNodeInTree {
                 type_name,
@@ -192,7 +230,15 @@ impl Item for NodePage {
     }
 
     fn dedupe_key(&self, _cx: &App) -> Option<SharedString> {
-        Some(Self::key(&self.type_name, &self.id, self.at_commit.as_deref()).into())
+        Some(
+            Self::key(
+                &self.type_name,
+                &self.id,
+                self.at_commit.as_deref(),
+                self.branch.as_deref(),
+            )
+            .into(),
+        )
     }
 
     fn is_stale(&self, cx: &App) -> bool {
@@ -211,6 +257,7 @@ impl Item for NodePage {
                 "type_name": self.type_name,
                 "id": self.id,
                 "at_commit": self.at_commit,
+                "branch": self.branch,
                 "label": label,
             }),
         })
@@ -222,9 +269,28 @@ impl NodePage {
     /// Collapse all.
     fn render_toolbar(&self, cx: &mut Context<Self>) -> gpui::Div {
         let (hide_empty, any_empty) = self.toolbar;
+        let other = self.other_branch(cx);
+        let writes_to = other
+            .as_ref()
+            .map(|branch| self.session.read(cx).writes_to(branch));
         studio_ui::ds::toolbar(cx)
             .children(studio_workspace::view_strip(Item::views(self, cx), cx))
             .child(div().flex_1())
+            // The branch the page reads and edits, when the window shows another (spec 038).
+            .children(other.zip(writes_to).map(|(branch, writes_to)| {
+                let tip = if writes_to == branch {
+                    format!("This page reads and edits {branch}, whatever the window shows.")
+                } else {
+                    format!(
+                        "This page reads {branch}, whatever the window shows; edits go to \
+                         {writes_to}."
+                    )
+                };
+                studio_ui::ds::meta(IconName::GitBranch, format!("on {branch}"))
+                    .id("page-branch")
+                    .flex_none()
+                    .tip(studio_ui::ds::tooltip(tip))
+            }))
             .child(
                 studio_ui::ds::toolbar_actions()
                     // The eye shows only when it changes something, as on a tree.

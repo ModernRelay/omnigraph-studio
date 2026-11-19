@@ -202,7 +202,9 @@
     "bindings": {
       "ctrl-n": "studio_graph::NewQuery",
       "ctrl-shift-o": "studio_graph::OpenMap",
-      "ctrl-shift-r": "studio_graph::ReviewBranch"
+      "ctrl-shift-r": "studio_graph::ReviewBranch",
+      "ctrl-alt-p": "studio_graph::ToggleProposeChanges",
+      "ctrl-alt-shift-p": "studio_graph::StopProposing"
     }
   },
   {

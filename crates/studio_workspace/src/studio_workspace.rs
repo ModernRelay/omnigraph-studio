@@ -34,7 +34,7 @@ use graph_store::{
 };
 use studio_actions::graph::{
     OpenAsCanvas, OpenAsHistory, OpenAsMap, OpenAsPage, OpenAsReview, OpenAsSource, OpenAsTable,
-    OpenAsTree, OpenBranchHistory, OpenCommit,
+    OpenAsTree, OpenBranchHistory, OpenCommit, ReviewBranch, StopProposing, ToggleProposeChanges,
 };
 use studio_actions::workspace::OpenViewAt;
 use studio_actions::workspace::{
@@ -962,7 +962,11 @@ impl Workspace {
                 .map(|(session, _)| {
                     let session = session.read(cx);
                     let server = &session.connection.read(cx).server;
+                    let (propose_off, propose_on) = session.proposing_switches();
                     SavedGraph {
+                        proposing_into: session.proposal().map(|open| open.base.clone()),
+                        propose_off,
+                        propose_on,
                         target: server.name.clone(),
                         url: server.url.clone(),
                         graph: session.graph_id.clone(),
@@ -4797,15 +4801,31 @@ impl Workspace {
     fn render_branch(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let session = self.session.as_ref()?;
         let s = session.read(cx);
-        let branch = s.branch.clone();
+        // On a proposal the bar names the branch it proposes into, then the proposal, where the
+        // window's edits land (spec 038).
+        let proposal = s.proposal().cloned();
+        let branch = proposal
+            .as_ref()
+            .map_or_else(|| s.branch.clone(), |open| open.base.clone());
         // The access route refused changes on the window's branch: its edits are disabled, so
         // the bar says so beside the name (spec 002).
-        let read_only = s.refusal(AccessAction::Change, &AccessScope::branch(&branch));
+        let read_only = s.refusal(AccessAction::Change, &AccessScope::branch(&s.branch));
+        // Edits of the branch start a proposal: said beside it, since an edit lands elsewhere.
+        let proposes = proposal.is_none() && read_only.is_none() && s.proposes_on(&branch);
+        let protected = s.protects(&branch);
+        let edits = s.proposal_edits();
         let branch_tooltip = if read_only.is_some() {
             format!(
                 "Reads in this window use {branch}, which your credential may not change. Switch \
                  branch."
             )
+        } else if let Some(open) = &proposal {
+            format!(
+                "Edits in this window are proposed on {}, to merge into {branch}. Switch branch.",
+                open.branch
+            )
+        } else if proposes {
+            format!("Reads in this window use {branch}; edits start a proposal. Switch branch.")
         } else {
             format!("Reads and edits in this window use {branch}. Switch branch.")
         };
@@ -4873,6 +4893,38 @@ impl Workspace {
                             }))
                         }),
                 )
+                .when(proposes, |row| {
+                    row.child(
+                        div()
+                            .id("branch-proposes")
+                            .debug_selector(|| "branch-proposes".into())
+                            .child(
+                                studio_ui::ds::bar_button(
+                                    "branch-proposes-button",
+                                    "proposes edits",
+                                )
+                                .style(ButtonStyle::Subtle)
+                                .tip_fn(move |_, cx| {
+                                    studio_ui::ds::tooltip_for_action_view(
+                                        if protected {
+                                            "Edits start a proposal branch, since main is treated \
+                                         as protected. Turn proposals off"
+                                        } else {
+                                            "Edits start a proposal branch. Turn proposals off"
+                                        },
+                                        &ToggleProposeChanges,
+                                        cx,
+                                    )
+                                })
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(Box::new(ToggleProposeChanges), cx)
+                                }),
+                            ),
+                    )
+                })
+                .when_some(proposal, |row, open| {
+                    row.child(self.render_proposal(open, edits))
+                })
                 .when_some(read_only, |row, reason| {
                     row.child(
                         div()
@@ -4891,6 +4943,65 @@ impl Workspace {
                     )
                 }),
         )
+    }
+
+    /// The proposal the window is on (spec 038): where its edits land, with a menu to review
+    /// it, leave it, or turn proposals off, and how many edits it holds, which opens its review.
+    fn render_proposal(&self, open: graph_store::Proposal, edits: usize) -> impl IntoElement {
+        let label = format!("Proposing on {}", open.branch);
+        let base = open.base.clone();
+        h_flex()
+            .id("proposal")
+            .debug_selector(|| "proposal".into())
+            .gap(px(studio_ui::ds::space::XS))
+            .items_center()
+            .flex_none()
+            .child(studio_ui::ds::text::body("→").color(Color::Disabled))
+            .child(
+                PopoverMenu::new("proposal-menu")
+                    .anchor(gpui::Anchor::TopLeft)
+                    .attach(gpui::Anchor::BottomLeft)
+                    .trigger(
+                        studio_ui::ds::bar_button("proposal", label)
+                            .style(ButtonStyle::Subtle)
+                            .start_icon(Icon::new(IconName::GitBranch))
+                            .end_icon(Icon::new(IconName::ChevronUpDown))
+                            .tip(studio_ui::ds::tooltip(format!(
+                                "Edits land on {}, not on {base}, until it is merged.",
+                                open.branch
+                            ))),
+                    )
+                    .menu(move |window, cx| {
+                        let base = base.clone();
+                        Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                            menu.header("Proposal")
+                                .action("Review proposal", Box::new(ReviewBranch))
+                                .action(
+                                    format!("Stop proposing; show {base}"),
+                                    Box::new(StopProposing),
+                                )
+                                .separator()
+                                .action(
+                                    format!("Edit {base} directly"),
+                                    Box::new(ToggleProposeChanges),
+                                )
+                        }))
+                    }),
+            )
+            .child(
+                studio_ui::ds::bar_button(
+                    "proposal-review",
+                    match edits {
+                        0 => "Review".to_owned(),
+                        n => format!("{} · Review", studio_ui::plural(n, "edit", "edits")),
+                    },
+                )
+                .style(ButtonStyle::Subtle)
+                .tip_fn(|_, cx| {
+                    studio_ui::ds::tooltip_for_action_view("Review proposal", &ReviewBranch, cx)
+                })
+                .on_click(|_, window, cx| window.dispatch_action(Box::new(ReviewBranch), cx)),
+            )
     }
 
     /// The document column: its panes, and the bottom dock when it sits under the document
@@ -7336,6 +7447,67 @@ mod tests {
         );
     }
 
+    /// The top bar says where the window's edits land (spec 038): beside a protected branch
+    /// that proposes, "proposes edits"; on a proposal, the branch it proposes into and the
+    /// proposal; with proposals turned off, neither. The window saves its proposal.
+    #[gpui::test]
+    fn the_top_bar_says_where_edits_land(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+            cx.set_global(graph_store::ProposeProtected(true));
+        });
+        let http = http_client::FakeHttpClient::create(|_| async {
+            Ok(http_client::http::Response::builder()
+                .status(200)
+                .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                .body(http_client::AsyncBody::from(
+                    r#"{"branches":["main","proposal/act-ada/1119-1"]}"#,
+                ))
+                .unwrap())
+        });
+        let server = graph_store::ServerEntry {
+            name: "test".into(),
+            url: "http://studio.test".into(),
+            source: graph_store::ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection =
+            cx.new(|_| graph_store::Connection::new(server, Some("t".into()), http).unwrap());
+        let session = cx.new(|cx| GraphSession::new(connection, "notes".into(), "main".into(), cx));
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        workspace.update(cx, |workspace, cx| {
+            workspace.graph_order.push(session.entity_id());
+            workspace.subscribe_session(session.clone(), cx);
+        });
+        let shown = |selector: &'static str, cx: &mut gpui::VisualTestContext| {
+            cx.run_until_parked();
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            cx.debug_bounds(selector).is_some()
+        };
+        assert!(shown("branch-proposes", cx), "main proposes edits");
+        assert!(!shown("proposal", cx));
+
+        // On a proposal into main, as a reopened window is.
+        session.update(cx, |session, cx| {
+            session.set_branch("proposal/act-ada/1119-1".into(), cx);
+            session.restore_proposing(Vec::new(), Vec::new(), Some("main".into()));
+        });
+        assert!(shown("proposal", cx), "the proposal is named");
+        assert!(!shown("branch-proposes", cx));
+        let saved = workspace.read_with(cx, |workspace, cx| workspace.session_snapshot(cx));
+        assert_eq!(saved.graphs[0].proposing_into.as_deref(), Some("main"));
+
+        // Proposals off for main: the window goes back to it, and edits land there.
+        session.update(cx, |session, cx| session.set_proposing("main", false, cx));
+        assert!(!shown("proposal", cx));
+        assert!(!shown("branch-proposes", cx), "edits of main go to main");
+        session.read_with(cx, |session, _| assert_eq!(session.branch, "main"));
+        let saved = workspace.read_with(cx, |workspace, cx| workspace.session_snapshot(cx));
+        assert_eq!(saved.graphs[0].propose_off, ["main"]);
+    }
+
     /// The tab strip and its tabs are the header strip's height, under which every column's
     /// header rule lines up; the status bar has its own height.
     #[gpui::test]
@@ -7933,6 +8105,7 @@ mod tests {
             id: id.into(),
             at_commit: None,
             snapshot: None,
+            branch: None,
         };
         cx.update(|cx| {
             studio_theme::init_test(cx);

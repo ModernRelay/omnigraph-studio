@@ -328,6 +328,7 @@ impl Item for RelationshipTree {
             id: node.id,
             at_commit: self.at_commit.clone(),
             snapshot: self.exploration.read(cx).pin().map(str::to_owned),
+            branch: None,
         }))
     }
 
@@ -423,6 +424,7 @@ impl Item for RelationshipTree {
                     type_name: node.type_name,
                     id: node.id,
                     at_commit,
+                    branch: None,
                     preview: false,
                 }))
             }
@@ -887,6 +889,7 @@ impl RelationshipTree {
                 type_name: node.type_name.clone(),
                 id: node.id.clone(),
                 at_commit: self.at_commit.clone(),
+                branch: None,
                 preview: false,
             }),
             cx,
@@ -979,6 +982,7 @@ impl RelationshipTree {
                         type_name: node.type_name.clone(),
                         id: node.id.clone(),
                         at_commit: self.at_commit.clone(),
+                        branch: None,
                         preview: false,
                     }),
                     cx,

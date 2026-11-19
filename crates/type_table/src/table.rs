@@ -6483,6 +6483,7 @@ impl TypeTable {
                 type_name: self.type_name.clone(),
                 id: row.id.clone(),
                 at_commit: self.at_commit.clone(),
+                branch: None,
                 preview: false,
             }),
             cx,
@@ -6602,7 +6603,9 @@ impl TypeTable {
                 .update(cx, |table, cx| table.pick_choice(index, window, cx))
                 .ok();
         });
-        let (focus, branch) = (self.select_focus.clone(), self.branch.clone().into());
+        // Its keys name where the save lands: a protected branch's is a proposal (spec 038).
+        let branch = self.session.read(cx).writes_to(&self.branch).into();
+        let focus = self.select_focus.clone();
         let view = cx.new(|_| {
             CellSelect::new(
                 property, choices, text, width, notice, branch, focus, on_pick,
@@ -12299,7 +12302,7 @@ impl TypeTable {
                 .children(hint.map(studio_ui::ds::text::meta))
                 .child(studio_ui::ds::text::meta(format!(
                     "↵ save · esc cancel · write · {}",
-                    self.branch
+                    self.session.read(cx).writes_to(&self.branch)
                 ))),
         )
     }
@@ -14647,7 +14650,9 @@ mod tests {
         cx.run_until_parked();
         let (page, cx) = cx.add_window_view({
             let session = session.clone();
-            move |_, cx| crate::NodePage::new(session, "Person".into(), "p1".into(), None, None, cx)
+            move |_, cx| {
+                crate::NodePage::new(session, "Person".into(), "p1".into(), None, None, None, cx)
+            }
         });
         cx.run_until_parked();
         let saved = page.read_with(cx, |page, cx| {
@@ -14669,6 +14674,7 @@ mod tests {
                 "Person".into(),
                 "p1".into(),
                 None,
+                None,
                 label,
                 cx,
             )
@@ -14683,6 +14689,7 @@ mod tests {
                 "Person".into(),
                 "p1".into(),
                 Some("c0".into()),
+                None,
                 None,
                 cx,
             )
@@ -16096,7 +16103,7 @@ mod tests {
         cx.run_until_parked();
         let page_session = session.clone();
         let (page, page_cx) = app.add_window_view(move |_, cx| {
-            crate::peek::NodePeek::page(page_session, "Person".into(), "p1".into(), None, cx)
+            crate::peek::NodePeek::page(page_session, "Person".into(), "p1".into(), None, None, cx)
         });
         page_cx.run_until_parked();
         let works_at = |table: &TypeTable| {
@@ -16217,7 +16224,7 @@ mod tests {
         });
         let page_session = session.clone();
         let (page, cx) = cx.add_window_view(move |_, cx| {
-            crate::peek::NodePeek::page(page_session, "Person".into(), "p1".into(), None, cx)
+            crate::peek::NodePeek::page(page_session, "Person".into(), "p1".into(), None, None, cx)
         });
         cx.run_until_parked();
         let company = |page: &crate::peek::NodePeek| {
@@ -16306,7 +16313,7 @@ mod tests {
         sent.lock().unwrap().clear();
         let page_session = session.clone();
         let (_page, page_cx) = app.add_window_view(move |_, cx| {
-            NodePeek::page(page_session, "Person".into(), "p1".into(), None, cx)
+            NodePeek::page(page_session, "Person".into(), "p1".into(), None, None, cx)
         });
         page_cx.run_until_parked();
         session.read_with(cx, |session, _| {

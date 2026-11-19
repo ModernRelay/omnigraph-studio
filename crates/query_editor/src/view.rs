@@ -28,7 +28,7 @@ use graph_client::api::{
 };
 use graph_client::api::{ErrorCode, RankingOutput};
 use graph_client::{ReadError, Unauthorized, WriteOutcome};
-use graph_store::{GraphSession, SessionEvent};
+use graph_store::{GraphSession, Loadable, SessionEvent};
 use serde_json::{Map, Value};
 use studio_actions::query::{
     ApplyFix, CopyCell, CopyRow, Explain, NextPage, NextProblem, PreviousProblem, Run, Save,
@@ -600,6 +600,9 @@ struct HeldEdit {
 /// How many bytes either side of a held edit its context takes.
 const EDIT_CONTEXT: usize = 16;
 
+/// How many of the graph's other branches the snapshot picker offers (spec 038).
+const PICKER_BRANCHES: usize = 12;
+
 /// How many of the branch's latest commits the snapshot picker offers.
 const PICKER_COMMITS: usize = 15;
 
@@ -684,6 +687,11 @@ pub struct QueryEditor {
     picker_menu: Option<WeakEntity<ContextMenu>>,
     /// Reads run at this commit and writes are refused (spec 009); `None` uses the branch.
     at_commit: Option<String>,
+    /// The branch the tab reads and writes whatever the window shows (spec 038), picked in
+    /// its snapshot picker; `None` follows the window's.
+    own_branch: Option<String>,
+    /// Asks after the head of the tab's own branch, which the window may not show.
+    _head_watch: Option<graph_store::HeadWatch>,
     editor: Entity<Editor>,
     /// The editor's focus, held so a part drawn on its own (the problems list) names it
     /// without reading the editor, which would make that part draw again at every key.
@@ -885,9 +893,9 @@ impl Item for QueryEditor {
 
     /// The rows shown were read at a commit their branch, the one shown, has moved past.
     fn is_stale(&self, cx: &App) -> bool {
-        let branch = &self.session.read(cx).branch;
+        let branch = self.branch(cx);
         matches!(&self.output, Output::Rows(rows)
-            if rows.newer && matches!(&rows.read_at, ReadAt::Branch(read) if read == branch))
+            if rows.newer && matches!(&rows.read_at, ReadAt::Branch(read) if *read == branch))
     }
 
     fn tab_icon(&self, _cx: &App) -> Option<IconName> {
@@ -940,6 +948,7 @@ impl Item for QueryEditor {
                     "name": stored.entry.name,
                     "view": stored.view,
                     "at_commit": self.at_commit,
+                    "branch": self.own_branch,
                     "values": values,
                     "widths": self.column_widths,
                 }),
@@ -947,6 +956,7 @@ impl Item for QueryEditor {
         }
         let mut data = serde_json::json!({
             "at_commit": self.at_commit,
+            "branch": self.own_branch,
             "path": self.path.as_ref().map(|path| path.to_string_lossy().into_owned()),
             "widths": self.column_widths,
         });
@@ -1125,6 +1135,9 @@ impl QueryEditor {
                         this.set_example(window, cx);
                         this.schedule_check(window, cx);
                     }
+                    // A tab on a branch of its own reads it whatever the window shows (spec
+                    // 038); its picker names the window's branch, so it is drawn again.
+                    SessionEvent::BranchChanged if this.own_branch.is_some() => cx.notify(),
                     SessionEvent::BranchChanged => {
                         // A write waiting to be confirmed was for the branch shown when it
                         // was asked for. So are the commits offered to pin to: none until the
@@ -1142,9 +1155,7 @@ impl QueryEditor {
                         cx.notify()
                     }
                     SessionEvent::BranchesChanged => cx.notify(),
-                    SessionEvent::Committed { branch }
-                        if *branch == this.session.read(cx).branch =>
-                    {
+                    SessionEvent::Committed { branch } if *branch == this.branch(cx) => {
                         this.commits_stale(window, cx)
                     }
                     SessionEvent::HeadMoved { branch, head } => this.head_moved(branch, head, cx),
@@ -1195,6 +1206,8 @@ impl QueryEditor {
             server_fix_holds: false,
             last_runs: HashMap::new(),
             at_commit: None,
+            own_branch: None,
+            _head_watch: None,
             editor,
             editor_focus,
             parsed: false,
@@ -1248,8 +1261,8 @@ impl QueryEditor {
     /// costs only the commits it holds, where the whole list costs every commit the branch has.
     /// An open picker shows them when they come.
     fn load_commits(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let branch = self.branch(cx);
         let read = self.session.update(cx, |session, cx| {
-            let branch = session.branch.clone();
             session.commit_page(&branch, PICKER_COMMITS as u32, None, cx)
         });
         self.commits_failed = false;
@@ -1310,6 +1323,15 @@ impl QueryEditor {
         if !self.commits_fresh && self.commits_task.is_none() {
             self.load_commits(window, cx);
         }
+        // The other branches it offers: a list not read, or that could not be, is read for the
+        // next look.
+        if matches!(
+            self.session.read(cx).branches,
+            Loadable::NotLoaded | Loadable::Failed(_)
+        ) {
+            self.session
+                .update(cx, |session, cx| session.reload_branches(cx));
+        }
     }
 
     /// The snapshot picker's menu, built from what the tab holds whenever it is built again.
@@ -1327,7 +1349,8 @@ impl QueryEditor {
         })
     }
 
-    /// The head of the branch, then its latest commits as they were read.
+    /// The head of the branch, then its latest commits as they were read, then the heads of
+    /// the graph's other branches (spec 038), the window's first.
     fn picker_entries(
         &self,
         mut menu: ContextMenu,
@@ -1346,6 +1369,7 @@ impl QueryEditor {
                 head_editor.update(cx, |editor, cx| editor.unpin(cx)).ok();
             },
         );
+        menu = self.branch_entries(menu, &branch, editor.clone(), cx);
         let waiting =
             (!self.commits_fresh && self.commits.is_empty()).then_some(if self.commits_failed {
                 "The latest commits could not be read"
@@ -1373,6 +1397,58 @@ impl QueryEditor {
                     let id = id.clone();
                     editor.update(cx, |editor, cx| editor.pin_to(id, cx)).ok();
                 });
+        }
+        menu
+    }
+
+    /// The picker's other branches: the window's first when the tab reads another, then the
+    /// graph's in the session's order, at most [`PICKER_BRANCHES`]; the Branches panel lists
+    /// them all.
+    fn branch_entries(
+        &self,
+        mut menu: ContextMenu,
+        current: &str,
+        editor: WeakEntity<Self>,
+        cx: &App,
+    ) -> ContextMenu {
+        let session = self.session.read(cx);
+        let window = session.branch.clone();
+        let listed: Vec<String> = match &session.branches {
+            Loadable::Loaded(branches) => branches.clone(),
+            _ => Vec::new(),
+        };
+        let mut others: Vec<String> = std::iter::once(window.clone())
+            .chain(listed.iter().filter(|branch| **branch != window).cloned())
+            .filter(|branch| branch != current)
+            .collect();
+        if others.is_empty() {
+            return menu;
+        }
+        let more = others.len().saturating_sub(PICKER_BRANCHES);
+        others.truncate(PICKER_BRANCHES);
+        menu = menu.separator().header("Read another branch");
+        for branch in others {
+            let label = if branch == window {
+                format!("Head of {branch} · the window's")
+            } else {
+                format!("Head of {branch}")
+            };
+            let editor = editor.clone();
+            menu = menu.entry(label, None, move |_, cx| {
+                let branch = branch.clone();
+                editor
+                    .update(cx, |editor, cx| editor.set_own_branch(Some(branch), cx))
+                    .ok();
+            });
+        }
+        if more > 0 {
+            menu = menu.item(
+                ContextMenuEntry::new(format!(
+                    "{} more in the Branches panel",
+                    studio_ui::group_digits(more)
+                ))
+                .disabled(true),
+            );
         }
         menu
     }
@@ -1409,6 +1485,10 @@ impl QueryEditor {
                         Some(commit) => {
                             format!("Reads run at commit {commit}; writes are refused")
                         }
+                        None if self.own_branch.is_some() => format!(
+                            "Reads and writes run at the head of {branch}, whatever the window \
+                             shows"
+                        ),
                         None => format!("Reads run at the head of {branch}"),
                     })),
             )
@@ -1929,8 +2009,43 @@ impl QueryEditor {
         self.session.read(cx).schema_model()
     }
 
+    /// The branch the tab reads and writes: one of its own (spec 038), else the window's.
     fn branch(&self, cx: &App) -> String {
-        self.session.read(cx).branch.clone()
+        self.own_branch
+            .clone()
+            .unwrap_or_else(|| self.session.read(cx).branch.clone())
+    }
+
+    /// The branch the tab reads when it is not the window's, as it saves it.
+    #[cfg(test)]
+    pub fn own_branch(&self) -> Option<&str> {
+        self.own_branch.as_deref()
+    }
+
+    /// Reads and writes `branch` from now on, whatever the window shows (spec 038), or the
+    /// window's branch again with `None` (or the window's own name). Its reads run at that
+    /// branch's head: a commit it was held at, a write waiting to be confirmed and the commits
+    /// the picker offered were the other branch's, and go.
+    pub fn set_own_branch(&mut self, branch: Option<String>, cx: &mut Context<Self>) {
+        let branch = branch.filter(|branch| *branch != self.session.read(cx).branch);
+        if branch == self.own_branch && self.at_commit.is_none() {
+            return;
+        }
+        self._head_watch = branch.as_ref().map(|branch| {
+            self.session.update(cx, |session, cx| {
+                session.read_access(graph_store::AccessScope::branch(branch), cx);
+                session.watch_head(branch, cx)
+            })
+        });
+        self.own_branch = branch;
+        self.at_commit = None;
+        self.pending_write = None;
+        self.commits.clear();
+        self.commits_fresh = false;
+        self.commits_task = None;
+        self.redraw_expected(cx);
+        cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
     }
 
     /// Fills an untouched, empty editor with a read over the schema's first node type.
@@ -3317,8 +3432,12 @@ impl QueryEditor {
         let task = match &prepared.stored {
             Some(name) => {
                 let (params, snapshot) = (prepared.params.clone(), self.at_commit.clone());
-                self.session.update(cx, |session, cx| {
-                    session.invoke_stored_read(name, params, snapshot, cx)
+                let branch = branch_of(&read_at);
+                self.session.update(cx, |session, cx| match branch {
+                    Some(branch) => {
+                        session.invoke_stored_read_on(&branch, name, params, snapshot, cx)
+                    }
+                    None => session.invoke_stored_read(name, params, snapshot, cx),
                 })
             }
             None => self
@@ -3342,7 +3461,7 @@ impl QueryEditor {
         let head_before = self
             .session
             .read(cx)
-            .head(&self.session.read(cx).branch)
+            .head(&self.branch(cx))
             .map(str::to_owned);
         // Replacing the task cancels an earlier read still in flight.
         self.run_task = Some(cx.spawn(async move |this, cx| {
@@ -3559,9 +3678,9 @@ impl QueryEditor {
         if self.writing {
             return;
         }
-        // Sent to the session's branch, as Run is: rows of another branch are read again
-        // there, once the session is back on it.
-        let branch = self.session.read(cx).branch.clone();
+        // Sent to the tab's branch, as Run is: rows of another branch are read again there,
+        // once the tab is back on it.
+        let branch = self.branch(cx);
         let Some(rerun) = (match &self.output {
             Output::Rows(rows) if matches!(&rows.read_at, ReadAt::Branch(read) if *read == branch) => {
                 rows.rerun.clone()
@@ -3752,9 +3871,7 @@ impl QueryEditor {
     fn rows_read_at(&self, output: &RowsOutput, cx: &App) -> (Option<String>, Option<String>) {
         match &output.read_at {
             ReadAt::Commit(commit) => (Some(commit.clone()), None),
-            ReadAt::Branch(branch) if *branch == self.session.read(cx).branch => {
-                (None, output.commit.clone())
-            }
+            ReadAt::Branch(branch) if *branch == self.branch(cx) => (None, output.commit.clone()),
             ReadAt::Branch(_) | ReadAt::Statement => (output.commit.clone(), None),
         }
     }
@@ -3780,11 +3897,17 @@ impl QueryEditor {
         Some(match node {
             Some((type_name, id)) => {
                 let (at_commit, snapshot) = self.rows_read_at(output, cx);
+                // Rows of the tab's own branch are inspected, and edited, there (spec 038).
+                let branch = self
+                    .own_branch
+                    .clone()
+                    .filter(|_| at_commit.is_none() && snapshot.is_some());
                 Picked::Node(InspectedNode {
                     type_name: type_name.clone(),
                     id: id.to_owned(),
                     at_commit,
                     snapshot,
+                    branch,
                 })
             }
             None => Picked::Row(row),
@@ -4596,7 +4719,13 @@ impl QueryEditor {
     fn render_confirm(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         use studio_ui::ds::{self, size, space};
         let pending = self.pending_write.as_ref()?;
-        let (said, button) = confirm_words(&pending.prepared, &pending.branch);
+        // A write that changes a branch's data names where it lands: a protected branch's goes
+        // to a proposal (spec 038).
+        let lands = match pending.prepared.publication {
+            Publication::Branch => self.session.read(cx).writes_to(&pending.branch),
+            _ => pending.branch.clone(),
+        };
+        let (said, button) = confirm_words(&pending.prepared, &lands);
         let what = match &pending.typed {
             Some(typed) => typed.what.clone(),
             None => said,
@@ -5765,6 +5894,14 @@ fn one_line_label(statement: &str) -> String {
     }
     let kept: String = words.chars().take(LABEL_CHARS - 1).collect();
     format!("{}…", kept.trim_end())
+}
+
+/// The branch a read went to, when it went to one.
+fn branch_of(read_at: &ReadAt) -> Option<String> {
+    match read_at {
+        ReadAt::Branch(branch) => Some(branch.clone()),
+        _ => None,
+    }
 }
 
 /// What the confirm bar says a write does, and its button: by where its result goes. A write
@@ -6952,6 +7089,7 @@ mod tests {
                         id: "p1".into(),
                         at_commit: held.map(str::to_owned),
                         snapshot: held.is_none().then(|| "c1".to_owned()),
+                        branch: None,
                     }
                 );
 
@@ -7106,6 +7244,96 @@ mod tests {
             let _menu = open(cx);
             cx.run_until_parked();
             assert_eq!(reads(), 3);
+        }
+
+        /// A query tab put on another branch in its picker reads that branch's head, a stored
+        /// query's too, and stays on it when the window moves (spec 038); it saves the branch,
+        /// and the window's branch picked again makes it follow the window.
+        #[gpui::test]
+        async fn a_tab_on_a_branch_of_its_own_reads_it_whatever_the_window_shows(
+            cx: &mut TestAppContext,
+        ) {
+            use futures::AsyncReadExt as _;
+            init(cx);
+            let sent: Arc<std::sync::Mutex<Vec<(String, Value)>>> = Arc::default();
+            let seen = sent.clone();
+            let http = FakeHttpClient::create(move |request| {
+                let path = request.uri().path().to_owned();
+                let seen = seen.clone();
+                async move {
+                    let mut bytes = Vec::new();
+                    request.into_body().read_to_end(&mut bytes).await.ok();
+                    let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                    let answer = if path.ends_with("/query") || path.contains("/queries/") {
+                        seen.lock().unwrap().push((path, body.clone()));
+                        json!({ "query_name": "people", "row_count": 0, "columns": ["slug"],
+                                "rows": [], "graph_commit_id": "x1",
+                                "target": { "branch": body["branch"] } })
+                    } else {
+                        json!({ "branches": ["main", "agent/x", "fix"] })
+                    };
+                    Ok(Response::builder()
+                        .status(200)
+                        .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                        .body(AsyncBody::from(answer.to_string()))
+                        .unwrap())
+                }
+            });
+            let server = ServerEntry {
+                name: "dev".into(),
+                url: "http://127.0.0.1:8787".into(),
+                source: ServerSource::Environment,
+                known_graphs: Vec::new(),
+            };
+            let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+            let session =
+                cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+            cx.run_until_parked();
+            let (editor, cx) =
+                cx.add_window_view(|window, cx| QueryEditor::new(1, session.clone(), window, cx));
+            cx.run_until_parked();
+            editor.update(cx, |editor, cx| {
+                editor.set_own_branch(Some("agent/x".into()), cx);
+                assert_eq!(editor.branch(cx), "agent/x");
+                assert_eq!(editor.own_branch(), Some("agent/x"));
+                let saved = Item::serialize(editor, cx).unwrap();
+                assert_eq!(saved.data["branch"], json!("agent/x"), "saved with the tab");
+                let read = Prepared {
+                    text: "query people() { match { $p: Person } return { $p.slug } }".into(),
+                    ..people()
+                };
+                editor.send_read(read, cx);
+            });
+            cx.run_until_parked();
+            editor.update(cx, |editor, cx| {
+                let stored = Prepared {
+                    stored: Some("people".into()),
+                    ..people()
+                };
+                editor.send_read(stored, cx);
+            });
+            cx.run_until_parked();
+            {
+                let sent = sent.lock().unwrap();
+                assert_eq!(sent.len(), 2, "{sent:?}");
+                for (path, body) in sent.iter() {
+                    assert_eq!(
+                        body["branch"],
+                        json!("agent/x"),
+                        "{path} on the tab's branch"
+                    );
+                }
+            }
+            // The window moves; the tab does not.
+            session.update(cx, |session, cx| session.set_branch("fix".into(), cx));
+            cx.run_until_parked();
+            editor.update(cx, |editor, cx| {
+                assert_eq!(editor.branch(cx), "agent/x");
+                // The window's branch, picked again: the tab follows the window.
+                editor.set_own_branch(Some("fix".into()), cx);
+                assert_eq!(editor.own_branch(), None);
+                assert_eq!(editor.branch(cx), "fix");
+            });
         }
 
         /// The result grid is reached by a key and its cell cursor moves by column too, so a

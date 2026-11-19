@@ -17,6 +17,7 @@ use graph_client::api::{BranchStartRefusalOutput, BranchStartRefusalReason, Comm
 use graph_store::{AccessAction, AccessScope, BranchStart, GraphSession, SessionEvent};
 use studio_actions::graph::{
     CreateBranch, CreateBranchAt, DeleteBranch, OpenBranch, OpenBranchHistory, ReviewBranch,
+    StopProposing, ToggleProposeChanges,
 };
 use studio_ui::ds::Tipped;
 use studio_ui::menu::{ContextMenu, ContextMenuEntry};
@@ -1075,9 +1076,42 @@ pub fn register(workspace: &mut Workspace) {
         let Some(session) = workspace.session() else {
             return;
         };
-        let branch = session.read(cx).branch.clone();
-        open_review(workspace, branch, TARGET.into(), window, cx);
+        // A proposal is reviewed against the branch it proposes into (spec 038).
+        let (branch, target) = {
+            let session = session.read(cx);
+            let target = session
+                .proposal()
+                .map_or_else(|| TARGET.to_owned(), |open| open.base.clone());
+            (session.branch.clone(), target)
+        };
+        open_review(workspace, branch, target, window, cx);
     });
+    workspace.register_action(|workspace, _: &ToggleProposeChanges, _window, cx| {
+        let Some(session) = workspace.session().cloned() else {
+            return;
+        };
+        session.update(cx, |session, cx| {
+            // On a proposal, the switch is the branch it proposes into's.
+            let branch = session
+                .proposal()
+                .map_or_else(|| session.branch.clone(), |open| open.base.clone());
+            let on = !session.proposes_on(&branch);
+            session.set_proposing(&branch, on, cx);
+        });
+    });
+    // Offered only while the window is on a proposal (constitution VIII).
+    workspace.register_action_when(
+        |workspace, cx| {
+            workspace
+                .session()
+                .is_some_and(|session| session.read(cx).proposal().is_some())
+        },
+        |workspace, _: &StopProposing, _window, cx| {
+            if let Some(session) = workspace.session().cloned() {
+                session.update(cx, |session, cx| session.stop_proposing(cx));
+            }
+        },
+    );
     workspace.register_action(|workspace, action: &OpenBranch, window, cx| {
         if action.branch == TARGET {
             window.dispatch_action(

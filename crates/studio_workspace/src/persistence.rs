@@ -245,6 +245,15 @@ pub struct SavedGraph {
     /// This window used Studio’s sign-in to the cluster’s control plane.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub plane_owned: bool,
+    /// The branch the window's proposal proposes into, when `branch` is a proposal (spec 038).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposing_into: Option<String>,
+    /// Protected branches whose edits the person turned proposals off for, and other branches
+    /// they turned them on for.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub propose_off: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub propose_on: Vec<String>,
 }
 
 /// A window to reopen at the next start: its graphs and where it was.
@@ -620,6 +629,9 @@ mod tests {
             branch: "main".into(),
             cluster: None,
             plane_owned: false,
+            proposing_into: None,
+            propose_off: Vec::new(),
+            propose_on: Vec::new(),
         }
     }
 
