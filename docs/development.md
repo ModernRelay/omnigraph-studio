@@ -79,7 +79,7 @@ CLI too (`omnigraph target add`, and `credentials set` for its token).
 | `OMNIGRAPH_STUDIO_GRAPH` | Opens this graph on that server at launch |
 | `OMNIGRAPH_STUDIO_BRANCH` | The branch to open (default `main`) |
 | `OMNIGRAPH_STUDIO_OAUTH_CLIENT` | The client ID Studio signs in with at any sign-in service, for development (spec 016) |
-| `OMNIGRAPH_STUDIO_DATA` | Directory of `settings.json`, `keymap.json` and the session (default `~/Library/Application Support/Omnigraph Studio`, `%APPDATA%\Omnigraph Studio` on Windows, or `$XDG_CONFIG_HOME/omnigraph-studio`) |
+| `OMNIGRAPH_STUDIO_DATA` | Directory of `settings.json`, `keymap.json` and the session (default `~/Library/Application Support/Omnigraph Studio`, `%APPDATA%\Omnigraph Studio` on Windows, or `$XDG_CONFIG_HOME/omnigraph-studio`, `~/.config` when that is unset; a build run from `target/`, as `cargo run` and `script/dev` run it, uses `Omnigraph Studio Dev`, or `omnigraph-studio-dev` on Linux, so it never rewrites the installed app's) |
 
 ## Checks
 
@@ -88,8 +88,10 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 python3 script/check-layers.py
+python3 script/check-design-tokens.py
 python3 script/check-brand.py
 python3 script/test_release_files.py
+python3 script/test_measure_expand_all.py
 ```
 
 CI runs these checks on macOS, Linux and Windows for each pull request that changes more than
@@ -111,23 +113,14 @@ new video in the README.
 
 ## Architecture
 
-Studio is a Cargo workspace (Rust 2024 edition) of 20 crates: 18 for the app and 2 for the
-tree-sitter grammars. A crate depends only on crates in lower layers, and feature crates never
-depend on each other. `script/check-layers.py` enforces this in CI.
-
-| Layer | Crates |
-|---|---|
-| 6 | `studio`: the binary, menus, windows, deep links |
-| 5 | `type_table`, `relationship_tree`, `graph_canvas`, `query_editor`, `review`, `history`, `agent_panel`, `command_palette` |
-| 4 | `studio_workspace`: panes, tabs, docks, modals, toasts |
-| 3 | `graph_store`: connections, graph sessions, snapshot pins, exploration |
-| 2 | `graph_client` (HTTP, no GPUI), `gq_language` (compiler wrapper, no GPUI), `studio_ui` |
-| 1 | `studio_settings`, `studio_theme` |
-| 0 | `studio_actions`: every action type |
+Studio is a Cargo workspace (Rust 2024 edition): its crates are in `crates/`, and the two
+tree-sitter grammars in `grammars/`. A crate depends only on crates in lower layers, and feature
+crates never depend on each other. [architecture.md](architecture.md) lists every crate and its
+layer, and `script/check-layers.py` enforces the same table in CI.
 
 GPUI and its crates come from git at one release tag ([zed-pin.md](zed-pin.md)). The
-tree-sitter grammars for `.gq` and `.pg` are in `grammars/`. [architecture.md](architecture.md)
-describes the data flow and the state model.
+tree-sitter grammars are for `.gq` and `.pg`. [architecture.md](architecture.md) also describes
+the data flow and the state model.
 
 How Studio uses the Omnigraph API, in full (the README has the short form):
 

@@ -43,8 +43,10 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo deny check
 python3 script/check-layers.py   # crate layer rule; keep its table in step with docs/architecture.md
+python3 script/check-design-tokens.py   # colours and sizes as tokens only
 python3 script/check-brand.py    # the name is written Omnigraph
 python3 script/test_release_files.py   # a release's version-free copies and latest.json
+python3 script/test_measure_expand_all.py   # script/measure-expand-all runs with BSD tools, as on macOS
 ```
 
 - macOS needs the Command Line Tools: the default `runtime-shaders` feature compiles GPUI's Metal

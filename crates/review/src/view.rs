@@ -2563,7 +2563,7 @@ impl ReviewView {
                     Some(conflicts) if !conflicts.is_empty() => {
                         MergeState::Conflicts(Conflicts::new(conflicts))
                     }
-                    _ => MergeState::Refused(error.reason().to_owned()),
+                    _ => MergeState::Refused(merge_refused_words(&error, &branch, &target)),
                 },
                 WriteOutcome::NotSent { reason } => MergeState::NotSent(reason),
                 WriteOutcome::Unknown { reason } => {
@@ -2962,6 +2962,8 @@ impl ReviewView {
             .on_click(cx.listener(|this, _, _, cx| this.toggle_conflicts(cx)))
         });
         let delete_refused = self.delete_refusal(cx);
+        // The checkbox is off while Merge is, saying why as Merge does (constitution VI).
+        let delete_blocked = delete_refused.clone().or_else(|| self.merge_blocked(cx));
         Some(
             h_flex()
                 .flex_none()
@@ -2994,7 +2996,7 @@ impl ReviewView {
                             !deletable,
                             cx,
                         )
-                        .when_some(delete_refused, |checkbox, reason| {
+                        .when_some(delete_blocked, |checkbox, reason| {
                             checkbox.tip(studio_ui::ds::tooltip(reason))
                         })
                         .when(deletable, |checkbox| {
@@ -3274,14 +3276,7 @@ impl ReviewView {
                     .into_any_element(),
                 ),
             ),
-            MergeState::Refused(message) => (
-                Severity::Error,
-                format!(
-                    "The merge was refused: {}. Nothing was merged.",
-                    studio_ui::clause(message)
-                ),
-                None,
-            ),
+            MergeState::Refused(words) => (Severity::Error, words.clone(), None),
             MergeState::NotSent(reason) => (
                 Severity::Error,
                 format!(
@@ -3957,6 +3952,24 @@ impl ReviewView {
 }
 
 /// A notice under the header: a strip of the severity's tint, with its action at the end.
+/// What a refused merge says, by what refused it, and what to do next: the server's policy
+/// (403, the credential's answer the review read before may be out of date), a busy server
+/// (429) or a graph not ready (503) take the merge again later; any other says the server's
+/// words. Nothing was merged.
+fn merge_refused_words(error: &graph_client::ApiError, branch: &str, target: &str) -> String {
+    let reason = studio_ui::clause(error.reason());
+    match error.status {
+        403 => format!("Your credential may not merge {branch} into {target}. Nothing was merged."),
+        429 => {
+            format!("The server is busy: {reason}. Nothing was merged; merge again in a moment.")
+        }
+        503 => format!(
+            "The graph is not available: {reason}. Nothing was merged; merge again once it is."
+        ),
+        _ => format!("The merge was refused: {reason}. Nothing was merged."),
+    }
+}
+
 fn notice(severity: Severity, text: String, action: Option<AnyElement>) -> AnyElement {
     let mut callout = studio_ui::ds::callout(severity, text);
     if let Some(action) = action {
@@ -4979,10 +4992,12 @@ impl Render for ReviewView {
                         }
                     }))
             })
-            // Merge is registered only while the credential may merge (constitution VIII).
-            .when(self.merge_refusal(cx).is_none(), |view| {
-                view.on_action(cx.listener(|this, _: &Merge, _, cx| this.merge(cx)))
-            })
+            // Merge is registered only while the credential may merge and nothing blocks it,
+            // as its button says (constitution VIII).
+            .when(
+                self.merge_refusal(cx).is_none() && self.mergeable(cx),
+                |view| view.on_action(cx.listener(|this, _: &Merge, _, cx| this.merge(cx))),
+            )
             // Unfolding a change and summarizing the review write nothing: they work whatever
             // the credential may merge, as their buttons and row clicks do.
             .on_action(cx.listener(|this, _: &Summarize, _, cx| this.summarize(cx)))
@@ -5860,6 +5875,68 @@ pub(crate) mod tests {
         }
     }
 
+    /// A refused merge says what refused it and what to do next: a denial in the credential's
+    /// words, a busy server or a graph not ready to be merged into again later, and anything
+    /// else in the server's words. Nothing was merged.
+    #[gpui::test]
+    async fn a_refused_merge_says_what_refused_it(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        for (status, error, said) in [
+            (
+                403,
+                "policy denied action 'branch_merge' on branch 'feature' for actor 'act-dev'",
+                "Your credential may not merge feature into main. Nothing was merged.",
+            ),
+            (
+                429,
+                "too many writes in flight for actor 'act-dev'",
+                "The server is busy: too many writes in flight for actor 'act-dev'. Nothing was \
+                 merged; merge again in a moment.",
+            ),
+            (
+                503,
+                "graph knowledge is loading",
+                "The graph is not available: graph knowledge is loading. Nothing was merged; \
+                 merge again once it is.",
+            ),
+            (
+                400,
+                "feature is not a branch.",
+                "The merge was refused: feature is not a branch. Nothing was merged.",
+            ),
+        ] {
+            let refuse = move |path: &str, _: &str, sent: &str| {
+                (path.ends_with("/branches/merge") && !sent.contains(DRY_RUN)).then(|| {
+                    let action = if status == 429 || status == 503 {
+                        "retry"
+                    } else {
+                        "fix"
+                    };
+                    let disposition = json!({ "action": action, "effects": "none" });
+                    (
+                        status,
+                        json!({ "error": error, "disposition": disposition }),
+                    )
+                })
+            };
+            let (session, _) =
+                review_server_with(None, false, None, "f2", |_| (500, json!({})), refuse, cx);
+            let (view, cx) = cx.add_window_view(|window, cx| {
+                ReviewView::new(session, "feature".into(), "main".into(), window, cx)
+            });
+            cx.run_until_parked();
+            view.update(cx, |view, cx| view.merge(cx));
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| match &view.merge {
+                MergeState::Refused(words) => assert_eq!(words, said, "{status}"),
+                other => panic!("{status}: {other:?}"),
+            });
+        }
+    }
+
     /// What a lost merge was sent for: `head`, over a target head not known.
     fn sent(head: &str) -> MergeSent {
         MergeSent {
@@ -6691,6 +6768,30 @@ pub(crate) mod tests {
                 assert!(view.reviewed_keys.is_empty(), "nor its marks");
             });
         }
+    }
+
+    /// Merge is offered by key and in the palette only while it can run: not on a review of
+    /// one commit, whose button is disabled saying to review them all.
+    #[gpui::test]
+    async fn merge_is_offered_only_while_it_can_run(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, _) = review_server(false, None, "f2", |_| (500, json!({})), cx);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            ReviewView::new(session, "feature".into(), "main".into(), window, cx)
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.focus(&view.focus_handle(cx), cx));
+        cx.run_until_parked();
+        assert!(cx.update(|window, cx| window.is_action_available(&Merge, cx)));
+        view.update(cx, |view, cx| {
+            view.scope = Some("f1".into());
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(!cx.update(|window, cx| window.is_action_available(&Merge, cx)));
     }
 
     /// A merge the access route says the credential may not make is not offered: Merge is

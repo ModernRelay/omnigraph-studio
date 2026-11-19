@@ -115,9 +115,52 @@ fn main() {
     println!("test every_action_has_a_key_or_is_palette_only ... ok");
     every_destination_has_a_key();
     println!("test every_destination_has_a_key ... ok");
+    no_view_takes_the_keys_of_back_and_forward();
+    println!("test no_view_takes_the_keys_of_back_and_forward ... ok");
     the_persons_keymap_wins_and_is_read_again(&mut cx, &keymap);
     println!("test the_persons_keymap_wins_and_is_read_again ... ok");
     std::fs::remove_dir_all(&data).ok();
+}
+
+/// Back and Forward work wherever the person is: a view that bound their keys to something of
+/// its own would take them while it has focus, as the tree's Expand All and Collapse All took
+/// ⌥→ and ⌥← on Linux and Windows, where they are Forward and Back, until 2026-11-18.
+fn no_view_takes_the_keys_of_back_and_forward() {
+    for (platform, content) in KEYMAPS {
+        let blocks: Vec<serde_json::Value> = serde_json::from_str(content).unwrap();
+        let bindings = |block: &serde_json::Value| {
+            block["bindings"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(key, action)| (key.clone(), action.clone()))
+                .collect::<Vec<_>>()
+        };
+        let moves: Vec<(String, serde_json::Value)> = blocks
+            .iter()
+            .filter(|block| block.get("context").is_none())
+            .flat_map(bindings)
+            .filter(|(_, action)| {
+                ["studio::GoBack", "studio::GoForward"].contains(&action.as_str().unwrap_or(""))
+            })
+            .collect();
+        assert_eq!(
+            moves.len(),
+            2,
+            "{platform}: Back and Forward each have a key"
+        );
+        for block in &blocks {
+            for (key, action) in bindings(block) {
+                for (taken, moves_to) in &moves {
+                    assert!(
+                        key != *taken || action == *moves_to,
+                        "{platform}: {} binds `{key}`, {moves_to}'s key, to {action}",
+                        block["context"]
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn every_keymap_binding_names_a_studio_action(cx: &mut HeadlessAppContext) {

@@ -1056,6 +1056,12 @@ the one a window has the graph open on, and with neither it is refused, naming b
 text percent-encoded, about 196 KB, is refused before it is read. `studio::OpenLink { url }`
 opens a link from inside Studio.
 
+Copy Link (`studio::CopyLink`, ⌘⌥C, in the Graph menu, as Zed's Copy Path) puts the link to
+where the window is on the clipboard: the node the active tab shows (a page, a tree or canvas of
+one node), else the window's graph, with its branch, main included: a link without a branch keeps a
+window already showing the graph on its own branch. It carries what a
+link carries and no more, so it opens in a Studio that knows the server (since 2026-11-18).
+
 ## Deferred
 
 - `omnigraph-studio://open?target=…&binding=sha256:…&home=sha256:…[&graph=…]`, what
@@ -1070,6 +1076,8 @@ opens a link from inside Studio.
 ## Validation log
 
 | Date | Claim | Check | Result |
+| 2026-11-18 | A link copied on main opens on main, in a window already on another branch (Devin's review of #142) | `studio` `copy_link_copies_where_the_window_is`, extended: a window on knowledge at main copies a link naming `branch=main` | Before, a link copied on main named no branch, and `show_graph_in` keeps an open session's branch when a link names none: opened in a window on review, it showed review. Now a copied link always names its branch |
+| 2026-11-18 | Copy Link copies a link that opens where the window is | `studio` `deep_link::tests::a_copied_link_opens_what_it_was_copied_from` (a graph, a branch with spaces and `&`, a node id with `?&=`, each read back by `parse`); `copy_link_copies_where_the_window_is` (a window on knowledge at review: the clipboard holds its graph link); offscreen snapshot of the palette finding it with Ctrl-Alt-C | Studio opened links and the CLI made them, but nothing in Studio made one: to send someone a node, a person wrote the URL by hand |
 | 2026-11-15 | A page's group still being read when its neighbours' type is named otherwise lands renamed (review of #111) | `type_table` `a_group_read_out_when_nodes_are_named_otherwise_lands_renamed`: Ada's page, her companies' read held, Company named by `code`, then the read let go; failing with the check removed | Before: the group showed "Analytical Engines" for good, since only groups already read were renamed. Now a group's first read and its next page carry the schema they were built under, and land renamed when it names their type by another property than the view's (`NodePeek::rename_if_named_otherwise`), as a table's relationship cells do. The next page goes the same way; it has no test of its own |
 | 2026-11-14 | A new node name renames what views show in place ("Node names") | `type_table` `naming_nodes_otherwise_renames_them_in_place` (a Person table and Ada's page, Company named by `code`: at once every cell and group as it was, then renamed; 2 reads, one a view, nothing else), failing with the old reading again (the table's cell gone at once); `graph_store` tests in spec 005's log; offscreen frames on the dense graph through a 700 ms proxy, Topic named by category, of an Artifact table and Topic `topic-00325`'s page | Before: the table's topic chips gave way to bare counts with 4 reads running, back renamed at +2.2 s; the page's relationship list grew from 4 groups to 9 as empty ones came back unread, Broader closed, 6 reads running. After: the chips and groups stay; one read each, the names changing in place, and the page's title at once from the values held |
 | 2026-11-14 | Open history leaves the graph on the branch it reads, on a toast and in the activity log; Undo moves it to the delete's branch | `studio_workspace` `a_toasts_follow_up_acts_on_the_graph_and_branch_written_to` (an unknown outcome on `fix`, then the graph moved to main: the press opens `OpenBranchHistory` for `fix` and the graph is still on main; a commit on `fix` opened from main by View commit, the graph still on main; a delete on `fix`, then the graph moved to main and another graph shown: Undo shows the graph, on `fix`) and `outcomes_described_alike_are_toasted_each_with_its_own_follow_up` (the toast's action names the branch); `studio` `activity::tests::an_unknown_outcome_opens_its_branchs_history` (the row's press opens `fix`'s history with the window on main) | Passed. Before, each press called `set_branch` first; the tests said so and were rewritten |

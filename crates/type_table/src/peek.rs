@@ -28,6 +28,7 @@ use serde_json::{Map, Value};
 use studio_actions::graph::{OpenBlob, OpenNodePage, ShowNodeInTree, ShowNodeOnCanvas};
 use studio_actions::node::{CancelField, ExpandField, SaveField, SaveNodeDrafts};
 use studio_actions::table::{SelectNextSuggestion, SelectPreviousSuggestion};
+use studio_actions::workspace::Refresh;
 use studio_ui::ds::Tipped;
 use studio_ui::ds::space;
 use studio_ui::menu::ContextMenu;
@@ -5634,6 +5635,17 @@ impl NodePeek {
             })
             .on_action(cx.listener(Self::on_cancel_field))
             .on_action(cx.listener(Self::on_expand_field))
+            // A node read at its branch's head reads again on ⌘R, as its Refresh button does;
+            // one held at a commit never moves, and an edge is read with its table.
+            .when(
+                !self.holds_commit && matches!(self.subject, PeekSubject::Node { .. }),
+                |view| {
+                    view.on_action(cx.listener(|this, _: &Refresh, _, cx| {
+                        this.refresh(cx);
+                        cx.propagate();
+                    }))
+                },
+            )
             .size_full()
             .child(
                 list(
@@ -5803,9 +5815,13 @@ impl NodePeek {
                         meta.child(
                             studio_ui::ds::row_button("peek-newer", "Newer data · Refresh")
                                 .style(ButtonStyle::Tinted(ui::TintColor::Accent))
-                                .tip(studio_ui::ds::tooltip(
-                                    "The branch moved since this was read. Refresh reads it at the head.",
-                                ))
+                                .tip_fn(|_, cx| {
+                                    studio_ui::ds::tooltip_for_action_view(
+                                        "The branch moved since this was read. Refresh reads it at the head.",
+                                        &Refresh,
+                                        cx,
+                                    )
+                                })
                                 .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
                         )
                     }),
@@ -8307,6 +8323,31 @@ mod tests {
             let draft = session.read_with(cx, |session, _| session.draft(&key).cloned());
             assert_eq!(draft.as_ref(), Some(&retyped), "head holds {head_holds}");
         }
+    }
+
+    /// ⌘R on a node's page reads it again at the head, as its Refresh button does.
+    #[gpui::test]
+    async fn cmd_r_reads_a_nodes_page_again(cx: &mut TestAppContext) {
+        let (session, writer) = session_followed(
+            PEOPLE,
+            |request| {
+                let name = match request["at"].as_str() {
+                    Some("c2") => "Ada B",
+                    _ => "Ada",
+                };
+                json!([{ "n": { "@id": "p1", "slug": "p1", "name": name } }])
+            },
+            cx,
+        );
+        let (view, cx) = page(session.clone(), cx);
+        writer.commit("c2", vec![changed("node", "Person", "p1", None)]);
+        cx.update(|window, cx| window.focus(&view.focus_handle(cx), cx));
+        cx.dispatch_action(Refresh);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.snapshot.as_deref(), Some("c2"));
+            assert_eq!(view.value_of("name"), json!("Ada B"));
+        });
     }
 
     /// Refresh wants the newest, which the session may not hold yet: it asks after the head,
