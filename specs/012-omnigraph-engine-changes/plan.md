@@ -564,7 +564,7 @@ A gallery shows a type's rows as tiles of one of their files. Contract 0.14 read
 cell at a time, as its whole bytes or one range, and says nothing else of it; checked against a
 `v0.15.0` release server on 2026-11-18 (spec 035's validation log).
 
-**E55. A preview of a Blob cell made by the server.** `GET /graphs/{id}/blob` with a preview
+**E55. A preview of a Blob cell made by the server.** ([#1465](https://github.com/ModernRelay/omnigraph/issues/1465)) `GET /graphs/{id}/blob` with a preview
 parameter (an edge length; a format) answering a small image of a picture, or of a PDF's first
 page, cacheable by the Blob's content (E57). A screen of 24 photos of about 3 MB costs a client
 today about 48 requests and 72 MB, all decoded by the client; with a preview, 24 requests and
@@ -573,7 +573,7 @@ the server cannot preview answers its kind and no image. *Waits:* 035. *Today:* 
 tile's file whole up to 8 MiB and 40 megapixels, decodes and scales it to 480 px off the main
 thread, and holds at most 64 MiB of previews; a PDF's first page is drawn on macOS only.
 
-**E56. A Blob's metadata in GQ.** A projection of a Blob cell's metadata (`$n.file.@size`,
+**E56. A Blob's metadata in GQ.** ([#1466](https://github.com/ModernRelay/omnigraph/issues/1466)) A projection of a Blob cell's metadata (`$n.file.@size`,
 `.@kind`, `.@digest`) and a test of whether it holds a value (`$n.file is not null`, refused
 today with `T7: blob comparisons in filters are not supported`). One page would then say what
 each tile holds, a gallery could leave out rows without a file, and the type table's Blob
@@ -581,13 +581,13 @@ column would need no `HEAD` per cell. Engine rule: the bytes are still never pro
 *Waits:* 035, 004. *Today:* one `HEAD` per drawn tile or cell, shared at a commit by the
 table, the peek and the gallery; a gallery pages through rows without a file.
 
-**E57. A validator that names a Blob's bytes.** A strong validator stable across commits that
+**E57. A validator that names a Blob's bytes.** ([#1467](https://github.com/ModernRelay/omnigraph/issues/1467)) A strong validator stable across commits that
 did not change the value: a content digest in `HEAD` and `GET` (`Repr-Digest`, or a `digest`
 field in `blob stat`). Today an `ETag` names the type's table version: after a write to another
 row's title an unchanged value answers a new `ETag`. *Waits:* 035. *Today:* a preview is kept
 only at the commit it was read at, and read again when the gallery's pin moves.
 
-**E58. A media type and an image's size kept with a Blob.** `PUT /blob` taking the body's
+**E58. A media type and an image's size kept with a Blob.** ([#1468](https://github.com/ModernRelay/omnigraph/issues/1468)) `PUT /blob` taking the body's
 `Content-Type` (or a `media_type` field on a load) and `HEAD` answering it, with an image's
 pixel size. Today every value answers `application/octet-stream`. *Waits:* 035. *Today:*
 Studio judges a value by its first bytes (`blob::value_kind`) and reads an image's size from its
@@ -595,7 +595,7 @@ header in the first 64 KiB. A gallery places its masonry from that read (spec 03
 screen ahead of the view for the rows below; with E58 a row would be placed from its `HEAD`, and
 a picture whose header is past 64 KiB would not be placed as a square.
 
-**E59. Diff images that describe a Blob instead of carrying it.** `GET /diff`,
+**E59. Diff images that describe a Blob instead of carrying it.** ([#1469](https://github.com/ModernRelay/omnigraph/issues/1469)) `GET /diff`,
 `GET /branches/diff` and the change feed carry a changed Blob whole, as `base64:` text, in both
 the `before` and the `after` image, so a page of changes to photos is megabytes and a client
 holds both sides. A description (size, digest; the commit to read each side at) would keep a
