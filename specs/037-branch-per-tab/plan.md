@@ -199,6 +199,13 @@ to <where it lands>", and its row has no hover tooltip, which covered the menu.
   review's three sides (proposal 3, E53).
 - **Tables, trees and canvases on a branch of their own.** They follow the window. Their view
   strip from a page on a branch opens them on the window's branch.
+- **Drafts typed on `main` before the proposal started.** The edit that starts the proposal
+  lands there; other unsaved values typed on `main` meanwhile wait on `main`, as a branch's
+  drafts do. Moving them with the window needs the save that is out to settle on the branch it
+  was typed on first.
+- **A pinned view's edit after the move.** A view held on `main` (not following the window)
+  that edits once the session is on the proposal sends its edit there bound to the `main`
+  commit it read; once the proposal has moved, the server refuses it (412) and the draft stays.
 - **A proposal from a branch other than `main`.** Waits on E63.
 - **Typed "Propose changes" per window.** The setting is per graph; a window-only toggle was not
   needed by any workflow walked.
