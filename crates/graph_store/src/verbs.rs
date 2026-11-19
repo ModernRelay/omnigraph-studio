@@ -200,19 +200,21 @@ impl GraphSession {
         node_type_candidates(&schema, &[param, &entry.name], None)
     }
 
-    /// The stamps a hand edit or a new node of `type_name` carries in this graph (spec 041):
-    /// what the settings ask, for the properties the type declares. An actor's is left out
-    /// while the actor is not known.
+    /// The stamps a hand edit or a new node carries in this graph (spec 041): what the
+    /// settings ask, which a write applies to the properties its type declares. The time is
+    /// this Mac's, as the engine spells an instant, so a view of the write shows the value it
+    /// wrote; an actor's is left out while the actor is not known.
     pub fn stamps(&self, cx: &App) -> Vec<Stamp> {
         let Some(settings) = self.settings(cx) else {
             return Vec::new();
         };
+        let now = gq_language::input::engine_instant(chrono::Utc::now());
         settings
             .stamps(&self.overrides_key())
             .into_iter()
             .filter_map(|(property, stamp)| {
                 let value = match stamp {
-                    studio_settings::Stamp::Now => StampValue::Now,
+                    studio_settings::Stamp::Now => StampValue::Time(now.clone()),
                     studio_settings::Stamp::Actor => StampValue::Text(self.actor()?.to_owned()),
                 };
                 Some(Stamp { property, value })

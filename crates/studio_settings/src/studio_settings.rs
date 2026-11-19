@@ -250,7 +250,7 @@ pub struct GraphOverrides {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub pinned_queries: Vec<String>,
     /// What Studio writes into a property on every edit and new node of a type that declares
-    /// it, by property name (spec 041): `"now"` sets a `DateTime` to the server's time,
+    /// it, by property name (spec 041): `"now"` sets a `DateTime` to the time of the edit,
     /// `"actor"` a `String` to the credential's actor. `{"updated_at": "now"}` keeps the
     /// graph's own compare-and-swap rule for hand edits. Writes from the CLI and agents keep
     /// their own until Omnigraph stamps them itself (E65).
@@ -262,7 +262,7 @@ pub struct GraphOverrides {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Stamp {
-    /// The server's time when the write runs, for a `DateTime`.
+    /// The time of the edit, by this computer's clock, for a `DateTime`.
     Now,
     /// The actor the credential resolves to, for a `String`.
     Actor,

@@ -273,9 +273,11 @@ impl NodePage {
         (actions, held)
     }
 
-    /// Opens the Actions menu, from ⌥↵.
+    /// Opens the Actions menu, from ⌥↵; not on a page held at a commit, whose button is
+    /// disabled: an action writes to the branch's head.
     fn show_actions(&mut self, _: &ShowActions, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.node_actions(cx).0.is_empty() {
+        let (actions, held) = self.node_actions(cx);
+        if held.is_none() && !actions.is_empty() {
             self.actions_menu.show(window, cx);
         }
     }
@@ -444,10 +446,23 @@ mod tests {
             assert!(page.actions_menu.is_deployed(), "⌥↵ opens the menu")
         });
         let (held, cx) = page(&session, Some("c1"), cx);
+        cx.run_until_parked();
         held.read_with(cx, |page, cx| {
             let (actions, held) = page.node_actions(cx);
             assert_eq!(actions.len(), 1);
             assert!(held.is_some_and(|reason| reason.contains("commit c1")));
+        });
+        cx.update(|window, cx| {
+            let focus = held.read(cx).focus_handle(cx);
+            window.focus(&focus, cx);
+        });
+        cx.simulate_keystrokes("alt-enter");
+        cx.run_until_parked();
+        held.read_with(cx, |page, _| {
+            assert!(
+                !page.actions_menu.is_deployed(),
+                "a held page runs no action"
+            )
         });
     }
 }

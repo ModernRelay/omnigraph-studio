@@ -138,11 +138,16 @@ pub(crate) fn write_rows(
         nodes: rows
             .iter()
             .map(|row| {
-                let values = row
+                let mut values: Vec<(String, Value)> = row
                     .cells
                     .iter()
                     .map(|(property, _, new)| (property.clone(), new.clone()))
                     .collect();
+                // What the stamps wrote too, so a view that takes the write shows it.
+                let set: Vec<&str> = row.cells.iter().map(|(p, _, _)| p.as_str()).collect();
+                values.extend(
+                    builder::stamped_values(schema, type_name, &stamps, &set).unwrap_or_default(),
+                );
                 (row.id.clone(), values)
             })
             .collect(),
@@ -183,11 +188,17 @@ pub(crate) fn write_cells(
         .iter()
         .map(|(id, old)| (id.clone(), vec![(property.to_owned(), old.clone())]))
         .collect();
+    let stamped =
+        builder::stamped_values(schema, type_name, &stamps, &[property]).unwrap_or_default();
     let wrote = graph_store::Wrote {
         type_name: type_name.to_owned(),
         nodes: rows
             .iter()
-            .map(|(id, _)| (id.clone(), vec![(property.to_owned(), new.clone())]))
+            .map(|(id, _)| {
+                let mut values = vec![(property.to_owned(), new.clone())];
+                values.extend(stamped.iter().cloned());
+                (id.clone(), values)
+            })
             .collect(),
     };
     send_bound(
@@ -546,6 +557,19 @@ mod stamp_tests {
         });
         let (session, sent) = session_recording_writes(ISSUES, cx);
         cx.run_until_parked();
+        // What a view that takes the write is told it set.
+        type Told = std::sync::Arc<std::sync::Mutex<Vec<Vec<(String, serde_json::Value)>>>>;
+        let told: Told = Default::default();
+        let _told = cx.update(|cx| {
+            let told = told.clone();
+            cx.subscribe(&session, move |_, event: &graph_store::SessionEvent, _| {
+                if let graph_store::SessionEvent::PropertiesWritten { wrote, .. } = event {
+                    told.lock()
+                        .unwrap()
+                        .push(wrote.values_of("lk-acl").unwrap_or_default().to_vec());
+                }
+            })
+        });
         let graph = session.read_with(cx, |session, _| session.overrides_key());
         let edit = |cx: &mut TestAppContext| {
             let schema = session.read_with(cx, |session, _| session.schema_model().unwrap());
@@ -580,8 +604,24 @@ mod stamp_tests {
         });
         let stamped = edit(cx);
         assert!(
-            stamped.contains("set { title: $new0_0, updated_at: now() }"),
+            stamped.contains("set { title: $new0_0, updated_at: $stamp0_0 }"),
             "the time, and no actor while none is known: {stamped}"
+        );
+        let sent_at = sent.lock().unwrap().last().unwrap()["params"]["stamp0_0"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            sent_at.starts_with("20") && sent_at.contains('T'),
+            "{sent_at}"
+        );
+        assert_eq!(
+            told.lock().unwrap().last().unwrap(),
+            &vec![
+                ("title".to_owned(), json!("New")),
+                ("updated_at".to_owned(), json!(sent_at)),
+            ],
+            "a view that takes the write shows the stamp it wrote"
         );
     }
 }

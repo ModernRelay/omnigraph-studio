@@ -272,6 +272,16 @@ pub(crate) fn date_time(text: &str) -> String {
     engine_date_time(&spaced).unwrap_or(spaced)
 }
 
+/// An instant as the engine writes a `DateTime`, to the millisecond: `2026-11-19T07:31:54.283`,
+/// the fraction left out when it is zero.
+pub fn engine_instant(at: chrono::DateTime<chrono::Utc>) -> String {
+    let seconds = at.format("%Y-%m-%dT%H:%M:%S");
+    match at.timestamp_subsec_millis() {
+        0 => seconds.to_string(),
+        millis => format!("{seconds}.{millis:03}"),
+    }
+}
+
 /// `text` as the engine writes the instant it names, when it is one of the shapes
 /// [`date_time`] rewrites and names an instant to the millisecond.
 fn engine_date_time(text: &str) -> Option<String> {

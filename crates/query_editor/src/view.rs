@@ -2920,8 +2920,10 @@ impl QueryEditor {
             return;
         };
         let value = if list {
+            // The last item is the text the menu searched for: the pick takes its place.
             let text = input.read(cx).text(cx);
-            let mut items = match gq_language::param_value(param, "[String]", true, &text) {
+            let done = text.rsplit_once(',').map_or("", |(done, _)| done);
+            let mut items = match gq_language::param_value(param, "[String]", true, done) {
                 Ok(Some(Value::Array(items))) => items,
                 _ => Vec::new(),
             };
@@ -4346,7 +4348,9 @@ impl QueryEditor {
 
     /// The node the selected cell's row acts on (spec 041): the cell's own node, else the
     /// row's first; with the commit the rows were read at, when they were held at one.
-    fn selected_row_node(&self) -> Option<(String, String, Option<String>)> {
+    /// The commit is where the rows were read whenever it is not the head of the window's
+    /// branch, as the inspector holds them ([`Self::rows_read_at`]).
+    fn selected_row_node(&self, cx: &App) -> Option<(String, String, Option<String>)> {
         let (row, column) = self.selected?;
         let Output::Rows(rows) = &self.output else {
             return None;
@@ -4355,12 +4359,12 @@ impl QueryEditor {
             .table
             .cell_node(row, column)
             .or_else(|| rows.table.row_node(row))?;
-        Some((type_name, id, rows.held_at().map(str::to_owned)))
+        Some((type_name, id, self.rows_read_at(rows, cx).0))
     }
 
     /// Opens the page of the node the selected row shows (↵).
     fn open_row_node(&mut self, _: &OpenRowNode, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((type_name, id, at_commit)) = self.selected_row_node() else {
+        let Some((type_name, id, at_commit)) = self.selected_row_node(cx) else {
             return;
         };
         window.dispatch_action(
@@ -4390,7 +4394,7 @@ impl QueryEditor {
         let Some((row, _)) = self.selected else {
             return;
         };
-        let node = self.selected_row_node();
+        let node = self.selected_row_node(cx);
         let actions = node
             .as_ref()
             .map(|(type_name, _, _)| self.session.read(cx).node_actions(type_name, cx))
@@ -4775,7 +4779,7 @@ impl QueryEditor {
                 }
                 if self.selected.is_some() {
                     let focus = &self.results_focus;
-                    if self.selected_row_node().is_some() {
+                    if self.selected_row_node(cx).is_some() {
                         keys.push(KeyHint::new("Open the row's node", &OpenRowNode, focus));
                         keys.push(KeyHint::new("Show the row's actions", &ShowActions, focus));
                     }
@@ -9088,7 +9092,11 @@ mod tests {
         #[gpui::test]
         async fn a_row_that_returns_a_key_is_the_node_it_names(cx: &mut TestAppContext) {
             init_settings(cx);
-            let (session, _) = served(cx, vec![schema_route(ISSUES)]);
+            let branches = (
+                "/branches",
+                json!({"branches": ["main", "fix"]}).to_string(),
+            );
+            let (session, _) = served(cx, vec![schema_route(ISSUES), branches]);
             cx.run_until_parked();
             let schema = session.read_with(cx, |session, _| session.schema_model().unwrap());
             let opened: Arc<std::sync::Mutex<Vec<OpenNodePage>>> = Arc::default();
@@ -9114,6 +9122,7 @@ mod tests {
                 let output: ReadOutput = serde_json::from_value(json!({
                     "query_name": "open",
                     "target": {"branch": "main"},
+                    "graph_commit_id": "c9",
                     "row_count": 2,
                     "columns": ["i.slug", "i.title", "i.done", "n"],
                     "rows": [
@@ -9153,7 +9162,7 @@ mod tests {
                         type_name: "Issue".into(),
                         id: "lk-acl".into(),
                         at_commit: None,
-                        snapshot: None,
+                        snapshot: Some("c9".into()),
                     }))
                 );
                 editor.select_cell(0, 3, window, cx);
@@ -9174,6 +9183,25 @@ mod tests {
                     .map(|open| (open.type_name.as_str(), open.id.as_str()))
                     .collect::<Vec<_>>(),
                 [("Issue", "lk-sync")]
+            );
+            assert_eq!(
+                opened.lock().unwrap()[0].at_commit,
+                None,
+                "at the branch's head"
+            );
+            // The window moves to another branch and the rows stay: they open where they were
+            // read, as the inspector holds them.
+            let session = editor.read_with(cx, |editor, _| editor.session.clone());
+            session.update(cx, |session, cx| session.set_branch("fix".into(), cx));
+            cx.run_until_parked();
+            editor.update_in(cx, |editor, window, cx| {
+                window.focus(&editor.results_focus, cx);
+            });
+            cx.simulate_keystrokes("enter");
+            assert_eq!(opened.lock().unwrap().len(), 2, "opened again");
+            assert_eq!(
+                opened.lock().unwrap().last().unwrap().at_commit.as_deref(),
+                Some("c9")
             );
             cx.simulate_keystrokes("alt-enter");
             cx.run_until_parked();
@@ -9293,8 +9321,14 @@ mod tests {
             editor.update_in(cx, |editor, window, cx| {
                 editor.act_on_node("ids", json!(["lk-acl"]), window, cx);
                 assert_eq!(editor.params["ids"].read(cx).text(cx), "lk-acl");
+                // The item being typed is what the menu searched for: a pick takes its place.
+                editor.params["ids"]
+                    .update(cx, |input, cx| input.set_text("lk-acl, syn", window, cx));
                 editor.pick_node("ids", "lk-sync".into(), true, window, cx);
                 assert_eq!(editor.params["ids"].read(cx).text(cx), "lk-acl, lk-sync");
+                editor.params["ids"].update(cx, |input, cx| {
+                    input.set_text("lk-acl, lk-sync, ac", window, cx)
+                });
                 editor.pick_node("ids", "lk-acl".into(), true, window, cx);
                 assert_eq!(editor.params["ids"].read(cx).text(cx), "lk-acl, lk-sync");
                 let pending = editor.pending_write.as_ref().expect("it asks first");

@@ -161,13 +161,17 @@ that type: a `String` parameter takes the node's id, a list of `String` takes a 
 ### 4. Write conventions per graph
 
 `graphs."<key>".stamps` maps a property name to what Studio writes into it on every hand edit
-and new node of a type that declares it: `"now"` for a `DateTime` (the server's `now()`) and
-`"actor"` for a `String` (the credential's actor, as the access route answers it). beads:
+and new node of a type that declares it: `"now"` for a `DateTime` (the time of the edit by this
+computer's clock, spelled as the engine spells an instant) and `"actor"` for a `String` (the credential's actor, as the access route answers it). beads:
 `{"updated_at": "now"}`; the dev graph: `{"updatedAt": "now", "updatedBy": "actor"}`.
 
 - A stamp is added to the `set` of the update Studio builds for an edit, never to a property
   the edit sets itself. It is not bound in the `where`: a stamp is what changed, not what was
-  read. A new node takes it unless the person filled it.
+  read. A new node takes it unless the person filled it, and a required stamped property may
+  be left empty in the new-node dialog.
+- The value is Studio's, not the server's `now()`, so the views that take the write (the
+  table, the page, the inserted row) show what was written and stay at its commit; with
+  `now()` they could not know it without a read.
 - A type that does not declare the property, or declares another type for it, is not stamped.
   An `actor` stamp with no actor known (an access route not answered) is left out.
 - Nothing is stamped by default. The settings document's description of `stamps` names both
@@ -208,7 +212,7 @@ and new node of a type that declares it: `"now"` for a `DateTime` (the server's 
 | 2026-11-19 | The catalog says nothing of a mutation's type or file | `GET /graphs/beads/queries`, `GET /graphs/company/queries` on `v0.15.0` | Entries carry `name`, `tool_name`, `description`, `instruction`, `mutation`, `params` only |
 
 | 2026-11-19 | A result row that returns a key is its node; a stored read's rows are nodes once a column is linked; a node action fills its node and asks before it writes; a read with no parameters runs as it opens; pins and groups; stamps on hand edits | `gq_language` `columns_name_their_variable_and_what_names_a_node`, `writes_stamp_what_the_graph_asks_and_the_type_declares`; `graph_store` `verbs::tests`; `studio_settings` `a_graphs_verbs_rows_pins_and_stamps_are_kept_per_graph`; `query_editor` `a_row_that_returns_a_key_is_the_node_it_names` (and the row menu's draw count), `a_stored_reads_rows_are_nodes_once_the_person_says_which`, `a_node_action_fills_its_node_and_asks_before_it_writes`, `a_read_with_no_parameters_runs_when_it_opens`, `pinned_queries_lead_then_reads_then_writes`; `type_table` `a_pages_actions_are_the_mutations_said_to_act_on_its_type`, `a_hand_edit_carries_the_graphs_stamps`; `studio` keymap tests | Pass |
-| 2026-11-19 | It works against a real server | Offscreen snapshots (`crates/studio/examples/snapshot.rs`) and the debug binary under Xvfb, against `omnigraph-server` `v0.15.0` serving the beads, company-brain and hardware-program cookbooks in one cluster (seeds loaded with `load/ndjson?mode=append`) | beads `ready` ran as it opened; "Rows as nodes…" offered Comment, Issue and Memory for `i.slug`; linked to Issue, a row picked the issue in the inspector and its menu offered Claim… and Close…; Claim… filled `$id` with `lk-acl`, `$who` took the keyboard, Run showed "Run on main", ↵ committed one node, and `lk-acl` left `ready`. The page of `lk-sync` had Actions (⌥↵). Its kind set on the page committed `updated_at` at the server's time with `{"updated_at": "now"}`. company's `verify_claim` offered "a Claim" first, and "provider" picked `provider-certifies-nov-6`. program's `budget_rollup` faded at the cut and, scrolled, showed `violated` as a chip on `dc-pl-mass`. In the binary, one click on `blocked` in the Queries panel ran it |
+| 2026-11-19 | It works against a real server | Offscreen snapshots (`crates/studio/examples/snapshot.rs`) and the debug binary under Xvfb, against `omnigraph-server` `v0.15.0` serving the beads, company-brain and hardware-program cookbooks in one cluster (seeds loaded with `load/ndjson?mode=append`) | beads `ready` ran as it opened; "Rows as nodes…" offered Comment, Issue and Memory for `i.slug`; linked to Issue, a row picked the issue in the inspector and its menu offered Claim… and Close…; Claim… filled `$id` with `lk-acl`, `$who` took the keyboard, Run showed "Run on main", ↵ committed one node, and `lk-acl` left `ready`. The page of `lk-sync` had Actions (⌥↵). Its kind set on the page committed `updated_at` with `{"updated_at": "now"}` (then the server's `now()`; see Corrections); after the review's fix, the page showed `2026-11-19T07:59:02.345` at once, the value the server then read back. company's `verify_claim` offered "a Claim" first, and "provider" picked `provider-certifies-nov-6`. program's `budget_rollup` faded at the cut and, scrolled, showed `violated` as a chip on `dc-pl-mass`. In the binary, one click on `blocked` in the Queries panel ran it |
 
 ## Corrections
 
@@ -221,5 +225,12 @@ and new node of a type that declares it: `"now"` for a `DateTime` (the server's 
 - 2026-11-19 · The fade at a grid's cut edge was decided as the rows were laid out, from the last
   frame's scroll range, which the first frame of a result has not set; it is now painted after
   layout, from this frame's range.
+- 2026-11-19 · Review of PR #152: a stamp of the server's `now()` left the views that take a
+  write showing the old `updated_at` at the new commit, so "now" is now the edit's time by
+  Studio's clock, and the views are told it with the edit; a required stamped property
+  blocked the new-node dialog, which now lets it be left empty; ↵ and the row menu opened rows
+  kept after a branch switch on the new branch, and now open them where they were read, as
+  the inspector does; a list parameter's pick kept the text searched as an item, and now takes
+  its place; ⌥↵ opened the Actions menu on a page held at a commit, and no longer does.
 - 2026-11-19 · A trigger's tooltip covered its own open menu ("Rows as nodes…", "Names a
   node…"); it is hidden while the menu is open, as the table's toolbar menus do.

@@ -3585,15 +3585,42 @@ pub struct Stamp {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum StampValue {
-    /// The server's time when the write runs (`now()`), for a `DateTime`.
+    /// The server's time when the write runs (`now()`), for a `DateTime`. Its value is not
+    /// known to the writer: a view of the write cannot show it until it reads it.
     Now,
+    /// An instant the writer chose, as the engine spells one, for a `DateTime`.
+    Time(String),
     /// A text, such as the credential's actor, for a `String`.
     Text(String),
 }
 
-/// The assignments `stamps` add to a write of `node` that sets `set` itself: one for each
-/// stamp the node declares, of a type it fits, that the write does not set. A text is sent as
-/// a parameter named `{prefix}{i}`.
+/// The stamps that apply to a write of `node` that sets `set` itself: those the node declares,
+/// of a type they fit, that the write does not set, each with its property.
+fn applied_stamps<'a>(
+    node: &'a NodeType,
+    stamps: &'a [Stamp],
+    set: &[&str],
+) -> Vec<(usize, &'a Property, &'a StampValue)> {
+    stamps
+        .iter()
+        .enumerate()
+        .filter(|(_, stamp)| !set.contains(&stamp.property.as_str()))
+        .filter_map(|(i, stamp)| {
+            let property = node.property(&stamp.property)?;
+            let fits = !property.list
+                && match &stamp.value {
+                    StampValue::Now | StampValue::Time(_) => property.kind == ScalarKind::DateTime,
+                    StampValue::Text(_) => {
+                        property.base_type == "String" && property.enum_values.is_none()
+                    }
+                };
+            fits.then_some((i, property, &stamp.value))
+        })
+        .collect()
+}
+
+/// The assignments `stamps` add to a write of `node` that sets `set` itself ([`applied_stamps`]).
+/// A value is sent as a parameter named `{prefix}{i}`.
 fn stamp_assignments(
     node: &NodeType,
     stamps: &[Stamp],
@@ -3601,29 +3628,46 @@ fn stamp_assignments(
     prefix: &str,
     params: &mut Params,
 ) -> Vec<String> {
-    stamps
-        .iter()
-        .enumerate()
-        .filter(|(_, stamp)| !set.contains(&stamp.property.as_str()))
-        .filter_map(|(i, stamp)| {
-            let property = node.property(&stamp.property)?;
-            if property.list {
-                return None;
-            }
-            let value = match &stamp.value {
-                StampValue::Now if property.kind == ScalarKind::DateTime => "now()".to_owned(),
-                StampValue::Text(text)
-                    if property.base_type == "String" && property.enum_values.is_none() =>
-                {
-                    params.add(
-                        &format!("{prefix}{i}"),
-                        "String",
-                        Value::String(text.clone()),
-                    )
-                }
-                _ => return None,
+    applied_stamps(node, stamps, set)
+        .into_iter()
+        .map(|(i, property, value)| {
+            let value = match value {
+                StampValue::Now => "now()".to_owned(),
+                StampValue::Time(at) => params.add(
+                    &format!("{prefix}{i}"),
+                    "DateTime",
+                    Value::String(at.clone()),
+                ),
+                StampValue::Text(text) => params.add(
+                    &format!("{prefix}{i}"),
+                    "String",
+                    Value::String(text.clone()),
+                ),
             };
-            Some(format!("{}: {value}", property.name))
+            format!("{}: {value}", property.name)
+        })
+        .collect()
+}
+
+/// The values `stamps` write into a node of `type_name` besides `set` (spec 041), for a view
+/// to show what the write did; `None` when one is the server's own (`now()`), which only a
+/// read can tell.
+pub fn stamped_values(
+    schema: &SchemaModel,
+    type_name: &str,
+    stamps: &[Stamp],
+    set: &[&str],
+) -> Option<Vec<(String, Value)>> {
+    let Some(node) = schema.node(type_name) else {
+        return Some(Vec::new());
+    };
+    applied_stamps(node, stamps, set)
+        .into_iter()
+        .map(|(_, property, value)| match value {
+            StampValue::Now => None,
+            StampValue::Time(text) | StampValue::Text(text) => {
+                Some((property.name.clone(), Value::String(text.clone())))
+            }
         })
         .collect()
 }

@@ -150,10 +150,23 @@ fn property_fields<T: InsertForm>(
 /// The fields' values, parsed for their types, an empty one left out; `None` when one does
 /// not parse, which then shows why.
 fn field_values(fields: &mut [Field], cx: &App) -> Option<Vec<(String, Value)>> {
+    field_values_stamped(fields, &[], cx)
+}
+
+/// [`field_values`], where a field of `stamped` (a property the graph stamps, spec 041) may be
+/// left empty, though the type requires it: its stamp fills it.
+fn field_values_stamped(
+    fields: &mut [Field],
+    stamped: &[String],
+    cx: &App,
+) -> Option<Vec<(String, Value)>> {
     let mut values = Vec::new();
     let mut valid = true;
     for field in fields {
         let text = field.editor.read(cx).text(cx);
+        if text.trim().is_empty() && stamped.contains(&field.property.name) {
+            continue;
+        }
         match parse_input(&field.property, &text) {
             Ok(Value::Null) => {}
             Ok(value) => values.push((field.property.name.clone(), value)),
@@ -310,7 +323,21 @@ impl InsertForm for InsertRowModal {
         if self.saving || self.blocked.is_some() || self.held_back() {
             return;
         }
-        let values = field_values(&mut self.fields, cx);
+        // A property the graph stamps, left empty, takes its stamp (spec 041): it may be left
+        // empty, and the row the table shows holds the stamp's value.
+        let stamps = self.session.read(cx).stamps(cx);
+        let stamped: Vec<(String, Value)> =
+            builder::stamped_values(&self.schema, &self.type_name, &stamps, &[])
+                .unwrap_or_default();
+        let names: Vec<String> = stamped.iter().map(|(name, _)| name.clone()).collect();
+        let values = field_values_stamped(&mut self.fields, &names, cx).map(|mut values| {
+            for (name, value) in &stamped {
+                if !values.iter().any(|(set, _)| set == name) {
+                    values.push((name.clone(), value.clone()));
+                }
+            }
+            values
+        });
         let mut ends = Vec::new();
         let mut valid = values.is_some();
         for required in &mut self.required {
@@ -341,14 +368,11 @@ impl InsertForm for InsertRowModal {
             .as_ref()
             .and_then(|key| values.iter().find(|(name, _)| name == key))
             .map(|(_, value)| value.clone());
-        // A property the graph stamps, left empty, takes its stamp (spec 041).
-        let stamps = self.session.read(cx).stamps(cx);
         let built = (|| {
-            let mut parts = vec![builder::insert_node_stamped(
+            let mut parts = vec![builder::insert_node(
                 &self.schema,
                 &self.type_name,
                 &values,
-                &stamps,
             )?];
             if !ends.is_empty() {
                 // The new node is named by its key's value, which the form requires.
@@ -2243,6 +2267,79 @@ mod tests {
                 assert!(values.contains(&&Value::from("bo")), "{params:?}");
             }
         }
+    }
+
+    /// Spec 041: a new node's required property the graph stamps may be left empty: the insert
+    /// sends the stamp's value, which a filled field's value replaces.
+    #[gpui::test]
+    async fn a_new_nodes_empty_stamped_property_takes_its_stamp(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+            studio_settings::keep_changes_in_memory(cx);
+            editor::init(cx);
+        });
+        const ISSUES: &str = "node Issue {\n  slug: String @key\n  updated_at: DateTime\n}\n";
+        let (session, sent) = crate::test_support::session_recording_writes(ISSUES, cx);
+        cx.run_until_parked();
+        let graph = session.read_with(cx, |session, _| session.overrides_key());
+        cx.update(|cx| {
+            let text =
+                format!(r#"{{"graphs": {{"{graph}": {{"stamps": {{"updated_at": "now"}}}}}}}}"#);
+            let read = studio_settings::StudioSettings::read(&text).unwrap();
+            studio_settings::update(cx, |settings| *settings = read.settings);
+        });
+        let (workspace, cx) = cx.add_window_view(studio_workspace::Workspace::new);
+        let table = workspace.update_in(cx, |_, window, cx| {
+            let workspace = cx.entity().downgrade();
+            cx.new(|cx| {
+                TypeTable::new(workspace, session.clone(), "Issue".into(), None, window, cx)
+            })
+        });
+        cx.run_until_parked();
+        let schema = Arc::new(SchemaModel::parse(ISSUES).unwrap());
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_modal(window, cx, |window, cx| {
+                InsertRowModal::new(
+                    table.downgrade(),
+                    session.clone(),
+                    schema.clone(),
+                    "Issue".into(),
+                    window,
+                    cx,
+                )
+            })
+        });
+        let modal = workspace
+            .read_with(cx, |workspace, _| {
+                workspace.active_modal::<InsertRowModal>()
+            })
+            .expect("open");
+        modal.update_in(cx, |modal, window, cx| {
+            let slug = modal
+                .fields
+                .iter()
+                .find(|f| f.property.name == "slug")
+                .unwrap();
+            slug.editor
+                .update(cx, |editor, cx| editor.set_text("lk-new", window, cx));
+            modal.submit(window, cx);
+        });
+        cx.run_until_parked();
+        let request = sent
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("the insert is sent");
+        let query = request["query"].as_str().unwrap();
+        assert!(query.contains("updated_at: $p1"), "{query}");
+        assert!(
+            request["params"]["p1"]
+                .as_str()
+                .is_some_and(|at| at.contains('T')),
+            "{request}"
+        );
     }
 
     /// ↵ in the insert dialog sends the insert and closes the dialog; refused, the same dialog
