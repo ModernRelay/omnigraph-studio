@@ -123,6 +123,10 @@ pub(super) enum Sides {
         edge: String,
         from: String,
         edges: Vec<CardEdge>,
+        /// Both sides' relationships were read whole: neither read failed nor reached
+        /// [`CARD_EDGES`]. Otherwise a relationship missing from one side's rows may be there,
+        /// so none is offered for removal.
+        whole: bool,
     },
     /// Nothing more to show than the server's words: a value constraint, or a conflict naming
     /// no entity Studio can read.
@@ -511,6 +515,9 @@ impl ReviewView {
                 .map_err(|why| why.0)?;
                 (branch, query)
             }
+            (Some(Sides::Card { whole: false, .. }), Choice::Remove { .. }) => {
+                return Err("Not every relationship of either side could be read.".into());
+            }
             (
                 Some(Sides::Card { edge, .. }),
                 Choice::Remove {
@@ -608,7 +615,11 @@ impl ReviewView {
         let Some(list) = self.resolve.of else { return };
         let what = self.conflict_title(ix);
         if !on_target {
-            let key = conflict_key(list, ix);
+            // Sent with the key of the review's change of the entity when it holds one, so its
+            // card turns fixed too and offers no fix from the values the decision replaced.
+            let key = self
+                .change_key_of(ix)
+                .unwrap_or_else(|| conflict_key(list, ix));
             self.resolve.pending.insert(key.clone(), ix);
             self.resolve
                 .decisions
@@ -650,36 +661,58 @@ impl ReviewView {
                 format!("Write to {target}"),
             ),
         };
+        // The write is bound to the target head its values were read at, for this list: a
+        // confirmation answered after the sides were read again sends nothing.
+        let SidesState::Read(read) = &self.resolve.state else {
+            return;
+        };
+        let bound = read.target_head.clone();
         let view = cx.entity().downgrade();
         // Run after the update this is asked from: with no workspace to ask in, `confirm` agrees
         // at once.
         studio_workspace::confirm(window, cx, title, description, action, move |_, cx| {
             cx.defer(move |cx| {
                 view.update(cx, |this, cx| {
-                    this.send_target_write(ix, choice, request, cx)
+                    this.send_target_write(ix, choice, request, (list, bound), cx)
                 })
                 .ok();
             });
         });
     }
 
-    /// Sends a decision's write to the target, bound to the target's head the sides were read
-    /// at, or the one the last such write left. Never retried.
+    /// Sends a decision's write to the target, bound to `read`'s head: the target's head its
+    /// values were read at, or the one the last such write left, for the conflicts list
+    /// `read` names. A list read again since sends nothing and says so. Never retried.
     fn send_target_write(
         &mut self,
         ix: usize,
         choice: Choice,
         request: ChangeRequest,
+        read: (u64, String),
         cx: &mut Context<Self>,
     ) {
-        let SidesState::Read(read) = &self.resolve.state else {
-            return;
+        let (list, bound) = read;
+        let current = match &self.resolve.state {
+            SidesState::Read(read) => Some(read.target_head.as_str()),
+            _ => None,
         };
+        if self.resolve.of != Some(list) || current != Some(bound.as_str()) {
+            if self.resolve.of == Some(list) {
+                self.resolve.decisions.insert(
+                    ix,
+                    Decision::Unavailable(format!(
+                        "Not written: {} moved while you confirmed. Decide again.",
+                        self.target
+                    )),
+                );
+                cx.notify();
+            }
+            return;
+        }
         if self.target_write_refusal(cx).is_some() {
             return;
         }
-        let bound = read.target_head.clone();
-        let list = self.resolve.of;
+        let list = Some(list);
         let description = match &choice {
             Choice::Remove { .. } => format!(
                 "Remove a relationship of {} on {} to resolve a conflict",
@@ -801,6 +834,14 @@ impl ReviewView {
             return None;
         };
         Some((change, target.image().cloned()))
+    }
+
+    /// The key of the review's change of the conflict's entity, when the review holds one.
+    fn change_key_of(&self, ix: usize) -> Option<String> {
+        let conflict = self.conflicts()?.get(ix)?;
+        let data = self.data.as_ref()?;
+        let change = data.change_to(&conflict.type_name, conflict.entity_id.as_deref()?)?;
+        Some(data.folded.changes[change].key())
     }
 
     /// The conflict's entity in a few words: its type and name, else its id.
@@ -1003,9 +1044,12 @@ impl ReviewView {
                 [target_by, source_by],
                 cx,
             ),
-            Some(Sides::Card { edges, from, edge }) => {
-                self.render_card_edges(ix, &edge, &from, &edges, cx)
-            }
+            Some(Sides::Card {
+                edges,
+                from,
+                edge,
+                whole,
+            }) => self.render_card_edges(ix, &edge, &from, &edges, whole, cx),
             Some(Sides::Words) | None => {
                 studio_ui::ds::text::meta(conflict.message.clone()).into_any_element()
             }
@@ -1156,6 +1200,7 @@ impl ReviewView {
         edge: &str,
         from: &str,
         edges: &[CardEdge],
+        whole: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let names = match &self.resolve.state {
@@ -1175,15 +1220,23 @@ impl ReviewView {
         };
         let source_name = name_of(to_type.as_ref().map(|(from, _)| from), from);
         let now = studio_ui::now_micros();
-        let target_refused = self.target_write_refusal(cx);
-        let branch_refused = self.branch_write_refusal(cx);
+        const PART: &str = "Not every relationship of either side could be read, so which side \
+                            alone holds each is not known.";
+        let partial = (!whole).then(|| PART.to_owned());
+        let target_refused = partial.clone().or_else(|| self.target_write_refusal(cx));
+        let branch_refused = partial.clone().or_else(|| self.branch_write_refusal(cx));
         let decided = matches!(
             self.resolve.decisions.get(&ix),
             Some(Decision::Writing(_) | Decision::Wrote(..))
         );
-        let mut list = v_flex().gap(px(space::XS)).child(studio_ui::ds::text::meta(format!(
-            "{source_name} may hold fewer {edge} relationships than the two sides hold together:"
-        )));
+        let mut list = v_flex()
+            .gap(px(space::XS))
+            .child(studio_ui::ds::text::meta(format!(
+                "{source_name} may hold fewer {edge} relationships than the two sides hold together:"
+            )))
+            .when(!whole, |list| {
+                list.child(studio_ui::ds::text::meta(PART).color(Color::Warning))
+            });
         for (n, card) in edges.iter().enumerate() {
             let other = name_of(to_type.as_ref().map(|(_, to)| to), &card.to);
             let place = match (card.on_target, card.on_source) {
@@ -1575,7 +1628,7 @@ async fn read_sides(
         }
     }
     // The relationships each `@card` conflict counts, on each side.
-    let mut cards: HashMap<usize, (String, String, Vec<CardEdge>)> = HashMap::new();
+    let mut cards: HashMap<usize, (String, String, Vec<CardEdge>, bool)> = HashMap::new();
     for (ix, conflict) in plan.conflicts.iter().enumerate() {
         if !matches!(conflict.kind, MergeConflictKind::CardinalityViolation) {
             continue;
@@ -1592,13 +1645,20 @@ async fn read_sides(
             continue;
         };
         let mut edges: Vec<CardEdge> = Vec::new();
+        let mut whole = true;
         for (head, on_target) in [(&target_head, true), (&source_head, false)] {
             let read = session
                 .update(cx, |session, cx| {
                     session.read(&query, Some(head.clone()), cx)
                 })
                 .await;
-            let Ok(answer) = read else { continue };
+            let Ok(answer) = read else {
+                whole = false;
+                continue;
+            };
+            if answer.rows.as_array().map_or(0, Vec::len) >= CARD_EDGES as usize {
+                whole = false;
+            }
             for (id, (_, ends)) in images_of(&answer.rows, true, &[]) {
                 let to = ends.map(|(_, to)| to).unwrap_or_default();
                 match edges.iter_mut().find(|edge| edge.id == id) {
@@ -1615,7 +1675,10 @@ async fn read_sides(
             }
         }
         edges.sort_by(|a, b| a.id.cmp(&b.id));
-        cards.insert(ix, (conflict.type_name.clone(), from.to_owned(), edges));
+        cards.insert(
+            ix,
+            (conflict.type_name.clone(), from.to_owned(), edges, whole),
+        );
     }
     // Who set the target's side: its feed since the fork, of the conflicts' types, the newest
     // change to each entity kept.
@@ -1626,14 +1689,14 @@ async fn read_sides(
         .collect();
     types.sort();
     types.dedup();
-    let wanted: HashSet<(String, String)> =
-        plan.conflicts
-            .iter()
-            .filter_map(|conflict| Some((conflict.type_name.clone(), conflict.entity_id.clone()?)))
-            .chain(cards.values().flat_map(|(edge, _, edges)| {
-                edges.iter().map(|card| (edge.clone(), card.id.clone()))
-            }))
-            .collect();
+    let wanted: HashSet<(String, String)> = plan
+        .conflicts
+        .iter()
+        .filter_map(|conflict| Some((conflict.type_name.clone(), conflict.entity_id.clone()?)))
+        .chain(cards.values().flat_map(|(edge, _, edges, _)| {
+            edges.iter().map(|card| (edge.clone(), card.id.clone()))
+        }))
+        .collect();
     let fork = plan
         .fork
         .clone()
@@ -1680,13 +1743,18 @@ async fn read_sides(
         .iter()
         .enumerate()
         .map(|(ix, conflict)| {
-            if let Some((edge, from, mut edges)) = cards.remove(&ix) {
+            if let Some((edge, from, mut edges, whole)) = cards.remove(&ix) {
                 for card in &mut edges {
                     if card.on_target && !card.on_source {
                         card.by = who.get(&(edge.clone(), card.id.clone())).cloned();
                     }
                 }
-                return Sides::Card { edge, from, edges };
+                return Sides::Card {
+                    edge,
+                    from,
+                    edges,
+                    whole,
+                };
             }
             let Some(id) = conflict.entity_id.clone() else {
                 return Sides::Words;
@@ -1722,7 +1790,9 @@ async fn read_sides(
         }
     }
     for sides in &each {
-        if let Sides::Card { edge, from, edges } = sides
+        if let Sides::Card {
+            edge, from, edges, ..
+        } = sides
             && let Some(edge) = schema.edge(edge)
         {
             ends.push((edge.from.clone(), from.clone()));
@@ -1770,7 +1840,7 @@ async fn read_who(
     cx: &mut AsyncApp,
 ) -> (HashMap<(String, String), SetBy>, bool) {
     let mut who = HashMap::new();
-    let start = format!("after:{fork}");
+    let mut start = format!("after:{fork}");
     let mut token: Option<String> = None;
     for _ in 0..WHO_PAGES {
         let page = session
@@ -1808,9 +1878,15 @@ async fn read_who(
                 }
             }
         }
-        match page.next_page_token {
-            Some(next) => token = Some(next),
-            None => return (who, reached || page.caught_up != Some(false)),
+        match (page.next_page_token, page.caught_up, page.blocks.last()) {
+            (Some(next), ..) => token = Some(next),
+            // The page worked through all the commits one may and stopped short of the head:
+            // the next starts after its last commit, as the review's own feed reads on.
+            (None, Some(false), Some(last)) if !reached => {
+                start = format!("after:{}", last.cause.graph_commit_id);
+                token = None;
+            }
+            (None, caught_up, _) => return (who, reached || caught_up != Some(false)),
         }
     }
     (who, false)
@@ -2013,12 +2089,25 @@ mod tests {
                         "changes": [{ "kind": "node", "type": { "id": "Deal", "name": "Deal" }, "id": "d1", "op": "update", "before": before, "after": after }] }],
                         "cursor": "c", "caught_up": true }),
                     )
+                } else if path.ends_with("/changes")
+                    && query.contains("branch=main")
+                    && !query.contains("after%3Am1x")
+                {
+                    // A page that worked through all the commits it may and stopped short of
+                    // main's head, with no token: an earlier change by someone else.
+                    let after = json!({ "properties": deal("on-hold") });
+                    (
+                        200,
+                        json!({ "blocks": [{ "cause": { "graph_commit_id": "m1x", "parent_commit_id": "m1", "authored_branch": "main", "authored_at": 0, "actor_id": "act-early" },
+                        "changes": [{ "kind": "node", "type": { "id": "Deal", "name": "Deal" }, "id": "d1", "op": "update", "before": null, "after": after }] }],
+                        "caught_up": false }),
+                    )
                 } else if path.ends_with("/changes") && query.contains("branch=main") {
                     // Main's side came by the merge of tentative/scout.
                     let after = json!({ "properties": deal("ic-ready") });
                     (
                         200,
-                        json!({ "blocks": [{ "cause": { "graph_commit_id": "m2", "parent_commit_id": "m1", "merged_parent_commit_id": "s1", "authored_branch": "main", "authored_at": 0, "actor_id": "act-admin" },
+                        json!({ "blocks": [{ "cause": { "graph_commit_id": "m2", "parent_commit_id": "m1x", "merged_parent_commit_id": "s1", "authored_branch": "main", "authored_at": 0, "actor_id": "act-admin" },
                         "changes": [{ "kind": "node", "type": { "id": "Deal", "name": "Deal" }, "id": "d1", "op": "update", "before": null, "after": after },
                                     { "kind": "edge", "type": { "id": "SupersededBy", "name": "SupersededBy" }, "id": "e20", "op": "insert", "before": null, "after": null }] }],
                         "cursor": "c", "caught_up": true }),
@@ -2096,8 +2185,10 @@ mod tests {
 
     /// The conflicts list reads each conflict's three sides: the fork's from the review's
     /// changes, main's and this branch's at their heads, and who set main's, through the merge
-    /// that brought it. "Keep main's" writes main's values onto the branch, bound to the head
-    /// the fixes bind to, and the merge is checked again.
+    /// that brought it, reading main's feed on past a page that stopped short of its head.
+    /// "Keep main's" writes main's values onto the branch, bound to the head the fixes bind to,
+    /// as a fix of the entity's card, which then offers no other fix; the merge is checked
+    /// again.
     #[gpui::test]
     async fn a_conflict_shows_three_sides_and_keeps_mains(cx: &mut TestAppContext) {
         let (view, sent, cx) = review_with_conflicts(divergent_deal(), cx);
@@ -2116,6 +2207,7 @@ mod tests {
             assert_eq!(stage(base), Some(json!("in-diligence")));
             assert_eq!(stage(target), Some(json!("ic-ready")));
             assert_eq!(stage(source), Some(json!("dead")));
+            // Not act-early: the feed was read on after the page that stopped at m1x.
             let by = target_by.clone().expect("who set main's");
             assert_eq!(by.actor.as_deref(), Some("act-scout"));
             assert_eq!(by.from.as_deref(), Some("tentative/scout"));
@@ -2151,6 +2243,14 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert!(view.conflicts().is_none(), "nothing stops the merge now");
             assert!(view.show_conflicts, "the list stays, saying so");
+            let data = view.data.as_ref().expect("read");
+            let card = data
+                .change_to("Deal", "d1")
+                .expect("the review's change of d1");
+            assert!(
+                view.cards[card].fix.done(),
+                "the card the decision replaced is fixed"
+            );
         });
     }
 
@@ -2172,6 +2272,26 @@ mod tests {
         assert!(write.contains("\"old0_0\":\"ic-ready\""), "{write}");
     }
 
+    /// A confirmation answered after main moved, its sides read again at another head, sends
+    /// nothing and says to decide again.
+    #[gpui::test]
+    async fn a_confirmation_answered_after_main_moved_sends_nothing(cx: &mut TestAppContext) {
+        let (view, sent, cx) = review_with_conflicts(divergent_deal(), cx);
+        sent.lock().unwrap().clear();
+        view.update(cx, |view, cx| {
+            let list = view.resolve.of.expect("a list");
+            let request = view.side_write(0, &Choice::Source, cx).expect("a write");
+            view.send_target_write(0, Choice::Source, request, (list, "m1".into()), cx);
+            assert!(matches!(
+                view.resolve.decisions.get(&0),
+                Some(Decision::Unavailable(why)) if why.contains("moved while you confirmed")
+            ));
+        });
+        cx.run_until_parked();
+        let asked = sent.lock().unwrap().clone();
+        assert!(!asked.iter().any(|r| r.contains("/mutate")), "{asked:?}");
+    }
+
     /// Too many relationships from one node: the card lists each side's, with its other end, and
     /// removes the branch's on the branch.
     #[gpui::test]
@@ -2180,10 +2300,17 @@ mod tests {
             "message": "@card violation on edge SupersededBy: source 'c13' has 2 edges (max 1)" }]);
         let (view, sent, cx) = review_with_conflicts(conflicts, cx);
         view.read_with(cx, |view, _| {
-            let Some(Sides::Card { edge, from, edges }) = view.sides_at(0) else {
+            let Some(Sides::Card {
+                edge,
+                from,
+                edges,
+                whole,
+            }) = view.sides_at(0)
+            else {
                 panic!("a card conflict's sides");
             };
             assert_eq!((edge.as_str(), from.as_str()), ("SupersededBy", "c13"));
+            assert!(whole, "both sides read whole");
             let places: Vec<(&str, &str, bool, bool)> = edges
                 .iter()
                 .map(|e| (e.id.as_str(), e.to.as_str(), e.on_target, e.on_source))

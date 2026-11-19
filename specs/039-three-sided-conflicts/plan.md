@@ -217,4 +217,20 @@ changes' list is (`docs/drawing.md`): keys in the review's search draw it no tim
 
 ## Corrections
 
-None yet.
+- 2026-11-19, review of #151 (Devin):
+  - A write to the target was bound to the target head held when the confirmation was
+    answered, which a read of the sides in between could have moved. Now it is bound to the head
+    its values were read at, for the list they were read in; one answered after either moved
+    sends nothing and says "Not written: main moved while you confirmed. Decide again."
+    (`a_confirmation_answered_after_main_moved_sends_nothing`).
+  - A `@card` conflict whose relationships could not all be read (a read failed, or a side
+    reached 50) took a missing relationship as absent and offered to remove a shared one. Now
+    such a card says not every relationship could be read, and offers no Remove.
+  - Keep main's was sent under a key of its own, so the entity's card in the feed still offered
+    fixes from the values it replaced. It is now sent as that card's fix, which turns it fixed
+    until Refresh.
+  - Who set the target's side stopped at a feed page that stopped short of the head with no
+    page token. It now reads on after that page's last commit, as the review's own feed does
+    (`a_conflict_shows_three_sides_and_keeps_mains`).
+  - Use in Edit… put the target's value in the field as text, which cannot tell an empty string
+    from null. The form now saves the value Use took while the field still reads it.

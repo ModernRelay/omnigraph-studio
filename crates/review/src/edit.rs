@@ -26,6 +26,9 @@ struct Field {
     current: Value,
     /// The target's value, when the form was opened from a conflict and it holds the node.
     other: Option<Value>,
+    /// The value Use put in the field: saved as it is while the field's text still reads it,
+    /// since a text cannot tell an empty string from null.
+    used: Option<Value>,
     error: Option<String>,
 }
 
@@ -82,6 +85,7 @@ impl EditModal {
                     editor,
                     current,
                     other: None,
+                    used: None,
                     error: None,
                 }
             })
@@ -118,10 +122,12 @@ impl EditModal {
 
     /// Puts the other branch's value of field `at` in its input.
     fn use_other(&mut self, at: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(field) = self.fields.get(at) else {
+        let Some(field) = self.fields.get_mut(at) else {
             return;
         };
-        let text = edit_text(field.other.as_ref().unwrap_or(&Value::Null));
+        let value = field.other.clone().unwrap_or(Value::Null);
+        let text = edit_text(&value);
+        field.used = Some(value);
         field
             .editor
             .update(cx, |editor, cx| editor.set_text(text, window, cx));
@@ -133,7 +139,12 @@ impl EditModal {
         let mut valid = true;
         for field in &mut self.fields {
             let text = field.editor.read(cx).text(cx);
-            match typed(&field.property, &field.current, &text) {
+            let used = field
+                .used
+                .clone()
+                .filter(|used| edit_text(used) == text)
+                .map(Ok);
+            match used.or_else(|| typed(&field.property, &field.current, &text)) {
                 None => field.error = None,
                 Some(Ok(value)) => {
                     field.error = None;
