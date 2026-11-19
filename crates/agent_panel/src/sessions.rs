@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use gpui::{App, AppContext as _, Context, Entity, Global};
+use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Global};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use studio_workspace::{ToastKind, Workspace};
@@ -65,6 +65,27 @@ pub enum Live {
     Failed,
 }
 
+/// Something a conversation did that the person may want to hear of while Studio is in the
+/// background (spec 045): which conversation, its graph's key ([`SessionRecord::graph`]), its
+/// agent branch once the branch exists, and what happened. Names only, never what was said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attention {
+    pub session: String,
+    pub graph: String,
+    pub branch: Option<String>,
+    pub kind: AttentionKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttentionKind {
+    /// The agent ended its turn.
+    Finished,
+    /// The turn ended short: a limit, a refusal or an error. Not when the person stopped it.
+    Stopped,
+    /// A change or a tool began to wait for the person's answer.
+    Waiting,
+}
+
 /// The index, shared by every agent tab and the Agent sidebar panel.
 pub struct AgentSessions {
     path: PathBuf,
@@ -97,6 +118,8 @@ const REBOUND_KEPT: usize = 64;
 struct GlobalSessions(Entity<AgentSessions>);
 
 impl Global for GlobalSessions {}
+
+impl EventEmitter<Attention> for AgentSessions {}
 
 impl AgentSessions {
     /// The one index of this run of Studio.
@@ -409,8 +432,31 @@ impl AgentSessions {
             None => self.live.remove(session).is_some(),
         };
         if changed {
+            if live == Some(Live::Waiting) {
+                self.tell(session, AttentionKind::Waiting, cx);
+            }
             cx.notify();
         }
+    }
+
+    /// A turn of `session` ended as `kind` says ([`Attention`]).
+    pub fn turn_ended(&mut self, session: &str, kind: AttentionKind, cx: &mut Context<Self>) {
+        self.tell(session, kind, cx);
+    }
+
+    /// Tells whoever listens ([`crate::on_attention`]) what `session` did, when it is a
+    /// conversation of the index.
+    fn tell(&mut self, session: &str, kind: AttentionKind, cx: &mut Context<Self>) {
+        let Some(record) = self.get(session) else {
+            return;
+        };
+        let attention = Attention {
+            session: record.session.clone(),
+            graph: record.graph.clone(),
+            branch: record.branch_created.then(|| record.branch.clone()),
+            kind,
+        };
+        cx.emit(attention);
     }
 
     pub fn is_unread(&self, session: &str) -> bool {

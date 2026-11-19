@@ -27,9 +27,10 @@ mod ui_tools;
 
 pub use launch::launch_agent;
 pub use panel::PRESETS;
+pub use sessions::{Attention, AttentionKind};
 pub use ui_tools::{UiToolEndpoint, UiToolEntry};
 
-use gpui::{App, AppContext as _};
+use gpui::{App, AppContext as _, Subscription};
 use studio_actions::agent::{Ask, NewConversation, OpenAgent, OpenConversation, ShowConversations};
 use studio_workspace::{PanelPosition, Workspace};
 use ui::IconName;
@@ -37,6 +38,47 @@ use ui::IconName;
 /// The argument that starts Studio's executable as the agent's launcher, which runs the agent
 /// without Omnigraph's credentials in its environment where there is no `env -u` (spec 013).
 pub const LAUNCH_COMMAND: &str = "launch-agent";
+
+/// Calls `on_attention` whenever a conversation, in any window, finishes a turn, stops short or
+/// begins to wait for the person's answer (spec 045): what a notification tells someone working
+/// in another app. It names the conversation, its graph and its branch, never what was said.
+pub fn on_attention(
+    cx: &mut App,
+    mut on_attention: impl FnMut(&Attention, &mut App) + 'static,
+) -> Subscription {
+    let sessions = sessions::AgentSessions::global(cx);
+    cx.subscribe(&sessions, move |_, attention, cx| {
+        on_attention(attention, cx)
+    })
+}
+
+/// The key of the graph a conversation is filed under (`GraphSession::overrides_key`), when it
+/// is one of the index's.
+pub fn graph_of_conversation(session: &str, cx: &mut App) -> Option<String> {
+    let sessions = sessions::AgentSessions::global(cx);
+    let sessions = sessions.read(cx);
+    let session = sessions.current(session);
+    sessions.get(&session).map(|record| record.graph.clone())
+}
+
+/// Files a conversation, given as its saved record, in the index, for another crate's tests.
+#[cfg(any(test, feature = "test-support"))]
+pub fn remember_conversation_for_test(record: serde_json::Value, cx: &mut App) {
+    let record: sessions::SessionRecord = serde_json::from_value(record).expect("a record");
+    let sessions = sessions::AgentSessions::global(cx);
+    sessions.update(cx, |sessions, cx| sessions.upsert(record, cx));
+}
+
+/// Tells the index a turn of `session` ended as `kind` says, as an agent tab does, for another
+/// crate's tests.
+#[cfg(any(test, feature = "test-support"))]
+pub fn end_turn_for_test(session: &str, kind: AttentionKind, cx: &mut App) {
+    let sessions = sessions::AgentSessions::global(cx);
+    sessions.update(cx, |sessions, cx| match kind {
+        AttentionKind::Waiting => sessions.set_live(session, Some(sessions::Live::Waiting), cx),
+        _ => sessions.turn_ended(session, kind, cx),
+    });
+}
 
 pub fn init(cx: &mut App) {
     // Agents run with the login shell's PATH (spec 011); read it before the first one starts.

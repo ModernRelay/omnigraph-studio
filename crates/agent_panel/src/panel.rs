@@ -37,7 +37,7 @@ use crate::cli_home::{self, CliHome};
 use crate::gateway::{Gateway, GatewayEvent, OnOutcome, Seen};
 use crate::gateway_rules::{Creates, Sandbox, WriteKind, WriteSummary};
 use crate::host::{AgentLaunch, HostCommand, HostEvent, Opened, SessionLaunch};
-use crate::sessions::{AgentSessions, Live, SessionRecord};
+use crate::sessions::{AgentSessions, AttentionKind, Live, SessionRecord};
 use crate::ui_tools::{StudioServer, studio_call};
 
 /// Presets offered when no agent is set: the ACP crate's own preset commands.
@@ -1837,6 +1837,17 @@ impl AgentPanel {
                 {
                     self.sessions
                         .update(cx, |sessions, cx| sessions.mark_unread(&id, cx));
+                }
+                // What a notification may tell the person away from Studio (spec 045); not a
+                // stop they asked for.
+                let attention = match &stop {
+                    Ok(StopReason::EndTurn) => Some(AttentionKind::Finished),
+                    Ok(StopReason::Cancelled) => None,
+                    Ok(_) | Err(_) => Some(AttentionKind::Stopped),
+                };
+                if let (Some(id), Some(kind)) = (self.session_id.clone(), attention) {
+                    self.sessions
+                        .update(cx, |sessions, cx| sessions.turn_ended(&id, kind, cx));
                 }
                 match stop {
                     Ok(StopReason::EndTurn) => {}
@@ -5810,5 +5821,95 @@ mod tests {
         assert_eq!(activity_summary(1, 1), "Thought 1 time, used 1 tool");
         assert_eq!(activity_summary(0, 2), "Used 2 tools");
         assert_eq!(activity_summary(2, 0), "Thought 2 times");
+    }
+
+    /// A turn's end, and a change waiting for the person, are told to whoever listens
+    /// ([`crate::on_attention`], spec 045) with the conversation's graph and its branch once it
+    /// exists; a stop the person asked for is not.
+    #[gpui::test]
+    async fn a_turn_that_ends_says_how(cx: &mut gpui::TestAppContext) {
+        use crate::sessions::{Attention, AttentionKind};
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, _) = graph_store::test_server::followed_session(
+            "node Person {\n  slug: String @key\n}\n",
+            |_| serde_json::json!([]),
+            cx,
+        );
+        cx.run_until_parked();
+        let (_root, cx) = cx.add_window_view(|_, _| gpui::EmptyView);
+        let panel = cx.update(|window, cx| {
+            cx.new(|cx| AgentPanel::new(session, WeakEntity::new_invalid(), None, window, cx))
+        });
+        let heard = std::rc::Rc::new(std::cell::RefCell::new(Vec::<Attention>::new()));
+        cx.update(|_, cx| {
+            let heard = heard.clone();
+            crate::on_attention(cx, move |attention, _| {
+                heard.borrow_mut().push(attention.clone())
+            })
+            .detach();
+        });
+        panel.update(cx, |panel, cx| {
+            panel.apply_event(
+                HostEvent::Ready {
+                    agent: "Claude Code".into(),
+                    session: "s-turns".into(),
+                    opened: Opened::New,
+                    ui_tools: None,
+                },
+                cx,
+            )
+        });
+        let graph = "dev@http://127.0.0.1:8787/knowledge";
+        let record: SessionRecord = serde_json::from_value(serde_json::json!({
+            "session": "s-turns",
+            "graph": graph,
+            "agent": "claude",
+            "created_at": "2026-11-19T10:00:00Z",
+            "updated_at": "2026-11-19T10:00:00Z",
+            "branch": "agent/turns",
+            "branch_created": false,
+            "pinned": false,
+            "archived": false,
+            "cwd": "/tmp"
+        }))
+        .unwrap();
+        let sessions = cx.update(|_, cx| AgentSessions::global(cx));
+        sessions.update(cx, |sessions, cx| sessions.upsert(record, cx));
+
+        for stop in [
+            Ok(StopReason::EndTurn),
+            Ok(StopReason::Cancelled),
+            Ok(StopReason::MaxTokens),
+            Err("the agent quit".to_owned()),
+        ] {
+            panel.update(cx, |panel, cx| {
+                panel.apply_event(HostEvent::TurnEnded { stop }, cx)
+            });
+        }
+        sessions.update(cx, |sessions, cx| {
+            sessions.set_branch_created("s-turns", "agent/turns", true, cx);
+            sessions.set_live("s-turns", Some(Live::Waiting), cx);
+            // Still waiting: told once.
+            sessions.set_live("s-turns", Some(Live::Waiting), cx);
+        });
+        cx.run_until_parked();
+        let heard = heard.borrow();
+        let kinds: Vec<_> = heard.iter().map(|attention| attention.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                AttentionKind::Finished,
+                AttentionKind::Stopped,
+                AttentionKind::Stopped,
+                AttentionKind::Waiting
+            ]
+        );
+        assert!(heard.iter().all(|attention| attention.graph == graph));
+        assert_eq!(heard[0].branch, None, "no branch yet");
+        assert_eq!(heard[3].branch.as_deref(), Some("agent/turns"));
     }
 }
