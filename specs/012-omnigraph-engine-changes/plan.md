@@ -453,8 +453,10 @@ text (`GET /graphs/{id}/queries`). Studio therefore cannot tell that a result co
 `$m.city` of a `Company`, nor add `$m.@id` to know which node a row shows, and a view built on a
 stored query is read-only. The entry's result columns, each with its variable, the variable's
 type, the property, and whether the query returns that variable's `@id`, would make its plain
-property cells editable as a `.gq` file's are. Engine rule: no query text is exposed; the
-descriptor is the compiler's. *Waits:* 024. *Today:* stored-query views are read-only.
+property cells editable as a `.gq` file's are, and its rows the nodes they show (spec 041).
+Engine rule: no query text is exposed; the descriptor is the compiler's. *Waits:* 024, 041.
+*Today:* stored-query views are read-only; a stored read's rows are nodes once the person says
+which column names one (`graphs."<key>".row_nodes`).
 
 **E52. A commit's schema change.** A commit that changed the schema cannot be compared with its
 parent: `GET /commits/{id}/changes` refuses it (409, `change_diff_refusal.reason`
@@ -558,6 +560,37 @@ results of a scan and of an index are the same. *Waits:* 031. *Today:* Studio ru
 search only on properties that declare an index, merges its hits after its own matches, and
 leaves out a property whose search fails.
 
+### The graph's own verbs (spec 041)
+
+Read from a `v0.15.0` server serving the beads and company-brain cookbooks on 2026-11-19; the
+readings are in spec 041's validation log.
+
+**E64. A stored query's file and tags, and a mutation's target.** Filed as
+[ModernRelay/omnigraph#1474](https://github.com/ModernRelay/omnigraph/issues/1474). A catalog
+entry (`GET /graphs/{id}/queries`) carries a query's name, description, instruction, whether it
+writes and its typed parameters, never the file it was declared in, nor tags, nor what a
+mutation writes: beads' `claim` is `id: string, who: string, lease: datetime?`, and nothing says
+`id` names an `Issue`. The entry's source file and tags (an annotation such as `@tag("check")`)
+would let a client group a graph's 60 to 70 stored queries as its owner wrote them and mark its
+checks once for every client; a mutation's written type and the parameter that names the entity
+it acts on would let a client offer "Verify claim" on a claim's page with no setting. Engine
+rule: no query text is exposed; the descriptor is the compiler's (it knows the `update Issue …
+where slug = $id`). *Waits:* 041 (and proposal 1's checks). *Today:* the Queries panel groups
+stored queries as Pinned, Reads and Writes; the person says once per graph which type a
+mutation's parameter names (`graphs."<key>".node_params`), which makes it an action on that
+type's pages and result rows.
+
+**E65. Properties the engine stamps on every write.** A graph whose compare-and-swap keys on
+`updated_at` (beads' `edit`, the hardware program's `revise_requirement`) relies on every writer
+setting it; a hand edit from Studio, a `load` or another client that does not is overwritten by
+an agent working from a stale read. A schema annotation such as `@stamp(now)` on a `DateTime`
+and `@stamp(actor)` on a `String`, applied by the engine on every insert and update of the type
+unless the write sets the property, would keep the graph's rule for every writer. Engine rule:
+the stamp is the commit's time and actor, the same for every row a write touches, and a write
+that sets the property itself wins. *Waits:* 041. *Today:* a per-graph setting
+(`graphs."<key>".stamps`) adds the stamps to Studio's own edits and new nodes; other writers keep
+their own.
+
 ### In 0.14, not in 0.13.0
 
 Studio's minimum server serves these, so it uses them without asking the server's OpenAPI
@@ -598,6 +631,8 @@ Then engine changes still open:
    disposition.
 10. E49 to E51, which would make finding a node one request and right on every type, however
     large; E49 is the smallest.
+11. E64, then E65: the catalog says what a stored mutation acts on, and the schema what every
+    write stamps, so a graph's verbs and rules need no setting in each client.
 
 ## Decisions
 
@@ -611,6 +646,7 @@ Then engine changes still open:
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-11-19 | A catalog entry names no file, tag or written type (E64) | `GET /graphs/beads/queries` and `GET /graphs/company/queries` on a `v0.15.0` server serving the cookbooks; `gh issue view 1474` | Entries carry `name`, `tool_name`, `description`, `instruction`, `mutation`, `params`; #1474 open. E65 is new, not filed |
 | 2026-11-18 | What `v0.15.0` resolves, and a validation refusal's disposition (E9, E35 to E38, E54) | `docs/releases/v0.15.0.md` at the tag; `gh issue view` 969, 970, 972, 1157; mutations sent with curl to `v0.14.0` and `v0.15.0` release servers serving `script/dev-server`'s cluster plus a `MemberOf: Member -> Team @card(1..)` edge | E9 landed (#1012); E35 partly (#1201, #969 closed); #970, #972, #1157 open. A lone `Member` insert: 0.14 commits it, 0.15 answers 400 `@card violation … (min 1)` with `effects: unknown, action: reconcile`; with its `MemberOf` in the same mutation both commit. Deleting a required edge and an edge to a missing node answer the same disposition on both releases: E54 |
 | 2026-11-17 | Omnigraph `v0.15.0` needs no engine change from Studio | `openapi.json` at `v0.15.0` diffed with `v0.14.0`'s; the release notes (`gh release view v0.15.0`) | Contract still 0.14; no path, field or enum value removed; new fields (`ranking`, `details`, `client_id`) optional, one new error code (`not_admitted`). No new ID |
 | 2026-11-06 | A page of a wide, large type costs the server what it holds, not what it returns (E39) | `script/dev-big-server` (`v0.14.0`, `Account`: 95 columns, 100,000 rows), each read sent with curl, then Studio's snapshot tool with `OMNIGRAPH_STUDIO_TRACE` (`docs/perf/20261106-report.md`) | `order { $n.@id } limit 100` returning `$n`: 0.91 s; returning `$n.slug`: 0.08 s; `$n` unordered: 0.03 s; `$n.@id = $id`: 0.43 s; `$n.@id in $ids` (101): 0.46 s. Studio's first page: 947 ms of which 3.5 ms decoding. Filed as E39 |

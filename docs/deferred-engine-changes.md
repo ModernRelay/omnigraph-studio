@@ -37,7 +37,7 @@ it goes through Omnigraph's own RFC process.
 | E40 | Arithmetic and string functions in GQ expressions (`return`, `order`, filters), so a computed column is the server's projection | 023 | No computed columns |
 | E41 | An optional traversal in `match`, so a page sorted by a neighbour's value or an aggregate over a relationship is one keyset run that keeps the nodes with no neighbour | 023 | Sorting by a lookup or rollup is not offered |
 | E42 | A per-graph view registry clients may write, so a view is shared with everyone who opens the graph; a view names a stored query or a type, never its own query text | 024 | Views are personal, in Studio's settings |
-| E43 | A stored query's result columns with the variable, type and property each comes from, in its catalog entry | 024 | Stored-query views are read-only |
+| E43 | A stored query's result columns with the variable, type and property each comes from, in its catalog entry | 024, 041 | Stored-query views are read-only; a stored read's rows are nodes once the person says which column names one, per graph |
 | E44 | A commit's added, changed and removed counts in `CommitOutput`, and by type | 009, 026, 033 | One changes page per drawn commit, partial past 100 |
 | E45 | A direct `cluster apply` that releases its admission lock when it ends (or `--release-lock`; [#1359](https://github.com/ModernRelay/omnigraph/issues/1359)) | 029 | The local recipe releases it with `cluster status --json` piped into `cluster force-unlock` |
 | E46 | The CLI keeps a token for a loopback `http://` server | 029 | Adds the server as an anonymous target and keeps the token in memory until Studio quits |
@@ -49,6 +49,8 @@ it goes through Omnigraph's own RFC process.
 | E52 | The schema at a commit, or a commit's schema diff | 033 | A schema change's tab says "Schema change" and the type the refusal names, with no retry |
 | E53 | A merge conflict's base, source and target images | 033 | The conflict's kind in words and the server's message, on its card and in the conflicts list |
 | E54 | A write refused in validation, before any effect (an `@card` bound, a missing endpoint), states `effects: none` and the violation as a typed detail; 0.14 and 0.15 answer 400 `bad_request` with `effects: unknown, action: reconcile` | 004, 034 | Judges it unknown, as the disposition says, and names the `@card` bound from the server's words; the new-node dialog sends a node with the edges its minimum needs so a 0.15 server does not refuse it |
+| E64 | A stored query's source file and tags in its catalog entry; a mutation's written type and target parameter ([#1474](https://github.com/ModernRelay/omnigraph/issues/1474)) | 041 | Stored queries grouped as Pinned, Reads and Writes; the person says once per graph which type a mutation's parameter names, which makes it a node action |
+| E65 | Properties the engine stamps on every write (`@stamp(now)`, `@stamp(actor)`) | 041 | A per-graph `stamps` setting adds them to Studio's own edits and new nodes |
 
 Every server Studio supports serves these (checked against `v0.14.0`'s OpenAPI document, 2026-10-24):
 
