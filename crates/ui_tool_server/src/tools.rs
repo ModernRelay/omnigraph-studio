@@ -849,6 +849,10 @@ async fn target_window(
         return read.unwrap_or_else(|_| Answer::window_closed(id));
     };
 
+    // A branch the window has not listed yet is the usual case for an agent that has just made
+    // it: the branch list is read once, as the Branches panel's Refresh reads it, before the
+    // call is judged (spec 043).
+    read_branches_for(cx, handle, tool, &input).await;
     let first = handle.update(cx, |workspace, window, cx| {
         dispatch(id, tool, &input, workspace, window, cx)
     });
@@ -911,6 +915,44 @@ async fn target_window(
         answer
     });
     second.unwrap_or_else(|_| Answer::window_closed(id))
+}
+
+/// Reads the window's branch list again, once, when a tool names a branch its last list did not
+/// hold, and waits for it, at most [`WAIT`]. The session reads it, not this crate.
+async fn read_branches_for(
+    cx: &mut AsyncApp,
+    handle: WindowHandle<Workspace>,
+    tool: &UiTool,
+    input: &Value,
+) {
+    let named = tool.needs.iter().find_map(|need| match need {
+        Need::Branch(key) => input.get(*key).and_then(Value::as_str).map(str::trim),
+        _ => None,
+    });
+    let Some(branch) = named.filter(|branch| !branch.is_empty()) else {
+        return;
+    };
+    let session = handle.update(cx, |workspace, _, cx| {
+        let session = workspace.session()?.clone();
+        let unknown = session
+            .read(cx)
+            .branches
+            .loaded()
+            .is_some_and(|branches| !branches.iter().any(|known| known == branch));
+        unknown.then(|| {
+            session.update(cx, |session, cx| session.reload_branches(cx));
+            session
+        })
+    });
+    let Ok(Some(session)) = session else {
+        return;
+    };
+    let deadline = cx.background_executor().now() + WAIT;
+    while cx.update(|cx| session.read(cx).branches_reading())
+        && cx.background_executor().now() < deadline
+    {
+        cx.background_executor().timer(POLL).await;
+    }
 }
 
 /// What a window says the first time an agent outside Studio acts in it, once a run.

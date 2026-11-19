@@ -8,6 +8,19 @@ use ui_tool_server::tools::{self as ui_tools, Answer, Caller, Target};
 
 /// A window with every feature, showing the dev graph's schema on a fake server.
 fn studio(cx: &mut TestAppContext) -> (gpui::Entity<Workspace>, &mut VisualTestContext, u64) {
+    let (workspace, cx, id, _) = studio_served(cx);
+    (workspace, cx, id)
+}
+
+/// [`studio`], with what the fake server serves.
+fn studio_served(
+    cx: &mut TestAppContext,
+) -> (
+    gpui::Entity<Workspace>,
+    &mut VisualTestContext,
+    u64,
+    std::sync::Arc<std::sync::Mutex<graph_store::test_server::Served>>,
+) {
     cx.update(|cx| {
         studio_theme::init_test(cx);
         studio_settings::init_test(cx);
@@ -21,7 +34,7 @@ fn studio(cx: &mut TestAppContext) -> (gpui::Entity<Workspace>, &mut VisualTestC
         history::init(cx);
         agent_panel::init(cx);
     });
-    let (session, _) = graph_store::test_server::followed_session(
+    let (session, served) = graph_store::test_server::followed_session(
         include_str!("../../../dev/cluster/knowledge.pg"),
         |_| json!([]),
         cx,
@@ -42,7 +55,7 @@ fn studio(cx: &mut TestAppContext) -> (gpui::Entity<Workspace>, &mut VisualTestC
     });
     cx.update(|window, _| window.refresh());
     cx.run_until_parked();
-    (workspace, cx, id)
+    (workspace, cx, id, served)
 }
 
 async fn run(cx: &mut VisualTestContext, id: u64, name: &str, mut input: Value) -> Answer {
@@ -161,6 +174,47 @@ async fn graph_open_branch_and_its_history_open_main(cx: &mut TestAppContext) {
     .await;
     assert_eq!(again.outcome, "no_change", "the same history");
     let missing = run(cx, id, "graph_open_branch", json!({ "branch": "nope" })).await;
+    assert_eq!(missing.outcome, "not_available");
+}
+
+/// An agent that has just made a branch names it before Studio's poll has listed it: the
+/// window reads its branch list once and opens it (spec 043). A branch still not listed after
+/// that read is refused as before.
+#[gpui::test]
+async fn graph_open_branch_reads_the_branches_for_one_just_made(cx: &mut TestAppContext) {
+    let (workspace, cx, id, served) = studio_served(cx);
+    served.lock().unwrap().branches.push("agent/new".into());
+    let answer = run(
+        cx,
+        id,
+        "graph_open_branch",
+        json!({ "branch": "agent/new" }),
+    )
+    .await;
+    assert_eq!(
+        opened(&answer),
+        (
+            json!({ "kind": "branch", "branch": "agent/new" }),
+            json!("Review")
+        )
+    );
+    workspace.read_with(cx, |workspace, cx| {
+        let session = workspace.session().unwrap().read(cx);
+        assert!(
+            session
+                .branches
+                .loaded()
+                .unwrap()
+                .contains(&"agent/new".to_owned())
+        );
+    });
+    let missing = run(
+        cx,
+        id,
+        "graph_open_branch",
+        json!({ "branch": "agent/none" }),
+    )
+    .await;
     assert_eq!(missing.outcome, "not_available");
 }
 

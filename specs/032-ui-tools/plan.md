@@ -219,7 +219,7 @@ The first set is small and only navigates and shows things.
 | `graph_show_node_in_tree` | `graph::ShowNodeInTree` | Open the relationship tree from a node |
 | `graph_open_map` | `graph::OpenMap` | Open the schema's map |
 | `graph_open_source` | `graph::OpenSource` | Open the schema's source, at a type |
-| `graph_open_branch` | `graph::OpenBranch` | Open a branch's review tab |
+| `graph_open_branch` | `graph::OpenBranch` | Open a branch's review tab; a branch the window has not listed yet is looked for in the branch list read once first (spec 043) |
 | `graph_open_branch_history` | `graph::OpenBranchHistory` | Open a branch's history |
 | `graph_open_commit` | `graph::OpenCommit` | Open one commit |
 | `graph_new_query_with_text` | `graph::NewQueryWithText` | Open a query tab with text in it. It does not run |
