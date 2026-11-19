@@ -422,7 +422,7 @@
       "k": "studio_review::PreviousChange",
       "up": "studio_review::PreviousChange",
       "space": "studio_review::ToggleChange",
-      "g": "studio_graph::OpenAsCanvas"
+      "g": "studio_review::ShowOnCanvas"
     }
   },
   {

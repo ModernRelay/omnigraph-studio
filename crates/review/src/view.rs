@@ -30,8 +30,8 @@ use serde_json::Value;
 use studio_actions::changes::OpenChanged;
 use studio_actions::graph::OpenNodePage;
 use studio_actions::review::{
-    AcceptAndNext, EditChange, Merge, NextChange, PreviousChange, RevertAndNext, Summarize,
-    SwitchLayout, ToggleChange,
+    AcceptAndNext, EditChange, Merge, NextChange, PreviousChange, RevertAndNext, ShowOnCanvas,
+    Summarize, SwitchLayout, ToggleChange,
 };
 use studio_actions::workspace::Refresh;
 use studio_actions::{ViewKind, ViewLink};
@@ -1338,6 +1338,15 @@ impl ReviewView {
                 .get(&(entry.other_type.clone(), entry.other_id.clone()))
                 .cloned(),
         }
+    }
+
+    /// Whether the review is read and holds a change to draw (spec 042).
+    fn can_draw_change(&self) -> bool {
+        matches!(self.load, LoadState::Ready)
+            && self
+                .data
+                .as_ref()
+                .is_some_and(|data| !data.groups.groups.is_empty())
     }
 
     /// The review's change as a graph, for its canvas (spec 042): `None` until it is read.
@@ -5135,6 +5144,14 @@ impl Render for ReviewView {
                     this.set_layout(this.layout.other(), cx)
                 }),
             )
+            // Offered once the change is read and holds something to draw (spec 042).
+            .when(self.can_draw_change(), |d| {
+                d.on_action(cx.listener(|this, _: &ShowOnCanvas, window, cx| {
+                    if let Some(action) = this.change_on_canvas() {
+                        window.dispatch_action(Box::new(action), cx);
+                    }
+                }))
+            })
             .child(header)
             .child(body)
             .children(self.render_footer(cx))
@@ -6638,6 +6655,19 @@ pub(crate) mod tests {
                 Some("role: partner")
             );
         });
+        // `g` (ShowOnCanvas) asks for the same change.
+        let shown: Rc<std::cell::Cell<usize>> = Rc::default();
+        cx.update(|_, cx| {
+            let shown = shown.clone();
+            cx.on_action(move |action: &ShowChangeOnCanvas, _| {
+                assert_eq!(action.links.len(), 1);
+                shown.set(shown.get() + 1);
+            });
+        });
+        view.update_in(cx, |view, window, cx| window.focus(&view.focus_handle, cx));
+        cx.dispatch_action(ShowOnCanvas);
+        cx.run_until_parked();
+        assert_eq!(shown.get(), 1);
     }
 
     /// A name read for a node the review knows only by id is kept while the review is read at

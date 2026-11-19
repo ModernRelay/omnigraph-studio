@@ -983,6 +983,8 @@ pub mod review {
             ToggleChange,
             /// Switch the review between its feed of types and one record at a time.
             SwitchLayout,
+            /// Show the branch's change as a graph: what it changed and what that hangs on.
+            ShowOnCanvas,
         ]
     );
 }

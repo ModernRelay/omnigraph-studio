@@ -31,8 +31,9 @@ changed relationship, what its other end is beyond its name.
   card's height never changes when they arrive. A change read again at a new head is drawn in
   the same tab with the nodes drawn before where they were.
 - **VI, VIII.** The Canvas view is a link of the review's view strip, disabled with its reason
-  while the changes are read or when there are none; `g` in the review and the palette's
-  "Open as canvas" open it.
+  while the changes are read or when there are none; `studio_review::ShowOnCanvas` (`g` in
+  the review, and in the palette once the change is read) and the palette's "Open as canvas"
+  open it.
 - **IX, work is bounded.** The canvas's node cap (spec 006) bounds the change's chips, with
   "Too many nodes to draw · N not shown · Open as table"; the facts read is one read per type,
   of at most `NAME_BATCH` ids, the first `NAME_LIMIT` ends, as the names read is.
@@ -56,7 +57,7 @@ changed relationship, what its other end is beyond its name.
   pill (`SceneKind::Hub`) between a node and its neighbours.
 - `studio_graph::OpenAsCanvas` ("Show what the active tab shows on a canvas") is offered while
   the active tab's strip has a Canvas link (`Workspace::register_view_action`), and has no
-  default binding.
+  default binding: `studio/tests/keymaps.rs` keeps the OpenAs family palette-only.
 - `builder::nodes_fields_by_id` reads chosen properties of nodes of one type by id, each in
   its `field_column` (`v_<name>`).
 - Omnigraph `v0.15.0` (contract 0.14): the review's reads are the change feed and
@@ -71,8 +72,10 @@ changed relationship, what its other end is beyond its name.
 - The review's view strip is Review · **Canvas** · History. Canvas is disabled with
   "The changes are still being read" until the review is read, and with "No changes to draw"
   for a review with none; its tooltip is "The change as a graph, with what it attaches to".
-  `g` in the review (context `Review && !searching`) and the palette's Open as canvas
-  (`studio_graph::OpenAsCanvas`) open it, as a click on the link does.
+  `studio_review::ShowOnCanvas` ("Show the branch's change as a graph"; `g` in context
+  `Review && !searching`, offered once the change is read and holds something) and the
+  palette's Open as canvas (`studio_graph::OpenAsCanvas`) open it, as a click on the link
+  does.
 - Opening it sends `studio_graph::ShowChangeOnCanvas` with the change as a graph
   (`change_cards::change_graph`):
   - **nodes**: every node the branch changed, with what it did (`ChangeMark`: Added, Changed,
@@ -158,7 +161,7 @@ changed relationship, what its other end is beyond its name.
 | Facts read for anchors only; a changed end's from its own image | A read for every end | The changed end's values are in the review already, and at the same head |
 | The review builds the graph (`change_cards::change_graph`) and the canvas draws it from an action | The canvas reading the review's entity | Feature crates do not depend on each other (`docs/architecture.md`); the action carries ids, names and marks only, as `ShowResultsOnCanvas` does |
 | A change's canvas opens no further out than 0.8 | A whole fit, as a walk opens | A reviewer reads names; a fit of a seven-relationship ingest drew letter marks only. Fit still fits the whole |
-| The data action has no binding of its own | A `studio_review::ShowOnCanvas` | `OpenAsCanvas` already means "show what the tab shows on a canvas"; `g` binds it in the review as `g` shows a row or a tree node on a canvas. `ShowChangeOnCanvas`, like `ShowResultsOnCanvas`, carries data and is not built from the palette |
+| The review's key is an action of its own, `studio_review::ShowOnCanvas` on `g` | Binding `g` to `studio_graph::OpenAsCanvas` | The OpenAs family stays palette-only (`every_action_has_a_key_or_is_palette_only`, which caught the first attempt in CI); `g` shows a row or a tree node on a canvas the same way (`studio_table::ShowRowOnCanvas`, `studio_tree::ShowOnCanvas`). `ShowChangeOnCanvas`, like `ShowResultsOnCanvas`, carries data and is not built from the palette |
 
 ## Deferred
 
@@ -180,7 +183,8 @@ changed relationship, what its other end is beyond its name.
 | 2026-11-19 | A change draws each node once, marked, its anchors unmarked, each relationship a pill between its ends, from where most relationships meet; a removed node reads at the fork; pointing and zooming make no chip text; the same change lays out nothing and a newer one keeps the nodes' places | `graph_canvas` `a_change_draws_its_nodes_and_relationships_marked` | Passes |
 | 2026-11-19 | A change past the cap draws what fits, every pill with both ends, and counts the rest | `graph_canvas` `a_change_past_the_cap_counts_what_it_leaves_out` | Passes |
 | 2026-11-19 | The review's graph holds its changed nodes, its anchors named, its relationships source to target in a card's words, and counts what it cannot draw | `change_cards` `a_change_is_a_graph_of_its_nodes_their_anchors_and_its_relationships` | Passes |
-| 2026-11-19 | Canvas waits for the review; read, it sends the change at the reviewed head and fork; a line shows its anchor's facts read at the head | `review` `the_change_opens_as_a_graph_and_its_lines_say_what_they_reach` | Passes |
+| 2026-11-19 | Canvas waits for the review; read, it sends the change at the reviewed head and fork, as `g` does; a line shows its anchor's facts read at the head | `review` `the_change_opens_as_a_graph_and_its_lines_say_what_they_reach` | Passes |
+| 2026-11-19 | A self-relationship hangs off its node; a relationship the cap leaves out is counted; a removed node is walked at the fork (review of #145) | `graph_canvas` `a_change_past_the_cap_counts_what_it_leaves_out`, `a_change_draws_its_nodes_and_relationships_marked` | Pass |
 | 2026-11-19 | It works against a real server on a cookbook graph | Omnigraph `v0.15.0` release binaries (`omnigraph-server`, `omnigraph`), the vc-os cookbook applied as a cluster, its seed loaded with `load --mode append`, and the study's V2 ingest replayed as `act-writer` on `tentative/ingest-mtg-helix-margin-deep-dive` (11 stored mutations: a Meeting, an Artifact, a Signal, a Commitment and 7 relationships); Studio's offscreen snapshot (`crates/studio/examples/snapshot.rs`, debug build, 1600x1000) opening the branch's review, then Canvas, then a click on the deal | The review's line "about → Helix Runtime — Series A  Deal · round_type: series-a · stage: in-diligence · outcome: open"; the canvas "4 nodes changed · 7 relationships · 3 ends as they were", the call in the middle with the deal and Elena Vargas unmarked beside it; the deal selected shows in the inspector at the reviewed head. The first fit zoomed to about 0.3, where every chip was a letter mark (the study's f16): the first view now stops at 0.8 |
 | 2026-11-19 | Facts are a type's enumerations, numbers, dates, then text, three at most, never key, name, list or bookkeeping; their words are cut at a word | `gq_language` `a_nodes_facts_are_its_enumerations_numbers_dates_then_text`; `graph_store` `facts_read_as_names_and_values_cut_to_a_line` | Pass |
 
