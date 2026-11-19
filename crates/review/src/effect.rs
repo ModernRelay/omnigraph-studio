@@ -9,8 +9,8 @@
 use std::collections::HashSet;
 
 use gpui::{
-    AnyElement, AnyView, App, Context, Entity, EventEmitter, FocusHandle, Focusable, Render,
-    SharedString, StyleRefinement, Subscription, WeakEntity, Window,
+    AnyElement, AnyView, App, Context, Entity, EventEmitter, FocusHandle, Focusable, ListAlignment,
+    ListState, Render, SharedString, StyleRefinement, Subscription, WeakEntity, Window, list,
 };
 use graph_store::effect::{
     Effect, EffectRead, Heads, MergeResult, ResultStep, Rows, Side, Source, Want,
@@ -39,6 +39,19 @@ pub(crate) const ROWS_SHOWN: usize = 50;
 /// The most cells a listed row shows.
 const CELLS_SHOWN: usize = 4;
 
+/// One entry of the Effect's list.
+#[derive(Clone, Debug, PartialEq)]
+enum Entry {
+    /// A section's heading with its columns' names: the checks, or the watched reads.
+    Columns { checks: bool },
+    /// The watched section with nothing marked.
+    NoneWatched,
+    /// A read, by key.
+    Read(String),
+    /// An unfolded read's rows, by key.
+    Rows(String),
+}
+
 /// The tab.
 pub struct EffectView {
     session: Entity<GraphSession>,
@@ -54,6 +67,9 @@ pub struct EffectView {
     list: Entity<EffectRows>,
     /// The menu of reads to run, which its key opens too.
     picker_menu: PopoverMenuHandle<ContextMenu>,
+    /// The list's entries, and its state: only the entries in view are drawn.
+    entries: Vec<Entry>,
+    list_state: ListState,
     /// The session asks after both branches' heads while the tab is open, so a commit to
     /// either offers Refresh (constitution II), whatever branch the window is on.
     _head_watches: [graph_store::HeadWatch; 2],
@@ -177,11 +193,12 @@ impl EffectView {
         effect.update(cx, |effect, cx| effect.want(Want::All, None, cx));
         let list = EffectRows::new(cx);
         let subscriptions = vec![cx.observe(&effect, |this, _, cx| {
+            this.sync_entries(cx);
             this.keep_selection(cx);
             cx.emit(ItemEvent::UpdateTab);
             cx.notify();
         })];
-        Self {
+        let mut view = Self {
             session,
             effect,
             branch,
@@ -191,9 +208,14 @@ impl EffectView {
             open: HashSet::new(),
             list,
             picker_menu: PopoverMenuHandle::default(),
+            entries: Vec::new(),
+            list_state: ListState::new(0, ListAlignment::Top, px(800.)),
             _head_watches: head_watches,
             _subscriptions: subscriptions,
-        }
+        };
+        // The Effect may be read already: a review of the branch shares it.
+        view.sync_entries(cx);
+        view
     }
 
     /// The selection stays on a read still listed, else moves to the first.
@@ -237,6 +259,7 @@ impl EffectView {
         if !self.open.remove(&key) {
             self.open.insert(key.clone());
         }
+        self.sync_entries(cx);
         self.selected = Some(key);
         cx.notify();
     }
@@ -453,13 +476,7 @@ impl EffectView {
 
     /// The reads, checks first, as the cached list draws them.
     pub(crate) fn render_list(&self, cx: &mut Context<Self>) -> AnyElement {
-        let effect = self.effect.read(cx);
-        let held = effect.merge_result().held().is_some()
-            || matches!(effect.merge_result(), MergeResult::Publishing { .. });
-        let has_marks = effect.has_marks();
-        // Each read's sides are shared, so this copies a few names and counts.
-        let all: Vec<EffectRead> = effect.reads().to_vec();
-        if all.is_empty() {
+        if self.entries.is_empty() {
             return studio_ui::ds::empty_state(
                 IconName::ListTodo,
                 "No read is marked for this graph's reviews",
@@ -481,42 +498,91 @@ impl EffectView {
             )
             .into_any_element();
         }
-        let mut list = v_flex().w_full().pb(px(space::BETWEEN));
-        let sections: [(&str, bool); 2] = [("Checks", true), ("Watched", false)];
-        for (title, checks) in sections {
-            let reads: Vec<&EffectRead> = all
-                .iter()
-                .filter(|read| read.is_check() == checks)
-                .collect();
-            if reads.is_empty() {
-                if !checks && !has_marks {
-                    list = list.child(
-                        v_flex()
-                            .px(px(space::EDGE))
-                            .pt(px(space::BETWEEN - space::XS))
-                            .gap(px(space::SM))
-                            .child(studio_ui::ds::text::meta(title.to_owned()))
-                            .child(studio_ui::ds::text::muted(
-                                "No read is watched. Reads lists the stored reads to watch.",
-                            )),
-                    );
+        // Virtualized (constitution IX): only the entries in view are drawn.
+        list(
+            self.list_state.clone(),
+            // A list's item takes the width it is laid out in only when told to.
+            cx.processor(|this, ix, _window, cx| {
+                v_flex()
+                    .w_full()
+                    .child(this.render_entry(ix, cx))
+                    .into_any_element()
+            }),
+        )
+        .size_full()
+        .pb(px(space::BETWEEN))
+        .into_any_element()
+    }
+
+    /// The list's entries as the Effect and the unfolded reads are now: each section's
+    /// heading, its reads, and under an unfolded read its rows. The list is told what changed:
+    /// a new shape is spliced in, new answers in the same shape are measured again where they
+    /// are, so the scroll stays.
+    fn sync_entries(&mut self, cx: &App) {
+        let effect = self.effect.read(cx);
+        let mut entries = Vec::new();
+        if !effect.reads().is_empty() {
+            for checks in [true, false] {
+                let reads: Vec<&EffectRead> = effect
+                    .reads()
+                    .iter()
+                    .filter(|read| read.is_check() == checks)
+                    .collect();
+                if reads.is_empty() {
+                    if !checks && !effect.has_marks() {
+                        entries.push(Entry::NoneWatched);
+                    }
+                    continue;
                 }
-                continue;
-            }
-            list = list.child(self.render_columns(title, held, cx));
-            for read in reads {
-                list = list.child(self.render_read(read, held, cx));
-                if self.open.contains(&read.key) {
-                    list = list.child(render_rows_of(read, &self.target, held, cx));
+                entries.push(Entry::Columns { checks });
+                for read in reads {
+                    entries.push(Entry::Read(read.key.clone()));
+                    if self.open.contains(&read.key) {
+                        entries.push(Entry::Rows(read.key.clone()));
+                    }
                 }
             }
         }
-        div()
-            .id("effect-list")
-            .size_full()
-            .overflow_y_scroll()
-            .child(list)
-            .into_any_element()
+        if entries != self.entries {
+            let old = self.list_state.item_count();
+            self.list_state.splice(0..old, entries.len());
+            self.entries = entries;
+        } else {
+            self.list_state.remeasure();
+        }
+    }
+
+    /// One entry of the list.
+    fn render_entry(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let Some(entry) = self.entries.get(ix).cloned() else {
+            return gpui::Empty.into_any_element();
+        };
+        let effect = self.effect.read(cx);
+        let held = effect.merge_result().held().is_some()
+            || matches!(effect.merge_result(), MergeResult::Publishing { .. });
+        let read = |key: &str| effect.reads().iter().find(|read| read.key == key).cloned();
+        match entry {
+            Entry::Columns { checks } => {
+                self.render_columns(if checks { "Checks" } else { "Watched" }, held, cx)
+            }
+            Entry::NoneWatched => v_flex()
+                .px(px(space::EDGE))
+                .pt(px(space::BETWEEN - space::XS))
+                .gap(px(space::SM))
+                .child(studio_ui::ds::text::meta("Watched"))
+                .child(studio_ui::ds::text::muted(
+                    "No read is watched. Reads lists the stored reads to watch.",
+                ))
+                .into_any_element(),
+            Entry::Read(key) => match read(&key) {
+                Some(read) => self.render_read(&read, held, cx),
+                None => gpui::Empty.into_any_element(),
+            },
+            Entry::Rows(key) => match read(&key) {
+                Some(read) => render_rows_of(&read, &self.target, held, cx),
+                None => gpui::Empty.into_any_element(),
+            },
+        }
     }
 
     /// A section's heading, with the columns' names at their places.
@@ -1481,6 +1547,42 @@ mod tests {
             .filter(|line| line.contains("/commits/u1/publish"))
             .count();
         assert_eq!(published, 1, "never sent again");
+    }
+
+    /// A new credential takes the held result's answers away with the rest, and reads them
+    /// again under itself.
+    #[gpui::test]
+    async fn a_new_credential_reads_the_merge_result_again(cx: &mut gpui::TestAppContext) {
+        init(cx);
+        let (session, _asked) = effect_server(cx);
+        let graph = session.read_with(cx, |session, _| session.overrides_key());
+        cx.update(|cx| {
+            studio_settings::update(cx, |settings| {
+                settings.set_effect_mark(&graph, "ready", Some(EffectMark::Watched))
+            })
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            EffectView::new(session.clone(), "feature".into(), "main".into(), window, cx)
+        });
+        cx.run_until_parked();
+        let effect = view.read_with(cx, |view, _| view.effect.clone());
+        effect.update(cx, |effect, cx| effect.check_merge_result(cx));
+        cx.run_until_parked();
+        session.update(cx, |_, cx| {
+            cx.emit(graph_store::SessionEvent::CredentialChanged)
+        });
+        effect.read_with(cx, |effect, _| {
+            let ready = effect.reads().iter().find(|r| r.key == "ready").unwrap();
+            assert!(
+                !matches!(ready.at_result, Some(Side::Rows(_))),
+                "the old credential's answer is gone"
+            );
+        });
+        cx.run_until_parked();
+        effect.read_with(cx, |effect, _| {
+            let ready = effect.reads().iter().find(|r| r.key == "ready").unwrap();
+            assert!(matches!(ready.at_result, Some(Side::Rows(_))));
+        });
     }
 
     /// The list of reads is a cached view of its own: moving through the reads draws it once a

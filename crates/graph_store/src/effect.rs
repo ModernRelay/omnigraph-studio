@@ -288,7 +288,18 @@ impl Effect {
             }
             // The schema says which relationships have no key, for Studio's own check.
             SessionEvent::StoredQueriesChanged | SessionEvent::SchemaChanged => this.resolve(cx),
-            SessionEvent::CredentialChanged => this.refresh(cx),
+            // Nothing read under the old credential stays: the result's answers go too, and
+            // are read again at the held result.
+            SessionEvent::CredentialChanged => {
+                for read in &mut this.reads {
+                    read.at_result = None;
+                    read.result_diff = None;
+                }
+                this.refresh(cx);
+                if this.merge_result.held().is_some() {
+                    this.read_result(cx);
+                }
+            }
             SessionEvent::AccessChanged => cx.notify(),
             _ => {}
         })];
