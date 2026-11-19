@@ -3956,6 +3956,34 @@ pub fn insert_edge(
     })
 }
 
+/// Deletes every edge of one type between two nodes, in either direction, in one statement
+/// (spec 044): a relationship read both ways, removed whatever edges hold it, those not read
+/// included. Their nodes stay.
+pub fn delete_edges_between(
+    schema: &SchemaModel,
+    edge_name: &str,
+    a: &str,
+    b: &str,
+) -> Result<BuiltQuery, BuildError> {
+    let edge = edge(schema, edge_name)?;
+    let mut params = Params::new();
+    let a = params.add("a", "String", Value::String(a.to_owned()));
+    let b = params.add("b", "String", Value::String(b.to_owned()));
+    let text = format!(
+        "query studio_delete_edges_between({sig}) {{\n  delete {ty} where (@src = {a} and @dst = {b}) or (@src = {b} and @dst = {a})\n}}\n",
+        sig = params.signature(),
+        ty = edge.name,
+    );
+    Ok(BuiltQuery {
+        name: "studio_delete_edges_between".into(),
+        text,
+        params: params.values,
+        depends: Depends::Unknown,
+        seeds: None,
+        empty_without: None,
+    })
+}
+
 /// Deletes one edge by its id.
 pub fn delete_edge(
     schema: &SchemaModel,
@@ -5515,6 +5543,9 @@ mod tests {
         assert_compiles(&edges);
         let counted = page_degrees(&schema, "Person", &both, &["person-000000".into()]).unwrap();
         assert_compiles(&counted);
+        let removed =
+            delete_edges_between(&schema, "Knows", "person-000000", "person-000001").unwrap();
+        assert_compiles(&removed);
         assert!(counted.text.contains("$n <knows> $m"), "{}", counted.text);
         // A works-at relationship has two ends of two types: it is never read both ways.
         let works = schema

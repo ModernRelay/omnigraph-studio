@@ -340,9 +340,11 @@ struct AddEdge {
 enum EdgeChange {
     /// To the node with this id.
     Add(String),
-    /// The edges with these ids: one, or each edge between this node and one related both
-    /// ways (spec 044).
-    Remove(Vec<String>),
+    /// The edge with this id.
+    Remove(String),
+    /// Every edge between this node and the one with this id, either way: a relationship read
+    /// both ways (spec 044), whose edges may number more than were read.
+    RemoveBetween(String),
 }
 
 /// One write of a relationship change ([`NodePeek::write_edge`]): a replace is the removal of
@@ -536,6 +538,9 @@ pub struct NodePeek {
     group_menu: Option<(Entity<ContextMenu>, gpui::Point<Pixels>, Subscription)>,
     /// The type's relationships in the person's order, by key, as its layout last said.
     layout_order: Vec<String>,
+    /// The group of the related node the person selected on a page, which the keys that move,
+    /// name or fold a relationship act on.
+    selected_group: Option<usize>,
     _subscription: Subscription,
     /// The view's keyboard: ⌘S saves its drafts while it, or a field in it, has it. A page hands
     /// its focus here ([`crate::node_page::NodePage`]), so the keys reach the view with no field
@@ -827,6 +832,7 @@ impl NodePeek {
             regroup_owed: false,
             group_menu: None,
             layout_order: Vec::new(),
+            selected_group: None,
             _subscription: subscription,
         };
         match values {
@@ -1134,6 +1140,10 @@ impl NodePeek {
     /// person's, and stay; a write still out goes on.
     fn credential_changed(&mut self, cx: &mut Context<Self>) {
         self.forget_read(cx);
+        // What the old token read of related nodes' lines goes with the rest.
+        self.lines.clear();
+        self.lines_asked.clear();
+        self._line_reads.clear();
         self.owe_node(cx);
     }
 
@@ -3715,22 +3725,33 @@ impl NodePeek {
     }
 
     /// The first click on a neighbour's × asks; the second removes the relationship: its edge,
-    /// or each of its edges in a group read both ways.
+    /// or in a group read both ways every edge between the two (spec 044). `edge_id` names the
+    /// row; `neighbour` is the node at its other end.
     fn press_remove(
         &mut self,
         index: usize,
-        edge_ids: Vec<String>,
+        edge_id: String,
+        neighbour: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.edge_write_refusal(index).is_some() {
             return;
         }
-        if self.removing.as_deref() == edge_ids.first().map(String::as_str) {
+        if self.removing.as_deref() == Some(edge_id.as_str()) {
             self.removing = None;
-            self.write_edge(index, EdgeChange::Remove(edge_ids), None, window, cx);
+            let both = self
+                .groups
+                .get(index)
+                .is_some_and(|group| group.group.direction == Direction::Both);
+            let change = if both {
+                EdgeChange::RemoveBetween(neighbour)
+            } else {
+                EdgeChange::Remove(edge_id)
+            };
+            self.write_edge(index, change, None, window, cx);
         } else {
-            self.removing = edge_ids.first().cloned();
+            self.removing = Some(edge_id);
             cx.notify();
         }
     }
@@ -3793,11 +3814,12 @@ impl NodePeek {
                     step,
                 )
             }
-            EdgeChange::Remove(edge_ids) => (
-                match edge_ids.as_slice() {
-                    [edge_id] => builder::delete_edge(&schema, &group.edge, edge_id),
-                    _ => builder::delete_edges(&schema, &group.edge, edge_ids),
-                },
+            EdgeChange::Remove(edge_id) => (
+                builder::delete_edge(&schema, &group.edge, edge_id),
+                EdgeStep::Remove,
+            ),
+            EdgeChange::RemoveBetween(other) => (
+                builder::delete_edges_between(&schema, &group.edge, &id, other),
                 EdgeStep::Remove,
             ),
         });
@@ -3816,7 +3838,7 @@ impl NodePeek {
         let branch = self.branch.clone();
         let other = match &change {
             EdgeChange::Add(other) => other.clone(),
-            EdgeChange::Remove(_) => group.other_type.clone(),
+            EdgeChange::Remove(_) | EdgeChange::RemoveBetween(_) => group.other_type.clone(),
         };
         self.edge_writes.insert(index);
         self.group_notices.remove(&index);
@@ -5212,10 +5234,11 @@ impl NodePeek {
         &self,
         index: usize,
         n: usize,
-        edge_ids: Vec<String>,
+        edge_id: String,
+        neighbour: String,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let asked = self.removing.as_deref() == edge_ids.first().map(String::as_str);
+        let asked = self.removing.as_deref() == Some(edge_id.as_str());
         let edge = self.groups[index].group.edge.clone();
         if asked {
             return studio_ui::ds::row_button(
@@ -5229,7 +5252,7 @@ impl NodePeek {
             )))
             .on_click(cx.listener(move |this, _, window, cx| {
                 cx.stop_propagation();
-                this.press_remove(index, edge_ids.clone(), window, cx)
+                this.press_remove(index, edge_id.clone(), neighbour.clone(), window, cx)
             }))
             .into_any_element();
         }
@@ -5243,7 +5266,7 @@ impl NodePeek {
             ))
             .on_click(cx.listener(move |this, _, window, cx| {
                 cx.stop_propagation();
-                this.press_remove(index, edge_ids.clone(), window, cx)
+                this.press_remove(index, edge_id.clone(), neighbour.clone(), window, cx)
             }))
             .into_any_element()
     }
@@ -5337,6 +5360,7 @@ impl NodePeek {
                                             window.dispatch_action(Box::new(open), cx);
                                         } else {
                                             this.select_related(&ty, &id, cx);
+                                            this.selected_group = Some(index);
                                         }
                                     },
                                 ))
@@ -5353,12 +5377,15 @@ impl NodePeek {
                                 window.dispatch_action(Box::new(open), cx);
                             })
                         };
+                        let other_id = neighbour.id.clone();
                         match edge_ids.first().cloned().filter(|_| removes) {
                             // Pressed once, "Remove" stays until it is pressed again.
                             Some(first) if self.removing.as_deref() == Some(first.as_str()) => {
-                                row.end(self.render_remove(index, n, edge_ids, cx))
+                                row.end(self.render_remove(index, n, first, other_id, cx))
                             }
-                            Some(_) => row.actions(self.render_remove(index, n, edge_ids, cx)),
+                            Some(first) => {
+                                row.actions(self.render_remove(index, n, first, other_id, cx))
+                            }
                             None => row,
                         }
                     }))
@@ -5817,6 +5844,9 @@ impl NodePeek {
             .when(self.page, |view| {
                 view.on_action(cx.listener(Self::on_move_up))
                     .on_action(cx.listener(Self::on_move_down))
+                    .on_action(cx.listener(Self::on_move_to_top))
+                    .on_action(cx.listener(Self::on_name_relationship))
+                    .on_action(cx.listener(Self::on_toggle_both_ways))
             })
             .children(
                 self.group_menu
@@ -6069,14 +6099,14 @@ impl NodePeek {
             }
         }
         if !lines.is_empty() {
+            // Reads still out may answer with the old line after the new one: they go, and
+            // every row's line is asked for again (one the session's memo holds costs nothing).
+            self._line_reads.clear();
+            self.lines_asked.clear();
             self.lines
                 .retain(|(type_name, _), _| !lines.contains(type_name));
-            self.lines_asked
-                .retain(|(type_name, _)| !lines.contains(type_name));
             for index in 0..self.groups.len() {
-                if lines.contains(&self.groups[index].group.other_type) {
-                    self.read_lines(index, cx);
-                }
+                self.read_lines(index, cx);
             }
         }
         cx.notify();
@@ -6124,6 +6154,13 @@ impl NodePeek {
             return;
         }
         let at = group.read_at.clone();
+        // What the lines say is what the view shows: a head move that changes the type's nodes
+        // is not carried past (spec 015).
+        let depends = Depends::Types {
+            nodes: vec![other.clone()],
+            edges: Vec::new(),
+        };
+        self.note_shown(depends, None, cx);
         let read = self
             .session
             .update(cx, |session, cx| session.node_lines(ends, at, cx));
@@ -6182,14 +6219,17 @@ impl NodePeek {
 
     /// The group the page's selected related node is in, for the keys that move a group.
     fn selected_group(&self) -> Option<usize> {
+        // The group of the row the person clicked, while that node is still selected: a node
+        // can be in more than one group.
+        let index = self.selected_group?;
         let (type_name, id) = self.selected.as_ref()?;
-        self.groups.iter().position(|group| {
-            group.group.other_type == *type_name
-                && group
-                    .neighbours
-                    .loaded()
-                    .is_some_and(|shown| shown.iter().any(|n| n.id == *id))
-        })
+        let group = self.groups.get(index)?;
+        (group.group.other_type == *type_name
+            && group
+                .neighbours
+                .loaded()
+                .is_some_and(|shown| shown.iter().any(|n| n.id == *id)))
+        .then_some(index)
     }
 
     fn on_move_up(
@@ -6212,6 +6252,67 @@ impl NodePeek {
         if let Some(index) = self.selected_group() {
             self.move_group(index, 1, cx);
         }
+    }
+
+    fn on_move_to_top(
+        &mut self,
+        _: &studio_actions::node::MoveRelationshipToTop,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(group) = self
+            .selected_group()
+            .and_then(|index| self.groups.get(index))
+        {
+            let key = builder::relationship_key(&group.group);
+            self.change_layout(move |layout| layout.to_top(&key), cx);
+        }
+    }
+
+    fn on_name_relationship(
+        &mut self,
+        _: &studio_actions::node::NameRelationship,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(group) = self
+            .selected_group()
+            .and_then(|index| self.groups.get(index))
+        else {
+            return;
+        };
+        let key = builder::relationship_key(&group.group);
+        let title = graph_store::layout::schema_title(&group.group);
+        let current = self
+            .layout(cx)
+            .and_then(|layout| layout.name_of(&key))
+            .map(str::to_owned);
+        self.open_name_dialog(key, title, current, window, cx);
+    }
+
+    fn on_toggle_both_ways(
+        &mut self,
+        _: &studio_actions::node::ToggleBothWays,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(schema) = self.schema.clone() else {
+            return;
+        };
+        let Some(group) = self
+            .selected_group()
+            .and_then(|index| self.groups.get(index))
+        else {
+            return;
+        };
+        if !group.group.to_itself(&schema) {
+            return;
+        }
+        let (edge, on) = (
+            group.group.edge.clone(),
+            group.group.direction != Direction::Both,
+        );
+        self.change_layout(move |layout| layout.set_both_ways(&edge, on), cx);
     }
 
     /// Group `index`'s menu at `position`: move it, name it, read it both ways.
@@ -6272,6 +6373,7 @@ impl NodePeek {
                 .item(
                     studio_ui::menu::ContextMenuEntry::new("Move to top")
                         .disabled(at == Some(0))
+                        .action(Box::new(studio_actions::node::MoveRelationshipToTop))
                         .handler(on(Box::new(move |this, _, cx| {
                             let key = top.clone();
                             this.change_layout(move |layout| layout.to_top(&key), cx)
@@ -6283,8 +6385,9 @@ impl NodePeek {
             let current = named.clone();
             let menu = menu
                 .item(
-                    studio_ui::menu::ContextMenuEntry::new("Name…").handler(on(Box::new(
-                        move |this, window, cx| {
+                    studio_ui::menu::ContextMenuEntry::new("Name…")
+                        .action(Box::new(studio_actions::node::NameRelationship))
+                        .handler(on(Box::new(move |this, window, cx| {
                             this.open_name_dialog(
                                 rename.clone(),
                                 title.clone(),
@@ -6292,8 +6395,7 @@ impl NodePeek {
                                 window,
                                 cx,
                             )
-                        },
-                    ))),
+                        }))),
                 )
                 .when(named.is_some(), |menu| {
                     menu.item(
@@ -6312,6 +6414,7 @@ impl NodePeek {
                     } else {
                         "Read both ways as one"
                     })
+                    .action(Box::new(studio_actions::node::ToggleBothWays))
                     .handler(on(Box::new(move |this, _, cx| {
                         let edge = edge.clone();
                         this.change_layout(move |layout| layout.set_both_ways(&edge, !both), cx)
@@ -8017,13 +8120,13 @@ mod tests {
         let (view, cx) = page(session(KNOWS, cx), cx);
         view.update_in(cx, |view, window, cx| {
             assert!(!view.groups.is_empty(), "Person knows Person");
-            view.press_remove(0, vec!["e1".into()], window, cx);
+            view.press_remove(0, "e1".into(), "p2".into(), window, cx);
             assert_eq!(view.removing.as_deref(), Some("e1"), "the first press asks");
             assert!(view.edge_writes.is_empty(), "nothing is written yet");
-            view.press_remove(0, vec!["e1".into()], window, cx);
+            view.press_remove(0, "e1".into(), "p2".into(), window, cx);
             assert!(view.edge_writes.contains(&0), "the second press writes");
-            view.press_remove(0, vec!["e1".into()], window, cx);
-            view.press_remove(0, vec!["e1".into()], window, cx);
+            view.press_remove(0, "e1".into(), "p2".into(), window, cx);
+            view.press_remove(0, "e1".into(), "p2".into(), window, cx);
             assert!(view.removing.is_none(), "no press while the write is out");
             view.start_add(0, window, cx);
             assert!(view.adding.is_none(), "no add while the write is out");
@@ -10072,8 +10175,8 @@ mod tests {
                     ("p3", ["e3".to_owned()].as_slice())
                 ]
             );
-            view.press_remove(0, vec!["e1".into(), "e2".into()], window, cx);
-            view.press_remove(0, vec!["e1".into(), "e2".into()], window, cx);
+            view.press_remove(0, "e1".into(), "p2".into(), window, cx);
+            view.press_remove(0, "e1".into(), "p2".into(), window, cx);
         });
         cx.run_until_parked();
         assert!(
@@ -10087,8 +10190,9 @@ mod tests {
         );
         let sent = sent.lock().unwrap();
         assert_eq!(sent.len(), 1, "one write: {sent:?}");
-        assert_eq!(sent[0]["name"], "studio_delete_edges");
-        assert_eq!(sent[0]["params"]["ids"], json!(["e1", "e2"]));
+        assert_eq!(sent[0]["name"], "studio_delete_edges_between");
+        assert_eq!(sent[0]["params"]["a"], json!("p1"));
+        assert_eq!(sent[0]["params"]["b"], json!("p2"));
     }
 
     /// A related node's row says what its type's rows show after their names (spec 044):

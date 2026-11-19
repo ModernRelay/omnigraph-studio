@@ -323,7 +323,10 @@
       "space": "studio::ToggleInspector",
       "alt-up": "studio_node::MoveRelationshipUp",
       "alt-down": "studio_node::MoveRelationshipDown",
-      "cmd-alt-l": "studio_node::ShapeType"
+      "cmd-alt-l": "studio_node::ShapeType",
+      "alt-shift-up": "studio_node::MoveRelationshipToTop",
+      "f2": "studio_node::NameRelationship",
+      "alt-shift-b": "studio_node::ToggleBothWays"
     }
   },
   {

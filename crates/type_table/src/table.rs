@@ -12703,6 +12703,12 @@ impl Render for TypeTable {
             .when(self.kind == TableKind::Node, |table| {
                 table.on_action(cx.listener(Self::toggle_reading_layout))
             })
+            // A card opens its page on ↵ wherever the table may not edit, too.
+            .when(!writable && self.reads_as_cards(cx), |table| {
+                table.on_action(cx.listener(|this, _: &EditCell, window, cx| {
+                    this.on_open_row_page(&OpenRowPage, window, cx)
+                }))
+            })
             .on_action(cx.listener(Self::on_explore))
             .on_action(cx.listener(|this, _: &RefreshTable, window, cx| this.refresh(window, cx)))
             .on_action(cx.listener(Self::on_copy))
@@ -12858,12 +12864,16 @@ pub(crate) fn card_parts(
                 .as_str()
                 .is_some_and(|text| text.contains(char::is_whitespace))
     };
-    let text_property = lead.and_then(|lead| node.property(lead)).or_else(|| {
-        node.properties
-            .iter()
-            .filter(|p| !p.is_key && Some(p.name.as_str()) != label)
-            .find(long)
-    });
+    // The lead when it is text; a number or a status the type leads with stays a value.
+    let text_property = lead
+        .and_then(|lead| node.property(lead))
+        .filter(|property| reads_as_markdown(property))
+        .or_else(|| {
+            node.properties
+                .iter()
+                .filter(|p| !p.is_key && Some(p.name.as_str()) != label)
+                .find(long)
+        });
     let text = text_property
         .and_then(|property| row.value(&property.name).as_str())
         .map(studio_ui::text::plain_run)

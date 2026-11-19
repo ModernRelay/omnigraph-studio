@@ -1961,8 +1961,12 @@ impl Exploration {
                 this.state
                     .lines
                     .retain(|node, _| !lines.contains(&node.type_name));
-                this.lines_asked
-                    .retain(|node| !lines.contains(&node.type_name));
+                // Reads still out may land with the old line after the new one: they go, and
+                // every row's line is asked for again (the session's memo answers those held).
+                if !lines.is_empty() {
+                    this.lines_asked.clear();
+                    this._line_reads.clear();
+                }
                 this.request_missing(cx);
                 this.want_lines(cx);
                 this.changed(cx);

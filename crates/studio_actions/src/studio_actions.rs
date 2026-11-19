@@ -761,6 +761,13 @@ pub mod node {
             /// Shape how this node's type reads: what its page leads with, what its rows show
             /// after their names, and whether its table reads as cards.
             ShapeType,
+            /// Put the relationship of the selected related node first on its type's pages.
+            MoveRelationshipToTop,
+            /// Name the relationship of the selected related node in your own words.
+            NameRelationship,
+            /// Read the relationship of the selected related node both ways as one, or each way
+            /// apart again: for a relationship from a type to itself.
+            ToggleBothWays,
         ]
     );
 }

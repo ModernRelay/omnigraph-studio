@@ -116,7 +116,9 @@ incoming one. A relationship between two types is never folded; its menu offers 
 - **On a page** a group both ways reads its edges in one read, each row an edge, and lists each
   related node once, the edges to it together (`listed_rows`); it counts related nodes, not
   edges (`page_degrees`, `count($m)`). Its × removes every edge between the two, in either
-  direction, in one write (`delete_edges`). Its "+" adds an edge from this node.
+  direction and whether read or not, in one write (`delete_edges_between`: `delete Knows where
+  (@src = $a and @dst = $b) or (@src = $b and @dst = $a)`). Its "+" adds an edge from this
+  node.
 - **In the tree and on the canvas** a page both ways is read by node (`After::Neighbour`), each
   node once (`ExploreState::apply_page` drops the repeats), and is as long as the rows it read,
   so a full page still offers more.
@@ -141,7 +143,9 @@ incoming one. A relationship between two types is never folded; its menu offers 
   edge from the type to itself. The header's tooltip is not drawn over its open menu.
 - **A related node's row** shows the line of its type after its name, muted and cut first
   (`SidebarRow::detail`), read once for the group's nodes at the commit they were read at
-  (`GraphSession::node_lines`), and again for a type whose line changes. Its mark is its type's
+  (`GraphSession::node_lines`), noted in the page's read scope so a head move that changes the
+  type's nodes is not carried past, and again for a type whose line changes (reads still out are
+  dropped then, so an old line never lands after a new one). Its mark is its type's
   letter on the type's tint, as every row of a group is one type (beads B3).
 - **No relationships yet.** A page whose every relationship is counted empty, and hidden,
   says "No relationships yet · Show all to add one" under its heading; the button is the eye's.
@@ -198,9 +202,14 @@ A node type read as cards draws its table's rows as cards in place of the grid
 | `studio_node::ShapeType` | `NodePage && !Editor` | ⌘⌥L | Ctrl-Alt-L |
 | `studio_node::MoveRelationshipUp` | `NodePage && !Editor` | ⌥↑ | Alt-↑ |
 | `studio_node::MoveRelationshipDown` | `NodePage && !Editor` | ⌥↓ | Alt-↓ |
+| `studio_node::MoveRelationshipToTop` | `NodePage && !Editor` | ⌥⇧↑ | Alt-Shift-↑ |
+| `studio_node::NameRelationship` | `NodePage && !Editor` | F2 | F2 |
+| `studio_node::ToggleBothWays` | `NodePage && !Editor` | ⌥⇧B | Alt-Shift-B |
 | `studio_table::ToggleReadingLayout` | `TypeTable` | ⌘⌥R | Ctrl-Alt-R |
 
-The move keys move the relationship of the related node selected on the page.
+The relationship keys act on the group of the related node the person selected on the page (the
+group of the row clicked, as one node can sit in two groups); the group's menu shows each key.
+The lead and the line are chosen in the layout menu, which ⌘⌥L opens and the arrows walk.
 
 ## Decisions
 
@@ -238,6 +247,7 @@ The move keys move the relationship of the related node selected on the page.
 | 2026-11-19 | The walk reads the layout | `graph_store` `a_walk_reads_its_types_layout` | Ordered, folded, Maya once on a full page that still offers more |
 | 2026-11-19 | Fit keeps names readable | `graph_canvas` `fit_keeps_the_names_readable_and_fit_again_shows_all` | A 3,000 px walk in 600 px fits at `LEGIBLE_ZOOM` centred; Fit again shows all; again names |
 | 2026-11-19 | The running app reads the cookbooks as the study asked | `examples/snapshot` (debug build, Linux, lavapipe) against the `v0.15.0` server above, with each graph's layout in a settings file (`OMNIGRAPH_STUDIO_DATA`): brain `per-theo`'s page, its group menu (right-click) and its layout menu (Ctrl-Alt-L); program's tree from `blk-payload`, Imager optics opened with Alt-→; dev's canvas from `inc-presence-leak`, every relationship opened in its tree, then Fit and Fit; company's Claim table as cards; beads `lk-queue`'s page | brain: `brief` first; "Notes about them" and "Tasks" first with "preference · For Theo: peated Islay…" and "next · 2026-05-20 · i-owe"; `knows ↔ Person` lists Marco, Maya and Alex once (3, where the study saw them twice). program: "Imager optics mass 24.5 kg · estimated" in the tree and the inspector. dev: the first Fit drew every name (eleven nodes), the second the whole walk as marks. company: each claim's quote whole, `kind` and `status` in view. beads: "Blocked by" and "Blocks", each row an `I` |
+| 2026-11-19 | One write removes every edge of a relationship read both ways | `studio_delete_edges_between` sent to the `v0.15.0` server on a scratch branch of `brain` for `per-theo` and `per-maya`, then `$p <knows> $m` read there; the branch deleted after | `affected_edges: 2` in one commit; Theo then knew Alex and Marco only |
 | 2026-11-19 | Cards draw the rows and cost a keystroke nothing | `type_table` `a_type_read_as_cards_draws_its_rows_as_cards` (`docs/drawing.md`, Guards) | The card's text whole, its status as a value; typing in the filter field drew no card; ↵ opened the cursor's page |
 
 ## Corrections
@@ -248,3 +258,10 @@ The move keys move the relationship of the related node selected on the page.
   (`fit_again_shows_all`); `fit_keeps_the_names_readable_and_fit_again_shows_all` covers both.
 - 2026-11-19, before landing · A group's tooltip stayed over the menu its right-click opened;
   it is not drawn while the menu is open.
+- 2026-11-19, review of #154 · A both-ways × deleted only the edges read, so a node with more
+  edges than a page stayed related: it deletes by endpoints now. A related node's line was not
+  in the page's read scope; a line read still out could land after a newer one; a new token
+  kept the old token's lines; the move keys moved the first group holding the selected node,
+  not the one clicked; ↵ on a read-only table's card did nothing; a lead that is not text hid a
+  card's text; moving to the top, naming and folding had no keys. Each is fixed as described
+  above.
