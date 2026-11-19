@@ -292,33 +292,41 @@ async fn a_canvas_at_rest_is_not_drawn_again(cx: &mut gpui::TestAppContext) {
     });
 }
 
-/// A chip grabbed while it glides is taken from where it is drawn: it stays under the pointer,
-/// rather than jumping to where it was going.
+/// A chip pressed while it glides is held where it is drawn, under the pointer, for as long as
+/// the press lasts; a drag moves it from there, and a press that ends without a drag lets it
+/// glide on to its place.
 #[gpui::test]
 async fn a_chip_grabbed_mid_glide_stays_under_the_pointer(cx: &mut gpui::TestAppContext) {
     let (canvas, cx) = walk_in_window(cx);
-    land(
-        &canvas,
-        &["A", "B"],
-        vec![Vec2::default(), Vec2::new(0., 60.)],
-        cx,
-    );
-    until_rest(cx);
-    land(
-        &canvas,
-        &["A", "B"],
-        vec![Vec2::default(), Vec2::new(240., 60.)],
-        cx,
-    );
-    for _ in 0..3 {
-        frame(cx);
-    }
-    let chip = canvas.read_with(cx, |canvas, _| canvas.chips.borrow()[1]);
+    let glide_b_right = |canvas: &Entity<GraphCanvas>, cx: &mut VisualTestContext| {
+        land(
+            canvas,
+            &["A", "B"],
+            vec![Vec2::default(), Vec2::new(0., 60.)],
+            cx,
+        );
+        until_rest(cx);
+        land(
+            canvas,
+            &["A", "B"],
+            vec![Vec2::default(), Vec2::new(240., 60.)],
+            cx,
+        );
+        for _ in 0..3 {
+            frame(cx);
+        }
+        canvas.read_with(cx, |canvas, _| canvas.chips.borrow()[1].center())
+    };
+    let at = glide_b_right(&canvas, cx);
     let grabbed = drawn(&canvas, 1, cx);
     assert!(grabbed.x < 240., "still on its way");
     let zoom = canvas.read_with(cx, |canvas, _| canvas.zoom);
-    let at = chip.center();
     cx.simulate_mouse_down(at, MouseButton::Left, Modifiers::none());
+    // Held, not sliding out from under the pointer while the button is down.
+    for _ in 0..4 {
+        frame(cx);
+    }
+    assert_eq!(drawn(&canvas, 1, cx), grabbed, "held where it was taken");
     let to = point(at.x + px(40.), at.y);
     cx.simulate_mouse_move(to, MouseButton::Left, Modifiers::none());
     cx.run_until_parked();
@@ -329,6 +337,19 @@ async fn a_chip_grabbed_mid_glide_stays_under_the_pointer(cx: &mut gpui::TestApp
         "under the pointer: {placed:?}, not {expected:?}"
     );
     cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::none());
+    until_rest(cx);
+
+    // A click, a press with no drag: held while down, then on to its place.
+    canvas.update(cx, |canvas, _| canvas.pinned.clear());
+    let at = glide_b_right(&canvas, cx);
+    let pressed = drawn(&canvas, 1, cx);
+    cx.simulate_mouse_down(at, MouseButton::Left, Modifiers::none());
+    frame(cx);
+    assert_eq!(drawn(&canvas, 1, cx), pressed);
+    cx.simulate_mouse_up(at, MouseButton::Left, Modifiers::none());
+    assert_eq!(drawn(&canvas, 1, cx), pressed, "no jump when let go");
+    assert!(until_rest(cx) <= one_glide());
+    assert_eq!(drawn(&canvas, 1, cx), Vec2::new(240., 60.));
 }
 
 /// Reset layout glides the chips to their new places and the view to the fit; a walk's first
@@ -408,6 +429,10 @@ async fn an_arrow_key_keeps_the_chip_it_reaches_in_view(cx: &mut gpui::TestAppCo
     canvas.read_with(cx, |canvas, cx| {
         assert_eq!(canvas.selected_index(), Some(1));
         assert!(canvas.glide.is_none(), "at once");
+        assert!(
+            canvas.camera_touched,
+            "a resize keeps the chip in sight, not a new fit"
+        );
         let viewport = canvas.bounds.get().unwrap();
         let at = to_screen(canvas.positions[1], viewport, canvas.center, canvas.zoom);
         assert!(viewport.contains(&at), "B is in view");

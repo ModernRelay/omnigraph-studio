@@ -8,7 +8,9 @@
 //! window comes to the front, so a change made in the system's settings is taken when the
 //! person comes back.
 
-use gpui::{App, AppContext as _};
+use gpui::App;
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+use gpui::AppContext as _;
 use studio_settings::{ReduceMotion, StudioSettings};
 use studio_workspace::Workspace;
 
@@ -34,20 +36,32 @@ fn apply(cx: &mut App) {
     match StudioSettings::get(cx).studio.reduce_motion {
         ReduceMotion::On => cx.set_reduce_motion(true),
         ReduceMotion::Off => cx.set_reduce_motion(false),
-        ReduceMotion::System => {
-            let read = cx.background_spawn(async { system_reduces_motion() });
-            cx.spawn(async move |cx| {
-                let reduce = read.await;
-                cx.update(|cx| {
-                    // The setting may have changed while the system was asked.
-                    if StudioSettings::get(cx).studio.reduce_motion == ReduceMotion::System {
-                        cx.set_reduce_motion(reduce);
-                    }
-                });
-            })
-            .detach();
-        }
+        ReduceMotion::System => apply_system(cx),
     }
+}
+
+/// macOS and Windows answer in the process, at once: set before the first frame, so nothing
+/// moves at launch that the person asked to keep still.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn apply_system(cx: &mut App) {
+    cx.set_reduce_motion(system_reduces_motion());
+}
+
+/// Linux asks `gsettings`, a process, so off the main thread; its answer lands a moment after
+/// launch.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn apply_system(cx: &mut App) {
+    let read = cx.background_spawn(async { system_reduces_motion() });
+    cx.spawn(async move |cx| {
+        let reduce = read.await;
+        cx.update(|cx| {
+            // The setting may have changed while the system was asked.
+            if StudioSettings::get(cx).studio.reduce_motion == ReduceMotion::System {
+                cx.set_reduce_motion(reduce);
+            }
+        });
+    })
+    .detach();
 }
 
 /// macOS: Accessibility › Display › Reduce motion.

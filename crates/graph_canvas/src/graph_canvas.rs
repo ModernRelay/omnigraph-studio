@@ -278,6 +278,9 @@ struct Drag {
     followers: Vec<(usize, Vec2)>,
     /// A drag begun with ⇧ on empty space draws an area instead of moving the view.
     area: bool,
+    /// Chips that were gliding when the press took them, held where they were drawn, with the
+    /// places they were going to: a press that ends without a drag lets them glide on.
+    held: Vec<(usize, Vec2)>,
     /// The scene the indices above are in. Reads that finish during the drag lay the canvas
     /// out again, which can move a chip to another index or remove it.
     scene: Arc<Scene>,
@@ -295,6 +298,8 @@ impl Drag {
         if Arc::ptr_eq(&self.scene, scene) {
             return;
         }
+        // The layout placed the chips the press held.
+        self.held.clear();
         let at = scene.indices();
         let moved = |index: usize| {
             self.scene
@@ -1578,13 +1583,13 @@ impl GraphCanvas {
     }
 
     /// Moves the view just enough to show the selected chip whole in `viewport`, at the zoom
-    /// it has: the canvas's size changed under a view the person placed.
-    fn keep_selected_in(&mut self, viewport: Bounds<Pixels>) {
+    /// it has: the canvas's size changed under a view the person placed. Whether it moved.
+    fn keep_selected_in(&mut self, viewport: Bounds<Pixels>) -> bool {
         let Some(index) = self.selected_index() else {
-            return;
+            return false;
         };
         let Some(at) = self.positions.get(index).copied() else {
-            return;
+            return false;
         };
         let half_width = self.half_widths.get(index).copied().unwrap_or(60.) * self.zoom;
         let half_height = REVEAL_HALF_HEIGHT * self.zoom;
@@ -1611,7 +1616,9 @@ impl GraphCanvas {
                     zoom: self.zoom,
                 });
             }
+            return true;
         }
+        false
     }
 
     fn min_zoom(&self) -> f32 {
@@ -2007,6 +2014,17 @@ impl GraphCanvas {
             Some((index, _)) => self.followers(&[index], now),
             None => Vec::new(),
         };
+        // What the press took stops where it is drawn and is held there, under the pointer,
+        // until the drag moves it or the press ends.
+        let mut held = Vec::new();
+        for &(index, at) in node.iter().chain(&followers) {
+            if self.appear.remove(&index).is_some()
+                && let Some(position) = Arc::make_mut(&mut self.positions).get_mut(index)
+            {
+                held.push((index, *position));
+                *position = at;
+            }
+        }
         self.drag = Some(Drag {
             start: event.position,
             center: self.center,
@@ -2016,6 +2034,7 @@ impl GraphCanvas {
             took_chip: node.is_some(),
             followers,
             area: hit.is_none() && event.modifiers.shift,
+            held,
             scene: self.scene.clone(),
         });
         // Drawn again, so the caption lets the drag pass over it.
@@ -2165,6 +2184,9 @@ impl GraphCanvas {
         };
         // Drawn again, so the caption takes its own presses again.
         cx.notify();
+        if !drag.moved {
+            self.let_go(&drag, cx);
+        }
         drag.follow(&self.scene);
         if drag.area {
             // The chips the area touches are marked, added to those marked before.
@@ -2257,12 +2279,34 @@ impl GraphCanvas {
         let Some(mut drag) = self.drag.take() else {
             return;
         };
+        if !drag.moved {
+            self.let_go(&drag, cx);
+        }
         if drag.moved && !drag.area {
             drag.follow(&self.scene);
             self.place_dragged(&drag, cx);
         }
         self.area = None;
         cx.notify();
+    }
+
+    /// A press that ended without a drag lets the chips it held glide on to their places, from
+    /// where they were held. A layout that landed meanwhile placed them itself.
+    fn let_go(&mut self, drag: &Drag, cx: &App) {
+        if drag.held.is_empty() || !Arc::ptr_eq(&drag.scene, &self.scene) {
+            return;
+        }
+        let now = motion::now(cx);
+        let positions = Arc::make_mut(&mut self.positions);
+        for &(index, to) in &drag.held {
+            let Some(position) = positions.get_mut(index) else {
+                continue;
+            };
+            let from = std::mem::replace(position, to);
+            if motion::enabled(cx) {
+                self.appear.insert(index, Glide::new(from, to, now));
+            }
+        }
     }
 
     /// A dragged node or pill stays where it was dropped, and is remembered there, as does
@@ -3168,8 +3212,12 @@ impl GraphCanvas {
             self.select(Some(next), cx);
             // The view keeps the chip the keys reached in sight, at once: an arrow key is
             // pressed many times a minute, which never animates (constitution VII).
-            if let Some(viewport) = self.bounds.get() {
-                self.keep_selected_in(viewport);
+            // A view moved for the keys is one the person placed: a resize then keeps the chip
+            // in sight rather than fitting the walk again.
+            if let Some(viewport) = self.bounds.get()
+                && self.keep_selected_in(viewport)
+            {
+                self.camera_touched = true;
             }
         }
     }
@@ -3876,6 +3924,7 @@ mod tests {
             took_chip: true,
             followers: vec![(2, Vec2::new(2., 2.)), (0, Vec2::new(0., 0.))],
             area: false,
+            held: Vec::new(),
             scene: before.clone(),
         };
         drag.follow(&before);
@@ -4035,6 +4084,7 @@ mod tests {
                 took_chip: true,
                 followers: Vec::new(),
                 area: false,
+                held: Vec::new(),
                 scene: canvas.scene.clone(),
             });
             canvas.apply_layout(
@@ -4069,6 +4119,7 @@ mod tests {
                 took_chip: true,
                 followers: Vec::new(),
                 area: false,
+                held: Vec::new(),
                 scene: canvas.scene.clone(),
             };
             canvas.place_dragged(&drag, cx);
