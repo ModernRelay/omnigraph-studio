@@ -28,8 +28,10 @@ use graph_client::api::{
 };
 use graph_client::api::{ErrorCode, RankingOutput};
 use graph_client::{ReadError, Unauthorized, WriteOutcome};
+use graph_store::row_diff::RowDiff;
 use graph_store::{GraphSession, SessionEvent};
 use serde_json::{Map, Value};
+use studio_actions::effect::{ToggleCheck, ToggleWatched};
 use studio_actions::query::{
     ApplyFix, CopyCell, CopyRow, Explain, NextPage, NextProblem, PreviousProblem, Run, Save,
     SaveAs, SelectNextColumn, SelectPreviousColumn, ToggleResultsFocus,
@@ -96,6 +98,29 @@ struct Prepared {
     /// It asks for a plan (`explain`): only its answer is shown as one, whatever another
     /// read's columns are called.
     explain: bool,
+}
+
+/// What makes two runs the same read, whose rows can be compared (spec 036): the same text or
+/// stored query, the same values and the same page.
+#[derive(Debug, Clone, PartialEq)]
+struct RunKey {
+    text: String,
+    stored: Option<String>,
+    params: Option<Value>,
+    page: usize,
+}
+
+impl Prepared {
+    /// The run's key, for a read whose rows a later run is compared with; none for a write, a
+    /// statement or a plan.
+    fn run_key(&self) -> Option<RunKey> {
+        (!self.write && !self.statement && !self.explain).then(|| RunKey {
+            text: self.text.clone(),
+            stored: self.stored.clone(),
+            params: self.params.clone(),
+            page: self.page,
+        })
+    }
 }
 
 /// Where a read's rows came from, as its answer says.
@@ -220,6 +245,11 @@ struct RowsOutput {
     /// The head of that branch the session knew when the rows were shown, which may lag the
     /// commit they were read at: a later head other than both is a newer one.
     head_seen: Option<String>,
+    /// What made these rows, so the next run of the same read is compared with them.
+    run_key: Option<RunKey>,
+    /// How these rows differ from the last run of the same read in this tab (spec 036): its
+    /// rows are marked, and its counts are a fact ("+4 −1 since the last run").
+    since: Option<Arc<RowDiff>>,
 }
 
 impl RowsOutput {
@@ -3329,6 +3359,13 @@ impl QueryEditor {
             page if page > 1 => format!("Reading page {page} of {}…", prepared.label),
             _ => format!("Running {}{}…", prepared.label, read_at.suffix()),
         };
+        // The rows of the last run of the same read, to mark what this run brings (spec 036).
+        let previous = match &self.output {
+            Output::Rows(rows) if rows.run_key.is_some() && rows.run_key == prepared.run_key() => {
+                Some((rows.table.columns.clone(), rows.table.rows.clone()))
+            }
+            _ => None,
+        };
         self.replace_output(
             Output::Running {
                 label: label.into(),
@@ -3351,16 +3388,32 @@ impl QueryEditor {
             // The rows are built off the main thread: a large answer would hold up frames.
             let columns = prepared.columns.clone();
             let explain = prepared.explain;
-            let answer = cx
-                .background_spawn(
-                    async move { Answer::of(result, columns.as_deref(), schema, explain) },
-                )
+            let (answer, since) = cx
+                .background_spawn(async move {
+                    let answer = Answer::of(result, columns.as_deref(), schema, explain);
+                    let since = match (&answer, previous) {
+                        (Answer::Rows(_, built), Some((columns, rows)))
+                            if columns == built.table.columns =>
+                        {
+                            Some(Arc::new(graph_store::row_diff::diff_rows(
+                                &columns,
+                                &rows,
+                                &built.table.rows,
+                            )))
+                        }
+                        _ => None,
+                    };
+                    (answer, since)
+                })
                 .await;
             this.update(cx, |this, cx| {
                 // A new output replaces the plan whose operator lit the text.
                 this.light_plan_parts(None, cx);
                 let sent = prepared.sent.clone();
                 this.show_read(prepared, read_at, answer, elapsed);
+                if let Output::Rows(rows) = &mut this.output {
+                    rows.since = since;
+                }
                 this.hold_diagnostic(sent.as_ref(), cx);
                 this.rows_against_head(head_before, cx);
                 cx.emit(ItemEvent::UpdateTab);
@@ -3462,6 +3515,7 @@ impl QueryEditor {
                 // a statement names its own branches, and a commit never moves.
                 let rerun = (to_branch && matches!(read_at, ReadAt::Branch(_)) && !prepared.write)
                     .then(|| prepared.clone());
+                let run_key = prepared.run_key();
                 Output::Rows(Box::new(RowsOutput {
                     label: prepared.label,
                     graph,
@@ -3480,6 +3534,8 @@ impl QueryEditor {
                     rerun,
                     newer: false,
                     head_seen: None,
+                    run_key,
+                    since: None,
                 }))
             }
             Answer::Refused(error) => {
@@ -3917,6 +3973,40 @@ impl QueryEditor {
         }
     }
 
+    /// What the tab's stored read is marked under for the graph's reviews (spec 036): its name,
+    /// or its saved view's key; `None` for a query of the editor's, a stored query that writes,
+    /// and one that needs parameters a view does not keep.
+    fn effect_key(&self) -> Option<String> {
+        let stored = self.stored.as_ref()?;
+        if stored.entry.mutation {
+            return None;
+        }
+        match &stored.view {
+            Some(view) => Some(studio_settings::effect_view_key(view)),
+            None => stored
+                .entry
+                .params
+                .iter()
+                .all(|param| param.nullable)
+                .then(|| stored.entry.name.clone()),
+        }
+    }
+
+    /// Marks the tab's stored read as `mark` for the graph's reviews, or takes the mark away
+    /// when it is already that.
+    fn toggle_effect_mark(&mut self, mark: studio_settings::EffectMark, cx: &mut Context<Self>) {
+        let Some(key) = self.effect_key() else {
+            return;
+        };
+        let graph = self.session.read(cx).overrides_key();
+        studio_settings::update(cx, |settings| {
+            let now = settings.effect_marks(&graph).get(&key).copied();
+            settings.set_effect_mark(&graph, &key, (now != Some(mark)).then_some(mark));
+        });
+        cx.notify();
+    }
+
+    // ---- rendering ----
     // ---- rendering ----
 
     fn status_parts(&self, cx: &mut Context<Self>) -> ItemStatus {
@@ -3932,6 +4022,18 @@ impl QueryEditor {
             KeyHint::new("Save", &Save, &editor_focus),
             KeyHint::new("Save as…", &SaveAs, &editor_focus),
         ];
+        if self.effect_key().is_some() {
+            keys.push(KeyHint::new(
+                "Watch in reviews",
+                &ToggleWatched,
+                &editor_focus,
+            ));
+            keys.push(KeyHint::new(
+                "Use as a check in reviews",
+                &ToggleCheck,
+                &editor_focus,
+            ));
+        }
         if self.stored.is_none()
             && self
                 .analysis
@@ -3973,6 +4075,19 @@ impl QueryEditor {
                 start.push(
                     ds::meta(IconName::Clock, format_elapsed(rows.elapsed)).into_any_element(),
                 );
+                if let Some(since) = &rows.since {
+                    start.push(
+                        ds::meta(
+                            IconName::HistoryRerun,
+                            if since.is_empty() {
+                                "Same rows as the last run".to_owned()
+                            } else {
+                                format!("{} since the last run", since.counts())
+                            },
+                        )
+                        .into_any_element(),
+                    );
+                }
                 if let Some(ranking) = &rows.ranking {
                     let (fact, warning) = ranking_fact(ranking);
                     start.push(ds::meta(IconName::Crosshair, fact).into_any_element());
@@ -4200,6 +4315,19 @@ impl QueryEditor {
             Some(_) => "A stored query: the server runs it by name, and its text stays there",
             None => "The query under the cursor",
         };
+        // What it is to the graph's reviews (spec 036), as a tag after its kind.
+        let marked = self.effect_key().and_then(|key| {
+            let graph = self.session.read(cx).overrides_key();
+            let mark = cx
+                .try_global::<studio_settings::StudioSettings>()?
+                .effect_marks(&graph)
+                .get(&key)
+                .copied()?;
+            Some(match mark {
+                studio_settings::EffectMark::Check => "check in reviews",
+                studio_settings::EffectMark::Watched => "watched in reviews",
+            })
+        });
         let busy = self.writing;
         let run_tip = match &self.stored {
             Some(stored) => format!("Run {} with the values below", stored.entry.name),
@@ -4216,6 +4344,7 @@ impl QueryEditor {
                     .child(studio_ui::ds::icon::lead(icon))
                     .child(studio_ui::ds::text::title(title).single_line().truncate())
                     .children(kind.map(studio_ui::ds::text::muted))
+                    .children(marked.map(|marked| studio_ui::ds::tag(marked, cx)))
             }))
             .children(
                 self.file_error
@@ -4739,14 +4868,23 @@ impl QueryEditor {
     }
 
     fn render_results(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        match &self.output {
+        let other = match &self.output {
+            Output::Rows(rows) => return self.render_rows(rows, window, cx),
             Output::Empty => self.render_expected(cx),
             Output::Running { .. } => v_flex().flex_1().min_h_0().into_any_element(),
-            Output::Rows(rows) => self.render_rows(rows, window, cx),
             Output::Plan(plan) => self.render_plan(plan, cx),
             Output::Written(result) => self.render_written(result, cx),
             Output::Failed(failure) => self.render_failure(failure, cx),
-        }
+        };
+        // The result area holds the tab's focus whatever it shows: a stored read without
+        // parameters has no other place for it, so before its first rows its keys (Run, and
+        // marking it for reviews) had nowhere to go.
+        v_flex()
+            .track_focus(&self.results_focus)
+            .flex_1()
+            .min_h_0()
+            .child(other)
+            .into_any_element()
     }
 
     /// Before the first run: the columns the query under the cursor will return, or what Run
@@ -5021,6 +5159,7 @@ impl QueryEditor {
             Color::Disabled.color(cx),
             Color::Default.color(cx),
         );
+        let (added, changed) = (Color::Created.color(cx), Color::Modified.color(cx));
         let selected = self.selected;
         range
             .filter_map(|ix| {
@@ -5038,11 +5177,20 @@ impl QueryEditor {
                                 .w(px(ROW_NUMBER_WIDTH))
                                 .flex_none()
                                 .px(px(space::MD))
-                                .child(
-                                    studio_ui::cell_text((ix + 1).to_string(), cx)
+                                .child({
+                                    // A row the last run of the same read lacked, or whose
+                                    // cells moved since, says so by its number (spec 036).
+                                    let (mark, color) = match &rows.since {
+                                        Some(since) if since.added_at(ix) => ("+", added),
+                                        Some(since) if since.changed_at(ix).is_some() => {
+                                            ("~", changed)
+                                        }
+                                        _ => ("", muted),
+                                    };
+                                    studio_ui::cell_text(format!("{mark}{}", ix + 1), cx)
                                         .meta(cx)
-                                        .color(muted),
-                                ),
+                                        .color(color)
+                                }),
                         )
                         .children(places.iter().map(|place| {
                             let column = match *place {
@@ -5513,6 +5661,16 @@ impl Render for QueryEditor {
             .on_action(cx.listener(Self::apply_fix_action))
             .on_action(cx.listener(Self::refresh))
             .on_action(cx.listener(|this, _: &RevertView, window, cx| this.revert_view(window, cx)))
+            // A stored read a review can run is marked for the graph's reviews from its tab
+            // (spec 036); registered only on such a tab (constitution VIII).
+            .when_some(self.effect_key(), |view, _| {
+                view.on_action(cx.listener(|this, _: &ToggleWatched, _, cx| {
+                    this.toggle_effect_mark(studio_settings::EffectMark::Watched, cx)
+                }))
+                .on_action(cx.listener(|this, _: &ToggleCheck, _, cx| {
+                    this.toggle_effect_mark(studio_settings::EffectMark::Check, cx)
+                }))
+            })
             .size_full()
             .child(toolbar)
             .children(disk_change)
@@ -7927,6 +8085,102 @@ mod tests {
             cx.run_until_parked();
             assert_eq!(reads(), 2, "a write is never sent again");
             editor.read_with(cx, |editor, cx| assert!(!editor.is_stale(cx)));
+        }
+
+        /// A run of the same read compares its rows with the last run's (spec 036): rows new to
+        /// the answer and rows whose cells moved are marked by their number, and the footer
+        /// counts them. A first run, or another read, compares nothing.
+        #[gpui::test]
+        async fn a_rerun_marks_the_rows_it_brings(cx: &mut TestAppContext) {
+            init(cx);
+            let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = runs.clone();
+            let http = FakeHttpClient::create(move |request| {
+                let path = request.uri().path().to_owned();
+                let body = if path.ends_with("/query") {
+                    // lk-acl leaves, lk-share comes, lk-release moves.
+                    let rows = match counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                        0 => json!([
+                            {"i.slug": "lk-sync", "i.priority": 0},
+                            {"i.slug": "lk-acl", "i.priority": 1},
+                            {"i.slug": "lk-release", "i.priority": 1}
+                        ]),
+                        _ => json!([
+                            {"i.slug": "lk-sync", "i.priority": 0},
+                            {"i.slug": "lk-share", "i.priority": 1},
+                            {"i.slug": "lk-release", "i.priority": 2}
+                        ]),
+                    };
+                    json!({
+                        "query_name": "ready", "target": {"branch": "main"}, "row_count": 3,
+                        "columns": ["i.slug", "i.priority"], "rows": rows,
+                        "graph_commit_id": "01JHEADAAAAA",
+                    })
+                    .to_string()
+                } else {
+                    r#"{"branches":["main"]}"#.to_owned()
+                };
+                async move {
+                    Ok(Response::builder()
+                        .status(200)
+                        .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                        .body(AsyncBody::from(body))
+                        .unwrap())
+                }
+            });
+            let server = ServerEntry {
+                name: "dev".into(),
+                url: "http://127.0.0.1:8787".into(),
+                source: ServerSource::Environment,
+                known_graphs: Vec::new(),
+            };
+            let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+            let session =
+                cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+            cx.run_until_parked();
+            let (editor, cx) =
+                cx.add_window_view(|window, cx| QueryEditor::new(1, session.clone(), window, cx));
+            let run = |cx: &mut gpui::VisualTestContext| {
+                editor.update_in(cx, |editor, window, cx| {
+                    editor.cursor = 0;
+                    editor.run(&Run, window, cx);
+                });
+                cx.run_until_parked();
+            };
+            editor.update_in(cx, |editor, window, cx| {
+                editor.set_text(
+                    "query ready() { match { $i: Issue } return { $i.slug, $i.priority } }",
+                    window,
+                    cx,
+                );
+            });
+            run(cx);
+            let since = |cx: &mut gpui::VisualTestContext| {
+                editor.read_with(cx, |editor, _| {
+                    let Output::Rows(rows) = &editor.output else {
+                        panic!("no rows");
+                    };
+                    rows.since.clone()
+                })
+            };
+            assert!(since(cx).is_none(), "a first run compares nothing");
+            run(cx);
+            let diff = since(cx).expect("the same read again");
+            assert_eq!(diff.added, vec![1]);
+            assert_eq!(diff.removed, vec![1]);
+            assert_eq!(diff.changed.len(), 1);
+            assert!(diff.added_at(1) && diff.changed_at(2).is_some());
+            assert_eq!(diff.counts(), "+1 −1 ~1");
+            // Another read is not compared with this one.
+            editor.update_in(cx, |editor, window, cx| {
+                editor.set_text(
+                    "query ready() { match { $i: Issue } return { $i.slug, $i.priority } limit 3 }",
+                    window,
+                    cx,
+                );
+            });
+            run(cx);
+            assert!(since(cx).is_none(), "another read's text");
         }
 
         /// A refused read's hint says what became of the token, as the Open dialog does:

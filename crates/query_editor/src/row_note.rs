@@ -246,7 +246,7 @@ mod tests {
                 .to_vec(),
             types: vec![None; 6],
             node_types: vec![Some("Person".into()), None, None, None, None, None],
-            rows: vec![
+            rows: std::sync::Arc::new(vec![
                 vec![json!(null); 6],
                 vec![
                     json!({"@id": "p1", "name": "Ada"}),
@@ -256,7 +256,7 @@ mod tests {
                     json!(["a", "b", "c", "d"]),
                     json!(null),
                 ],
-            ],
+            ]),
         };
         let note = RowNote::new(1, &table, None).expect("the second row");
         assert_eq!(note.place(), (2, 2));

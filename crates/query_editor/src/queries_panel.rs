@@ -74,6 +74,8 @@ enum PanelRow {
         name: String,
         description: Option<String>,
         mutation: bool,
+        /// It takes a parameter that must be given, so a review cannot run it as it is.
+        needs_params: bool,
     },
 }
 
@@ -139,6 +141,11 @@ impl QueriesPanel {
     ) -> Self {
         let mut subscriptions =
             vec![cx.observe_global::<SavedQueriesChanged>(|this, cx| this.owe_folder(cx))];
+        // A read marked for the graph's reviews says so on its row (spec 036).
+        if cx.has_global::<studio_settings::StudioSettings>() {
+            subscriptions
+                .push(cx.observe_global::<studio_settings::StudioSettings>(|_, cx| cx.notify()));
+        }
         if let Some(workspace) = workspace.upgrade() {
             subscriptions.push(cx.subscribe_in(
                 &workspace,
@@ -225,6 +232,7 @@ impl QueriesPanel {
                     name: query.name.clone(),
                     description: query.description.clone(),
                     mutation: query.mutation,
+                    needs_params: query.params.iter().any(|param| !param.nullable),
                 }));
             }
         }
@@ -381,16 +389,28 @@ impl QueriesPanel {
                 name,
                 description,
                 mutation,
+                needs_params,
             } => {
                 let tooltip = description.unwrap_or_else(|| format!("Run {name} on the server"));
                 let click = Rc::new(self.click(ix, cx));
+                let graph = self.graph_key(cx).unwrap_or_default();
+                // What it is to the graph's reviews (spec 036), beside its name.
+                let mark = cx
+                    .try_global::<studio_settings::StudioSettings>()
+                    .and_then(|settings| settings.effect_marks(&graph).get(&name).copied());
                 let row = {
                     let name = name.clone();
                     move |_: &mut Window, _: &mut App| {
                         let click = click.clone();
+                        let end = match (mutation, mark) {
+                            (true, _) => Some("writes"),
+                            (false, Some(studio_settings::EffectMark::Check)) => Some("check"),
+                            (false, Some(studio_settings::EffectMark::Watched)) => Some("watched"),
+                            (false, None) => None,
+                        };
                         ds::SidebarRow::new(("stored-query", ix), name.clone())
                             .icon(IconName::Server)
-                            .when(mutation, |row| row.end(ds::sidebar_count("writes")))
+                            .when_some(end, |row, end| row.end(ds::sidebar_count(end)))
                             .selected(selected)
                             .tip(ds::tooltip(tooltip.clone()))
                             .on_click(move |event, window, cx| click(event, window, cx))
@@ -400,6 +420,7 @@ impl QueriesPanel {
                     .trigger(move |_, window, cx| row(window, cx))
                     .menu(move |window, cx| {
                         let name = name.clone();
+                        let graph = graph.clone();
                         ContextMenu::build(window, cx, move |menu, _, _| {
                             let open = OpenStoredQuery {
                                 name: name.clone(),
@@ -424,6 +445,40 @@ impl QueriesPanel {
                                 })
                                 .disabled(mutation)
                                 .handler(save),
+                            )
+                            // A review runs a read without parameters at both heads (spec 036).
+                            .when(
+                                !mutation && !needs_params,
+                                |menu| {
+                                    let set = |to: studio_settings::EffectMark| {
+                                        let (graph, name) = (graph.clone(), name.clone());
+                                        move |_: &mut Window, cx: &mut App| {
+                                            studio_settings::update(cx, |settings| {
+                                                let now = settings
+                                                    .effect_marks(&graph)
+                                                    .get(&name)
+                                                    .copied();
+                                                let next = (now != Some(to)).then_some(to);
+                                                settings.set_effect_mark(&graph, &name, next)
+                                            })
+                                        }
+                                    };
+                                    menu.separator()
+                                        .toggleable_entry(
+                                            "Watch in reviews",
+                                            mark == Some(studio_settings::EffectMark::Watched),
+                                            IconPosition::Start,
+                                            None,
+                                            set(studio_settings::EffectMark::Watched),
+                                        )
+                                        .toggleable_entry(
+                                            "Use as a check in reviews",
+                                            mark == Some(studio_settings::EffectMark::Check),
+                                            IconPosition::Start,
+                                            None,
+                                            set(studio_settings::EffectMark::Check),
+                                        )
+                                },
                             )
                         })
                     })

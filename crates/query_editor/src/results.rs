@@ -2,6 +2,7 @@
 //! diagnostics mapped back into the editor's text, and the small formats they use (spec 007).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use gq_language::{ResultColumn, SchemaModel, TokenKind};
 use graph_client::api::{
@@ -23,7 +24,8 @@ pub struct ResultTable {
     pub types: Vec<Option<String>>,
     /// The node type of each column that returns whole nodes.
     pub node_types: Vec<Option<String>>,
-    pub rows: Vec<Vec<Value>>,
+    /// Shared, so the next run can be compared with these rows off the main thread (spec 036).
+    pub rows: Arc<Vec<Vec<Value>>>,
 }
 
 impl ResultTable {
@@ -67,7 +69,7 @@ impl ResultTable {
             columns,
             types,
             node_types,
-            rows,
+            rows: Arc::new(rows),
         }
     }
 
@@ -81,7 +83,7 @@ impl ResultTable {
         let mut index: HashMap<(String, String), usize> = HashMap::new();
         let mut links: Vec<(usize, usize)> = Vec::new();
         let mut linked: HashSet<(usize, usize)> = HashSet::new();
-        for row in &self.rows {
+        for row in self.rows.iter() {
             let mut previous: Option<usize> = None;
             for (value, node_type) in row.iter().zip(&self.node_types) {
                 let (Some(type_name), Some(id)) =
@@ -1010,7 +1012,7 @@ mod tests {
         assert!(table.row_json(5).is_none());
         // A column named twice shows its cell twice.
         let twice = ResultTable::new(vec!["a".into(), "a".into()], json!([{"a": 1}]), None);
-        assert_eq!(twice.rows, [vec![json!(1), json!(1)]]);
+        assert_eq!(*twice.rows, [vec![json!(1), json!(1)]]);
     }
 
     #[test]
