@@ -202,7 +202,9 @@
     "bindings": {
       "cmd-n": "studio_graph::NewQuery",
       "cmd-shift-o": "studio_graph::OpenMap",
-      "cmd-shift-r": "studio_graph::ReviewBranch"
+      "cmd-shift-r": "studio_graph::ReviewBranch",
+      "cmd-alt-p": "studio_graph::ToggleProposeChanges",
+      "cmd-alt-shift-p": "studio_graph::StopProposing"
     }
   },
   {

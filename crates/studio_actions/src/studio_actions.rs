@@ -347,6 +347,11 @@ pub mod graph {
             CreateBranch,
             /// Delete the current branch.
             DeleteBranch,
+            /// Turn proposals on or off for this graph: on, an edit on main starts a branch of
+            /// its own and lands there, to be reviewed and merged.
+            ToggleProposeChanges,
+            /// Stop proposing and go back to main; the proposal stays a branch, to review later.
+            StopProposing,
         ]
     );
 
@@ -534,6 +539,10 @@ pub mod graph {
         pub id: String,
         #[serde(default)]
         pub at_commit: Option<String>,
+        /// Read and edit the node on this branch, whatever the window's branch (spec 037);
+        /// `None` follows the window's.
+        #[serde(default)]
+        pub on_branch: Option<String>,
         /// Open as the pane's preview tab, which the next preview replaces.
         #[serde(default)]
         pub preview: bool,

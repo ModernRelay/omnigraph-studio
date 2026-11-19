@@ -1325,10 +1325,11 @@ impl ReviewView {
     }
 
     /// The node whose card holds the selected change, as the inspector shows it (spec 020): a
-    /// change of its own, or of a relationship reviewed on its card. It is read where the
-    /// review reads it, and held there, so it is read-only as the review is: at the reviewed
-    /// head, or, for a node the branch removes, at the fork, where it last was. None for an
-    /// edge whose type the schema lacks, which has a card of its own and no node.
+    /// change of its own, or of a relationship reviewed on its card. It is on the reviewed
+    /// branch (spec 037): read at the reviewed head, and edited there, so a fix made in the
+    /// inspector, or on the page it opens, lands on the branch under review. A node the branch
+    /// removes is held at the fork, where it last was, and read-only. None for an edge whose
+    /// type the schema lacks, which has a card of its own and no node.
     fn selected_node(&self) -> Option<InspectedNode> {
         let data = self.data.as_ref()?;
         let at = *data.groups.home.get(self.selected?)?;
@@ -1341,16 +1342,21 @@ impl ReviewView {
         let removed = group.change.is_some_and(|own| {
             change_cards::kind_of_change(&data.folded.changes[own]) == ChangeKind::Removed
         });
-        let commit = if removed {
-            data.fork.clone()
-        } else {
-            data.head.clone()
-        }?;
+        if removed {
+            return Some(InspectedNode {
+                type_name: group.type_name.clone(),
+                id: group.id.clone(),
+                at_commit: Some(data.fork.clone()?),
+                snapshot: None,
+                branch: None,
+            });
+        }
         Some(InspectedNode {
             type_name: group.type_name.clone(),
             id: group.id.clone(),
-            at_commit: Some(commit),
-            snapshot: None,
+            at_commit: None,
+            snapshot: Some(data.head.clone()?),
+            branch: Some(self.branch.clone()),
         })
     }
 
@@ -2276,8 +2282,8 @@ impl ReviewView {
         Some(conflict_wording(conflict.kind, here, &self.target))
     }
 
-    /// Opens the selected change's node page where the review holds it, read-only: at the
-    /// reviewed head, or at the fork for a node the branch removes ([`Self::selected_node`]).
+    /// Opens the selected change's node page on the reviewed branch, where it can be fixed, or
+    /// held at the fork for a node the branch removes ([`Self::selected_node`]).
     fn open_selected_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(node) = self.selected_node() else {
             return;
@@ -2287,6 +2293,7 @@ impl ReviewView {
                 type_name: node.type_name,
                 id: node.id,
                 at_commit: node.at_commit,
+                on_branch: node.branch,
                 preview: false,
             }),
             cx,
@@ -5628,13 +5635,20 @@ pub(crate) mod tests {
             id: id.into(),
             at_commit: Some(commit.into()),
             snapshot: None,
+            branch: None,
         };
 
         select("p1", cx);
         assert_eq!(
             inspected(cx),
-            Some(node("p1", "f2")),
-            "at the reviewed head"
+            Some(InspectedNode {
+                type_name: "Person".into(),
+                id: "p1".into(),
+                at_commit: None,
+                snapshot: Some("f2".into()),
+                branch: Some("feature".into()),
+            }),
+            "on the reviewed branch, at its reviewed head, where it can be fixed (spec 037)"
         );
         let before = told.get();
         select("p2", cx);

@@ -8,6 +8,7 @@ use gpui::{
 use graph_store::GraphSession;
 use serde_json::json;
 use studio_actions::{ViewKind, ViewLink};
+use studio_ui::ds::Tipped as _;
 use studio_workspace::{Inspected, InspectedNode, Item, ItemEvent, SavedItem};
 use ui::prelude::*;
 
@@ -18,6 +19,9 @@ pub struct NodePage {
     type_name: String,
     id: String,
     at_commit: Option<String>,
+    /// The branch the page is on when it is not the window's (spec 037): opened from a review,
+    /// or from a page on one.
+    on_branch: Option<String>,
     /// The node's label as the tab last named it, saved with the tab: a page restored behind
     /// another tab, or one whose branch changed, reads nothing until it is shown, and its tab
     /// is named by this until then.
@@ -38,12 +42,20 @@ impl NodePage {
         type_name: String,
         id: String,
         at_commit: Option<String>,
+        on_branch: Option<String>,
         saved_label: Option<String>,
         cx: &mut Context<Self>,
     ) -> Self {
         let view = {
             let (type_name, id, at_commit) = (type_name.clone(), id.clone(), at_commit.clone());
-            cx.new(|cx| NodePeek::page(session, type_name, id, at_commit, cx))
+            let branch = on_branch.clone();
+            cx.new(|cx| {
+                let mut page = NodePeek::page(session, type_name, id, at_commit, cx);
+                if let Some(branch) = branch {
+                    page.on_branch(branch, cx);
+                }
+                page
+            })
         };
         // The tab's title is the node's label once it is read, and its dot says newer data:
         // the tab is told when either changes, not at each change of the view, which draws
@@ -76,6 +88,7 @@ impl NodePage {
             type_name,
             id,
             at_commit,
+            on_branch,
             saved_label,
             tab: (String::new(), false),
             toolbar: (true, false),
@@ -108,11 +121,21 @@ impl NodePage {
         (view.hides_empty(), view.any_empty())
     }
 
-    /// One page per node at the head, and one per node and commit.
-    pub fn key(type_name: &str, id: &str, at_commit: Option<&str>) -> String {
-        match at_commit {
+    /// One page per node at the head, one per node and commit, and one per node on each branch
+    /// a page is on of its own (spec 037).
+    pub fn key(
+        type_name: &str,
+        id: &str,
+        at_commit: Option<&str>,
+        on_branch: Option<&str>,
+    ) -> String {
+        let key = match at_commit {
             Some(commit) => format!("node:{type_name}:{id}@{commit}"),
             None => format!("node:{type_name}:{id}"),
+        };
+        match on_branch {
+            Some(branch) => format!("{key}~{branch}"),
+            None => key,
         }
     }
 }
@@ -192,7 +215,15 @@ impl Item for NodePage {
     }
 
     fn dedupe_key(&self, _cx: &App) -> Option<SharedString> {
-        Some(Self::key(&self.type_name, &self.id, self.at_commit.as_deref()).into())
+        Some(
+            Self::key(
+                &self.type_name,
+                &self.id,
+                self.at_commit.as_deref(),
+                self.on_branch.as_deref(),
+            )
+            .into(),
+        )
     }
 
     fn is_stale(&self, cx: &App) -> bool {
@@ -211,6 +242,7 @@ impl Item for NodePage {
                 "type_name": self.type_name,
                 "id": self.id,
                 "at_commit": self.at_commit,
+                "on_branch": self.on_branch,
                 "label": label,
             }),
         })
@@ -222,8 +254,24 @@ impl NodePage {
     /// Collapse all.
     fn render_toolbar(&self, cx: &mut Context<Self>) -> gpui::Div {
         let (hide_empty, any_empty) = self.toolbar;
+        // A page on a branch of its own says which in its own header, since the top bar names
+        // the window's (constitution XIII, spec 037).
+        let own = self.on_branch.clone().map(|branch| {
+            div()
+                .id("page-branch")
+                .debug_selector(|| "page-branch".into())
+                .flex_none()
+                .tip(studio_ui::ds::tooltip(format!(
+                    "This page reads and edits {branch}, whatever branch the window is on"
+                )))
+                .child(studio_ui::ds::meta(
+                    IconName::GitBranch,
+                    format!("on {branch}"),
+                ))
+        });
         studio_ui::ds::toolbar(cx)
             .children(studio_workspace::view_strip(Item::views(self, cx), cx))
+            .children(own)
             .child(div().flex_1())
             .child(
                 studio_ui::ds::toolbar_actions()

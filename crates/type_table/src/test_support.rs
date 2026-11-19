@@ -1021,8 +1021,12 @@ fn serve_blobs(
                     )
                 }
             } else {
-                // A second branch, for views that follow the window to another one.
-                (200, json!({ "branches": ["main", "fix"] }))
+                // A second branch, for views that follow the window to another one, and a
+                // proposal of main (spec 037).
+                (
+                    200,
+                    json!({ "branches": ["main", "fix", "proposal/act-ada/1119-1"] }),
+                )
             };
             Ok(Response::builder()
                 .status(status)

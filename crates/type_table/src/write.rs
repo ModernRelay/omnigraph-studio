@@ -9,7 +9,7 @@ use gq_language::input::same_value;
 use gq_language::{BuiltQuery, SchemaModel, builder};
 use graph_client::WriteOutcome;
 use graph_client::api::ChangeOutput;
-use graph_store::{AccessAction, AccessScope, GraphSession};
+use graph_store::GraphSession;
 use serde_json::{Map, Value};
 
 use crate::model::{Notice, SaveResult, Tone, published, save_result};
@@ -22,9 +22,7 @@ pub(crate) fn change_refusal(
     branch: &str,
     cx: &App,
 ) -> Option<String> {
-    session
-        .read(cx)
-        .refusal(AccessAction::Change, &AccessScope::branch(branch))
+    session.read(cx).edit_refusal(branch, cx)
 }
 
 /// How a write bound to the values it was read at ended: the write's own outcome, never sent

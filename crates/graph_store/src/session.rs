@@ -38,6 +38,9 @@ use crate::memo::{Held, Memo};
 use crate::scope::{ReadScope, Scope, ScopeSince};
 use crate::server_features::{ServerFeature, ServerFeatures};
 
+mod proposal;
+pub use proposal::{Landing, PROTECTED, Proposal};
+
 /// A value that loads from the server.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Loadable<T> {
@@ -932,6 +935,16 @@ pub struct GraphSession {
     connection_ready: bool,
     /// What the credential may do was forgotten while parked: it is read when shown again.
     access_owed: bool,
+    /// Edits on a protected branch start a proposal (spec 037): on in a window's session
+    /// ([`crate::open_session`]), as the graph's `propose_changes` setting says.
+    proposes: bool,
+    /// The changes Studio made on the proposal the session is on, since it moved there.
+    proposal_changes: u64,
+    /// A proposal's branch whose first edit did not land, which the next edit from its commit
+    /// takes.
+    spare_proposal: Option<proposal::Spare>,
+    /// A proposal being started, which the edits sent meanwhile wait for.
+    starting_proposal: Option<proposal::Starting>,
     _connection_watch: Option<ConnectionWatch>,
 }
 
@@ -942,7 +955,8 @@ impl GraphSession {
     /// confirmation names whole, since two windows can both be on `main` (spec 020).
     pub fn write_scope(&self, branch: &str, cx: &App) -> String {
         let server = self.connection.read(cx).server.name.clone();
-        format!("{server} › {} › {branch}", self.graph_id)
+        let lands = self.write_target(branch, cx);
+        format!("{server} › {} › {lands}", self.graph_id)
     }
 
     /// A session on `graph_id` that a window shows: it reads the graph at once.
@@ -1061,6 +1075,10 @@ impl GraphSession {
             read_refused: false,
             connection_ready: false,
             access_owed: false,
+            proposes: false,
+            proposal_changes: 0,
+            spare_proposal: None,
+            starting_proposal: None,
             _connection_watch: None,
         };
         session.credential = session.client(cx).credential_changes();
@@ -1508,9 +1526,23 @@ impl GraphSession {
         snapshot: Option<String>,
         cx: &mut Context<Self>,
     ) -> Task<Result<ReadOutput, ReadError>> {
+        let branch = self.branch.clone();
+        self.invoke_stored_read_on(name, params, snapshot, branch, cx)
+    }
+
+    /// [`Self::invoke_stored_read`] at `branch`'s head when there is no `snapshot`: a query
+    /// tab on a branch of its own (spec 037).
+    pub fn invoke_stored_read_on(
+        &mut self,
+        name: &str,
+        params: Option<Value>,
+        snapshot: Option<String>,
+        branch: String,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<ReadOutput, ReadError>> {
         let request = InvokeStoredQueryRequest {
             params,
-            branch: snapshot.is_none().then(|| self.branch.clone()),
+            branch: snapshot.is_none().then_some(branch),
             snapshot,
             expect_mutation: Some(false),
         };
@@ -1533,9 +1565,28 @@ impl GraphSession {
         description: String,
         cx: &mut Context<Self>,
     ) -> Task<WriteOutcome<ChangeOutput>> {
+        let name = name.to_owned();
+        let asked = branch.clone();
+        self.routed(
+            &asked,
+            None,
+            move |this, branch, _, cx| {
+                this.invoke_stored_write_direct(name, params, branch, description, cx)
+            },
+            cx,
+        )
+    }
+
+    fn invoke_stored_write_direct(
+        &mut self,
+        name: String,
+        params: Option<Value>,
+        branch: String,
+        description: String,
+        cx: &mut Context<Self>,
+    ) -> Task<WriteOutcome<ChangeOutput>> {
         let client = self.client(cx);
         let graph = self.graph_id.clone();
-        let name = name.to_owned();
         let request = InvokeStoredQueryRequest {
             params,
             branch: Some(branch.clone()),
@@ -2071,6 +2122,7 @@ impl GraphSession {
         }
         self.branch = branch;
         self.branch_moves += 1;
+        self.proposal_changes = 0;
         // Not yet shown: the first show reads the graph on this branch.
         if !self.opened {
             cx.emit(SessionEvent::BranchChanged);
@@ -2396,7 +2448,13 @@ impl GraphSession {
             .scopes
             .get_mut(&id)
             .map(|scope| scope.add(query.depends.clone()));
-        let read = self.asked_by(id, |this| this.read(query, snapshot, cx));
+        // With no commit, the head of the branch the scope's view reads, which is the session's
+        // unless the view is on one of its own (spec 037).
+        let branch = self
+            .scopes
+            .get(&id)
+            .map_or_else(|| self.branch.clone(), |scope| scope.branch.clone());
+        let read = self.asked_by(id, |this| this.read_from(query, snapshot, branch, cx));
         // The token goes with this task: dropped by the view, the read stops counting as out.
         cx.spawn(async move |this, cx| {
             let result = read.await;
@@ -3345,11 +3403,24 @@ impl GraphSession {
         snapshot: Option<String>,
         cx: &mut Context<Self>,
     ) -> Task<Result<ReadOutput, ReadError>> {
+        let branch = self.branch.clone();
+        self.read_from(query, snapshot, branch, cx)
+    }
+
+    /// [`Self::read`] of `branch`'s head when there is no `snapshot`: a view on a branch of its
+    /// own (spec 037).
+    fn read_from(
+        &mut self,
+        query: &BuiltQuery,
+        snapshot: Option<String>,
+        branch: String,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<ReadOutput, ReadError>> {
         let request = QueryRequest {
             query: query.text.clone(),
             name: Some(query.name.clone()),
             params: query.params_value(),
-            branch: snapshot.is_none().then(|| self.branch.clone()),
+            branch: snapshot.is_none().then_some(branch),
             snapshot: snapshot.clone(),
         };
         let Some(commit) = snapshot else {
@@ -4373,14 +4444,21 @@ impl GraphSession {
         description: String,
         cx: &mut Context<Self>,
     ) -> Task<WriteOutcome<graph_client::api::BlobWriteOutput>> {
-        let client = self.client(cx);
-        let (graph, sent_to) = (self.graph_id.clone(), branch.to_owned());
-        let request = async move {
-            client
-                .blob_put(&graph, &sent_to, &cell, if_match.as_deref(), bytes)
-                .await
-        };
-        self.send_blob_write(branch, description, request, cx)
+        self.routed(
+            branch,
+            None,
+            move |this, branch, _, cx| {
+                let client = this.client(cx);
+                let (graph, sent_to) = (this.graph_id.clone(), branch.clone());
+                let request = async move {
+                    client
+                        .blob_put(&graph, &sent_to, &cell, if_match.as_deref(), bytes)
+                        .await
+                };
+                this.send_blob_write(&branch, description, request, cx)
+            },
+            cx,
+        )
     }
 
     /// Sets a nullable Blob cell to null on `branch`, bound as [`Self::blob_put_on`] binds. A
@@ -4393,14 +4471,21 @@ impl GraphSession {
         description: String,
         cx: &mut Context<Self>,
     ) -> Task<WriteOutcome<graph_client::api::BlobWriteOutput>> {
-        let client = self.client(cx);
-        let (graph, sent_to) = (self.graph_id.clone(), branch.to_owned());
-        let request = async move {
-            client
-                .blob_clear(&graph, &sent_to, &cell, if_match.as_deref())
-                .await
-        };
-        self.send_blob_write(branch, description, request, cx)
+        self.routed(
+            branch,
+            None,
+            move |this, branch, _, cx| {
+                let client = this.client(cx);
+                let (graph, sent_to) = (this.graph_id.clone(), branch.clone());
+                let request = async move {
+                    client
+                        .blob_clear(&graph, &sent_to, &cell, if_match.as_deref())
+                        .await
+                };
+                this.send_blob_write(&branch, description, request, cx)
+            },
+            cx,
+        )
     }
 
     /// Runs a Blob write on `branch` as every write of the session runs ([`Self::run_write`]).
@@ -4440,7 +4525,7 @@ impl GraphSession {
             params: query.params_value(),
             branch: Some(branch.to_owned()),
         };
-        self.send_write(request, if_commit, description, follow_up, None, cx)
+        self.write_request_with(request, if_commit, description, follow_up, None, cx)
     }
 
     /// [`Self::write_on`] for a write that sets the properties `wrote` names: once it commits,
@@ -4461,9 +4546,11 @@ impl GraphSession {
             params: query.params_value(),
             branch: Some(branch.to_owned()),
         };
-        self.send_write(request, if_commit, description, None, Some(wrote), cx)
+        self.write_request_with(request, if_commit, description, None, Some(wrote), cx)
     }
 
+    /// Sends a mutation as it is written. One that names a branch lands where an edit on it
+    /// lands ([`Self::lands_on`]); a statement names its own branches and goes as it is.
     pub fn write_request(
         &mut self,
         request: ChangeRequest,
@@ -4471,7 +4558,34 @@ impl GraphSession {
         description: String,
         cx: &mut Context<Self>,
     ) -> Task<WriteOutcome<ChangeOutput>> {
-        self.send_write(request, if_commit, description, None, None, cx)
+        self.write_request_with(request, if_commit, description, None, None, cx)
+    }
+
+    /// [`Self::send_write`] on the branch the request's edit lands on (spec 037).
+    fn write_request_with(
+        &mut self,
+        request: ChangeRequest,
+        if_commit: Option<String>,
+        description: String,
+        follow_up: Option<FollowUp>,
+        wrote: Option<Wrote>,
+        cx: &mut Context<Self>,
+    ) -> Task<WriteOutcome<ChangeOutput>> {
+        let Some(branch) = request.branch.clone() else {
+            return self.send_write(request, if_commit, description, follow_up, wrote, cx);
+        };
+        self.routed(
+            &branch,
+            if_commit,
+            move |this, branch, if_commit, cx| {
+                let request = ChangeRequest {
+                    branch: Some(branch),
+                    ..request
+                };
+                this.send_write(request, if_commit, description, follow_up, wrote, cx)
+            },
+            cx,
+        )
     }
 
     fn send_write(
@@ -4672,6 +4786,9 @@ impl GraphSession {
         };
         let branch = log.branch.clone();
         let wrote = log.wrote.clone();
+        if commit.is_some() && branch == self.branch && self.proposal().is_some() {
+            self.proposal_changes += 1;
+        }
         self.log_outcome(log, outcome);
         if let Some(commit) = commit {
             self.committed(branch, commit, parent, wrote, cx);
@@ -4869,6 +4986,15 @@ impl GraphSession {
                     }
                     this.drop_drafts_of(&source, cx);
                     this.read_branches(Some(source), cx);
+                } else if matches!(outcome, WriteOutcome::Committed(_))
+                    && this.branch == source
+                    && this
+                        .proposal()
+                        .is_some_and(|proposal| proposal.base == target)
+                {
+                    // A proposal merged is done with: the window goes back to what it proposed
+                    // to (spec 037), and the branch stays as the merge left it.
+                    this.set_branch(target, cx);
                 }
             },
             cx,
@@ -4999,7 +5125,11 @@ pub fn open_session(
     cx: &mut App,
 ) -> Entity<GraphSession> {
     connection.update(cx, |connection, _| connection.remember_graph(&graph_id));
-    cx.new(|cx| GraphSession::new(connection, graph_id, branch, cx))
+    cx.new(|cx| {
+        let mut session = GraphSession::new(connection, graph_id, branch, cx);
+        session.follow_proposal_setting();
+        session
+    })
 }
 
 /// Opens a session on a graph its window opens behind the one it shows: it reads nothing until
@@ -5011,7 +5141,11 @@ pub fn open_session_behind(
     cx: &mut App,
 ) -> Entity<GraphSession> {
     connection.update(cx, |connection, _| connection.remember_graph(&graph_id));
-    cx.new(|cx| GraphSession::parked(connection, graph_id, branch, cx))
+    cx.new(|cx| {
+        let mut session = GraphSession::parked(connection, graph_id, branch, cx);
+        session.follow_proposal_setting();
+        session
+    })
 }
 
 /// What the ledger calls a node's relationship count, however it is read.

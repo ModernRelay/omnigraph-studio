@@ -29,8 +29,8 @@ use gpui::{
     WeakEntity, Window, WindowControlArea, WindowHandle, deferred, div, point,
 };
 use graph_store::{
-    AccessAction, AccessScope, ConnectionRegistry, ConnectionState, ControlPlane, GraphSession,
-    Loadable, OutcomeKind, SessionEvent,
+    ConnectionRegistry, ConnectionState, ControlPlane, GraphSession, Loadable, OutcomeKind,
+    SessionEvent,
 };
 use studio_actions::graph::{
     OpenAsCanvas, OpenAsHistory, OpenAsMap, OpenAsPage, OpenAsReview, OpenAsSource, OpenAsTable,
@@ -4799,15 +4799,30 @@ impl Workspace {
         let s = session.read(cx);
         let branch = s.branch.clone();
         // The access route refused changes on the window's branch: its edits are disabled, so
-        // the bar says so beside the name (spec 002).
-        let read_only = s.refusal(AccessAction::Change, &AccessScope::branch(&branch));
-        let branch_tooltip = if read_only.is_some() {
-            format!(
+        // the bar says so beside the name (spec 002). An edit that starts a proposal is the
+        // server's to judge when it is sent (spec 037).
+        let read_only = s.edit_refusal(&branch, cx);
+        // On a proposal the breadcrumb names what it proposes to, and the proposal follows it
+        // (spec 037); on a protected branch, that edits propose.
+        let proposal = s.proposal();
+        let proposes = proposal.is_none() && s.protects(&branch, cx);
+        let shown = proposal
+            .as_ref()
+            .map_or_else(|| branch.clone(), |proposal| proposal.base.clone());
+        let branch_tooltip = match (&proposal, read_only.is_some()) {
+            (Some(proposal), _) => format!(
+                "Edits in this window land on {}, which proposes them to {}. Switch branch.",
+                proposal.branch, proposal.base
+            ),
+            (None, true) => format!(
                 "Reads in this window use {branch}, which your credential may not change. Switch \
                  branch."
-            )
-        } else {
-            format!("Reads and edits in this window use {branch}. Switch branch.")
+            ),
+            (None, false) if proposes => format!(
+                "Reads in this window use {branch}; an edit starts a proposal from it. Switch \
+                 branch."
+            ),
+            (None, false) => format!("Reads and edits in this window use {branch}. Switch branch."),
         };
         let session_for_menu = session.clone();
         Some(
@@ -4821,7 +4836,7 @@ impl Workspace {
                         .anchor(gpui::Anchor::TopLeft)
                         .attach(gpui::Anchor::BottomLeft)
                         .trigger(
-                            studio_ui::ds::bar_button("branch", branch.clone())
+                            studio_ui::ds::bar_button("branch", shown)
                                 .style(ButtonStyle::Subtle)
                                 .tip(studio_ui::ds::tooltip(branch_tooltip))
                                 .start_icon(Icon::new(IconName::GitBranch))
@@ -4889,8 +4904,76 @@ impl Workspace {
                             })
                             .child(studio_ui::ds::text::muted("read only").single_line()),
                     )
-                }),
+                })
+                .when(proposes, |row| {
+                    row.child(
+                        div()
+                            .id("branch-proposes")
+                            .debug_selector(|| "branch-proposes".into())
+                            .flex_none()
+                            .tip_fn(move |_, cx| {
+                                studio_ui::ds::tooltip_with_meta(
+                                    "An edit here starts a proposal: a branch of its own, \
+                                     reviewed and merged into main",
+                                    Some(&studio_actions::graph::ToggleProposeChanges),
+                                    "Turn proposals off for this graph to write main directly",
+                                    cx,
+                                )
+                            })
+                            .child(studio_ui::ds::text::muted("edits propose").single_line()),
+                    )
+                })
+                .children(proposal.map(|proposal| Self::render_proposal(proposal, cx))),
         )
+    }
+
+    /// The proposal the window is on (spec 037): its branch, the changes made on it here, and
+    /// the review that merges it, one step away.
+    fn render_proposal(
+        proposal: graph_store::Proposal,
+        _cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let changes = match proposal.changes {
+            0 => None,
+            1 => Some("1 change".to_owned()),
+            n => Some(format!("{} changes", studio_ui::group_digits(n as usize))),
+        };
+        let base = proposal.base.clone();
+        h_flex()
+            .id("proposal")
+            .debug_selector(|| "proposal".into())
+            .gap(px(studio_ui::ds::space::XS))
+            .items_center()
+            .flex_none()
+            .child(studio_ui::ds::text::muted("Proposing on").single_line())
+            .child(studio_ui::ds::icon::lead(IconName::GitBranch).color(Color::Accent))
+            .child(studio_ui::ds::text::body(proposal.branch.clone()).single_line())
+            .children(
+                changes.map(|changes| {
+                    studio_ui::ds::text::muted(format!("· {changes}")).single_line()
+                }),
+            )
+            .child(
+                studio_ui::ds::bar_button("proposal-review", "Review")
+                    .style(ButtonStyle::Subtle)
+                    .tip(studio_ui::ds::tooltip_for_action(
+                        format!("Review the proposal against {base}, and merge it from there"),
+                        &studio_actions::graph::ReviewBranch,
+                    ))
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(studio_actions::graph::ReviewBranch), cx)
+                    }),
+            )
+            .child(
+                studio_ui::ds::icon_button("proposal-stop", IconName::Close)
+                    .tip(studio_ui::ds::tooltip_for_action(
+                        format!("Stop proposing and go back to {}", proposal.base),
+                        &studio_actions::graph::StopProposing,
+                    ))
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(studio_actions::graph::StopProposing), cx)
+                    }),
+            )
     }
 
     /// The document column: its panes, and the bottom dock when it sits under the document
@@ -7336,6 +7419,76 @@ mod tests {
         );
     }
 
+    /// On main of a window's session the bar says edits propose, not that main is read only,
+    /// though the credential may not change it (spec 037): the proposal's start is the server's
+    /// to judge. On a proposal it names the proposal beside main, with its review; off, main
+    /// reads as the credential leaves it.
+    #[gpui::test]
+    fn the_bar_says_edits_propose_and_names_the_proposal(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+            studio_settings::keep_changes_in_memory(cx);
+        });
+        let http = http_client::FakeHttpClient::create(move |request| {
+            let path = request.uri().path().to_owned();
+            async move {
+                let body = if path.ends_with("/access") {
+                    r#"{"graph_id":"notes","actor_id":"act-ada","graph_wide":["read"],"actions":["read"]}"#
+                } else {
+                    r#"{"branches":["main","proposal/act-ada/1119-1"]}"#
+                };
+                Ok(http_client::http::Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                    .body(http_client::AsyncBody::from(body))
+                    .unwrap())
+            }
+        });
+        let server = graph_store::ServerEntry {
+            name: "test".into(),
+            url: "http://studio.test".into(),
+            source: graph_store::ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection =
+            cx.new(|_| graph_store::Connection::new(server, Some("t".into()), http).unwrap());
+        let session = cx.new(|cx| {
+            let mut session = GraphSession::new(connection, "notes".into(), "main".into(), cx);
+            session.follow_proposal_setting();
+            session
+        });
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        workspace.update(cx, |workspace, cx| {
+            workspace.graph_order.push(session.entity_id());
+            workspace.subscribe_session(session.clone(), cx);
+        });
+        let shown = |id: &'static str, cx: &mut gpui::VisualTestContext| {
+            cx.run_until_parked();
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            cx.debug_bounds(id).is_some()
+        };
+        assert!(shown("branch-proposes", cx));
+        assert!(!shown("branch-read-only", cx), "edits on main propose");
+        assert!(!shown("proposal", cx));
+        session.update(cx, |session, cx| {
+            session.set_branch("proposal/act-ada/1119-1".into(), cx)
+        });
+        assert!(shown("proposal", cx), "the proposal is named");
+        assert!(!shown("branch-proposes", cx));
+        session.update(cx, |session, cx| session.stop_proposing(cx));
+        assert!(!shown("proposal", cx));
+        assert!(shown("branch-proposes", cx), "back on main");
+        // Turned off for the graph, main is what the credential leaves it.
+        cx.update(|_, cx| {
+            let graph = session.read(cx).overrides_key();
+            studio_settings::update(cx, |settings| settings.set_propose_changes(&graph, false));
+        });
+        assert!(!shown("branch-proposes", cx));
+        assert!(shown("branch-read-only", cx));
+    }
+
     /// The tab strip and its tabs are the header strip's height, under which every column's
     /// header rule lines up; the status bar has its own height.
     #[gpui::test]
@@ -7933,6 +8086,7 @@ mod tests {
             id: id.into(),
             at_commit: None,
             snapshot: None,
+            branch: None,
         };
         cx.update(|cx| {
             studio_theme::init_test(cx);

@@ -1120,6 +1120,10 @@ pub struct TypeTable {
     bulk_editor: Entity<Editor>,
     drafts: DraftsBar,
     cursor: Option<Cursor>,
+    /// The row the cursor was on, by id, and its column, when the window moved onto a proposal
+    /// of the branch the table showed (spec 037): the proposal is that branch and the person's
+    /// edit, so the cursor goes back to the row once the proposal's first page is in.
+    cursor_after_move: Option<(String, usize)>,
     editing: Option<Editing>,
     /// The open edit's editor, made for it ([`Self::fresh_cell_editor`]), and its events.
     cell_editor: Entity<Editor>,
@@ -1595,6 +1599,7 @@ impl TypeTable {
             drafts: DraftsBar::default(),
             bulk_editor,
             cursor: None,
+            cursor_after_move: None,
             editing: None,
             cell_editor,
             _cell_editor_events: cell_editor_events,
@@ -1731,6 +1736,17 @@ impl TypeTable {
                 self.cells.clear();
                 self.draft_notices.clear();
                 self.sync_drafts(cx);
+                // Onto a proposal of the branch left, which an edit here just started, the
+                // cursor stays on its row (spec 037).
+                let onto_proposal = self
+                    .session
+                    .read(cx)
+                    .proposal()
+                    .is_some_and(|proposal| proposal.base == left);
+                self.cursor_after_move = self
+                    .cursor
+                    .filter(|_| onto_proposal)
+                    .and_then(|cursor| Some((self.rows.get(cursor.row)?.id.clone(), cursor.col)));
                 self.owe_reload(cx);
             }
             SessionEvent::DraftsChanged => self.drafts_changed(cx),
@@ -4852,6 +4868,12 @@ impl TypeTable {
                 let ids: Vec<String> = page.iter().map(|row| row.id.clone()).collect();
                 let added = !page.is_empty();
                 self.rows.extend(page);
+                if first.is_some()
+                    && let Some((id, col)) = self.cursor_after_move.take()
+                    && let Some(row) = self.rows.iter().position(|row| row.id == id)
+                {
+                    self.cursor = Some(Cursor { row, col });
+                }
                 self.load_relations(ids, cx);
                 match first {
                     Some(counted) => {
@@ -6483,6 +6505,7 @@ impl TypeTable {
                 type_name: self.type_name.clone(),
                 id: row.id.clone(),
                 at_commit: self.at_commit.clone(),
+                on_branch: None,
                 preview: false,
             }),
             cx,
@@ -6602,7 +6625,9 @@ impl TypeTable {
                 .update(cx, |table, cx| table.pick_choice(index, window, cx))
                 .ok();
         });
-        let (focus, branch) = (self.select_focus.clone(), self.branch.clone().into());
+        // The keys line names where the pick lands (spec 037).
+        let branch = self.session.read(cx).write_target(&self.branch, cx).into();
+        let focus = self.select_focus.clone();
         let view = cx.new(|_| {
             CellSelect::new(
                 property, choices, text, width, notice, branch, focus, on_pick,
@@ -12299,7 +12324,7 @@ impl TypeTable {
                 .children(hint.map(studio_ui::ds::text::meta))
                 .child(studio_ui::ds::text::meta(format!(
                     "↵ save · esc cancel · write · {}",
-                    self.branch
+                    self.session.read(cx).write_target(&self.branch, cx)
                 ))),
         )
     }
@@ -13152,6 +13177,54 @@ mod tests {
 
     /// Another writer's commit that changed none of the types the table reads moves its pin to
     /// the head without reading again; one that wrote its type offers Refresh (spec 015).
+    /// The window moving onto a proposal of the table's branch, as the first edit there does,
+    /// keeps the cursor on its row once the proposal's rows are in (spec 037); a move to any
+    /// other branch starts the table afresh, as before.
+    #[gpui::test]
+    async fn the_cursor_stays_on_its_row_when_the_window_moves_onto_a_proposal(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let session = session(PEOPLE, cx);
+        cx.run_until_parked();
+        let (table, cx) = cx.add_window_view({
+            let session = session.clone();
+            move |window, cx| {
+                TypeTable::new(
+                    WeakEntity::new_invalid(),
+                    session,
+                    "Person".into(),
+                    None,
+                    window,
+                    cx,
+                )
+            }
+        });
+        cx.run_until_parked();
+        table.update(cx, |table, _| {
+            table.cursor = Some(Cursor { row: 1, col: 1 })
+        });
+        session.update(cx, |session, cx| {
+            session.set_branch("proposal/act-ada/1119-1".into(), cx)
+        });
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert_eq!(table.branch, "proposal/act-ada/1119-1");
+            assert_eq!(
+                table.cursor,
+                Some(Cursor { row: 1, col: 1 }),
+                "on Grace still"
+            );
+            assert_eq!(table.selected_row_id(), Some("p2"));
+        });
+        session.update(cx, |session, cx| session.set_branch("fix".into(), cx));
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| assert_eq!(table.cursor, None));
+    }
+
     /// A table's Tree holds what it shows: the selected rows, or its rows under the filters. Its
     /// Canvas holds one node, the row under the cursor, and without one says why it cannot open
     /// (spec 020).
@@ -14647,7 +14720,9 @@ mod tests {
         cx.run_until_parked();
         let (page, cx) = cx.add_window_view({
             let session = session.clone();
-            move |_, cx| crate::NodePage::new(session, "Person".into(), "p1".into(), None, None, cx)
+            move |_, cx| {
+                crate::NodePage::new(session, "Person".into(), "p1".into(), None, None, None, cx)
+            }
         });
         cx.run_until_parked();
         let saved = page.read_with(cx, |page, cx| {
@@ -14669,6 +14744,7 @@ mod tests {
                 "Person".into(),
                 "p1".into(),
                 None,
+                None,
                 label,
                 cx,
             )
@@ -14683,6 +14759,7 @@ mod tests {
                 "Person".into(),
                 "p1".into(),
                 Some("c0".into()),
+                None,
                 None,
                 cx,
             )

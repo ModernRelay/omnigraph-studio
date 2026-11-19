@@ -65,6 +65,7 @@ pub fn init(cx: &mut App) {
                 type_name,
                 id,
                 at_commit: text("at_commit"),
+                on_branch: text("on_branch"),
                 preview: false,
             };
             // Named as it was until it is shown: a page behind another tab reads nothing.
@@ -181,6 +182,7 @@ pub fn init(cx: &mut App) {
                 type_name: action.type_name.clone(),
                 id: action.id.clone(),
                 at_commit: None,
+                on_branch: None,
                 preview: false,
             };
             open_node_page(workspace, &page, None, window, cx);
@@ -568,6 +570,7 @@ fn node_inspector(
     let holds = node.at_commit.is_some();
     let snapshot = node.at_commit.clone().or_else(|| node.snapshot.clone());
     let session = session.clone();
+    let branch = node.branch.clone();
     cx.new(|cx| {
         let mut peek = NodePeek::new(
             session,
@@ -578,6 +581,10 @@ fn node_inspector(
             true,
             cx,
         );
+        // A tab on a branch of its own (a review's) has its node edited there (spec 037).
+        if let Some(branch) = branch {
+            peek.on_branch(branch, cx);
+        }
         if holds {
             peek.hold_commit();
         }
@@ -623,14 +630,32 @@ fn open_node_page(
     let Some(session) = workspace.session().cloned() else {
         return;
     };
-    let key = NodePage::key(&action.type_name, &action.id, action.at_commit.as_deref());
+    // A page asked for on the window's own branch follows the window, as any page does.
+    let on_branch = action
+        .on_branch
+        .clone()
+        .filter(|branch| *branch != session.read(cx).branch);
+    let key = NodePage::key(
+        &action.type_name,
+        &action.id,
+        action.at_commit.as_deref(),
+        on_branch.as_deref(),
+    );
     let (type_name, id, at_commit) = (
         action.type_name.clone(),
         action.id.clone(),
         action.at_commit.clone(),
     );
     workspace.open_item_with::<NodePage>(key, action.preview, window, cx, move |_window, cx| {
-        NodePage::new(session, type_name, id, at_commit, saved_label, cx)
+        NodePage::new(
+            session,
+            type_name,
+            id,
+            at_commit,
+            on_branch,
+            saved_label,
+            cx,
+        )
     });
 }
 

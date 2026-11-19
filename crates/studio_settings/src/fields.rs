@@ -438,6 +438,7 @@ mod tests {
                 "studio.tree_page_size",
                 "studio.canvas_max_nodes",
                 "studio.review_layout",
+                "studio.propose_changes",
                 "studio.health_check_seconds",
                 "studio.show_performance",
                 "studio.auto_update",
@@ -461,6 +462,7 @@ mod tests {
             [
                 "Appearance",
                 "Browsing",
+                "Editing",
                 "Connection",
                 "Updates",
                 "Omnigraph Cloud",

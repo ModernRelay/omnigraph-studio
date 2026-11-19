@@ -551,6 +551,7 @@ impl Item for GraphCanvas {
             id: node.id,
             at_commit: self.held_at(),
             snapshot: self.exploration.read(cx).pin().map(str::to_owned),
+            branch: None,
         }))
     }
 
@@ -600,6 +601,7 @@ impl Item for GraphCanvas {
                     type_name: node.type_name,
                     id: node.id,
                     at_commit: at_commit.clone(),
+                    on_branch: None,
                     preview: false,
                 }))
             }
@@ -1743,6 +1745,7 @@ impl GraphCanvas {
                             type_name: graph_node.type_name,
                             id: graph_node.id,
                             at_commit: self.held_at(),
+                            on_branch: None,
                             preview: false,
                         }),
                         cx,
@@ -2191,6 +2194,7 @@ impl GraphCanvas {
                 type_name: node.type_name.clone(),
                 id: node.id.clone(),
                 at_commit: self.held_at(),
+                on_branch: None,
                 preview: false,
             }),
             cx,
@@ -2407,6 +2411,7 @@ impl GraphCanvas {
                                 type_name: type_name.clone(),
                                 id: key.clone(),
                                 at_commit: at_commit.clone(),
+                                on_branch: None,
                                 preview: false,
                             }),
                         )

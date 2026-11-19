@@ -17,6 +17,7 @@ use graph_client::api::{BranchStartRefusalOutput, BranchStartRefusalReason, Comm
 use graph_store::{AccessAction, AccessScope, BranchStart, GraphSession, SessionEvent};
 use studio_actions::graph::{
     CreateBranch, CreateBranchAt, DeleteBranch, OpenBranch, OpenBranchHistory, ReviewBranch,
+    StopProposing, ToggleProposeChanges,
 };
 use studio_ui::ds::Tipped;
 use studio_ui::menu::{ContextMenu, ContextMenuEntry};
@@ -1116,6 +1117,35 @@ pub fn register(workspace: &mut Workspace) {
             CreateBranchModal::at_commit(session, commit, window, cx)
         });
     });
+    // Proposals (spec 037): turned on or off for the window's graph, in its own settings.
+    workspace.register_action(|workspace, _: &ToggleProposeChanges, _, cx| {
+        let Some(session) = workspace.session() else {
+            return;
+        };
+        let (graph, propose) = {
+            let session = session.read(cx);
+            (
+                session.overrides_key(),
+                !session.options(cx).propose_changes,
+            )
+        };
+        studio_settings::update(cx, move |settings| {
+            settings.set_propose_changes(&graph, propose)
+        });
+    });
+    // Offered only while the window is on a proposal.
+    workspace.register_action_when(
+        |workspace, cx| {
+            workspace
+                .session()
+                .is_some_and(|session| session.read(cx).proposal().is_some())
+        },
+        |workspace, _: &StopProposing, _, cx| {
+            if let Some(session) = workspace.session() {
+                session.update(cx, |session, cx| session.stop_proposing(cx));
+            }
+        },
+    );
     // Not registered while the credential may not delete the window's branch, so the palette
     // does not offer it (constitution VIII).
     workspace.register_action_when(

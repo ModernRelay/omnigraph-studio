@@ -183,6 +183,14 @@ pub struct StudioOptions {
     /// listed beside one record at a time.
     #[schemars(title = "Review layout", extend("x-section" = "Browsing"))]
     pub review_layout: ReviewLayout,
+    /// An edit on `main` starts a branch of its own, a proposal, and lands there; it reaches
+    /// `main` when the proposal is reviewed and merged (spec 037). Off, edits write `main`
+    /// directly where the credential may change it.
+    #[schemars(
+        title = "Propose changes to main",
+        extend("x-section" = "Editing", "x-per-graph" = true)
+    )]
+    pub propose_changes: bool,
     /// Seconds between checks that the server still answers.
     #[schemars(
         title = "Health check interval",
@@ -210,6 +218,7 @@ impl Default for StudioOptions {
             tree_page_size: 50,
             canvas_max_nodes: 2000,
             review_layout: ReviewLayout::default(),
+            propose_changes: true,
             health_check_seconds: 30,
             show_performance: true,
             auto_update: true,
@@ -229,6 +238,8 @@ pub struct GraphOverrides {
     pub tree_page_size: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub canvas_max_nodes: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub propose_changes: Option<bool>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub views: Vec<SavedView>,
     /// The property that names each type's nodes, by type, where the person chose one; other
@@ -398,6 +409,8 @@ pub struct GraphOptions {
     pub type_table_page_size: u32,
     pub tree_page_size: u32,
     pub canvas_max_nodes: u32,
+    /// Whether an edit on `main` starts a proposal (spec 037).
+    pub propose_changes: bool,
 }
 
 /// The property that names one type's nodes in a graph, and the ones that can (spec 002, "Node
@@ -1069,7 +1082,19 @@ impl StudioSettings {
             ),
             tree_page_size: pick(|o| o.tree_page_size, self.studio.tree_page_size),
             canvas_max_nodes: pick(|o| o.canvas_max_nodes, self.studio.canvas_max_nodes),
+            propose_changes: own
+                .and_then(|o| o.propose_changes)
+                .unwrap_or(self.studio.propose_changes),
         }
+    }
+
+    /// Whether edits on `main` start a proposal in `graph` (its [`overrides_key`]), set for
+    /// that graph alone.
+    pub fn set_propose_changes(&mut self, graph: &str, propose: bool) {
+        self.graphs
+            .entry(graph.to_owned())
+            .or_default()
+            .propose_changes = Some(propose);
     }
 
     /// Reads a settings file: comments and trailing commas are allowed, missing keys take

@@ -413,8 +413,14 @@ enum SaveState {
 
 pub struct NodePeek {
     session: Entity<GraphSession>,
-    /// The branch the view reads: the session's, since the view last followed it there.
+    /// The branch the view reads: the session's, since the view last followed it there, or one
+    /// of its own ([`Self::on_branch`]).
     branch: String,
+    /// The view is on a branch of its own (spec 037): it reads that branch's head and edits
+    /// there, and stays when the window moves to another branch.
+    own_branch: bool,
+    /// Asks after the head of the view's own branch while the view is on it.
+    _branch_watch: Option<graph_store::HeadWatch>,
     blobs: Vec<BlobSlot>,
     schema: Option<Arc<SchemaModel>>,
     subject: PeekSubject,
@@ -653,6 +659,7 @@ impl NodePeek {
             // being edited was the branch left's; its drafts wait for it in the session.
             if let SessionEvent::BranchChanged = event
                 && !this.holds_commit
+                && !this.own_branch
                 && session.read(cx).branch != this.branch
             {
                 let left = std::mem::replace(&mut this.branch, session.read(cx).branch.clone());
@@ -729,8 +736,7 @@ impl NodePeek {
                 SessionEvent::ChangesRead { branch } if this.awaiting_changes => Some(branch),
                 _ => None,
             };
-            if moved.is_some_and(|branch| *branch == session.read(cx).branch) && !this.writes_out()
-            {
+            if moved.is_some_and(|branch| *branch == this.branch) && !this.writes_out() {
                 this.compare_head(cx);
             }
         });
@@ -747,6 +753,8 @@ impl NodePeek {
         let mut this = Self {
             session,
             branch,
+            own_branch: false,
+            _branch_watch: None,
             blobs: Vec::new(),
             schema,
             subject,
@@ -852,6 +860,7 @@ impl NodePeek {
             type_name: type_name.clone(),
             id: id.clone(),
             at_commit: self.held_commit(),
+            on_branch: self.own_branch().map(str::to_owned),
             preview: true,
         })
     }
@@ -865,6 +874,7 @@ impl NodePeek {
             id,
             at_commit: self.held_commit(),
             snapshot: None,
+            branch: self.own_branch().map(str::to_owned),
         })
     }
 
@@ -913,6 +923,30 @@ impl NodePeek {
             self.schema.as_ref()?.node(self.subject.type_name())?,
             values,
         )
+    }
+
+    /// Puts the view on `branch` (spec 037), before it first reads: it reads that branch's head,
+    /// or the commit it was given there, edits there, and stays there when the window moves to
+    /// another branch. The window's own branch changes nothing.
+    pub fn on_branch(&mut self, branch: String, cx: &mut Context<Self>) {
+        self.own_branch = true;
+        self.branch = branch.clone();
+        let scope = self.scope.clone();
+        let watch = self.session.update(cx, |session, cx| {
+            if let Some(scope) = &scope {
+                session.reset_scope(scope, &branch);
+            }
+            // What the credential may do there decides which controls edit.
+            session.read_access(graph_store::AccessScope::branch(&branch), cx);
+            session.watch_head(&branch, cx)
+        });
+        self._branch_watch = Some(watch);
+        cx.notify();
+    }
+
+    /// The branch the view is on when it is one of its own, not the window's.
+    pub fn own_branch(&self) -> Option<&str> {
+        self.own_branch.then_some(self.branch.as_str())
     }
 
     /// The peek shows the commit it was given whatever the branch does: no Refresh is offered.
@@ -973,10 +1007,9 @@ impl NodePeek {
         self.forget_read(cx);
         // What it showed is let go; what it reads now is told again, under the new schema too.
         if let Some(scope) = &self.scope {
-            self.session.update(cx, |session, _| {
-                let branch = session.branch.clone();
-                session.reset_scope(scope, &branch);
-            });
+            let branch = self.branch.clone();
+            self.session
+                .update(cx, |session, _| session.reset_scope(scope, &branch));
         }
     }
 
@@ -1198,10 +1231,10 @@ impl NodePeek {
         self.values = Loadable::Loading;
         // At the head the session knows, a node kept there answers at once: a table's page
         // read it already.
-        let snapshot = self.snapshot.clone().or_else(|| {
-            let session = self.session.read(cx);
-            session.head(&session.branch).map(str::to_owned)
-        });
+        let snapshot = self
+            .snapshot
+            .clone()
+            .or_else(|| self.session.read(cx).head(&self.branch).map(str::to_owned));
         // Read at the head the session holds, the read pins the view there: a head the session
         // sees move while it is out finds no pin to compare, and is compared once it lands.
         let asked = self.snapshot.is_none().then(|| snapshot.clone()).flatten();
@@ -1998,7 +2031,10 @@ impl NodePeek {
             .children(self.blobs.iter().enumerate().map(|(index, slot)| {
                 let saving = self.saving.on(&self.branch, &slot.property);
                 let facts = match &slot.meta {
-                    _ if saving => format!("saving to {}…", self.branch),
+                    _ if saving => format!(
+                        "saving to {}…",
+                        self.session.read(cx).write_target(&self.branch, cx)
+                    ),
                     Loadable::Loaded(BlobMeta::Managed { size, .. }) => {
                         studio_ui::format_bytes(*size)
                     }
@@ -3408,7 +3444,7 @@ impl NodePeek {
             return;
         };
         let session = self.session.read(cx);
-        let (Some(head), Some(pin)) = (session.head(&session.branch), self.snapshot.clone()) else {
+        let (Some(head), Some(pin)) = (session.head(&self.branch), self.snapshot.clone()) else {
             return;
         };
         if head == pin {
@@ -4075,7 +4111,7 @@ impl NodePeek {
         if count == 0 && !self.saving_drafts {
             return None;
         }
-        let branch = self.session.read(cx).branch.clone();
+        let branch = self.session.read(cx).write_target(&self.branch, cx);
         let refused = self.change_refusal(cx);
         let label = match count {
             1 => "1 change not saved".to_owned(),
@@ -4303,9 +4339,12 @@ impl NodePeek {
             .then(|| self.render_picker(index, property, value, cx))
             .flatten();
         let opens_editor = editable && picker.is_none() && !editing && !saving;
-        // A boxed value may be cut at its box's end: the tooltip has it whole.
+        // A boxed value may be cut at its box's end: the tooltip has it whole. An enum's menu
+        // opens where its tooltip would show, so it has none; the menu names where a choice
+        // writes (spec 037, pharma R3).
         let whole = (!value.is_null()).then(|| display_value(Some(property), value));
-        let tooltip = (!editing).then(|| {
+        let menu = picker.is_some() && property.enum_values.is_some();
+        let tooltip = (!editing && !menu).then(|| {
             let what = if draft.is_some() {
                 format!(
                     "Not saved; it holds “{}”. Click to edit; ⌘S saves this node's changes together",
@@ -4634,6 +4673,11 @@ impl NodePeek {
             let nullable = property.nullable;
             let property = property.clone();
             let shown = current.clone().unwrap_or_else(|| "—".into());
+            // A choice writes at once: the menu says where first (constitution IV).
+            let lands = format!(
+                "Writes to {}",
+                self.session.read(cx).write_target(&self.branch, cx)
+            );
             // A select, raised as the values are boxed, on their edge.
             return Some(
                 div()
@@ -4645,13 +4689,15 @@ impl NodePeek {
                             ))
                             .anchor(gpui::Anchor::TopLeft)
                             .menu(move |window, cx| {
-                                let (this, property, options, current) = (
+                                let (this, property, options, current, lands) = (
                                     this.clone(),
                                     property.clone(),
                                     options.clone(),
                                     current.clone(),
+                                    lands.clone(),
                                 );
                                 Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                                    menu = menu.header(lands.clone());
                                     let choose = |chosen: Value| {
                                         let (this, property) = (this.clone(), property.clone());
                                         move |window: &mut Window, cx: &mut App| {
@@ -4730,7 +4776,7 @@ impl NodePeek {
             .notice
             .as_ref()
             .is_some_and(|notice| matches!(notice.tone, Tone::Invalid | Tone::Refused));
-        let branch = self.session.read(cx).branch.clone();
+        let branch = self.session.read(cx).write_target(&self.branch, cx);
         let keys = if lines {
             format!("↵ save · ⇧↵ line break · ⌘⇧↵ editor · esc cancel · write · {branch}")
         } else {
@@ -5028,7 +5074,7 @@ impl NodePeek {
     /// the relationship is written to.
     fn render_add_row(&self, adding: &AddEdge, cx: &mut Context<Self>) -> AnyElement {
         let index = adding.index;
-        let branch = self.session.read(cx).branch.clone();
+        let branch = self.session.read(cx).write_target(&self.branch, cx);
         let replaces = self.holds_one(index)
             && matches!(self.groups[index].count, Loadable::Loaded(n) if n > 0);
         let found = match &adding.found {
@@ -5175,7 +5221,8 @@ impl NodePeek {
                 let on_page = self.page;
                 v_flex()
                     .children(neighbours.iter().enumerate().map(|(n, neighbour)| {
-                        let open = open_node(&other, &neighbour.id, at_commit.clone());
+                        let open =
+                            open_node(&other, &neighbour.id, at_commit.clone(), self.own_branch());
                         let label = neighbour
                             .label
                             .clone()
@@ -5256,7 +5303,7 @@ impl NodePeek {
         let label_width = self.label_width();
         let endpoint = |label: &'static str, icon: IconName, ty: &String, key: &str| {
             let id = values.get(key).and_then(Value::as_str)?.to_owned();
-            let open = open_node(ty, &id, at_commit.clone());
+            let open = open_node(ty, &id, at_commit.clone(), self.own_branch());
             Some(
                 studio_ui::ds::property_row(icon, label, label_width)
                     .px(px(space::XS))
@@ -5295,11 +5342,17 @@ impl NodePeek {
 
 /// Opening a related node's page, at the commit the view holds or the head: as a preview, which
 /// a second click keeps.
-fn open_node(type_name: &str, id: &str, at_commit: Option<String>) -> OpenNodePage {
+fn open_node(
+    type_name: &str,
+    id: &str,
+    at_commit: Option<String>,
+    on_branch: Option<&str>,
+) -> OpenNodePage {
     OpenNodePage {
         type_name: type_name.to_owned(),
         id: id.to_owned(),
         at_commit,
+        on_branch: on_branch.map(str::to_owned),
         preview: true,
     }
 }
@@ -6144,6 +6197,7 @@ mod tests {
                     "p1".into(),
                     None,
                     None,
+                    None,
                     cx,
                 )
             }
@@ -6197,6 +6251,7 @@ mod tests {
                         "Person".into(),
                         "p1".into(),
                         held.map(str::to_owned),
+                        None,
                         None,
                         cx,
                     )
@@ -9361,5 +9416,50 @@ mod tests {
                 Some(BlobEdit::Failed { notice, .. }) if notice.message == refused
             ));
         });
+    }
+
+    /// A page on a branch of its own (one a review opened, spec 037) reads that branch, stays
+    /// there when the window moves to another, says so where it writes, and edits there.
+    #[gpui::test]
+    async fn a_page_on_a_branch_of_its_own_edits_there_and_stays(cx: &mut TestAppContext) {
+        let access = json!({ "graph_id": "knowledge", "actor_id": "act-writer",
+            "graph_wide": ["read", "change"], "actions": ["read", "change"] });
+        let (session, sent, _) = crate::test_support::session_with_access(PEOPLE, access, cx);
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (view, cx) = cx.add_window_view({
+            let session = session.clone();
+            move |_, cx| {
+                let mut page = NodePeek::page(session, "Person".into(), "p1".into(), None, cx);
+                page.on_branch("agent/x".into(), cx);
+                page
+            }
+        });
+        cx.run_until_parked();
+        session.update(cx, |session, cx| session.set_branch("fix".into(), cx));
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(
+                view.own_branch(),
+                Some("agent/x"),
+                "the window's move left it"
+            );
+            assert_eq!(view.value_of("name"), json!("Ada"));
+            assert_eq!(
+                view.open_page_action().unwrap().on_branch.as_deref(),
+                Some("agent/x")
+            );
+            let property = view.property_named("name").cloned().unwrap();
+            view.start_edit(property, window, cx);
+            let editor = view.edits["name"].editor.clone();
+            editor.update(cx, |editor, cx| editor.set_text("Ada Lovelace", window, cx));
+            view.save_field("name", window, cx);
+        });
+        cx.run_until_parked();
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0]["branch"], "agent/x");
     }
 }

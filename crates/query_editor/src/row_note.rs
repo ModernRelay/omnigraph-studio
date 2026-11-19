@@ -185,6 +185,7 @@ impl Render for RowNote {
                                     type_name: type_name.clone(),
                                     id: id.clone(),
                                     at_commit: at_commit.clone(),
+                                    on_branch: None,
                                     preview: event.click_count() < 2,
                                 }),
                                 cx,

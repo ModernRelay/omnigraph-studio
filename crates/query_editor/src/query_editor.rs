@@ -212,6 +212,10 @@ pub fn init(cx: &mut App) {
             .and_then(|commit| commit.as_str())
             .map(str::to_owned);
         let widths = saved_widths(data);
+        let on_branch = data
+            .get("on_branch")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         if let Some(path) = data.get("path").and_then(|path| path.as_str()) {
             // A file tab keeps its text with the hash of the file's text it was typed over,
             // and says whether it was the file's (`saved`): that is shown only when the file
@@ -238,6 +242,9 @@ pub fn init(cx: &mut App) {
             {
                 editor.update(cx, |editor, cx| {
                     editor.set_column_widths(widths);
+                    if on_branch.is_some() {
+                        editor.set_on_branch(on_branch, cx);
+                    }
                     if let Some(commit) = at_commit {
                         editor.pin_to(commit, cx);
                     }
@@ -254,6 +261,9 @@ pub fn init(cx: &mut App) {
             // Its text, even emptied, is the tab's: the example does not fill it again.
             let mut editor = QueryEditor::with_text(number, session, &text, window, cx);
             editor.set_column_widths(widths);
+            if on_branch.is_some() {
+                editor.set_on_branch(on_branch, cx);
+            }
             if let Some(commit) = at_commit {
                 editor.pin_to(commit, cx);
             }
@@ -278,7 +288,13 @@ pub fn init(cx: &mut App) {
         );
         if let Some(editor) = opened {
             let widths = saved_widths(data);
-            editor.update(cx, |editor, _| editor.set_column_widths(widths));
+            let on_branch = text("on_branch");
+            editor.update(cx, |editor, cx| {
+                editor.set_column_widths(widths);
+                if on_branch.is_some() {
+                    editor.set_on_branch(on_branch, cx);
+                }
+            });
         }
     });
     studio_workspace::register_item_kind(

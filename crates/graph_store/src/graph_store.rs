@@ -70,8 +70,9 @@ pub mod cli {
 }
 pub use session::{
     BranchStart, DraftEntry, DraftKey, ExternalWrite, FollowUp, GraphSession, HeadWatch, HeldAs,
-    Loadable, MergeEntry, MergeSent, MergeSettled, NAME_LIMIT, OutcomeEntry, OutcomeKind,
-    SchemaFailure, SessionEvent, Wrote, nothing_sent, open_session, open_session_behind,
+    Landing, Loadable, MergeEntry, MergeSent, MergeSettled, NAME_LIMIT, OutcomeEntry, OutcomeKind,
+    PROTECTED, Proposal, SchemaFailure, SessionEvent, Wrote, nothing_sent, open_session,
+    open_session_behind,
 };
 
 /// The user agent of Studio's requests.

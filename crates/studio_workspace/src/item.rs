@@ -59,6 +59,9 @@ pub struct InspectedNode {
     /// The commit the tab shows while it follows the head: the inspector reads there, as the
     /// tab does, and offers Refresh when the branch has moved past it.
     pub snapshot: Option<String>,
+    /// The branch the tab is on when it is not the window's (spec 037): the inspector reads
+    /// that branch's head and edits there. `None` follows the window's branch.
+    pub branch: Option<String>,
 }
 
 /// What a tab has selected, as identifiers only: what a reader of the window is told (a UI

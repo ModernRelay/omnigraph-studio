@@ -914,6 +914,7 @@ impl CommitView {
             id,
             at_commit: Some(commit),
             snapshot: None,
+            branch: None,
         })
     }
 
@@ -959,6 +960,7 @@ impl CommitView {
                 type_name,
                 id,
                 at_commit: Some(commit),
+                on_branch: None,
                 preview: false,
             }),
             cx,

@@ -5,6 +5,7 @@ use gpui::{App, Menu, MenuItem, OsAction, SystemMenuType};
 use studio_actions::agent::OpenAgent;
 use studio_actions::graph::{
     CreateBranch, NewQuery, OpenHistory, OpenMap, OpenQueryFile, OpenSource, ReviewBranch,
+    StopProposing, ToggleProposeChanges,
 };
 use studio_actions::query::{Save, SaveAs};
 use studio_actions::update::{CheckForUpdates, RestartToUpdate};
@@ -99,6 +100,8 @@ pub fn set(cx: &mut App) {
             MenuItem::separator(),
             MenuItem::action("Create Branch…", CreateBranch),
             MenuItem::action("Review Branch", ReviewBranch),
+            MenuItem::action("Propose Changes to Main", ToggleProposeChanges),
+            MenuItem::action("Stop Proposing", StopProposing),
         ]),
         Menu::new("Help").items([
             MenuItem::action("Keyboard Shortcuts", ShowKeyBindings),
