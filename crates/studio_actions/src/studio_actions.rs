@@ -581,6 +581,19 @@ pub mod graph {
         pub preview: bool,
     }
 
+    /// Run a stored mutation on a node (spec 041): its tab opens with `param` filled with the
+    /// node's id, or a list holding it, and asks before it writes.
+    #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = studio_graph)]
+    pub struct RunNodeAction {
+        /// The stored mutation.
+        pub query: String,
+        /// Its parameter that names the node.
+        pub param: String,
+        pub type_name: String,
+        pub id: String,
+    }
+
     /// Walk a node's relationships on a canvas of its own.
     #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
     #[action(namespace = studio_graph)]
@@ -750,6 +763,9 @@ pub mod node {
             SaveText,
             /// Save every unsaved change of the node shown as one commit.
             SaveNodeDrafts,
+            /// Show what can be done to the node shown or selected: its page, tree and canvas,
+            /// and the stored mutations that act on its type.
+            ShowActions,
         ]
     );
 }
@@ -855,6 +871,8 @@ pub mod query {
             PreviousProblem,
             /// Apply the compiler's suggested fix for the problem gone to or under the cursor.
             ApplyFix,
+            /// Open the page of the node the selected result row shows.
+            OpenRowNode,
         ]
     );
 }
@@ -871,6 +889,8 @@ pub mod queries {
             SelectPrevious,
             /// Open the query selected in the Queries panel.
             OpenSelected,
+            /// Pin the stored query selected in the Queries panel at the top, or unpin it.
+            TogglePin,
         ]
     );
 }

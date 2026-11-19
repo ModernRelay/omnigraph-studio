@@ -246,6 +246,9 @@ mod tests {
                 .to_vec(),
             types: vec![None; 6],
             node_types: vec![Some("Person".into()), None, None, None, None, None],
+            identifies: vec![Some("Person".into()), None, None, None, None, None],
+            variables: vec![None; 6],
+            owners: vec![Some(0), None, None, None, None, None],
             rows: vec![
                 vec![json!(null); 6],
                 vec![

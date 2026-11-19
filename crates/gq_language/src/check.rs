@@ -74,6 +74,15 @@ pub struct ResultColumn {
     /// The node type of a column that returns a whole node (`return { $p }`), from the
     /// variable's binding.
     pub node_type: Option<String>,
+    /// The node variable the column reads: `p` for `$p`, `$p.name` and `$p.@id`, when `$p` is
+    /// bound to a node; `None` for an aggregate or any other expression (spec 041).
+    pub variable: Option<String>,
+    /// The node type whose node the column's value names by id (spec 041): a whole node, its
+    /// `@id`, or its key where the key is one `String` property ([`NodeType::id_key`]), which
+    /// the engine keeps as the id.
+    ///
+    /// [`NodeType::id_key`]: crate::NodeType::id_key
+    pub identifies: Option<String>,
 }
 
 /// A result column's kind as a type reads: `String`, `[Date]`, `Vector(3)`, a whole node's
@@ -311,6 +320,34 @@ pub fn check(schema: &SchemaModel, source: &str) -> QueryCheck {
         match typecheck_query_decl(&schema.catalog, decl) {
             Ok(checked) => {
                 let mut info = info;
+                // Each projection's node variable and its type, and whether it names the node
+                // by id (spec 041).
+                let sources: Vec<(Option<(String, String)>, bool)> = match &checked {
+                    CheckedQuery::Read(context) => decl
+                        .return_clause
+                        .iter()
+                        .map(|projection| {
+                            let (var, identifies) = match &projection.expr {
+                                Expr::Variable(var) => (var, true),
+                                Expr::PropAccess { variable, property } => {
+                                    (variable, property == "@id")
+                                }
+                                _ => return (None, false),
+                            };
+                            let Some(BoundVariable::Node { type_name }) =
+                                context.bindings().get(var)
+                            else {
+                                return (None, false);
+                            };
+                            let identifies = identifies
+                                || matches!(&projection.expr, Expr::PropAccess { property, .. }
+                                    if schema.node(type_name).and_then(|node| node.id_key())
+                                        == Some(property.as_str()));
+                            (Some((var.clone(), type_name.clone())), identifies)
+                        })
+                        .collect(),
+                    CheckedQuery::Mutation(_) => Vec::new(),
+                };
                 // Columns that return a whole node, by name, with the node's type.
                 let node_types: Vec<(String, String)> = match &checked {
                     CheckedQuery::Read(context) => decl
@@ -340,7 +377,8 @@ pub fn check(schema: &SchemaModel, source: &str) -> QueryCheck {
                                 .result
                                 .iter()
                                 .zip(&decl.return_clause)
-                                .map(|(field, projection)| {
+                                .enumerate()
+                                .map(|(at, (field, projection))| {
                                     let column = executed_column_name(
                                         &projection.expr,
                                         projection.alias.as_deref(),
@@ -349,12 +387,19 @@ pub fn check(schema: &SchemaModel, source: &str) -> QueryCheck {
                                         .iter()
                                         .find(|(name, _)| *name == column)
                                         .map(|(_, ty)| ty.clone());
+                                    let (source, identifies) =
+                                        sources.get(at).cloned().unwrap_or((None, false));
                                     ResultColumn {
                                         name: field.name.clone(),
                                         kind: kind_label(field, node_type.as_deref()),
                                         nullable: field.nullable,
                                         node_type,
                                         column,
+                                        identifies: source
+                                            .as_ref()
+                                            .filter(|_| identifies)
+                                            .map(|(_, ty)| ty.clone()),
+                                        variable: source.map(|(var, _)| var),
                                     }
                                 })
                                 .collect();
@@ -639,6 +684,40 @@ mod tests {
             .map(|c| c.node_type.as_deref())
             .collect();
         assert_eq!(types, [Some("Person"), Some("Company"), None]);
+    }
+
+    /// Spec 041: a column names the node variable it reads, and says which node type it names
+    /// by id: a whole node, its `@id`, or its one-`String`-property key.
+    #[test]
+    fn columns_name_their_variable_and_what_names_a_node() {
+        let result = check(
+            &dev(),
+            "query q() { match { $p: Person  $p worksAt $c } \
+             return { $p.slug, $p.name, $c.@id, $c, count($p) as n, $c.name as employer } }",
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let columns: Vec<(&str, Option<&str>, Option<&str>)> = result.queries[0]
+            .columns
+            .iter()
+            .map(|c| {
+                (
+                    c.column.as_str(),
+                    c.variable.as_deref(),
+                    c.identifies.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            columns,
+            [
+                ("p.slug", Some("p"), Some("Person")),
+                ("p.name", Some("p"), None),
+                ("c.@id", Some("c"), Some("Company")),
+                ("c", Some("c"), Some("Company")),
+                ("n", None, None),
+                ("employer", Some("c"), None),
+            ]
+        );
     }
 
     #[test]

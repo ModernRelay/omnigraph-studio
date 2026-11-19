@@ -3575,6 +3575,59 @@ fn bound_to(
     Ok(format!(" and {} = {old}", property.name))
 }
 
+/// A value a write sets in a property besides what the person set (spec 041): a graph's own
+/// rule, such as `updated_at` on every change.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Stamp {
+    pub property: String,
+    pub value: StampValue,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum StampValue {
+    /// The server's time when the write runs (`now()`), for a `DateTime`.
+    Now,
+    /// A text, such as the credential's actor, for a `String`.
+    Text(String),
+}
+
+/// The assignments `stamps` add to a write of `node` that sets `set` itself: one for each
+/// stamp the node declares, of a type it fits, that the write does not set. A text is sent as
+/// a parameter named `{prefix}{i}`.
+fn stamp_assignments(
+    node: &NodeType,
+    stamps: &[Stamp],
+    set: &[&str],
+    prefix: &str,
+    params: &mut Params,
+) -> Vec<String> {
+    stamps
+        .iter()
+        .enumerate()
+        .filter(|(_, stamp)| !set.contains(&stamp.property.as_str()))
+        .filter_map(|(i, stamp)| {
+            let property = node.property(&stamp.property)?;
+            if property.list {
+                return None;
+            }
+            let value = match &stamp.value {
+                StampValue::Now if property.kind == ScalarKind::DateTime => "now()".to_owned(),
+                StampValue::Text(text)
+                    if property.base_type == "String" && property.enum_values.is_none() =>
+                {
+                    params.add(
+                        &format!("{prefix}{i}"),
+                        "String",
+                        Value::String(text.clone()),
+                    )
+                }
+                _ => return None,
+            };
+            Some(format!("{}: {value}", property.name))
+        })
+        .collect()
+}
+
 /// One row's edits in a batch: its id, and per property the value the row showed and the new
 /// value.
 #[derive(Debug, Clone, PartialEq)]
@@ -3592,6 +3645,17 @@ pub fn update_rows(
     schema: &SchemaModel,
     type_name: &str,
     rows: &[RowEdit],
+) -> Result<BuiltQuery, BuildError> {
+    update_rows_stamped(schema, type_name, rows, &[])
+}
+
+/// [`update_rows`], each row's statement also setting the `stamps` its type declares and the
+/// row does not set (spec 041). A stamp is not bound: it is what the write changes.
+pub fn update_rows_stamped(
+    schema: &SchemaModel,
+    type_name: &str,
+    rows: &[RowEdit],
+    stamps: &[Stamp],
 ) -> Result<BuiltQuery, BuildError> {
     let node = node(schema, type_name)?;
     let mut params = Params::new();
@@ -3618,6 +3682,14 @@ pub fn update_rows(
                 &mut params,
             )?);
         }
+        let set: Vec<&str> = row.cells.iter().map(|(name, _, _)| name.as_str()).collect();
+        sets.extend(stamp_assignments(
+            node,
+            stamps,
+            &set,
+            &format!("stamp{r}_"),
+            &mut params,
+        ));
         statements.push(format!(
             "update {ty} set {{ {sets} }} where {predicate}",
             ty = node.name,
@@ -3652,6 +3724,19 @@ pub fn update_cells(
     rows: &[(String, Value)],
     new: &Value,
 ) -> Result<BuiltQuery, BuildError> {
+    update_cells_stamped(schema, type_name, property_name, rows, new, &[])
+}
+
+/// [`update_cells`], each statement also setting the `stamps` the type declares, other than
+/// the property set (spec 041).
+pub fn update_cells_stamped(
+    schema: &SchemaModel,
+    type_name: &str,
+    property_name: &str,
+    rows: &[(String, Value)],
+    new: &Value,
+    stamps: &[Stamp],
+) -> Result<BuiltQuery, BuildError> {
     let node = node(schema, type_name)?;
     let property = property(node, property_name)?;
     if !property.editable_in_cell() {
@@ -3659,6 +3744,10 @@ pub fn update_cells(
     }
     let mut params = Params::new();
     let new = params.add("new", &property.param_type(true), new.clone());
+    let stamped = stamp_assignments(node, stamps, &[property_name], "stamp", &mut params)
+        .into_iter()
+        .map(|assignment| format!(", {assignment}"))
+        .collect::<String>();
     // The rows by the value they showed, in the order each value first appears.
     let mut groups: Vec<(Value, Vec<Value>)> = Vec::new();
     let mut group_of: HashMap<String, usize> = HashMap::new();
@@ -3677,7 +3766,7 @@ pub fn update_cells(
             let ids = params.add(&format!("ids{index}"), "[String]", Value::Array(ids));
             let bound = bound_to(property, &old, &format!("old{index}"), &mut params)?;
             Ok(format!(
-                "update {ty} set {{ {prop}: {new} }} where @id in {ids}{bound}",
+                "update {ty} set {{ {prop}: {new}{stamped} }} where @id in {ids}{bound}",
                 ty = node.name,
                 prop = property.name,
             ))
@@ -3704,6 +3793,17 @@ pub fn insert_node(
     type_name: &str,
     values: &[(String, Value)],
 ) -> Result<BuiltQuery, BuildError> {
+    insert_node_stamped(schema, type_name, values, &[])
+}
+
+/// [`insert_node`], also setting the `stamps` the type declares that `values` leave out
+/// (spec 041).
+pub fn insert_node_stamped(
+    schema: &SchemaModel,
+    type_name: &str,
+    values: &[(String, Value)],
+    stamps: &[Stamp],
+) -> Result<BuiltQuery, BuildError> {
     let node = node(schema, type_name)?;
     if values.is_empty() {
         return Err(BuildError::NoValues(node.name.clone()));
@@ -3719,6 +3819,8 @@ pub fn insert_node(
         );
         assignments.push(format!("{}: {param}", property.name));
     }
+    let set: Vec<&str> = values.iter().map(|(name, _)| name.as_str()).collect();
+    assignments.extend(stamp_assignments(node, stamps, &set, "stamp", &mut params));
     let text = format!(
         "query studio_insert({sig}) {{\n  insert {ty} {{ {assignments} }}\n}}\n",
         sig = params.signature(),
@@ -4473,6 +4575,106 @@ mod tests {
             update_rows(&schema, "Person", &key),
             Err(BuildError::NotEditable(_))
         ));
+    }
+
+    /// Spec 041: an edit and a new node set the graph's stamps the type declares, of a type
+    /// they fit, unbound, unless the person set the property; a type without them is written
+    /// as before.
+    #[test]
+    fn writes_stamp_what_the_graph_asks_and_the_type_declares() {
+        let schema = SchemaModel::parse(
+            "node Issue {\n  slug: String @key\n  title: String\n  updated_at: DateTime?\n  \
+             updated_by: String?\n  status: enum(open, closed)\n}\n\
+             node Note {\n  slug: String @key\n  body: String?\n  updated_at: String?\n}\n",
+        )
+        .unwrap();
+        let stamps = [
+            Stamp {
+                property: "updated_at".into(),
+                value: StampValue::Now,
+            },
+            Stamp {
+                property: "updated_by".into(),
+                value: StampValue::Text("act-ada".into()),
+            },
+            Stamp {
+                property: "status".into(),
+                value: StampValue::Text("act-ada".into()),
+            },
+        ];
+        let rows = [RowEdit {
+            id: "lk-acl".into(),
+            cells: vec![("title".into(), json!("Old"), json!("New"))],
+        }];
+        let query = update_rows_stamped(&schema, "Issue", &rows, &stamps).unwrap();
+        assert!(
+            query.text.contains(
+                "update Issue set { title: $new0_0, updated_at: now(), updated_by: $stamp0_1 } \
+                 where @id = $id0 and title = $old0_0"
+            ),
+            "{}",
+            query.text
+        );
+        assert_eq!(query.params["stamp0_1"], "act-ada");
+        assert_compiles_in(&schema, &query);
+        // A property the edit sets is the person's.
+        let rows = [RowEdit {
+            id: "lk-acl".into(),
+            cells: vec![(
+                "updated_at".into(),
+                Value::Null,
+                json!("2026-11-19T00:00:00Z"),
+            )],
+        }];
+        let query = update_rows_stamped(&schema, "Issue", &rows, &stamps).unwrap();
+        assert_eq!(
+            query.text.matches("updated_at").count(),
+            2,
+            "{}",
+            query.text
+        );
+        assert_compiles_in(&schema, &query);
+        let query = update_cells_stamped(
+            &schema,
+            "Issue",
+            "title",
+            &[("lk-acl".into(), json!("Old"))],
+            &json!("New"),
+            &stamps,
+        )
+        .unwrap();
+        assert!(
+            query
+                .text
+                .contains("set { title: $new, updated_at: now(), updated_by: $stamp1 }"),
+            "{}",
+            query.text
+        );
+        assert_compiles_in(&schema, &query);
+        let query = insert_node_stamped(
+            &schema,
+            "Issue",
+            &[
+                ("slug".into(), json!("lk-new")),
+                ("title".into(), json!("New")),
+                ("status".into(), json!("open")),
+            ],
+            &stamps,
+        )
+        .unwrap();
+        assert!(
+            query
+                .text
+                .contains("updated_at: now(), updated_by: $stamp1")
+        );
+        assert_compiles_in(&schema, &query);
+        // A `String` named `updated_at` is not a time: nothing is stamped.
+        let rows = [RowEdit {
+            id: "n1".into(),
+            cells: vec![("body".into(), Value::Null, json!("text"))],
+        }];
+        let query = update_rows_stamped(&schema, "Note", &rows, &stamps).unwrap();
+        assert_eq!(query, update_rows(&schema, "Note", &rows).unwrap());
     }
 
     /// A text property filters by its start and, where it is indexed, by the engine's full-text

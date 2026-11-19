@@ -23,6 +23,15 @@ pub struct ResultTable {
     pub types: Vec<Option<String>>,
     /// The node type of each column that returns whole nodes.
     pub node_types: Vec<Option<String>>,
+    /// The node type each column names by id (spec 041): a whole node, its `@id`, or its key
+    /// where the key is one `String` property; for a stored query, what the person said.
+    pub identifies: Vec<Option<String>>,
+    /// The node variable each column reads (`i` for `i.title`), when known.
+    pub variables: Vec<Option<String>>,
+    /// For each column, the column that names the node its cells belong to: itself when it
+    /// names one, else one of the same variable that does; `None` for an aggregate or a column
+    /// of no node in the result.
+    pub owners: Vec<Option<usize>>,
     pub rows: Vec<Vec<Value>>,
 }
 
@@ -63,41 +72,145 @@ impl ResultTable {
             .iter()
             .map(|column| described(column).and_then(|c| c.node_type.clone()))
             .collect();
-        Self {
+        let identifies = columns
+            .iter()
+            .map(|column| {
+                described(column).and_then(|c| c.identifies.clone().or(c.node_type.clone()))
+            })
+            .collect();
+        let variables = columns
+            .iter()
+            .map(|column| described(column).and_then(|c| c.variable.clone()))
+            .collect();
+        let mut table = Self {
+            owners: Vec::new(),
             columns,
             types,
             node_types,
+            identifies,
+            variables,
             rows,
-        }
+        };
+        table.find_owners();
+        table
+    }
+
+    /// Says which columns name nodes in a stored query's answer, whose columns the catalog
+    /// does not describe (E43): `links` names each such column with its node type, as the
+    /// person said (spec 041). A column named `<var>.<property>` reads `var`, as the server
+    /// names a projection without an alias, so the others of its variable belong to it.
+    pub fn link_columns(&mut self, links: &std::collections::BTreeMap<String, String>) {
+        self.identifies = self
+            .columns
+            .iter()
+            .map(|column| links.get(column).cloned())
+            .collect();
+        self.variables = self
+            .columns
+            .iter()
+            .map(|column| {
+                graph_store::verbs::column_parts(column).map(|(variable, _)| variable.to_owned())
+            })
+            .collect();
+        self.find_owners();
+    }
+
+    /// Each column's owner: the first column of its variable that names the node, or itself.
+    fn find_owners(&mut self) {
+        self.owners = (0..self.columns.len())
+            .map(|column| {
+                if self.identifies[column].is_some() {
+                    return Some(column);
+                }
+                let variable = self.variables[column].as_ref()?;
+                (0..self.columns.len()).find(|&other| {
+                    self.identifies[other].is_some()
+                        && self.variables[other].as_ref() == Some(variable)
+                })
+            })
+            .collect();
+    }
+
+    /// Whether any column names a node, so rows can be nodes.
+    pub fn has_nodes(&self) -> bool {
+        self.identifies.iter().any(Option::is_some)
+    }
+
+    /// The node the cell at `row`, `column` belongs to, by type and id (spec 041); `None` for
+    /// a cell of no node's, or one whose node is null in this row.
+    pub fn cell_node(&self, row: usize, column: usize) -> Option<(String, String)> {
+        let owner = (*self.owners.get(column)?)?;
+        self.node_at(row, owner)
+    }
+
+    /// The node of the row's first column that names one: what the row's menu acts on when
+    /// the cell under it belongs to none.
+    pub fn row_node(&self, row: usize) -> Option<(String, String)> {
+        (0..self.columns.len())
+            .filter(|&column| self.identifies[column].is_some())
+            .find_map(|column| self.node_at(row, column))
+    }
+
+    /// The node column `column` names in `row`: a whole node's `@id`, or the id itself.
+    fn node_at(&self, row: usize, column: usize) -> Option<(String, String)> {
+        let type_name = self.identifies.get(column)?.as_ref()?;
+        let value = self.rows.get(row)?.get(column)?;
+        let id = match value {
+            Value::Object(node) => node.get("@id")?.as_str()?,
+            Value::String(id) => id.as_str(),
+            _ => return None,
+        };
+        Some((type_name.clone(), id.to_owned()))
     }
 
     /// The result's nodes, each once, and which of them share a row, for drawing on a canvas
     /// (specs 006, 007). `None` when no column returns whole nodes.
     pub fn graph(&self, schema: &SchemaModel) -> Option<ResultGraph> {
-        if self.node_types.iter().all(Option::is_none) {
+        if !self.has_nodes() {
             return None;
         }
+        // A key column's node is named by its label property's column of the same variable,
+        // when the result has one (spec 041).
+        let label_columns: Vec<Option<usize>> = (0..self.columns.len())
+            .map(|column| {
+                let type_name = self.identifies[column].as_ref()?;
+                let variable = self.variables[column].as_ref()?;
+                let label = schema.node(type_name)?.label_property()?;
+                self.columns
+                    .iter()
+                    .position(|name| *name == format!("{variable}.{label}"))
+            })
+            .collect();
         let mut nodes: Vec<ResultNode> = Vec::new();
         let mut index: HashMap<(String, String), usize> = HashMap::new();
         let mut links: Vec<(usize, usize)> = Vec::new();
         let mut linked: HashSet<(usize, usize)> = HashSet::new();
         for row in &self.rows {
             let mut previous: Option<usize> = None;
-            for (value, node_type) in row.iter().zip(&self.node_types) {
-                let (Some(type_name), Some(id)) =
-                    (node_type, value.get("@id").and_then(Value::as_str))
-                else {
+            for (column, (value, node_type)) in row.iter().zip(&self.identifies).enumerate() {
+                let Some(type_name) = node_type else {
+                    continue;
+                };
+                let id = match value {
+                    Value::Object(node) => node.get("@id").and_then(Value::as_str),
+                    Value::String(id) => Some(id.as_str()),
+                    _ => None,
+                };
+                let Some(id) = id else {
                     continue;
                 };
                 let key = (type_name.clone(), id.to_owned());
                 let at = *index.entry(key).or_insert_with(|| {
-                    let label = schema
-                        .node(type_name)
-                        .and_then(|node| node.label_property())
-                        .and_then(|label| value.get(label))
-                        .and_then(Value::as_str)
-                        .filter(|label| *label != id)
-                        .map(str::to_owned);
+                    let label = match value {
+                        Value::Object(_) => schema
+                            .node(type_name)
+                            .and_then(|node| node.label_property())
+                            .and_then(|label| value.get(label)),
+                        _ => label_columns[column].and_then(|label| row.get(label)),
+                    }
+                    .and_then(Value::as_str)
+                    .filter(|label| *label != id)
+                    .map(str::to_owned);
                     nodes.push(ResultNode {
                         type_name: type_name.clone(),
                         id: id.to_owned(),
@@ -959,6 +1072,8 @@ mod tests {
             kind: kind.into(),
             nullable,
             node_type: None,
+            variable: None,
+            identifies: None,
         }
     }
 
@@ -982,6 +1097,53 @@ mod tests {
         assert_eq!(links, [(0, 1), (2, 1)]);
         let plain = ResultTable::new(vec!["n".into()], serde_json::json!([{"n": 1}]), None);
         assert!(plain.graph(&schema).is_none());
+    }
+
+    /// Spec 041: a key column names its node, the columns of its variable belong to it, an
+    /// aggregate to none; the graph takes key columns' nodes, named by their label column.
+    #[test]
+    fn a_key_column_makes_its_rows_nodes() {
+        let schema = SchemaModel::parse(include_str!("../../../dev/cluster/knowledge.pg")).unwrap();
+        let mut slug = column("p.slug", "String", false);
+        slug.variable = Some("p".into());
+        slug.identifies = Some("Person".into());
+        let mut name = column("p.name", "String", false);
+        name.variable = Some("p".into());
+        let count = column("n", "Int", false);
+        let rows = json!([
+            {"p.slug": "ada", "p.name": "Ada", "n": 2},
+            {"p.slug": "bob", "p.name": "Bob", "n": 1}
+        ]);
+        let table = ResultTable::new(
+            vec!["p.slug".into(), "p.name".into(), "n".into()],
+            rows.clone(),
+            Some(&[slug, name, count]),
+        );
+        assert_eq!(table.owners, [Some(0), Some(0), None]);
+        assert_eq!(
+            table.cell_node(1, 1),
+            Some(("Person".to_owned(), "bob".to_owned()))
+        );
+        assert_eq!(table.cell_node(1, 2), None, "an aggregate is the row's");
+        assert_eq!(table.row_node(1), table.cell_node(1, 0));
+        let (nodes, _) = table.graph(&schema).unwrap();
+        assert_eq!(nodes[1].id, "bob");
+        assert_eq!(nodes[1].label.as_deref(), Some("Bob"));
+        // A stored query's answer names nothing until the person links a column.
+        let mut stored = ResultTable::new(
+            vec!["p.slug".into(), "p.name".into(), "n".into()],
+            rows,
+            None,
+        );
+        assert!(!stored.has_nodes());
+        stored.link_columns(&[("p.slug".to_owned(), "Person".to_owned())].into());
+        assert_eq!(stored.owners, [Some(0), Some(0), None]);
+        assert_eq!(
+            stored.cell_node(0, 1),
+            Some(("Person".to_owned(), "ada".to_owned()))
+        );
+        stored.link_columns(&Default::default());
+        assert_eq!(stored.cell_node(0, 1), None, "unlinked again");
     }
 
     /// The compiler names a column as the server does (`gq_language::check`), so types are

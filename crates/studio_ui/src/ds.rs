@@ -1124,6 +1124,43 @@ pub fn wash() -> Div {
         .child(field(315., gpui::rgba(0x78a5f01f).into()))
 }
 
+/// The widest the fade at a scrolled edge reaches into the content.
+pub const EDGE_FADE: f32 = 32.;
+
+/// A fade over the right edge of an area that scrolls sideways with `scroll`, painted while
+/// its content goes on past that edge, so a cut column reads as more to the right (spec 041).
+/// Placed last in a `relative` parent of the scrolling area, it takes no pointer. Whether the
+/// content goes on is read as it paints, after this frame's layout set the scroll range.
+pub fn trailing_edge_fade(scroll: &gpui::ScrollHandle, cx: &App) -> impl IntoElement {
+    let surface = surface::document(cx);
+    let scroll = scroll.clone();
+    div()
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .right_0()
+        .w(px(EDGE_FADE))
+        .child(
+            gpui::canvas(
+                |_, _, _| {},
+                move |bounds, _, window, _| {
+                    let (offset, max) = (scroll.offset().x, scroll.max_offset().x);
+                    if max > px(0.) && -offset < max - px(1.) {
+                        window.paint_quad(gpui::fill(
+                            bounds,
+                            gpui::linear_gradient(
+                                90.,
+                                gpui::linear_color_stop(surface.opacity(0.), 0.),
+                                gpui::linear_color_stop(surface, 1.),
+                            ),
+                        ));
+                    }
+                },
+            )
+            .size_full(),
+        )
+}
+
 /// Icon roles, as the text roles: a quiet icon beside a title or a label, and a smaller one
 /// among metadata or inside a dense row. An icon in a button takes the button's own size.
 pub mod icon {
@@ -1325,6 +1362,8 @@ pub struct SidebarRow {
     label_color: Color,
     /// Muted after the label, cut before the label is ([`SidebarRow::detail`]).
     detail: Option<SharedString>,
+    /// A line under the label, smaller and muted ([`SidebarRow::note`]).
+    note: Option<SharedString>,
     end: Option<AnyElement>,
     /// Shown in place of `end` while the row is hovered: pin, archive.
     actions: Option<AnyElement>,
@@ -1346,6 +1385,7 @@ impl SidebarRow {
             label: label.into(),
             label_color: Color::Default,
             detail: None,
+            note: None,
             end: None,
             actions: None,
             selected: false,
@@ -1353,6 +1393,13 @@ impl SidebarRow {
             tooltip: None,
             on_click: None,
         }
+    }
+
+    /// A line under the label, smaller and muted and cut at the row's width: what a stored
+    /// query does, under its name (spec 041). The row grows to hold it.
+    pub fn note(mut self, note: impl Into<SharedString>) -> Self {
+        self.note = Some(note.into());
+        self
     }
 
     /// Muted after the label, and cut first when the row is short of room, so a short label
@@ -1437,10 +1484,14 @@ impl RenderOnce for SidebarRow {
             surface::hover(cx),
             is_glass(cx),
         );
+        let note = self.note;
         h_flex()
             .id(self.id)
             .relative()
-            .h(px(size::SIDEBAR_ROW))
+            .map(|row| match &note {
+                None => row.h(px(size::SIDEBAR_ROW)),
+                Some(_) => row.min_h(px(size::SIDEBAR_ROW)).py(px(space::XS)),
+            })
             .map(|row| {
                 if self.flush {
                     row.px(px(space::XS))
@@ -1469,14 +1520,21 @@ impl RenderOnce for SidebarRow {
                     .size(LabelSize::Small)
                     .color(self.label_color)
                     .single_line();
-                match self.detail {
-                    Some(detail) => row.child(div().flex_none().child(label)).child(
+                match (self.detail, note) {
+                    (_, Some(note)) => row.child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(label.truncate())
+                            .child(text::meta(note).single_line().truncate()),
+                    ),
+                    (Some(detail), None) => row.child(div().flex_none().child(label)).child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .child(text::muted(detail).single_line().truncate()),
                     ),
-                    None => row.child(label.truncate()).child(div().flex_1()),
+                    (None, None) => row.child(label.truncate()).child(div().flex_1()),
                 }
             })
             .map(|row| match self.actions {

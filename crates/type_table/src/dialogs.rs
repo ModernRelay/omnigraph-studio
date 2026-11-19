@@ -341,11 +341,14 @@ impl InsertForm for InsertRowModal {
             .as_ref()
             .and_then(|key| values.iter().find(|(name, _)| name == key))
             .map(|(_, value)| value.clone());
+        // A property the graph stamps, left empty, takes its stamp (spec 041).
+        let stamps = self.session.read(cx).stamps(cx);
         let built = (|| {
-            let mut parts = vec![builder::insert_node(
+            let mut parts = vec![builder::insert_node_stamped(
                 &self.schema,
                 &self.type_name,
                 &values,
+                &stamps,
             )?];
             if !ends.is_empty() {
                 // The new node is named by its key's value, which the form requires.

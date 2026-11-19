@@ -22,6 +22,7 @@ use graph_client::api::QueryCatalogEntry;
 use serde_json::{Map, Value};
 use studio_actions::graph::{
     NewQuery, NewQueryWithText, OpenQueryAt, OpenQueryFile, OpenSource, OpenStoredQuery,
+    RunNodeAction,
 };
 use studio_workspace::{ItemEvent, PanelPosition, ToastKind, Workspace};
 use ui::IconName;
@@ -399,7 +400,7 @@ pub fn init(cx: &mut App) {
                     .clone()
                     .map(|query| query.params)
             });
-            open_stored(
+            let editor = open_stored(
                 workspace,
                 action.name.clone(),
                 values,
@@ -409,6 +410,47 @@ pub fn init(cx: &mut App) {
                 window,
                 cx,
             );
+            // A read with no parameters runs as it opens (spec 041).
+            if let Some(editor) = editor {
+                editor.update(cx, |editor, cx| editor.run_on_open(window, cx));
+            }
+        });
+        // A node's action: the stored mutation's tab with the node in its parameter, asking
+        // before it writes (spec 041).
+        workspace.register_action(|workspace, action: &RunNodeAction, window, cx| {
+            let Some(session) = workspace.session().cloned() else {
+                return;
+            };
+            let list = session
+                .read(cx)
+                .stored_query(&action.query)
+                .and_then(|entry| {
+                    entry
+                        .params
+                        .into_iter()
+                        .find(|param| param.name == action.param)
+                })
+                .is_some_and(|param| param.kind == graph_client::api::ParamKind::List);
+            let value = if list {
+                Value::Array(vec![Value::String(action.id.clone())])
+            } else {
+                Value::String(action.id.clone())
+            };
+            if let Some(editor) = open_stored(
+                workspace,
+                action.query.clone(),
+                None,
+                None,
+                None,
+                false,
+                window,
+                cx,
+            ) {
+                let param = action.param.clone();
+                editor.update(cx, |editor, cx| {
+                    editor.act_on_node(&param, value, window, cx)
+                });
+            }
         });
         workspace.register_action(|workspace, action: &OpenSource, window, cx| {
             open_schema(

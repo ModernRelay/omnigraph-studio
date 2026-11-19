@@ -16,7 +16,7 @@ use editor::{
 };
 use gpui::{
     AnyView, App, ClickEvent, ClipboardItem, Context, DragMoveEvent, Entity, EventEmitter,
-    FocusHandle, Focusable, HighlightStyle, MouseButton, MouseDownEvent, Pixels, Render,
+    FocusHandle, Focusable, HighlightStyle, MouseButton, MouseDownEvent, Pixels, Point, Render,
     ScrollHandle, ScrollStrategy, SharedString, StyleRefinement, Subscription, Task,
     UnderlineStyle, UniformListScrollHandle, WeakEntity, Window, uniform_list,
 };
@@ -30,9 +30,11 @@ use graph_client::api::{ErrorCode, RankingOutput};
 use graph_client::{ReadError, Unauthorized, WriteOutcome};
 use graph_store::{GraphSession, SessionEvent};
 use serde_json::{Map, Value};
+use studio_actions::graph::{OpenNodePage, RunNodeAction};
+use studio_actions::node::ShowActions;
 use studio_actions::query::{
-    ApplyFix, CopyCell, CopyRow, Explain, NextPage, NextProblem, PreviousProblem, Run, Save,
-    SaveAs, SelectNextColumn, SelectPreviousColumn, ToggleResultsFocus,
+    ApplyFix, CopyCell, CopyRow, Explain, NextPage, NextProblem, OpenRowNode, PreviousProblem, Run,
+    Save, SaveAs, SelectNextColumn, SelectPreviousColumn, ToggleResultsFocus,
 };
 use studio_actions::table::RevertView;
 use studio_actions::workspace::Refresh;
@@ -46,7 +48,7 @@ use studio_ui::{
 };
 use studio_workspace::{Inspected, InspectedNode, Item, ItemEvent, ItemStatus, KeyHint, SavedItem};
 use ui::prelude::*;
-use ui::{KeyBinding, PopoverMenu};
+use ui::{KeyBinding, PopoverMenu, PopoverMenuHandle};
 
 use crate::analysis::Analysis;
 use crate::completion::GqCompletionProvider;
@@ -129,6 +131,19 @@ impl ReadAt {
     }
 }
 
+/// The open menu of a stored query's parameter that names a node (spec 041): the nodes of its
+/// type that the parameter's text finds, read when the menu opens.
+struct NodePicks {
+    param: String,
+    menu: WeakEntity<ContextMenu>,
+    /// `None` while the search is out.
+    hits: Option<Result<Vec<graph_store::node_search::NodeHit>, String>>,
+    _search: Task<()>,
+}
+
+/// The most nodes a parameter's menu offers to pick.
+const PICKS: usize = 12;
+
 /// The stored query a tab runs: the server serves it by name and never sends its text, so the
 /// tab shows its description and parameters where a query tab shows its text.
 struct Stored {
@@ -143,6 +158,9 @@ struct Stored {
     /// Whether the tab showed other values than the view as saved when it last said so, so a
     /// keystroke in a parameter redraws the tab only when that changes.
     view_changed: bool,
+    /// It was opened from a list before the catalog was read: once the catalog says it is a
+    /// read with no parameters, it runs (spec 041).
+    run_when_known: bool,
 }
 
 /// The saved view (spec 024) a file's tab shows: one of its queries, run with the view's values.
@@ -294,7 +312,7 @@ struct BuiltRows {
 /// table, or the refusal.
 enum Answer {
     Plan(ReadOutput),
-    Rows(ReadOutput, BuiltRows),
+    Rows(ReadOutput, Box<BuiltRows>),
     Refused(ReadError),
 }
 
@@ -304,12 +322,13 @@ impl Answer {
         columns: Option<&[ResultColumn]>,
         schema: Option<Arc<SchemaModel>>,
         explain: bool,
+        links: Option<&BTreeMap<String, String>>,
     ) -> Self {
         match result {
             Ok(output) if explain && is_plan(&output.columns) => Answer::Plan(output),
             Ok(mut output) => {
-                let built = BuiltRows::new(&mut output, columns, schema);
-                Answer::Rows(output, built)
+                let built = BuiltRows::new(&mut output, columns, schema, links);
+                Answer::Rows(output, Box::new(built))
             }
             Err(error) => Answer::Refused(error),
         }
@@ -322,9 +341,14 @@ impl BuiltRows {
         output: &mut ReadOutput,
         columns: Option<&[ResultColumn]>,
         schema: Option<Arc<SchemaModel>>,
+        links: Option<&BTreeMap<String, String>>,
     ) -> Self {
         let rows = Arc::unwrap_or_clone(std::mem::take(&mut output.rows));
-        let table = ResultTable::new(output.columns.clone(), rows, columns);
+        let mut table = ResultTable::new(output.columns.clone(), rows, columns);
+        // A stored query's columns that name nodes, as the person said (spec 041).
+        if let Some(links) = links {
+            table.link_columns(links);
+        }
         let widths = (0..table.columns.len())
             .map(|i| table.column_width(i))
             .collect();
@@ -731,6 +755,15 @@ pub struct QueryEditor {
     /// The result area as a view of its own, drawn again only when what it shows changes
     /// ([`Self::redraw_results`]).
     results: Entity<QueryResults>,
+    /// A result row's menu while it is open, and where (spec 041).
+    row_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
+    /// The menu beside a stored query's parameter that names a node while it is open, and the
+    /// nodes it found for the parameter's text (spec 041).
+    node_picks: Option<NodePicks>,
+    /// The status bar's "Rows as nodes" menu and each node parameter's menu, so a trigger's
+    /// tooltip does not cover its own open menu.
+    row_links_menu: PopoverMenuHandle<ContextMenu>,
+    param_menus: std::cell::RefCell<HashMap<String, PopoverMenuHandle<ContextMenu>>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -1065,6 +1098,7 @@ impl QueryEditor {
             pending: Map::new(),
             view,
             view_changed: false,
+            run_when_known: false,
         };
         // A restored tab is made before anything asked for the catalog it reads its query from.
         session.update(cx, |session, cx| session.want_stored_queries(cx));
@@ -1221,6 +1255,10 @@ impl QueryEditor {
             file_view: None,
             view_values: Map::new(),
             results: QueryResults::new(cx),
+            row_menu: None,
+            node_picks: None,
+            row_links_menu: PopoverMenuHandle::default(),
+            param_menus: Default::default(),
             _subscriptions: subscriptions,
         };
         this.parse_as_gq(cx);
@@ -2728,6 +2766,11 @@ impl QueryEditor {
         self.sync_stored_params(window, cx);
         // Before a run, the result area says whether the query writes.
         self.redraw_expected(cx);
+        if let Some(stored) = &mut self.stored
+            && std::mem::take(&mut stored.run_when_known)
+        {
+            self.run_on_open(window, cx);
+        }
         cx.notify();
     }
 
@@ -2785,6 +2828,325 @@ impl QueryEditor {
 
     /// The parameters the form shows, `(name, type, nullable)`: the stored query's, else the
     /// declaration's under the cursor.
+    /// The node type each of the stored query's parameters names, as the person said
+    /// (spec 041).
+    fn node_params(&self, cx: &App) -> BTreeMap<String, String> {
+        match &self.stored {
+            Some(stored) => self.session.read(cx).node_params(&stored.entry.name, cx),
+            None => BTreeMap::new(),
+        }
+    }
+
+    /// Says parameter `param` of the stored query names nodes of `type_name`, or none.
+    fn set_node_param(&mut self, param: &str, type_name: Option<String>, cx: &mut Context<Self>) {
+        let Some(stored) = &self.stored else {
+            return;
+        };
+        let (graph, query, param) = (
+            self.session.read(cx).overrides_key(),
+            stored.entry.name.clone(),
+            param.to_owned(),
+        );
+        studio_settings::update(cx, move |settings| {
+            settings.set_node_param(&graph, &query, &param, type_name)
+        });
+        cx.notify();
+    }
+
+    /// The menu of parameter `param` opened as `menu`: the nodes its text names are found, at
+    /// the branch's head, and the menu is built again when they are.
+    fn node_picks_opened(
+        &mut self,
+        param: String,
+        type_name: String,
+        menu: WeakEntity<ContextMenu>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text = self
+            .params
+            .get(&param)
+            .map(|input| input.read(cx).text(cx))
+            .unwrap_or_default();
+        // A list's text is its items: the last one is what is being typed.
+        let text = text
+            .trim_matches(|c| c == '[' || c == ']')
+            .rsplit(',')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .trim_matches('"')
+            .to_owned();
+        let search = self.session.update(cx, |session, cx| {
+            session.find_nodes(&type_name, &text, None, None, PICKS, cx)
+        });
+        let task = cx.spawn_in(window, async move |this, cx| {
+            let found = search.await;
+            let Ok(menu) = this.update(cx, |this, cx| {
+                let picks = this.node_picks.as_mut()?;
+                picks.hits = Some(
+                    found
+                        .map(|found| found.hits)
+                        .map_err(|error| error.to_string()),
+                );
+                cx.notify();
+                picks.menu.upgrade()
+            }) else {
+                return;
+            };
+            if let Some(menu) = menu {
+                cx.update(|window, cx| menu.update(cx, |menu, cx| menu.rebuild(window, cx)))
+                    .ok();
+            }
+        });
+        self.node_picks = Some(NodePicks {
+            param,
+            menu,
+            hits: None,
+            _search: task,
+        });
+    }
+
+    /// Puts node `id` in parameter `param`'s field: a list's gets it added.
+    fn pick_node(
+        &mut self,
+        param: &str,
+        id: String,
+        list: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(input) = self.params.get(param).cloned() else {
+            return;
+        };
+        let value = if list {
+            let text = input.read(cx).text(cx);
+            let mut items = match gq_language::param_value(param, "[String]", true, &text) {
+                Ok(Some(Value::Array(items))) => items,
+                _ => Vec::new(),
+            };
+            if !items.iter().any(|item| item.as_str() == Some(id.as_str())) {
+                items.push(Value::String(id));
+            }
+            Value::Array(items)
+        } else {
+            Value::String(id)
+        };
+        let text = gq_language::input::edit_text(&value);
+        input.update(cx, |input, cx| input.set_text(text, window, cx));
+        window.focus(&input.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    /// The menu beside a parameter that can name a node: the nodes of its type its text finds,
+    /// to pick one, then which type it names (spec 041).
+    fn node_param_entries(
+        &self,
+        mut menu: ContextMenu,
+        editor: WeakEntity<Self>,
+        param: &ParamDescriptor,
+        cx: &App,
+    ) -> ContextMenu {
+        let Some(stored) = &self.stored else {
+            return menu;
+        };
+        let mapped = self.node_params(cx).get(&param.name).cloned();
+        let list = param.kind == ParamKind::List;
+        if let Some(type_name) = &mapped {
+            menu = menu.header(format!("Pick {}", a_or_an(type_name)));
+            let picks = self
+                .node_picks
+                .as_ref()
+                .filter(|picks| picks.param == param.name);
+            match picks.and_then(|picks| picks.hits.as_ref()) {
+                None => {
+                    menu = menu.item(ContextMenuEntry::new("Finding nodes…").disabled(true));
+                }
+                Some(Err(error)) => {
+                    menu = menu.item(ContextMenuEntry::new(error.clone()).disabled(true));
+                }
+                Some(Ok(hits)) if hits.is_empty() => {
+                    menu = menu.item(
+                        ContextMenuEntry::new(format!("No {type_name} matches the text typed"))
+                            .disabled(true),
+                    );
+                }
+                Some(Ok(hits)) => {
+                    for hit in hits {
+                        let label = match &hit.label {
+                            Some(label) => format!("{label} · {}", hit.id),
+                            None => hit.id.clone(),
+                        };
+                        let (editor, name, id) =
+                            (editor.clone(), param.name.clone(), hit.id.clone());
+                        menu = menu.entry(label, None, move |window, cx| {
+                            let (name, id) = (name.clone(), id.clone());
+                            editor
+                                .update(cx, |editor, cx| {
+                                    editor.pick_node(&name, id, list, window, cx)
+                                })
+                                .ok();
+                        });
+                    }
+                }
+            }
+            menu = menu.separator();
+        }
+        menu = menu.header(format!("${} names", param.name));
+        let candidates = self
+            .session
+            .read(cx)
+            .param_type_candidates(&stored.entry, &param.name);
+        for type_name in candidates {
+            let checked = mapped.as_deref() == Some(type_name.as_str());
+            let (editor, name) = (editor.clone(), param.name.clone());
+            let label = a_or_an(&type_name);
+            menu =
+                menu.toggleable_entry(label, checked, IconPosition::Start, None, move |_, cx| {
+                    let (name, type_name) = (name.clone(), type_name.clone());
+                    editor
+                        .update(cx, |editor, cx| {
+                            editor.set_node_param(&name, (!checked).then_some(type_name), cx)
+                        })
+                        .ok();
+                });
+        }
+        let (editor, name) = (editor, param.name.clone());
+        menu.toggleable_entry(
+            "No node",
+            mapped.is_none(),
+            IconPosition::Start,
+            None,
+            move |_, cx| {
+                editor
+                    .update(cx, |editor, cx| editor.set_node_param(&name, None, cx))
+                    .ok();
+            },
+        )
+    }
+
+    /// The control beside a stored query's parameter that can name a node: the type it names,
+    /// or an offer to say one, opening [`Self::node_param_entries`].
+    fn render_node_param(&self, param: &ParamDescriptor, cx: &mut Context<Self>) -> AnyElement {
+        let mapped = self.node_params(cx).get(&param.name).cloned();
+        let editor = cx.entity().downgrade();
+        let (param, name) = (param.clone(), param.name.clone());
+        let label = mapped.clone().unwrap_or_else(|| "Names a node…".to_owned());
+        let tip = match &mapped {
+            Some(type_name) => format!(
+                "${name} names {}: pick one here. Change what it names in this menu",
+                a_or_an(type_name)
+            ),
+            None => format!(
+                "Say which node ${name} names: its field then picks one, and a stored mutation                  becomes an action on that node's page"
+            ),
+        };
+        let handle = self
+            .param_menus
+            .borrow_mut()
+            .entry(name.clone())
+            .or_default()
+            .clone();
+        let open = handle.is_deployed();
+        PopoverMenu::new(SharedString::from(format!("node-param-{name}")))
+            .with_handle(handle)
+            .trigger(
+                studio_ui::ds::button(
+                    SharedString::from(format!("node-param-button-{name}")),
+                    label,
+                )
+                .style(ButtonStyle::Subtle)
+                .end_icon(Icon::new(IconName::ChevronDown))
+                .when(!open, |button| button.tip(studio_ui::ds::tooltip(tip))),
+            )
+            .menu(move |window, cx| {
+                let this = editor.clone();
+                let name = param.name.clone();
+                let param = param.clone();
+                let menu = ContextMenu::build_persistent(window, cx, move |menu, _, cx| {
+                    let menu = menu.keep_open_on_confirm(false);
+                    match this.upgrade() {
+                        Some(editor) => {
+                            editor
+                                .read(cx)
+                                .node_param_entries(menu, this.clone(), &param, cx)
+                        }
+                        None => menu,
+                    }
+                });
+                if let Some(type_name) = editor
+                    .upgrade()
+                    .and_then(|e| e.read(cx).node_params(cx).get(&name).cloned())
+                {
+                    let opened = menu.downgrade();
+                    let param = name.clone();
+                    editor
+                        .update(cx, |editor, cx| {
+                            editor.node_picks_opened(param, type_name, opened, window, cx)
+                        })
+                        .ok();
+                }
+                Some(menu)
+            })
+            .into_any_element()
+    }
+
+    /// A node action reached this tab (spec 041): `param` takes `value`, and the mutation runs
+    /// when nothing it needs is missing, which asks before it writes; otherwise the first
+    /// field it needs takes the keyboard.
+    pub fn act_on_node(
+        &mut self,
+        param: &str,
+        value: Value,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut values = Map::new();
+        values.insert(param.to_owned(), value);
+        self.fill_params(&values, window, cx);
+        let Some(stored) = &self.stored else {
+            return;
+        };
+        let missing = stored.entry.params.iter().find(|param| {
+            !param.nullable
+                && self
+                    .params
+                    .get(&param.name)
+                    .is_none_or(|input| input.read(cx).text(cx).trim().is_empty())
+        });
+        match missing.and_then(|param| self.params.get(&param.name)) {
+            Some(input) => window.focus(&input.focus_handle(cx), cx),
+            None => self.run(&Run, window, cx),
+        }
+    }
+
+    /// A stored read with no parameters runs when it is opened from a list (spec 041); a tab
+    /// that ran already, or one restored at start, runs nothing.
+    pub fn run_on_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let read = self.session.read(cx).stored_queries.loaded().is_some();
+        let Some(stored) = &mut self.stored else {
+            return;
+        };
+        // Opened before the catalog was read: it runs when the catalog says what it is.
+        if !read {
+            stored.run_when_known = true;
+            return;
+        }
+        let stored = &*stored;
+        let known = self
+            .session
+            .read(cx)
+            .stored_query(&stored.entry.name)
+            .is_some();
+        if known
+            && !stored.entry.mutation
+            && stored.entry.params.is_empty()
+            && matches!(self.output, Output::Empty)
+        {
+            self.run(&Run, window, cx);
+        }
+    }
+
     fn shown_params(&self) -> Option<Vec<(String, String, bool)>> {
         match &self.stored {
             Some(stored) => Some(
@@ -3337,6 +3699,11 @@ impl QueryEditor {
         );
         self.selected = None;
         let schema = self.session.read(cx).schema_model();
+        // A stored query's columns that name nodes, as the person said (spec 041).
+        let links = prepared
+            .stored
+            .as_ref()
+            .map(|name| self.session.read(cx).row_nodes(name, cx));
         // The head the session knew when the read went: one it learns while the read is out is
         // compared with the commit the answer was read at.
         let head_before = self
@@ -3352,9 +3719,9 @@ impl QueryEditor {
             let columns = prepared.columns.clone();
             let explain = prepared.explain;
             let answer = cx
-                .background_spawn(
-                    async move { Answer::of(result, columns.as_deref(), schema, explain) },
-                )
+                .background_spawn(async move {
+                    Answer::of(result, columns.as_deref(), schema, explain, links.as_ref())
+                })
                 .await;
             this.update(cx, |this, cx| {
                 // A new output replaces the plan whose operator lit the text.
@@ -3387,6 +3754,7 @@ impl QueryEditor {
             prepared.columns.as_deref(),
             schema,
             prepared.explain,
+            None,
         );
         self.show_read(prepared, read_at, answer, elapsed);
     }
@@ -3427,7 +3795,7 @@ impl QueryEditor {
                     right_aligned,
                     graph,
                     shown,
-                } = built;
+                } = *built;
                 // A width the person dragged a column to wins over the one from its content.
                 let widths = widths
                     .into_iter()
@@ -3765,24 +4133,15 @@ impl QueryEditor {
         let Output::Rows(output) = &self.output else {
             return None;
         };
-        let values = output.table.rows.get(row)?;
-        let node = output
-            .table
-            .node_types
-            .get(column)
-            .and_then(Option::as_ref)
-            .zip(
-                values
-                    .get(column)
-                    .and_then(|value| value.get("@id"))
-                    .and_then(Value::as_str),
-            );
-        Some(match node {
+        output.table.rows.get(row)?;
+        // A cell of a node's (its whole node, its key, or one of its properties beside them)
+        // picks the node (spec 041); any other cell, its row.
+        Some(match output.table.cell_node(row, column) {
             Some((type_name, id)) => {
                 let (at_commit, snapshot) = self.rows_read_at(output, cx);
                 Picked::Node(InspectedNode {
-                    type_name: type_name.clone(),
-                    id: id.to_owned(),
+                    type_name,
+                    id,
                     at_commit,
                     snapshot,
                 })
@@ -3818,6 +4177,318 @@ impl QueryEditor {
             cx.emit(ItemEvent::UpdateTab);
         }
         self.redraw_results(cx);
+        cx.notify();
+    }
+
+    /// Says column `column` of the stored read's answer names nodes of `type_name`, or none,
+    /// and shows the rows as it says (spec 041). With no column, no column names any.
+    fn set_row_node(
+        &mut self,
+        column: Option<String>,
+        type_name: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(stored) = &self.stored else {
+            return;
+        };
+        let (graph, query) = (
+            self.session.read(cx).overrides_key(),
+            stored.entry.name.clone(),
+        );
+        let linked = self.session.read(cx).row_nodes(&query, cx);
+        studio_settings::update(cx, move |settings| match column {
+            Some(column) => settings.set_row_node(&graph, &query, &column, type_name),
+            None => {
+                for column in linked.keys() {
+                    settings.set_row_node(&graph, &query, column, None);
+                }
+            }
+        });
+        self.relink_rows(cx);
+    }
+
+    /// Shows the stored read's rows as the person's links say now: which cells are nodes, and
+    /// the nodes the result's tree and canvas take.
+    fn relink_rows(&mut self, cx: &mut Context<Self>) {
+        let Some(name) = self.stored_name().map(str::to_owned) else {
+            return;
+        };
+        let links = self.session.read(cx).row_nodes(&name, cx);
+        let schema = self.session.read(cx).schema_model();
+        let Output::Rows(rows) = &mut self.output else {
+            return;
+        };
+        rows.table.link_columns(&links);
+        rows.graph = schema
+            .and_then(|schema| rows.table.graph(&schema))
+            .map(Arc::new);
+        self.row_note = None;
+        self.report_selection(cx);
+        cx.emit(ItemEvent::UpdateTab);
+        self.redraw_results(cx);
+        cx.notify();
+    }
+
+    /// The columns of a stored read's answer that may name nodes, each with the types it may
+    /// name (spec 041): a column `<var>.<key>` names the types keyed by `<key>`, or any for
+    /// `@id`, those named like the variable or the query first.
+    fn linkable_columns(&self, cx: &App) -> Vec<(String, Vec<String>)> {
+        let (Some(stored), Output::Rows(rows)) = (&self.stored, &self.output) else {
+            return Vec::new();
+        };
+        let Some(schema) = self.session.read(cx).schema_model() else {
+            return Vec::new();
+        };
+        rows.table
+            .columns
+            .iter()
+            .filter_map(|column| {
+                let (variable, key) = graph_store::verbs::column_parts(column)?;
+                let types = graph_store::verbs::node_type_candidates(
+                    &schema,
+                    &[variable, &stored.entry.name],
+                    Some(key),
+                );
+                (!types.is_empty()).then(|| (column.clone(), types))
+            })
+            .collect()
+    }
+
+    /// The status bar's control that says which node a stored read's rows are (spec 041):
+    /// "Rows: Issue" once a column is linked, else "Rows as nodes…".
+    fn render_row_links(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let columns = self.linkable_columns(cx);
+        if columns.is_empty() {
+            return None;
+        }
+        let Output::Rows(rows) = &self.output else {
+            return None;
+        };
+        let linked: Vec<(String, String)> = rows
+            .table
+            .columns
+            .iter()
+            .zip(&rows.table.identifies)
+            .filter_map(|(column, ty)| Some((column.clone(), ty.clone()?)))
+            .collect();
+        let label = match linked.as_slice() {
+            [] => "Rows as nodes…".to_owned(),
+            [(_, type_name)] => format!("Rows: {type_name}"),
+            _ => format!("Rows: {} node columns", linked.len()),
+        };
+        let tip = if linked.is_empty() {
+            "Say which column names a node, so a row opens its page, shows its relationships and              offers its actions"
+                .to_owned()
+        } else {
+            "Which column of the rows names a node, as you said for this graph".to_owned()
+        };
+        let editor = cx.entity().downgrade();
+        let open = self.row_links_menu.is_deployed();
+        Some(
+            PopoverMenu::new("row-links")
+                .anchor(gpui::Anchor::BottomRight)
+                .with_handle(self.row_links_menu.clone())
+                .trigger(
+                    studio_ui::ds::button("row-links-button", label)
+                        .style(ButtonStyle::Subtle)
+                        .start_icon(Icon::new(IconName::Link))
+                        .when(!open, |button| button.tip(studio_ui::ds::tooltip(tip))),
+                )
+                .menu(move |window, cx| {
+                    let (columns, linked, editor) =
+                        (columns.clone(), linked.clone(), editor.clone());
+                    Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                        for (column, types) in &columns {
+                            menu = menu.header(format!("{column} names"));
+                            for type_name in types {
+                                let checked =
+                                    linked.iter().any(|(c, t)| c == column && t == type_name);
+                                let (editor, column, type_name) =
+                                    (editor.clone(), column.clone(), type_name.clone());
+                                menu = menu.toggleable_entry(
+                                    a_or_an(&type_name),
+                                    checked,
+                                    IconPosition::Start,
+                                    None,
+                                    move |_, cx| {
+                                        let (column, type_name) =
+                                            (column.clone(), type_name.clone());
+                                        editor
+                                            .update(cx, |editor, cx| {
+                                                editor.set_row_node(
+                                                    Some(column),
+                                                    (!checked).then_some(type_name),
+                                                    cx,
+                                                )
+                                            })
+                                            .ok();
+                                    },
+                                );
+                            }
+                        }
+                        let editor = editor.clone();
+                        menu.separator().toggleable_entry(
+                            "Rows are not nodes",
+                            linked.is_empty(),
+                            IconPosition::Start,
+                            None,
+                            move |_, cx| {
+                                editor
+                                    .update(cx, |editor, cx| editor.set_row_node(None, None, cx))
+                                    .ok();
+                            },
+                        )
+                    }))
+                })
+                .into_any_element(),
+        )
+    }
+
+    /// The node the selected cell's row acts on (spec 041): the cell's own node, else the
+    /// row's first; with the commit the rows were read at, when they were held at one.
+    fn selected_row_node(&self) -> Option<(String, String, Option<String>)> {
+        let (row, column) = self.selected?;
+        let Output::Rows(rows) = &self.output else {
+            return None;
+        };
+        let (type_name, id) = rows
+            .table
+            .cell_node(row, column)
+            .or_else(|| rows.table.row_node(row))?;
+        Some((type_name, id, rows.held_at().map(str::to_owned)))
+    }
+
+    /// Opens the page of the node the selected row shows (↵).
+    fn open_row_node(&mut self, _: &OpenRowNode, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((type_name, id, at_commit)) = self.selected_row_node() else {
+            return;
+        };
+        window.dispatch_action(
+            Box::new(OpenNodePage {
+                type_name,
+                id,
+                at_commit,
+                preview: false,
+            }),
+            cx,
+        );
+    }
+
+    /// Opens the selected row's menu at its cell (⌥↵).
+    fn show_row_actions(&mut self, _: &ShowActions, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_row_menu(None, window, cx);
+    }
+
+    /// The selected row's menu, at `position` or else under the row (spec 041): its node's
+    /// page, tree and canvas and the stored mutations that act on it, then copying.
+    fn open_row_menu(
+        &mut self,
+        position: Option<Point<Pixels>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((row, _)) = self.selected else {
+            return;
+        };
+        let node = self.selected_row_node();
+        let actions = node
+            .as_ref()
+            .map(|(type_name, _, _)| self.session.read(cx).node_actions(type_name, cx))
+            .unwrap_or_default();
+        let branch = self.branch(cx);
+        let position = position.unwrap_or_else(|| {
+            let state = self.results_scroll.0.borrow();
+            match state.base_handle.bounds_for_item(row) {
+                Some(bounds) => gpui::point(
+                    bounds.origin.x + px(ROW_NUMBER_WIDTH),
+                    bounds.origin.y + bounds.size.height,
+                ),
+                None => state.base_handle.bounds().origin,
+            }
+        });
+        let editor = cx.entity().downgrade();
+        let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+            let run = |f: fn(&mut QueryEditor, &mut Window, &mut Context<QueryEditor>)| {
+                let editor = editor.clone();
+                move |window: &mut Window, cx: &mut App| {
+                    editor.update(cx, |editor, cx| f(editor, window, cx)).ok();
+                }
+            };
+            if let Some((type_name, id, at_commit)) = &node {
+                let page = OpenNodePage {
+                    type_name: type_name.clone(),
+                    id: id.clone(),
+                    at_commit: at_commit.clone(),
+                    preview: false,
+                };
+                let tree = studio_actions::graph::ShowNodeInTree {
+                    type_name: type_name.clone(),
+                    id: id.clone(),
+                    at_commit: at_commit.clone(),
+                    preview: true,
+                };
+                let canvas = studio_actions::graph::ShowNodeOnCanvas {
+                    type_name: type_name.clone(),
+                    id: id.clone(),
+                    at_commit: at_commit.clone(),
+                    preview: true,
+                };
+                menu = menu
+                    .header(format!("{type_name} · {id}"))
+                    .entry("Open page", None, move |window, cx| {
+                        window.dispatch_action(Box::new(page.clone()), cx)
+                    })
+                    .entry("Show in tree", None, move |window, cx| {
+                        window.dispatch_action(Box::new(tree.clone()), cx)
+                    })
+                    .entry("Show on canvas", None, move |window, cx| {
+                        window.dispatch_action(Box::new(canvas.clone()), cx)
+                    });
+                if !actions.is_empty() {
+                    menu = menu.header(format!("Stored mutations · on {branch}"));
+                    for action in &actions {
+                        let run = RunNodeAction {
+                            query: action.query.clone(),
+                            param: action.param.clone(),
+                            type_name: type_name.clone(),
+                            id: id.clone(),
+                        };
+                        menu =
+                            menu.item(ContextMenuEntry::new(format!("{}…", action.label)).handler(
+                                move |window, cx| window.dispatch_action(Box::new(run.clone()), cx),
+                            ));
+                    }
+                }
+                menu = menu.separator();
+            }
+            menu.entry(
+                "Copy cell",
+                None,
+                run(|editor, window, cx| editor.copy_cell(&CopyCell, window, cx)),
+            )
+            .entry(
+                "Copy row",
+                None,
+                run(|editor, window, cx| editor.copy_row(&CopyRow, window, cx)),
+            )
+        });
+        let subscription = cx.subscribe_in(
+            &menu,
+            window,
+            |this, menu, _: &gpui::DismissEvent, window, cx| {
+                this.row_menu = None;
+                // Back to the rows, unless what the menu did took the keyboard (an action's
+                // tab, a page).
+                if window.focused(cx).is_none()
+                    || menu.focus_handle(cx).contains_focused(window, cx)
+                {
+                    window.focus(&this.results_focus, cx);
+                }
+                cx.notify();
+            },
+        );
+        window.focus(&menu.focus_handle(cx), cx);
+        self.row_menu = Some((menu, position, subscription));
         cx.notify();
     }
 
@@ -4064,6 +4735,10 @@ impl QueryEditor {
                     );
                 }
 
+                // A stored read's rows are nodes once the person says which (spec 041).
+                if let Some(links) = self.render_row_links(cx) {
+                    end.push(links);
+                }
                 if let Some(views) = rows.views() {
                     let tree = views.clone();
                     end.push(
@@ -4100,6 +4775,10 @@ impl QueryEditor {
                 }
                 if self.selected.is_some() {
                     let focus = &self.results_focus;
+                    if self.selected_row_node().is_some() {
+                        keys.push(KeyHint::new("Open the row's node", &OpenRowNode, focus));
+                        keys.push(KeyHint::new("Show the row's actions", &ShowActions, focus));
+                    }
                     keys.push(KeyHint::new("Copy cell", &CopyCell, focus));
                     keys.push(KeyHint::new("Copy row", &CopyRow, focus));
                     keys.push(KeyHint::new(
@@ -4574,6 +5253,16 @@ impl QueryEditor {
                     ds::fields().children(params.iter().filter_map(|(name, ty, nullable)| {
                         let input = self.params.get(name)?.clone();
                         let ty = format!("{ty}{}", if *nullable { "?" } else { "" });
+                        // A stored query's parameter that can name a node says which, and
+                        // picks one (spec 041).
+                        let names_node = self
+                            .stored
+                            .as_ref()
+                            .and_then(|stored| {
+                                stored.entry.params.iter().find(|param| param.name == *name)
+                            })
+                            .filter(|param| graph_store::verbs::can_name_node(param))
+                            .cloned();
                         Some(ds::field(
                             format!("${name}"),
                             h_flex()
@@ -4584,6 +5273,9 @@ impl QueryEditor {
                                         .flex_1()
                                         .max_w(px(size::INSPECTOR_WIDTH))
                                         .child(ds::field_input(input)),
+                                )
+                                .children(
+                                    names_node.map(|param| self.render_node_param(&param, cx)),
                                 )
                                 .child(ds::text::meta(ty).single_line()),
                         ))
@@ -4863,25 +5555,34 @@ impl QueryEditor {
                 .child(studio_ui::ds::empty_state(IconName::Hash, "No rows"))
                 .into_any_element()
         } else {
+            // Columns past the right edge: a fade there says the rows go on (spec 041).
             div()
-                .id("query-results-scroll")
+                .relative()
                 .flex_1()
                 .min_h_0()
-                .overflow_x_scroll()
-                .track_scroll(&self.results_hscroll)
+                .flex()
                 .child(
-                    v_flex().h_full().w(px(total)).child(header()).child(
-                        uniform_list(
-                            "query-results",
-                            table.rows.len(),
-                            cx.processor(|this, range, window, cx| {
-                                this.render_grid_rows(range, window, cx)
-                            }),
-                        )
-                        .track_scroll(&self.results_scroll)
-                        .flex_1(),
-                    ),
+                    div()
+                        .id("query-results-scroll")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_x_scroll()
+                        .track_scroll(&self.results_hscroll)
+                        .child(
+                            v_flex().h_full().w(px(total)).child(header()).child(
+                                uniform_list(
+                                    "query-results",
+                                    table.rows.len(),
+                                    cx.processor(|this, range, window, cx| {
+                                        this.render_grid_rows(range, window, cx)
+                                    }),
+                                )
+                                .track_scroll(&self.results_scroll)
+                                .flex_1(),
+                            ),
+                        ),
                 )
+                .child(studio_ui::ds::trailing_edge_fade(&self.results_hscroll, cx))
                 .into_any_element()
         };
         v_flex()
@@ -4889,6 +5590,8 @@ impl QueryEditor {
             .track_focus(&self.results_focus)
             .on_action(cx.listener(Self::copy_cell))
             .on_action(cx.listener(Self::copy_row))
+            .on_action(cx.listener(Self::open_row_node))
+            .on_action(cx.listener(Self::show_row_actions))
             .on_action(
                 cx.listener(|this, _: &menu::SelectNext, _, cx| this.move_selection(1, 0, cx)),
             )
@@ -5053,20 +5756,36 @@ impl QueryEditor {
                             };
                             let cell_selected = selected == Some((ix, column));
                             let right = rows.right_aligned[column];
+                            let value = &values[column];
                             let text = studio_ui::cell_text(shown[column].clone(), cx).color(
-                                if values[column].is_null() {
-                                    disabled
-                                } else {
-                                    default
+                                match value {
+                                    Value::Null => disabled,
+                                    // A flag that is off recedes; one that is on is a chip.
+                                    Value::Bool(false) => muted,
+                                    _ => default,
                                 },
                             );
+                            let content = match value {
+                                Value::Bool(true) => studio_ui::ds::chip(shown[column].clone(), cx)
+                                    .into_any_element(),
+                                _ if right => text.align_end().into_any_element(),
+                                _ => text.into_any_element(),
+                            };
                             grid_cell(px(rows.widths[column]), right)
                                 .when(cell_selected, |d| d.bg(selected_bg))
-                                .child(if right { text.align_end() } else { text })
+                                .child(content)
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |this, _, window, cx| {
                                         this.select_cell(ix, column, window, cx)
+                                    }),
+                                )
+                                // The row's menu: its node's views and actions (spec 041).
+                                .on_mouse_down(
+                                    MouseButton::Right,
+                                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                        this.select_cell(ix, column, window, cx);
+                                        this.open_row_menu(Some(event.position), window, cx);
                                     }),
                                 )
                                 .into_any_element()
@@ -5521,6 +6240,11 @@ impl Render for QueryEditor {
             .children(params)
             .children(confirm)
             .child(results)
+            .children(
+                self.row_menu
+                    .as_ref()
+                    .map(|(menu, position, _)| studio_ui::ds::menu_at(menu.clone(), *position)),
+            )
     }
 }
 
@@ -5547,6 +6271,16 @@ fn diff_sides(page: &ReadPageOutput) -> Option<AnyElement> {
 /// The dedupe key of a tab editing `path`, so a file opens once.
 pub fn file_key(path: &std::path::Path) -> String {
     format!("query-file:{}", path.display())
+}
+
+/// A type's name with its article, as a menu says what a parameter names: "a Claim", "an
+/// Issue".
+fn a_or_an(type_name: &str) -> String {
+    let vowel = type_name
+        .chars()
+        .next()
+        .is_some_and(|c| "AEIOUaeiou".contains(c));
+    format!("{} {type_name}", if vowel { "an" } else { "a" })
 }
 
 /// A file's name as the tab and its bars say it: `people.gq`.
@@ -8301,6 +9035,366 @@ mod tests {
                 editor.set_saved(long);
                 editor.unsaved = false;
                 assert!(editor.serialize(cx).unwrap().data.get("text").is_none());
+            });
+        }
+
+        // ---- spec 041: rows are nodes, mutations are node actions ----
+
+        const ISSUES: &str = "node Issue {\n  slug: String @key\n  title: String\n  \
+                              done: Bool?\n}\nnode Comment {\n  slug: String @key\n}\n";
+
+        /// The catalog route serving beads' `ready`, `claim` and `close`, as a `v0.15.0` server
+        /// lists them.
+        fn catalog_route() -> (&'static str, String) {
+            (
+                "/queries",
+                json!({"queries": [
+                    {"name": "ready", "description": "Claimable work", "params": []},
+                    {"name": "claim", "mutation": true, "params": [
+                        {"name": "id", "kind": "string", "nullable": false},
+                        {"name": "who", "kind": "string", "nullable": false},
+                        {"name": "lease", "kind": "datetime", "nullable": true}]},
+                    {"name": "close", "mutation": true, "params": [
+                        {"name": "ids", "kind": "list", "item_kind": "string", "nullable": false},
+                        {"name": "reason", "kind": "string", "nullable": true}]}
+                ]})
+                .to_string(),
+            )
+        }
+
+        fn init_settings(cx: &mut TestAppContext) {
+            init(cx);
+            cx.update(|cx| {
+                studio_settings::init_test(cx);
+                studio_settings::keep_changes_in_memory(cx);
+            });
+        }
+
+        /// A catalog entry as the session holds it, once read.
+        fn stored_entry(
+            session: &Entity<GraphSession>,
+            name: &str,
+            cx: &mut TestAppContext,
+        ) -> QueryCatalogEntry {
+            session.read_with(cx, |session, _| {
+                session.stored_query(name).expect("the catalog lists it")
+            })
+        }
+
+        /// Spec 041: a `.gq` read that returns a node's key makes each row that node: a cell
+        /// of its key or of its other properties picks it for the inspector, an aggregate's
+        /// picks the row, ↵ opens its page, and ⌥↵ opens the row's menu without drawing the
+        /// rows again. A `true` flag is a chip. Nothing is added to the query sent.
+        #[gpui::test]
+        async fn a_row_that_returns_a_key_is_the_node_it_names(cx: &mut TestAppContext) {
+            init_settings(cx);
+            let (session, _) = served(cx, vec![schema_route(ISSUES)]);
+            cx.run_until_parked();
+            let schema = session.read_with(cx, |session, _| session.schema_model().unwrap());
+            let opened: Arc<std::sync::Mutex<Vec<OpenNodePage>>> = Arc::default();
+            cx.update(|cx| {
+                cx.bind_keys([
+                    gpui::KeyBinding::new("enter", OpenRowNode, Some("QueryResults")),
+                    gpui::KeyBinding::new("alt-enter", ShowActions, Some("QueryResults")),
+                    gpui::KeyBinding::new("down", menu::SelectNext, Some("menu")),
+                    gpui::KeyBinding::new("up", menu::SelectPrevious, Some("menu")),
+                ]);
+                let opened = opened.clone();
+                cx.on_action(move |open: &OpenNodePage, _| {
+                    opened.lock().unwrap().push(open.clone())
+                });
+            });
+            let text = "query open() { match { $i: Issue } \
+                        return { $i.slug, $i.title, $i.done, count($i) as n } }";
+            let columns = gq_language::check(&schema, text).queries[0].columns.clone();
+            assert!(!text.contains("@id"), "the query is sent as written");
+            let (editor, cx) =
+                cx.add_window_view(|window, cx| QueryEditor::new(1, session, window, cx));
+            editor.update_in(cx, |editor, window, cx| {
+                let output: ReadOutput = serde_json::from_value(json!({
+                    "query_name": "open",
+                    "target": {"branch": "main"},
+                    "row_count": 2,
+                    "columns": ["i.slug", "i.title", "i.done", "n"],
+                    "rows": [
+                        {"i.slug": "lk-acl", "i.title": "ACLs", "i.done": true, "n": 1},
+                        {"i.slug": "lk-sync", "i.title": "Sync", "i.done": false, "n": 1}
+                    ],
+                }))
+                .unwrap();
+                let prepared = Prepared {
+                    name: Some("open".into()),
+                    label: "open".into(),
+                    columns: Some(columns),
+                    ..Default::default()
+                };
+                editor.finish_read(
+                    prepared,
+                    ReadAt::Branch("main".into()),
+                    Ok(output),
+                    Duration::ZERO,
+                    Some(schema.clone()),
+                );
+                editor.redraw_results(cx);
+                let Output::Rows(rows) = &editor.output else {
+                    panic!("rows");
+                };
+                let graph = rows.graph.as_ref().expect("the keys make nodes");
+                assert_eq!(graph.0[0].id, "lk-acl");
+                assert_eq!(
+                    graph.0[0].label.as_deref(),
+                    Some("ACLs"),
+                    "named by its title"
+                );
+                editor.select_cell(0, 1, window, cx);
+                assert_eq!(
+                    editor.picked(cx),
+                    Some(Picked::Node(InspectedNode {
+                        type_name: "Issue".into(),
+                        id: "lk-acl".into(),
+                        at_commit: None,
+                        snapshot: None,
+                    }))
+                );
+                editor.select_cell(0, 3, window, cx);
+                assert_eq!(
+                    editor.picked(cx),
+                    Some(Picked::Row(0)),
+                    "an aggregate's cell"
+                );
+                editor.select_cell(1, 0, window, cx);
+            });
+            cx.run_until_parked();
+            cx.simulate_keystrokes("enter");
+            assert_eq!(
+                opened
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|open| (open.type_name.as_str(), open.id.as_str()))
+                    .collect::<Vec<_>>(),
+                [("Issue", "lk-sync")]
+            );
+            cx.simulate_keystrokes("alt-enter");
+            cx.run_until_parked();
+            let renders = editor.read_with(cx, |editor, cx| {
+                assert!(editor.row_menu.is_some(), "the row's menu is open");
+                editor.results.read(cx).renders
+            });
+            // The menu is drawn over the rows, outside them: moving through it leaves them.
+            cx.simulate_keystrokes("down down up");
+            cx.run_until_parked();
+            editor.read_with(cx, |editor, cx| {
+                assert_eq!(
+                    editor.results.read(cx).renders,
+                    renders,
+                    "moving through the row's menu drew the rows"
+                );
+            });
+        }
+
+        /// Spec 041: a stored read's rows are no node until the person says which column names
+        /// one; the menu offers the types keyed by the column's property, the choice is kept
+        /// for the graph, and taking it back makes them rows again.
+        #[gpui::test]
+        async fn a_stored_reads_rows_are_nodes_once_the_person_says_which(cx: &mut TestAppContext) {
+            init_settings(cx);
+            let (session, _) = served(cx, vec![schema_route(ISSUES), catalog_route()]);
+            session.update(cx, |session, cx| session.want_stored_queries(cx));
+            cx.run_until_parked();
+            let entry = stored_entry(&session, "ready", cx);
+            let graph = session.read_with(cx, |session, _| session.overrides_key());
+            let (editor, cx) = cx.add_window_view(|window, cx| {
+                QueryEditor::new_stored(1, session, entry, None, window, cx)
+            });
+            editor.update_in(cx, |editor, window, cx| {
+                let output: ReadOutput = serde_json::from_value(json!({
+                    "query_name": "ready",
+                    "target": {"branch": "main"},
+                    "row_count": 1,
+                    "columns": ["i.slug", "i.title"],
+                    "rows": [{"i.slug": "lk-acl", "i.title": "ACLs"}],
+                }))
+                .unwrap();
+                let prepared = Prepared {
+                    stored: Some("ready".into()),
+                    ..people()
+                };
+                editor.finish_read(
+                    prepared,
+                    ReadAt::Branch("main".into()),
+                    Ok(output),
+                    Duration::ZERO,
+                    None,
+                );
+                editor.select_cell(0, 1, window, cx);
+                assert_eq!(editor.picked(cx), Some(Picked::Row(0)), "not said yet");
+                assert_eq!(
+                    editor.linkable_columns(cx),
+                    [(
+                        "i.slug".to_owned(),
+                        vec!["Comment".to_owned(), "Issue".to_owned()]
+                    )],
+                    "the types keyed by slug"
+                );
+                editor.set_row_node(Some("i.slug".into()), Some("Issue".into()), cx);
+                assert!(matches!(
+                    editor.picked(cx),
+                    Some(Picked::Node(InspectedNode { ref id, .. })) if id == "lk-acl"
+                ));
+                let Output::Rows(rows) = &editor.output else {
+                    panic!("rows");
+                };
+                assert!(rows.views().is_some(), "its Tree takes the node");
+            });
+            cx.update(|_, cx| {
+                let settings = cx.global::<studio_settings::StudioSettings>();
+                assert_eq!(settings.row_nodes(&graph, "ready")["i.slug"], "Issue");
+            });
+            editor.update(cx, |editor, cx| {
+                editor.set_row_node(None, None, cx);
+                assert_eq!(editor.picked(cx), Some(Picked::Row(0)), "rows again");
+            });
+        }
+
+        /// Spec 041: a stored mutation whose parameter the person says names an Issue is an
+        /// action on Issues; run on a node, its tab fills the parameter (a list's with a list)
+        /// and asks before it writes, sending nothing, or puts the keyboard in the field it
+        /// still needs.
+        #[gpui::test]
+        async fn a_node_action_fills_its_node_and_asks_before_it_writes(cx: &mut TestAppContext) {
+            init_settings(cx);
+            let (session, asked) = served(cx, vec![schema_route(ISSUES), catalog_route()]);
+            session.update(cx, |session, cx| session.want_stored_queries(cx));
+            cx.run_until_parked();
+            let graph = session.read_with(cx, |session, _| session.overrides_key());
+            cx.update(|cx| {
+                studio_settings::update(cx, |settings| {
+                    settings.set_node_param(&graph, "close", "ids", Some("Issue".into()));
+                    settings.set_node_param(&graph, "claim", "id", Some("Issue".into()));
+                    settings.set_node_param(&graph, "claim", "lease", Some("Issue".into()));
+                })
+            });
+            let actions = cx.update(|cx| session.read(cx).node_actions("Issue", cx));
+            assert_eq!(
+                actions
+                    .iter()
+                    .map(|action| (action.label.as_str(), action.param.as_str()))
+                    .collect::<Vec<_>>(),
+                [("Claim", "id"), ("Close", "ids")],
+                "a DateTime names no node"
+            );
+            assert!(cx.update(|cx| session.read(cx).node_actions("Comment", cx).is_empty()));
+
+            let close = stored_entry(&session, "close", cx);
+            let (editor, cx) = cx.add_window_view(|window, cx| {
+                QueryEditor::new_stored(1, session.clone(), close, None, window, cx)
+            });
+            editor.update_in(cx, |editor, window, cx| {
+                editor.act_on_node("ids", json!(["lk-acl"]), window, cx);
+                assert_eq!(editor.params["ids"].read(cx).text(cx), "lk-acl");
+                editor.pick_node("ids", "lk-sync".into(), true, window, cx);
+                assert_eq!(editor.params["ids"].read(cx).text(cx), "lk-acl, lk-sync");
+                editor.pick_node("ids", "lk-acl".into(), true, window, cx);
+                assert_eq!(editor.params["ids"].read(cx).text(cx), "lk-acl, lk-sync");
+                let pending = editor.pending_write.as_ref().expect("it asks first");
+                assert!(pending.prepared.write);
+            });
+            cx.run_until_parked();
+            assert!(
+                !asked
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|ask| ask.ends_with("/queries/close")),
+                "nothing is sent before ↵"
+            );
+
+            let claim = stored_entry(&session, "claim", cx);
+            let claim = cx.update(|window, cx| {
+                cx.new(|cx| QueryEditor::new_stored(2, session, claim, None, window, cx))
+            });
+            claim.update_in(cx, |editor, window, cx| {
+                editor.act_on_node("id", json!("lk-acl"), window, cx);
+                assert!(editor.pending_write.is_none(), "who claims is not said yet");
+                assert!(
+                    editor.params["who"]
+                        .read(cx)
+                        .focus_handle(cx)
+                        .is_focused(window),
+                    "the field it needs has the keyboard"
+                );
+            });
+        }
+
+        /// Spec 041: a stored read with no parameters runs when it is opened; one with
+        /// parameters, a write and a tab that ran already wait.
+        #[gpui::test]
+        async fn a_read_with_no_parameters_runs_when_it_opens(cx: &mut TestAppContext) {
+            init_settings(cx);
+            let ready = (
+                "/queries/ready",
+                json!({"query_name": "ready", "target": {"branch": "main"}, "row_count": 0,
+                       "columns": ["i.slug"], "rows": []})
+                .to_string(),
+            );
+            let (session, asked) = served(cx, vec![schema_route(ISSUES), ready, catalog_route()]);
+            session.update(cx, |session, cx| session.want_stored_queries(cx));
+            cx.run_until_parked();
+            let sent = |name: &str| {
+                asked
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|ask| {
+                        ask.starts_with("POST") && ask.ends_with(&format!("/queries/{name}"))
+                    })
+                    .count()
+            };
+            for name in ["ready", "close"] {
+                let entry = stored_entry(&session, name, cx);
+                let session = session.clone();
+                let (editor, cx) = cx.add_window_view(|window, cx| {
+                    QueryEditor::new_stored(1, session, entry, None, window, cx)
+                });
+                editor.update_in(cx, |editor, window, cx| editor.run_on_open(window, cx));
+                cx.run_until_parked();
+                editor.update_in(cx, |editor, window, cx| editor.run_on_open(window, cx));
+                cx.run_until_parked();
+            }
+            assert_eq!(sent("ready"), 1, "once, when it opened");
+            assert_eq!(sent("close"), 0, "a write waits for Run");
+
+            // Opened before the catalog is read, it runs once the catalog says it may.
+            let (late, _) = served(cx, vec![schema_route(ISSUES), catalog_route()]);
+            let entry = QueryCatalogEntry {
+                name: "ready".into(),
+                tool_name: None,
+                description: None,
+                instruction: None,
+                mutation: false,
+                params: Vec::new(),
+            };
+            let (_, cx) =
+                cx.add_window_view(|window, cx| QueryEditor::new(9, session.clone(), window, cx));
+            // Made and opened in one step, before the catalog it asks for is read.
+            let editor = cx.update(|window, cx| {
+                let editor = cx.new(|cx| QueryEditor::new_stored(1, late, entry, None, window, cx));
+                editor.update(cx, |editor, cx| {
+                    editor.run_on_open(window, cx);
+                    assert!(
+                        matches!(editor.output, Output::Empty),
+                        "not before the catalog"
+                    );
+                });
+                editor
+            });
+            cx.run_until_parked();
+            editor.read_with(cx, |editor, _| {
+                assert!(
+                    !matches!(editor.output, Output::Empty),
+                    "it ran once the catalog came"
+                );
             });
         }
     }

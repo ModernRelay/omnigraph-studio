@@ -313,13 +313,15 @@
     "bindings": {
       "up": "studio_queries::SelectPrevious",
       "down": "studio_queries::SelectNext",
-      "enter": "studio_queries::OpenSelected"
+      "enter": "studio_queries::OpenSelected",
+      "p": "studio_queries::TogglePin"
     }
   },
   {
     "context": "NodePage && !Editor",
     "bindings": {
-      "space": "studio::ToggleInspector"
+      "space": "studio::ToggleInspector",
+      "alt-enter": "studio_node::ShowActions"
     }
   },
   {
@@ -410,7 +412,9 @@
       "ctrl-c": "studio_query::CopyCell",
       "ctrl-shift-c": "studio_query::CopyRow",
       "left": "studio_query::SelectPreviousColumn",
-      "right": "studio_query::SelectNextColumn"
+      "right": "studio_query::SelectNextColumn",
+      "enter": "studio_query::OpenRowNode",
+      "alt-enter": "studio_node::ShowActions"
     }
   },
   {

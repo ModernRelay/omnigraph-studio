@@ -73,6 +73,7 @@ the interaction and asserts the count:
 | `type_table` `rows_draw_only_the_columns_in_view` | A 21-column type draws the pinned column and those in view; scrolled to the end, the last; the cursor's column always; a line lays out one gap for the rest, as wide as they are; widened, every column in the frame of the resize |
 | `type_table` `rows_draw_the_cells_their_own_view_meets` | In a grid half its window's width, rows leave the columns past its edge empty that the window's width picks; widened with the window unchanged, the first frame after it draws them |
 | `query_editor` `a_wide_result_draws_only_the_columns_in_view` | A 60-column result draws the columns in view and one gap for the rest, as wide as they are; scrolled to the end, the last |
+| `query_editor` `a_row_that_returns_a_key_is_the_node_it_names` | A result row's menu (spec 041) is drawn by the tab, outside the cached rows: moving through it draws them no times |
 | `query_editor` `typing_in_the_query_leaves_the_results_as_they_were` | The result area follows the tab's `notify`; typing in the query does not draw it |
 | `query_editor` `typing_leaves_the_problems_as_they_were` | The problems strip is a cached view of its own; typing that leaves the problems unchanged does not draw it |
 | `graph_store` `counts_landing_together_are_taken_in_one_walk` | Expand all on 140 nodes asks 2,800 counts in 40 reads; the walk is flattened at most once a read and views hear at most one `Loaded` a read (3 walks and 2 events measured; 2,801 and 2,800 before) |

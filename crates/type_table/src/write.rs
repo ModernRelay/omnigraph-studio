@@ -118,7 +118,10 @@ pub(crate) fn write_rows(
     description: String,
     cx: &mut App,
 ) -> Result<Task<Bound>, String> {
-    let query = builder::update_rows(schema, type_name, rows).map_err(|error| error.to_string())?;
+    // The graph's own rules for a hand edit, such as `updated_at` (spec 041).
+    let stamps = session.read(cx).stamps(cx);
+    let query = builder::update_rows_stamped(schema, type_name, rows, &stamps)
+        .map_err(|error| error.to_string())?;
     let read = rows
         .iter()
         .map(|row| {
@@ -173,7 +176,8 @@ pub(crate) fn write_cells(
     description: String,
     cx: &mut App,
 ) -> Result<Task<Bound>, String> {
-    let query = builder::update_cells(schema, type_name, property, rows, new)
+    let stamps = session.read(cx).stamps(cx);
+    let query = builder::update_cells_stamped(schema, type_name, property, rows, new, &stamps)
         .map_err(|error| error.to_string())?;
     let read = rows
         .iter()
@@ -518,5 +522,66 @@ mod tests {
         }
         assert!(matches!(set(&rows[1..], cx), Bound::Changed));
         assert_eq!(writes.lock().unwrap().len(), 1, "nothing more sent");
+    }
+}
+
+#[cfg(test)]
+mod stamp_tests {
+    use gpui::TestAppContext;
+    use serde_json::json;
+
+    use crate::test_support::session_recording_writes;
+
+    const ISSUES: &str = "node Issue {\n  slug: String @key\n  title: String\n  \
+                          updated_at: DateTime?\n  updated_by: String?\n}\n";
+
+    /// Spec 041: a hand edit carries the graph's stamps, as the settings ask, for the
+    /// properties its type declares; the actor's waits until the access route names one.
+    #[gpui::test]
+    async fn a_hand_edit_carries_the_graphs_stamps(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+            studio_settings::keep_changes_in_memory(cx);
+        });
+        let (session, sent) = session_recording_writes(ISSUES, cx);
+        cx.run_until_parked();
+        let graph = session.read_with(cx, |session, _| session.overrides_key());
+        let edit = |cx: &mut TestAppContext| {
+            let schema = session.read_with(cx, |session, _| session.schema_model().unwrap());
+            let write = cx.update(|cx| {
+                super::write_properties(
+                    &session,
+                    "main",
+                    &schema,
+                    "Issue",
+                    "lk-acl",
+                    &[("title".into(), json!("Old"), json!("New"))],
+                    None,
+                    cx,
+                )
+                .unwrap()
+            });
+            cx.run_until_parked();
+            drop(write);
+            sent.lock().unwrap().last().unwrap()["query"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let plain = edit(cx);
+        assert!(!plain.contains("updated_at"), "nothing asked: {plain}");
+        cx.update(|cx| {
+            let text = format!(
+                r#"{{"graphs": {{"{graph}": {{"stamps": {{"updated_at": "now", "updated_by": "actor"}}}}}}}}"#
+            );
+            let read = studio_settings::StudioSettings::read(&text).unwrap();
+            studio_settings::update(cx, |settings| *settings = read.settings);
+        });
+        let stamped = edit(cx);
+        assert!(
+            stamped.contains("set { title: $new0_0, updated_at: now() }"),
+            "the time, and no actor while none is known: {stamped}"
+        );
     }
 }

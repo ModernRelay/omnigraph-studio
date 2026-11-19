@@ -1,6 +1,8 @@
 //! The left dock's "Queries" panel (spec 007): this graph's saved `.gq` files, the most
-//! recently changed first, then the stored queries the server serves for the graph. A click
-//! opens one, as ↵ opens the one ↑ and ↓ select; ⌘S in a new query saves it here.
+//! recently changed first, then the stored queries the server serves for the graph: those the
+//! person pinned, then the reads, then the writes, each with what it does under its name
+//! (spec 041). A click opens one, as ↵ opens the one ↑ and ↓ select; ⌘S in a new query saves
+//! it here.
 
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -12,7 +14,7 @@ use gpui::{
 };
 use graph_store::{GraphSession, Loadable, SessionEvent};
 use studio_actions::graph::{NewQuery, OpenQueryFile, OpenStoredQuery};
-use studio_actions::queries::{OpenSelected, SelectNext, SelectPrevious};
+use studio_actions::queries::{OpenSelected, SelectNext, SelectPrevious, TogglePin};
 use studio_ui::ds::Tipped;
 use studio_ui::menu::{ContextMenu, ContextMenuEntry};
 use studio_workspace::{ToastKind, Workspace, WorkspaceEvent};
@@ -66,14 +68,21 @@ enum PanelRow {
         path: PathBuf,
         modified: SystemTime,
     },
-    StoredHeader,
+    /// A heading over stored queries: "Stored" while they are read or when there are none,
+    /// else "Pinned", "Reads" and "Writes" (spec 041). The first carries the refresh button.
+    StoredHeader {
+        title: &'static str,
+        refresh: bool,
+    },
     StoredReading,
     StoredFailed(String),
     StoredEmpty,
     Stored {
         name: String,
         description: Option<String>,
+        instruction: Option<String>,
         mutation: bool,
+        pinned: bool,
     },
 }
 
@@ -137,8 +146,11 @@ impl QueriesPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let mut subscriptions =
-            vec![cx.observe_global::<SavedQueriesChanged>(|this, cx| this.owe_folder(cx))];
+        let mut subscriptions = vec![
+            cx.observe_global::<SavedQueriesChanged>(|this, cx| this.owe_folder(cx)),
+            // Pins live in the settings (spec 041).
+            cx.observe_global::<studio_settings::StudioSettings>(|_, cx| cx.notify()),
+        ];
         if let Some(workspace) = workspace.upgrade() {
             subscriptions.push(cx.subscribe_in(
                 &workspace,
@@ -213,22 +225,87 @@ impl QueriesPanel {
         let Some(session) = &self.session else {
             return rows;
         };
-        rows.push(PanelRow::StoredHeader);
+        let stored = PanelRow::StoredHeader {
+            title: "Stored",
+            refresh: true,
+        };
         match &session.read(cx).stored_queries {
-            Loadable::NotLoaded | Loadable::Loading => rows.push(PanelRow::StoredReading),
-            Loadable::Failed(error) => rows.push(PanelRow::StoredFailed(error.clone())),
+            Loadable::NotLoaded | Loadable::Loading => {
+                rows.extend([stored, PanelRow::StoredReading])
+            }
+            Loadable::Failed(error) => rows.extend([stored, PanelRow::StoredFailed(error.clone())]),
+            Loadable::Loaded(queries) if queries.is_empty() => {
+                rows.extend([stored, PanelRow::StoredEmpty])
+            }
             Loadable::Loaded(queries) => {
-                if queries.is_empty() {
-                    rows.push(PanelRow::StoredEmpty);
-                }
-                rows.extend(queries.iter().map(|query| PanelRow::Stored {
+                // Pinned first, in the order pinned; then the reads and the writes, as the
+                // catalog lists them (spec 041). Until Omnigraph says which file each comes
+                // from (E64), what it does is the grouping Studio knows.
+                let pinned = self.pinned(cx);
+                let row = |query: &graph_client::api::QueryCatalogEntry| PanelRow::Stored {
                     name: query.name.clone(),
                     description: query.description.clone(),
+                    instruction: query.instruction.clone(),
                     mutation: query.mutation,
-                }));
+                    pinned: pinned.contains(&query.name),
+                };
+                let mut groups: Vec<(&'static str, Vec<PanelRow>)> = vec![
+                    (
+                        "Pinned",
+                        pinned
+                            .iter()
+                            .filter_map(|name| queries.iter().find(|q| q.name == *name))
+                            .map(row)
+                            .collect(),
+                    ),
+                    ("Reads", Vec::new()),
+                    ("Writes", Vec::new()),
+                ];
+                for query in queries.iter().filter(|q| !pinned.contains(&q.name)) {
+                    groups[if query.mutation { 2 } else { 1 }]
+                        .1
+                        .push(row(query));
+                }
+                let mut first = true;
+                for (title, group) in groups {
+                    if group.is_empty() {
+                        continue;
+                    }
+                    rows.push(PanelRow::StoredHeader {
+                        title,
+                        refresh: std::mem::take(&mut first),
+                    });
+                    rows.extend(group);
+                }
             }
         }
         rows
+    }
+
+    /// The stored queries pinned in this graph, in the order pinned (spec 041).
+    fn pinned(&self, cx: &App) -> Vec<String> {
+        match (
+            self.graph_key(cx),
+            cx.try_global::<studio_settings::StudioSettings>(),
+        ) {
+            (Some(graph), Some(settings)) => settings.pinned_queries(&graph),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Pins the selected stored query at the top, or unpins it (`p`).
+    fn toggle_pin(&mut self, _: &TogglePin, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(RowKey::Stored(name)) = self.selected.clone() {
+            self.toggle_pinned(name, cx);
+        }
+    }
+
+    fn toggle_pinned(&mut self, name: String, cx: &mut Context<Self>) {
+        let Some(graph) = self.graph_key(cx) else {
+            return;
+        };
+        toggle_pinned(graph, name, cx);
+        cx.notify();
     }
 
     /// Where the selected row is among the rows drawn.
@@ -347,17 +424,20 @@ impl QueriesPanel {
                     .on_click(self.click(ix, cx))
                     .into_any_element()
             }
-            PanelRow::StoredHeader => {
+            PanelRow::StoredHeader { title, refresh } => {
                 let session = self.session.clone();
-                let refresh = studio_ui::ds::row_icon_button("stored-refresh", IconName::RotateCw)
-                    .icon_color(Color::Muted)
-                    .tip(studio_ui::ds::tooltip("Read the stored queries again"))
-                    .on_click(move |_, _, cx| {
-                        if let Some(session) = &session {
-                            session.update(cx, |session, cx| session.reload_stored_queries(cx));
-                        }
-                    });
-                ds::section_header("Stored", Some(refresh.into_any_element())).into_any_element()
+                let refresh = refresh.then(|| {
+                    studio_ui::ds::row_icon_button("stored-refresh", IconName::RotateCw)
+                        .icon_color(Color::Muted)
+                        .tip(studio_ui::ds::tooltip("Read the stored queries again"))
+                        .on_click(move |_, _, cx| {
+                            if let Some(session) = &session {
+                                session.update(cx, |session, cx| session.reload_stored_queries(cx));
+                            }
+                        })
+                        .into_any_element()
+                });
+                ds::section_header(title, refresh).into_any_element()
             }
             PanelRow::StoredReading => {
                 ds::sidebar_note("Reading stored queries…").into_any_element()
@@ -380,27 +460,59 @@ impl QueriesPanel {
             PanelRow::Stored {
                 name,
                 description,
+                instruction,
                 mutation,
+                pinned,
             } => {
-                let tooltip = description.unwrap_or_else(|| format!("Run {name} on the server"));
+                // The whole description, and the instruction, which a tab shows under it.
+                let tooltip = match (&description, &instruction) {
+                    (Some(description), Some(instruction)) => {
+                        format!("{description}\n\n{instruction}")
+                    }
+                    (Some(description), None) => description.clone(),
+                    (None, Some(instruction)) => instruction.clone(),
+                    (None, None) => format!("Run {name} on the server"),
+                };
                 let click = Rc::new(self.click(ix, cx));
                 let row = {
                     let name = name.clone();
                     move |_: &mut Window, _: &mut App| {
                         let click = click.clone();
                         ds::SidebarRow::new(("stored-query", ix), name.clone())
-                            .icon(IconName::Server)
+                            .icon(if pinned {
+                                IconName::Pin
+                            } else {
+                                IconName::Server
+                            })
+                            .when_some(description.clone(), |row, description| {
+                                row.note(description)
+                            })
                             .when(mutation, |row| row.end(ds::sidebar_count("writes")))
                             .selected(selected)
                             .tip(ds::tooltip(tooltip.clone()))
                             .on_click(move |event, window, cx| click(event, window, cx))
                     }
                 };
+                let graph = self.graph_key(cx);
                 right_click_menu(SharedString::from(format!("stored-menu-{name}")))
                     .trigger(move |_, window, cx| row(window, cx))
                     .menu(move |window, cx| {
                         let name = name.clone();
+                        let graph = graph.clone();
                         ContextMenu::build(window, cx, move |menu, _, _| {
+                            let pin = {
+                                let (graph, name) = (graph.clone(), name.clone());
+                                move |_: &mut Window, cx: &mut App| {
+                                    if let Some(graph) = graph.clone() {
+                                        toggle_pinned(graph, name.clone(), cx);
+                                    }
+                                }
+                            };
+                            let menu = menu.entry(
+                                if pinned { "Unpin" } else { "Pin to the top" },
+                                Some(Box::new(TogglePin)),
+                                pin,
+                            );
                             let open = OpenStoredQuery {
                                 name: name.clone(),
                                 view: None,
@@ -497,6 +609,7 @@ impl Render for QueriesPanel {
             .on_action(cx.listener(Self::select_next))
             .on_action(cx.listener(Self::select_previous))
             .on_action(cx.listener(Self::open_selected))
+            .on_action(cx.listener(Self::toggle_pin))
             .child(
                 list(
                     self.list_state.clone(),
@@ -573,6 +686,13 @@ impl Render for QueriesActions {
                     })
             }))
     }
+}
+
+/// Pins the stored query `name` of `graph` at the top of the Queries panel, or unpins it.
+fn toggle_pinned(graph: String, name: String, cx: &mut App) {
+    studio_settings::update(cx, move |settings| {
+        settings.toggle_pinned_query(&graph, &name)
+    });
 }
 
 /// Shows the graph's queries folder, made first off the main thread. One that cannot be made
@@ -785,6 +905,58 @@ mod tests {
                 ("people_titled".to_owned(), false),
             ]
         );
+    }
+
+    /// Spec 041: the stored queries are grouped by what they do, reads before writes, each
+    /// with its description under its name; `p` pins the selected one at the top, kept for
+    /// the graph, and again unpins it, the selection staying on it.
+    #[gpui::test]
+    async fn pinned_queries_lead_then_reads_then_writes(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+            studio_settings::keep_changes_in_memory(cx);
+            cx.bind_keys([
+                KeyBinding::new("down", SelectNext, Some("QueriesPanel")),
+                KeyBinding::new("p", TogglePin, Some("QueriesPanel")),
+            ]);
+        });
+        let session = session(cx);
+        cx.run_until_parked();
+        let (panel, cx) = cx.add_window_view(|window, cx| {
+            QueriesPanel::new(WeakEntity::new_invalid(), Some(session), window, cx)
+        });
+        cx.run_until_parked();
+        let headers = |cx: &mut gpui::VisualTestContext| {
+            panel.read_with(cx, |panel, _| {
+                panel
+                    .rows
+                    .iter()
+                    .filter_map(|row| match row {
+                        PanelRow::StoredHeader { title, .. } => Some(*title),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(headers(cx), ["Reads", "Writes"]);
+        cx.update(|window, cx| window.focus(&panel.focus_handle(cx), cx));
+        cx.simulate_keystrokes("down down p");
+        cx.run_until_parked();
+        assert_eq!(headers(cx), ["Pinned", "Reads"]);
+        let graph = panel.read_with(cx, |panel, cx| panel.graph_key(cx).unwrap());
+        cx.update(|_, cx| {
+            let settings = cx.global::<studio_settings::StudioSettings>();
+            assert_eq!(settings.pinned_queries(&graph), ["set_title"]);
+        });
+        assert_eq!(
+            panel.read_with(cx, |panel, _| panel.selected.clone()),
+            Some(RowKey::Stored("set_title".into())),
+            "the selection stays on the query it pinned"
+        );
+        cx.simulate_keystrokes("p");
+        cx.run_until_parked();
+        assert_eq!(headers(cx), ["Reads", "Writes"]);
     }
 
     #[gpui::test]

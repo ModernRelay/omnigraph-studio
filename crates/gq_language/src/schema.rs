@@ -122,6 +122,15 @@ impl NodeType {
         self.key.as_deref()
     }
 
+    /// The key property whose value is the node's id: a key of one `String` property, whose
+    /// spelling the engine keeps as the id (`canonical_key_id`, spec 041). `None` for a type
+    /// with no key, a key of several properties or a key of another type.
+    pub fn id_key(&self) -> Option<&str> {
+        let key = self.property(self.key.as_deref()?)?;
+        (key.kind == ScalarKind::Text && !key.list && key.base_type == "String")
+            .then_some(key.name.as_str())
+    }
+
     /// The properties a node can be named by, in schema order: its single text values.
     pub fn label_candidates(&self) -> impl Iterator<Item = &Property> {
         self.properties.iter().filter(|p| p.can_name())

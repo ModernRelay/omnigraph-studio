@@ -235,6 +235,37 @@ pub struct GraphOverrides {
     /// types are named by their `name`, `title` or key (spec 002, "Node names").
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
+    /// For a stored read, the node type each of its columns names by id, by column, where the
+    /// person chose one (spec 041): `{"ready": {"i.slug": "Issue"}}`. Its rows open as those
+    /// nodes. The catalog does not say until Omnigraph adds it (E43).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub row_nodes: BTreeMap<String, BTreeMap<String, String>>,
+    /// For a stored mutation, the node type each of its parameters names, by parameter, where
+    /// the person chose one (spec 041): `{"verify_claim": {"slug": "Claim"}}`. The mutation is
+    /// then an action on that type's nodes, and the parameter's field picks one. The catalog
+    /// does not say until Omnigraph adds it (E64).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub node_params: BTreeMap<String, BTreeMap<String, String>>,
+    /// Stored queries pinned at the top of the Queries panel, in the order pinned (spec 041).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pinned_queries: Vec<String>,
+    /// What Studio writes into a property on every edit and new node of a type that declares
+    /// it, by property name (spec 041): `"now"` sets a `DateTime` to the server's time,
+    /// `"actor"` a `String` to the credential's actor. `{"updated_at": "now"}` keeps the
+    /// graph's own compare-and-swap rule for hand edits. Writes from the CLI and agents keep
+    /// their own until Omnigraph stamps them itself (E65).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub stamps: BTreeMap<String, Stamp>,
+}
+
+/// What a write stamps into a property (spec 041).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Stamp {
+    /// The server's time when the write runs, for a `DateTime`.
+    Now,
+    /// The actor the credential resolves to, for a `String`.
+    Actor,
 }
 
 /// A named filter, order, grouping and set of columns for one type's table (spec 004), listed
@@ -1044,6 +1075,102 @@ impl StudioSettings {
             }
         }
         self.graphs.retain(|_, overrides| !overrides.is_empty());
+    }
+
+    /// The node type each column of the stored read `query` names by id, by column (spec 041).
+    pub fn row_nodes(&self, graph: &str, query: &str) -> BTreeMap<String, String> {
+        self.graphs
+            .get(graph)
+            .and_then(|overrides| overrides.row_nodes.get(query))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Says column `column` of the stored read `query` names nodes of `type_name`, or nothing
+    /// with `None`.
+    pub fn set_row_node(
+        &mut self,
+        graph: &str,
+        query: &str,
+        column: &str,
+        type_name: Option<String>,
+    ) {
+        let overrides = self.graphs.entry(graph.to_owned()).or_default();
+        let columns = overrides.row_nodes.entry(query.to_owned()).or_default();
+        match type_name {
+            Some(type_name) => {
+                columns.insert(column.to_owned(), type_name);
+            }
+            None => {
+                columns.remove(column);
+            }
+        }
+        overrides.row_nodes.retain(|_, columns| !columns.is_empty());
+        self.graphs.retain(|_, overrides| !overrides.is_empty());
+    }
+
+    /// Every stored mutation's parameters that name nodes, by mutation, then parameter, with
+    /// the node type each names (spec 041).
+    pub fn node_params(&self, graph: &str) -> BTreeMap<String, BTreeMap<String, String>> {
+        self.graphs
+            .get(graph)
+            .map(|overrides| overrides.node_params.clone())
+            .unwrap_or_default()
+    }
+
+    /// Says parameter `param` of the stored mutation `query` names a node of `type_name`, or
+    /// nothing with `None`.
+    pub fn set_node_param(
+        &mut self,
+        graph: &str,
+        query: &str,
+        param: &str,
+        type_name: Option<String>,
+    ) {
+        let overrides = self.graphs.entry(graph.to_owned()).or_default();
+        let params = overrides.node_params.entry(query.to_owned()).or_default();
+        match type_name {
+            Some(type_name) => {
+                params.insert(param.to_owned(), type_name);
+            }
+            None => {
+                params.remove(param);
+            }
+        }
+        overrides.node_params.retain(|_, params| !params.is_empty());
+        self.graphs.retain(|_, overrides| !overrides.is_empty());
+    }
+
+    /// The stored queries pinned in a graph, in the order pinned (spec 041).
+    pub fn pinned_queries(&self, graph: &str) -> Vec<String> {
+        self.graphs
+            .get(graph)
+            .map(|overrides| overrides.pinned_queries.clone())
+            .unwrap_or_default()
+    }
+
+    /// Pins the stored query `query` after the others, or unpins it if it is pinned.
+    pub fn toggle_pinned_query(&mut self, graph: &str, query: &str) {
+        let pinned = &mut self
+            .graphs
+            .entry(graph.to_owned())
+            .or_default()
+            .pinned_queries;
+        match pinned.iter().position(|name| name == query) {
+            Some(at) => {
+                pinned.remove(at);
+            }
+            None => pinned.push(query.to_owned()),
+        }
+        self.graphs.retain(|_, overrides| !overrides.is_empty());
+    }
+
+    /// What a graph's writes stamp, by property name (spec 041).
+    pub fn stamps(&self, graph: &str) -> BTreeMap<String, Stamp> {
+        self.graphs
+            .get(graph)
+            .map(|overrides| overrides.stamps.clone())
+            .unwrap_or_default()
     }
 
     /// Removes a graph's view of a type by name.
@@ -1989,6 +2116,42 @@ mod tests {
         assert_eq!(read_clean(&text), settings);
         settings.set_label("dev/knowledge", "Person", None);
         assert!(settings.graphs.is_empty(), "the default is no entry");
+    }
+
+    /// Spec 041: what the person says of a graph's stored queries is kept per graph, and
+    /// taking it back leaves no entry.
+    #[test]
+    fn a_graphs_verbs_rows_pins_and_stamps_are_kept_per_graph() {
+        let mut settings = StudioSettings::default();
+        settings.set_row_node("local/beads", "ready", "i.slug", Some("Issue".into()));
+        settings.set_node_param("local/beads", "claim", "id", Some("Issue".into()));
+        settings.set_node_param("local/beads", "close", "ids", Some("Issue".into()));
+        settings.toggle_pinned_query("local/beads", "ready");
+        settings.toggle_pinned_query("local/beads", "blocked");
+        assert_eq!(
+            settings.row_nodes("local/beads", "ready")["i.slug"],
+            "Issue"
+        );
+        assert!(settings.row_nodes("local/company", "ready").is_empty());
+        assert_eq!(settings.node_params("local/beads")["close"]["ids"], "Issue");
+        assert_eq!(settings.pinned_queries("local/beads"), ["ready", "blocked"]);
+        let text = r#"{"graphs": {"local/beads": {"stamps": {"updated_at": "now", "updatedBy": "actor"}}}}"#;
+        let read = read_clean(text);
+        assert_eq!(read.stamps("local/beads")["updated_at"], Stamp::Now);
+        assert_eq!(read.stamps("local/beads")["updatedBy"], Stamp::Actor);
+        let text = serde_json::to_string(&settings).unwrap();
+        assert!(
+            text.contains(r#""row_nodes":{"ready":{"i.slug":"Issue"}}"#),
+            "{text}"
+        );
+        assert_eq!(read_clean(&text), settings);
+        settings.set_row_node("local/beads", "ready", "i.slug", None);
+        settings.set_node_param("local/beads", "claim", "id", None);
+        settings.set_node_param("local/beads", "close", "ids", None);
+        settings.toggle_pinned_query("local/beads", "ready");
+        assert_eq!(settings.pinned_queries("local/beads"), ["blocked"]);
+        settings.toggle_pinned_query("local/beads", "blocked");
+        assert!(settings.graphs.is_empty(), "nothing said leaves no entry");
     }
 
     #[test]

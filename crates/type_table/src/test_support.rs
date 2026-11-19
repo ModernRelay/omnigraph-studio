@@ -1020,6 +1020,17 @@ fn serve_blobs(
                         }),
                     )
                 }
+            } else if path.ends_with("/queries") {
+                // The graph's stored queries: one that acts on a person (spec 041).
+                (
+                    200,
+                    json!({"queries": [
+                        {"name": "verify_person", "mutation": true,
+                         "description": "Mark a person verified",
+                         "params": [{"name": "slug", "kind": "string", "nullable": false}]},
+                        {"name": "people", "params": []}
+                    ]}),
+                )
             } else {
                 // A second branch, for views that follow the window to another one.
                 (200, json!({ "branches": ["main", "fix"] }))

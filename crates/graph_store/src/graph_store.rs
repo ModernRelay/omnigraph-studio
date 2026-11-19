@@ -29,6 +29,7 @@ pub mod sign_in;
 pub mod test_server;
 #[cfg(test)]
 mod test_tls;
+pub mod verbs;
 
 use std::sync::Arc;
 
