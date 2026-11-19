@@ -67,6 +67,7 @@ view (layer 5) ──reads──▶ entity in graph_store ──calls──▶ g
 | `GraphSession` | graph id, branch, schema, branch list, type counts and the commit they count (`counts_commit`), the heads it watches, the read memo, the node-search name indexes by type and commit (spec 031; at most 32 MiB, forgotten with the memo), what the credential may do, drafts and the outcome log | One per open graph in a window; its views share it. Each view holds its own snapshot pin. What Studio saves of it is under one key, its CLI target and its id (`overrides_key`, `<target>/<graph>`). A new token on its connection reads what it may do again, forgets every answer the read memo kept with the old one (reads at a commit, Blob cells, relationship counts, branch heads, commits' changes), and reads the type counts, the stored-query catalog (once a view has wanted it) and the branch list again, showing none of the old token's meanwhile; a parked session forgets at once and reads when shown again. A read a view sent under the old token answers nothing of it, and views that show what they read (tables, node pages, the tree and canvas, review) let it go and read it again at the commit they show. It keeps the schema, which the server answers alike to every credential that may read the graph, and reads it again only when none is held, since a 401 may have refused it; it keeps the heads and change logs, which describe commits and only carry forward answers read since. A 403 on its graph reads what the credential may do again and keeps the answers; one on another graph of the server changes nothing here |
 | `SchemaModel` | the `.pg` source from `GET /schema`, compiled with `omnigraph-compiler` into node, edge and property shapes | One per session, rebuilt when the schema is read again (Refresh, or another writer's schema seen at a head move) |
 | `Exploration` | the set of expanded paths (node → relationship group → node …) | Shared by the relationship tree and the canvas |
+| Proposals (`GraphSession::proposal`, spec 038) | the proposal the window is on (its branch and the branch it proposes into), and the branches the person turned proposals off or on for | A write asked of a protected branch (`main` until E63) goes where `GraphSession::write_target` says: a new `proposal/<actor>/<MMDD>-<n>` branch the write starts, which the window then shows, or the open one. Saved with the window's graph |
 | Drafts (`GraphSession::drafts`) | unsaved property values by branch, each with the value it was read at (spec 014) | A branch's wait while another is shown; a save is one mutation bound to the values read |
 | Outcomes (`GraphSession::outcomes`) | each write and its outcome (committed, refused, unknown), the newest 1,000 | Rendered in the activity panel |
 
@@ -106,7 +107,10 @@ write that matched nothing, or a 412, reopens the draft.
 ```
 
 - Top bar (spec 020): the traffic lights, the connection chip, graph and branch, what the server is,
-  and the Activity and inspector toggles.
+  and the Activity and inspector toggles. On a proposal (spec 038), the branch it proposes into,
+  then "Proposing on …" with its edits and Review. A tab on a branch of its own (a page, a query
+  tab, a review's inspector) names that branch in its own header; the top names the window's,
+  which new tabs read.
 - Each column's header is its panel's own (title and buttons).
 - Left dock: Data (the schema, node types and edge types with counts), Queries, Branches,
   Conversations. Right dock: the inspector, which shows what the tab in front has selected

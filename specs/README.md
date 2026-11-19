@@ -65,6 +65,7 @@ Add tasks, contracts or data-model files only for large features.
 | 032 | [Agents drive Studio's window](032-ui-tools/plan.md) | steps 1 to 3 built: the window, the canvas and the tree |
 | 033 | [One way to show a change](033-diff-ux/plan.md) | built 2026-11-17 |
 | 034 | [Omnigraph 0.15](034-omnigraph-0.15/plan.md) | built 2026-11-18 |
+| 038 | [The branch belongs to the tab; a protected branch takes proposals](038-tab-branch-and-proposals/plan.md) | step 1 built 2026-11-19; waits on E63 |
 
 Each plan's first line holds its full status. 012 is not scheduled: it records every Omnigraph change Studio would use, what Studio does
 without it, and which plan waits on it. Each feature plan's Deferred section names its IDs.

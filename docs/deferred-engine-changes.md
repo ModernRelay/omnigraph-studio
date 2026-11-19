@@ -49,6 +49,7 @@ it goes through Omnigraph's own RFC process.
 | E52 | The schema at a commit, or a commit's schema diff | 033 | A schema change's tab says "Schema change" and the type the refusal names, with no retry |
 | E53 | A merge conflict's base, source and target images | 033 | The conflict's kind in words and the server's message, on its card and in the conflicts list |
 | E54 | A write refused in validation, before any effect (an `@card` bound, a missing endpoint), states `effects: none` and the violation as a typed detail; 0.14 and 0.15 answer 400 `bad_request` with `effects: unknown, action: reconcile` | 004, 034 | Judges it unknown, as the disposition says, and names the `@card` bound from the server's words; the new-node dialog sends a node with the edges its minimum needs so a 0.15 server does not refuse it |
+| E63 | Which branches the graph's policy protects, in `AccessOutput` or the branch list ([#1473](https://github.com/ModernRelay/omnigraph/issues/1473)) | 038 | Treats `main` as protected: an edit of it starts a proposal branch unless the person turns proposals off (⌘⌥P); any other branch only where they turn them on |
 
 Every server Studio supports serves these (checked against `v0.14.0`'s OpenAPI document, 2026-10-24):
 
