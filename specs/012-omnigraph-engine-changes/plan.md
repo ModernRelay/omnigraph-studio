@@ -558,6 +558,35 @@ results of a scan and of an index are the same. *Waits:* 031. *Today:* Studio ru
 search only on properties that declare an index, merges its hits after its own matches, and
 leaves out a property whose search fails.
 
+### Agent work as lanes (spec 043)
+
+From the cookbook study (`docs/ux/2026-11-18-cookbook-study.md`, proposal "Agent work as lanes",
+PR #143), checked against `v0.15.0`'s OpenAPI document and server on 2026-11-19; the readings
+are in spec 043's validation log.
+
+**E60. A commit's operation and message, and a branch's creator.** Filed as
+[ModernRelay/omnigraph#1470](https://github.com/ModernRelay/omnigraph/issues/1470).
+`CommitOutput` carries an actor, times and parents, never what the write was: the CLI's receipt
+for a stored mutation names it (`query_name`), and the commit does not keep it. The branch
+details `v0.15.0` serves (E9, `BranchDetailOutput`) carry a branch's head, start and times, not
+the actor that created it, so a list of agents' branches cannot say whose each is. Carry the
+operation (the stored query's name, or `mutate`, `load`, `merge`, `blob put`) and an optional
+message the writer supplies in `CommitOutput`, and the creating actor in the detailed branch
+list. Engine rule: the server records the actor it resolved from the bearer token at the
+boundary, never one the client asserts (invariant 10). *Waits:* 043 (the creator; the study's
+proposal 4 waits on the operation). *Today:* the Branches panel groups by who wrote each
+branch's newest commit, from a 0.15 server's detailed list, and says so in the group's words.
+
+**E66. A branch's standing against its target, in its details.** Not filed yet. Whether a branch
+is merged into a target, and by how many commits it is ahead of it, is two reads a branch
+today: `GET /branches/merge-base` (merged when the base is the branch's head) and, when it is
+not, a page of `GET /commits?branch=` counted down to the base. A list of agents' branches needs
+both for every row it draws. The detailed branch list could answer, per branch and against one
+target (`main` by default): whether its head is in the target, and the commits it is ahead and
+behind, counted to a bound. Engine rule: derived from `__manifest` lineage as the merge base is,
+and bounded: a count past the bound says so. *Waits:* 043. *Today:* the two reads, for the rows
+the panel draws only, again when main moves; past 100 commits a row says "100+ ahead".
+
 ### In 0.14, not in 0.13.0
 
 Studio's minimum server serves these, so it uses them without asking the server's OpenAPI
@@ -611,6 +640,7 @@ Then engine changes still open:
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-11-19 | What a lane of agent work can read today (E60, E66) | `crates/graph_client/openapi/omnigraph-0.15.0.json`: `BranchDetailOutput`, `CommitOutput`, `branchMergeBase`, `diff`; a `v0.15.0` server serving the company-brain cookbook, agents writing through the CLI with their own targets (spec 043) | `BranchDetailOutput` has `name`, `head`, `updated_at`, `created_at`, `from`, `from_commit_id`: no creator; `CommitOutput` has no operation or message. `GET /diff` takes a branch or a commit on each side. Filed E60 as #1470 (the study); E66 added here |
 | 2026-11-18 | What `v0.15.0` resolves, and a validation refusal's disposition (E9, E35 to E38, E54) | `docs/releases/v0.15.0.md` at the tag; `gh issue view` 969, 970, 972, 1157; mutations sent with curl to `v0.14.0` and `v0.15.0` release servers serving `script/dev-server`'s cluster plus a `MemberOf: Member -> Team @card(1..)` edge | E9 landed (#1012); E35 partly (#1201, #969 closed); #970, #972, #1157 open. A lone `Member` insert: 0.14 commits it, 0.15 answers 400 `@card violation … (min 1)` with `effects: unknown, action: reconcile`; with its `MemberOf` in the same mutation both commit. Deleting a required edge and an edge to a missing node answer the same disposition on both releases: E54 |
 | 2026-11-17 | Omnigraph `v0.15.0` needs no engine change from Studio | `openapi.json` at `v0.15.0` diffed with `v0.14.0`'s; the release notes (`gh release view v0.15.0`) | Contract still 0.14; no path, field or enum value removed; new fields (`ranking`, `details`, `client_id`) optional, one new error code (`not_admitted`). No new ID |
 | 2026-11-06 | A page of a wide, large type costs the server what it holds, not what it returns (E39) | `script/dev-big-server` (`v0.14.0`, `Account`: 95 columns, 100,000 rows), each read sent with curl, then Studio's snapshot tool with `OMNIGRAPH_STUDIO_TRACE` (`docs/perf/20261106-report.md`) | `order { $n.@id } limit 100` returning `$n`: 0.91 s; returning `$n.slug`: 0.08 s; `$n` unordered: 0.03 s; `$n.@id = $id`: 0.43 s; `$n.@id in $ids` (101): 0.46 s. Studio's first page: 947 ms of which 3.5 ms decoding. Filed as E39 |

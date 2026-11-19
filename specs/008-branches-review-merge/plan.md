@@ -48,6 +48,11 @@ place), X (designed on 0.13; the better routes are deferred).
   branch list changes; one that changes while the list is hidden is read when it is shown again
   (since 2026-10-22; before, the first 20 heads were read as the list was made and again at
   every commit or change of the list, shown or not).
+- Since 2026-11-19 (spec 043) the list is lanes of work: grouped by the prefix of the names
+  two or more branches share (`agent/`, `tentative/`), or by who wrote each branch's newest
+  commit on a 0.15 server; each drawn branch marked `merged` (with Delete, confirmed with ↵) or
+  "3 ahead" of main; a Refresh on the title line; and "Compare with…", a read-only review tab
+  of the diff between two branches or a branch and a commit.
 - Built (start at a commit, E21, 2026-10-20): History's "New branch here…" (spec 009)
   dispatches `CreateBranchAt`, which opens the same new-branch dialog started at that commit:
   "New branch at <short id>", then who made it and when, read by its id as the dialog opens
