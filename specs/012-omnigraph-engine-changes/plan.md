@@ -456,6 +456,19 @@ type, the property, and whether the query returns that variable's `@id`, would m
 property cells editable as a `.gq` file's are. Engine rule: no query text is exposed; the
 descriptor is the compiler's. *Waits:* 024. *Today:* stored-query views are read-only.
 
+**E64. A stored query's file and tags, and a mutation's target.** Filed as
+[ModernRelay/omnigraph#1474](https://github.com/ModernRelay/omnigraph/issues/1474). The
+cookbooks keep their health checks and to-do lists in stored reads (`ready`, hygiene checks,
+`budget_rollup`, `gate_*`) and their verbs in stored mutations (`close`, `verify_claim`), but a
+catalog entry (`QueryCatalogEntry`: name, description, instruction, mutation, params,
+tool_name) says neither which file a query came from nor any tags, so a graph cannot declare
+"these are my checks" once for every client. The entry should carry the query's source file and
+its tags (from an annotation such as `@tag("check")`), and a mutation's entry the type it
+writes and the parameter naming the entity it acts on. Engine rule: tags are data about the
+question, read with the catalog's `read` gate; no query text is exposed (as E43).
+*Waits:* 036 (and the study's proposal 5 for a mutation's target). *Today:* the person marks a
+graph's checks and watched reads, per graph, in Studio's settings.
+
 **E52. A commit's schema change.** A commit that changed the schema cannot be compared with its
 parent: `GET /commits/{id}/changes` refuses it (409, `change_diff_refusal.reason`
 `schema_boundary`, naming one type), and `GET /graphs/{id}/schema` answers only the head's

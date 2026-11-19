@@ -258,6 +258,12 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
   - An overwrite `load csv`'s `executed.operators` shows under the write's outcome: each node's
     rows, compute time and wall time.
 
+- Since 2026-11-19 (spec 036): a tab that runs the same read again (same text or stored query,
+  values and page) marks the rows new to the answer ("+12" in the number gutter) and those whose
+  cells moved ("~3"), and its footer says "+4 −1 since the last run" or "Same rows as the last
+  run". A stored read without required parameters is marked for the graph's reviews from its
+  tab (⌘⌥E watched, ⌘⌥K check) and its Queries panel row.
+
 ## Deferred
 
 - Editing a schema: the schema view is read-only. Schema changes stay with

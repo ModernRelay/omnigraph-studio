@@ -195,6 +195,11 @@ place), X (designed on 0.13; the better routes are deferred).
   still equals the reviewed head. It merges only a review on screen, with no fix out: never
   while the review is being read (a head nobody has seen), and never from the branch list or
   the menu, which open the review instead.
+- The graph's checks (spec 036): a stored read marked as a check that has rows at the reviewed
+  head leads the merge strip ("1 check has rows on feature: unsourced · Show effect"), and the
+  first Merge press only arms the merge ("… Merge again to merge anyway."); so does a check
+  still being read. The branch's Effect is a tab beside its review and history (since
+  2026-11-19).
 - "Delete the branch after merging", beside the button and on by default, deletes the branch once the merge
   lands (`delete_branch`): the server reports the deletion on the answer and never undoes the
   merge for it, and the outcome says "Deleted <branch>." or why it was not. A session on the
