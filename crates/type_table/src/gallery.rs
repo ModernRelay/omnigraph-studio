@@ -1,7 +1,10 @@
-//! A type's rows as tiles of one of their files (spec 035): a uniform grid of square previews
-//! with captions, one tab per set, read a page at a time at one commit. Each tile's file is
-//! read on its own through the Blob route once scrolling pauses, at most four at once, and
-//! drawn from a preview decoded and scaled off the main thread; the previews held are capped.
+//! A type's rows as tiles of one of their files (spec 035): a masonry of columns of one width,
+//! each tile as tall as its file's shape needs, placed in row order into the shortest column and
+//! never moved after, one tab per set, read a page at a time at one commit. Each tile's file is
+//! read on its own through the Blob route once scrolling pauses, at most four at once: its first
+//! bytes give its shape, for the rows about a screen below too, and the rest of a picture is
+//! read for the tiles shown and drawn from a preview decoded and scaled off the main thread; the
+//! previews held are capped.
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -13,8 +16,8 @@ use std::time::Duration;
 use collections::IndexSet;
 use gpui::{
     AnyView, App, ClickEvent, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    KeyContext, Render, ScrollStrategy, SharedString, StyleRefinement, Subscription, Task,
-    UniformListScrollHandle, WeakEntity, Window, uniform_list,
+    KeyContext, Render, ScrollHandle, SharedString, StyleRefinement, Subscription, Task,
+    WeakEntity, Window, point,
 };
 use gq_language::{BuiltQuery, Filter, ScalarKind, SchemaModel, Sort, builder};
 use graph_client::api::ReadOutput;
@@ -39,6 +42,7 @@ use ui::PopoverMenu;
 use ui::prelude::*;
 
 use crate::branch_diff::{BranchDiff, TARGET};
+use crate::masonry::{Masonry, Place};
 use crate::model::{Paging, Row, node_rows};
 use crate::peek::{NodePeek, PeekSubject};
 use crate::tile::{self, FIRST_READ, Facts, Look};
@@ -56,7 +60,7 @@ pub(crate) const PREVIEWS_HELD: usize = 64 * 1024 * 1024;
 /// read, and one draw each would draw the grid dozens of times.
 pub(crate) const LANDING_DELAY: Duration = Duration::from_millis(30);
 
-/// How large a gallery's tiles are drawn; each line's tiles grow from it to fill the line.
+/// How wide a gallery's columns are drawn at least; the columns grow from it to fill the width.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TileSize {
@@ -100,13 +104,24 @@ impl TileSize {
     }
 }
 
-/// How many tiles of at least `edge` fit a line `width` wide, and how wide each is drawn so the
-/// line is filled: the grid's edges keep [`space::EDGE`], and tiles [`space::LG`] apart.
-pub(crate) fn line_layout(width: f32, edge: f32) -> (usize, f32) {
+/// How many columns of at least `edge` fit `width`, and how wide each is drawn so they fill it:
+/// the gallery's edges keep [`space::EDGE`], and columns and tiles are [`space::LG`] apart.
+pub(crate) fn column_layout(width: f32, edge: f32) -> (usize, f32) {
     let inner = (width - 2. * space::EDGE).max(edge);
     let columns = ((inner + space::LG) / (edge + space::LG)).floor().max(1.) as usize;
     let tile = (inner - space::LG * (columns as f32 - 1.)) / columns as f32;
     (columns, tile.max(edge.min(inner)))
+}
+
+/// What a tile adds to its preview's height: the ring and inset around the preview, and the
+/// caption under it.
+fn tile_chrome() -> f32 {
+    2. * tile_inset() + studio_ui::ds::size::TILE_CAPTION
+}
+
+/// How far a tile's preview sits inside its edge: the cursor's ring and [`space::XS`].
+fn tile_inset() -> f32 {
+    studio_ui::ds::size::ACCENT_LINE + space::XS
 }
 
 /// What is known of one tile's file.
@@ -115,6 +130,12 @@ struct Tile {
     meta: Loadable<BlobMeta>,
     /// What its first bytes said.
     facts: Option<Facts>,
+    /// Its shape, height over width, once known: kept for the gallery's life, so the columns
+    /// are laid out again without a read.
+    shape: Option<f32>,
+    /// The first bytes of a file measured ahead of the view, kept for its preview's read to go
+    /// on from.
+    head: Option<Vec<u8>>,
     look: Loadable<Look>,
 }
 
@@ -123,9 +144,29 @@ impl Default for Tile {
         Self {
             meta: Loadable::NotLoaded,
             facts: None,
+            shape: None,
+            head: None,
             look: Loadable::NotLoaded,
         }
     }
+}
+
+impl Tile {
+    /// What it holds against [`PREVIEWS_HELD`].
+    fn held(&self) -> usize {
+        let look = match &self.look {
+            Loadable::Loaded(look) => look.held(),
+            _ => 0,
+        };
+        look + self.head.as_ref().map_or(0, Vec::len)
+    }
+}
+
+/// What a tile's read is for: its shape alone (a row below the view), or its preview too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Want {
+    Shape,
+    Preview,
 }
 
 /// A tile and the property it shows, by row id.
@@ -167,14 +208,21 @@ pub struct TypeGallery {
     pick_anchor: Option<usize>,
     size: TileSize,
     tiles: HashMap<TileKey, Tile>,
-    tile_tasks: HashMap<TileKey, Task<()>>,
-    tile_queue: VecDeque<TileKey>,
-    /// What the previews held take, against [`PREVIEWS_HELD`].
+    tile_tasks: HashMap<TileKey, (Want, Task<()>)>,
+    tile_queue: VecDeque<(TileKey, Want)>,
+    /// What the previews and first bytes held take, against [`PREVIEWS_HELD`].
     held: usize,
-    /// The lines the grid drew last, and those whose tiles were asked for.
-    lines_drawn: Range<usize>,
-    lines_read: Option<Range<usize>>,
+    /// Where the tiles are; laid out again from the shapes kept when the width or tile size
+    /// changes.
+    masonry: Masonry,
+    /// The span of the columns the grid showed last, top to bottom, and the one whose tiles
+    /// were asked for.
+    span: Range<f32>,
+    span_read: Option<(i32, i32)>,
     _read_wait: Option<Task<()>>,
+    /// The branch's diff is being read: nothing is placed until it is in, since the rows the
+    /// branch removed go first.
+    diff_pending: bool,
     /// A draw owed for tiles that landed, [`LANDING_DELAY`] after the first of them.
     _landing: Option<Task<()>>,
     /// The grid's width as last laid out, and the line layout it gives.
@@ -189,7 +237,7 @@ pub struct TypeGallery {
     peek: Option<(String, Entity<NodePeek>)>,
     inspected_row: Option<String>,
     grid: Entity<GalleryGrid>,
-    scroll: UniformListScrollHandle,
+    scroll: ScrollHandle,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
     #[cfg(test)]
@@ -275,9 +323,11 @@ impl TypeGallery {
             tile_tasks: HashMap::new(),
             tile_queue: VecDeque::new(),
             held: 0,
-            lines_drawn: 0..0,
-            lines_read: None,
+            masonry: Masonry::new(1, size.edge(), space::LG, tile_chrome()),
+            span: 0.0..0.0,
+            span_read: None,
             _read_wait: None,
+            diff_pending: false,
             _landing: None,
             width: Rc::new(Cell::new(0.)),
             diff: None,
@@ -289,7 +339,7 @@ impl TypeGallery {
             peek: None,
             inspected_row: None,
             grid,
-            scroll: UniformListScrollHandle::new(),
+            scroll: ScrollHandle::new(),
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
             #[cfg(test)]
@@ -337,7 +387,10 @@ impl TypeGallery {
         self.newer = false;
         self.diff = None;
         self.diff_base = None;
-        self.lines_read = None;
+        self.diff_pending = false;
+        self.span_read = None;
+        self.relayout(true);
+        self.scroll.set_offset(point(px(0.), px(0.)));
         self.schema = self.session.read(cx).schema_model();
         self.files = self
             .schema
@@ -504,11 +557,10 @@ impl TypeGallery {
             .or((!self.rows.is_empty()).then_some(0));
             // After the cursor, which moves with its tile past the rows put before it.
             self.place_removed();
-            if let Some(cursor) = self.cursor {
-                self.scroll_to_tile(cursor);
-            }
             cx.emit(ItemEvent::UpdateTab);
         }
+        self.place_ready(cx);
+        self.read_tiles(cx);
         cx.notify();
     }
 
@@ -527,16 +579,16 @@ impl TypeGallery {
                 .is_none_or(|property| property.nullable)
     }
 
-    /// Reads the next page when the lines drawn come within a page of the last row read.
+    /// Reads the next page once the rows a screen below the view would need come within a page
+    /// of the last row read.
     fn want_more(&mut self, cx: &mut Context<Self>) {
         if !matches!(self.first_page, Loadable::Loaded(())) || self.more_error.is_some() {
             return;
         }
-        let (columns, _) = self.line_layout();
-        let visible_end = (self.lines_drawn.end * columns).min(self.rows.len());
+        let wanted = self.masonry.placed() + self.ahead_rows();
         if self
             .paging
-            .wants_more(self.rows.len(), visible_end, self.loading_more)
+            .wants_more(self.rows.len(), wanted, self.loading_more)
         {
             let pin = self.paging.pinned.clone();
             self.read_page(pin, false, cx);
@@ -594,10 +646,21 @@ impl TypeGallery {
             self.type_name.clone(),
         );
         let generation = self.generation;
+        self.diff_pending = true;
         self._diff = Some(cx.spawn(async move |this, cx| {
             let Some((base, folded)) =
                 crate::table::read_branch_diff_from(&session, &branch, cx).await
             else {
+                // Unread, the tiles are placed unmarked, as a table shows its rows unmarked.
+                this.update(cx, |this, cx| {
+                    if this.generation == generation {
+                        this.diff_pending = false;
+                        this.place_ready(cx);
+                        this.read_tiles(cx);
+                        cx.notify();
+                    }
+                })
+                .ok();
                 return;
             };
             let diff =
@@ -612,14 +675,18 @@ impl TypeGallery {
                 }
                 this.diff = Some(Arc::new(diff));
                 this.diff_base = Some(base);
+                this.diff_pending = false;
                 this.place_removed();
+                this.place_ready(cx);
+                this.read_tiles(cx);
                 cx.notify();
             })
             .ok();
         }));
     }
 
-    /// Puts the rows the branch removed first, once the first page and the diff are both in.
+    /// Puts the rows the branch removed first, once the first page and the diff are both in:
+    /// before any tile is placed ([`Self::diff_pending`]).
     fn place_removed(&mut self) {
         let (Some(diff), Loadable::Loaded(())) = (self.diff.clone(), &self.first_page) else {
             return;
@@ -717,22 +784,82 @@ impl TypeGallery {
         self.read_from_start(cx);
     }
 
-    // ---- tiles ----
+    // ---- tiles and their places ----
 
-    /// The line layout for the width last laid out.
-    fn line_layout(&self) -> (usize, f32) {
+    /// The columns for the width last laid out.
+    fn column_layout(&self) -> (usize, f32) {
         let width = self.width.get();
         let width = if width > 0. {
             width
         } else {
             studio_ui::ds::size::WINDOW_WIDTH - studio_ui::ds::size::SIDEBAR_WIDTH
         };
-        line_layout(width, self.size.edge())
+        column_layout(width, self.size.edge())
     }
 
-    fn line_count(&self) -> usize {
-        let (columns, _) = self.line_layout();
-        self.rows.len().div_ceil(columns)
+    /// Lays the columns out again for the width and tile size, from the shapes kept: no read.
+    /// `always` empties them even when they fit (a read from the start, another file shown).
+    fn relayout(&mut self, always: bool) {
+        let (columns, width) = self.column_layout();
+        if !always && self.masonry.fits(columns, width) {
+            return;
+        }
+        self.masonry = Masonry::new(columns, width, space::LG, tile_chrome());
+        self.place_known();
+    }
+
+    /// The shape of row `row`'s tile, once known.
+    fn shape_of(&self, row: usize) -> Option<f32> {
+        let property = self.property.as_ref()?;
+        let id = &self.rows.get(row)?.id;
+        self.tiles
+            .get(&(id.clone(), property.clone()))
+            .and_then(|tile| tile.shape)
+    }
+
+    /// Places the rows whose shapes are known, in row order, up to the first that is not;
+    /// nothing while the branch's diff is out, since the rows it removed go first.
+    fn place_known(&mut self) -> usize {
+        if self.diff_pending || !matches!(self.first_page, Loadable::Loaded(())) {
+            return 0;
+        }
+        let from = self.masonry.placed();
+        let shapes: Vec<Option<f32>> = (from..self.rows.len())
+            .map(|row| self.shape_of(row))
+            .collect();
+        self.masonry.place_known(self.rows.len(), |row| {
+            shapes.get(row - from).copied().flatten()
+        })
+    }
+
+    /// Places what is ready; when a tile was placed, the rows after it are measured on.
+    fn place_ready(&mut self, cx: &mut Context<Self>) {
+        if self.place_known() > 0 {
+            self.want_more(cx);
+        }
+    }
+
+    /// How many rows below the last placed one are measured ahead: a screen's worth of square
+    /// tiles and a line more, while the shortest column ends within a screen of the view's
+    /// bottom.
+    fn ahead_rows(&self) -> usize {
+        let screen = self.screen_height();
+        if self.masonry.placed() > 0 && self.masonry.shortest() > self.span.end + screen {
+            return 0;
+        }
+        let columns = self.masonry.columns();
+        let lines = (screen / self.masonry.width().max(1.)).ceil() as usize;
+        columns * (lines + 1)
+    }
+
+    /// The height of the view, as last drawn.
+    fn screen_height(&self) -> f32 {
+        let height = f32::from(self.scroll.bounds().size.height);
+        if height > 0. {
+            height
+        } else {
+            studio_ui::ds::size::WINDOW_HEIGHT
+        }
     }
 
     /// The commit a row's file is read at: where it last was for a row the branch removed, else
@@ -744,44 +871,67 @@ impl TypeGallery {
         self.paging.pinned.clone()
     }
 
-    /// The grid drew `lines`: the next page is read when they near the end, and their tiles'
-    /// files once scrolling rests.
-    fn drew_lines(&mut self, lines: Range<usize>, cx: &mut Context<Self>) {
-        self.lines_drawn = lines.clone();
+    /// The grid showed `span` of its columns: the next page is read when the rows needed below
+    /// near the end of those read, and the tiles' files once scrolling rests.
+    fn saw(&mut self, span: Range<f32>, cx: &mut Context<Self>) {
+        self.span = span.clone();
         self.want_more(cx);
-        if self.lines_read.as_ref() == Some(&lines) || self.property.is_none() {
+        let key = (span.start.round() as i32, span.end.round() as i32);
+        if self.span_read == Some(key) || self.property.is_none() {
             return;
         }
-        self.lines_read = Some(lines.clone());
+        self.span_read = Some(key);
         self._read_wait = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(READ_AFTER).await;
-            this.update(cx, |this, cx| this.read_tiles(lines, cx)).ok();
+            this.update(cx, |this, cx| this.read_tiles(cx)).ok();
         }));
     }
 
-    /// The keys of the tiles on `lines`, in the order they are drawn.
-    fn keys_on(&self, lines: Range<usize>) -> Vec<TileKey> {
+    /// What the view wants read: the files of the tiles it shows, then the shapes of the rows
+    /// a screen below the last placed one, each in row order.
+    fn wanted(&self) -> Vec<(TileKey, Want)> {
         let Some(property) = &self.property else {
             return Vec::new();
         };
-        let (columns, _) = self.line_layout();
-        let from = (lines.start * columns).min(self.rows.len());
-        let to = (lines.end * columns).min(self.rows.len());
-        self.rows[from..to]
-            .iter()
-            .map(|row| (row.id.clone(), property.clone()))
-            .collect()
+        let key = |row: usize| (self.rows[row].id.clone(), property.clone());
+        let mut wanted: Vec<(TileKey, Want)> = self
+            .masonry
+            .meeting(self.span.clone())
+            .into_iter()
+            .map(|row| (key(row), Want::Preview))
+            .collect();
+        let from = self.masonry.placed();
+        let to = (from + self.ahead_rows()).min(self.rows.len());
+        wanted.extend((from..to).map(|row| (key(row), Want::Shape)));
+        wanted
     }
 
-    /// Reads the files of the tiles on `lines`, the first first; reads out for tiles no longer
-    /// drawn are dropped, which stops their requests, and are asked again when they return.
-    pub(crate) fn read_tiles(&mut self, lines: Range<usize>, cx: &mut Context<Self>) {
-        let keys = self.keys_on(lines);
-        let on: HashSet<&TileKey> = keys.iter().collect();
+    /// Whether a tile still needs what `want` asks.
+    fn needs(&self, key: &TileKey, want: Want) -> bool {
+        match self.tiles.get(key) {
+            None => true,
+            Some(tile) if matches!(tile.meta, Loadable::Failed(_)) => false,
+            Some(tile) => match want {
+                Want::Shape => tile.shape.is_none(),
+                Want::Preview => !matches!(tile.look, Loadable::Loaded(_) | Loadable::Failed(_)),
+            },
+        }
+    }
+
+    /// Reads what the view wants, the tiles shown first; reads out for tiles it no longer
+    /// wants are dropped, which stops their requests, and are asked again when they are. A
+    /// read out for a tile's shape that is now shown finishes, and its preview is asked after.
+    pub(crate) fn read_tiles(&mut self, cx: &mut Context<Self>) {
+        let wanted: Vec<(TileKey, Want)> = self
+            .wanted()
+            .into_iter()
+            .filter(|(key, want)| self.needs(key, *want))
+            .collect();
+        let wants: HashSet<&TileKey> = wanted.iter().map(|(key, _)| key).collect();
         let gone: Vec<TileKey> = self
             .tile_tasks
             .keys()
-            .filter(|key| !on.contains(key))
+            .filter(|key| !wants.contains(key))
             .cloned()
             .collect();
         for key in gone {
@@ -795,31 +945,31 @@ impl TypeGallery {
                 }
             }
         }
-        self.tile_queue.retain(|key| on.contains(key));
-        for key in &keys {
-            let tile = self.tiles.entry(key.clone()).or_default();
-            let unread = matches!(tile.look, Loadable::NotLoaded);
-            if unread && !self.tile_tasks.contains_key(key) && !self.tile_queue.contains(key) {
-                tile.look = Loadable::Loading;
-                self.tile_queue.push_back(key.clone());
-            }
-        }
+        self.tile_queue = wanted.into_iter().collect();
         self.read_queued(cx);
     }
 
     fn read_queued(&mut self, cx: &mut Context<Self>) {
         while self.tile_tasks.len() < READS_AT_ONCE {
-            let Some(key) = self.tile_queue.pop_front() else {
+            let Some((key, want)) = self.tile_queue.pop_front() else {
                 break;
             };
-            let task = self.read_tile(key.clone(), cx);
-            self.tile_tasks.insert(key, task);
+            if self.tile_tasks.contains_key(&key) || !self.needs(&key, want) {
+                continue;
+            }
+            let tile = self.tiles.entry(key.clone()).or_default();
+            if want == Want::Preview {
+                tile.look = Loadable::Loading;
+            }
+            let task = self.read_tile(key.clone(), want, cx);
+            self.tile_tasks.insert(key, (want, task));
         }
     }
 
-    /// One tile's file: what the cell holds, its first bytes, and the rest of a file drawn
-    /// whole, then its preview made off the main thread.
-    fn read_tile(&mut self, key: TileKey, cx: &mut Context<Self>) -> Task<()> {
+    /// One tile's read: what the cell holds; its first bytes, which give its shape; and, for a
+    /// tile shown, the rest of a file drawn whole, then its preview made off the main thread. A
+    /// file whose first bytes are all of it has its preview made at once, wherever it is.
+    fn read_tile(&mut self, key: TileKey, want: Want, cx: &mut Context<Self>) -> Task<()> {
         let cell = BlobCell {
             edge: false,
             type_name: self.type_name.clone(),
@@ -831,10 +981,13 @@ impl TypeGallery {
         let scope = (!self.is_removed(&key.0))
             .then(|| self.scope.clone())
             .flatten();
-        let known = self
-            .tiles
-            .get(&key)
-            .and_then(|tile| tile.meta.loaded().cloned());
+        let (known, head) = match self.tiles.get_mut(&key) {
+            Some(tile) => (tile.meta.loaded().cloned(), tile.head.take()),
+            None => (None, None),
+        };
+        if let Some(head) = &head {
+            self.held = self.held.saturating_sub(head.len());
+        }
         let session = self.session.downgrade();
         let generation = self.generation;
         cx.spawn(async move |this, cx| {
@@ -853,10 +1006,10 @@ impl TypeGallery {
                 }
             };
             let size = match &meta {
-                Ok(BlobMeta::Managed { size, .. }) => Some(*size),
+                Ok(BlobMeta::Managed { size, .. }) if *size > 0 => Some(*size),
                 _ => None,
             };
-            let still = this
+            let go_on = this
                 .update(cx, |this, cx| {
                     if this.generation != generation {
                         return false;
@@ -865,32 +1018,91 @@ impl TypeGallery {
                     match meta {
                         Ok(meta) => {
                             if size.is_none() {
-                                tile.look = Loadable::Loaded(Look::Icon);
+                                // No file, an empty one or a reference: a short band, at once.
+                                tile.shape = Some(tile::shape::NO_FILE);
+                                tile.look = Loadable::Loaded(match meta {
+                                    BlobMeta::Managed { .. } => Look::Empty,
+                                    _ => Look::Icon,
+                                });
                             }
                             tile.meta = Loadable::Loaded(meta);
                         }
                         Err(error) => {
+                            tile.shape = Some(tile::shape::NO_FILE);
                             tile.meta = Loadable::Failed(error.clone());
                             tile.look = Loadable::Failed(error);
                         }
                     }
-                    this.landed(cx);
+                    if size.is_none() {
+                        this.tile_landed(&key, cx);
+                    }
                     true
                 })
                 .unwrap_or(false);
-            let (Some(size), true) = (size, still) else {
-                this.update(cx, |this, cx| this.tile_done(&key, cx)).ok();
+            let (Some(size), true) = (size, go_on) else {
                 return;
             };
-            let result = read_file(&session, &cell, &snapshot, scope.as_ref(), size, cx).await;
-            let look = match result {
-                Ok((bytes, facts)) => {
-                    this.update(cx, |this, _| {
+            let first = match head {
+                Some(head) => Ok(head),
+                None => {
+                    let to = size.min(FIRST_READ);
+                    read_bytes(&session, &cell, &snapshot, scope.as_ref(), 0, to, cx).await
+                }
+            };
+            let first = match first {
+                Ok(first) => first,
+                Err(error) => {
+                    this.update(cx, |this, cx| {
                         if let Some(tile) = this.tiles.get_mut(&key) {
-                            tile.facts = Some(facts);
+                            tile.shape.get_or_insert(tile::shape::NO_FILE);
+                            tile.look = Loadable::Failed(error);
                         }
+                        this.tile_landed(&key, cx);
                     })
                     .ok();
+                    return;
+                }
+            };
+            let facts = Facts::of(&first);
+            let whole = first.len() as u64 >= size;
+            // Measured ahead and not whole: its first bytes wait for its preview's read.
+            let measured_only = want == Want::Shape && !whole;
+            let stop = this
+                .update(cx, |this, cx| {
+                    if this.generation != generation {
+                        return true;
+                    }
+                    let tile = this.tiles.entry(key.clone()).or_default();
+                    tile.facts = Some(facts);
+                    tile.shape = Some(facts.shape());
+                    if measured_only {
+                        tile.head = Some(first.clone());
+                        if matches!(tile.look, Loadable::Loading) {
+                            tile.look = Loadable::NotLoaded;
+                        }
+                        this.held += first.len();
+                        this.tile_landed(&key, cx);
+                    }
+                    measured_only
+                })
+                .unwrap_or(true);
+            if stop {
+                return;
+            }
+            let bytes = if !whole && tile::draws_whole(&facts, size) {
+                let from = first.len() as u64;
+                read_bytes(&session, &cell, &snapshot, scope.as_ref(), from, size, cx)
+                    .await
+                    .map(|rest| {
+                        let mut bytes = first;
+                        bytes.extend(rest);
+                        bytes
+                    })
+            } else {
+                Ok(first)
+            };
+            let look = match bytes {
+                Ok(bytes) => {
                     let svg = cx.update(|cx| cx.svg_renderer());
                     Ok(cx
                         .background_spawn(async move { tile::look(bytes, size, &svg) })
@@ -914,17 +1126,25 @@ impl TypeGallery {
                         Err(error) => Loadable::Failed(error),
                     };
                 }
-                this.tile_done(&key, cx);
+                this.tile_landed(&key, cx);
                 this.let_go_past_cap(cx);
-                this.landed(cx);
             })
             .ok();
         })
     }
 
-    /// A tile's read landed: the grid draws it [`LANDING_DELAY`] from the first landing not yet
-    /// drawn, with every other that lands meanwhile.
-    fn landed(&mut self, cx: &mut Context<Self>) {
+    /// A tile's read ended: what it made known is placed, the next read starts, and the grid
+    /// draws it [`LANDING_DELAY`] from the first landing not yet drawn, with every other that
+    /// lands meanwhile.
+    fn tile_landed(&mut self, key: &TileKey, cx: &mut Context<Self>) {
+        self.tile_tasks.remove(key);
+        if self.place_known() > 0 {
+            // The columns grew: rows further below, or tiles now shown, may be wanted.
+            self.want_more(cx);
+            self.read_tiles(cx);
+        } else {
+            self.read_queued(cx);
+        }
         if self._landing.is_some() {
             return;
         }
@@ -938,45 +1158,55 @@ impl TypeGallery {
         }));
     }
 
-    fn tile_done(&mut self, key: &TileKey, cx: &mut Context<Self>) {
-        self.tile_tasks.remove(key);
-        self.read_queued(cx);
-    }
-
-    /// Frees the previews of the tiles farthest from the lines drawn while they hold more than
-    /// [`PREVIEWS_HELD`]; each is read again if it comes back into view. The tiles drawn keep
-    /// theirs, so a screen that alone holds more than the cap is not read again and again.
+    /// Frees the previews and first bytes of the tiles farthest from the span shown while
+    /// they hold more than [`PREVIEWS_HELD`]; each is read again if it comes back into view.
+    /// The tiles shown keep theirs, so a screen that alone holds more is not read again and
+    /// again; every shape is kept.
     fn let_go_past_cap(&mut self, cx: &mut App) {
         if self.held <= PREVIEWS_HELD {
             return;
         }
-        let (columns, _) = self.line_layout();
-        let middle = (self.lines_drawn.start + self.lines_drawn.end) * columns / 2;
-        let drawn = self.lines_drawn.start * columns..self.lines_drawn.end * columns;
+        let shown: HashSet<usize> = self
+            .masonry
+            .meeting(self.span.clone())
+            .into_iter()
+            .collect();
+        let middle = (self.span.start + self.span.end) / 2.;
         let place: HashMap<&str, usize> = self
             .rows
             .iter()
             .enumerate()
             .map(|(ix, row)| (row.id.as_str(), ix))
             .collect();
-        let mut held: Vec<(usize, TileKey)> = self
+        let mut held: Vec<(f32, TileKey)> = self
             .tiles
             .iter()
-            .filter(|(_, tile)| matches!(tile.look, Loadable::Loaded(Look::Image { .. })))
+            .filter(|(_, tile)| tile.held() > 0)
             .filter_map(|(key, _)| {
-                let ix = place.get(key.0.as_str()).copied().unwrap_or(usize::MAX);
-                (!drawn.contains(&ix)).then(|| (ix.abs_diff(middle), key.clone()))
+                let row = place.get(key.0.as_str()).copied()?;
+                if shown.contains(&row) {
+                    return None;
+                }
+                // A row not placed yet is below every placed one.
+                let distance = self
+                    .masonry
+                    .place_of(row)
+                    .map_or(f32::MAX, |place| (place.middle() - middle).abs());
+                Some((distance, key.clone()))
             })
             .collect();
-        held.sort_by_key(|(distance, _)| std::cmp::Reverse(*distance));
+        held.sort_by(|a, b| b.0.total_cmp(&a.0));
         for (_, key) in held {
             if self.held <= PREVIEWS_HELD {
                 break;
             }
-            if let Some(tile) = self.tiles.get_mut(&key)
-                && let Loadable::Loaded(look) =
-                    std::mem::replace(&mut tile.look, Loadable::NotLoaded)
-            {
+            let Some(tile) = self.tiles.get_mut(&key) else {
+                continue;
+            };
+            if let Some(head) = tile.head.take() {
+                self.held = self.held.saturating_sub(head.len());
+            }
+            if let Loadable::Loaded(look) = std::mem::replace(&mut tile.look, Loadable::NotLoaded) {
                 self.held = self.held.saturating_sub(look.held());
                 if let Look::Image { image, .. } = look {
                     image.release(cx);
@@ -1018,32 +1248,40 @@ impl TypeGallery {
         }
     }
 
-    fn scroll_to_tile(&self, ix: usize) {
-        let (columns, _) = self.line_layout();
-        self.scroll
-            .scroll_to_item(ix / columns, ScrollStrategy::Nearest);
+    /// Scrolls the least that shows row `row`'s tile whole, once it is placed.
+    fn scroll_to_tile(&self, row: usize) {
+        let Some(place) = self.masonry.place_of(row) else {
+            return;
+        };
+        let height = self.screen_height();
+        let top = -f32::from(self.scroll.offset().y);
+        // The columns start [`space::EDGE`] down the scroll area.
+        let (tile_top, tile_bottom) = (place.top, place.bottom() + 2. * space::EDGE);
+        let to = if tile_top < top {
+            tile_top
+        } else if tile_bottom > top + height {
+            tile_bottom - height
+        } else {
+            return;
+        };
+        self.scroll.set_offset(point(px(0.), px(-to.max(0.))));
     }
 
-    /// Moves the cursor by `by` tiles, or by lines with `lines`.
-    pub(crate) fn move_cursor(&mut self, by: isize, lines: bool, cx: &mut Context<Self>) {
-        if self.rows.is_empty() {
+    /// Moves the cursor: within its column by `by` tiles, or with `across` to the tile in the
+    /// next column (`by` −1 or 1) whose middle is nearest. A cursor on a row not placed yet
+    /// goes to the first tile.
+    pub(crate) fn move_cursor(&mut self, by: isize, across: bool, cx: &mut Context<Self>) {
+        if self.masonry.placed() == 0 {
             return;
         }
-        let (columns, _) = self.line_layout();
-        let last = self.rows.len() - 1;
-        let at = self.cursor.unwrap_or(0);
-        let next = if lines {
-            let wanted = at as isize + by * columns as isize;
-            if wanted < 0 {
-                at % columns
-            } else {
-                // ↓ on the line above a short last line goes to its last tile.
-                (wanted as usize).min(last)
-            }
-        } else {
-            (at as isize + by).clamp(0, last as isize) as usize
+        let next = match self.cursor.filter(|&row| row < self.masonry.placed()) {
+            None => Some(0),
+            Some(row) if across => self.masonry.across(row, by),
+            Some(row) => self.masonry.vertical(row, by),
         };
-        self.set_cursor(next, cx);
+        if let Some(next) = next {
+            self.set_cursor(next, cx);
+        }
     }
 
     fn set_cursor(&mut self, ix: usize, cx: &mut Context<Self>) {
@@ -1056,7 +1294,7 @@ impl TypeGallery {
     }
 
     fn move_to_end(&mut self, cx: &mut Context<Self>) {
-        if let Some(last) = self.rows.len().checked_sub(1) {
+        if let Some(last) = self.masonry.placed().checked_sub(1) {
             self.set_cursor(last, cx);
         }
     }
@@ -1183,7 +1421,10 @@ impl TypeGallery {
             return;
         }
         self.property = Some(property);
-        self.lines_read = None;
+        // Another file, other shapes: the columns are placed again from the first tile.
+        self.relayout(true);
+        self.span_read = None;
+        self.read_tiles(cx);
         cx.emit(ItemEvent::UpdateTab);
         cx.notify();
     }
@@ -1207,7 +1448,9 @@ impl TypeGallery {
             return;
         }
         self.size = size;
-        self.lines_read = None;
+        // The columns flow again from the shapes kept, with no read.
+        self.relayout(false);
+        self.span_read = None;
         if let Some(cursor) = self.cursor {
             self.scroll_to_tile(cursor);
         }
@@ -1434,81 +1677,122 @@ impl TypeGallery {
         .left_0()
         .w_full()
         .h(px(0.));
-        let _ = window;
-        let lines = self.line_count() + usize::from(self.more_error.is_some());
+        // The columns flow again from the shapes kept when the width changed.
+        self.relayout(false);
+        let inset = space::EDGE;
+        let top = -f32::from(self.scroll.offset().y);
+        let screen = {
+            let height = f32::from(self.scroll.bounds().size.height);
+            if height > 0. {
+                height
+            } else {
+                f32::from(window.viewport_size().height)
+            }
+        };
+        // The span of the columns in view; tiles half a screen either side are laid out too,
+        // so a scroll shows them drawn.
+        let span = (top - inset)..(top - inset + screen);
+        self.saw(span.clone(), cx);
+        let drawn = self
+            .masonry
+            .meeting((span.start - screen / 2.)..(span.end + screen / 2.));
+        let waiting = self.masonry.placed() < self.rows.len() || !self.paging.exhausted;
+        let band = if waiting {
+            space::LG + studio_ui::ds::size::TILE_BAND
+        } else {
+            0.
+        };
+        let height = 2. * inset + self.masonry.height() + band;
+        let tiles: Vec<AnyElement> = drawn
+            .into_iter()
+            .filter_map(|row| self.render_tile(row, cx))
+            .collect();
+        let bands = waiting.then(|| self.render_bands(cx));
         div()
             .relative()
             .size_full()
             .child(measure)
             .child(
-                uniform_list(
-                    "gallery-lines",
-                    lines,
-                    cx.processor(|this, range: Range<usize>, window, cx| {
-                        this.drew_lines(range.clone(), cx);
-                        this.render_lines(range, window, cx)
-                    }),
-                )
-                .track_scroll(&self.scroll)
-                .size_full()
-                .py(px(space::EDGE)),
+                div()
+                    .id("gallery-columns")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll)
+                    .child(
+                        div()
+                            .relative()
+                            .w_full()
+                            .h(px(height))
+                            .children(tiles)
+                            .children(bands.into_iter().flatten()),
+                    ),
             )
             .into_any_element()
     }
 
-    fn render_lines(
-        &self,
-        range: Range<usize>,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Vec<AnyElement> {
-        let (columns, tile) = self.line_layout();
-        let line_count = self.line_count();
-        range
-            .map(|line| {
-                if line >= line_count {
-                    return self.render_more_error(cx);
-                }
-                let from = line * columns;
-                let to = (from + columns).min(self.rows.len());
-                h_flex()
-                    .w_full()
-                    .px(px(space::EDGE))
-                    .pb(px(space::LG))
-                    .gap(px(space::LG))
-                    .items_start()
-                    .children((from..to).map(|ix| self.render_tile(ix, tile, cx)))
+    /// Under each column, while rows wait for their shapes or their page: a quiet band where
+    /// the next tiles will go, never a tile's placeholder. The shortest column's says why, and
+    /// offers Retry when the next page failed.
+    fn render_bands(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let bottoms = self.masonry.bottoms().to_vec();
+        let shortest = (0..bottoms.len())
+            .min_by(|a, b| bottoms[*a].total_cmp(&bottoms[*b]))
+            .unwrap_or(0);
+        let radius = studio_ui::ds::radii(cx).md;
+        bottoms
+            .iter()
+            .enumerate()
+            .map(|(column, bottom)| {
+                let says: Option<AnyElement> =
+                    (column == shortest).then(|| match &self.more_error {
+                        Some(error) => h_flex()
+                            .gap(px(space::SM))
+                            .child(
+                                div()
+                                    .id("gallery-more-error")
+                                    .tip(studio_ui::ds::tooltip(format!(
+                                        "The next page could not be read: {error}"
+                                    )))
+                                    .child(
+                                        studio_ui::ds::text::meta("Not read").color(Color::Warning),
+                                    ),
+                            )
+                            .child(
+                                studio_ui::ds::row_button("gallery-retry-more", "Retry").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.more_error = None;
+                                        this.want_more(cx);
+                                        cx.notify();
+                                    }),
+                                ),
+                            )
+                            .into_any_element(),
+                        None => studio_ui::ds::text::meta("Reading…").into_any_element(),
+                    });
+                div()
+                    .absolute()
+                    .left(px(self.masonry.left(column, space::EDGE)))
+                    .top(px(space::EDGE + bottom))
+                    .w(px(self.masonry.width()))
+                    .h(px(studio_ui::ds::size::TILE_BAND))
+                    .rounded(px(radius))
+                    .bg(studio_ui::ds::surface::highlight(cx))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .children(says)
                     .into_any_element()
             })
             .collect()
     }
 
-    fn render_more_error(&self, cx: &mut Context<Self>) -> AnyElement {
-        let error = self.more_error.clone().unwrap_or_default();
-        h_flex()
-            .w_full()
-            .px(px(space::EDGE))
-            .gap(px(space::MD))
-            .child(studio_ui::ds::text::error(format!(
-                "The next page could not be read: {error}"
-            )))
-            .child(
-                studio_ui::ds::row_button("gallery-retry-more", "Retry").on_click(cx.listener(
-                    |this, _, _, cx| {
-                        this.more_error = None;
-                        this.want_more(cx);
-                        cx.notify();
-                    },
-                )),
-            )
-            .into_any_element()
-    }
-
-    /// One tile: its preview in a well, the row's name and what the file is. The cursor's tile
-    /// is ringed in the focus colour, a picked one checked, and a branch's change marked as
-    /// every change is (spec 033).
-    fn render_tile(&self, ix: usize, width: f32, cx: &mut Context<Self>) -> AnyElement {
-        let row = &self.rows[ix];
+    /// One placed tile: its preview, as tall as its file's shape needs, then the row's name and
+    /// what the file is. The cursor's tile is ringed in the focus colour, a picked one checked,
+    /// and a branch's change marked as every change is (spec 033).
+    fn render_tile(&self, ix: usize, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let place: Place = *self.masonry.place_of(ix)?;
+        let row = self.rows.get(ix)?;
+        let width = self.masonry.width();
         let radii = studio_ui::ds::radii(cx);
         let property = self.property.clone().unwrap_or_default();
         let tile = self.tiles.get(&(row.id.clone(), property.clone()));
@@ -1518,12 +1802,12 @@ impl TypeGallery {
         let removed = change == Some(NetChange::Removed);
         let name = self.row_label(row).unwrap_or_else(|| row.id.clone());
         let (meta, meta_color) = self.meta_of(&row.id, tile, &property);
-        // The ring and the fill sit [`space::XS`] outside the well, inside a ring as wide as
-        // the accent line: the well's corner is concentric within the tile's.
-        let gap = studio_ui::ds::size::ACCENT_LINE + space::XS;
+        // The ring and the fill sit [`space::XS`] outside the preview, inside a ring as wide as
+        // the accent line: the preview's corner is concentric within the tile's.
         let outer = radii.md;
-        let well_radius = studio_ui::ds::radius::within(outer, gap);
-        let inner = width - 2. * gap;
+        let well_radius = studio_ui::ds::radius::within(outer, tile_inset());
+        let inner = width - 2. * tile_inset();
+        let preview_height = place.height - tile_chrome();
         let fill = if cursor {
             Some(studio_ui::ds::surface::selected_document(cx))
         } else if picked {
@@ -1531,107 +1815,114 @@ impl TypeGallery {
         } else {
             None
         };
-        let preview = self.render_preview(tile, inner, well_radius, cx);
+        let preview = self.render_preview(tile, inner, preview_height, well_radius, cx);
         let kind = change.map(|net| match net {
             NetChange::Added => ChangeKind::Added,
             NetChange::Changed => ChangeKind::Changed,
             NetChange::Removed => ChangeKind::Removed,
         });
         let tip = format!("{name}\n{meta}");
-        v_flex()
-            .id(("gallery-tile", ix))
-            .debug_selector(move || format!("gallery-tile-{ix}"))
-            .w(px(width))
-            .flex_none()
-            .p(px(space::XS))
-            .rounded(px(outer))
-            .border(px(studio_ui::ds::size::ACCENT_LINE))
-            .border_color(if cursor {
-                studio_ui::ds::surface::focus(cx)
-            } else {
-                gpui::transparent_black()
-            })
-            .when_some(fill, |tile, fill| tile.bg(fill))
-            .when(removed, |tile| tile.opacity(studio_ui::ds::opacity::DIMMED))
-            .cursor_pointer()
-            .tip(studio_ui::ds::tooltip(tip))
-            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                this.click_tile(ix, event, window, cx)
-            }))
-            .child(
-                div()
-                    .relative()
-                    .size(px(inner))
-                    .rounded(px(well_radius))
-                    .overflow_hidden()
-                    .bg(studio_ui::ds::surface::well(cx))
-                    .child(preview)
-                    // A bar of the change's colour along the preview's top edge.
-                    .when_some(
-                        kind.filter(|kind| *kind != ChangeKind::Removed),
-                        |well, kind| {
+        Some(
+            v_flex()
+                .id(("gallery-tile", ix))
+                .debug_selector(move || format!("gallery-tile-{ix}"))
+                .absolute()
+                .left(px(self.masonry.left(place.column, space::EDGE)))
+                .top(px(space::EDGE + place.top))
+                .w(px(width))
+                .h(px(place.height))
+                .p(px(space::XS))
+                .rounded(px(outer))
+                .border(px(studio_ui::ds::size::ACCENT_LINE))
+                .border_color(if cursor {
+                    studio_ui::ds::surface::focus(cx)
+                } else {
+                    gpui::transparent_black()
+                })
+                .when_some(fill, |tile, fill| tile.bg(fill))
+                .when(removed, |tile| tile.opacity(studio_ui::ds::opacity::DIMMED))
+                .cursor_pointer()
+                .tip(studio_ui::ds::tooltip(tip))
+                .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                    this.click_tile(ix, event, window, cx)
+                }))
+                .child(
+                    div()
+                        .relative()
+                        .w(px(inner))
+                        .h(px(preview_height))
+                        .rounded(px(well_radius))
+                        .overflow_hidden()
+                        .bg(studio_ui::ds::surface::well(cx))
+                        .child(preview)
+                        // A bar of the change's colour along the preview's top edge.
+                        .when_some(
+                            kind.filter(|kind| *kind != ChangeKind::Removed),
+                            |well, kind| {
+                                well.child(
+                                    div()
+                                        .absolute()
+                                        .top_0()
+                                        .left_0()
+                                        .w_full()
+                                        .h(px(studio_ui::ds::size::ACCENT_LINE))
+                                        .bg(kind.color().color(cx)),
+                                )
+                            },
+                        )
+                        .when(picked, |well| {
                             well.child(
                                 div()
                                     .absolute()
-                                    .top_0()
-                                    .left_0()
-                                    .w_full()
-                                    .h(px(studio_ui::ds::size::ACCENT_LINE))
-                                    .bg(kind.color().color(cx)),
+                                    .top(px(space::SM))
+                                    .left(px(space::SM))
+                                    .child(studio_ui::ds::check_box(
+                                        ("gallery-pick", ix),
+                                        ui::ToggleState::Selected,
+                                        cx,
+                                    )),
                             )
-                        },
-                    )
-                    .when(picked, |well| {
-                        well.child(
-                            div()
-                                .absolute()
-                                .top(px(space::SM))
-                                .left(px(space::SM))
-                                .child(studio_ui::ds::check_box(
-                                    ("gallery-pick", ix),
-                                    ui::ToggleState::Selected,
-                                    cx,
-                                )),
-                        )
-                    }),
-            )
-            .child(
-                v_flex()
-                    .h(px(studio_ui::ds::size::TILE_CAPTION))
-                    .pt(px(space::SM))
-                    .px(px(space::XXS))
-                    .gap(px(space::XXS))
-                    .when(kind == Some(ChangeKind::Added), |caption| {
-                        caption
-                            .rounded(px(well_radius))
-                            .bg(studio_ui::ds::surface::wash(Color::Created, cx))
-                    })
-                    .child(
-                        h_flex()
-                            .min_w_0()
-                            .gap(px(space::XS))
-                            .when_some(kind, |line, kind| {
-                                line.child(
-                                    studio_ui::ds::text::body(kind.symbol()).color(kind.color()),
-                                )
-                            })
-                            .child(
-                                div().min_w_0().flex_1().child(
-                                    studio_ui::ds::text::body(name)
-                                        .single_line()
-                                        .truncate()
-                                        .when(removed, |label| label.strikethrough()),
+                        }),
+                )
+                .child(
+                    v_flex()
+                        .h(px(studio_ui::ds::size::TILE_CAPTION))
+                        .pt(px(space::SM))
+                        .px(px(space::XXS))
+                        .gap(px(space::XXS))
+                        .when(kind == Some(ChangeKind::Added), |caption| {
+                            caption
+                                .rounded(px(well_radius))
+                                .bg(studio_ui::ds::surface::wash(Color::Created, cx))
+                        })
+                        .child(
+                            h_flex()
+                                .min_w_0()
+                                .gap(px(space::XS))
+                                .when_some(kind, |line, kind| {
+                                    line.child(
+                                        studio_ui::ds::text::body(kind.symbol())
+                                            .color(kind.color()),
+                                    )
+                                })
+                                .child(
+                                    div().min_w_0().flex_1().child(
+                                        studio_ui::ds::text::body(name)
+                                            .single_line()
+                                            .truncate()
+                                            .when(removed, |label| label.strikethrough()),
+                                    ),
                                 ),
-                            ),
-                    )
-                    .child(
-                        studio_ui::ds::text::meta(meta)
-                            .color(meta_color)
-                            .single_line()
-                            .truncate(),
-                    ),
-            )
-            .into_any_element()
+                        )
+                        .child(
+                            studio_ui::ds::text::meta(meta)
+                                .color(meta_color)
+                                .single_line()
+                                .truncate(),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 
     /// A tile's meta line and its colour: what the file is, or why there is none.
@@ -1655,10 +1946,14 @@ impl TypeGallery {
         }
     }
 
+    /// What a tile's preview well shows: its picture filling it edge to edge (a shape held to
+    /// the masonry's bounds, or a small picture never drawn past twice its pixels, sits
+    /// centered in it), the first lines of a text, or its kind's icon.
     fn render_preview(
         &self,
         tile: Option<&Tile>,
-        edge: f32,
+        width: f32,
+        height: f32,
         radius: f32,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -1678,11 +1973,12 @@ impl TypeGallery {
                 icon(IconName::Warning, Color::Warning)
             }
             (_, Loadable::Loaded(Look::Image { image, .. })) => {
-                // Fitted, never past twice its own pixels.
                 let (w, h) = image_size(image, tile.facts.as_ref());
-                let room = edge - 2. * space::MD;
-                let scale = (room / w).min(room / h).min(2.);
+                let scale = (width / w).min(height / h).min(2.);
                 let (w, h) = (w * scale, h * scale);
+                // Edge to edge it takes the well's corner; inside it, a picture's square one.
+                let fills = width - w < 1. && height - h < 1.;
+                let corner = if fills { radius } else { 0. };
                 centered()
                     .child(
                         div()
@@ -1692,6 +1988,7 @@ impl TypeGallery {
                             .child(
                                 gpui::img(image.source())
                                     .size_full()
+                                    .rounded(px(corner))
                                     .object_fit(gpui::ObjectFit::Contain),
                             )
                             .child(
@@ -1700,7 +1997,7 @@ impl TypeGallery {
                                     .top_0()
                                     .left_0()
                                     .size_full()
-                                    .rounded(px(studio_ui::ds::radius::within(radius, space::MD)))
+                                    .rounded(px(corner))
                                     .border(px(studio_ui::ds::size::HAIRLINE))
                                     .border_color(studio_ui::ds::surface::image_outline(cx)),
                             ),
@@ -1725,8 +2022,8 @@ impl TypeGallery {
     }
 }
 
-/// The size a preview is laid out at, in pixels: an image's own, an SVG's from its header when
-/// known, else a square.
+/// The size a preview is laid out at, in pixels: an image's own, a drawing's shape at a
+/// preview's size, else a square.
 fn image_size(image: &crate::blob::ShownImage, facts: Option<&Facts>) -> (f32, f32) {
     match image {
         crate::blob::ShownImage::Raster(render) => {
@@ -1738,10 +2035,17 @@ fn image_size(image: &crate::blob::ShownImage, facts: Option<&Facts>) -> (f32, f
                 _ => (w.max(1.), h.max(1.)),
             }
         }
-        crate::blob::ShownImage::Svg(_) => (
-            studio_ui::ds::size::TILE_LARGE,
-            studio_ui::ds::size::TILE_LARGE,
-        ),
+        // A drawing has no pixels of its own: its shape, as large as a preview is held.
+        crate::blob::ShownImage::Svg(_) => {
+            let edge = tile::THUMB_EDGE as f32;
+            match facts.and_then(|facts| facts.drawing) {
+                Some((w, h)) if w > 0. && h > 0. => {
+                    let scale = edge / w.max(h);
+                    (w * scale, h * scale)
+                }
+                _ => (edge, edge),
+            }
+        }
     }
 }
 
@@ -1756,27 +2060,26 @@ fn kind_icon(kind: Option<crate::blob::ValueKind>) -> IconName {
     }
 }
 
-/// A file of `size` bytes read at `snapshot`: its first [`FIRST_READ`] bytes, and the rest
-/// when it is drawn whole ([`tile::draws_whole`]), with what its first bytes say.
-async fn read_file(
+/// Bytes `from..to` of a file read at `snapshot`, in as many reads as the server takes to give
+/// them (it answers up to 4 MiB a range).
+async fn read_bytes(
     session: &WeakEntity<GraphSession>,
     cell: &BlobCell,
     snapshot: &Option<String>,
     scope: Option<&ReadScope>,
-    size: u64,
+    from: u64,
+    to: u64,
     cx: &mut gpui::AsyncApp,
-) -> Result<(Vec<u8>, Facts), String> {
+) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
-    let mut wanted = size.min(FIRST_READ);
-    let mut facts = None;
-    while (bytes.len() as u64) < wanted {
-        let from = bytes.len() as u64;
+    while from + (bytes.len() as u64) < to {
+        let at = from + bytes.len() as u64;
         let read = session
             .update(cx, |session, cx| match scope {
                 Some(scope) => {
-                    session.blob_bytes_in(scope, cell.clone(), snapshot.clone(), from..wanted, cx)
+                    session.blob_bytes_in(scope, cell.clone(), snapshot.clone(), at..to, cx)
                 }
-                None => session.blob_bytes(cell.clone(), snapshot.clone(), from..wanted, cx),
+                None => session.blob_bytes(cell.clone(), snapshot.clone(), at..to, cx),
             })
             .map_err(|_| "The graph closed.".to_owned())?;
         let chunk = read.await.map_err(|error| error.to_string())?;
@@ -1784,16 +2087,8 @@ async fn read_file(
             break;
         }
         bytes.extend(chunk);
-        if facts.is_none() && bytes.len() as u64 >= wanted.min(FIRST_READ) {
-            let judged = Facts::of(&bytes);
-            if tile::draws_whole(&judged, size) {
-                wanted = size;
-            }
-            facts = Some(judged);
-        }
     }
-    let facts = facts.unwrap_or_else(|| Facts::of(&bytes));
-    Ok((bytes, facts))
+    Ok(bytes)
 }
 
 impl Item for TypeGallery {
@@ -2034,10 +2329,10 @@ impl Render for TypeGallery {
             .track_focus(&self.focus_handle)
             .size_full()
             .bg(studio_ui::ds::surface::document(cx))
-            .on_action(cx.listener(|this, _: &MoveLeft, _, cx| this.move_cursor(-1, false, cx)))
-            .on_action(cx.listener(|this, _: &MoveRight, _, cx| this.move_cursor(1, false, cx)))
-            .on_action(cx.listener(|this, _: &MoveUp, _, cx| this.move_cursor(-1, true, cx)))
-            .on_action(cx.listener(|this, _: &MoveDown, _, cx| this.move_cursor(1, true, cx)))
+            .on_action(cx.listener(|this, _: &MoveLeft, _, cx| this.move_cursor(-1, true, cx)))
+            .on_action(cx.listener(|this, _: &MoveRight, _, cx| this.move_cursor(1, true, cx)))
+            .on_action(cx.listener(|this, _: &MoveUp, _, cx| this.move_cursor(-1, false, cx)))
+            .on_action(cx.listener(|this, _: &MoveDown, _, cx| this.move_cursor(1, false, cx)))
             .on_action(cx.listener(|this, _: &MoveToFirst, _, cx| this.set_cursor(0, cx)))
             .on_action(cx.listener(|this, _: &MoveToLast, _, cx| this.move_to_end(cx)))
             .on_action(cx.listener(|this, _: &OpenFile, window, cx| this.open_file(window, cx)))

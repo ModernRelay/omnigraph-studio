@@ -4,7 +4,7 @@ use gpui::{KeyBinding, TestAppContext, VisualTestContext};
 use serde_json::json;
 
 use super::*;
-use crate::test_support::{Blobs, session_with_files};
+use crate::test_support::session_with_files;
 
 const NOTES: &str =
     "node Note {\n  slug: String @key\n  title: String\n  attachment: Blob?\n  scan: Blob?\n}\n";
@@ -110,13 +110,16 @@ fn open(
     (gallery, cx)
 }
 
-/// Lets reads land, then the pause before tiles are read, then those reads.
+/// Lets reads land, then the pause before tiles are read, then those reads, then the draw of
+/// what landed.
 fn settle(cx: &mut VisualTestContext) {
-    cx.run_until_parked();
-    cx.executor().advance_clock(READ_AFTER);
-    cx.run_until_parked();
-    cx.executor().advance_clock(LANDING_DELAY);
-    cx.run_until_parked();
+    for _ in 0..3 {
+        cx.run_until_parked();
+        cx.executor().advance_clock(READ_AFTER);
+        cx.run_until_parked();
+        cx.executor().advance_clock(LANDING_DELAY);
+        cx.run_until_parked();
+    }
 }
 
 fn grid_renders(gallery: &Entity<TypeGallery>, cx: &mut VisualTestContext) -> usize {
@@ -124,134 +127,355 @@ fn grid_renders(gallery: &Entity<TypeGallery>, cx: &mut VisualTestContext) -> us
     grid.read_with(cx, |grid, _| grid.renders)
 }
 
-fn columns(gallery: &Entity<TypeGallery>, cx: &mut VisualTestContext) -> usize {
-    gallery.read_with(cx, |gallery, _| gallery.line_layout().0)
+/// A PNG of `width` by `height` pixels, of noise when `noisy` so it does not compress (and is
+/// read in more than its first 64 KiB), else of one colour.
+fn png(width: u32, height: u32, noisy: bool) -> Vec<u8> {
+    let mut seed = 0x2545_f491_u32;
+    let image = image::RgbImage::from_fn(width, height, |_, _| {
+        if noisy {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            let [a, b, c, _] = seed.to_le_bytes();
+            image::Rgb([a, b, c])
+        } else {
+            image::Rgb([40, 120, 200])
+        }
+    });
+    let mut bytes = Vec::new();
+    image
+        .write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+    bytes
 }
 
-/// Each line's tiles fill it: as many of at least the size as fit, with the edges and gaps
-/// kept, and one when the line is narrower than a tile.
-#[test]
-fn a_lines_tiles_fill_it() {
-    let edge = studio_ui::ds::size::TILE;
-    let (columns, tile) = line_layout(1200., edge);
-    assert_eq!(columns, 6);
-    let used = columns as f32 * tile + (columns as f32 - 1.) * space::LG + 2. * space::EDGE;
-    assert!((used - 1200.).abs() < 0.01, "{used}");
-    assert!(tile >= edge);
-    let (columns, tile) = line_layout(100., edge);
-    assert_eq!(columns, 1);
-    assert_eq!(tile, edge);
-    // Larger tiles, fewer to a line.
-    assert!(line_layout(1200., studio_ui::ds::size::TILE_LARGE).0 < 6);
-    assert!(line_layout(1200., studio_ui::ds::size::TILE_SMALL).0 > 6);
-}
-
-/// The arrows move across the grid: across a line's ends, a line up and down in the same
-/// column, ↓ above a short last line to the last tile, Home and End; X picks, ⌘A picks every
-/// tile, Esc takes them out; = and − change the tiles' size.
-#[gpui::test]
-async fn the_keys_move_across_the_grid_and_pick(cx: &mut TestAppContext) {
-    init(cx);
-    let (session, _) = session_with_files(NOTES, notes_answering(13), None, cx);
-    let (gallery, cx) = open(session, opening("Note"), cx);
-    let columns = columns(&gallery, cx);
-    assert!((2..13).contains(&columns), "{columns} columns");
-    let cursor = |cx: &mut VisualTestContext| gallery.read_with(cx, |g, _| g.cursor);
-    assert_eq!(cursor(cx), Some(0));
-
-    cx.simulate_keystrokes("right");
-    assert_eq!(cursor(cx), Some(1));
-    cx.simulate_keystrokes("left left");
-    assert_eq!(cursor(cx), Some(0), "the first tile is the first");
-    cx.simulate_keystrokes("down");
-    assert_eq!(cursor(cx), Some(columns), "a line down, the same column");
-    cx.simulate_keystrokes("up");
-    assert_eq!(cursor(cx), Some(0));
-    cx.simulate_keystrokes("up");
-    assert_eq!(cursor(cx), Some(0), "above the first line it stays");
-    // Along the line's end to the next line's start.
-    for _ in 0..columns {
-        cx.simulate_keystrokes("right");
-    }
-    assert_eq!(cursor(cx), Some(columns));
-    cx.simulate_keystrokes("end");
-    assert_eq!(cursor(cx), Some(12));
-    cx.simulate_keystrokes("home");
-    assert_eq!(cursor(cx), Some(0));
-    // ↓ from a line whose column the short last line lacks goes to the last tile.
-    let last_line_start = 12 / columns * columns;
-    let above = last_line_start - columns + columns - 1;
-    if 12 % columns != columns - 1 && above + columns > 12 {
-        gallery.update(cx, |gallery, cx| gallery.set_cursor(above, cx));
-        cx.simulate_keystrokes("down");
-        assert_eq!(cursor(cx), Some(12));
-    }
-
-    cx.simulate_keystrokes("home x right x");
+/// Each row's place, by row, as the gallery holds them.
+fn places(gallery: &Entity<TypeGallery>, cx: &mut VisualTestContext) -> Vec<Place> {
     gallery.read_with(cx, |gallery, _| {
-        assert_eq!(
-            gallery.picks.iter().cloned().collect::<Vec<_>>(),
-            ["n000", "n001"]
+        (0..gallery.masonry.placed())
+            .map(|row| *gallery.masonry.place_of(row).unwrap())
+            .collect()
+    })
+}
+
+/// The columns fill the width: as many of at least the tile size as fit, with the edges and
+/// gaps kept, and one when the width is narrower than a column.
+#[test]
+fn the_columns_fill_the_width() {
+    let edge = studio_ui::ds::size::TILE;
+    let (columns, width) = column_layout(1200., edge);
+    assert_eq!(columns, 6);
+    let used = columns as f32 * width + (columns as f32 - 1.) * space::LG + 2. * space::EDGE;
+    assert!((used - 1200.).abs() < 0.01, "{used}");
+    assert!(width >= edge);
+    let (columns, width) = column_layout(100., edge);
+    assert_eq!(columns, 1);
+    assert_eq!(width, edge);
+    assert!(column_layout(1200., studio_ui::ds::size::TILE_LARGE).0 < 6);
+    assert!(column_layout(1200., studio_ui::ds::size::TILE_SMALL).0 > 6);
+}
+
+/// Tiles are as tall as their files' shapes, from the pictures' headers, and the kinds'
+/// shapes where a file has none: a row without a file is a short band.
+#[gpui::test]
+async fn a_tile_is_as_tall_as_its_files_shape(cx: &mut TestAppContext) {
+    init(cx);
+    let (session, blobs) = session_with_files(NOTES, notes_answering(4), None, cx);
+    blobs.set("Note/n000/attachment", &png(200, 400, false));
+    blobs.set("Note/n001/attachment", &png(400, 100, false));
+    blobs.set("Note/n002/attachment", b"%PDF-1.4\n%a page\n");
+    // n003 holds none.
+    let (gallery, cx) = open(session, opening("Note"), cx);
+    gallery.read_with(cx, |gallery, _| {
+        let m = &gallery.masonry;
+        assert_eq!(m.placed(), 4);
+        let preview = |row: usize| m.place_of(row).unwrap().height - tile_chrome();
+        let width = m.width();
+        assert!((preview(0) - width * 2.).abs() < 0.01, "a tall picture");
+        assert!(
+            (preview(1) - width * 0.4).abs() < 0.01,
+            "a wide one, held to the bound"
+        );
+        assert!(
+            (preview(2) - width * tile::shape::DOCUMENT).abs() < 0.01,
+            "a page"
+        );
+        assert!(
+            (preview(3) - width * tile::shape::NO_FILE).abs() < 0.01,
+            "no file"
         );
     });
-    cx.simulate_keystrokes("x");
-    gallery.read_with(cx, |gallery, _| assert_eq!(gallery.picks.len(), 1));
+}
+
+/// Up and down stay in a column; left and right go to the next column's tile whose middle is
+/// nearest; Home and End, X, ⌘A and Esc, = and −, and F as before. A size change flows the
+/// columns again from the shapes kept, reading nothing.
+#[gpui::test]
+async fn the_arrows_move_within_and_across_columns(cx: &mut TestAppContext) {
+    init(cx);
+    let (session, blobs) = session_with_files(NOTES, notes_answering(40), None, cx);
+    // Shapes that leave the columns uneven: tall, square, wide, by turns.
+    for i in 0..40 {
+        let (w, h) = [(100, 200), (100, 100), (200, 100)][i % 3];
+        blobs.set(&format!("Note/n{i:03}/attachment"), &png(w, h, false));
+    }
+    let (gallery, cx) = open(session, opening("Note"), cx);
+    let (columns, placed) = gallery.read_with(cx, |g, _| (g.masonry.columns(), g.masonry.placed()));
+    assert!((3..20).contains(&columns), "{columns} columns");
+    assert_eq!(placed, 40);
+    let cursor = |cx: &mut VisualTestContext| gallery.read_with(cx, |g, _| g.cursor.unwrap());
+    let column_of = |cx: &mut VisualTestContext, row: usize| places(&gallery, cx)[row].column;
+    assert_eq!(cursor(cx), 0);
+
+    // Down the first column, and back up.
+    let below = gallery
+        .read_with(cx, |g, _| g.masonry.vertical(0, 1))
+        .unwrap();
+    cx.simulate_keystrokes("down");
+    assert_eq!(cursor(cx), below);
+    assert_eq!(column_of(cx, below), 0, "down stays in its column");
+    cx.simulate_keystrokes("up up");
+    assert_eq!(cursor(cx), 0, "above the first it stays");
+
+    // Right, from the lower tile: the next column's tile whose middle is nearest.
+    cx.simulate_keystrokes("down right");
+    let at = cursor(cx);
+    let all = places(&gallery, cx);
+    assert_eq!(all[at].column, 1);
+    let middle = all[below].middle();
+    let nearest = (0..all.len())
+        .filter(|&row| all[row].column == 1)
+        .min_by(|&a, &b| {
+            (all[a].middle() - middle)
+                .abs()
+                .total_cmp(&(all[b].middle() - middle).abs())
+        })
+        .unwrap();
+    assert_eq!(at, nearest);
+    cx.simulate_keystrokes("left");
+    let at = cursor(cx);
+    assert_eq!(column_of(cx, at), 0);
+    cx.simulate_keystrokes("left");
+    assert_eq!(cursor(cx), at, "nothing left of the first column");
+    cx.simulate_keystrokes("end");
+    assert_eq!(cursor(cx), 39);
+    cx.simulate_keystrokes("home");
+    assert_eq!(cursor(cx), 0);
+
+    cx.simulate_keystrokes("x down x");
+    gallery.read_with(cx, |gallery, _| {
+        let picked: Vec<&str> = gallery.picks.iter().map(String::as_str).collect();
+        assert_eq!(picked, ["n000", gallery.rows[below].id.as_str()]);
+    });
     cx.simulate_keystrokes("cmd-a");
-    gallery.read_with(cx, |gallery, _| assert_eq!(gallery.picks.len(), 13));
+    gallery.read_with(cx, |gallery, _| assert_eq!(gallery.picks.len(), 40));
     cx.simulate_keystrokes("escape");
     gallery.read_with(cx, |gallery, _| assert!(gallery.picks.is_empty()));
 
-    cx.simulate_keystrokes("=");
+    // A size change flows the columns again from the shapes kept, reading nothing.
+    let read_before = blobs.reads.lock().unwrap().len();
+    cx.simulate_keystrokes("- -");
+    settle(cx);
+    gallery.read_with(cx, |gallery, _| {
+        assert_eq!(gallery.size, TileSize::Small);
+        assert!(
+            gallery.masonry.columns() > columns,
+            "narrower columns, more of them"
+        );
+        assert_eq!(gallery.masonry.placed(), 40);
+    });
+    assert_eq!(
+        blobs.reads.lock().unwrap().len(),
+        read_before,
+        "the shapes kept laid the columns out"
+    );
+    cx.simulate_keystrokes("= =");
     gallery.read_with(cx, |gallery, _| assert_eq!(gallery.size, TileSize::Large));
-    cx.simulate_keystrokes("- - -");
-    gallery.read_with(cx, |gallery, _| assert_eq!(gallery.size, TileSize::Small));
 
-    // F shows the type's next file, then the first again.
-    gallery.read_with(cx, |gallery, _| {
-        assert_eq!(gallery.property.as_deref(), Some("attachment"))
-    });
     cx.simulate_keystrokes("f");
-    gallery.read_with(cx, |gallery, _| {
-        assert_eq!(gallery.property.as_deref(), Some("scan"))
-    });
+    gallery.read_with(cx, |g, _| assert_eq!(g.property.as_deref(), Some("scan")));
     cx.simulate_keystrokes("f");
-    gallery.read_with(cx, |gallery, _| {
-        assert_eq!(gallery.property.as_deref(), Some("attachment"))
+    gallery.read_with(cx, |g, _| {
+        assert_eq!(g.property.as_deref(), Some("attachment"))
     });
 }
 
-/// The first page is read alone; the next only once the lines drawn come within a page of the
-/// last row read, at the first page's commit; a set read to its end reads nothing more.
+/// A placed tile keeps its position when later shapes arrive: with the fourth file's bytes
+/// held, the three before it are placed and nothing after it, whatever landed, and a band
+/// waits under the columns; once they come, the rest are placed after them, and the first
+/// three are where they were.
 #[gpui::test]
-async fn pages_are_read_as_the_lines_drawn_near_the_end(cx: &mut TestAppContext) {
+async fn a_placed_tile_keeps_its_place_when_later_shapes_arrive(cx: &mut TestAppContext) {
     init(cx);
-    let (session, _) = session_with_files(NOTES, notes_answering(500), None, cx);
+    let (session, blobs) = session_with_files(NOTES, notes_answering(8), None, cx);
+    for i in 0..8 {
+        let (w, h) = [(100, 160), (160, 100), (100, 100), (100, 220)][i % 4];
+        blobs.set(&format!("Note/n{i:03}/attachment"), &png(w, h, false));
+    }
+    let held = blobs.hold_reads("Note/n003/attachment");
     let (gallery, cx) = open(session, opening("Note"), cx);
+    let early = places(&gallery, cx);
+    assert_eq!(early.len(), 3, "placed up to the shape not known");
+    gallery.read_with(cx, |gallery, _| {
+        let key = |i: usize| (format!("n{i:03}"), "attachment".to_owned());
+        assert!(
+            gallery
+                .tiles
+                .get(&key(5))
+                .is_some_and(|t| t.shape.is_some()),
+            "a later shape landed and waits"
+        );
+        assert!(gallery.masonry.placed() < gallery.rows.len());
+    });
+    drop(held);
+    settle(cx);
+    let all = places(&gallery, cx);
+    assert_eq!(all.len(), 8);
+    assert_eq!(&all[..3], &early[..], "a placed tile moved");
+}
+
+/// The tiles shown have their files read and drawn; rows a screen below are measured from
+/// their first bytes alone; nothing further is read. Reads for tiles no longer wanted before
+/// they were sent ask nothing.
+#[gpui::test]
+async fn the_tiles_shown_are_drawn_and_the_rows_below_measured(cx: &mut TestAppContext) {
+    init(cx);
+    let (session, blobs) = session_with_files(NOTES, notes_answering(400), None, cx);
+    let big = png(300, 300, true);
+    assert!(big.len() as u64 > FIRST_READ, "{}", big.len());
+    for i in 0..80 {
+        blobs.set(&format!("Note/n{i:03}/attachment"), &big);
+    }
+    let (gallery, cx) = open(session, opening("Note"), cx);
+    let reads = blobs.reads.lock().unwrap().clone();
+    let (shown, placed) = gallery.read_with(cx, |gallery, _| {
+        (
+            gallery.masonry.meeting(gallery.span.clone()),
+            gallery.masonry.placed(),
+        )
+    });
+    assert!(!shown.is_empty());
+    assert!(
+        placed > *shown.last().unwrap() + 1,
+        "rows below were measured and placed"
+    );
+    assert!(placed < 400, "not every row: {placed}");
+    let rest = |row: usize| {
+        let cell = format!("GET Note/n{row:03}/attachment 65536-");
+        reads.iter().any(|read| read.starts_with(&cell))
+    };
+    let first = |row: usize| {
+        let cell = format!("GET Note/n{row:03}/attachment 0-65535");
+        reads.iter().any(|read| *read == cell)
+    };
+    for &row in &shown {
+        assert!(first(row) && rest(row), "shown row {row} drawn: {reads:?}");
+    }
+    let below = *shown.last().unwrap() + 1;
+    assert!(first(below), "row {below} measured");
+    assert!(
+        !rest(below),
+        "row {below} measured from its first bytes alone"
+    );
+    assert!(
+        !reads
+            .iter()
+            .any(|read| read.contains(&format!("/n{:03}/", placed + 50))),
+        "nothing far below is read"
+    );
+    gallery.read_with(cx, |gallery, _| {
+        let tile = |row: usize| &gallery.tiles[&(format!("n{row:03}"), "attachment".to_owned())];
+        assert!(matches!(
+            tile(shown[0]).look,
+            Loadable::Loaded(Look::Image { .. })
+        ));
+        assert_eq!(
+            tile(below).head.as_ref().map(Vec::len),
+            Some(FIRST_READ as usize)
+        );
+        assert!(gallery.tile_tasks.is_empty(), "every read ended");
+    });
+
+    // Asked for and then no longer wanted before they were sent: nothing of theirs is read.
+    blobs.reads.lock().unwrap().clear();
+    gallery.update(cx, |gallery, cx| {
+        gallery.release_all(cx);
+        gallery.span = 0.0..400.;
+        gallery.read_tiles(cx);
+        assert_eq!(gallery.tile_tasks.len(), READS_AT_ONCE, "four at once");
+        let bottom = gallery.masonry.height();
+        gallery.span = (bottom - 100.)..bottom;
+        gallery.read_tiles(cx);
+        let wanted: HashSet<TileKey> = gallery.wanted().into_iter().map(|(key, _)| key).collect();
+        assert!(gallery.tile_tasks.keys().all(|key| wanted.contains(key)));
+    });
+    cx.run_until_parked();
+    let later = blobs.reads.lock().unwrap().clone();
+    gallery.read_with(cx, |gallery, _| {
+        let near: HashSet<usize> = gallery.masonry.meeting(0.0..400.).into_iter().collect();
+        let far: HashSet<usize> = gallery
+            .masonry
+            .meeting((gallery.masonry.height() - 100.)..gallery.masonry.height())
+            .into_iter()
+            .collect();
+        for read in &later {
+            let id = read.split('/').nth(1).unwrap();
+            let row: usize = id.trim_start_matches('n').parse().unwrap();
+            assert!(
+                !near.contains(&row) || far.contains(&row),
+                "a read for a tile scrolled away was sent: {read}"
+            );
+        }
+    });
+}
+
+/// Pages are read as the rows wanted a screen below the view near the end of those read, at
+/// the first page's commit, and no further: a set of 5,000 is not read whole until it is
+/// scrolled through.
+#[gpui::test]
+async fn pages_are_read_as_the_columns_near_the_end(cx: &mut TestAppContext) {
+    init(cx);
+    let (session, _) = session_with_files(NOTES, notes_answering(5_000), None, cx);
+    let (gallery, cx) = open(session, opening("Note"), cx);
+    let opened = gallery.read_with(cx, |gallery, _| {
+        assert!(
+            gallery.rows.len() >= 200,
+            "a first page is two of the graph's pages"
+        );
+        assert!(gallery.rows.len() < 5_000, "{} read", gallery.rows.len());
+        assert!(gallery.masonry.placed() < gallery.rows.len());
+        assert!(!gallery.paging.exhausted);
+        assert_eq!(gallery.paging.pinned.as_deref(), Some("c1"));
+        assert_eq!(gallery.count, Loadable::Loaded(5_000));
+        gallery.rows.len()
+    });
+    let mut read = vec![opened];
+    for _ in 0..80 {
+        gallery.update(cx, |gallery, cx| {
+            let bottom = gallery.masonry.height();
+            gallery.scroll.set_offset(point(px(0.), px(-bottom)));
+            cx.notify();
+        });
+        settle(cx);
+        read.push(gallery.read_with(cx, |gallery, _| gallery.rows.len()));
+    }
+    assert!(
+        read.windows(2).any(|pair| pair[1] > pair[0]),
+        "scrolled down, later pages were read: {read:?}"
+    );
     gallery.read_with(cx, |gallery, _| {
         assert_eq!(
             gallery.rows.len(),
-            200,
-            "a first page is two of the graph's pages"
+            5_000,
+            "scrolled through, every row was read"
         );
-        assert!(!gallery.paging.exhausted);
-        assert_eq!(gallery.paging.pinned.as_deref(), Some("c1"));
-        assert_eq!(gallery.count, Loadable::Loaded(500));
-        assert_eq!(gallery.count_text(), "200 of 500 read");
-    });
-    // Near the end of what was read, the next page is read.
-    let columns = columns(&gallery, cx);
-    gallery.update(cx, |gallery, cx| {
-        let line = 150 / columns;
-        gallery.scroll.scroll_to_item(line, ScrollStrategy::Top);
-        cx.notify();
-    });
-    settle(cx);
-    gallery.read_with(cx, |gallery, _| {
-        assert_eq!(gallery.rows.len(), 500, "the second page read the rest");
         assert!(gallery.paging.exhausted);
-        assert_eq!(gallery.count_text(), "500 rows");
+        assert_eq!(gallery.count_text(), "5,000 rows");
         let ids: HashSet<&str> = gallery.rows.iter().map(|row| row.id.as_str()).collect();
-        assert_eq!(ids.len(), 500, "no row twice");
+        assert_eq!(ids.len(), 5_000, "no row twice");
     });
 }
 
@@ -272,168 +496,50 @@ async fn a_gallery_of_listed_rows_holds_them_in_their_order(cx: &mut TestAppCont
         assert_eq!(ids, ["n007", "n002", "n015"]);
         assert_eq!(gallery.cursor, Some(1), "the table's cursor row");
         assert!(gallery.paging.exhausted);
+        assert_eq!(gallery.masonry.placed(), 3);
         assert_eq!(gallery.count_text(), "3 rows");
     });
 }
 
-/// Only the tiles on the lines drawn are read, once scrolling rests, at most four at once;
-/// each reads what its cell holds, its first bytes and, for a picture, the rest; a null cell
-/// reads nothing past its `HEAD`. A read for tiles scrolled away before it was sent is
-/// dropped, and nothing of theirs is asked.
-#[gpui::test]
-async fn only_the_tiles_drawn_are_read_and_those_scrolled_away_are_dropped(
-    cx: &mut TestAppContext,
-) {
-    init(cx);
-    let (session, blobs) = session_with_files(NOTES, notes_answering(400), None, cx);
-    let picture = {
-        let mut bytes = Vec::new();
-        image::RgbaImage::from_pixel(600, 300, image::Rgba([10, 120, 200, 255]))
-            .write_to(
-                &mut std::io::Cursor::new(&mut bytes),
-                image::ImageFormat::Png,
-            )
-            .unwrap();
-        bytes
-    };
-    blobs.set("Note/n000/attachment", &picture);
-    blobs.set("Note/n001/attachment", b"plain text, short");
-    // n002 holds none: its HEAD answers 404, which the client reads as null.
-    let (gallery, cx) = open(session, opening("Note"), cx);
-    let reads = |blobs: &Blobs| blobs.reads.lock().unwrap().clone();
-    let first = reads(&blobs);
-    let (drawn, per_line) = gallery.read_with(cx, |gallery, _| {
-        (gallery.lines_drawn.clone(), gallery.line_layout().0)
-    });
-    let tiles_drawn = (drawn.end * per_line).min(400);
-    let heads = first.iter().filter(|read| read.starts_with("HEAD")).count();
-    assert_eq!(heads, tiles_drawn, "a HEAD for each tile drawn: {first:?}");
-    assert!(first.contains(&"HEAD Note/n000/attachment".to_owned()));
-    assert!(
-        !first.iter().any(|read| read.contains("/n399/")),
-        "nothing far below is read"
-    );
-    // The picture is read in two: its first 64 KiB judged it, then the rest. Its size here is
-    // under 64 KiB, so one range holds it whole.
-    let picture_reads: Vec<&String> = first
-        .iter()
-        .filter(|read| read.starts_with("GET Note/n000/"))
-        .collect();
-    assert_eq!(picture_reads.len(), 1, "{picture_reads:?}");
-    assert!(
-        !first.iter().any(|read| read.starts_with("GET Note/n002/")),
-        "a null cell reads no bytes"
-    );
-    gallery.read_with(cx, |gallery, _| {
-        let tile = |id: &str| gallery.tiles.get(&(id.to_owned(), "attachment".to_owned()));
-        assert!(matches!(
-            tile("n000").map(|tile| &tile.look),
-            Some(Loadable::Loaded(Look::Image { .. }))
-        ));
-        assert_eq!(
-            tile("n000")
-                .and_then(|tile| tile.facts)
-                .and_then(|facts| facts.pixels),
-            Some((600, 300))
-        );
-        assert!(matches!(
-            tile("n001").map(|tile| &tile.look),
-            Some(Loadable::Loaded(Look::Text(_)))
-        ));
-        assert!(matches!(
-            tile("n002").map(|tile| &tile.meta),
-            Some(Loadable::Loaded(BlobMeta::Null))
-        ));
-        assert!(gallery.tile_tasks.is_empty(), "every read ended");
-        assert!(gallery.held > 0);
-    });
-
-    // Tiles asked for and then scrolled past before their reads were sent ask nothing.
-    blobs.reads.lock().unwrap().clear();
-    let (lines, far) = gallery.read_with(cx, |gallery, _| {
-        let lines = gallery.line_count();
-        (lines - 4..lines - 2, lines - 1..lines)
-    });
-    gallery.update(cx, |gallery, cx| {
-        let columns = gallery.line_layout().0;
-        gallery.read_tiles(lines, cx);
-        assert_eq!(gallery.tile_tasks.len(), READS_AT_ONCE, "four at once");
-        assert_eq!(gallery.tile_queue.len(), 2 * columns - READS_AT_ONCE);
-        gallery.read_tiles(far.clone(), cx);
-        assert!(
-            gallery
-                .tile_tasks
-                .keys()
-                .chain(gallery.tile_queue.iter())
-                .all(|(id, _)| {
-                    let ix: usize = id.trim_start_matches('n').parse().unwrap();
-                    (far.start * columns..far.end * columns).contains(&ix)
-                }),
-            "only the lines now drawn are read"
-        );
-    });
-    cx.run_until_parked();
-    let later = reads(&blobs);
-    let columns = columns(&gallery, cx);
-    assert!(
-        later.iter().all(|read| {
-            let id = read.split('/').nth(1).unwrap();
-            let ix: usize = id.trim_start_matches('n').parse().unwrap();
-            (far.start * columns..far.end * columns).contains(&ix)
-        }),
-        "a read for a tile scrolled away was sent: {later:?}"
-    );
-}
-
-/// Past the cap, the previews farthest from the lines drawn are let go, freeing what they
-/// held; those drawn stay, even past the cap, so a screen is never read again and again.
+/// Past the cap, the previews and first bytes held farthest from the span shown are let go;
+/// those shown stay, even past the cap; every shape stays.
 #[gpui::test]
 async fn previews_past_the_cap_are_let_go_farthest_first(cx: &mut TestAppContext) {
     init(cx);
-    let (session, _) = session_with_files(NOTES, notes_answering(100), None, cx);
+    let (session, _) = session_with_files(NOTES, notes_answering(2_000), None, cx);
     let (gallery, cx) = open(session, opening("Note"), cx);
     gallery.update(cx, |gallery, cx| {
-        gallery.release_all(cx);
-        gallery.lines_drawn = 0..1;
-        let each = PREVIEWS_HELD / 4;
-        for id in ["n000", "n050", "n099", "n001"] {
+        assert!(gallery.masonry.placed() + 1 < gallery.rows.len());
+        let shown = gallery.masonry.meeting(gallery.span.clone());
+        let near = shown[0];
+        let far = gallery.masonry.placed() - 1;
+        let unplaced = gallery.masonry.placed() + 1;
+        let key = |row: usize| (format!("n{row:03}"), "attachment".to_owned());
+        let each = PREVIEWS_HELD / 3;
+        for row in [near, far] {
             let image = crate::blob::ShownImage::from_rgba(1, 1, vec![0; 4]).unwrap();
-            gallery.tiles.insert(
-                (id.to_owned(), "attachment".to_owned()),
-                Tile {
-                    look: Loadable::Loaded(Look::Image { image, bytes: each }),
-                    ..Tile::default()
-                },
-            );
-            gallery.held += each;
+            let tile = gallery.tiles.entry(key(row)).or_default();
+            tile.look = Loadable::Loaded(Look::Image { image, bytes: each });
         }
-        gallery.held += 1;
+        gallery.tiles.entry(key(unplaced)).or_default().head = Some(vec![0; each]);
+        gallery.held = 3 * each + each / 2;
         gallery.let_go_past_cap(cx);
-        let kept = |gallery: &TypeGallery, id: &str| {
-            matches!(
-                gallery.tiles[&(id.to_owned(), "attachment".to_owned())].look,
-                Loadable::Loaded(Look::Image { .. })
-            )
-        };
-        assert!(kept(gallery, "n000") && kept(gallery, "n001") && kept(gallery, "n050"));
-        assert!(!kept(gallery, "n099"), "the farthest went");
-        assert!(gallery.held <= PREVIEWS_HELD);
-
-        // Past the cap with only the tiles drawn holding previews, they keep them.
-        gallery.held = PREVIEWS_HELD * 2;
+        let tile = |gallery: &TypeGallery, row: usize| gallery.tiles[&key(row)].held();
+        assert!(tile(gallery, unplaced) == 0, "an unplaced row is farthest");
+        assert!(tile(gallery, near) > 0 && tile(gallery, far) > 0);
+        gallery.held = 2 * PREVIEWS_HELD;
         gallery.let_go_past_cap(cx);
-        assert!(
-            kept(gallery, "n000") && kept(gallery, "n001"),
-            "the tiles drawn keep theirs"
-        );
+        assert!(tile(gallery, near) > 0, "a tile shown keeps its preview");
+        assert_eq!(tile(gallery, far), 0);
+        assert!(gallery.tiles[&key(far)].shape.is_some(), "its shape stays");
     });
 }
 
-/// On a branch, a tile is marked as the branch changed its row (spec 033): the rows it
-/// removed come first, read where they last were; an added row, a changed one, and one whose
-/// file changed say so; the toolbar counts them.
+/// On a branch, nothing is placed until the branch's diff is in, so the rows it removed come
+/// first without moving a placed tile; tiles are marked as the branch changed their rows
+/// (spec 033), the removed row's file read where it last was.
 #[gpui::test]
-async fn a_branch_marks_its_tiles_and_shows_removed_rows_first(cx: &mut TestAppContext) {
+async fn a_branch_marks_its_tiles_and_places_removed_rows_first(cx: &mut TestAppContext) {
     init(cx);
     let note_type = json!({ "id": "Note", "name": "Note" });
     let changes = json!([
@@ -453,6 +559,13 @@ async fn a_branch_marks_its_tiles_and_shows_removed_rows_first(cx: &mut TestAppC
     gallery.read_with(cx, |gallery, _| {
         let ids: Vec<&str> = gallery.rows.iter().map(|row| row.id.as_str()).collect();
         assert_eq!(ids, ["n900", "n000", "n001", "n002"]);
+        let first = gallery.masonry.place_of(0).unwrap();
+        assert_eq!(
+            (first.column, first.top),
+            (0, 0.),
+            "the removed row is placed first"
+        );
+        assert_eq!(gallery.masonry.placed(), 4);
         assert_eq!(gallery.change_of("n000"), Some(NetChange::Added));
         assert_eq!(gallery.change_of("n001"), Some(NetChange::Changed));
         assert!(gallery.file_changed("n001"));
@@ -460,14 +573,12 @@ async fn a_branch_marks_its_tiles_and_shows_removed_rows_first(cx: &mut TestAppC
         assert!(gallery.is_removed("n900"));
         assert_eq!(gallery.diff.as_ref().unwrap().counts(), (1, 1, 1));
         assert_eq!(
-            gallery.cursor,
-            Some(1),
-            "the cursor stays on the first tile read"
+            gallery.selected_row_id(),
+            Some("n000"),
+            "the cursor stays on its tile"
         );
-        assert_eq!(gallery.selected_row_id(), Some("n000"));
         assert_eq!(gallery.diff_base.as_deref(), Some("c0"));
     });
-    // The removed row's file is read at the merge base, where it last was.
     assert!(
         blobs
             .reads
@@ -476,18 +587,17 @@ async fn a_branch_marks_its_tiles_and_shows_removed_rows_first(cx: &mut TestAppC
             .iter()
             .any(|read| read.starts_with("HEAD Note/n900/attachment")),
     );
-    // A removed tile is not picked.
     gallery.update(cx, |gallery, cx| gallery.pick(0, false, cx));
     gallery.read_with(cx, |gallery, _| assert!(gallery.picks.is_empty()));
 }
 
-/// The grid is a cached view of its own: it follows the gallery's `notify`, a key that moves
-/// the cursor draws it once, and previews landing together draw it once, not once a tile.
+/// The grid is a cached view of its own: a key that moves the cursor draws it once, and
+/// previews landing together draw it once, not once a tile.
 #[gpui::test]
 async fn a_key_draws_the_grid_once_and_previews_land_together(cx: &mut TestAppContext) {
     init(cx);
     let (session, blobs) = session_with_files(NOTES, notes_answering(40), None, cx);
-    for i in 0..8 {
+    for i in 0..40 {
         blobs.set(
             &format!("Note/n{i:03}/attachment"),
             format!("text {i}").as_bytes(),
@@ -498,37 +608,28 @@ async fn a_key_draws_the_grid_once_and_previews_land_together(cx: &mut TestAppCo
     cx.simulate_keystrokes("right");
     cx.run_until_parked();
     let before = grid_renders(&gallery, cx);
-    cx.simulate_keystrokes("right");
+    cx.simulate_keystrokes("down");
     cx.run_until_parked();
     assert_eq!(grid_renders(&gallery, cx), before + 1, "one draw a key");
-    cx.simulate_keystrokes("left left");
+    cx.simulate_keystrokes("up left");
     cx.run_until_parked();
     assert_eq!(grid_renders(&gallery, cx), before + 3, "one draw a key");
 
-    // Every tile read again: the tiles drawn land, and the grid is drawn far fewer times
-    // than the tiles that landed.
+    // Every preview read again: the tiles shown land, and the grid is drawn once for them.
     gallery.update(cx, |gallery, cx| {
-        gallery.release_all(cx);
-        gallery.lines_read = None;
-        cx.notify();
+        for tile in gallery.tiles.values_mut() {
+            tile.look = Loadable::NotLoaded;
+        }
+        gallery.read_tiles(cx);
     });
-    cx.run_until_parked();
     let before = grid_renders(&gallery, cx);
-    let landed = gallery.read_with(cx, |gallery, _| {
-        gallery.keys_on(gallery.lines_drawn.clone()).len()
-    });
-    cx.executor().advance_clock(READ_AFTER);
     cx.run_until_parked();
+    let landed = gallery.read_with(cx, |gallery, _| {
+        gallery.masonry.meeting(gallery.span.clone()).len()
+    });
     cx.executor().advance_clock(LANDING_DELAY);
     cx.run_until_parked();
     let drew = grid_renders(&gallery, cx) - before;
-    gallery.read_with(cx, |gallery, _| {
-        let read = gallery
-            .tiles
-            .values()
-            .filter(|tile| matches!(tile.look, Loadable::Loaded(_)))
-            .count();
-        assert_eq!(read, landed);
-    });
+    assert!(landed > 4, "{landed} tiles shown");
     assert_eq!(drew, 1, "{drew} draws for {landed} tiles landing together");
 }

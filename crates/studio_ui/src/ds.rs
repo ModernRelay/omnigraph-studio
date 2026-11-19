@@ -266,13 +266,15 @@ pub mod size {
     pub const ACCENT_LINE: f32 = 2.;
     /// The tallest a preview (an image, a document's first page) shows before it opens.
     pub const PREVIEW_MAX_HEIGHT: f32 = 240.;
-    /// A gallery tile's square preview at each of its sizes (spec 035), the smallest a line's
-    /// tiles grow from to fill it.
+    /// A gallery column's width at each tile size (spec 035), the narrowest the columns grow
+    /// from to fill the gallery.
     pub const TILE_SMALL: f32 = 128.;
     pub const TILE: f32 = 176.;
     pub const TILE_LARGE: f32 = 240.;
     /// A gallery tile's caption under its preview: a name line and a meta line.
     pub const TILE_CAPTION: f32 = 44.;
+    /// The band at the end of a gallery's columns while rows wait to be placed.
+    pub const TILE_BAND: f32 = 48.;
     /// A short label before a value ("From", "To").
     pub const SHORT_LABEL: f32 = 40.;
     /// The tallest a modal grows before its body scrolls.

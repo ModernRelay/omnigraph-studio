@@ -12,6 +12,7 @@ mod dialogs;
 mod fill;
 mod gallery;
 mod grouping;
+mod masonry;
 mod model;
 mod node_page;
 mod offers;

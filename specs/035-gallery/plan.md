@@ -1,8 +1,9 @@
 # 035: A gallery of a type's files
 
 Status: draft; step 1 (the gallery tab, which writes nothing itself) built as a prototype
-2026-11-18 (`crates/type_table/src/gallery.rs`, `tile.rs`) · drafted 2026-11-18, claims checked
-against Studio `50a495c` and Omnigraph `v0.15.0` the same day
+2026-11-18 as a uniform grid, reworked 2026-11-19 as a masonry (`crates/type_table/src/gallery.rs`,
+`masonry.rs`, `tile.rs`) · drafted 2026-11-18, claims checked against Studio `50a495c` and
+Omnigraph `v0.15.0` the same day
 
 ## Problem
 
@@ -35,22 +36,24 @@ Four jobs follow, each a reason a list of names is the wrong shape:
    at once and opens the one that looks wrong.
 3. **Compare a row's file before and after.** On a branch, a changed tile can show what the
    target holds beside what the branch holds; the review of the branch links to the same.
-4. **Pick one.** A cover image, the report to attach: move across the grid, Space to see it in
+4. **Pick one.** A cover image, the report to attach: move across the columns, Space to see it in
    the inspector, ↵ to open it, ⌘↵ to open its row.
 
 ## Principles
 
 - II: the gallery reads one commit: the commit of the table it was opened from, or the head
   when opened at the head with nothing read yet. Every tile's file is read at that commit.
-- V: tiles never move. The grid is uniform, so a preview landing, failing or being freed
-  changes nothing around it. Rows a later page brings come after the last tile.
+- V: tiles never move. A tile is placed only once its shape is known and every row before it
+  is placed, in row order, so a preview landing, failing or being freed, or a later shape
+  arriving, changes no placed tile. Rows a later page brings are placed after the last one.
 - VI: every control shows its key; the File chip, the size control and each tile's states say
   what they are in their tooltips.
 - VII: tiles appear as they are read, without motion; the cursor moves instantly.
 - VIII: every gallery action is in `studio_actions` with a key in every keymap.
-- IX: virtualized by line, paged a page ahead, reads only for the lines drawn once scrolling
-  pauses, at most four files read at once, a cap on what is read and decoded per tile, and a
-  cap on the decoded previews held.
+- IX: only the tiles meeting the view are laid out, paged a page ahead of the rows wanted,
+  reads only for the tiles shown and the rows a screen below once scrolling pauses, at most
+  four files read at once, a cap on what is read and decoded per tile, and a cap on the
+  previews and first bytes held.
 - X: designed against contract 0.14; E55 to E59 record what the engine could do instead.
 - XIII: Gallery is a view of a set, so it is a tab, opened from the view strip of the table it
   comes from, which stays. It has reads (each tile's file) and a selection of its own.
@@ -129,41 +132,70 @@ Four jobs follow, each a reason a list of names is the wrong shape:
 - The tab is titled "Gallery: Note", or "Gallery: Note, design" with its filters, and comes
   back after a restart (`gallery` item kind) at the commit it held, or at the head.
 
-### Layout: a uniform grid
+### Layout: a masonry
 
-Three layouts were compared (Decisions has the reasons):
+Three layouts were compared. On 2026-11-18 the uniform grid was chosen; on 2026-11-19 Ragnor
+asked for the gallery to be "more Pinterest style", and the masonry's two costs turned out to
+be answerable within today's API (Decisions):
 
 | | Uniform grid | Justified rows (Flickr, Google Photos) | Masonry (Pinterest) |
 |---|---|---|---|
-| Needs before placing a tile | nothing | each file's aspect ratio | each file's aspect ratio |
-| Reads to lay out a screen | none | a header read per tile, ahead of the view | the same |
-| A preview landing | fills its square | moves every later tile on the line | moves every tile below |
-| ↑ and ↓ | the tile above or below | the nearest by x, which varies | ambiguous |
-| Mixed kinds (PDF, text, bytes, none) | one square each | no natural ratio | no natural ratio |
-| Virtualization | lines of equal height (`uniform_list`) | lines of known height only once read | columns of unknown height |
+| Needs before placing a tile | nothing | each file's shape | each file's shape |
+| Where the shape comes from | — | the first bytes, which every tile reads anyway | the same |
+| A shape arriving late | — | moves every later tile on the line, unless lines wait | moves nothing, when tiles are placed strictly in row order |
+| ↑ and ↓ | the tile above or below | the nearest by x | the tile above or below in its column |
+| Mixed kinds (PDF, text, bytes, none) | one square each | a shape per kind | a shape per kind |
+| A picture | cropped or boxed in a square | its own shape | its own shape |
 
-**Chosen: a uniform grid of square previews with a caption.**
+**Chosen: a masonry.** Columns of one width; each tile as tall as its file's shape needs and
+its caption under the picture; rows placed in row order, each into the shortest column (the
+first of equal ones), `space::LG` apart (`masonry::Masonry`).
 
-- Tile sizes: Small 128, Medium 176 (default), Large 240 pixels, the preview square
-  (`ds::size::TILE_SMALL`, `TILE`, `TILE_LARGE`). `=` and `−` change it, as the Blob tab's
-  zoom keys; the toolbar's segmented control shows it. Saved with the tab.
-- The columns are as many tiles of at least that size as fit the document's width, less
-  `space::EDGE` either side and `space::LG` between tiles; the tiles then grow to fill the
-  line, so there is no ragged right edge. A resize changes the number of columns, never a
-  tile's line height.
-- A tile: the preview well (`surface::well`, `radii.sm`), the file fitted inside it, never
-  enlarged past twice its own size, with `surface::image_outline` around a raster image; below
-  it the caption (`size::TILE_CAPTION`): the row's name (its label, else its key) in body text,
-  then a meta line, the file's kind and size ("PNG · 640 × 400 · 2.6 KB"), cut with an
-  ellipsis and whole in the tooltip.
+- **Shapes from the bytes already read.** A tile's first read, its first 64 KiB
+  (`FIRST_READ`), is made for every tile anyway: it judges the kind and holds most icons and
+  texts whole. Its header gives a picture's size: a PNG's IHDR (bytes 16 to 24) and a GIF's
+  screen descriptor (bytes 6 to 10) read directly, a JPEG's frame header and a WebP's through
+  the `image` decoder, past whatever metadata comes first; an SVG's from its root element's
+  `viewBox`, or its `width` and `height` (`tile::Facts::shape`). Measuring therefore adds no
+  request: the preview's read goes on from the bytes kept. E58 (the media type and an image's
+  size answered by `HEAD`) would make the shape known from the `HEAD` alone, before any byte.
+- **A shape for every kind** (`tile::shape`), so every row places as soon as its kind is
+  known: a picture its own height over width, held between 0.4 and 2.2
+  (`masonry::MIN_RATIO`, `MAX_RATIO`; the picture fits inside); a picture whose size is not in
+  its first bytes a square; a PDF a letter page upright (11 ÷ 8.5); text a square; other bytes
+  4 : 3 landscape; no file, an empty value, an external reference or a failed read a short
+  band, 1 : 2.
+- **Placed tiles never move.** A row is placed when its shape is known and every row before it
+  is placed. A shape that lands early waits, kept; one that lands late places itself and the
+  rows waiting behind it. On a branch, nothing is placed until the branch's diff is read, since
+  the rows it removed go first. Rows still waiting show as a quiet band at the end of each
+  column (`ds::size::TILE_BAND`, the faint highlight), "Reading…" in the shortest one where the
+  next tile goes; never as a placeholder that later resizes.
+- **Measured ahead.** The rows a screen below the last placed one, a screen's worth of square
+  tiles and a column more, have their first bytes read while the shortest column ends within a
+  screen of the view's bottom, so a scroll rarely meets the band. Their first bytes are kept
+  for their preview's read.
+- **Column width** follows the tile size: at least Small 128, Medium 176 (default), Large 240
+  pixels (`ds::size::TILE_SMALL`, `TILE`, `TILE_LARGE`), as many columns as fit the document
+  less `space::EDGE` either side and `space::LG` between, grown to fill it. A resize or a size
+  change (`=` and `−`, the toolbar's segmented control) flows the columns again from the shapes
+  kept, with no read; another file shown (`F`) places them again from the first.
+- **A tile**: the preview well (`surface::well`), its corner concentric within the tile's
+  (`radius::within(radii.md, ring + XS)`), the picture filling it edge to edge with the same
+  corner and a `surface::image_outline` hairline; a picture held to the bounds, or a small one
+  never drawn past twice its pixels, sits centered and square-cornered. Below it the caption
+  (`size::TILE_CAPTION`): the row's name (its label, else its key) in body text, then a meta
+  line, the file's kind, pixel size and size ("PNG · 640 × 400 · 2.6 KB"), cut with an ellipsis
+  and whole in the tooltip.
 - The cursor's tile has the focus ring (`surface::focus`, `size::ACCENT_LINE`); a picked tile
-  a check in its preview's corner and the picked fill (`surface::picked`) under its caption.
+  a check in its preview's corner and the picked fill (`surface::picked`).
 
 ### What a tile shows
 
 | The cell holds | Preview | Meta line |
 |---|---|---|
-| Not read yet | the empty well | the kind once its first bytes are read |
+| Not read yet | not placed: the band at the column's end | — |
+| Measured ahead, not shown yet | placed, at its shape; the empty well until shown | the kind and size |
 | PNG, JPEG, GIF, WebP up to 8 MiB and 40 megapixels | the image, scaled to at most 480 px on its long side off the main thread | "JPEG · 3024 × 4032 · 2.4 MB" |
 | SVG up to 8 MiB | the drawing, as GPUI draws an SVG | "SVG · 1.1 KB" |
 | PDF up to 8 MiB | its first page on macOS; elsewhere the document icon | "PDF · 766 B" |
@@ -184,9 +216,9 @@ Key context `Gallery`; every key is an action in `studio_gallery` unless named:
 
 | Key (macOS; Ctrl for ⌘ elsewhere) | Action | Does |
 |---|---|---|
-| ← → | `MoveLeft`, `MoveRight` | the tile before or after, across line ends |
-| ↑ ↓ | `MoveUp`, `MoveDown` | the tile a line up or down in the same column; ↓ on a short last line goes to the last tile |
-| Home, End | `MoveToFirst`, `MoveToLast` | the first tile; the last tile read (reading on) |
+| ↑ ↓ | `MoveUp`, `MoveDown` | the tile above or below in the cursor's column |
+| ← → | `MoveLeft`, `MoveRight` | the tile in the next column whose vertical middle is nearest the cursor tile's, the higher of two as near; nothing past the edge |
+| Home, End | `MoveToFirst`, `MoveToLast` | the first tile; the last tile placed |
 | Space | `studio::ToggleInspector` | the inspector shows the cursor's row, as the table's peek: every property, its relationships, its files |
 | ↵ | `OpenFile` | the file in its Blob tab (spec 004) at the tile's commit; a null or empty cell opens the tab's empty state with Choose File… |
 | ⌘↵ | `OpenRowPage` | the row's page |
@@ -209,38 +241,47 @@ nothing in step 1; ↵ opens a Blob tab, which writes as spec 004 says.
 ### Paging and virtualization
 
 - Rows are read as the table reads them (`builder::node_page`, keyset by the table's order,
-  `Paging` at the gallery's commit, the graph's page size), a page ahead of the last line
-  drawn. A gallery of picked rows reads them by id, a page at a time.
-- The grid is a `uniform_list` of lines, each a line of tiles; only the lines in view are laid
-  out. The count reads as the table's ("13 rows", "40 of 13,402 read").
+  `Paging` at the gallery's commit, the graph's page size), a page ahead of the rows wanted:
+  those placed and those measured ahead. A gallery of picked rows reads them by id, a page at a
+  time.
+- The columns are one scroll area whose content is as tall as the tallest column (and the band);
+  each frame lays out only the tiles that meet the view and half a screen either side, found by
+  a search in each column (`Masonry::meeting`), so a frame costs what it shows, not what is
+  placed. The count reads as the table's ("13 rows", "40 of 13,402 read").
 
 ### Reading the files
 
-- A tile's file is read once scrolling has paused for 120 ms, for the tiles on the lines drawn,
-  the first drawn first, at most four tiles at once (`GALLERY_READS_AT_ONCE`), which leaves the
-  connection's other four slots to pages, counts and the inspector.
+- Reads start once scrolling has paused for 120 ms: first the tiles shown, in row order, then
+  the rows measured ahead; at most four tiles at once (`gallery::READS_AT_ONCE`), which leaves
+  the connection's other four slots to pages, counts and the inspector. A shape landing that
+  places tiles asks for what the view wants next at once.
 - Each tile: its `HEAD` at the commit (shared with the table's cells and the peek); then its
   first 64 KiB (`FIRST_READ`), which judges its kind, gives an image's size and holds a text's
-  first lines; then, for an image, an SVG or a PDF up to 8 MiB whose header fits 40 megapixels,
-  the rest in the server's 4 MiB ranges. Nothing else is read for a tile.
+  first lines; then, for a tile shown, an image, an SVG or a PDF up to 8 MiB whose header fits
+  40 megapixels, the rest in the server's 4 MiB ranges. A row measured ahead stops after its
+  first read, its bytes kept for the rest; a file whole in its first read has its preview made
+  at once. Nothing else is read for a tile.
 - The bytes are decoded and scaled off the main thread to at most 480 px on the long side
   (`THUMB_EDGE`, twice the large tile), then dropped: a tile keeps only its preview, and a
   text's first lines.
-- A tile scrolled out of the lines drawn before its read ends has the read dropped (its request
-  stops) and is read again when it returns.
-- The previews held are capped at 64 MiB (`PREVIEWS_HELD`, about seventy at the cap's 480 px);
-  past it, those farthest from the lines drawn are freed (`ShownImage::release`) and read again
-  if they come back. The tiles on the lines drawn keep theirs even past the cap, so a screen
-  that alone holds more is never read again and again. Closing the tab or reading again frees
+- A read for a tile the view no longer wants (scrolled away) is dropped (its request stops)
+  and asked again when it is.
+- The previews and kept first bytes are capped at 64 MiB together (`PREVIEWS_HELD`, about
+  seventy previews at the cap's 480 px); past it, those farthest from the span shown are freed
+  (`ShownImage::release`), rows not placed first, and read again if they come back. The tiles
+  shown keep theirs even past the cap, so a screen that alone holds more is never read again
+  and again. Every shape is kept, at a few bytes a row. Closing the tab or reading again frees
   them all.
 - Reads go through a scope of their own (`ReadView::Gallery`, spec 030) while the gallery
   follows its branch, so the ledger names them (`GraphSession::blob_bytes_in` for ranges). A
   range is now counted as `blob_bytes`; before this plan the peek's and the Blob tab's ranges
   were counted as `blob_head`.
-- Cost of a screen. A 1440 × 900 window with the sidebar open shows six columns and four lines
-  of Medium tiles, 24 tiles. With every `HEAD` already read by the table: 24 first reads, and
-  for photos of about 3 MB one more each, about 48 requests and 72 MB. A server thumbnail (E55)
-  would make it 24 requests and well under a megabyte.
+- Cost of a screen. A 1440 × 900 window with the sidebar open shows about six columns of Medium
+  tiles, some 24 tiles of mixed shapes. With every `HEAD` already read by the table: 24 first
+  reads, and for photos of about 3 MB one more each, about 48 requests and 72 MB; the rows a
+  screen below cost one first read each (64 KiB), which their previews then go on from. The
+  masonry adds no request to the grid's. A server thumbnail (E55) would make it 24 requests
+  and well under a megabyte; E58 would let a row be placed from its `HEAD`.
 
 ### On a branch
 
@@ -268,17 +309,19 @@ marked (spec 033):
 | No row | `ds::empty_state(Images, "No rows")`; filtered: "No rows match" |
 | The first page failed | `ds::error_state("Could not read Note", reason)` with Retry (⌘R) |
 | The Blob property is gone after a schema change | "Note has no files now" and Open as Table |
-| A later page failed | a line after the last tile: the reason and Retry |
+| Rows waiting for their shapes or their page | the band under each column, "Reading…" in the shortest |
+| A later page failed | the shortest column's band says "Not read", the reason in its tooltip, and Retry |
 | Newer data | "Newer data · Refresh" in the toolbar, as the table's |
 
 ### Drawing
 
-The grid is a view of its own (`GalleryGrid`), made with the tab and drawn cached; the tab
+The columns are a view of their own (`GalleryGrid`), made with the tab and drawn cached; the tab
 answers `Item::caches_its_parts`. A tile's read changes its state at once but draws nothing:
 the grid is drawn 30 ms after the first landing not yet drawn (`LANDING_DELAY`, the command
 palette's), with every other landing meanwhile, so a screen of 24 tiles landing in a burst draws
 the grid once rather than 48 times (measured in the test: 48 draws for 40 tiles before). A key
-moves the cursor with one draw of the grid. Tests count the grid's draws (`docs/drawing.md`).
+moves the cursor with one draw of the grid, and a scroll draws it once a frame, laying out only
+the tiles near the view. Tests count the grid's draws (`docs/drawing.md`).
 Each tile carries an element id for its click and tooltip; a screen holds tens of tiles, not the
 table's hundreds of cells.
 
@@ -286,20 +329,23 @@ table's hundreds of cells.
 
 | Decision | Rejected alternatives | Why |
 |---|---|---|
-| A uniform grid of square tiles with captions | Justified rows; masonry | Placing a tile in either needs its aspect ratio, which only its first bytes give: a read per row before the grid can be laid out, and every tile on a line or below moving as reads land (constitution V). ↑ and ↓ have one answer only in a grid. PDFs, text, bytes and empty cells have no ratio. Justified rows are the better layout for a type of photos alone, once the engine says an image's size (E58) |
+| A masonry: columns of one width, tiles as tall as their files' shapes, placed in row order into the shortest column (since 2026-11-19) | A uniform grid of square tiles (built first, 2026-11-18); justified rows | Ragnor, 2026-11-19: "more Pinterest style". The grid was chosen because placing by shape seemed to need a read per row before layout and to move tiles as shapes landed. Neither holds: the shape is in the first 64 KiB that every tile reads anyway, so measuring adds no request, only reads it a screen early; and placing strictly in row order, each tile only once every row before it is placed, never moves a placed tile (constitution V; `a_placed_tile_keeps_its_place_when_later_shapes_arrive`). Kinds without a shape take one each, so nothing waits on them. Justified rows would make a late shape move the tiles beside it, or hold a whole line back for its slowest file |
+| Left and right go to the next column's tile whose middle is nearest | The next tile in row order; the tile at the same top | In columns of different heights a row's neighbour in order is anywhere on screen; the same top rarely exists. The nearest middle is where the eye goes |
+| Rows waiting show as a band at the columns' end | A placeholder tile at a guessed shape | A guess resizes when the shape lands, which moves everything under it |
 | A tab of its own, opened from the view strip | A toggle that swaps the table's grid for tiles | Constitution XIII: it has reads (every tile's file) and a selection of its own. The table's 19,600 lines stay untouched |
 | Its own pages, pinned to the table's commit | Drawing the table's loaded rows | A view never follows its source (spec 020, "Set"); pinned to the table's commit its first pages are answered from the session's memo, so the shared rows cost nothing |
 | Gallery listed only for types with a Blob | Listed and disabled everywhere | The schema fixes whether it applies, for the tab's life; a disabled Gallery on every table would say nothing useful |
 | Previews decoded and scaled by Studio, from the whole file up to 8 MiB | Reading only a prefix (an embedded JPEG thumbnail); no previews past a smaller cap | The API has no preview (E55); the peek's 8 MiB cap is one rule for one person's attention. A JPEG's own thumbnail is optional and often missing |
-| A first read of 64 KiB | The peek's 4 KiB | One request for most icons, diagrams and short texts, the image header always in it; 64 KiB × 24 tiles is 1.5 MB |
+| A first read of 64 KiB, also for rows measured ahead | The peek's 4 KiB; a smaller probe for the shape | One request for most icons, diagrams and short texts, and the image header nearly always in it: a camera JPEG's frame header follows its metadata, often tens of kilobytes. A smaller probe would need a second request for such a JPEG, and its bytes would be read again for the preview; the 64 KiB a row below costs are those its preview needs first |
 | Previews kept at 480 px, whatever the tile size | Decoding at the shown size | Changing the tile size draws what is held, with no read |
 | Bulk writes stay in the table | Delete and set from the gallery in step 1 | One dialog for each destructive action (constitution IV); the delete dialog is bound to the table (`DeleteRowModal` holds a `TypeTable`) |
 
 ## Open questions
 
-1. Should rows without a file be hidden? Without E56 a gallery of a large type where few rows
-   have a file pages through null tiles; hiding them client-side needs every row's `HEAD`
-   ahead of the view, which is a read per row.
+1. Should rows without a file be hidden? They are short bands now. Without E56 a gallery of a
+   large type where few rows have a file pages through them; leaving them out of the columns
+   is possible (their `HEAD` is read before they are placed anyway) but makes the set's count
+   and the gallery's disagree.
 2. Which properties should a caption show beyond the name? An enum such as `kind` or `outcome`
    as a tag would help the cookbooks' types; a Caption menu, or the table's first visible
    columns?
@@ -309,13 +355,14 @@ table's hundreds of cells.
 5. Should a gallery's picks carry back to the table it came from, so a bulk delete is one
    step? Spec 020 says each tab keeps its own selection.
 6. Edge types with Blob properties have no strip; would a gallery of edges help anyone?
+7. Should very tall pictures be cropped to the bound, as Pinterest crops them, rather than
+   boxed whole inside it, as built?
 
 ## Deferred
 
 - Step 2: before and after on a branch (`ShowTarget`), picks carried to the table for its bulk
   actions, Save files… for the picked tiles into a folder, and a caption property.
 - The UI tools (spec 032) do not offer the gallery to agents yet.
-- Justified rows for a type of images, once E58 gives an image's size.
 - Engine changes, [spec 012](../012-omnigraph-engine-changes/plan.md) and
   [docs/deferred-engine-changes.md](../../docs/deferred-engine-changes.md):
   - **E55** a server-made preview of a Blob cell (a small image of a picture, a PDF's first
@@ -325,7 +372,8 @@ table's hundreds of cells.
   - **E57** a validator that names a Blob's bytes, stable across commits that did not change
     them, so a preview read at one commit stands at the next.
   - **E58** a media type and, for an image, its pixel size kept with a Blob and answered by its
-    `HEAD`.
+    `HEAD`: a row's tile would be placed from its `HEAD`, with no first read for the rows below
+    the view, and a picture past 64 KiB of metadata would not fall back to a square.
   - **E59** diff and change-feed images that describe a Blob by size and digest instead of
     carrying it whole.
 

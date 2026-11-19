@@ -591,8 +591,9 @@ only at the commit it was read at, and read again when the gallery's pin moves.
 `Content-Type` (or a `media_type` field on a load) and `HEAD` answering it, with an image's
 pixel size. Today every value answers `application/octet-stream`. *Waits:* 035. *Today:*
 Studio judges a value by its first bytes (`blob::value_kind`) and reads an image's size from its
-header in the first 64 KiB; it lays tiles out in a uniform grid, since a justified layout would
-need every row's first bytes before placing a tile.
+header in the first 64 KiB. A gallery places its masonry from that read (spec 035), made a
+screen ahead of the view for the rows below; with E58 a row would be placed from its `HEAD`, and
+a picture whose header is past 64 KiB would not be placed as a square.
 
 **E59. Diff images that describe a Blob instead of carrying it.** `GET /diff`,
 `GET /branches/diff` and the change feed carry a changed Blob whole, as `base64:` text, in both

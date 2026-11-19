@@ -602,9 +602,44 @@ pub(crate) struct Blobs {
     /// Every read of a cell, in order: `HEAD Type/id/property`, or `GET Type/id/property
     /// from-to` for a range, `GET Type/id/property` whole.
     pub(crate) reads: Mutex<Vec<String>>,
+    /// Gates a cell's byte reads wait at, by cell (`Type/id/property`), until the test sends.
+    pub(crate) read_gates: Mutex<
+        std::collections::HashMap<
+            String,
+            futures::future::Shared<futures::channel::oneshot::Receiver<()>>,
+        >,
+    >,
 }
 
 impl Blobs {
+    /// Holds the byte reads of `cell` until the sender returned is used or dropped.
+    pub(crate) fn hold_reads(&self, cell: &str) -> futures::channel::oneshot::Sender<()> {
+        use futures::FutureExt as _;
+        let (send, wait) = futures::channel::oneshot::channel();
+        self.read_gates
+            .lock()
+            .unwrap()
+            .insert(cell.to_owned(), wait.shared());
+        send
+    }
+
+    /// The gate a byte read of the cell `query` names waits at, if one is set.
+    fn read_gate(
+        &self,
+        query: &str,
+    ) -> Option<futures::future::Shared<futures::channel::oneshot::Receiver<()>>> {
+        let param = |name: &str| {
+            query
+                .split('&')
+                .filter_map(|pair| pair.split_once('='))
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| decoded(value))
+                .unwrap_or_default()
+        };
+        let cell = format!("{}/{}/{}", param("type"), param("id"), param("property"));
+        self.read_gates.lock().unwrap().get(&cell).cloned()
+    }
+
     /// Sets a cell's value, as another writer would: it gets an ETag of its own, and while
     /// `versioned` so does every other cell of its type.
     pub(crate) fn set(&self, cell: &str, bytes: &[u8]) -> String {
@@ -893,6 +928,10 @@ fn serve_blobs(
                 let mut body = Vec::new();
                 request.into_body().read_to_end(&mut body).await.ok();
                 let write = !matches!(method.as_str(), "HEAD" | "GET");
+                let read_gate = (method == "GET").then(|| blobs.read_gate(&query)).flatten();
+                if let Some(gate) = read_gate {
+                    gate.await.ok();
+                }
                 let gate = write.then(|| blobs.hold.lock().unwrap().take()).flatten();
                 if let Some(gate) = gate {
                     gate.await.ok();

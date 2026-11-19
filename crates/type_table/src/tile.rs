@@ -1,6 +1,6 @@
-//! What a gallery tile shows of a file (spec 035): its kind and size from its first bytes, and
-//! a preview made off the main thread at most [`THUMB_EDGE`] pixels on its long side. Pure but
-//! for the decoded image, which the gallery holds and frees; no reads.
+//! What a gallery tile shows of a file (spec 035): its kind, size and shape from its first
+//! bytes, and a preview made off the main thread at most [`THUMB_EDGE`] pixels on its long side.
+//! Pure but for the decoded image, which the gallery holds and frees; no reads.
 
 use std::io::Cursor;
 
@@ -21,12 +21,30 @@ pub const MAX_PIXELS: u64 = 40_000_000;
 const TEXT_SHOWN: usize = 600;
 const TEXT_LINES: usize = 12;
 
+/// The shapes a tile takes, as height over width, where its file's first bytes say none
+/// (spec 035): each kind one shape, so the tile is placed as soon as its kind is known.
+pub mod shape {
+    /// A row without a file, an empty value, an external reference or a cell that could not be
+    /// read: a short band, so it takes little room among pictures.
+    pub const NO_FILE: f32 = 0.5;
+    /// A PDF: a letter page upright.
+    pub const DOCUMENT: f32 = 11. / 8.5;
+    /// Text: a square, room for its first lines.
+    pub const TEXT: f32 = 1.;
+    /// Other bytes: a landscape card for its icon.
+    pub const BYTES: f32 = 0.75;
+    /// An image or SVG whose size is not in its first bytes.
+    pub const PICTURE: f32 = 1.;
+}
+
 /// What a file's first bytes say of it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Facts {
     pub kind: ValueKind,
     /// An image's pixel size, from its header.
     pub pixels: Option<(u32, u32)>,
+    /// An SVG's size, from its root element's `viewBox`, or its `width` and `height`.
+    pub drawing: Option<(f32, f32)>,
 }
 
 impl Facts {
@@ -37,7 +55,31 @@ impl Facts {
             ValueKind::Image(format) => image_size(format, prefix),
             _ => None,
         };
-        Self { kind, pixels }
+        let drawing = match kind {
+            ValueKind::Svg => text_prefix(prefix).and_then(svg_size),
+            _ => None,
+        };
+        Self {
+            kind,
+            pixels,
+            drawing,
+        }
+    }
+
+    /// The tile's shape, height over width: an image's or a drawing's own, else its kind's
+    /// ([`shape`]).
+    pub fn shape(&self) -> f32 {
+        let own = match (self.pixels, self.drawing) {
+            (Some((w, h)), _) if w > 0 && h > 0 => Some(h as f32 / w as f32),
+            (_, Some((w, h))) if w > 0. && h > 0. => Some(h / w),
+            _ => None,
+        };
+        own.unwrap_or(match self.kind {
+            ValueKind::Image(_) | ValueKind::Svg => shape::PICTURE,
+            ValueKind::Pdf => shape::DOCUMENT,
+            ValueKind::Text => shape::TEXT,
+            ValueKind::Binary => shape::BYTES,
+        })
     }
 
     /// The kind in a word, as a tile's meta line starts.
@@ -61,8 +103,20 @@ pub fn kind_word(kind: ValueKind) -> &'static str {
     }
 }
 
-/// An image's pixel size from its header, when the bytes hold it.
+/// An image's pixel size from its header, when the bytes hold it. A PNG's is in its first chunk
+/// and a GIF's in its screen descriptor, read here from 24 and 10 bytes; a JPEG's and a WebP's
+/// are found by the decoder, past whatever metadata comes first.
 fn image_size(format: ImageFormat, bytes: &[u8]) -> Option<(u32, u32)> {
+    let be = |at: usize| Some(u32::from_be_bytes(bytes.get(at..at + 4)?.try_into().ok()?));
+    let le16 = |at: usize| Some(u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().ok()?));
+    match format {
+        // The signature, then IHDR's length and name, then its width and height.
+        ImageFormat::Png if bytes.get(12..16) == Some(b"IHDR") => {
+            return Some((be(16)?, be(20)?));
+        }
+        ImageFormat::Gif => return Some((u32::from(le16(6)?), u32::from(le16(8)?))),
+        _ => {}
+    }
     let format = match format {
         ImageFormat::Png => image::ImageFormat::Png,
         ImageFormat::Jpeg => image::ImageFormat::Jpeg,
@@ -73,6 +127,43 @@ fn image_size(format: ImageFormat, bytes: &[u8]) -> Option<(u32, u32)> {
     image::ImageReader::with_format(Cursor::new(bytes), format)
         .into_dimensions()
         .ok()
+}
+
+/// An SVG's size from its root element: its `viewBox`'s width and height, else its `width` and
+/// `height` in user units (a trailing `px` allowed; a percentage or other unit says nothing).
+fn svg_size(text: &str) -> Option<(f32, f32)> {
+    let start = text.find("<svg")?;
+    let tag = &text[start..];
+    let tag = &tag[..tag.find('>')?];
+    let attribute = |name: &str| -> Option<&str> {
+        let mut rest = tag;
+        loop {
+            let at = rest.find(name)?;
+            let before = rest[..at].chars().next_back();
+            let after = rest[at + name.len()..].trim_start();
+            rest = &rest[at + name.len()..];
+            if before.is_some_and(char::is_whitespace)
+                && let Some(value) = after.strip_prefix('=')
+            {
+                let value = value.trim_start();
+                let quote = value.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+                let value = &value[1..];
+                return Some(&value[..value.find(quote)?]);
+            }
+        }
+    };
+    if let Some(view_box) = attribute("viewBox") {
+        let numbers: Vec<f32> = view_box
+            .split(|c: char| c.is_whitespace() || c == ',')
+            .filter(|part| !part.is_empty())
+            .filter_map(|part| part.parse().ok())
+            .collect();
+        if let [_, _, w, h] = numbers[..] {
+            return Some((w, h));
+        }
+    }
+    let length = |value: &str| value.trim().trim_end_matches("px").parse::<f32>().ok();
+    Some((length(attribute("width")?)?, length(attribute("height")?)?))
 }
 
 /// What to read past the first bytes of a file of `size` bytes: `true` when the whole is read
@@ -285,6 +376,7 @@ mod tests {
         let facts = Facts {
             kind: ValueKind::Image(ImageFormat::Jpeg),
             pixels: Some((3024, 4032)),
+            drawing: None,
         };
         assert!(draws_whole(&facts, 2_400_000));
         assert!(!draws_whole(&facts, IMAGE_MAX + 1));
@@ -305,5 +397,44 @@ mod tests {
         assert!(!draws_whole(&text, 5));
         assert_eq!(meta_line(Some(&text), 5), "Text · 5 B");
         assert_eq!(meta_line(Some(&Facts::of(b"")), 0), "0 B");
+    }
+
+    /// A tile's shape is its picture's own, read from a header in the first bytes (a JPEG's
+    /// past its metadata too), or a drawing's from its root element; other kinds take theirs.
+    #[test]
+    fn a_tiles_shape_comes_from_the_first_bytes_or_its_kind() {
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut jpeg)
+            .encode_image(&image::RgbImage::from_pixel(
+                300,
+                450,
+                image::Rgb([9, 9, 9]),
+            ))
+            .unwrap();
+        // Metadata before the frame header, as a camera writes it.
+        let mut with_metadata = jpeg[..2].to_vec();
+        let comment = vec![b'x'; 20_000];
+        with_metadata.extend([0xff, 0xfe]);
+        with_metadata.extend(((comment.len() + 2) as u16).to_be_bytes());
+        with_metadata.extend(&comment);
+        with_metadata.extend(&jpeg[2..]);
+        // Its first bytes only, the frame header past 20 KB of metadata.
+        let facts = Facts::of(&with_metadata[..comment.len() + 1_000]);
+        assert_eq!(facts.pixels, Some((300, 450)));
+        assert_eq!(facts.shape(), 1.5);
+        let png = png(400, 100);
+        assert_eq!(Facts::of(&png[..32]).shape(), 0.25);
+
+        let drawing = br#"<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg" width="480" height="300" viewBox="0 0 960 600"><rect/></svg>"#;
+        assert_eq!(Facts::of(drawing).drawing, Some((960., 600.)));
+        assert_eq!(Facts::of(drawing).shape(), 0.625);
+        let sized = br#"<svg xmlns="http://www.w3.org/2000/svg" width="40px" height='80'></svg>"#;
+        assert_eq!(Facts::of(sized).shape(), 2.);
+        let no_size = br#"<svg xmlns="http://www.w3.org/2000/svg" width="100%"></svg>"#;
+        assert_eq!(Facts::of(no_size).shape(), shape::PICTURE);
+
+        assert_eq!(Facts::of(b"%PDF-1.4\n").shape(), shape::DOCUMENT);
+        assert_eq!(Facts::of(b"some text").shape(), shape::TEXT);
+        assert_eq!(Facts::of(&[0, 1, 2, 255]).shape(), shape::BYTES);
     }
 }
