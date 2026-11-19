@@ -49,6 +49,8 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
 - **Follow key** (2026-11-14): ⌥↵ follows a single-target relationship all the way
   (`studio_canvas::FollowRelationship`, below).
 - **Query results:** a query whose result has node or edge columns can open as a canvas.
+- **A branch's change** (spec 042): a review opens its change as a canvas, each changed
+  relationship a pill between its ends and every changed chip marked + ~ −.
 
 ## Decisions
 

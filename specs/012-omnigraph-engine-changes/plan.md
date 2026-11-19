@@ -216,7 +216,7 @@ mutating route is needed: edits, loads, merges, branch and commit control alread
 | E13 | `GET /graphs/{id}/indexes` | RFC 0046 index status | Observes only, never builds | 010 | Index facts from `explain` statistics |
 | E14 | `POST /graphs/{id}/schema/plan {schema_source}` → migration plan | `plan_schema` | Read-only; apply stays a deployment on clusters and direct-only on standalone graphs | later | Schema changes stay with `omnigraph cluster apply` |
 | E15 | `GET /whoami` → actor and permitted actions per graph and branch scope | Policy evaluation for the resolved token | Never lets a client assert identity | 002 | Landed as `GET /graphs/{id}/access` (#1073); until adopted, show every action, and a 403 is a denial and the draft stays |
-| E16 | `GET /graphs/{id}/nodes/{type}/{key}/neighborhood` → count per edge type and direction | Graph index degree (the source of filter-free `count { }` blocks) | Pinned to a snapshot; bounded by the schema's edge types | 005, 006 | One count query per edge type, concurrent, cached for the pinned commit |
+| E16 | `GET /graphs/{id}/nodes/{type}/{key}/neighborhood` → count per edge type and direction | Graph index degree (the source of filter-free `count { }` blocks) | Pinned to a snapshot; bounded by the schema's edge types | 005, 006, 042 | One count query per edge type, concurrent, cached for the pinned commit |
 
 ### Language tooling
 

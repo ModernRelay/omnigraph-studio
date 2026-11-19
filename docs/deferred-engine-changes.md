@@ -18,7 +18,7 @@ it goes through Omnigraph's own RFC process.
 | E12 | Query profile over HTTP | 007 | Plans only, through `explain query …` |
 | E13 | Index status | 010 | Index facts from `explain` statistics |
 | E14 | Read-only schema plan | later | Schema changes stay with `omnigraph cluster apply` |
-| E16 | Neighbourhood counts per node | 005, 006 | One count query per edge type, concurrent, cached per pinned commit |
+| E16 | Neighbourhood counts per node | 005, 006, 042 | One count query per edge type, concurrent, cached per pinned commit |
 | E17 | `omnigraph lsp` language server | 007 | `gq_language` calls `omnigraph-compiler` in-process |
 | E18 | Tree-sitter grammars and a Zed extension in the Omnigraph repository | E17 | Grammars in this repository under `grammars/` |
 | E19 | Publish `omnigraph-compiler` to crates.io again (stops at 0.8.0) | 001 | Git dependency on tag `v0.15.0` |

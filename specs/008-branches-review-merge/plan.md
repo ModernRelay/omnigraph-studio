@@ -70,6 +70,9 @@ place), X (designed on 0.13; the better routes are deferred).
 ### Review (`review` crate)
 
 - Opens as a tab "Review <branch> → <target>".
+- Its view strip is Review · Canvas · History: Canvas draws the change as a graph, with the
+  nodes its changed relationships reach, and a relationship line names what its other end is
+  beyond its name (spec 042).
 - Scope selector: since the fork (default), or one commit (its own changes, read from
   `GET /graphs/{g}/commits/{id}/changes`). The menu is a list that draws, and labels, only the
   commits in view, the keys moving through every row (since 2026-10-21). A scope change at the
