@@ -6,6 +6,7 @@
 mod branches;
 mod conflicts;
 mod edit;
+mod effect;
 mod scope_menu;
 mod summary;
 mod view;
@@ -17,12 +18,27 @@ use ui::IconName;
 use branches::BranchList;
 use view::open_review;
 
+pub use effect::EffectView;
+
 /// Registers this surface with every new workspace.
 pub fn init(cx: &mut App) {
     studio_workspace::register_item_kind(cx, "review", |data, workspace, window, cx| {
         let field = |name: &str| data.get(name).and_then(|value| value.as_str());
         if let (Some(branch), Some(target)) = (field("branch"), field("target")) {
             open_review(workspace, branch.to_owned(), target.to_owned(), window, cx);
+        }
+    });
+    studio_workspace::register_item_kind(cx, "effect", |data, workspace, window, cx| {
+        let field = |name: &str| data.get(name).and_then(|value| value.as_str());
+        if let (Some(branch), Some(target)) = (field("branch"), field("target")) {
+            effect::open_effect(
+                workspace,
+                branch.to_owned(),
+                target.to_owned(),
+                false,
+                window,
+                cx,
+            );
         }
     });
     cx.observe_new(|workspace: &mut Workspace, window, cx| {

@@ -202,7 +202,8 @@
     "bindings": {
       "ctrl-n": "studio_graph::NewQuery",
       "ctrl-shift-o": "studio_graph::OpenMap",
-      "ctrl-shift-r": "studio_graph::ReviewBranch"
+      "ctrl-shift-r": "studio_graph::ReviewBranch",
+      "ctrl-shift-e": "studio_effect::OpenEffect"
     }
   },
   {
@@ -366,7 +367,9 @@
       "ctrl-alt-z": "studio_table::RevertView",
       "f8": "studio_query::NextProblem",
       "shift-f8": "studio_query::PreviousProblem",
-      "ctrl-.": "studio_query::ApplyFix"
+      "ctrl-.": "studio_query::ApplyFix",
+      "ctrl-alt-e": "studio_effect::ToggleWatched",
+      "ctrl-alt-k": "studio_effect::ToggleCheck"
     }
   },
   {
@@ -380,6 +383,8 @@
       "f8": "studio_query::NextProblem",
       "shift-f8": "studio_query::PreviousProblem",
       "ctrl-.": "studio_query::ApplyFix",
+      "ctrl-alt-e": "studio_effect::ToggleWatched",
+      "ctrl-alt-k": "studio_effect::ToggleCheck",
       "f6": "studio_query::ToggleResultsFocus",
       "ctrl-alt-n": "studio_query::NextPage"
     }
@@ -433,6 +438,20 @@
       "ctrl-shift-enter": "studio_review::Merge",
       "ctrl-shift-m": "studio_review::Summarize",
       "ctrl-shift-v": "studio_review::SwitchLayout"
+    }
+  },
+  {
+    "context": "Effect",
+    "bindings": {
+      "j": "studio_effect::NextRead",
+      "down": "studio_effect::NextRead",
+      "k": "studio_effect::PreviousRead",
+      "up": "studio_effect::PreviousRead",
+      "space": "studio_effect::ToggleRead",
+      "ctrl-alt-r": "studio_effect::PickReads",
+      "ctrl-alt-m": "studio_effect::CheckMergeResult",
+      "ctrl-shift-enter": "studio_effect::PublishMergeResult",
+      "ctrl-alt-backspace": "studio_effect::DropMergeResult"
     }
   },
   {

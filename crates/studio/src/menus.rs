@@ -99,6 +99,7 @@ pub fn set(cx: &mut App) {
             MenuItem::separator(),
             MenuItem::action("Create Branch…", CreateBranch),
             MenuItem::action("Review Branch", ReviewBranch),
+            MenuItem::action("Branch Effect", studio_actions::effect::OpenEffect),
         ]),
         Menu::new("Help").items([
             MenuItem::action("Keyboard Shortcuts", ShowKeyBindings),

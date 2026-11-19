@@ -1078,6 +1078,27 @@ pub fn register(workspace: &mut Workspace) {
         let branch = session.read(cx).branch.clone();
         open_review(workspace, branch, TARGET.into(), window, cx);
     });
+    workspace.register_action(
+        |workspace, _: &studio_actions::effect::OpenEffect, window, cx| {
+            let Some(session) = workspace.session() else {
+                return;
+            };
+            let branch = session.read(cx).branch.clone();
+            crate::effect::open_effect(workspace, branch, TARGET.into(), false, window, cx);
+        },
+    );
+    workspace.register_action(
+        |workspace, action: &studio_actions::graph::OpenBranchEffect, window, cx| {
+            crate::effect::open_effect(
+                workspace,
+                action.branch.clone(),
+                TARGET.into(),
+                action.preview,
+                window,
+                cx,
+            );
+        },
+    );
     workspace.register_action(|workspace, action: &OpenBranch, window, cx| {
         if action.branch == TARGET {
             window.dispatch_action(

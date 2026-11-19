@@ -32,6 +32,7 @@ pub enum ViewKind {
     Source,
     Review,
     History,
+    Effect,
 }
 
 impl ViewKind {
@@ -45,6 +46,7 @@ impl ViewKind {
             Self::Source => "Source",
             Self::Review => "Review",
             Self::History => "History",
+            Self::Effect => "Effect",
         }
     }
 }
@@ -630,6 +632,17 @@ pub mod graph {
         pub preview: bool,
     }
 
+    /// Open what one branch does to the reads marked for the graph's reviews, against main
+    /// (spec 036).
+    #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = studio_graph)]
+    pub struct OpenBranchEffect {
+        pub branch: String,
+        /// Open as the pane's preview tab, which the next preview replaces.
+        #[serde(default)]
+        pub preview: bool,
+    }
+
     /// Open one commit's changes.
     #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
     #[action(namespace = studio_graph)]
@@ -932,6 +945,37 @@ pub mod review {
             ToggleChange,
             /// Switch the review between its feed of types and one record at a time.
             SwitchLayout,
+        ]
+    );
+}
+
+pub mod effect {
+    use gpui::actions;
+
+    actions!(
+        studio_effect,
+        [
+            /// Show what the current branch does to the reads marked for this graph's reviews,
+            /// run at main's head and at the branch's.
+            OpenEffect,
+            /// Choose the stored reads a review runs, watched or as checks.
+            PickReads,
+            /// Go to the next read.
+            NextRead,
+            /// Go to the previous read.
+            PreviousRead,
+            /// Unfold the selected read to the rows that came, went and changed, or fold it.
+            ToggleRead,
+            /// Merge the branch as an unpublished commit and run the reads on the result.
+            CheckMergeResult,
+            /// Publish the merge result held now onto main.
+            PublishMergeResult,
+            /// Drop the merge result held now; main stays as it is.
+            DropMergeResult,
+            /// Watch this stored read in the graph's reviews, or stop watching it.
+            ToggleWatched,
+            /// Use this stored read as a check in the graph's reviews: it should return no rows.
+            ToggleCheck,
         ]
     );
 }

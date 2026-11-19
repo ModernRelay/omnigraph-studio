@@ -609,6 +609,16 @@ pub struct ReviewView {
     /// The session saw the branch's head move while a fix or the merge was out; compared once
     /// they are back, since each moves the bound head itself.
     head_moved_while_writing: bool,
+    /// What the branch does to the reads marked for the graph's reviews (spec 036): its checks
+    /// hold Merge behind one more press while they have rows at the reviewed head.
+    effect: Entity<graph_store::effect::Effect>,
+    /// The reviewed head the checks were asked for, once: a head they cannot be read at is
+    /// not asked again until the review reads another.
+    checks_asked: Option<String>,
+    /// Merge was pressed once while a check had rows or was still read: the next press merges.
+    merge_past_checks: bool,
+    /// What the checks said of the merge when the review was last told.
+    drawn_hold: graph_store::effect::Hold,
     /// The session asks after the reviewed branch's head while the review is open.
     _head_watch: Option<HeadWatch>,
     _target_watch: HeadWatch,
@@ -673,16 +683,23 @@ impl Item for ReviewView {
         vec![
             ViewLink::current(ViewKind::Review),
             ViewLink::to(ViewKind::History),
+            ViewLink::to(ViewKind::Effect),
         ]
     }
 
     fn view_action(&self, kind: ViewKind, _cx: &App) -> Option<Box<dyn gpui::Action>> {
-        (kind == ViewKind::History).then(|| {
-            Box::new(studio_actions::graph::OpenBranchHistory {
-                branch: self.branch.clone(),
+        let branch = self.branch.clone();
+        match kind {
+            ViewKind::History => Some(Box::new(studio_actions::graph::OpenBranchHistory {
+                branch,
                 preview: true,
-            }) as Box<dyn gpui::Action>
-        })
+            })),
+            ViewKind::Effect => Some(Box::new(studio_actions::graph::OpenBranchEffect {
+                branch,
+                preview: true,
+            })),
+            _ => None,
+        }
     }
 
     fn dedupe_key(&self, _cx: &App) -> Option<SharedString> {
@@ -761,7 +778,26 @@ impl ReviewView {
             session.read_access(AccessScope::branch_into(&branch, &target), cx)
         });
         let target_watch = session.update(cx, |session, cx| session.watch_head(&target, cx));
+        let effect = session.update(cx, |session, cx| session.effect(&branch, &target, cx));
+        // The review draws only what the checks say of its merge, so it is drawn again only
+        // when that changes, not at every read of the Effect.
+        let effect_subscription = cx.observe(&effect, |this: &mut Self, _, cx| {
+            let hold = this.check_hold(cx);
+            if hold == this.drawn_hold {
+                return;
+            }
+            // A press past the checks holds only while they still hold.
+            if this.merge_past_checks && matches!(hold, graph_store::effect::Hold::Clear) {
+                this.merge_past_checks = false;
+            }
+            this.drawn_hold = hold;
+            cx.notify();
+        });
         let mut view = Self {
+            effect,
+            checks_asked: None,
+            merge_past_checks: false,
+            drawn_hold: graph_store::effect::Hold::Unread,
             session,
             branch,
             target,
@@ -828,6 +864,7 @@ impl ReviewView {
             _subscriptions: vec![
                 subscription,
                 search_subscription,
+                effect_subscription,
                 // The inspector shows the selected change's node (spec 020).
                 cx.observe_self(|this, cx| this.report_selection(cx)),
             ],
@@ -2416,6 +2453,96 @@ impl ReviewView {
         })
     }
 
+    /// What the graph's checks say of merging the reviewed head (spec 036).
+    fn check_hold(&self, cx: &App) -> graph_store::effect::Hold {
+        self.effect.read(cx).hold(self.bound_head.as_deref())
+    }
+
+    /// Asks the Effect for the checks at the reviewed head, once a head: a review on screen
+    /// with the whole branch read.
+    fn ask_checks(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.load, LoadState::Ready) || self.scope.is_some() {
+            return;
+        }
+        let Some(head) = self.bound_head.clone() else {
+            return;
+        };
+        if self.checks_asked.as_deref() == Some(head.as_str()) {
+            return;
+        }
+        self.checks_asked = Some(head.clone());
+        self.merge_past_checks = false;
+        self.effect.update(cx, |effect, cx| {
+            effect.want(graph_store::effect::Want::Checks, Some(&head), cx)
+        });
+    }
+
+    /// The merge strip's line for the checks, and whether the next press merges past them.
+    fn checks_line(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use graph_store::effect::Hold;
+        let (text, color) = match self.check_hold(cx) {
+            Hold::Clear | Hold::Unread => return None,
+            Hold::Reading(n) if self.merge_past_checks => (
+                format!(
+                    "{} still running. Merge again to merge without waiting.",
+                    studio_ui::plural(n, "check is", "checks are")
+                ),
+                Color::Warning,
+            ),
+            Hold::Reading(n) => (
+                format!("{} running…", studio_ui::plural(n, "check", "checks")),
+                Color::Muted,
+            ),
+            Hold::Rows(names) if self.merge_past_checks => (
+                format!(
+                    "{} rows on {}: {}. Merge again to merge anyway.",
+                    studio_ui::plural(names.len(), "check has", "checks have"),
+                    self.branch,
+                    names.join(", ")
+                ),
+                Color::Warning,
+            ),
+            Hold::Rows(names) => (
+                format!(
+                    "{} rows on {}: {}",
+                    studio_ui::plural(names.len(), "check has", "checks have"),
+                    self.branch,
+                    names.join(", ")
+                ),
+                Color::Warning,
+            ),
+        };
+        let branch = self.branch.clone();
+        Some(
+            h_flex()
+                .gap(px(space::CONTROLS))
+                .items_center()
+                .min_w_0()
+                .child(
+                    h_flex()
+                        .gap(px(space::INLINE))
+                        .items_center()
+                        .min_w_0()
+                        .child(studio_ui::ds::icon::meta(IconName::Warning).color(color))
+                        .child(studio_ui::ds::text::body(text).color(color).truncate()),
+                )
+                .child(
+                    studio_ui::ds::button("review-show-effect", "Show effect")
+                        .style(ButtonStyle::Outlined)
+                        .on_click(move |_, window, cx| {
+                            window.dispatch_action(
+                                Box::new(studio_actions::graph::OpenBranchEffect {
+                                    branch: branch.clone(),
+                                    preview: false,
+                                }),
+                                cx,
+                            )
+                        }),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// Whether the merge deletes the branch: as the checkbox says, never `main`, and not when
     /// the credential may not delete it.
     fn delete_after_merge(&self, cx: &App) -> bool {
@@ -2445,6 +2572,17 @@ impl ReviewView {
         if !self.mergeable(cx) || self.merge_refusal(cx).is_some() {
             return;
         }
+        // A check with rows, or still read, holds the merge behind one more press (spec 036).
+        let held = !matches!(
+            self.check_hold(cx),
+            graph_store::effect::Hold::Clear | graph_store::effect::Hold::Unread
+        );
+        if held && !self.merge_past_checks {
+            self.merge_past_checks = true;
+            cx.notify();
+            return;
+        }
+        self.merge_past_checks = false;
         self.merge = MergeState::Checking;
         self.show_conflicts = false;
         cx.notify();
@@ -2962,50 +3100,71 @@ impl ReviewView {
             .on_click(cx.listener(|this, _, _, cx| this.toggle_conflicts(cx)))
         });
         let delete_refused = self.delete_refusal(cx);
-        Some(
+        let checks = self.checks_line(cx);
+        let strip = h_flex()
+            .flex_none()
+            .px(px(space::EDGE))
+            .py(px(space::LG))
+            .gap(px(space::CONTROLS))
+            .items_center()
+            .border_t_1()
+            .border_color(studio_ui::ds::surface::rule(cx));
+        // The checks' line is a row of its own over the merge strip (spec 036).
+        let checks = checks.map(|checks| {
             h_flex()
                 .flex_none()
                 .px(px(space::EDGE))
-                .py(px(space::LG))
-                .gap(px(space::CONTROLS))
-                .items_center()
+                .pt(px(space::LG))
                 .border_t_1()
                 .border_color(studio_ui::ds::surface::rule(cx))
-                .child(
-                    h_flex()
-                        .flex_1()
-                        .min_w_0()
-                        .gap(px(space::INLINE))
-                        .items_center()
-                        .children(icon)
-                        .when(!status.is_empty(), |row| {
-                            row.child(div().min_w_0().child(studio_ui::ds::text::body(status)))
-                        }),
-                )
-                .children(show_conflicts)
-                .when(self.branch != "main", |row| {
-                    // A branch the credential may not delete stays, unchecked, saying why.
-                    let deletable = mergeable && delete_refused.is_none();
-                    row.child(
-                        studio_ui::ds::checkbox(
-                            "delete-after-merge",
-                            self.delete_branch && delete_refused.is_none(),
-                            "Delete the branch after merging",
-                            !deletable,
-                            cx,
-                        )
-                        .when_some(delete_refused, |checkbox, reason| {
-                            checkbox.tip(studio_ui::ds::tooltip(reason))
-                        })
-                        .when(deletable, |checkbox| {
-                            checkbox.on_click(cx.listener(|this, _, _, cx| {
-                                this.delete_branch = !this.delete_branch;
-                                cx.notify();
-                            }))
-                        }),
+                .child(checks)
+        });
+        let strip = if checks.is_some() {
+            strip.border_t_0()
+        } else {
+            strip
+        };
+        let strip = strip
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap(px(space::INLINE))
+                    .items_center()
+                    .children(icon)
+                    .when(!status.is_empty(), |row| {
+                        row.child(div().min_w_0().child(studio_ui::ds::text::body(status)))
+                    }),
+            )
+            .children(show_conflicts)
+            .when(self.branch != "main", |row| {
+                // A branch the credential may not delete stays, unchecked, saying why.
+                let deletable = mergeable && delete_refused.is_none();
+                row.child(
+                    studio_ui::ds::checkbox(
+                        "delete-after-merge",
+                        self.delete_branch && delete_refused.is_none(),
+                        "Delete the branch after merging",
+                        !deletable,
+                        cx,
                     )
-                })
-                .child(merge_button)
+                    .when_some(delete_refused, |checkbox, reason| {
+                        checkbox.tip(studio_ui::ds::tooltip(reason))
+                    })
+                    .when(deletable, |checkbox| {
+                        checkbox.on_click(cx.listener(|this, _, _, cx| {
+                            this.delete_branch = !this.delete_branch;
+                            cx.notify();
+                        }))
+                    }),
+                )
+            })
+            .child(merge_button);
+        Some(
+            v_flex()
+                .flex_none()
+                .children(checks)
+                .child(strip)
                 .into_any_element(),
         )
     }
@@ -4900,6 +5059,14 @@ impl Render for ReviewView {
         if std::mem::take(&mut self.read_owed) {
             cx.defer_in(window, |this, _, cx| this.reload(cx));
         }
+        // Drawn with the whole branch read: the checks are read at its head (spec 036).
+        if matches!(self.load, LoadState::Ready)
+            && self.scope.is_none()
+            && self.bound_head.is_some()
+            && self.checks_asked != self.bound_head
+        {
+            cx.defer_in(window, |this, _, cx| this.ask_checks(cx));
+        }
         let header = self.render_header(cx);
         let body = match (&self.load, &self.data) {
             (LoadState::Ready, Some(_)) if self.show_conflicts => self.render_conflicts(cx),
@@ -5857,6 +6024,79 @@ pub(crate) mod tests {
                 }
                 _ => panic!("not merged"),
             });
+        }
+    }
+
+    /// A stored read marked as a check that has rows at the reviewed head holds Merge behind
+    /// one more press, and says which check (spec 036): the first press sends nothing, the
+    /// second merges. A check with no rows holds nothing.
+    #[gpui::test]
+    async fn a_check_with_rows_holds_merge_behind_one_more_press(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+            studio_settings::keep_changes_in_memory(cx);
+            editor::init(cx);
+        });
+        for rows_on_branch in [1, 0] {
+            let catalog = json!({ "queries": [{ "name": "unsourced", "tool_name": "unsourced", "mutation": false, "params": [] }] });
+            let over = move |path: &str, _: &str, sent: &str| {
+                if path.ends_with("/queries") {
+                    return Some((200, catalog.clone()));
+                }
+                path.ends_with("/queries/unsourced").then(|| {
+                    // At the branch head, f2, the check finds rows; at main's, none.
+                    let n = if sent.contains("\"f2\"") { rows_on_branch } else { 0 };
+                    let rows: Vec<Value> = (0..n).map(|i| json!({ "s.slug": format!("s{i}") })).collect();
+                    (
+                        200,
+                        json!({ "query_name": "unsourced", "target": { "snapshot": "x" }, "row_count": n, "columns": ["s.slug"], "rows": rows }),
+                    )
+                })
+            };
+            let (session, asked) =
+                review_server_with(None, false, None, "f2", |_| (500, json!({})), over, cx);
+            let graph = session.read_with(cx, |session, _| session.overrides_key());
+            cx.update(|cx| {
+                studio_settings::update(cx, |settings| {
+                    settings.set_effect_mark(
+                        &graph,
+                        "unsourced",
+                        Some(studio_settings::EffectMark::Check),
+                    )
+                })
+            });
+            let (view, cx) = cx.add_window_view(|window, cx| {
+                ReviewView::new(session, "feature".into(), "main".into(), window, cx)
+            });
+            cx.run_until_parked();
+            let merges = |asked: &std::sync::Arc<std::sync::Mutex<Vec<String>>>| {
+                asked
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|line| line.contains("/branches/merge?") && !line.contains(DRY_RUN))
+                    .count()
+            };
+            let hold = view.read_with(cx, |view, cx| view.check_hold(cx));
+            if rows_on_branch == 0 {
+                assert_eq!(hold, graph_store::effect::Hold::Clear);
+                view.update(cx, |view, cx| view.merge(cx));
+                cx.run_until_parked();
+                assert_eq!(merges(&asked), 1, "a clean check holds nothing");
+                continue;
+            }
+            assert_eq!(
+                hold,
+                graph_store::effect::Hold::Rows(vec!["unsourced".into()])
+            );
+            view.update(cx, |view, cx| view.merge(cx));
+            cx.run_until_parked();
+            assert_eq!(merges(&asked), 0, "the first press merges nothing");
+            assert!(view.read_with(cx, |view, _| view.merge_past_checks));
+            view.update(cx, |view, cx| view.merge(cx));
+            cx.run_until_parked();
+            assert_eq!(merges(&asked), 1, "the second press merges");
         }
     }
 

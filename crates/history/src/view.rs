@@ -434,16 +434,27 @@ impl Item for HistoryView {
                 ViewLink::to(ViewKind::Review)
             },
             ViewLink::current(ViewKind::History),
+            if self.branch == "main" {
+                ViewLink::disabled_because(ViewKind::Effect, "main is what branches merge into")
+            } else {
+                ViewLink::to(ViewKind::Effect)
+            },
         ]
     }
 
     fn view_action(&self, kind: ViewKind, _cx: &App) -> Option<Box<dyn gpui::Action>> {
-        (kind == ViewKind::Review).then(|| {
-            Box::new(studio_actions::graph::OpenBranch {
-                branch: self.branch.clone(),
+        let branch = self.branch.clone();
+        match kind {
+            ViewKind::Review => Some(Box::new(studio_actions::graph::OpenBranch {
+                branch,
                 preview: true,
-            }) as Box<dyn gpui::Action>
-        })
+            })),
+            ViewKind::Effect => Some(Box::new(studio_actions::graph::OpenBranchEffect {
+                branch,
+                preview: true,
+            })),
+            _ => None,
+        }
     }
 
     fn tab_icon(&self, _cx: &App) -> Option<IconName> {
