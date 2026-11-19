@@ -240,4 +240,10 @@ to <where it lands>", and its row has no hover tooltip, which covered the menu.
     after the branch.
   - An edit sent after a proposal was made but before its first edit landed started a second
     proposal; such an edit joins the one opening (`opening_proposal`), and its change counts.
-    Guarded by `edits_sent_together_go_to_one_proposal`.
+    Guarded by `edits_sent_together_go_to_one_proposal`. An edit that joins it bound to the
+    commit it was read at on `main` (a list, a relationship replaced) is refused once the first
+    edit has moved the proposal (412), and its draft stays to be saved again there: the binding
+    is what keeps it from writing over a value that changed. Property edits are bound by value
+    and join without it.
+  - A text editor opened from a page on its own branch followed the window when the window was
+    on that branch too; it keeps the page's branch.

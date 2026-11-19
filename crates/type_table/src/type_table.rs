@@ -604,11 +604,9 @@ fn open_text_editor(
     let Some(session) = workspace.session().cloned() else {
         return;
     };
-    // An editor asked for on the window's own branch follows the window, as any one does.
-    let on_branch = action
-        .on_branch
-        .clone()
-        .filter(|branch| *branch != session.read(cx).branch);
+    // Opened from a view on a branch of its own, it stays on that branch whatever the window
+    // does, even when the window is on it now.
+    let on_branch = action.on_branch.clone();
     let key = match &on_branch {
         Some(branch) => format!(
             "{}~{branch}",
