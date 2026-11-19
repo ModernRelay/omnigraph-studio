@@ -80,7 +80,7 @@ the interaction and asserts the count:
 | `command_palette` `answers_land_in_one_draw_whatever_the_types` | Twelve node types' answers land in one draw (`LANDING_DELAY`), not one a type; moving through the rows draws the palette once a key |
 | `review` `typing_in_the_search_leaves_the_changes_as_they_were` | The review's list of changes is a cached view of its own (`ReviewRows`): keys in its search draw it no times, the search landing once |
 | `history` `moving_through_a_commits_changes_draws_the_list_once_a_key` | A commit's list of changes is a cached view of its own (`CommitRows`): J and K draw it once a key |
-| `type_table` `a_key_draws_the_grid_once_and_previews_land_together` | A gallery's tiles are a cached view of their own (`GalleryGrid`, spec 035): an arrow key draws them once, and the previews of a screen landing together draw them once (`gallery::LANDING_DELAY`), not once a tile |
+| `type_table` `a_key_draws_the_grid_once_and_previews_land_together` | A gallery's columns are a cached view of their own (`GalleryGrid`, spec 035), laying out only the tiles near the view: an arrow key draws them once, and the previews of a screen landing together draw them once (`gallery::LANDING_DELAY`), not once a tile |
 | `studio_workspace` `a_tab_that_caches_its_parts_keeps_them_while_a_field_changes` | A tab that caches its parts keeps them while a field changes; a cached tab draws them again, which is the GPUI behavior the opt-out exists for |
 
 Draw counts are exact, so they run in CI. Times are not: the machine's load moves them several

@@ -369,7 +369,7 @@ async fn the_tiles_shown_are_drawn_and_the_rows_below_measured(cx: &mut TestAppC
     };
     let first = |row: usize| {
         let cell = format!("GET Note/n{row:03}/attachment 0-65535");
-        reads.iter().any(|read| *read == cell)
+        reads.contains(&cell)
     };
     for &row in &shown {
         assert!(first(row) && rest(row), "shown row {row} drawn: {reads:?}");

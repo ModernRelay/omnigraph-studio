@@ -918,9 +918,9 @@ impl TypeGallery {
         }
     }
 
-    /// Reads what the view wants, the tiles shown first; reads out for tiles it no longer
-    /// wants are dropped, which stops their requests, and are asked again when they are. A
-    /// read out for a tile's shape that is now shown finishes, and its preview is asked after.
+    /// Reads what the view wants, the tiles shown first; a preview's read out for a tile no
+    /// longer shown is dropped, which stops its request, and asked again when it is. A read out
+    /// for a tile's shape finishes, and its preview is asked after when it is shown.
     pub(crate) fn read_tiles(&mut self, cx: &mut Context<Self>) {
         let wanted: Vec<(TileKey, Want)> = self
             .wanted()
@@ -928,11 +928,13 @@ impl TypeGallery {
             .filter(|(key, want)| self.needs(key, *want))
             .collect();
         let wants: HashSet<&TileKey> = wanted.iter().map(|(key, _)| key).collect();
+        // A shape's read out is let finish: one bounded read, wanted again as soon as the
+        // columns reach its row, and dropped it would be sent twice.
         let gone: Vec<TileKey> = self
             .tile_tasks
-            .keys()
-            .filter(|key| !wants.contains(key))
-            .cloned()
+            .iter()
+            .filter(|(key, (want, _))| *want == Want::Preview && !wants.contains(key))
+            .map(|(key, _)| key.clone())
             .collect();
         for key in gone {
             self.tile_tasks.remove(&key);
