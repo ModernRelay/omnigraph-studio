@@ -23,8 +23,8 @@ use graph_store::{
     AccessAction, AccessScope, BranchStart, GraphSession, ServerFeature, SessionEvent,
 };
 use studio_actions::graph::{
-    CompareBranches, CreateBranch, CreateBranchAt, DeleteBranch, OpenBranch, OpenBranchHistory,
-    OpenCompare, RefreshBranches, ReviewBranch, ToggleBranchGrouping,
+    CompareBranches, CreateBranch, CreateBranchAt, DeleteBranch, FoldBranchGroups, OpenBranch,
+    OpenBranchHistory, OpenCompare, RefreshBranches, ReviewBranch, ToggleBranchGrouping,
 };
 use studio_settings::{BranchGrouping, StudioSettings};
 use studio_ui::ds::Tipped;
@@ -357,8 +357,16 @@ impl BranchList {
                         this.lane_moved(branch);
                         cx.notify();
                     }
-                    // A server that details its branches now, or no longer, can group by author.
-                    SessionEvent::BranchChanged | SessionEvent::CredentialChanged => {
+                    SessionEvent::BranchChanged => this.relayout(cx),
+                    // What the old credential read of each branch is not shown under the new
+                    // one: the drawn rows read their heads and lanes again.
+                    SessionEvent::CredentialChanged => {
+                        this.details.clear();
+                        this.asked.clear();
+                        this.reads.clear();
+                        this.lanes.clear();
+                        this.lanes_asked.clear();
+                        this.lane_reads.clear();
                         this.relayout(cx)
                     }
                     _ => {}
@@ -450,20 +458,44 @@ impl BranchList {
         let branches = session.branches.loaded()?;
         let grouping = self.grouping_shown(cx);
         let details = &self.details;
+        // Who wrote the newest commit: the detailed list's, unless a head read since (a commit
+        // seen on the branch) is newer.
         let layout = Rc::new(lay_out(
             branches,
             grouping,
             |branch| {
-                session
+                let listed = session
                     .branch_detail(branch)
-                    .map(|detail| detail.head.actor_id.clone())
-                    .or_else(|| details.get(branch).map(|detail| detail.actor.clone()))
-                    .flatten()
+                    .map(|detail| (detail.head.created_at, detail.head.actor_id.clone()));
+                let read = details
+                    .get(branch)
+                    .map(|detail| (detail.created_at, detail.actor.clone()));
+                match (listed, read) {
+                    (Some(listed), Some(read)) if read.0 > listed.0 => read.1,
+                    (Some(listed), _) => listed.1,
+                    (None, read) => read.and_then(|read| read.1),
+                }
             },
             &self.folded,
         ));
         self.layout = Some(layout.clone());
         Some(layout)
+    }
+
+    /// Folds every group to its header, or, when every one is folded, shows them all: the
+    /// keyboard's way to fold (`FoldBranchGroups`).
+    pub(crate) fn fold_all(&mut self, cx: &mut Context<Self>) {
+        let Some(layout) = self.layout(cx) else {
+            return;
+        };
+        if layout.groups.iter().any(|group| group.open) {
+            self.folded
+                .extend(layout.groups.iter().map(|group| group.key.clone()));
+        } else {
+            self.folded.clear();
+        }
+        self.layout = None;
+        cx.notify();
     }
 
     fn toggle_group(&mut self, key: String, cx: &mut Context<Self>) {
@@ -950,10 +982,15 @@ impl BranchList {
             }))
             .muted(true)
             .end(studio_ui::ds::sidebar_count(group.branches.to_string()))
-            .tip(studio_ui::ds::tooltip(format!(
-                "{tip}. Click to {} them.",
-                if group.open { "fold" } else { "show" }
-            )))
+            .tip_fn({
+                let tip = format!(
+                    "{tip}. Click to {} them; this key folds or shows every group.",
+                    if group.open { "fold" } else { "show" }
+                );
+                move |_, cx| {
+                    studio_ui::ds::tooltip_for_action_view(tip.clone(), &FoldBranchGroups, cx)
+                }
+            })
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_group(key.clone(), cx)));
         // As wide as the branch rows, so its count lines up with theirs.
         div().w_full().child(row).into_any_element()
@@ -2804,5 +2841,43 @@ mod tests {
         });
         assert_eq!(labels(cx), ["act-notes-bot", "act-slack-bot"]);
         assert!(requests(&asked, "detailed=true") >= 1, "{asked:?}");
+    }
+
+    /// The keyboard folds every group, then shows them all again (`FoldBranchGroups`).
+    #[gpui::test]
+    async fn every_group_folds_and_shows_from_the_keyboard(cx: &mut gpui::TestAppContext) {
+        cx.update(studio_theme::init_test);
+        let (session, _) = fake_server(
+            |path, _, _| {
+                if path.ends_with("/branches") {
+                    (
+                        200,
+                        json!({ "branches": ["main", "agent/a", "agent/b", "intake/x", "intake/y"] }),
+                    )
+                } else {
+                    (404, json!({ "error": "not here" }))
+                }
+            },
+            cx,
+        );
+        cx.run_until_parked();
+        let (list, cx) = cx.add_window_view(|window, cx| {
+            BranchList::new(WeakEntity::new_invalid(), Some(session), window, cx)
+        });
+        cx.run_until_parked();
+        let open = |cx: &mut gpui::VisualTestContext| {
+            list.update(cx, |list, cx| {
+                let layout = list.layout(cx).unwrap();
+                (
+                    layout.groups.iter().filter(|g| g.open).count(),
+                    layout.rows.len(),
+                )
+            })
+        };
+        assert_eq!(open(cx), (2, 1 + 2 + 4 + 1));
+        list.update(cx, |list, cx| list.fold_all(cx));
+        assert_eq!(open(cx), (0, 1 + 2 + 1), "headers only");
+        list.update(cx, |list, cx| list.fold_all(cx));
+        assert_eq!(open(cx), (2, 8));
     }
 }

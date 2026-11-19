@@ -1208,8 +1208,9 @@ impl GraphSession {
 
     /// Forgets every answer kept, and the reads under way with them, which then keep nothing
     /// when they land: answers read at a commit, Blob cells, relationship counts, branches'
-    /// newest commits and commits' changes. Each was read with a credential that may see more
-    /// than the one sent now, and a kept answer is shown again without asking the server.
+    /// newest commits and details, and commits' changes. Each was read with a credential that
+    /// may see more than the one sent now, and a kept answer is shown again without asking the
+    /// server.
     ///
     /// What it keeps, and why: the schema, which the server answers alike to every credential
     /// that may read the graph and every read is made under (Refresh, or another writer's
@@ -1226,6 +1227,10 @@ impl GraphSession {
         self.seeded_commits.clear();
         self.degree_commits.clear();
         self.head_commits.clear();
+        // Branches' details name heads and their writers, which the new credential may not read.
+        self.branch_details.clear();
+        self.details_answered = false;
+        self.details_read = None;
         self.commit_change_pages.clear();
         self.whole_commit_pages.clear();
     }
@@ -7340,6 +7345,13 @@ mod tests {
                 ],
                 "{version}: alone"
             );
+            // A new credential forgets what the old one read of the branches' details (spec
+            // 043: who wrote each branch groups the Branches panel).
+            session.update(cx, |session, _| session.forget_reads());
+            session.read_with(cx, |session, _| {
+                assert!(session.branch_detail("feature").is_none(), "{version}");
+                assert!(!session.details_answered);
+            });
         }
     }
 

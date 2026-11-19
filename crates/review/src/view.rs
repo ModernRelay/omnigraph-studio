@@ -825,16 +825,10 @@ impl ReviewView {
                     this.compare_head(cx)
                 }
                 // A compared branch that moves offers Refresh, whichever side it is.
-                SessionEvent::HeadMoved { branch, head }
+                SessionEvent::HeadMoved { branch, .. }
                     if this.compare.is_some() && *branch == this.target =>
                 {
-                    let shown = this.data.as_ref().and_then(|data| data.fork.as_deref());
-                    if !this.newer
-                        && matches!(this.load, LoadState::Ready)
-                        && shown.is_some_and(|shown| shown != head)
-                    {
-                        this.mark_newer(cx);
-                    }
+                    this.compare_target_head(cx)
                 }
                 // The dry run merged into the target as it was. It is read again when the review
                 // is next drawn: a review behind another tab asks the server nothing meanwhile.
@@ -1232,7 +1226,11 @@ impl ReviewView {
         let branch = self.branch.clone();
         let target = self.target.clone();
         let scope = self.scope.clone();
-        let compare = self.compare;
+        // Read through the merge base only while both sides are listed branches now: it takes
+        // branches only, and a compared branch may have been deleted since.
+        let compare = self
+            .compare
+            .map(|_| CompareSides::of(self.session.read(cx), &self.target, &self.branch));
         self._load_task = Some(cx.spawn(async move |this, cx| {
             let result = match compare {
                 Some(sides) => read_compare(session, target, branch, sides, this.clone(), cx).await,
@@ -1315,6 +1313,7 @@ impl ReviewView {
                 // offered as newer: the cards show the head read. Compared before the dry run,
                 // which is not read for a head the cards no longer show.
                 self.compare_head(cx);
+                self.compare_target_head(cx);
                 // Read now, or once the fix or merge out is back.
                 if changed {
                     self.preview_moved(cx);
@@ -2797,9 +2796,15 @@ impl ReviewView {
     fn compare_sides_listed(&mut self, cx: &mut Context<Self>) {
         let Some(held) = self.compare else { return };
         let listed = CompareSides::of(self.session.read(cx), &self.target, &self.branch);
+        // A side listed is a branch, whatever it was taken for (a branch made after the list
+        // the comparison was opened with); a branch no longer listed stays one, deleted.
+        let known = |held: Option<bool>, listed: Option<bool>| match (held, listed) {
+            (_, Some(true)) | (Some(true), _) => Some(true),
+            (held, listed) => listed.or(held),
+        };
         let sides = CompareSides {
-            from_branch: held.from_branch.or(listed.from_branch),
-            to_branch: held.to_branch.or(listed.to_branch),
+            from_branch: known(held.from_branch, listed.from_branch),
+            to_branch: known(held.to_branch, listed.to_branch),
         };
         if sides.to_branch == Some(true) && self._head_watch.is_none() {
             let branch = self.branch.clone();
@@ -2826,10 +2831,25 @@ impl ReviewView {
         cx.notify();
     }
 
+    /// Offers Refresh when the side a comparison is read from has moved past the head its
+    /// cards show; a read under way is compared once it lands.
+    fn compare_target_head(&mut self, cx: &mut Context<Self>) {
+        if self.compare.is_none() || self.newer || !matches!(self.load, LoadState::Ready) {
+            return;
+        }
+        let shown = self.data.as_ref().and_then(|data| data.fork.as_deref());
+        if let (Some(shown), Some(head)) = (shown, self.session.read(cx).head(&self.target))
+            && shown != head
+        {
+            self.mark_newer(cx);
+        }
+    }
+
     /// Read by name before its sides were known, a comparison of two branches shows no shared
     /// commit: their merge base names it, kept when it answers for the heads the cards show.
     fn read_compare_base(&mut self, cx: &mut Context<Self>) {
-        if !self.compare.is_some_and(CompareSides::both_branches) || self._base_task.is_some() {
+        let listed = CompareSides::of(self.session.read(cx), &self.target, &self.branch);
+        if self.compare.is_none() || !listed.both_branches() || self._base_task.is_some() {
             return;
         }
         let Some((from_head, to_head)) = self
@@ -8714,5 +8734,94 @@ pub(crate) mod tests {
                 "the shared commit"
             );
         });
+    }
+
+    /// A side compared before Studio listed it (an agent's new branch, typed in) is taken for a
+    /// commit, and becomes a branch, watched, when a list holds it. A compared branch deleted
+    /// since stays named as one, the tab is not opened again, and it is read again by name,
+    /// never through the merge base, which takes branches only.
+    #[gpui::test]
+    async fn a_compared_side_listed_later_is_a_branch_and_one_deleted_is_read_by_name(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let listed = std::sync::Arc::new(std::sync::Mutex::new(vec!["main", "agent/a"]));
+        let served = listed.clone();
+        let commit = |id: &str| json!({ "graph_commit_id": id, "graph_manifest_version": 1, "kind": "published", "created_at": 0 });
+        let (session, asked) = fake_server(
+            move |path, _, _| {
+                if path.ends_with("/branches/merge-base") {
+                    (
+                        200,
+                        json!({ "merge_base": commit("m1"), "source": "agent/b", "source_commit_id": "b1", "target": "agent/a", "target_commit_id": "a1" }),
+                    )
+                } else if path.ends_with("/diff") {
+                    (
+                        200,
+                        json!({ "from_commit_id": "a1", "to_commit_id": "b1", "changes": [] }),
+                    )
+                } else if path.ends_with("/branches") {
+                    (200, json!({ "branches": *served.lock().unwrap() }))
+                } else {
+                    (404, json!({ "error": "not here" }))
+                }
+            },
+            cx,
+        );
+        session.update(cx, |session, cx| session.reload_branches(cx));
+        cx.run_until_parked();
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            ReviewView::compare(
+                session.clone(),
+                "agent/a".into(),
+                "agent/b".into(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.compare.unwrap().to_branch,
+                Some(false),
+                "not listed yet"
+            );
+            assert!(view._head_watch.is_none());
+        });
+
+        listed.lock().unwrap().push("agent/b");
+        session.update(cx, |session, cx| session.reload_branches(cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.compare.unwrap().to_branch, Some(true));
+            assert!(view._head_watch.is_some(), "watched");
+            assert_eq!(view.tab_title(cx).as_ref(), "Compare agent/a · agent/b");
+        });
+
+        listed.lock().unwrap().retain(|branch| *branch != "agent/b");
+        session.update(cx, |session, cx| session.reload_branches(cx));
+        cx.run_until_parked();
+        asked.lock().unwrap().clear();
+        view.update(cx, |view, cx| {
+            assert_eq!(
+                view.compare.unwrap().to_branch,
+                Some(true),
+                "still a branch"
+            );
+            assert!(view.branch_deleted);
+            assert!(view.serialize(cx).is_none(), "not opened again");
+            view.reload(cx);
+        });
+        cx.run_until_parked();
+        let sent = asked.lock().unwrap().clone();
+        assert!(sent.iter().all(|r| !r.contains("merge-base")), "{sent:?}");
+        assert!(
+            sent.iter()
+                .any(|r| r.contains("/diff?from=agent%2Fa&to=agent%2Fb")),
+            "{sent:?}"
+        );
     }
 }

@@ -12,6 +12,7 @@ mod summary;
 mod view;
 
 use gpui::{App, AppContext as _};
+use studio_actions::graph::FoldBranchGroups;
 use studio_workspace::{PanelPosition, Workspace};
 use ui::IconName;
 
@@ -39,6 +40,13 @@ pub fn init(cx: &mut App) {
         let session = workspace.session().cloned();
         let list = cx.new(|cx| BranchList::new(handle, session, window, cx));
         let actions = cx.new(|cx| BranchesActions::new(&list, cx));
+        // Folding every group is the list's own: the keyboard's way to fold (spec 043).
+        let folds = list.downgrade();
+        workspace.register_action(move |_, _: &FoldBranchGroups, _, cx| {
+            if let Some(list) = folds.upgrade() {
+                list.update(cx, |list, cx| list.fold_all(cx));
+            }
+        });
         let view: gpui::AnyView = list.into();
         workspace.add_panel(
             PanelPosition::Left,

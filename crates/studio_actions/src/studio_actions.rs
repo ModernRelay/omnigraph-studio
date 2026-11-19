@@ -353,6 +353,9 @@ pub mod graph {
             RefreshBranches,
             /// Group the branches by who wrote them, or by the prefix of their name.
             ToggleBranchGrouping,
+            /// Fold every group of branches to its header, or show them all when every one is
+            /// folded.
+            FoldBranchGroups,
         ]
     );
 

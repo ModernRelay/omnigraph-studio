@@ -205,7 +205,8 @@
       "cmd-shift-r": "studio_graph::ReviewBranch",
       "cmd-alt-shift-r": "studio_graph::CompareBranches",
       "cmd-alt-shift-b": "studio_graph::RefreshBranches",
-      "cmd-alt-shift-g": "studio_graph::ToggleBranchGrouping"
+      "cmd-alt-shift-g": "studio_graph::ToggleBranchGrouping",
+      "cmd-alt-shift-k": "studio_graph::FoldBranchGroups"
     }
   },
   {

@@ -86,7 +86,13 @@ The study found three gaps in how Studio shows that work:
     so: "Branches whose newest commit act-notes-bot wrote".
   - A group's header is a row of the list (the same height, so the list stays uniform): a
     chevron, the prefix or author, and its count. A click folds or shows its branches, kept per
-    window while the graph is shown.
+    window while the graph is shown; ⌘⌥⇧K (`studio_graph::FoldBranchGroups`) folds every group,
+    or shows them all when every one is folded, and the header's tooltip names the key.
+  - By author, a branch's author is the detailed list's, unless a head the panel read since (a
+    commit seen on the branch) is newer: then that head's writer, and the branch moves to its
+    group when that head is read. A new credential forgets the details the old one read
+    (`GraphSession::forget_reads`), and the panel forgets its rows' heads and lanes, so no
+    group names a writer the new credential may not read.
 - **Lanes.** For each branch row drawn other than `main`, after the frame: its merge base with
   `main`. When the base is the branch's head, the row is **merged**: its name dims, a `merged`
   tag replaces its time, and **Delete** replaces Switch (disabled with the refusal when the
@@ -122,8 +128,11 @@ The study found three gaps in how Studio shows that work:
     opened again with the window before the list is read) is named to `GET /diff` as it is,
     since the merge base takes branches only; its first page names the commits it resolved, which
     the comparison shows and the later pages' token holds to. A side is a branch once the list
-    holds it, and is watched from then. A diff names no commit, so each difference is the second
-    head's.
+    holds it, and is watched from then: a branch made after the list the comparison opened with
+    is taken for a commit, then for a branch once a list holds it. A compared branch deleted
+    since stays named as a branch, is not opened again with the window, and is read again by
+    name, never through the merge base. A diff names no commit, so each difference is the
+    second head's.
   - **Words.** A card's kind is relative to the first side: + only on the second, − only on
     the first, ~ differs, as the facts line says ("+ only on agent/slack-oct-14 · − only on
     agent/notes-oct-14 · ~ differs"). The facts give each side's commit ("agent/notes-oct-14 at
@@ -138,7 +147,8 @@ The study found three gaps in how Studio shows that work:
     and the comparison is read again in the same tab; reviewed marks are of the other direction
     and are cleared.
   - **Newer data.** A compared branch whose head moves offers "Newer data: <a> or <b> changed
-    after this comparison was read." with Refresh.
+    after this comparison was read." with Refresh, whichever side it is, and also when it moved
+    while the comparison was being read.
 - The Effect view of the study's proposal 1 lands in the review; a comparison is a review tab,
   so it has it where proposal 1 builds it for every review tab.
 
@@ -214,6 +224,8 @@ a claim, a contradiction, a successor for Nov 20); the Slack agent a rival on
 | 2026-11-19 | A merged branch is deleted with ↵ | Delete on `agent/notes-oct-07` | "Everything on agent/notes-oct-07 is in main, so deleting it loses nothing." with no name to type; ↵ deleted it |
 | 2026-11-19 | A comparison with a commit, and both tabs again after a restart | "Compare with…", the seed commit's id typed; Studio quit and started again | "Compare agent/notes-oct-14 · XXAYM5WM": the notes agent's 3 nodes and 6 edges, only on the branch (the README's "3 nodes and 6 edges"). After the restart both comparisons were open again and read |
 
+| 2026-11-19 | The review's findings on #153 hold, and are fixed | Devin Review and Cursor Bugbot on the first push; `branches::tests::every_group_folds_and_shows_from_the_keyboard`, `view::tests::a_compared_side_listed_later_is_a_branch_and_one_deleted_is_read_by_name`, `graph_store` `session::tests` (the detailed-list test: `forget_reads` leaves no detail) | Folded and shown by the key; a side listed later becomes a watched branch, a deleted one is read by name with no merge-base; a new credential leaves no branch detail |
+
 ## Corrections
 
 - 2026-11-19, before merge: a comparison decided its sides from the branch list as it was made,
@@ -222,3 +234,8 @@ a claim, a contradiction, a successor for Nov 20); the Slack agent a rival on
   `v0.15.0` answers with a 500. A side is now unknown until the list says, nothing is watched
   meanwhile, and only two known branches are read through the merge base; any other pair is
   named to `GET /diff` as it is.
+- 2026-11-19, from the review of #153: a branch taken for a commit stayed one when a later
+  list held it; a deleted compared branch was still read through the merge base; a move of the
+  side compared from during a read offered no Refresh; grouping by author kept a writer the
+  detailed list named after a newer head was read, and kept the old credential's details after
+  a new token; groups folded only by pointer. Each is fixed as the Design says.
