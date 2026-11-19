@@ -243,7 +243,15 @@ nothing in step 1; ↵ opens a Blob tab, which writes as spec 004 says.
 - Rows are read as the table reads them (`builder::node_page`, keyset by the table's order,
   `Paging` at the gallery's commit, the graph's page size), a page ahead of the rows wanted:
   those placed and those measured ahead. A gallery of picked rows reads them by id, a page at a
-  time.
+  time, moving on in the list only once a page is read, so Retry reads a failed one again. A
+  page that shows no row and is not the last reads on at once (sorted, the rows with a value ran
+  out; listed, its rows are gone), and the gallery says "Reading…" until a row shows or the set
+  ends. At a commit made before a property was added, rows are read as columns without it, as
+  the table reads them.
+- The cursor opens on the table's cursor row: pages are read on until it is read, every row
+  before it is measured and placed, and the columns scroll to it. A listed set on a branch reads
+  the branch's diff too, marking its tiles and showing the listed rows the branch removed; read
+  whole, it counts the rows it shows.
 - The columns are one scroll area whose content is as tall as the tallest column (and the band);
   each frame lays out only the tiles that meet the view and half a screen either side, found by
   a search in each column (`Masonry::meeting`), so a frame costs what it shows, not what is
@@ -381,6 +389,7 @@ table's hundreds of cells.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-11-19 | Cursor Bugbot's and Devin Review's findings on #144 | Each checked against the code; a test for each real one, run against the code before the fix (with only `retry_page` stubbed as the old Retry and `absent` empty) and after: `an_empty_page_that_is_not_the_last_reads_on`, `a_listed_batch_of_rows_gone_reads_the_next`, `retry_reads_the_listed_batch_that_failed`, `a_commit_before_a_property_was_added_reads_the_rest`, `the_cursor_opens_on_its_row_past_the_first_page`, `the_cursor_opens_on_a_removed_row_once_it_is_placed`, `a_resize_reads_the_tiles_it_brings_into_view`, `a_listed_gallery_on_a_branch_marks_its_rows` | All eight failed before and pass after. A decoded preview dropped with its cancelled read is no leak: never drawn, it holds no texture and no asset (`a_preview_never_drawn_holds_nothing_of_gpuis`, GPUI `Image::is_asset_cached`) |
 | 2026-11-19 | A placed tile never moves, and the columns are placed in row order into the shortest | `masonry::tests` `a_placed_tile_keeps_its_place_when_later_shapes_arrive` (row 3's shape unknown: three placed, none after; once known, the first three where they were, the same as placing all at once), `rows_go_into_the_shortest_column_in_their_order`, `the_tiles_meeting_a_span_are_found_in_each_column`; `gallery::tests` `a_placed_tile_keeps_its_place_when_later_shapes_arrive` (the fake server holding n003's bytes: three placed while later shapes land and wait, a band under the columns; let go, all eight placed and the first three unmoved) | Pass |
 | 2026-11-19 | Shapes come from the first bytes, and every kind has one | `tile::tests` `a_tiles_shape_comes_from_the_first_bytes_or_its_kind` (a 300 × 450 JPEG past 20 KB of metadata, from its first 21 KB; a PNG from 32 bytes; an SVG's `viewBox`, its `width` and `height` with `px`, and a `100%` one; a PDF, text, bytes); `gallery::tests` `a_tile_is_as_tall_as_its_files_shape` (200 × 400 and 400 × 100 PNGs, a PDF, no file) | Pass. The `png` decoder's `into_dimensions` refused 32 bytes (it reads to the first image data), so a PNG's and a GIF's sizes are read from their headers directly |
 | 2026-11-19 | The arrows move within and across columns; a size change reads nothing | `masonry::tests` `the_arrows_move_within_and_across_columns`; `gallery::tests` `the_arrows_move_within_and_across_columns` (40 notes of three shapes: ↓ stays in column 0, → lands on column 1's tile whose middle is nearest, checked against every tile there, ← past the first column stays; X, ⌘A, Esc; − − then = = with the fake server's read log unchanged by the reflow; F) | Pass |

@@ -633,3 +633,303 @@ async fn a_key_draws_the_grid_once_and_previews_land_together(cx: &mut TestAppCo
     assert!(landed > 4, "{landed} tiles shown");
     assert_eq!(drew, 1, "{drew} draws for {landed} tiles landing together");
 }
+
+/// A set whose rows all lack the sort's value: the first page, of rows with one, is empty, and
+/// the gallery reads on to the rows without one rather than saying it has none. Review of
+/// #144: before, `wants_more` refused with no row read and the gallery said "No rows".
+#[gpui::test]
+async fn an_empty_page_that_is_not_the_last_reads_on(cx: &mut TestAppContext) {
+    init(cx);
+    let schema = NOTES.replace("  title: String\n", "  title: String\n  written: Date?\n");
+    let (session, _) = session_with_files(
+        &schema,
+        |request: &Value| {
+            let text = request["query"].as_str().unwrap_or_default();
+            match request["name"].as_str() {
+                // The rows with a date: none. The rows without one: ten.
+                Some("studio_page") if text.contains("is not null") => json!([]),
+                Some("studio_page") => Value::from((0..10).map(note).collect::<Vec<_>>()),
+                Some("studio_count") => json!([{ "n": 10 }]),
+                _ => json!([]),
+            }
+        },
+        None,
+        cx,
+    );
+    let sorted = ShowSetInGallery {
+        sort: Some(json!({ "property": "written", "descending": false })),
+        ..opening("Note")
+    };
+    let (gallery, cx) = open(session, sorted, cx);
+    gallery.read_with(cx, |gallery, _| {
+        assert_eq!(gallery.rows.len(), 10, "the rows without a date were read");
+        assert_eq!(gallery.cursor, Some(0));
+        assert_eq!(gallery.masonry.placed(), 10);
+    });
+}
+
+/// A listed set whose first batch is gone at the commit reads the next batch.
+#[gpui::test]
+async fn a_listed_batch_of_rows_gone_reads_the_next(cx: &mut TestAppContext) {
+    init(cx);
+    let (session, _) = session_with_files(NOTES, notes_answering(20), None, cx);
+    let mut ids: Vec<String> = (900..1100).map(|i| format!("n{i:03}")).collect();
+    ids.extend(["n003".to_owned(), "n001".to_owned()]);
+    let listed = ShowSetInGallery {
+        ids: Some(ids),
+        ..opening("Note")
+    };
+    let (gallery, cx) = open(session, listed, cx);
+    gallery.read_with(cx, |gallery, _| {
+        let ids: Vec<&str> = gallery.rows.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(ids, ["n003", "n001"]);
+        assert_eq!(
+            gallery.count_text(),
+            "2 rows",
+            "the rows gone are not counted"
+        );
+    });
+}
+
+/// A batch of listed rows that failed is read again by Retry: the same ids, in their order.
+/// Before, the list had moved past them when the batch was asked for, and Retry asked for the
+/// next one.
+#[gpui::test]
+async fn retry_reads_the_listed_batch_that_failed(cx: &mut TestAppContext) {
+    init(cx);
+    let asked: Arc<std::sync::Mutex<Vec<Vec<String>>>> = Arc::default();
+    let refused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let answer = notes_answering(300);
+    let (log, once) = (asked.clone(), refused.clone());
+    let (session, _) = session_with_files(
+        NOTES,
+        move |request: &Value| {
+            let ids: Vec<String> = request["params"]["ids"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|id| id.as_str().map(str::to_owned))
+                .collect();
+            if request["name"] == "studio_nodes_by_id" {
+                log.lock().unwrap().push(ids.clone());
+                if ids.first().map(String::as_str) != Some("n000")
+                    && !once.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    return json!({ "refuse": "the server was busy" });
+                }
+            }
+            answer(request)
+        },
+        None,
+        cx,
+    );
+    let listed = ShowSetInGallery {
+        ids: Some((0..300).map(|i| format!("n{i:03}")).collect()),
+        ..opening("Note")
+    };
+    let (gallery, cx) = open(session, listed, cx);
+    // Scrolled to the columns' end, the second batch is asked for, and refused.
+    for _ in 0..4 {
+        gallery.update(cx, |gallery, cx| {
+            let bottom = gallery.masonry.height();
+            gallery.scroll.set_offset(point(px(0.), px(-bottom)));
+            cx.notify();
+        });
+        settle(cx);
+    }
+    gallery.read_with(cx, |gallery, _| {
+        assert!(gallery.more_error.is_some(), "the second batch failed");
+        assert_eq!(gallery.rows.len(), 200);
+    });
+    gallery.update(cx, |gallery, cx| gallery.retry_page(cx));
+    settle(cx);
+    let asked = asked.lock().unwrap().clone();
+    assert_eq!(asked.len(), 3, "{asked:?}");
+    assert_eq!(asked[2], asked[1], "Retry asked for the batch that failed");
+    gallery.read_with(cx, |gallery, _| {
+        assert_eq!(gallery.rows.len(), 300);
+        let ids: Vec<&str> = gallery.rows.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(ids[200], "n200", "in their order");
+    });
+}
+
+/// A gallery held at a commit made before a property was added reads its rows without it, as
+/// the table does, listed or not. Before, the refusal was the gallery's error.
+#[gpui::test]
+async fn a_commit_before_a_property_was_added_reads_the_rest(cx: &mut TestAppContext) {
+    init(cx);
+    let schema = NOTES.replace(
+        "  title: String\n",
+        "  title: String\n  category: String?\n",
+    );
+    let fields = |i: usize| json!({ "id": format!("n{i:03}"), "v_slug": format!("n{i:03}"), "v_title": format!("Note {i}") });
+    let (session, _) = session_with_files(
+        &schema,
+        move |request: &Value| match request["name"].as_str() {
+            Some("studio_page") | Some("studio_nodes_by_id") => json!({
+                "refuse": "property 'category' of node type 'Note' does not exist at this snapshot"
+            }),
+            Some("studio_page_fields") => Value::from((0..3).map(fields).collect::<Vec<_>>()),
+            // The fake server answers a read of nodes' fields in its shape from `{"n": …}` rows.
+            Some("studio_nodes_fields") => Value::from((0..2).map(note).collect::<Vec<_>>()),
+            _ => json!([]),
+        },
+        None,
+        cx,
+    );
+    let held = ShowSetInGallery {
+        at_commit: Some("c0".into()),
+        ..opening("Note")
+    };
+    let (gallery, cx) = open(session.clone(), held.clone(), cx);
+    gallery.read_with(cx, |gallery, _| {
+        assert!(
+            matches!(gallery.first_page, Loadable::Loaded(())),
+            "{:?}",
+            gallery.first_page
+        );
+        assert_eq!(gallery.rows.len(), 3);
+        assert_eq!(gallery.rows[0].value("title"), &json!("Note 0"));
+        assert!(gallery.absent.contains_key("category"));
+    });
+    let listed = ShowSetInGallery {
+        ids: Some(vec!["n000".into(), "n001".into()]),
+        ..held
+    };
+    let (gallery, cx) = open(session, listed, cx);
+    gallery.read_with(cx, |gallery, _| {
+        assert_eq!(gallery.rows.len(), 2, "{:?}", gallery.first_page);
+    });
+}
+
+/// Opened at a row past the first page (the table's cursor), the gallery reads on to it, puts
+/// the cursor there once it is read, and scrolls to it once it is placed. Before, the row was
+/// looked for in the first page alone, and the cursor fell to the first tile.
+#[gpui::test]
+async fn the_cursor_opens_on_its_row_past_the_first_page(cx: &mut TestAppContext) {
+    init(cx);
+    let (session, _) = session_with_files(NOTES, notes_answering(500), None, cx);
+    let at = ShowSetInGallery {
+        select: Some("n350".into()),
+        ..opening("Note")
+    };
+    let (gallery, cx) = open(session, at, cx);
+    gallery.read_with(cx, |gallery, _| {
+        let cursor = gallery.cursor.expect("a cursor");
+        assert_eq!(gallery.rows[cursor].id, "n350");
+        assert!(cursor < gallery.masonry.placed(), "its tile is placed");
+        let place = gallery.masonry.place_of(cursor).unwrap();
+        let top = -f32::from(gallery.scroll.offset().y);
+        assert!(
+            top > 0. && place.top >= top - 1.,
+            "scrolled to it: {top} {place:?}"
+        );
+    });
+}
+
+/// On a branch, a gallery opened at a row the branch removed puts its cursor there once the
+/// diff puts the row first.
+#[gpui::test]
+async fn the_cursor_opens_on_a_removed_row_once_it_is_placed(cx: &mut TestAppContext) {
+    init(cx);
+    let note_type = json!({ "id": "Note", "name": "Note" });
+    let changes = json!([
+        { "kind": "node", "type": note_type, "id": "n900", "op": "delete",
+          "before": { "properties": { "slug": "n900", "title": "Gone" } }, "after": null },
+    ]);
+    let (session, _) = session_with_files(NOTES, notes_answering(3), Some(changes), cx);
+    cx.run_until_parked();
+    session.update(cx, |session, cx| session.set_branch("fix".into(), cx));
+    let at = ShowSetInGallery {
+        select: Some("n900".into()),
+        ..opening("Note")
+    };
+    let (gallery, cx) = open(session, at, cx);
+    gallery.read_with(cx, |gallery, _| {
+        assert_eq!(gallery.cursor, Some(0));
+        assert_eq!(gallery.rows[0].id, "n900");
+    });
+}
+
+/// A window resized so the columns flow again reads the tiles that now meet the same span.
+/// Before, the span read last was the same, and the tiles brought into view stayed unread.
+#[gpui::test]
+async fn a_resize_reads_the_tiles_it_brings_into_view(cx: &mut TestAppContext) {
+    init(cx);
+    let (session, blobs) = session_with_files(NOTES, notes_answering(120), None, cx);
+    let big = png(300, 300, true);
+    for i in 0..120 {
+        blobs.set(&format!("Note/n{i:03}/attachment"), &big);
+    }
+    let (gallery, cx) = open(session, opening("Note"), cx);
+    let columns = gallery.read_with(cx, |g, _| g.masonry.columns());
+    let size = cx.update(|window, _| window.viewport_size());
+    cx.simulate_resize(gpui::size(size.width * 2., size.height));
+    settle(cx);
+    gallery.read_with(cx, |gallery, _| {
+        assert!(gallery.masonry.columns() > columns, "wider, more columns");
+        let unread: Vec<usize> = gallery
+            .masonry
+            .meeting(gallery.span.clone())
+            .into_iter()
+            .filter(|&row| {
+                let key = (gallery.rows[row].id.clone(), "attachment".to_owned());
+                !matches!(
+                    gallery.tiles.get(&key).map(|t| &t.look),
+                    Some(Loadable::Loaded(_))
+                )
+            })
+            .collect();
+        assert!(
+            unread.is_empty(),
+            "tiles in view unread after the resize: {unread:?}"
+        );
+    });
+}
+
+/// A preview made but never drawn holds nothing of GPUI's: an SVG enters the asset cache only
+/// when an `img` draws it, and a raster image's texture only when it is painted, which is what
+/// `ShownImage::release` frees. So a preview dropped with its cancelled read leaks nothing.
+#[gpui::test]
+async fn a_preview_never_drawn_holds_nothing_of_gpuis(cx: &mut TestAppContext) {
+    let drawing = br#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"/>"#.to_vec();
+    let svg = cx.update(|cx| cx.svg_renderer());
+    let size = drawing.len() as u64;
+    let Look::Image { image, .. } = tile::look(drawing, size, &svg) else {
+        panic!("an SVG is drawn");
+    };
+    let crate::blob::ShownImage::Svg(image) = image else {
+        panic!("kept for GPUI to draw");
+    };
+    cx.update(|cx| assert!(!image.is_asset_cached(cx)));
+}
+
+/// On a branch, a gallery of listed rows reads the branch's diff too: its tiles are marked,
+/// and a listed row the branch removed is shown first rather than lost.
+#[gpui::test]
+async fn a_listed_gallery_on_a_branch_marks_its_rows(cx: &mut TestAppContext) {
+    init(cx);
+    let note_type = json!({ "id": "Note", "name": "Note" });
+    let changes = json!([
+        { "kind": "node", "type": note_type, "id": "n001", "op": "insert",
+          "before": null, "after": { "properties": { "slug": "n001", "title": "Note 1" } } },
+        { "kind": "node", "type": note_type, "id": "n900", "op": "delete",
+          "before": { "properties": { "slug": "n900", "title": "Gone" } }, "after": null },
+        { "kind": "node", "type": note_type, "id": "n901", "op": "delete",
+          "before": { "properties": { "slug": "n901", "title": "Not listed" } }, "after": null },
+    ]);
+    let (session, _) = session_with_files(NOTES, notes_answering(3), Some(changes), cx);
+    cx.run_until_parked();
+    session.update(cx, |session, cx| session.set_branch("fix".into(), cx));
+    let listed = ShowSetInGallery {
+        ids: Some(vec!["n001".into(), "n900".into(), "n002".into()]),
+        ..opening("Note")
+    };
+    let (gallery, cx) = open(session, listed, cx);
+    gallery.read_with(cx, |gallery, _| {
+        let ids: Vec<&str> = gallery.rows.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(ids, ["n900", "n001", "n002"]);
+        assert_eq!(gallery.change_of("n001"), Some(NetChange::Added));
+        assert_eq!(gallery.count_text(), "3 rows");
+    });
+}

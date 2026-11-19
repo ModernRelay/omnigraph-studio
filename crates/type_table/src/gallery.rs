@@ -21,7 +21,7 @@ use gpui::{
 };
 use gq_language::{BuiltQuery, Filter, ScalarKind, SchemaModel, Sort, builder};
 use graph_client::api::ReadOutput;
-use graph_client::{BlobCell, BlobMeta, ReadError};
+use graph_client::{BlobCell, BlobMeta, HistoricalGap, PropertyThen, ReadError};
 use graph_store::scope::ReadScope;
 use graph_store::{GraphSession, HeadWatch, Loadable, NetChange, SessionEvent};
 use serde_json::Value;
@@ -43,7 +43,7 @@ use ui::prelude::*;
 
 use crate::branch_diff::{BranchDiff, TARGET};
 use crate::masonry::{Masonry, Place};
-use crate::model::{Paging, Row, node_rows};
+use crate::model::{Paging, Row, field_rows, node_rows};
 use crate::peek::{NodePeek, PeekSubject};
 use crate::tile::{self, FIRST_READ, Facts, Look};
 
@@ -185,9 +185,17 @@ pub struct TypeGallery {
     opened_at: Option<String>,
     filters: Vec<Filter>,
     sort: Option<Sort>,
-    /// The rows it holds, when listed rather than read; how many of them were asked for.
+    /// The rows it holds, when listed rather than read; how many of them were read.
     ids: Option<Vec<String>>,
     listed_asked: usize,
+    /// Properties the commit read does not hold under their current names (a commit made
+    /// before they were added or renamed): rows are read as columns without them, as the
+    /// table reads them (spec 004).
+    absent: HashMap<String, PropertyThen>,
+    /// The commit the first page was asked at, so a read again after a refusal asks there.
+    first_snapshot: Option<String>,
+    /// The cursor's row is to be scrolled to once it is placed.
+    scroll_owed: bool,
     /// The Blob property the tiles show, and the type's Blob properties.
     property: Option<String>,
     files: Vec<String>,
@@ -302,6 +310,9 @@ impl TypeGallery {
             sort,
             ids: opening.ids,
             listed_asked: 0,
+            absent: HashMap::new(),
+            first_snapshot: None,
+            scroll_owed: false,
             property: opening.property,
             files: Vec::new(),
             schema: None,
@@ -373,8 +384,18 @@ impl TypeGallery {
     // ---- reading ----
 
     /// Reads the set from its first page: at the held commit, at the commit the gallery was
-    /// opened at (its source's, once), or at the head. Every preview is let go.
+    /// opened at (its source's, once), or at the head. Every preview is let go; the cursor's
+    /// row is found again.
     fn read_from_start(&mut self, cx: &mut Context<Self>) {
+        self.absent.clear();
+        self.start_reading(cx);
+    }
+
+    fn start_reading(&mut self, cx: &mut Context<Self>) {
+        if self.select_on_load.is_none() {
+            self.select_on_load = self.cursor_row().map(|row| row.id.clone());
+        }
+        self.cursor = None;
         self.generation += 1;
         self.release_all(cx);
         self.rows.clear();
@@ -417,6 +438,7 @@ impl TypeGallery {
             return;
         }
         let snapshot = self.at_commit.clone().or_else(|| self.opened_at.take());
+        self.first_snapshot = snapshot.clone();
         self.read_page(snapshot, true, cx);
         self.read_diff(cx);
         cx.notify();
@@ -431,16 +453,31 @@ impl TypeGallery {
             .max(1)
     }
 
-    fn page_query(&mut self, size: u32) -> Option<BuiltQuery> {
+    /// The next page's query, and for listed rows how far into the list it reads; the gallery
+    /// moves on only once the page is read, so a page that failed is asked again.
+    fn page_query(&self, size: u32) -> Option<(BuiltQuery, Option<usize>)> {
         let schema = self.schema.clone()?;
+        let without: Vec<String> = self.absent.keys().cloned().collect();
         match &self.ids {
             Some(ids) => {
                 let from = self.listed_asked.min(ids.len());
                 let to = (from + size as usize).min(ids.len());
-                self.listed_asked = to;
-                builder::nodes_by_ids(&schema, &self.type_name, &ids[from..to]).ok()
+                let listed = &ids[from..to];
+                let query = if without.is_empty() {
+                    builder::nodes_by_ids(&schema, &self.type_name, listed)
+                } else {
+                    let properties: Vec<String> = schema
+                        .node(&self.type_name)?
+                        .properties
+                        .iter()
+                        .filter(|p| p.projectable() && !without.contains(&p.name))
+                        .map(|p| p.name.clone())
+                        .collect();
+                    builder::nodes_fields_by_id(&schema, &self.type_name, listed, &properties)
+                };
+                query.ok().map(|query| (query, Some(to)))
             }
-            None => builder::node_page(
+            None if without.is_empty() => builder::node_page(
                 &schema,
                 &self.type_name,
                 &self.filters,
@@ -448,7 +485,19 @@ impl TypeGallery {
                 &self.paging.start,
                 size,
             )
-            .ok(),
+            .ok()
+            .map(|query| (query, None)),
+            None => builder::node_page_fields(
+                &schema,
+                &self.type_name,
+                &self.filters,
+                self.sort.as_ref(),
+                &self.paging.start,
+                size,
+                &without,
+            )
+            .ok()
+            .map(|query| (query, None)),
         }
     }
 
@@ -456,7 +505,7 @@ impl TypeGallery {
     fn read_page(&mut self, snapshot: Option<String>, first: bool, cx: &mut Context<Self>) {
         let base = self.page_size(cx);
         let size = self.paging.next_page_size(base);
-        let Some(query) = self.page_query(size) else {
+        let Some((query, listed_to)) = self.page_query(size) else {
             self.first_page = Loadable::Failed(format!(
                 "The schema has no node type {} to read.",
                 self.type_name
@@ -472,7 +521,7 @@ impl TypeGallery {
             let result = read.await;
             this.update(cx, |this, cx| {
                 if this.generation == generation {
-                    this.take_page(result, first, size, base, cx);
+                    this.take_page(result, first, size, base, listed_to, cx);
                 }
             })
             .ok();
@@ -497,11 +546,18 @@ impl TypeGallery {
         first: bool,
         size: u32,
         base: u32,
+        listed_to: Option<usize>,
         cx: &mut Context<Self>,
     ) {
         self.loading_more = false;
         let output = match result {
             Ok(output) => output,
+            // A commit made before a property was added: read again without it.
+            Err(ReadError::Refused(refusal)) if self.read_without(refusal.historical_gap()) => {
+                self.opened_at = self.first_snapshot.clone();
+                self.start_reading(cx);
+                return;
+            }
             Err(error) => {
                 if first {
                     self.first_page = Loadable::Failed(error.to_string());
@@ -512,7 +568,14 @@ impl TypeGallery {
                 return;
             }
         };
-        let mut page = node_rows(&output.rows);
+        let mut page = if self.absent.is_empty() {
+            node_rows(&output.rows)
+        } else {
+            field_rows(&output.rows)
+        };
+        if let Some(to) = listed_to {
+            self.listed_asked = to;
+        }
         match &self.ids {
             Some(ids) => {
                 // Listed rows keep the order they were listed in.
@@ -544,24 +607,91 @@ impl TypeGallery {
         }
         // A row the branch removed is shown first already; it is not read twice.
         let shown: HashSet<String> = self.rows.iter().map(|row| row.id.clone()).collect();
+        let before = self.rows.len();
         self.rows
             .extend(page.into_iter().filter(|row| !shown.contains(&row.id)));
+        let added = self.rows.len() > before;
         if first {
             self.first_page = Loadable::Loaded(());
             self.compare_head(cx);
             self.read_count(cx);
-            self.cursor = match self.select_on_load.take() {
-                Some(id) => self.rows.iter().position(|row| row.id == id),
-                None => None,
-            }
-            .or((!self.rows.is_empty()).then_some(0));
-            // After the cursor, which moves with its tile past the rows put before it.
             self.place_removed();
             cx.emit(ItemEvent::UpdateTab);
         }
+        self.count_listed();
+        self.find_cursor_row();
         self.place_ready(cx);
+        // A page that showed no row and is not the last reads on at once: sorted, the rows with
+        // a value ran out and those without one are next; listed, its rows are gone. The rows
+        // drawn ask for nothing while there are none.
+        if !added && !self.paging.exhausted {
+            let pin = self.paging.pinned.clone();
+            self.read_page(pin, false, cx);
+        } else {
+            self.want_more(cx);
+        }
         self.read_tiles(cx);
         cx.notify();
+    }
+
+    /// A listed set read whole counts the rows it shows: those gone at this commit are not in
+    /// it, and those the branch removed are.
+    fn count_listed(&mut self) {
+        if self.ids.is_some() && self.paging.exhausted {
+            self.count = Loadable::Loaded(self.rows.len() as i64);
+        }
+    }
+
+    /// Reads the page that failed again, at the pin: the same rows, listed or keyset.
+    pub(crate) fn retry_page(&mut self, cx: &mut Context<Self>) {
+        self.more_error = None;
+        let pin = self.paging.pinned.clone();
+        self.read_page(pin, false, cx);
+        cx.notify();
+    }
+
+    /// Puts the cursor on the row it was asked to open at (the table's cursor row, or the
+    /// cursor's before a read again) once that row is read; meanwhile there is none, and pages
+    /// are read on to find it. Once the set is read whole without it, the first tile.
+    fn find_cursor_row(&mut self) {
+        let Some(id) = self.select_on_load.clone() else {
+            if self.cursor.is_none() && !self.rows.is_empty() {
+                self.cursor = Some(0);
+            }
+            return;
+        };
+        if let Some(row) = self.rows.iter().position(|row| row.id == id) {
+            self.cursor = Some(row);
+            self.select_on_load = None;
+            self.scroll_owed = true;
+        } else if self.paging.exhausted && !self.diff_pending {
+            self.select_on_load = None;
+            self.cursor = (!self.rows.is_empty()).then_some(0);
+        }
+    }
+
+    /// Notes a property the commit read does not hold under its current name, so the rows are
+    /// read again without it; false when the refusal names no new property of the type. Once
+    /// per property, so the reads end.
+    fn read_without(&mut self, gap: Option<HistoricalGap>) -> bool {
+        let Some(HistoricalGap::Property {
+            owner,
+            property,
+            then,
+        }) = gap
+        else {
+            return false;
+        };
+        let known = self
+            .schema
+            .as_ref()
+            .and_then(|schema| schema.node(&self.type_name))
+            .is_some_and(|node| node.property(&property).is_some());
+        if owner != self.type_name || !known || self.absent.contains_key(&property) {
+            return false;
+        }
+        self.absent.insert(property, then);
+        true
     }
 
     fn sort_nulls_follow(&self) -> bool {
@@ -586,9 +716,12 @@ impl TypeGallery {
             return;
         }
         let wanted = self.masonry.placed() + self.ahead_rows();
-        if self
-            .paging
-            .wants_more(self.rows.len(), wanted, self.loading_more)
+        // The row the cursor opens at is not read yet: the pages are read on to it.
+        let finding = self.select_on_load.is_some() && !self.loading_more && !self.paging.exhausted;
+        if finding
+            || self
+                .paging
+                .wants_more(self.rows.len(), wanted, self.loading_more)
         {
             let pin = self.paging.pinned.clone();
             self.read_page(pin, false, cx);
@@ -637,7 +770,7 @@ impl TypeGallery {
     /// reads it: on a branch other than the target, following it.
     fn read_diff(&mut self, cx: &mut Context<Self>) {
         self._diff = None;
-        if self.branch == TARGET || self.at_commit.is_some() || self.ids.is_some() {
+        if self.branch == TARGET || self.at_commit.is_some() {
             return;
         }
         let (session, branch, type_name) = (
@@ -655,6 +788,7 @@ impl TypeGallery {
                 this.update(cx, |this, cx| {
                     if this.generation == generation {
                         this.diff_pending = false;
+                        this.find_cursor_row();
                         this.place_ready(cx);
                         this.read_tiles(cx);
                         cx.notify();
@@ -677,6 +811,8 @@ impl TypeGallery {
                 this.diff_base = Some(base);
                 this.diff_pending = false;
                 this.place_removed();
+                this.count_listed();
+                this.find_cursor_row();
                 this.place_ready(cx);
                 this.read_tiles(cx);
                 cx.notify();
@@ -692,12 +828,27 @@ impl TypeGallery {
             return;
         };
         let shown: HashSet<&str> = self.rows.iter().map(|row| row.id.as_str()).collect();
-        let placed: Vec<Row> = diff
+        // A gallery of listed rows shows the listed ones the branch removed, in their order.
+        let listed: Option<HashMap<&str, usize>> = self.ids.as_ref().map(|ids| {
+            ids.iter()
+                .enumerate()
+                .map(|(ix, id)| (id.as_str(), ix))
+                .collect()
+        });
+        let mut placed: Vec<Row> = diff
             .removed()
             .iter()
             .filter(|row| !shown.contains(row.id.as_str()))
+            .filter(|row| {
+                listed
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains_key(row.id.as_str()))
+            })
             .cloned()
             .collect();
+        if let Some(listed) = &listed {
+            placed.sort_by_key(|row| listed.get(row.id.as_str()).copied());
+        }
         if placed.is_empty() {
             return;
         }
@@ -806,6 +957,8 @@ impl TypeGallery {
         }
         self.masonry = Masonry::new(columns, width, space::LG, tile_chrome());
         self.place_known();
+        // Other tiles meet the same span now: they are asked for at the next draw.
+        self.span_read = None;
     }
 
     /// The shape of row `row`'s tile, once known.
@@ -827,9 +980,17 @@ impl TypeGallery {
         let shapes: Vec<Option<f32>> = (from..self.rows.len())
             .map(|row| self.shape_of(row))
             .collect();
-        self.masonry.place_known(self.rows.len(), |row| {
+        let placed = self.masonry.place_known(self.rows.len(), |row| {
             shapes.get(row - from).copied().flatten()
-        })
+        });
+        // The row the gallery opened at, once placed, is scrolled to.
+        if self.scroll_owed
+            && let Some(cursor) = self.cursor.filter(|&row| row < self.masonry.placed())
+        {
+            self.scroll_owed = false;
+            self.scroll_to_tile(cursor);
+        }
+        placed
     }
 
     /// Places what is ready; when a tile was placed, the rows after it are measured on.
@@ -901,7 +1062,15 @@ impl TypeGallery {
             .map(|row| (key(row), Want::Preview))
             .collect();
         let from = self.masonry.placed();
-        let to = (from + self.ahead_rows()).min(self.rows.len());
+        // The cursor's row, not placed yet (the row the gallery opened at), is measured to as
+        // well: every row before it is placed first.
+        let to_cursor = self
+            .cursor
+            .filter(|_| self.scroll_owed)
+            .map_or(0, |cursor| cursor + 1);
+        let to = (from + self.ahead_rows())
+            .max(to_cursor)
+            .min(self.rows.len());
         wanted.extend((from..to).map(|row| (key(row), Want::Shape)));
         wanted
     }
@@ -1654,6 +1823,21 @@ impl TypeGallery {
             )
             .into_any_element();
         }
+        // Pages that showed no row read on: the set is empty only once read whole.
+        if self.rows.is_empty() && (!self.paging.exhausted || self.diff_pending) {
+            if let Some(error) = &self.more_error {
+                return studio_ui::ds::error_state(
+                    format!("Could not read {}", self.type_name),
+                    error.clone(),
+                )
+                .child(
+                    studio_ui::ds::state_action("gallery-retry", "Retry", &Refresh, &focus, cx)
+                        .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                )
+                .into_any_element();
+            }
+            return studio_ui::ds::loading_state("Reading…").into_any_element();
+        }
         if self.rows.is_empty() {
             let title = if self.filters.is_empty() && self.ids.is_none() {
                 "No rows"
@@ -1760,13 +1944,8 @@ impl TypeGallery {
                                     ),
                             )
                             .child(
-                                studio_ui::ds::row_button("gallery-retry-more", "Retry").on_click(
-                                    cx.listener(|this, _, _, cx| {
-                                        this.more_error = None;
-                                        this.want_more(cx);
-                                        cx.notify();
-                                    }),
-                                ),
+                                studio_ui::ds::row_button("gallery-retry-more", "Retry")
+                                    .on_click(cx.listener(|this, _, _, cx| this.retry_page(cx))),
                             )
                             .into_any_element(),
                         None => studio_ui::ds::text::meta("Reading…").into_any_element(),
