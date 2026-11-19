@@ -209,6 +209,9 @@ impl NodeHistoryView {
                 this.reload(cx);
             }
             SessionEvent::SchemaChanged => this.reload(cx),
+            // A new token may read less: what the old one read goes, and the history is read
+            // again with the new one, as a node's page does.
+            SessionEvent::CredentialChanged => this.reload(cx),
             _ => {}
         });
         let list_view = NodeHistoryRows::new(cx);
@@ -236,6 +239,15 @@ impl NodeHistoryView {
 
     /// The history read again from the branch head.
     pub fn reload(&mut self, cx: &mut Context<Self>) {
+        // A schema that could not be read is read again first; its arrival reads the history.
+        let schema_failed = matches!(
+            self.session.read(cx).schema,
+            graph_store::Loadable::Failed(_)
+        );
+        if schema_failed && matches!(self.state, State::Failed(_)) {
+            self.session
+                .update(cx, |session, cx| session.reload_schema(cx));
+        }
         self.state = State::Reading;
         self.entries.clear();
         self.commits = 0;
@@ -258,7 +270,12 @@ impl NodeHistoryView {
     /// Reads `window`, and takes it below what was read.
     fn read(&mut self, window: NodeHistoryWindow, cx: &mut Context<Self>) {
         let Some(scope) = self.scope(cx) else {
-            // The schema is not read yet: its arrival reads the history (SchemaChanged).
+            // The schema is not read yet: its arrival reads the history (SchemaChanged). One
+            // that could not be read says so, and Try again reads it again.
+            if let graph_store::Loadable::Failed(error) = &self.session.read(cx).schema {
+                self.state =
+                    State::Failed(format!("The graph's schema could not be read: {error}").into());
+            }
             return;
         };
         let older = matches!(window, NodeHistoryWindow::Older { .. });
@@ -561,7 +578,21 @@ fn relationship_line(
     node_id: &str,
     schema: Option<&SchemaModel>,
 ) -> RelationshipLine {
-    let (from, to) = edge.endpoints().unwrap_or_default();
+    // The ends the node held: a relationship moved away from it is read from the image that
+    // still names it.
+    let ends = |image: Option<&graph_client::api::ChangeImageOutput>| {
+        let ends = image?.endpoints.as_ref()?;
+        Some((
+            ends.get("from")?.as_str()?.to_owned(),
+            ends.get("to")?.as_str()?.to_owned(),
+        ))
+    };
+    let (from, to) = [edge.after.as_ref(), edge.before.as_ref()]
+        .into_iter()
+        .filter_map(ends)
+        .find(|(from, to)| from == node_id || to == node_id)
+        .or_else(|| edge.endpoints())
+        .unwrap_or_default();
     let outgoing = from == node_id;
     let other = if outgoing { to } else { from };
     let words = match schema.and_then(|schema| schema.edge(&edge.type_name)) {
@@ -637,7 +668,9 @@ impl Render for NodeHistoryView {
                     .into_any_element()
             }
             State::Reading => change_cards::reading_state(None).into_any_element(),
-            State::Ready if self.entries.is_empty() && !self.offers_older() => {
+            State::Ready
+                if self.entries.is_empty() && !self.offers_older() && self.stopped.is_none() =>
+            {
                 change_cards::no_changes_state(format!(
                     "No commit on {} changed {} or its relationships since the graph began.",
                     self.branch, self.id
@@ -919,10 +952,24 @@ mod tests {
             );
             assert!(!view.offers_older(), "it reached the graph's first commit");
         });
-        let asked = asked.lock().unwrap();
-        assert_eq!(asked.len(), 2, "{asked:?}");
-        assert!(asked[0].contains("page_token=200"), "{asked:?}");
-        assert!(asked[1].contains("start=beginning"), "{asked:?}");
+        {
+            let asked = asked.lock().unwrap();
+            assert_eq!(asked.len(), 2, "{asked:?}");
+            assert!(asked[0].contains("page_token=200"), "{asked:?}");
+            assert!(asked[1].contains("start=beginning"), "{asked:?}");
+        }
+
+        // A new token may read less: what the old one read goes, and the newest window is read
+        // again with the new one.
+        asked.lock().unwrap().clear();
+        session.update(cx, |_, cx| cx.emit(SessionEvent::CredentialChanged));
+        view.read_with(cx, |view, _| assert!(view.entries.is_empty()));
+        cx.run_until_parked();
+        assert_eq!(
+            read(cx),
+            [("c220".to_owned(), Some("act-admin".to_owned()), true, 1)]
+        );
+        assert_eq!(asked.lock().unwrap().len(), 2);
     }
 
     /// The entries are a cached view of their own: a commit on another branch draws nothing, a

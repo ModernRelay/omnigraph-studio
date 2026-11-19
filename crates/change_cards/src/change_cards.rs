@@ -155,22 +155,25 @@ pub fn change_rows(
 /// 040).
 pub fn rows_of(change: &FoldedChange, schema: Option<&SchemaModel>) -> Vec<PropertyRow> {
     let mut rows = moved_end_rows(change);
-    let properties = property_rows(change, schema);
-    let shown: Vec<&str> = properties.iter().map(|row| row.name().as_ref()).collect();
+    rows.extend(with_setters(change, property_rows(change, schema)));
+    rows
+}
+
+/// `rows`, `change`'s property rows, each naming who set it where more than one actor set
+/// them (spec 040).
+fn with_setters(change: &FoldedChange, rows: Vec<PropertyRow>) -> Vec<PropertyRow> {
+    let shown: Vec<&str> = rows.iter().map(|row| row.name().as_ref()).collect();
     let setters: Vec<Option<(String, String)>> = shown
         .iter()
         .map(|name| change.mixed_setter(&shown, name).map(set_by_words))
         .collect();
-    rows.extend(
-        properties
-            .into_iter()
-            .zip(setters)
-            .map(|(row, by)| match by {
-                Some((who, detail)) => row.set_by(who, detail),
-                None => row,
-            }),
-    );
-    rows
+    rows.into_iter()
+        .zip(setters)
+        .map(|(row, by)| match by {
+            Some((who, detail)) => row.set_by(who, detail),
+            None => row,
+        })
+        .collect()
 }
 
 /// Who set a value, as its row's end says it, and its tooltip: the actor, then the commit and
@@ -250,7 +253,7 @@ pub fn relationship_line(
                 },
                 schema,
             ),
-            None => property_rows(edge, schema),
+            None => with_setters(edge, property_rows(edge, schema)),
         }),
         None => Rc::from([]),
     };

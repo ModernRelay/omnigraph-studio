@@ -310,6 +310,9 @@ pub struct HistoryView {
     match_at: Option<usize>,
     /// The search text the matches were found for, lowercase: typing finds them once it pauses.
     match_query: String,
+    /// How many commits' counts the matches were found with: counts read since, as rows are
+    /// drawn, may touch the node searched for (spec 040).
+    matched_learnt: usize,
     _search_task: Option<Task<()>>,
     focus_handle: FocusHandle,
     /// The first page's read.
@@ -552,6 +555,7 @@ impl HistoryView {
             matches: Vec::new(),
             match_at: None,
             match_query: String::new(),
+            matched_learnt: 0,
             _search_task: None,
             _search_subscription: search_subscription,
             _session_subscription: session_subscription,
@@ -1361,6 +1365,7 @@ impl HistoryView {
                 .collect()
         };
         self.match_query = query;
+        self.matched_learnt = self.counts.learnt.len();
         self.match_at = self
             .match_at
             .filter(|_| !self.matches.is_empty())
@@ -2135,6 +2140,11 @@ impl Render for HistoryView {
                 this.owed_due = false;
                 this.read_owed(cx);
             });
+        }
+        // Counts read since the search found its matches may touch the node it names: they
+        // are found too, the selection kept.
+        if !self.match_query.is_empty() && self.counts.learnt.len() != self.matched_learnt {
+            self.match_commits(cx);
         }
         let count = self.commits.len();
         let counter = self.match_counter();

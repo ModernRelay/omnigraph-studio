@@ -4181,10 +4181,10 @@ impl GraphSession {
         self.counted_read(
             "node_history",
             async move {
-                let (token, head, before) = match window {
-                    NodeHistoryWindow::Newest => (None, None, None),
+                let (token, head) = match window {
+                    NodeHistoryWindow::Newest => (None, None),
                     NodeHistoryWindow::Older { head, window } => {
-                        (Some(window.page_token), Some(head), Some(window.until))
+                        (Some(window.page_token), Some(head))
                     }
                 };
                 let listing = client
@@ -4210,15 +4210,14 @@ impl GraphSession {
                 let older = listing
                     .next_page_token
                     .clone()
-                    .map(|page_token| OlderWindow {
-                        page_token,
-                        until: oldest.graph_commit_id.clone(),
-                    });
-                // The first window ends at the head the listing resolved; an older one before
-                // the window above it.
-                let last = before.is_none().then(|| head.clone());
+                    .map(|page_token| OlderWindow { page_token });
+                // The window is the commits the page named: the feed reads up to the first block
+                // past them, the head's successor or the window above.
                 let types = scope.types();
-                let mut fold = NodeHistoryFold::new(scope, last, before);
+                let mut fold = NodeHistoryFold::new(
+                    scope,
+                    listing.commits.iter().map(|c| c.graph_commit_id.clone()),
+                );
                 let mut next = Some(FeedNext::Start(start));
                 let mut stopped = None;
                 for _ in 0..NODE_HISTORY_FEED_PAGES {
@@ -4258,6 +4257,9 @@ impl GraphSession {
                             break;
                         }
                     }
+                }
+                if stopped.is_none() && next.is_none() {
+                    fold.caught_up();
                 }
                 if stopped.is_none() && !fold.done() && next.is_some() {
                     stopped = Some(format!(

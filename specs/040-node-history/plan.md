@@ -86,7 +86,8 @@ why*, and Studio could not say:
   commits (`GET /commits?branch=&limit=200`), then the change feed from just before the oldest
   of them (`start=after:<its parent>`, or `beginning`), filtered to the node's type and every
   relationship type that ends at it (`type=Issue&type=BlockedBy&…`), in pages of 8,192 changes,
-  at most 12, read off the main thread. The feed stops at the head the listing resolved. The
+  at most 12, read off the main thread. A window is the commits the listing page named: the
+  first block of another commit (past the head, or the window above's) ends it. The
   commits that changed the node, or a relationship whose end of the node's type is the node,
   are kept, newest first; a change that ends where it began is left out.
 - **An entry** is one commit: the kind's mark (+ ~ −, of the node's own change), the actor, what
@@ -139,6 +140,7 @@ why*, and Studio could not say:
 |---|---|---|
 | A node's history is a tab of its own in the node's view strip | A section on the page; a panel in the inspector | It has reads, a window and a state of its own: constitution XIII makes it a tab. The page stays the node as it is; the inspector opens the tab as it opens the tree and canvas |
 | Read a window from the change feed filtered by type | One `GET /commits/{id}/changes` per commit, filtered in Studio (the study's sketch) | 200 requests against two; the feed covers up to 128 commits a page and filters by type on the server. Measured below |
+| A window is bounded by the commits its listing page names: the first feed block of another commit ends it | Stop at the head's block, or before the window above's first commit | A feed filtered by type need not send a block for a commit that changed none of the types, so a block to stop at may never come and an older window would read into the one above (review of #146). Empty blocks were sent on `v0.15.0`, but nothing promises it |
 | A window of 200 first-parent commits, with "Read the 200 commits before" | The whole history; a time window | Bounded work with an honest exit (IX); the listing's own page token keeps older windows on the same head |
 | Relationships that end at the node are part of its history | Only the node's own row | "Who linked this comment", "who blocked this issue" are the questions of beads and pharma |
 | A merge is shown as the merger's commit, with the merged commit's id | Walk the merged branch's commits to find the original author | The feed says only the merger; walking a merged branch per entry is unbounded reads for one row. E62 is to name the commits that changed the entity wherever they were made |
@@ -183,4 +185,9 @@ Not in this spec: the per-field Revert of the review (study, Appendix A), and st
 
 ## Corrections
 
-None yet.
+- 2026-11-19, review of #146: an older window stopped only at a block of the window above's
+  first commit, which a type-filtered feed need not send; windows are now bounded by the
+  listing's ids. The tab now reads again on a new credential, says when the schema could not
+  be read rather than waiting, does not call a read that stopped short empty, reads a moved
+  relationship's end from the image that names the node, and History's search takes in counts
+  read after it; relationship property rows name their setters too.

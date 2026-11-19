@@ -146,14 +146,20 @@ fn touched_by(changes: &[EntityChangeOutput]) -> (Vec<Touched>, usize) {
         }
     }
     let nodes = seen.len();
+    // Both images': a relationship moved from one node to another touched both.
     for change in changes {
-        let image = change.after.as_ref().or(change.before.as_ref());
-        let ends = image
-            .and_then(|image| image.endpoints.as_ref())
-            .and_then(|ends| Some((ends.get("from")?.as_str()?, ends.get("to")?.as_str()?)));
-        if let Some((from, to)) = ends {
-            take(&mut seen, &mut kept, None, from);
-            take(&mut seen, &mut kept, None, to);
+        for image in [change.after.as_ref(), change.before.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            let ends = image
+                .endpoints
+                .as_ref()
+                .and_then(|ends| Some((ends.get("from")?.as_str()?, ends.get("to")?.as_str()?)));
+            if let Some((from, to)) = ends {
+                take(&mut seen, &mut kept, None, from);
+                take(&mut seen, &mut kept, None, to);
+            }
         }
     }
     let named = if nodes > 0 { nodes } else { seen.len() };

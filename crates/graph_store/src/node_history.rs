@@ -11,6 +11,8 @@
 //! window goes on from the listing's page token and stops where the window before it began.
 //! Pure functions; the session sends the reads ([`crate::GraphSession::node_history`]).
 
+use std::collections::HashSet;
+
 use gq_language::SchemaModel;
 use graph_client::api::{ChangeBlockOutput, ChangeCauseOutput, EntityChangeOutput, EntityKind};
 
@@ -112,10 +114,9 @@ pub struct NodeHistoryEntry {
 /// Where an older window of a node's history goes on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OlderWindow {
-    /// The commit listing's continuation, for the head the first window resolved.
+    /// The commit listing's continuation, for the head the first window resolved: its page
+    /// names the older window's commits.
     pub page_token: String,
-    /// The oldest commit read so far: the older window stops before it.
-    pub until: String,
 }
 
 /// What a window of a node's history may read: the first, from the branch head, or an older
@@ -143,28 +144,32 @@ pub struct NodeHistoryPage {
 }
 
 /// Folds feed pages into a window's entries, keeping the commits that touched the node.
+///
+/// A window is the commits its listing page named, and nothing else: the feed starts just
+/// before the oldest of them, and the first block of a commit the page did not name is past
+/// the window (the head the first window resolved, or the window above an older one), which
+/// ends it. The bound does not rest on the feed sending a block for every commit, which a feed
+/// filtered by type need not do.
 #[derive(Debug)]
 pub struct NodeHistoryFold {
     scope: NodeScope,
-    /// The commit the window ends at, inclusive: the head for the first window.
-    last: Option<String>,
-    /// The commit the window ends before: where the window above it began.
-    before: Option<String>,
+    /// The commits the window's listing page named.
+    window: HashSet<String>,
     /// Entries oldest first, as the feed reads.
     entries: Vec<NodeHistoryEntry>,
-    commits: usize,
+    /// The window's commits whose blocks were read.
+    read: usize,
     done: bool,
 }
 
 impl NodeHistoryFold {
-    /// A fold that ends at commit `last` (inclusive), or before commit `before`.
-    pub fn new(scope: NodeScope, last: Option<String>, before: Option<String>) -> Self {
+    /// A fold of the window of `commits`, the ids a listing page named.
+    pub fn new(scope: NodeScope, commits: impl IntoIterator<Item = String>) -> Self {
         Self {
             scope,
-            last,
-            before,
+            window: commits.into_iter().collect(),
             entries: Vec::new(),
-            commits: 0,
+            read: 0,
             done: false,
         }
     }
@@ -176,13 +181,13 @@ impl NodeHistoryFold {
                 break;
             }
             let ChangeBlockOutput { cause, changes } = block;
-            if self.before.as_deref() == Some(cause.graph_commit_id.as_str()) {
+            if !self.window.contains(&cause.graph_commit_id) {
                 self.done = true;
                 break;
             }
-            self.commits += 1;
+            self.read += 1;
             self.take(&cause, changes);
-            if self.last.as_deref() == Some(cause.graph_commit_id.as_str()) {
+            if self.read == self.window.len() {
                 self.done = true;
             }
         }
@@ -233,16 +238,29 @@ impl NodeHistoryFold {
         self.done
     }
 
-    /// Whether no commit was read yet.
-    pub fn is_empty(&self) -> bool {
-        self.commits == 0
+    /// The feed was read to the branch's head: the window's commits it sent no block for
+    /// changed none of the node's types, so the window is read to its end.
+    pub fn caught_up(&mut self) {
+        self.done = true;
     }
 
-    /// The window's entries, newest first, and the commits it covered.
+    /// Whether no commit was read yet.
+    pub fn is_empty(&self) -> bool {
+        self.read == 0
+    }
+
+    /// The window's entries, newest first, and the commits it covered: all of them once it
+    /// was read to its end, since a feed filtered by type may send no block for a commit that
+    /// changed none of the types.
     pub fn finish(self) -> (Vec<NodeHistoryEntry>, usize) {
         let mut entries = self.entries;
         entries.reverse();
-        (entries, self.commits)
+        let commits = if self.done {
+            self.window.len()
+        } else {
+            self.read
+        };
+        (entries, commits)
     }
 }
 
@@ -299,7 +317,8 @@ mod tests {
     /// it began are left out.
     #[test]
     fn a_window_keeps_the_commits_that_touched_the_node() {
-        let mut fold = NodeHistoryFold::new(scope(), Some("c4".into()), None);
+        let window = ["c1", "c2", "c3", "c4"].map(String::from);
+        let mut fold = NodeHistoryFold::new(scope(), window);
         let done = fold.page(vec![
             block(
                 "c1",
@@ -349,7 +368,7 @@ mod tests {
                 )]),
             ),
         ]);
-        assert!(done, "the window ends at its head");
+        assert!(done, "c5 is past the window");
         let (entries, commits) = fold.finish();
         assert_eq!(commits, 4, "c5 is past the head the window was read at");
         let read: Vec<(&str, Option<&str>, bool, usize)> = entries
@@ -375,7 +394,7 @@ mod tests {
     /// An older window ends where the window above it began.
     #[test]
     fn an_older_window_stops_before_the_window_above() {
-        let mut fold = NodeHistoryFold::new(scope(), None, Some("c2".into()));
+        let mut fold = NodeHistoryFold::new(scope(), ["c1".to_owned()]);
         let done = fold.page(vec![
             block(
                 "c1",
@@ -399,6 +418,32 @@ mod tests {
         assert!(done);
         let (entries, commits) = fold.finish();
         assert_eq!(commits, 1);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].commit, "c1");
+    }
+
+    /// A feed filtered by type may send no block for a commit that changed none of the types:
+    /// the window still ends at the first commit past it, never on a commit it waits for.
+    #[test]
+    fn a_window_ends_without_a_block_for_every_commit() {
+        let window = ["c1", "c2", "c3"].map(String::from);
+        let mut fold = NodeHistoryFold::new(scope(), window);
+        let lk = |n: &str| {
+            json!([issue(
+                "lk-acl",
+                json!({"status": "open"}),
+                json!({"status": n})
+            )])
+        };
+        // c2 and c3 changed no type of the node, and their blocks are not sent; c4 is the
+        // window above's.
+        let done = fold.page(vec![
+            block("c1", "act-writer", lk("closed")),
+            block("c4", "act-writer", lk("deferred")),
+        ]);
+        assert!(done);
+        let (entries, commits) = fold.finish();
+        assert_eq!(commits, 3, "the window's commits, read to its end");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].commit, "c1");
     }
