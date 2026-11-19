@@ -538,9 +538,10 @@ pub struct NodePeek {
     group_menu: Option<(Entity<ContextMenu>, gpui::Point<Pixels>, Subscription)>,
     /// The type's relationships in the person's order, by key, as its layout last said.
     layout_order: Vec<String>,
-    /// The group of the related node the person selected on a page, which the keys that move,
-    /// name or fold a relationship act on.
-    selected_group: Option<usize>,
+    /// The group of the related node the person selected on a page, by its relationship key,
+    /// which the keys that move, name or fold a relationship act on: a fold makes the groups
+    /// again, so a place would name another.
+    selected_group: Option<String>,
     _subscription: Subscription,
     /// The view's keyboard: ⌘S saves its drafts while it, or a field in it, has it. A page hands
     /// its focus here ([`crate::node_page::NodePage`]), so the keys reach the view with no field
@@ -5360,7 +5361,10 @@ impl NodePeek {
                                             window.dispatch_action(Box::new(open), cx);
                                         } else {
                                             this.select_related(&ty, &id, cx);
-                                            this.selected_group = Some(index);
+                                            this.selected_group = this
+                                                .groups
+                                                .get(index)
+                                                .map(|g| builder::relationship_key(&g.group));
                                         }
                                     },
                                 ))
@@ -6221,7 +6225,15 @@ impl NodePeek {
     fn selected_group(&self) -> Option<usize> {
         // The group of the row the person clicked, while that node is still selected: a node
         // can be in more than one group.
-        let index = self.selected_group?;
+        // Folded or unfolded since it was clicked, the relationship is the same edge read the
+        // other way: `out:Knows` is now `both:Knows`, or the reverse.
+        let key = self.selected_group.as_deref()?;
+        let index = self.index_of(key).or_else(|| {
+            let (_, edge) = builder::parse_relationship_key(key)?;
+            ["both", "out", "in"]
+                .iter()
+                .find_map(|way| self.index_of(&format!("{way}:{edge}")))
+        })?;
         let (type_name, id) = self.selected.as_ref()?;
         let group = self.groups.get(index)?;
         (group.group.other_type == *type_name

@@ -265,3 +265,5 @@ The lead and the line are chosen in the layout menu, which ⌘⌥L opens and the
   not the one clicked; ↵ on a read-only table's card did nothing; a lead that is not text hid a
   card's text; moving to the top, naming and folding had no keys. Each is fixed as described
   above.
+- 2026-11-19, review of #154 · The selected group was kept by its place, which a fold renumbers;
+  it is kept by its relationship key, and found again folded or unfolded.
