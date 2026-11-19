@@ -434,6 +434,7 @@ mod tests {
                 "studio.window_style",
                 "studio.corner_radius",
                 "studio.bottom_dock_layout",
+                "studio.reduce_motion",
                 "studio.type_table_page_size",
                 "studio.tree_page_size",
                 "studio.canvas_max_nodes",

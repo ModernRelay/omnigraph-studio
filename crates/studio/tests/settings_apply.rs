@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use gpui::HeadlessAppContext;
-use studio_settings::{StudioSettings, ThemeMode};
+use studio_settings::{ReduceMotion, StudioSettings, ThemeMode};
 use theme::ActiveTheme as _;
 
 fn main() {
@@ -37,6 +37,8 @@ fn main() {
     println!("test settings_choose_the_active_theme ... ok");
     a_change_keeps_the_persons_text(&mut cx, &data);
     println!("test a_change_keeps_the_persons_text ... ok");
+    reduce_motion_reaches_every_animation(&mut cx);
+    println!("test reduce_motion_reaches_every_animation ... ok");
     std::fs::remove_dir_all(&data).ok();
 }
 
@@ -145,4 +147,18 @@ fn a_change_keeps_the_persons_text(cx: &mut HeadlessAppContext, data: &Path) {
 fn settle(cx: &mut HeadlessAppContext) {
     studio_settings::writes_done();
     cx.run_until_parked();
+}
+
+/// `studio.reduce_motion` sets GPUI's `reduce_motion`, which the canvas's glides, dialogs,
+/// toasts and spinners read: On keeps everything still and Off moves it, whatever the system
+/// asks; System asks the system.
+fn reduce_motion_reaches_every_animation(cx: &mut HeadlessAppContext) {
+    let app = cx.update(|cx| cx.to_async());
+    for (choice, reduced) in [(ReduceMotion::On, true), (ReduceMotion::Off, false)] {
+        app.update(|cx| studio_settings::update(cx, |s| s.studio.reduce_motion = choice));
+        settle(cx);
+        assert_eq!(cx.update(|cx| cx.reduce_motion()), reduced, "{choice:?}");
+    }
+    app.update(|cx| studio_settings::update(cx, |s| s.studio.reduce_motion = ReduceMotion::System));
+    settle(cx);
 }

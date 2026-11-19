@@ -13,6 +13,7 @@ pub mod logging;
 mod menus;
 mod open_graph;
 mod organizations;
+mod reduce_motion;
 mod settings_view;
 mod ui_tools;
 #[cfg(test)]
@@ -45,6 +46,8 @@ pub use open_graph::OpenGraphModal;
 pub fn init(cx: &mut App) {
     studio_theme::init_settings_store(cx);
     studio_settings::init(cx);
+    // Before anything draws, so nothing moves that the person asked to keep still.
+    reduce_motion::init(cx);
     studio_theme::init_themes(cx);
     editor::init(cx);
     graph_store::init(cx);

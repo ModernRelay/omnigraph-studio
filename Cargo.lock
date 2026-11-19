@@ -9522,6 +9522,7 @@ dependencies = [
  "libc",
  "log",
  "menu",
+ "objc2-app-kit 0.3.2",
  "query_editor",
  "relationship_tree",
  "review",
@@ -9542,6 +9543,7 @@ dependencies = [
  "ui",
  "ui_tool_server",
  "url",
+ "windows-sys 0.61.2",
  "zlog",
 ]
 

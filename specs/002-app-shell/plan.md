@@ -1016,6 +1016,14 @@ than styling one-off elements.
 Palette, J/K, cell cursor and tab switches never animate. Dialogs and toasts come up with a
 120–180 ms ease-out and leave faster. Reduced motion keeps fades only.
 
+- **Reduced motion** is the `studio.reduce_motion` setting ("Reduce motion", Appearance):
+  `system` (the default) follows the system's accessibility setting (macOS: Reduce motion;
+  Windows: Animation effects off; Linux: `org.gnome.desktop.interface enable-animations`
+  through `gsettings`), read at launch, when the setting changes and when a window comes to the
+  front; `on` and `off` choose whatever the system says. Studio sets GPUI's `reduce_motion`
+  from it (`crates/studio/src/reduce_motion.rs`), which every animation reads. GPUI reads no
+  system setting itself, so until 2026-11-19 nothing set it and Studio always moved.
+
 - **A dialog** (`ModalPlacement::Dialog`): its dim and card fade in over `motion::ENTER`
   (150 ms, out-cubic) as the card settles 6 px down into place. Focus is in it from the first
   frame, so typing never waits. It goes in one frame. The palette opens and closes in one.

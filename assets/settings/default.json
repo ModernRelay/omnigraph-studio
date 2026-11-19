@@ -13,6 +13,7 @@
     "window_style": "flat",
     "corner_radius": 10,
     "bottom_dock_layout": "contained",
+    "reduce_motion": "system",
     "type_table_page_size": 100,
     "tree_page_size": 50,
     "canvas_max_nodes": 2000,
