@@ -271,6 +271,17 @@ impl GraphCanvas {
                     to: pair(to),
                     relationship: None,
                 }),
+                // A branch's changed relationship (spec 042): from the node its pill hangs off
+                // to the node beyond it.
+                (SceneKind::Link { .. }, Some(to)) => {
+                    if let Some(from) = scene.nodes[edge.from].parent.and_then(node_of) {
+                        edges.push(OutlineEdge {
+                            from: pair(from),
+                            to: pair(to),
+                            relationship: None,
+                        });
+                    }
+                }
                 _ => {}
             }
         }
@@ -309,6 +320,10 @@ impl GraphCanvas {
                     "kind": if matches!(id, SceneId::Hub(_)) { "relationship" } else { "more" },
                     "node": { "type_name": key.node.type_name, "id": key.node.id },
                     "relationship": graph_store::relationship_key(&key.group),
+                }),
+                SceneId::Link(_) => json!({
+                    "kind": "changed_relationship",
+                    "label": label,
                 }),
             }
         });

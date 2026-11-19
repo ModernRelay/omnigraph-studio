@@ -39,7 +39,8 @@ use studio_actions::canvas::{
     WalkForward, ZoomIn, ZoomOut,
 };
 use studio_actions::graph::{
-    OpenMap, OpenNodePage, OpenType, ShowNodeInTree, ShowNodeOnCanvas, ShowResultsOnCanvas,
+    ChangeLink, ChangeMark, OpenBranch, OpenBranchHistory, OpenMap, OpenNodePage, OpenType,
+    ShowChangeOnCanvas, ShowNodeInTree, ShowNodeOnCanvas, ShowResultsOnCanvas,
 };
 use studio_actions::{ViewKind, ViewLink};
 use studio_settings::StudioSettings;
@@ -60,6 +61,9 @@ const ZOOM_STEP: f32 = 1.25;
 /// The furthest a schema canvas zooms out on its own to show what an expansion opened:
 /// further, its names are too small to read.
 const REVEAL_MIN_ZOOM: f32 = 0.55;
+/// The furthest a change's canvas opens zoomed out (spec 042): its chips still show their
+/// names (`paint::MARK_ONLY_BELOW`), which are what a reviewer reads.
+const CHANGE_MIN_ZOOM: f32 = 0.8;
 /// The room kept between what an expansion shows and the canvas's edges, in screen pixels:
 /// the floating controls stand there.
 const REVEAL_MARGIN: f32 = 64.;
@@ -121,6 +125,23 @@ pub fn init(cx: &mut App) {
                 cx,
                 move |_, cx| GraphCanvas::with_results(session, &action, cx),
             );
+        });
+        // A branch's change as a graph (spec 042): one tab per review, which a showing of the
+        // review at another head redraws.
+        workspace.register_action(|workspace, action: &ShowChangeOnCanvas, window, cx| {
+            let Some(session) = workspace.session().cloned() else {
+                return;
+            };
+            workspace.keep_active_tab(cx);
+            let key = change_key(&session.read(cx).graph_id, &action.branch, &action.target);
+            let opened = action.clone();
+            let canvas =
+                workspace.open_item_with::<GraphCanvas>(key, false, window, cx, move |_, cx| {
+                    GraphCanvas::with_change(session, &opened, cx)
+                });
+            if let Some(canvas) = canvas {
+                canvas.update(cx, |canvas, cx| canvas.show_change(action, cx));
+            }
         });
         workspace.register_action(|workspace, action: &OpenMap, window, cx| {
             open_ontology(workspace, action.preview, window, cx);
@@ -186,6 +207,11 @@ fn adopt_positions(
     });
 }
 
+/// The dedupe key of a branch's change on a canvas: one tab per review.
+fn change_key(graph_id: &str, branch: &str, target: &str) -> SharedString {
+    format!("canvas-change:{graph_id}:{branch}->{target}").into()
+}
+
 fn canvas_key(graph_id: &str, root: &NodeRef, at_commit: Option<&str>) -> SharedString {
     let key = format!("canvas:{graph_id}:{}:{}", root.type_name, root.id);
     match at_commit {
@@ -201,6 +227,8 @@ enum Mode {
     Results,
     /// The schema's types, walked from one ([`schema_walk`]).
     Schema,
+    /// A branch's change as a graph, drawn from its review (spec 042).
+    Change,
 }
 
 /// Asked of the page holding a schema canvas: show a type's description and properties.
@@ -215,6 +243,83 @@ struct ResultsData {
     links: Vec<(usize, usize)>,
     /// The commit the result was read at, when its query was held at one.
     at_commit: Option<String>,
+    /// For a branch's change (spec 042): what the branch did to each node and the
+    /// relationships it changed between them. `nodes` holds the change's nodes then.
+    change: Option<ChangeData>,
+}
+
+/// What a change's canvas draws beyond its nodes (spec 042).
+#[derive(Debug, Clone, PartialEq)]
+struct ChangeData {
+    branch: String,
+    target: String,
+    /// Where a node the branch removed is read: it is gone at the head the canvas holds.
+    fork: Option<String>,
+    marks: Vec<Option<ChangeMark>>,
+    links: Vec<ChangeLink>,
+    not_drawn: usize,
+}
+
+impl ChangeData {
+    /// The change's nodes, and what it holds beyond them, from what the review asked to draw.
+    fn of(action: &ShowChangeOnCanvas) -> (Vec<(NodeRef, Option<String>)>, Self) {
+        let nodes = action
+            .nodes
+            .iter()
+            .map(|n| {
+                (
+                    NodeRef::new(n.type_name.clone(), n.id.clone()),
+                    n.label.clone(),
+                )
+            })
+            .collect();
+        (
+            nodes,
+            Self {
+                branch: action.branch.clone(),
+                target: action.target.clone(),
+                fork: action.fork.clone(),
+                marks: action.nodes.iter().map(|n| n.change).collect(),
+                links: action.links.clone(),
+                not_drawn: action.not_drawn,
+            },
+        )
+    }
+
+    /// The change's nodes as [`model::change_scene`] takes them.
+    fn nodes(&self, nodes: &[(NodeRef, Option<String>)]) -> Vec<studio_actions::graph::ChangeNode> {
+        nodes
+            .iter()
+            .zip(&self.marks)
+            .map(
+                |((node, label), change)| studio_actions::graph::ChangeNode {
+                    type_name: node.type_name.clone(),
+                    id: node.id.clone(),
+                    label: label.clone(),
+                    change: *change,
+                },
+            )
+            .collect()
+    }
+
+    /// How many nodes and relationships the branch changed, and how many nodes it left as they
+    /// were that its relationships reach: the canvas's summary.
+    fn counts(&self) -> (usize, usize, usize) {
+        let changed = self.marks.iter().filter(|mark| mark.is_some()).count();
+        (changed, self.links.len(), self.marks.len() - changed)
+    }
+}
+
+/// What a change's canvas holds of the change `action` names (spec 042).
+fn change_results(action: &ShowChangeOnCanvas) -> ResultsData {
+    let (nodes, change) = ChangeData::of(action);
+    ResultsData {
+        title: action.branch.clone(),
+        nodes,
+        links: Vec::new(),
+        at_commit: action.at_commit.clone(),
+        change: Some(change),
+    }
 }
 
 /// Results canvases are tabs of their own, one per showing.
@@ -325,7 +430,9 @@ fn pin_key(id: &SceneId) -> Option<String> {
             key.node.id,
             gq_language::builder::relationship_key(&key.group)
         )),
-        SceneId::More(_) | SceneId::Note(_) => None,
+        // A change's pill is numbered by its place among the change's links, which another
+        // reading of the review numbers anew: it is not kept.
+        SceneId::More(_) | SceneId::Note(_) | SceneId::Link(_) => None,
     }
 }
 
@@ -517,7 +624,7 @@ impl Item for GraphCanvas {
     fn view_kind(&self, _cx: &App) -> Option<ViewKind> {
         match self.mode() {
             Mode::Schema => None,
-            Mode::Explore | Mode::Results => Some(ViewKind::Canvas),
+            Mode::Explore | Mode::Results | Mode::Change => Some(ViewKind::Canvas),
         }
     }
 
@@ -546,15 +653,29 @@ impl Item for GraphCanvas {
     /// it shows, which may be behind the head ("Newer data").
     fn inspected(&mut self, cx: &mut Context<Self>) -> Option<Inspected> {
         let node = self.inspected_node()?;
+        let at_commit = self.read_at(&node);
         Some(Inspected::Node(InspectedNode {
             type_name: node.type_name,
             id: node.id,
-            at_commit: self.held_at(),
+            at_commit,
             snapshot: self.exploration.read(cx).pin().map(str::to_owned),
         }))
     }
 
     fn tab_title(&self, cx: &App) -> SharedString {
+        if let Some((_, results)) = &self.results
+            && let Some(change) = &results.change
+        {
+            return match &results.at_commit {
+                Some(commit) => format!(
+                    "Change: {} @ {}",
+                    change.branch,
+                    studio_ui::short_commit_id(commit)
+                )
+                .into(),
+                None => format!("Change: {}", change.branch).into(),
+            };
+        }
         if let Some((_, results)) = &self.results {
             return match &results.at_commit {
                 Some(commit) => {
@@ -578,6 +699,14 @@ impl Item for GraphCanvas {
 
     /// A walk's views. A query's result picture has none: it is that result's, not a thing's.
     fn views(&self, _cx: &App) -> Vec<ViewLink> {
+        // A branch's change is the review's: its strip is the review's (spec 042).
+        if self.mode() == Mode::Change {
+            return vec![
+                ViewLink::to(ViewKind::Review),
+                ViewLink::current(ViewKind::Canvas),
+                ViewLink::to(ViewKind::History),
+            ];
+        }
         if self.walk.is_none() {
             return Vec::new();
         }
@@ -589,6 +718,21 @@ impl Item for GraphCanvas {
     }
 
     fn view_action(&self, kind: ViewKind, _cx: &App) -> Option<Box<dyn gpui::Action>> {
+        if let Some((_, results)) = &self.results
+            && let Some(change) = &results.change
+        {
+            return match kind {
+                ViewKind::Review => Some(Box::new(OpenBranch {
+                    branch: change.branch.clone(),
+                    preview: false,
+                })),
+                ViewKind::History => Some(Box::new(OpenBranchHistory {
+                    branch: change.branch.clone(),
+                    preview: true,
+                })),
+                _ => None,
+            };
+        }
         let (root, at_commit) = self.walk.as_ref()?;
         match kind {
             ViewKind::Page => {
@@ -671,12 +815,20 @@ impl Item for GraphCanvas {
         Some(match self.mode() {
             Mode::Explore => IconName::Crosshair,
             Mode::Results | Mode::Schema => IconName::GitGraph,
+            Mode::Change => IconName::GitBranch,
         })
     }
 
     fn dedupe_key(&self, cx: &App) -> Option<SharedString> {
         match (&self.results, &self.walk) {
-            (Some((seq, _)), _) => Some(format!("canvas-results:{seq}").into()),
+            (Some((seq, results)), _) => Some(match &results.change {
+                Some(change) => change_key(
+                    &self.session.read(cx).graph_id,
+                    &change.branch,
+                    &change.target,
+                ),
+                None => format!("canvas-results:{seq}").into(),
+            }),
             (None, Some((root, at_commit))) => Some(canvas_key(
                 &self.session.read(cx).graph_id,
                 root,
@@ -713,7 +865,13 @@ impl GraphCanvas {
     /// What the canvas draws: a query's result nodes when it was opened with them (whether or
     /// not they are laid out yet), else the walk from a node.
     fn mode(&self) -> Mode {
-        if self.results.is_some() {
+        if self
+            .results
+            .as_ref()
+            .is_some_and(|(_, results)| results.change.is_some())
+        {
+            Mode::Change
+        } else if self.results.is_some() {
             Mode::Results
         } else if self.schema_walk.is_some() {
             Mode::Schema
@@ -896,6 +1054,7 @@ impl GraphCanvas {
             nodes,
             links: action.links.clone(),
             at_commit: action.at_commit.clone(),
+            change: None,
         });
         let exploration = Exploration::unrooted(&session, cx);
         Self::build(
@@ -906,6 +1065,51 @@ impl GraphCanvas {
             HashMap::new(),
             cx,
         )
+    }
+
+    /// A canvas of a branch's change (spec 042), held at the reviewed head.
+    fn with_change(
+        session: Entity<GraphSession>,
+        action: &ShowChangeOnCanvas,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let seq = NEXT_RESULTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let exploration = Exploration::unrooted(&session, cx);
+        Self::build(
+            session,
+            exploration,
+            None,
+            Some((seq, Arc::new(change_results(action)))),
+            HashMap::new(),
+            cx,
+        )
+    }
+
+    /// Draws the change `action` names in place of the one drawn, when it is another: the
+    /// review was read again, at another head. The places of the chips drawn before stay
+    /// (constitution V); what is new is laid out beside them.
+    fn show_change(&mut self, action: &ShowChangeOnCanvas, cx: &mut Context<Self>) {
+        let results = change_results(action);
+        let Some((seq, drawn)) = &self.results else {
+            return;
+        };
+        if drawn.change == results.change
+            && drawn.nodes == results.nodes
+            && drawn.at_commit == results.at_commit
+        {
+            return;
+        }
+        self.results = Some((*seq, Arc::new(results)));
+        if self
+            .selected
+            .as_ref()
+            .is_some_and(|id| matches!(id, SceneId::Link(_)))
+        {
+            // A link's index is its place among the change's: another change numbers them anew.
+            self.selected = None;
+        }
+        cx.emit(ItemEvent::UpdateTab);
+        self.rebuild(cx);
     }
 
     /// A canvas of the schema's types, walked from `root` expanded, or with every type expanded
@@ -967,6 +1171,48 @@ impl GraphCanvas {
             (None, Some((_, results))) => results.at_commit.clone(),
             (None, None) => None,
         }
+    }
+
+    /// What a change's canvas holds, for its summary: the branch, the nodes and relationships it
+    /// changed and the nodes they reach that it left as they were, and what it cannot draw.
+    fn change_summary(&self) -> String {
+        let Some((_, results)) = &self.results else {
+            return String::new();
+        };
+        let Some(change) = &results.change else {
+            return String::new();
+        };
+        let (changed, links, anchors) = change.counts();
+        let mut parts = vec![
+            change.branch.clone(),
+            format!("{} changed", studio_ui::plural(changed, "node", "nodes")),
+            studio_ui::plural(links, "relationship", "relationships"),
+        ];
+        if anchors > 0 {
+            parts.push(format!(
+                "{} as they were",
+                studio_ui::plural(anchors, "end", "ends")
+            ));
+        }
+        if change.not_drawn > 0 {
+            parts.push(format!(
+                "{} not drawn",
+                studio_ui::group_digits(change.not_drawn)
+            ));
+        }
+        parts.join(" · ")
+    }
+
+    /// Where `node` is read, opened or inspected from this canvas: at the commit it holds, but a
+    /// node a branch removed at the fork, as it is gone at the head a change's canvas holds.
+    fn read_at(&self, node: &NodeRef) -> Option<String> {
+        if let Some((_, results)) = &self.results
+            && let Some(change) = &results.change
+            && self.scene.marks.get(&SceneId::Node(node.clone())) == Some(&ChangeMark::Removed)
+        {
+            return change.fork.clone();
+        }
+        self.held_at()
     }
 
     /// The explorer's scene as the exploration stands, under the node cap; none without a
@@ -1042,7 +1288,10 @@ impl GraphCanvas {
             return;
         }
         if let Some((_, results)) = self.results.clone() {
-            self.rebuild_results(&results, cx);
+            match &results.change {
+                Some(change) => self.rebuild_change(&results, change, cx),
+                None => self.rebuild_results(&results, cx),
+            }
             return;
         }
         if self.schema_walk.is_some() {
@@ -1124,7 +1373,7 @@ impl GraphCanvas {
             .map(|(node, (width, text))| LayoutNode {
                 parent: node.parent,
                 kind: match node.kind {
-                    SceneKind::Hub { .. } => LayoutKind::Hub,
+                    SceneKind::Hub { .. } | SceneKind::Link { .. } => LayoutKind::Hub,
                     // A note ends its node's column, as "+K more" ends a relationship's.
                     SceneKind::More { .. } | SceneKind::Note { .. } => LayoutKind::More,
                     SceneKind::Node { .. } => LayoutKind::Node,
@@ -1266,6 +1515,68 @@ impl GraphCanvas {
             self.fit_pending = true;
         }
         self.layout_key = Some((Mode::Results, None));
+        self.layout_generation += 1;
+        self.lay_out(
+            scene,
+            texts,
+            widths,
+            move || layout::explore_positions(&nodes),
+            cx,
+        );
+    }
+
+    /// Lays out a branch's change (spec 042): each pill hangs off the end it was reached from
+    /// and its other end off it, as a walk's hub and neighbours do; the walks' starts sit on a
+    /// ring, or a grid for many.
+    fn rebuild_change(
+        &mut self,
+        results: &ResultsData,
+        change: &ChangeData,
+        cx: &mut Context<Self>,
+    ) {
+        let scene = model::change_scene(
+            &change.nodes(&results.nodes),
+            &change.links,
+            self.node_cap(cx),
+        );
+        let roots: Vec<usize> = (0..scene.nodes.len())
+            .filter(|i| scene.nodes[*i].parent.is_none())
+            .collect();
+        let mut fixed = vec![None; scene.nodes.len()];
+        for (root, position) in roots.iter().zip(layout::result_root_positions(roots.len())) {
+            fixed[*root] = Some(position);
+        }
+        let (texts, widths) = chip_texts(&scene, &measurer(cx, &self.char_widths));
+        let nodes: Vec<LayoutNode> = scene
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, node)| LayoutNode {
+                parent: node.parent,
+                kind: match node.kind {
+                    SceneKind::Link { .. } => LayoutKind::Hub,
+                    _ => LayoutKind::Node,
+                },
+                space: widths[i],
+                previous: pin_key(&node.id)
+                    .and_then(|key| self.pinned.get(&key).copied())
+                    // A pill is numbered by its place among the change's links, which another
+                    // reading of the review numbers anew: only a node keeps its place.
+                    .or_else(|| {
+                        matches!(node.id, SceneId::Node(_))
+                            .then(|| self.known.get(&node.id).copied())
+                            .flatten()
+                    })
+                    .or(fixed[i]),
+                pinned: None,
+                half_height: paint::chip_half_height(&texts[i]),
+                side: None,
+            })
+            .collect();
+        if self.layout_key.is_none() {
+            self.fit_pending = true;
+        }
+        self.layout_key = Some((Mode::Change, None));
         self.layout_generation += 1;
         self.lay_out(
             scene,
@@ -1532,6 +1843,19 @@ impl GraphCanvas {
         self.fitted_size = Some(viewport.size);
     }
 
+    /// A change's canvas opens where its names can be read (spec 042): a change too wide to fit
+    /// at [`CHANGE_MIN_ZOOM`] is shown at it, from where its walk starts, the node most of its
+    /// relationships meet. Fit, asked for, still fits it whole.
+    fn keep_change_readable(&mut self) {
+        if self.mode() != Mode::Change || self.zoom >= CHANGE_MIN_ZOOM {
+            return;
+        }
+        self.zoom = CHANGE_MIN_ZOOM;
+        if let Some(start) = self.positions.first() {
+            self.center = *start;
+        }
+    }
+
     /// Moves the view just enough to show the selected chip whole in `viewport`, at the zoom
     /// it has: the canvas's size changed under a view the person placed.
     fn keep_selected_in(&mut self, viewport: Bounds<Pixels>) {
@@ -1611,6 +1935,8 @@ impl GraphCanvas {
         match self.selected.as_ref()? {
             SceneId::Node(node) | SceneId::Note(node) => Some(node.clone()),
             SceneId::Hub(key) | SceneId::More(key) => Some(key.node.clone()),
+            // A relationship a branch changed is shown on its review's card, not here.
+            SceneId::Link(_) => None,
         }
     }
 
@@ -1631,7 +1957,7 @@ impl GraphCanvas {
         self.schema_walk.as_ref()?;
         match self.selected.as_ref()? {
             SceneId::Node(node) => Some(node.type_name.as_str()),
-            SceneId::Hub(_) | SceneId::More(_) | SceneId::Note(_) => None,
+            SceneId::Hub(_) | SceneId::More(_) | SceneId::Note(_) | SceneId::Link(_) => None,
         }
     }
 
@@ -1738,17 +2064,20 @@ impl GraphCanvas {
                     self.exploration.update(cx, |e, cx| e.expand(&path, cx));
                 }
                 None => {
+                    let at_commit = self.read_at(&graph_node);
                     window.dispatch_action(
                         Box::new(OpenNodePage {
                             type_name: graph_node.type_name,
                             id: graph_node.id,
-                            at_commit: self.held_at(),
+                            at_commit,
                             preview: false,
                         }),
                         cx,
                     );
                 }
             },
+            // A changed relationship's pill opens nothing: its ends are the nodes beside it.
+            SceneKind::Link { .. } => {}
             SceneKind::Hub { open, .. } => {
                 if let Some(path) = node.path {
                     if open && !expand_only {
@@ -1802,7 +2131,7 @@ impl GraphCanvas {
                 *self.hub_limits.entry(key).or_insert(HUB_STEP) += HUB_STEP;
             }
             // A schema canvas reads nothing, so it notes nothing.
-            SceneKind::Note { .. } => {}
+            SceneKind::Note { .. } | SceneKind::Link { .. } => {}
         }
         self.rebuild(cx);
     }
@@ -1822,6 +2151,7 @@ impl GraphCanvas {
                     SceneId::Node(node) => &node.type_name,
                     SceneId::Hub(key) | SceneId::More(key) => &key.node.type_name,
                     SceneId::Note(node) => &node.type_name,
+                    SceneId::Link(_) => continue,
                 };
                 walk.collapse(ty);
             }
@@ -2030,7 +2360,7 @@ impl GraphCanvas {
             for &child in children.get(&owner).into_iter().flatten() {
                 let node = &self.scene.nodes[child];
                 let follows = match node.kind {
-                    SceneKind::Hub { .. } => {
+                    SceneKind::Hub { .. } | SceneKind::Link { .. } => {
                         pin_key(&node.id).is_none_or(|key| !self.pinned.contains_key(&key))
                     }
                     // What hangs off it as text, not a chip of its own: "+K more" and the
@@ -2190,7 +2520,7 @@ impl GraphCanvas {
             Box::new(OpenNodePage {
                 type_name: node.type_name.clone(),
                 id: node.id.clone(),
-                at_commit: self.held_at(),
+                at_commit: self.read_at(node),
                 preview: false,
             }),
             cx,
@@ -2389,7 +2719,10 @@ impl GraphCanvas {
             SceneKind::Node { node, .. } => self.session.read(cx).type_naming(&node.type_name),
             _ => None,
         };
-        let at_commit = self.held_at();
+        let at_commit = match &node.kind {
+            SceneKind::Node { node, .. } => self.read_at(node),
+            _ => self.held_at(),
+        };
         ContextMenu::build(window, cx, move |mut menu, _, _| {
             let id = node.id.clone();
             match &node.kind {
@@ -2589,7 +2922,7 @@ impl GraphCanvas {
                         }),
                     );
                 }
-                SceneKind::Note { .. } => {}
+                SceneKind::Note { .. } | SceneKind::Link { .. } => {}
             }
             if pinned {
                 let id = node.id.clone();
@@ -3128,6 +3461,9 @@ impl GraphCanvas {
             grid_dot: studio_ui::ds::surface::grid_dot(cx),
             canvas: studio_ui::ds::surface::canvas(cx),
             hub_dot: studio_ui::ds::surface::canvas_hub(cx),
+            added: Color::Created.color(cx),
+            changed: Color::Modified.color(cx),
+            removed: Color::Deleted.color(cx),
             font: theme::theme_settings(cx).ui_font(cx).clone(),
         };
         let scene = self.scene.clone();
@@ -3189,6 +3525,24 @@ impl GraphCanvas {
     fn render_caption(&self, cx: &mut Context<Self>) -> impl IntoElement {
         // What a click does; the summary at the top says what is drawn.
         let text = caption(self.mode());
+        // A change's canvas says first what its marks mean, each in its colour and never in
+        // colour alone (spec 033), and that an unmarked node is as the branch found it.
+        let legend = (self.mode() == Mode::Change).then(|| {
+            let mark = |kind: studio_ui::ChangeKind, word: &'static str| {
+                h_flex()
+                    .gap(px(space::INLINE))
+                    .child(studio_ui::ds::text::meta(kind.symbol()).color(kind.color()))
+                    .child(studio_ui::ds::text::meta(word).single_line())
+            };
+            h_flex()
+                .gap(px(space::SM))
+                .pl(px(space::MD))
+                .child(mark(studio_ui::ChangeKind::Added, "new"))
+                .child(mark(studio_ui::ChangeKind::Changed, "changed"))
+                .child(mark(studio_ui::ChangeKind::Removed, "removed"))
+                .child(studio_ui::ds::text::meta("unmarked: as it was").single_line())
+                .child(studio_ui::ds::text::meta("·"))
+        });
         // A floating bar as the summary and zoom are: one height, surface and corner.
         studio_ui::ds::float_bar("canvas-caption", cx)
             .absolute()
@@ -3196,9 +3550,11 @@ impl GraphCanvas {
             .left(px(space::EDGE))
             // A press on the caption is not one on a chip drawn under it; a drag passes over it.
             .when(self.drag.is_none(), |caption| caption.occlude())
+            .children(legend)
             .child(
                 div()
                     .px(px(space::MD))
+                    .when(self.mode() == Mode::Change, |d| d.pl(px(space::SM)))
                     .child(studio_ui::ds::text::meta(text).single_line()),
             )
     }
@@ -3279,6 +3635,7 @@ impl GraphCanvas {
             }
             // The root is the picker's label, beside this.
             Mode::Schema => studio_ui::plural(self.node_count, "type", "types"),
+            Mode::Change => self.change_summary(),
         };
         let root_error = match (&state.root_status, self.mode()) {
             (Loadable::Failed(message), Mode::Explore) => Some(message.clone()),
@@ -3513,7 +3870,7 @@ fn chip_texts(
         .nodes
         .iter()
         .map(|node| {
-            let text = paint::chip_text(node, measure);
+            let text = paint::chip_text_marked(node, scene.marks.get(&node.id).copied(), measure);
             let half = paint::chip_width(&text, measure) / 2.;
             (text, half)
         })
@@ -3526,7 +3883,7 @@ fn caption(mode: Mode) -> &'static str {
     match mode {
         Mode::Schema => "click to expand · double-click for details · ⇧-drag to select",
         // A result's node has no walk to expand: a click selects it, a double click opens it.
-        Mode::Results => "click to select · double-click to open · ⇧-drag to select",
+        Mode::Results | Mode::Change => "click to select · double-click to open · ⇧-drag to select",
         Mode::Explore => "click to expand · double-click to open · ⇧-drag to select",
     }
 }
@@ -3614,6 +3971,18 @@ impl Render for GraphCanvas {
             Loadable::Loaded(_) if self.scene.nodes.is_empty() => Some(
                 match self.mode() {
                     Mode::Explore | Mode::Schema => studio_ui::ds::loading_state("Laying out…"),
+                    Mode::Change
+                        if self
+                            .results
+                            .as_ref()
+                            .is_some_and(|(_, results)| !results.nodes.is_empty()) =>
+                    {
+                        studio_ui::ds::loading_state("Laying out…")
+                    }
+                    Mode::Change => studio_ui::ds::empty_state(
+                        IconName::GitBranch,
+                        "No nodes or relationships changed",
+                    ),
                     Mode::Results
                         if self
                             .results
@@ -3663,6 +4032,7 @@ impl Render for GraphCanvas {
                 }
                 self.glide = None;
                 self.fit(viewport);
+                self.keep_change_readable();
             } else if self.drawn_size.is_some_and(|size| size != viewport.size) {
                 // The person placed the view, so it is not fitted again; what is selected
                 // stays in sight, as when the inspector opens beside the canvas.
@@ -3793,6 +4163,7 @@ mod tests {
                 edges: Vec::new(),
                 capped: None,
                 cap: 0,
+                marks: HashMap::new(),
             })
         };
         let before = scene(&["A", "B", "C"]);
@@ -3925,6 +4296,7 @@ mod tests {
             edges: Vec::new(),
             capped: None,
             cap: 0,
+            marks: HashMap::new(),
         }
     }
 
@@ -5075,5 +5447,293 @@ mod tests {
         assert!(caption(Mode::Explore).starts_with("click to expand · double-click to open"));
         assert!(caption(Mode::Results).starts_with("click to select · double-click to open"));
         assert!(caption(Mode::Schema).starts_with("click to expand"));
+        assert!(caption(Mode::Change).starts_with("click to select · double-click to open"));
+    }
+
+    /// An ingest's change, as vcos V2 of the cookbook study found it (spec 042): a meeting the
+    /// agent added, hung on a deal and attended by a person, both as they were, and a signal
+    /// from the meeting supporting an assumption; and a note the branch removed, with no
+    /// relationship.
+    fn ingest_change(head: &str) -> ShowChangeOnCanvas {
+        use studio_actions::graph::{ChangeLink, ChangeNode};
+        let node = |type_name: &str, id: &str, label: &str, change| ChangeNode {
+            type_name: type_name.into(),
+            id: id.into(),
+            label: Some(label.into()),
+            change,
+        };
+        let link = |from, to, words: &str| ChangeLink {
+            from,
+            to,
+            words: words.into(),
+            change: ChangeMark::Added,
+        };
+        ShowChangeOnCanvas {
+            branch: "tentative/ingest".into(),
+            target: "main".into(),
+            at_commit: Some(head.into()),
+            fork: Some("f0".into()),
+            nodes: vec![
+                node("Signal", "s1", "62% gross margin", Some(ChangeMark::Added)),
+                node("Meeting", "m1", "Margin deep-dive", Some(ChangeMark::Added)),
+                node("Deal", "d1", "Helix Series A", None),
+                node("Person", "e1", "Elena Vargas", None),
+                node("Assumption", "a1", "On-prem margin", None),
+                node("Note", "n1", "Old note", Some(ChangeMark::Removed)),
+            ],
+            links: vec![
+                link(1, 2, "about"),
+                link(1, 3, "attended by"),
+                link(0, 4, "supports"),
+                link(0, 1, "from"),
+            ],
+            not_drawn: 0,
+        }
+    }
+
+    /// A branch's change on a canvas (spec 042): each node once, each changed relationship a
+    /// pill between its ends, every changed chip marked with what the branch did (+ ~ −) and
+    /// its anchors not; the walk starts from the node most changed relationships meet; a pill
+    /// says which way its relationship runs. The tab holds the reviewed head and its strip is
+    /// the review's. A node the branch removed is inspected and opened at the fork, the rest at
+    /// the head, and a pill shows nothing in the inspector. Pointing and zooming then draw the
+    /// canvas and wrap no name: a change's chips are made once, with the layout
+    /// (docs/drawing.md). The same change shown again lays out nothing; another, read at a new
+    /// head, is drawn in its place with the nodes drawn before where they were.
+    #[gpui::test]
+    async fn a_change_draws_its_nodes_and_relationships_marked(cx: &mut gpui::TestAppContext) {
+        use gpui::{Modifiers, ScrollDelta};
+        cx.update(studio_theme::init_test);
+        let (session, _served) = graph_store::test_server::followed_session(
+            "node Person {\n  slug: String @key\n  name: String\n}\n",
+            |_| serde_json::json!([]),
+            cx,
+        );
+        cx.run_until_parked();
+        // What was opened, by id, and at which commit.
+        type Opened = Rc<RefCell<Vec<(String, Option<String>)>>>;
+        let opened: Opened = Rc::default();
+        cx.update(|cx| {
+            let heard = opened.clone();
+            cx.on_action(move |action: &OpenNodePage, _| {
+                heard
+                    .borrow_mut()
+                    .push((action.id.clone(), action.at_commit.clone()))
+            });
+        });
+        let change = ingest_change("h1");
+        let (canvas, cx) =
+            cx.add_window_view(|_, cx| GraphCanvas::with_change(session, &change, cx));
+        cx.update(|window, cx| window.focus(&canvas.focus_handle(cx), cx));
+        settle(cx);
+        let node = |type_name: &str, id: &str| SceneId::Node(NodeRef::new(type_name, id));
+        canvas.update(cx, |canvas, cx| {
+            assert_eq!(canvas.mode(), Mode::Change);
+            let scene = canvas.scene.clone();
+            assert_eq!(scene.nodes.len(), 10, "six nodes and four pills");
+            assert_eq!(
+                scene.nodes[0].id,
+                node("Meeting", "m1"),
+                "the walk starts where most changed relationships meet"
+            );
+            assert_eq!(
+                scene
+                    .nodes
+                    .iter()
+                    .filter(|n| matches!(n.kind, SceneKind::Link { .. }))
+                    .count(),
+                4
+            );
+            assert_eq!(
+                scene.marks.get(&node("Meeting", "m1")),
+                Some(&ChangeMark::Added)
+            );
+            assert_eq!(
+                scene.marks.get(&node("Note", "n1")),
+                Some(&ChangeMark::Removed)
+            );
+            assert_eq!(
+                scene.marks.get(&node("Deal", "d1")),
+                None,
+                "an anchor is unmarked"
+            );
+            assert_eq!(scene.marks.get(&SceneId::Link(0)), Some(&ChangeMark::Added));
+            let text = |id: &SceneId| {
+                let at = canvas.index_of(id).expect("drawn");
+                canvas.texts[at]
+                    .rows
+                    .iter()
+                    .flatten()
+                    .map(|(piece, _)| piece.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            assert_eq!(text(&node("Meeting", "m1")), "+ Margin deep-dive");
+            assert_eq!(text(&node("Deal", "d1")), "Helix Series A");
+            assert_eq!(text(&node("Note", "n1")), "− Old note");
+            assert_eq!(
+                text(&SceneId::Link(0)),
+                "+ → about",
+                "from the meeting to the deal"
+            );
+            // The signal's "from" pill hangs off the meeting, which the relationship reaches.
+            assert_eq!(text(&SceneId::Link(3)), "+ ← from");
+            assert_eq!(
+                Item::tab_title(canvas, cx).as_ref(),
+                "Change: tentative/ingest @ h1"
+            );
+            let views: Vec<(ViewKind, bool)> = Item::views(canvas, cx)
+                .into_iter()
+                .map(|link| (link.kind, link.current))
+                .collect();
+            assert_eq!(
+                views,
+                [
+                    (ViewKind::Review, false),
+                    (ViewKind::Canvas, true),
+                    (ViewKind::History, false)
+                ]
+            );
+            assert_eq!(
+                canvas.change_summary(),
+                "tentative/ingest · 3 nodes changed · 4 relationships · 3 ends as they were"
+            );
+            // Where the inspector reads each: the removed note at the fork.
+            let mut inspects = |id: SceneId| {
+                canvas.selected = Some(id);
+                match Item::inspected(canvas, cx) {
+                    Some(Inspected::Node(inspected)) => Some(inspected.at_commit),
+                    _ => None,
+                }
+            };
+            assert_eq!(inspects(node("Note", "n1")), Some(Some("f0".into())));
+            assert_eq!(inspects(node("Deal", "d1")), Some(Some("h1".into())));
+            assert_eq!(inspects(SceneId::Link(0)), None, "a pill inspects nothing");
+            canvas.selected = Some(node("Note", "n1"));
+        });
+        cx.dispatch_action(OpenSelectedPage);
+        cx.run_until_parked();
+        assert_eq!(
+            opened.borrow().as_slice(),
+            [("n1".to_owned(), Some("f0".to_owned()))]
+        );
+        // Fitted, then pointed at and zoomed: drawn again, nothing wrapped or laid out.
+        canvas.update_in(cx, |canvas, window, cx| {
+            canvas.glide = None;
+            canvas.appear.clear();
+            canvas.fit(canvas.viewport(window));
+            cx.notify();
+        });
+        settle(cx);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let rects: Vec<Bounds<Pixels>> = canvas.read_with(cx, |canvas, _| {
+            canvas
+                .chips
+                .borrow()
+                .iter()
+                .copied()
+                .filter(|rect| rect.size.width > px(0.))
+                .collect()
+        });
+        assert_eq!(rects.len(), 10, "every chip is drawn");
+        let (made, generation, renders) = canvas.read_with(cx, |canvas, _| {
+            (
+                paint::CHIP_TEXTS_MADE.with(std::cell::Cell::get),
+                canvas.layout_generation,
+                canvas.renders.get(),
+            )
+        });
+        for rect in &rects {
+            cx.simulate_mouse_move(rect.center(), None, Modifiers::none());
+            cx.run_until_parked();
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        cx.simulate_event(ScrollEvent {
+            position: rects[0].center(),
+            delta: ScrollDelta::Pixels(point(px(0.), px(40.))),
+            ..Default::default()
+        });
+        settle(cx);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        canvas.read_with(cx, |canvas, _| {
+            assert!(canvas.renders.get() > renders, "pointing draws the canvas");
+            assert_eq!(canvas.layout_generation, generation, "no layout");
+            assert_eq!(
+                paint::CHIP_TEXTS_MADE.with(std::cell::Cell::get),
+                made,
+                "no name wrapped again"
+            );
+        });
+        // The same change again changes nothing; one read at a new head is drawn in its place,
+        // the nodes drawn before where they were.
+        let deal_at = canvas.read_with(cx, |canvas, _| {
+            canvas.positions[canvas.index_of(&node("Deal", "d1")).unwrap()]
+        });
+        canvas.update(cx, |canvas, cx| {
+            canvas.show_change(&ingest_change("h1"), cx)
+        });
+        settle(cx);
+        canvas.read_with(cx, |canvas, _| {
+            assert_eq!(canvas.layout_generation, generation, "the same change");
+        });
+        let mut newer = ingest_change("h2");
+        newer.links.push(studio_actions::graph::ChangeLink {
+            from: 5,
+            to: 2,
+            words: "about".into(),
+            change: ChangeMark::Removed,
+        });
+        canvas.update(cx, |canvas, cx| canvas.show_change(&newer, cx));
+        settle(cx);
+        canvas.update(cx, |canvas, cx| {
+            assert!(canvas.layout_generation > generation, "drawn again");
+            assert_eq!(
+                canvas.scene.nodes.len(),
+                11,
+                "the note's removed relationship"
+            );
+            assert_eq!(
+                canvas.positions[canvas.index_of(&node("Deal", "d1")).unwrap()],
+                deal_at,
+                "a node drawn before stays where it was"
+            );
+            assert_eq!(
+                Item::tab_title(canvas, cx).as_ref(),
+                "Change: tentative/ingest @ h2"
+            );
+        });
+    }
+
+    /// A change larger than the node cap draws what fits and counts the rest, by the type
+    /// most of them are (spec 006's caps); a pill is drawn only with room for its other end.
+    #[test]
+    fn a_change_past_the_cap_counts_what_it_leaves_out() {
+        let change = ingest_change("h1");
+        let nodes = ChangeData::of(&change).1.nodes(&ChangeData::of(&change).0);
+        let scene = model::change_scene(&nodes, &change.links, 4);
+        assert!(scene.nodes.len() <= 4, "{}", scene.nodes.len());
+        let (hidden, _) = scene.capped.clone().expect("over the cap");
+        let drawn_nodes = scene
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.kind, SceneKind::Node { .. }))
+            .count();
+        assert_eq!(hidden + drawn_nodes, 6, "every node drawn or counted");
+        for (index, chip) in scene.nodes.iter().enumerate() {
+            if matches!(chip.kind, SceneKind::Link { .. }) {
+                assert!(
+                    scene
+                        .edges
+                        .iter()
+                        .filter(|e| e.from == index || e.to == index)
+                        .count()
+                        == 2,
+                    "a pill has both its ends"
+                );
+            }
+        }
+        let whole = model::change_scene(&nodes, &change.links, 100);
+        assert!(whole.capped.is_none());
+        assert_eq!(whole.nodes.len(), 10);
     }
 }

@@ -453,6 +453,57 @@ pub mod graph {
         pub at_commit: Option<String>,
     }
 
+    /// What a branch did to a node or a relationship drawn on its change's canvas (spec 042).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize, Serialize, JsonSchema)]
+    pub enum ChangeMark {
+        Added,
+        Changed,
+        Removed,
+    }
+
+    /// One node of a branch's change as a graph: a node the branch changed (`change`), or one it
+    /// left as it was that a changed relationship reaches, its anchor (`None`).
+    #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
+    pub struct ChangeNode {
+        pub type_name: String,
+        pub id: String,
+        #[serde(default)]
+        pub label: Option<String>,
+        #[serde(default)]
+        pub change: Option<ChangeMark>,
+    }
+
+    /// One relationship the branch added, changed or removed, between two of a change's nodes.
+    #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
+    pub struct ChangeLink {
+        /// Indices into the change's nodes: the edge's source and target.
+        pub from: usize,
+        pub to: usize,
+        /// The edge type in words, as a review card names it.
+        pub words: String,
+        pub change: ChangeMark,
+    }
+
+    /// Draw a branch's change as a graph (spec 042): the nodes it changed, the nodes they
+    /// attach to through the relationships it changed, and those relationships, each marked by
+    /// what the branch did. The canvas holds the reviewed head, read-only.
+    #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = studio_graph)]
+    pub struct ShowChangeOnCanvas {
+        pub branch: String,
+        pub target: String,
+        /// The reviewed head, which the canvas holds and reads its nodes at.
+        pub at_commit: Option<String>,
+        /// The fork, where a node the branch removed is read.
+        #[serde(default)]
+        pub fork: Option<String>,
+        pub nodes: Vec<ChangeNode>,
+        pub links: Vec<ChangeLink>,
+        /// Changes the graph leaves out: relationships whose ends the schema does not name.
+        #[serde(default)]
+        pub not_drawn: usize,
+    }
+
     /// Open a Blob value in a tab of its own, read at a commit or the branch head.
     #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
     #[action(namespace = studio_graph)]

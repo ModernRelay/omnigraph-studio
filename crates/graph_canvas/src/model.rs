@@ -7,6 +7,7 @@ use graph_store::{
     Entry, EntryKind, ExplorePath, ExploreState, GroupKey, LoadTarget, Loadable, NodeRef,
     PageStatus,
 };
+use studio_actions::graph::{ChangeLink, ChangeMark, ChangeNode};
 
 /// Neighbours a hub shows before "+K more", and how many each click on it adds.
 pub const HUB_STEP: usize = 8;
@@ -18,6 +19,9 @@ pub enum SceneId {
     More(GroupKey),
     /// What an open node's relationships say while none is drawn.
     Note(NodeRef),
+    /// A relationship a branch changed, on its change's canvas (spec 042): its index among the
+    /// change's links.
+    Link(usize),
 }
 
 /// What is not drawn yet says, in place of it (H5 and H16 in the canvas UX report): an open
@@ -57,6 +61,9 @@ pub enum SceneKind {
     /// What an open node's relationships say while none is drawn: being read, could not be
     /// read (with Retry), or none.
     Note { node: NodeRef, note: Note },
+    /// A relationship a branch changed, as a pill between its two ends (spec 042). `outgoing`
+    /// when the chip it hangs off is the edge's source.
+    Link { outgoing: bool },
 }
 
 impl Note {
@@ -109,6 +116,9 @@ pub struct Scene {
     /// The node cap the scene was built under, which its banner names: a setting changed
     /// since is not this scene's until it is built again.
     pub cap: usize,
+    /// On a change's canvas, what the branch did to each chip it changed (spec 042); a node
+    /// without one is an anchor, which the branch left as it was.
+    pub marks: HashMap<SceneId, ChangeMark>,
 }
 
 /// `scene` without the nodes hidden (`HideNodes`), nor what hangs off them: the chips
@@ -161,6 +171,7 @@ pub fn without(scene: Scene, hidden: &HashSet<NodeRef>) -> Scene {
         edges,
         capped: scene.capped,
         cap: scene.cap,
+        marks: scene.marks,
     }
 }
 
@@ -195,7 +206,7 @@ pub fn open_paths(entries: &[Entry], state: &ExploreState, ids: &[SceneId]) -> V
             SceneId::Hub(key) | SceneId::More(key) => {
                 hubs.insert(key);
             }
-            SceneId::Note(_) => {}
+            SceneId::Note(_) | SceneId::Link(_) => {}
         }
     }
     entries
@@ -259,7 +270,128 @@ pub fn results_scene(
         edges,
         capped,
         cap,
+        marks: HashMap::new(),
     }
+}
+
+/// A branch's change as the canvas draws it (spec 042): each node once, and each changed
+/// relationship as a pill between its ends, so the line reads node, relationship, node. Laid
+/// out as a walk is: from the node most changed relationships meet (the call an ingest hung
+/// everything on), each pill hangs off the end it was reached from and the other end off the
+/// pill; a part no relationship joins starts a walk of its own. A node a second relationship
+/// reaches is drawn once, with a line to it. At most `cap` chips; the nodes left out are
+/// counted, by the type most of them are.
+pub fn change_scene(nodes: &[ChangeNode], links: &[ChangeLink], cap: usize) -> Scene {
+    let mut scene = Scene {
+        cap,
+        ..Scene::default()
+    };
+    let mut touching: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
+    for (index, link) in links.iter().enumerate() {
+        if link.from < nodes.len() && link.to < nodes.len() && link.from != link.to {
+            touching[link.from].push(index);
+            touching[link.to].push(index);
+        }
+    }
+    // Where the walks start: the nodes the most changed relationships meet, then the changed
+    // nodes before their anchors, then as given.
+    let mut starts: Vec<usize> = (0..nodes.len()).collect();
+    starts.sort_by_key(|&index| {
+        (
+            std::cmp::Reverse(touching[index].len()),
+            nodes[index].change.is_none(),
+            index,
+        )
+    });
+    let mut placed: Vec<Option<usize>> = vec![None; nodes.len()];
+    let mut drawn_links = vec![false; links.len()];
+    let node_chip = |node: &ChangeNode, parent: Option<usize>| {
+        let graph_node = NodeRef::new(node.type_name.clone(), node.id.clone());
+        SceneNode {
+            id: SceneId::Node(graph_node.clone()),
+            kind: SceneKind::Node {
+                node: graph_node,
+                root: false,
+                expanded: false,
+            },
+            label: node.label.clone().unwrap_or_else(|| node.id.clone()),
+            color_key: node.type_name.clone(),
+            parent,
+            path: None,
+        }
+    };
+    'walks: for start in starts {
+        if placed[start].is_some() {
+            continue;
+        }
+        if scene.nodes.len() >= cap {
+            break;
+        }
+        placed[start] = Some(scene.nodes.len());
+        scene.nodes.push(node_chip(&nodes[start], None));
+        let mut queue = std::collections::VecDeque::from([start]);
+        while let Some(at) = queue.pop_front() {
+            let Some(here) = placed[at] else { continue };
+            for &index in &touching[at] {
+                if drawn_links[index] {
+                    continue;
+                }
+                let link = &links[index];
+                let outgoing = link.from == at;
+                let other = if outgoing { link.to } else { link.from };
+                // A pill needs room for itself and, unless drawn, its other end.
+                let room = 1 + usize::from(placed[other].is_none());
+                if scene.nodes.len() + room > cap {
+                    break 'walks;
+                }
+                drawn_links[index] = true;
+                let pill = scene.nodes.len();
+                scene.nodes.push(SceneNode {
+                    id: SceneId::Link(index),
+                    kind: SceneKind::Link { outgoing },
+                    label: link.words.clone(),
+                    color_key: String::new(),
+                    parent: Some(here),
+                    path: None,
+                });
+                scene.marks.insert(SceneId::Link(index), link.change);
+                scene.edges.push(SceneEdge {
+                    from: here,
+                    to: pill,
+                });
+                let there = match placed[other] {
+                    Some(there) => there,
+                    None => {
+                        let there = scene.nodes.len();
+                        scene.nodes.push(node_chip(&nodes[other], Some(pill)));
+                        placed[other] = Some(there);
+                        queue.push_back(other);
+                        there
+                    }
+                };
+                scene.edges.push(SceneEdge {
+                    from: pill,
+                    to: there,
+                });
+            }
+        }
+    }
+    for (node, at) in nodes.iter().zip(&placed) {
+        if let (Some(at), Some(mark)) = (at, node.change) {
+            scene.marks.insert(scene.nodes[*at].id.clone(), mark);
+        }
+    }
+    let mut left_out: HashMap<&str, usize> = HashMap::new();
+    for (node, at) in nodes.iter().zip(&placed) {
+        if at.is_none() {
+            *left_out.entry(node.type_name.as_str()).or_default() += 1;
+        }
+    }
+    let hidden: usize = left_out.values().sum();
+    if hidden > 0 {
+        scene.capped = most_left_out(left_out).map(|type_name| (hidden, type_name));
+    }
+    scene
 }
 
 /// The exploration as the canvas draws it. `limits` holds how many neighbours each opened hub
@@ -643,6 +775,7 @@ pub fn explore_scene(
                 SceneId::Node(node) => node.type_name.as_str(),
                 SceneId::Hub(key) | SceneId::More(key) => key.group.other_type.as_str(),
                 SceneId::Note(node) => node.type_name.as_str(),
+                SceneId::Link(_) => continue,
             };
             *counts.entry(type_name).or_default() += 1;
         }

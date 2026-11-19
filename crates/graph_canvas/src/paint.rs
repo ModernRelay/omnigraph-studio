@@ -15,6 +15,8 @@ use gpui::{
 use studio_ui::ds::elevation::Layer;
 use studio_ui::type_color;
 
+use studio_actions::graph::ChangeMark;
+
 use crate::model::{Scene, SceneKind, SceneNode};
 
 pub(crate) struct Palette {
@@ -40,6 +42,11 @@ pub(crate) struct Palette {
     pub canvas: Hsla,
     /// A hub's or "+K more"'s dot from afar.
     pub hub_dot: Hsla,
+    /// What a branch did, on a change's canvas: the marks of the added, changed and removed
+    /// (spec 042), in the colours every change of Studio's carries (spec 033).
+    pub added: Hsla,
+    pub changed: Hsla,
+    pub removed: Hsla,
     pub font: Font,
 }
 
@@ -118,6 +125,8 @@ pub(crate) enum Role {
     Muted,
     /// A read that failed.
     Error,
+    /// What a branch did to the chip's node or relationship (spec 042): its mark, + ~ −.
+    Mark(ChangeMark),
 }
 
 impl Role {
@@ -147,8 +156,29 @@ pub(crate) struct ChipText {
 
 /// What `node`'s chip says, its name wrapped to fit a chip at most [`CHIP_MAX_WIDTH`] wide,
 /// as `measure` measures text (width of a text at a size and weight).
+#[cfg(test)]
 pub(crate) fn chip_text(
     node: &SceneNode,
+    measure: &impl Fn(&str, f32, FontWeight) -> f32,
+) -> ChipText {
+    chip_text_marked(node, None, measure)
+}
+
+/// The symbol of what a branch did, as every change of Studio's marks it (spec 033).
+pub(crate) fn mark_symbol(mark: ChangeMark) -> &'static str {
+    match mark {
+        ChangeMark::Added => "+",
+        ChangeMark::Changed => "~",
+        ChangeMark::Removed => "−",
+    }
+}
+
+/// [`chip_text`], led on a change's canvas by what the branch did to the chip's node or
+/// relationship (`mark`, spec 042): "+ Margin deep-dive", "− about". A removed node's name is
+/// muted, as it is gone at the head the canvas holds.
+pub(crate) fn chip_text_marked(
+    node: &SceneNode,
+    mark: Option<ChangeMark>,
     measure: &impl Fn(&str, f32, FontWeight) -> f32,
 ) -> ChipText {
     #[cfg(test)]
@@ -165,8 +195,17 @@ pub(crate) fn chip_text(
     };
     match &node.kind {
         SceneKind::Node { root, .. } => {
-            let role = if *root { Role::RootName } else { Role::Name };
-            let room = CHIP_MAX_WIDTH - PILL_PAD_X * 2. - PILL_MARK - PILL_GAP;
+            let role = match mark {
+                Some(ChangeMark::Removed) => Role::Muted,
+                _ if *root => Role::RootName,
+                _ => Role::Name,
+            };
+            let symbol = mark.map(|mark| (mark_symbol(mark), Role::Mark(mark)));
+            // The mark stands before the first line, so every line has its room less the mark.
+            let symbol_room = symbol.map_or(0., |(text, role)| {
+                measure(text, CHIP_TEXT, role.weight()) + PILL_GAP
+            });
+            let room = CHIP_MAX_WIDTH - PILL_PAD_X * 2. - PILL_MARK - PILL_GAP - symbol_room;
             let (lines, cut) = wrap_name(&label, room, CHIP_MAX_LINES, &|text: &str| {
                 measure(text, CHIP_TEXT, role.weight())
             });
@@ -175,10 +214,40 @@ pub(crate) fn chip_text(
                 initial,
                 rows: lines
                     .into_iter()
-                    .map(|line| vec![(line.into(), role)])
+                    .enumerate()
+                    .map(|(at, line)| {
+                        symbol
+                            .filter(|_| at == 0)
+                            .map(|(text, role)| (SharedString::from(text), role))
+                            .into_iter()
+                            .chain(std::iter::once((line.into(), role)))
+                            .collect()
+                    })
                     .collect(),
                 size: CHIP_TEXT,
                 cut,
+            }
+        }
+        // "+ about →": what the branch did, the relationship, and which way it runs from the
+        // chip it hangs off.
+        SceneKind::Link { outgoing } => {
+            let arrow = if *outgoing { "→" } else { "←" };
+            let mut row: Vec<(SharedString, Role)> = Vec::new();
+            if let Some(mark) = mark {
+                row.push((mark_symbol(mark).into(), Role::Mark(mark)));
+            }
+            let role = if mark == Some(ChangeMark::Removed) {
+                Role::Muted
+            } else {
+                Role::OpenHub
+            };
+            row.push((format!("{arrow} {label}").into(), role));
+            ChipText {
+                mark: false,
+                initial,
+                rows: vec![row],
+                size: HUB_TEXT,
+                cut: false,
             }
         }
         SceneKind::Hub { open, .. } => {
@@ -381,9 +450,10 @@ pub(crate) fn paint(
         .map(|index| {
             if mark_only(index) {
                 match scene.nodes[index].kind {
-                    SceneKind::Hub { .. } | SceneKind::More { .. } | SceneKind::Note { .. } => {
-                        HUB_DOT
-                    }
+                    SceneKind::Hub { .. }
+                    | SceneKind::More { .. }
+                    | SceneKind::Note { .. }
+                    | SceneKind::Link { .. } => HUB_DOT,
                     SceneKind::Node { .. } => MARK_SIZE / 2.,
                 }
             } else {
@@ -405,6 +475,9 @@ pub(crate) fn paint(
                             Role::Name | Role::RootName | Role::OpenHub => palette.text,
                             Role::Count | Role::Muted => palette.muted,
                             Role::Error => palette.error,
+                            Role::Mark(ChangeMark::Added) => palette.added,
+                            Role::Mark(ChangeMark::Changed) => palette.changed,
+                            Role::Mark(ChangeMark::Removed) => palette.removed,
                         },
                         weight: role.weight(),
                     })
@@ -512,9 +585,10 @@ pub(crate) fn paint(
         let pointed = hovered == Some(index) || lit.contains(&index);
         if mark_only(index) {
             rects[index] = match node.kind {
-                SceneKind::Hub { .. } | SceneKind::More { .. } | SceneKind::Note { .. } => {
-                    paint_dot(p, HUB_DOT, palette.hub_dot, window)
-                }
+                SceneKind::Hub { .. }
+                | SceneKind::More { .. }
+                | SceneKind::Note { .. }
+                | SceneKind::Link { .. } => paint_dot(p, HUB_DOT, palette.hub_dot, window),
                 SceneKind::Node { .. } => {
                     let initial = &texts[index].initial;
                     let line = letters
@@ -645,19 +719,29 @@ fn line_tone(
         && lit.contains(&to)
         && (scene.nodes[from].parent == Some(to) || scene.nodes[to].parent == Some(from));
     let kinds = (&scene.nodes[from].kind, &scene.nodes[to].kind);
-    let hub_link = matches!(kinds.0, SceneKind::Hub { .. } | SceneKind::More { .. })
-        || matches!(kinds.1, SceneKind::Hub { .. } | SceneKind::More { .. });
+    let hub_link = matches!(
+        kinds.0,
+        SceneKind::Hub { .. } | SceneKind::More { .. } | SceneKind::Link { .. }
+    ) || matches!(
+        kinds.1,
+        SceneKind::Hub { .. } | SceneKind::More { .. } | SceneKind::Link { .. }
+    );
     let member = matches!(
         kinds,
-        (SceneKind::Hub { .. }, SceneKind::Node { .. })
-            | (SceneKind::Node { .. }, SceneKind::Hub { .. })
+        (
+            SceneKind::Hub { .. } | SceneKind::Link { .. },
+            SceneKind::Node { .. }
+        ) | (
+            SceneKind::Node { .. },
+            SceneKind::Hub { .. } | SceneKind::Link { .. }
+        )
     ) && edge_is_member(scene, from, to);
     // A line from a hub to a node drawn elsewhere (a second way to it) crosses the canvas
     // where the tree's own lines stay beside their nodes: it is drawn faintest, and lights up
     // with its chips.
     let link = member && {
         let (hub, node) = match kinds.0 {
-            SceneKind::Hub { .. } => (from, to),
+            SceneKind::Hub { .. } | SceneKind::Link { .. } => (from, to),
             _ => (to, from),
         };
         scene.nodes[node].parent != Some(hub)
@@ -675,13 +759,19 @@ fn line_tone(
     } else {
         0.16
     };
+    // A relationship the branch removed hangs on a dotted line too: it is gone at the head.
+    let removed = |index: usize| {
+        matches!(scene.nodes[index].kind, SceneKind::Link { .. })
+            && scene.marks.get(&scene.nodes[index].id) == Some(&ChangeMark::Removed)
+    };
     let dotted = matches!(
         kinds.0,
         SceneKind::More { .. } | SceneKind::Note { .. } | SceneKind::Hub { open: false, .. }
     ) || matches!(
         kinds.1,
         SceneKind::More { .. } | SceneKind::Note { .. } | SceneKind::Hub { open: false, .. }
-    );
+    ) || removed(from)
+        || removed(to);
     Tone {
         alpha: (alpha * 1000.) as u16,
         dotted,
@@ -1303,7 +1393,7 @@ fn paint_dot(at: Point<Pixels>, radius: f32, color: Hsla, window: &mut Window) -
 /// rather than the hub to the node it belongs to.
 fn edge_is_member(scene: &Scene, from: usize, to: usize) -> bool {
     let (hub, node) = match (&scene.nodes[from].kind, &scene.nodes[to].kind) {
-        (SceneKind::Hub { .. }, _) => (from, to),
+        (SceneKind::Hub { .. } | SceneKind::Link { .. }, _) => (from, to),
         _ => (to, from),
     };
     scene.nodes[hub].parent != Some(node)
@@ -1447,6 +1537,7 @@ mod tests {
                 .collect(),
             capped: None,
             cap: 0,
+            marks: HashMap::new(),
         };
         let lit = way_back(&scene, Some(5));
         assert_eq!(lit, HashSet::from([5, 4, 2, 1, 0]));
