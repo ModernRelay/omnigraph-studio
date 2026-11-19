@@ -2266,6 +2266,36 @@ pub fn edge_page_without(
     })
 }
 
+/// The edges of a type that join a node of `from` to a node of `to`, at most `limit`, for
+/// finding an edge the target already has between the same ends (spec 036). Columns:
+/// `edge_id`, `from_id`, `to_id`; the caller keeps the pairs it asked about.
+pub fn edges_between(
+    schema: &SchemaModel,
+    edge_name: &str,
+    from: &[String],
+    to: &[String],
+    limit: u32,
+) -> Result<BuiltQuery, BuildError> {
+    let edge = edge(schema, edge_name)?;
+    let mut params = Params::new();
+    let from = params.add("from", "[String]", Value::from(from.to_vec()));
+    let to = params.add("to", "[String]", Value::from(to.to_vec()));
+    let text = format!(
+        "query studio_edges_between({sig}) {{\n  match {{\n    $a: {source}\n    $a {EDGE_VAR}:{hop} $b\n    $a.@id in {from}\n    $b.@id in {to}\n  }}\n  return {{ {EDGE_VAR}.@id as edge_id, $a.@id as from_id, $b.@id as to_id }}\n  limit {limit}\n}}\n",
+        sig = params.signature(),
+        source = edge.from,
+        hop = edge.traversal(),
+    );
+    Ok(BuiltQuery {
+        name: "studio_edges_between".into(),
+        text,
+        params: params.values,
+        depends: Depends::rows_of(schema, &edge.name, true, &[]),
+        seeds: None,
+        empty_without: None,
+    })
+}
+
 /// How many edges of a type match the filters. An edge binding cannot be counted bare, so this
 /// counts its `@id`.
 pub fn edge_count(
@@ -5373,6 +5403,10 @@ mod tests {
                 first.text
             );
             assert_compiles(&edge_count(&schema, &edge.name, &[]).unwrap());
+            let ids = ["a".to_owned(), "b".to_owned()];
+            let between = edges_between(&schema, &edge.name, &ids, &ids[..1], 500).unwrap();
+            assert_compiles(&between);
+            assert!(between.text.contains("limit 500"), "{}", between.text);
         }
         let filters = [
             Filter {

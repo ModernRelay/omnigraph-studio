@@ -1973,6 +1973,33 @@ impl GraphClient {
         self.read_changes(&["graphs", graph, "diff"], &query).await
     }
 
+    /// [`Self::diff`] of one kind of entity and one kind of change only (`kind`, `op`): the
+    /// edges a branch inserted, for the review's Effect (spec 036).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn diff_of(
+        &self,
+        graph: &str,
+        from: &str,
+        to: &str,
+        kind: Option<crate::api::EntityKind>,
+        op: Option<crate::api::ChangeOp>,
+        page_token: Option<&str>,
+        limit: u32,
+    ) -> Result<DiffOutput, ReadError> {
+        let limit = limit.to_string();
+        let mut query = vec![("from", from), ("to", to), ("limit", limit.as_str())];
+        if let Some(kind) = kind {
+            query.push(("kind", kind.wire()));
+        }
+        if let Some(op) = op {
+            query.push(("op", op.wire()));
+        }
+        if let Some(token) = page_token {
+            query.push(("page_token", token));
+        }
+        self.read_changes(&["graphs", graph, "diff"], &query).await
+    }
+
     /// `GET /graphs/{id}/branches/merge-base`: what a merge of `source` into `target` would
     /// classify against, with both heads.
     pub async fn merge_base(
@@ -2005,6 +2032,7 @@ impl GraphClient {
             target: Some(target.to_owned()),
             delete_branch: false,
             dry_run: true,
+            as_commit: false,
         };
         let raw = self
             .fetch(
@@ -2138,6 +2166,56 @@ impl GraphClient {
             &[],
         )
         .await
+    }
+}
+
+impl GraphClient {
+    /// `POST /graphs/{id}/commits/{commit}/publish`: publishes an unpublished commit onto the
+    /// branch it was written for (R2), sent once like every write. The answer is the published
+    /// commit.
+    pub async fn publish_commit(
+        &self,
+        graph: &str,
+        commit: &str,
+    ) -> WriteOutcome<crate::api::CommitOutput> {
+        self.write(
+            Method::POST,
+            &["graphs", graph, "commits", commit, "publish"],
+            &[],
+            None,
+            &[],
+        )
+        .await
+    }
+
+    /// `DELETE /graphs/{id}/commits/{commit}`: drops an unpublished commit, which no branch
+    /// holds; the server never drops a published one. Answered 204 with no body.
+    pub async fn drop_commit(&self, graph: &str, commit: &str) -> WriteOutcome<()> {
+        let outcome: WriteOutcome<serde::de::IgnoredAny> = match self
+            .send(
+                Method::DELETE,
+                self.url(&["graphs", graph, "commits", commit], &[]),
+                None,
+                &[],
+                WRITE_TIMEOUT,
+            )
+            .await
+        {
+            Ok(mut raw) => {
+                // No body is a success with nothing to read.
+                if raw.status.is_success() && raw.body.is_empty() {
+                    raw.body = b"null".to_vec();
+                }
+                classify_write(raw)
+            }
+            Err(no) => unanswered(no),
+        };
+        match outcome {
+            WriteOutcome::Committed(_) => WriteOutcome::Committed(()),
+            WriteOutcome::Refused(error) => WriteOutcome::Refused(error),
+            WriteOutcome::NotSent { reason } => WriteOutcome::NotSent { reason },
+            WriteOutcome::Unknown { reason } => WriteOutcome::Unknown { reason },
+        }
     }
 }
 
@@ -2771,6 +2849,7 @@ mod tests {
             target: Some("main".into()),
             delete_branch: true,
             dry_run: false,
+            as_commit: false,
         };
         block_on(async {
             at.health().await.ok();
@@ -2791,6 +2870,17 @@ mod tests {
             at.commit(graph, "c1").await.ok();
             at.commit_changes(graph, "c1", None, 10).await.ok();
             at.diff(graph, "c1", "c2", None, 10).await.ok();
+            at.diff_of(
+                graph,
+                "c1",
+                "c2",
+                Some(crate::api::EntityKind::Edge),
+                Some(crate::api::ChangeOp::Insert),
+                None,
+                10,
+            )
+            .await
+            .ok();
             at.merge_base(graph, "feature", "main").await.ok();
             at.merge_preview(graph, "feature", "main").await.ok();
             at.changes(graph, "main", FeedAt::Start("now"), &[], 10)
@@ -2801,6 +2891,8 @@ mod tests {
             let _ = at.create_branch(graph, &create).await;
             let _ = at.delete_branch(graph, "feature").await;
             let _ = at.merge(graph, &merge).await;
+            let _ = at.publish_commit(graph, "c1").await;
+            let _ = at.drop_commit(graph, "c1").await;
             at.blob_head(graph, &cell, BlobAt::Branch("main"))
                 .await
                 .ok();
@@ -2822,7 +2914,7 @@ mod tests {
                     .all(|(part, segment)| part.starts_with('{') || part == segment)
         };
         let sent = sent.lock().unwrap();
-        assert_eq!(sent.len(), 28, "one request per call: {sent:?}");
+        assert_eq!(sent.len(), 31, "one request per call: {sent:?}");
         for (method, path, carried) in sent.iter() {
             let public = path.ends_with("/healthz");
             assert_eq!(*carried, !public, "{method} {path} and the token");

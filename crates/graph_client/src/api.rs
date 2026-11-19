@@ -132,6 +132,16 @@ pub enum EntityKind {
     Edge,
 }
 
+impl EntityKind {
+    /// As a query parameter names it (`kind=edge`).
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Node => "node",
+            Self::Edge => "edge",
+        }
+    }
+}
+
 // ---- query and mutate ----
 
 /// `POST /graphs/{id}/query`. Set `snapshot` to pin a read to a commit (constitution II).
@@ -539,6 +549,10 @@ pub struct BranchMergeRequest {
     /// nothing written. The server reads both branches without the merge's write gate.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub dry_run: bool,
+    /// Leave the merge unpublished (R2): the target's head stays until `commit publish`.
+    /// Refused with `delete_branch` and with `dry_run`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub as_commit: bool,
 }
 
 /// `GET /graphs/{id}/branches/merge-base`: the commit a merge of `source` into `target` would
@@ -725,6 +739,19 @@ pub enum ChangeOp {
     /// An operation a newer server names: the change still decodes, read by its images.
     #[serde(other)]
     Other,
+}
+
+impl ChangeOp {
+    /// As a query parameter names it (`op=insert`); an operation this build does not know
+    /// filters nothing it could name, so it asks for inserts' opposite of nothing: every change.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Insert => "insert",
+            Self::Update => "update",
+            Self::Delete => "delete",
+            Self::Other => "",
+        }
+    }
 }
 
 /// An entity's properties at one side of a change. A null keeps its key; an absent key means
@@ -1092,7 +1119,7 @@ mod contract_tests {
         ),
         (
             "BranchMergeRequest",
-            &["source", "target", "delete_branch", "dry_run"],
+            &["source", "target", "delete_branch", "dry_run", "as_commit"],
         ),
         (
             "BranchMergeOutput",

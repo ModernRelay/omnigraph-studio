@@ -751,6 +751,8 @@ pub struct GraphSession {
     /// A view wanted the catalog ([`Self::want_stored_queries`]): it is read with the graph from
     /// then on, at a reload, a recheck and a new token.
     stored_queries_wanted: bool,
+    /// Each review's Effect (spec 036) while a view holds it ([`Self::effect`]).
+    effects: HashMap<(String, String), gpui::WeakEntity<crate::effect::Effect>>,
     /// Every write's outcome, oldest first: the newest [`OUTCOMES`].
     pub outcomes: Vec<OutcomeEntry>,
     /// How many outcomes were ever logged, those dropped from [`Self::outcomes`] included: a
@@ -983,6 +985,7 @@ impl GraphSession {
             _counts_commit_task: None,
             stored_queries: Loadable::NotLoaded,
             stored_queries_wanted: false,
+            effects: HashMap::new(),
             outcomes: Vec::new(),
             outcomes_logged: 0,
             merges_settled: 0,
@@ -4161,6 +4164,143 @@ impl GraphSession {
         )
     }
 
+    /// One page of the edges inserted from commit `from` to commit `to` (spec 036, the
+    /// Effect's check for an edge the target already has).
+    pub fn inserted_edges(
+        &mut self,
+        from: &str,
+        to: &str,
+        page_token: Option<String>,
+        limit: u32,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<DiffOutput, ReadError>> {
+        let (client, graph) = (self.client(cx), self.graph_id.clone());
+        let (from, to) = (from.to_owned(), to.to_owned());
+        self.counted_read(
+            "inserted_edges",
+            async move {
+                client
+                    .diff_of(
+                        &graph,
+                        &from,
+                        &to,
+                        Some(EntityKind::Edge),
+                        Some(graph_client::api::ChangeOp::Insert),
+                        page_token.as_deref(),
+                        limit,
+                    )
+                    .await
+            },
+            cx,
+        )
+    }
+
+    /// The review's Effect of `branch` against `target` (spec 036): one per pair for the
+    /// session's views, so the review's merge strip and the Effect tab read the same checks.
+    /// Kept while a view holds it.
+    pub fn effect(
+        &mut self,
+        branch: &str,
+        target: &str,
+        cx: &mut Context<Self>,
+    ) -> Entity<crate::effect::Effect> {
+        let key = (branch.to_owned(), target.to_owned());
+        self.effects.retain(|_, effect| effect.upgrade().is_some());
+        if let Some(effect) = self.effects.get(&key).and_then(|e| e.upgrade()) {
+            return effect;
+        }
+        let session = cx.entity();
+        let effect = cx.new(|cx| {
+            crate::effect::Effect::new(session, branch.to_owned(), target.to_owned(), cx)
+        });
+        self.effects.insert(key, effect.downgrade());
+        // What it reads: the catalog, and whether the credential may merge and drop a commit.
+        self.want_stored_queries(cx);
+        self.read_access(AccessScope::branch_into(branch, target), cx);
+        self.read_access(AccessScope::branch(target), cx);
+        effect
+    }
+
+    /// Merges `source` into `target` as an unpublished commit (R2, `as_commit`): `target`'s
+    /// head stays where it is until the commit is published. Sent once and logged like every
+    /// write; the commit it answers is logged as held, not as the target's head.
+    pub fn merge_as_commit(
+        &mut self,
+        source: String,
+        target: String,
+        cx: &mut Context<Self>,
+    ) -> Task<WriteOutcome<BranchMergeOutput>> {
+        let client = self.client(cx);
+        let graph = self.graph_id.clone();
+        let request = BranchMergeRequest {
+            source: source.clone(),
+            target: Some(target.clone()),
+            delete_branch: false,
+            dry_run: false,
+            as_commit: true,
+        };
+        let send = async move { client.merge(&graph, &request).await };
+        self.run_write(
+            send,
+            |output: &BranchMergeOutput| output.commit.as_ref(),
+            move |_, _, _| {
+                WriteLog::new(
+                    target.clone(),
+                    format!("Merge {source} into {target} as an unpublished commit"),
+                )
+            },
+            |_, _, _| {},
+            cx,
+        )
+    }
+
+    /// Publishes an unpublished commit onto `branch`, the branch it was written for, which
+    /// moves that branch's head to it. Sent once and logged like every write.
+    pub fn publish_commit(
+        &mut self,
+        commit: String,
+        branch: String,
+        cx: &mut Context<Self>,
+    ) -> Task<WriteOutcome<CommitOutput>> {
+        let client = self.client(cx);
+        let graph = self.graph_id.clone();
+        let short = studio_ui::short_commit_id(&commit).to_owned();
+        let send = async move { client.publish_commit(&graph, &commit).await };
+        self.run_write(
+            send,
+            |output: &CommitOutput| Some(output),
+            move |_, _, _| WriteLog::new(branch.clone(), format!("Publish {short} onto {branch}")),
+            |_, _, _| {},
+            cx,
+        )
+    }
+
+    /// Drops an unpublished commit, which no branch holds. Sent once and logged like every
+    /// write; it publishes nothing.
+    pub fn drop_commit(
+        &mut self,
+        commit: String,
+        branch: String,
+        cx: &mut Context<Self>,
+    ) -> Task<WriteOutcome<()>> {
+        let client = self.client(cx);
+        let graph = self.graph_id.clone();
+        let short = studio_ui::short_commit_id(&commit).to_owned();
+        let send = async move { client.drop_commit(&graph, &commit).await };
+        self.run_write(
+            send,
+            |_: &()| None,
+            move |_, _, _| {
+                WriteLog::new(
+                    branch.clone(),
+                    format!("Drop the unpublished commit {short}"),
+                )
+            },
+            |_, _, _| {},
+            cx,
+        )
+    }
+
     /// One page of the net changes from commit `from` to commit `to`.
     pub fn diff(
         &mut self,
@@ -4816,6 +4956,7 @@ impl GraphSession {
             target: Some(target.clone()),
             delete_branch,
             dry_run: false,
+            as_commit: false,
         };
         let send = async move { client.merge(&graph, &request).await };
         let (logged_source, logged_target) = (source.clone(), target.clone());

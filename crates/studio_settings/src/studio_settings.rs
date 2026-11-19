@@ -235,6 +235,27 @@ pub struct GraphOverrides {
     /// types are named by their `name`, `title` or key (spec 002, "Node names").
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
+    /// The reads a review's Effect runs at both heads (spec 036), by what they run: a stored
+    /// read's name, or `view:<id>` for a saved view of a stored query. Marked by the person,
+    /// since the catalog says nothing of a query's purpose (E64).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub effect: BTreeMap<String, EffectMark>,
+}
+
+/// What a read is to a review's Effect (spec 036).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectMark {
+    /// A read whose rows the reviewer wants to see move: the queue, a roll-up.
+    Watched,
+    /// A read that should return nothing: rows at the branch head hold the merge behind one
+    /// more key.
+    Check,
+}
+
+/// The key a saved view is marked under in [`GraphOverrides::effect`].
+pub fn effect_view_key(view_id: &str) -> String {
+    format!("view:{view_id}")
 }
 
 /// A named filter, order, grouping and set of columns for one type's table (spec 004), listed
@@ -1022,6 +1043,28 @@ impl StudioSettings {
             .views
             .iter_mut()
             .find(|view| view.key() == id)
+    }
+
+    /// The reads a graph's reviews run (spec 036), by key ([`GraphOverrides::effect`]).
+    pub fn effect_marks(&self, graph: &str) -> BTreeMap<String, EffectMark> {
+        self.graphs
+            .get(graph)
+            .map(|overrides| overrides.effect.clone())
+            .unwrap_or_default()
+    }
+
+    /// Marks a read for a graph's reviews, or takes its mark away with `None`.
+    pub fn set_effect_mark(&mut self, graph: &str, key: &str, mark: Option<EffectMark>) {
+        let marks = &mut self.graphs.entry(graph.to_owned()).or_default().effect;
+        match mark {
+            Some(mark) => {
+                marks.insert(key.to_owned(), mark);
+            }
+            None => {
+                marks.remove(key);
+            }
+        }
+        self.graphs.retain(|_, overrides| !overrides.is_empty());
     }
 
     /// The property chosen to name each type's nodes in a graph, by type.
@@ -1989,6 +2032,20 @@ mod tests {
         assert_eq!(read_clean(&text), settings);
         settings.set_label("dev/knowledge", "Person", None);
         assert!(settings.graphs.is_empty(), "the default is no entry");
+        // A read marked for the graph's reviews (spec 036), by name or saved view.
+        settings.set_effect_mark("dev/knowledge", "ready", Some(EffectMark::Watched));
+        let view = effect_view_key("v1");
+        settings.set_effect_mark("dev/knowledge", &view, Some(EffectMark::Check));
+        let text = serde_json::to_string(&settings).unwrap();
+        assert!(
+            text.contains(r#""effect":{"ready":"watched","view:v1":"check"}"#),
+            "{text}"
+        );
+        assert_eq!(read_clean(&text), settings);
+        assert!(settings.effect_marks("prod/knowledge").is_empty());
+        settings.set_effect_mark("dev/knowledge", "ready", None);
+        settings.set_effect_mark("dev/knowledge", &view, None);
+        assert!(settings.graphs.is_empty(), "no mark is no entry");
     }
 
     #[test]

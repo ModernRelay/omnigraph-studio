@@ -142,6 +142,9 @@ pub struct EdgeType {
     pub properties: Vec<Property>,
     /// What the schema says the relationship is ([`about`]).
     pub about: Option<String>,
+    /// The edge declares `@key(@src, @dst, …)`: inserting the same ends again upserts it.
+    /// Without a key, each insert of the same ends is another edge.
+    pub keyed: bool,
 }
 
 impl EdgeType {
@@ -280,6 +283,7 @@ impl SchemaModel {
                     min: edge.cardinality.min,
                     properties,
                     about: declared(&file, &edge.name).and_then(about),
+                    keyed: !keys.is_empty(),
                 }
             })
             .collect();
@@ -582,6 +586,18 @@ pub(crate) mod tests {
 
     /// Every member of a composite key is a key the server will not let change; the node has
     /// no single key for its id.
+    #[test]
+    fn an_edge_with_a_key_says_so() {
+        let schema = SchemaModel::parse(
+            "node Issue {\n  slug: String @key\n}\nnode Person {\n  slug: String @key\n}\n\
+             edge OwnedBy: Issue -> Person\n\
+             edge Blocks: Issue -> Issue {\n  @key(@src, @dst)\n}\n",
+        )
+        .unwrap();
+        assert!(!schema.edge("OwnedBy").unwrap().keyed);
+        assert!(schema.edge("Blocks").unwrap().keyed);
+    }
+
     #[test]
     fn a_composite_keys_members_are_keys() {
         let schema = SchemaModel::parse(
