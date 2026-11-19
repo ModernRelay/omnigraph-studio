@@ -474,6 +474,9 @@ pub mod graph {
         /// reads the value there and writes on its branch, bound to the value read.
         #[serde(default)]
         pub held: bool,
+        /// Write on this branch, whatever the window's (spec 037); `None` writes the window's.
+        #[serde(default)]
+        pub on_branch: Option<String>,
     }
 
     /// Open one node as a page in its own tab, read at the branch head.
@@ -496,6 +499,10 @@ pub mod graph {
         pub read_at: Option<String>,
         #[serde(default)]
         pub text: Option<String>,
+        /// Read and save on this branch, whatever the window's (spec 037); `None` follows the
+        /// window's.
+        #[serde(default)]
+        pub on_branch: Option<String>,
     }
 
     /// Put back what a delete removed, its nodes and their relationships, in one commit, while

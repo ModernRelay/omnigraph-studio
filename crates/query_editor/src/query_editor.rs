@@ -288,11 +288,16 @@ pub fn init(cx: &mut App) {
         );
         if let Some(editor) = opened {
             let widths = saved_widths(data);
-            let on_branch = text("on_branch");
+            let (on_branch, at_commit) = (text("on_branch"), text("at_commit"));
             editor.update(cx, |editor, cx| {
                 editor.set_column_widths(widths);
+                // Its own branch first: putting the tab on a branch lets a pin go, and the pin
+                // it was saved with comes back after (spec 037).
                 if on_branch.is_some() {
                     editor.set_on_branch(on_branch, cx);
+                    if let Some(commit) = at_commit {
+                        editor.pin_to(commit, cx);
+                    }
                 }
             });
         }

@@ -2239,6 +2239,7 @@ impl NodePeek {
                 .commit(self.snapshot.as_deref())
                 .map(str::to_owned),
             held: self.holds_commit,
+            on_branch: self.own_branch().map(str::to_owned),
         }
     }
 
@@ -2734,7 +2735,7 @@ impl NodePeek {
     /// The property's unsaved value, kept in the session's drafts.
     fn draft_of(&self, name: &str, cx: &App) -> Option<DraftEntry> {
         let key = self.draft_key(name)?;
-        self.session.read(cx).draft(&key).cloned()
+        self.session.read(cx).draft_on(&self.branch, &key).cloned()
     }
 
     /// The node's unsaved values, by property.
@@ -2744,7 +2745,7 @@ impl NodePeek {
         };
         self.session
             .read(cx)
-            .drafts()
+            .drafts_on(&self.branch)
             .filter(|(key, _)| key.type_name == *type_name && key.id == *id)
             .map(|(key, entry)| (key.property.clone(), entry.clone()))
             .collect()
@@ -2787,8 +2788,9 @@ impl NodePeek {
 
     fn put_draft(&mut self, name: &str, old: Value, text: String, cx: &mut Context<Self>) {
         if let Some(key) = self.draft_key(name) {
+            let branch = self.branch.clone();
             self.session.update(cx, |session, cx| {
-                session.set_draft(key, DraftEntry { old, text }, cx)
+                session.set_draft_on(&branch, key, DraftEntry { old, text }, cx)
             });
         }
     }
@@ -2930,6 +2932,7 @@ impl NodePeek {
                 property: name.to_owned(),
                 read_at: self.snapshot.clone(),
                 text: typed,
+                on_branch: self.own_branch().map(str::to_owned),
             }),
             cx,
         );
@@ -3567,7 +3570,9 @@ impl NodePeek {
         };
         let text = adding.editor.read(cx).text(cx).trim().to_owned();
         let other = &group.group.other_type;
-        let search = suggest::search_nodes(&self.session, other, &text, None, cx);
+        // At the head of the branch the view reads, which may be one of its own (spec 037).
+        let head = self.session.read(cx).head(&self.branch).map(str::to_owned);
+        let search = suggest::search_nodes(&self.session, other, &text, head, cx);
         adding._search = Some(cx.spawn(async move |this, cx| {
             let result = search.await;
             this.update(cx, |this, cx| {
@@ -9458,8 +9463,28 @@ mod tests {
             view.save_field("name", window, cx);
         });
         cx.run_until_parked();
-        let sent = sent.lock().unwrap();
-        assert_eq!(sent.len(), 1, "{sent:?}");
-        assert_eq!(sent[0]["branch"], "agent/x");
+        {
+            let sent = sent.lock().unwrap();
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            assert_eq!(sent[0]["branch"], "agent/x");
+        }
+        // Its drafts are its branch's, and so is what its text editor opens on.
+        let key = DraftKey {
+            type_name: "Person".into(),
+            id: "p1".into(),
+            property: "name".into(),
+        };
+        view.update(cx, |view, cx| {
+            view.put_draft("name", json!("Ada Lovelace"), "Ada King".into(), cx);
+            assert_eq!(
+                view.draft_of("name", cx).map(|draft| draft.text),
+                Some("Ada King".into())
+            );
+            assert_eq!(view.node_drafts(cx).len(), 1);
+        });
+        session.read_with(cx, |session, _| {
+            assert!(session.draft_on("agent/x", &key).is_some());
+            assert!(session.draft(&key).is_none(), "none on the window's branch");
+        });
     }
 }

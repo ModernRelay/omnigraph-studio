@@ -26,6 +26,9 @@ pub(crate) struct RowNote {
     fields: Vec<Field>,
     /// The commit the result's rows are held at, which a node opened from here is held at too.
     at_commit: Option<String>,
+    /// The branch the rows were read on when it is the tab's own (spec 037), which a node
+    /// opened from here is on too.
+    on_branch: Option<String>,
 }
 
 struct Field {
@@ -117,7 +120,14 @@ impl RowNote {
             of: table.rows.len(),
             fields,
             at_commit,
+            on_branch: None,
         })
+    }
+
+    /// The note of rows read on the tab's own branch (spec 037): its links open there.
+    pub(crate) fn on_branch(mut self, branch: Option<String>) -> Self {
+        self.on_branch = branch;
+        self
     }
 
     /// What the note says of each column, for a test: its name and its value as text.
@@ -179,13 +189,14 @@ impl Render for RowNote {
                     let open = {
                         let (type_name, id) = (type_name.clone(), id.clone());
                         let at_commit = self.at_commit.clone();
+                        let on_branch = self.on_branch.clone();
                         move |event: &ClickEvent, window: &mut Window, cx: &mut gpui::App| {
                             window.dispatch_action(
                                 Box::new(OpenNodePage {
                                     type_name: type_name.clone(),
                                     id: id.clone(),
                                     at_commit: at_commit.clone(),
-                                    on_branch: None,
+                                    on_branch: on_branch.clone(),
                                     preview: event.click_count() < 2,
                                 }),
                                 cx,

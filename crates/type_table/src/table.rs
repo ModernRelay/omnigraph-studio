@@ -6573,6 +6573,7 @@ impl TypeTable {
                     property: property.name.clone(),
                     read_at: self.paging.pinned.clone(),
                     text: None,
+                    on_branch: None,
                 }),
                 cx,
             );
@@ -8130,6 +8131,7 @@ impl TypeTable {
                 property,
                 read_at: self.paging.pinned.clone(),
                 text: typed,
+                on_branch: None,
             }),
             cx,
         );
@@ -14664,6 +14666,7 @@ mod tests {
                 property: "name".into(),
                 read_at: pinned.clone(),
                 text: None,
+                on_branch: None,
             }]
         );
         table.update_in(cx, |table, window, cx| {

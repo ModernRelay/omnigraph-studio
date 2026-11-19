@@ -50,6 +50,8 @@ pub struct TextEditor {
     /// The branch the value was read on, which saves go to: the window can move to another
     /// branch while text is being written.
     branch: String,
+    /// The editor is on a branch of its own (spec 037), and stays when the window moves.
+    own_branch: bool,
     schema: Option<Arc<SchemaModel>>,
     type_name: String,
     id: String,
@@ -94,6 +96,7 @@ impl TextEditor {
     /// edited at, so saves stay bound to what was read) or the branch head, showing `typed`
     /// when text was typed before it was opened here. Typed text that is the property's draft
     /// on the session's branch is bound, as the draft is, to the value it was typed over.
+    #[cfg(test)]
     #[expect(clippy::too_many_arguments)]
     pub fn new(
         session: Entity<GraphSession>,
@@ -105,6 +108,26 @@ impl TextEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::new_on(
+            session, type_name, id, property, read_at, typed, None, window, cx,
+        )
+    }
+
+    /// [`Self::new`] on `on_branch` when given (spec 037): the editor reads and saves there and
+    /// stays when the window moves to another branch.
+    #[expect(clippy::too_many_arguments)]
+    pub fn new_on(
+        session: Entity<GraphSession>,
+        type_name: String,
+        id: String,
+        property: String,
+        read_at: Option<String>,
+        typed: Option<String>,
+        on_branch: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let own_branch = on_branch.is_some();
         let editor = cx.new(|cx| {
             let mut editor = Editor::multi_line(window, cx);
             editor.set_soft_wrap();
@@ -142,7 +165,7 @@ impl TextEditor {
             }),
         ];
         let schema = session.read(cx).schema_model();
-        let branch = session.read(cx).branch.clone();
+        let branch = on_branch.unwrap_or_else(|| session.read(cx).branch.clone());
         // A draft opened here keeps the value it was typed over, which the session holds with
         // it: the value read now may be one changed elsewhere since, which a save bound to it
         // would overwrite.
@@ -197,6 +220,7 @@ impl TextEditor {
                 }
                 cx.notify();
             } else if let SessionEvent::BranchChanged = event
+                && !this.own_branch
                 && !this.unsaved
                 && this.typed.is_none()
                 && this.read_at.is_none()
@@ -213,6 +237,7 @@ impl TextEditor {
         Self {
             session,
             branch,
+            own_branch,
             schema,
             type_name,
             id,
@@ -642,6 +667,7 @@ impl Item for TextEditor {
                 "type_name": self.type_name,
                 "id": self.id,
                 "property": self.property,
+                "on_branch": self.own_branch.then(|| self.branch.clone()),
             }),
         })
     }

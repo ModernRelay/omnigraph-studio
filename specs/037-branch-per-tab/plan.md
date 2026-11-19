@@ -228,4 +228,16 @@ to <where it lands>", and its row has no hover tooltip, which covered the menu.
 
 ## Corrections
 
-None yet.
+- 2026-11-19, from review of PR #150 (Devin, Cursor Bugbot): an own-branch view still used the
+  window's branch in places, and two quick edits could split.
+  - A peek on its own branch read and typed drafts on the window's branch; they are its own
+    branch's now (`draft_of`, `node_drafts`, `put_draft`).
+  - The Blob and text editors it opens wrote the window's branch; `OpenBlob` and
+    `OpenTextEditor` carry `on_branch`, and the text editor stays there when the window moves.
+  - Its relationship search read the window's head; it searches at its own branch's head.
+  - A query tab's row note opened nodes on the window's branch; it carries the tab's.
+  - A stored-query tab restored with both a branch and a pin lost the pin; the pin is put back
+    after the branch.
+  - An edit sent after a proposal was made but before its first edit landed started a second
+    proposal; such an edit joins the one opening (`opening_proposal`), and its change counts.
+    Guarded by `edits_sent_together_go_to_one_proposal`.

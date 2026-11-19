@@ -84,6 +84,7 @@ pub fn init(cx: &mut App) {
                 property,
                 read_at: None,
                 text: None,
+                on_branch: text("on_branch"),
             };
             open_text_editor(workspace, &action, window, cx);
         }
@@ -119,7 +120,7 @@ pub fn init(cx: &mut App) {
             restore_saved_view(workspace, action, cx);
         });
         workspace.register_action(|workspace, action: &OpenBlob, window, cx| {
-            open_blob(workspace, action, None, window, cx);
+            open_blob(workspace, action, action.on_branch.clone(), window, cx);
         });
         workspace.register_action(|workspace, action: &OpenType, window, cx| {
             let filter = action.filter_id.clone().map(|id| match &action.via {
@@ -603,16 +604,28 @@ fn open_text_editor(
     let Some(session) = workspace.session().cloned() else {
         return;
     };
-    let key = TextEditor::key(&action.type_name, &action.id, &action.property);
+    // An editor asked for on the window's own branch follows the window, as any one does.
+    let on_branch = action
+        .on_branch
+        .clone()
+        .filter(|branch| *branch != session.read(cx).branch);
+    let key = match &on_branch {
+        Some(branch) => format!(
+            "{}~{branch}",
+            TextEditor::key(&action.type_name, &action.id, &action.property)
+        ),
+        None => TextEditor::key(&action.type_name, &action.id, &action.property),
+    };
     let action = action.clone();
     workspace.open_item(key, window, cx, move |window, cx| {
-        TextEditor::new(
+        TextEditor::new_on(
             session,
             action.type_name,
             action.id,
             action.property,
             action.read_at,
             action.text,
+            on_branch,
             window,
             cx,
         )
@@ -680,6 +693,7 @@ fn saved_blob(data: &Value) -> Option<SavedBlob> {
         edge: data.get("edge").and_then(Value::as_bool).unwrap_or(false),
         at_commit: text("at_commit"),
         held: data.get("held")?.as_bool()?,
+        on_branch: None,
     };
     let held = open.held && open.at_commit.is_some();
     let branch = text("branch");

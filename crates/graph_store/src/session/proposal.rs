@@ -193,14 +193,21 @@ impl GraphSession {
         outcome: &WriteOutcome<T>,
         cx: &mut Context<Self>,
     ) {
+        if self
+            .opening_proposal
+            .as_ref()
+            .is_some_and(|(_, opening)| opening == proposal)
+        {
+            self.opening_proposal = None;
+        }
         match outcome {
             WriteOutcome::Committed(_) | WriteOutcome::Unknown { .. } => {
                 self.spare_proposal = None;
                 if self.branch == from {
+                    // The changes made on it while it was opening, counted as they landed.
+                    let changes = self.proposal_changes;
                     self.set_branch(proposal.to_owned(), cx);
-                    // The first edit was counted before the session moved here.
-                    self.proposal_changes =
-                        u64::from(matches!(outcome, WriteOutcome::Committed(_)));
+                    self.proposal_changes = changes;
                     cx.notify();
                 }
             }
@@ -225,6 +232,13 @@ impl GraphSession {
         at: Option<String>,
         cx: &mut Context<Self>,
     ) -> Task<Result<String, WriteOutcome<T>>> {
+        // One made whose first edit is still out takes this edit too: the window is not on it
+        // yet, and another would split the person's changes.
+        if let Some((base, branch)) = &self.opening_proposal
+            && base == from
+        {
+            return Task::ready(Ok(branch.clone()));
+        }
         let start_commit = at.clone().or_else(|| self.head(from).map(str::to_owned));
         if let Some(spare) = &self.spare_proposal
             && spare.base == from
@@ -249,10 +263,14 @@ impl GraphSession {
         };
         self.starting_proposal = Some(Starting::default());
         let create = self.create_branch(name.clone(), start, cx);
+        let base = from.to_owned();
         cx.spawn(async move |this, cx| {
             let created = create.await;
             let branch = matches!(created, WriteOutcome::Committed(_)).then(|| name.clone());
             this.update(cx, |this, _| {
+                if let Some(branch) = &branch {
+                    this.opening_proposal = Some((base, branch.clone()));
+                }
                 for waiter in this
                     .starting_proposal
                     .take()
@@ -533,6 +551,44 @@ mod tests {
             assert_eq!(session.branch, "main");
             assert_eq!(session.proposal(), None);
         });
+    }
+
+    /// Two edits sent on main before either lands go to one proposal: the second waits for the
+    /// first's start, and one sent once the branch is made but before the first edit lands goes
+    /// there too, not to a second proposal.
+    #[gpui::test]
+    async fn edits_sent_together_go_to_one_proposal(cx: &mut TestAppContext) {
+        let (session, sent) = proposing_session(false, cx);
+        let (first, second) = session.update(cx, |session, cx| {
+            (
+                session.write_request(edit("main"), None, "Set slug".into(), cx),
+                session.write_request(edit("main"), None, "Set slug".into(), cx),
+            )
+        });
+        assert!(matches!(first.await, WriteOutcome::Committed(_)));
+        assert!(matches!(second.await, WriteOutcome::Committed(_)));
+        cx.run_until_parked();
+        let creates = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, path, ..)| path.ends_with("/branches"))
+            .count();
+        assert_eq!(creates, 1, "one proposal");
+        session.update(cx, |session, cx| {
+            assert_eq!(session.proposal().map(|p| p.changes), Some(2));
+            // Made, its first edit not back: an edit now joins it.
+            session.set_branch("main".into(), cx);
+            session.opening_proposal = Some(("main".into(), "proposal/act-writer/x".into()));
+        });
+        let third = session.update(cx, |session, cx| {
+            session.write_request(edit("main"), None, "Set slug".into(), cx)
+        });
+        assert!(matches!(third.await, WriteOutcome::Committed(_)));
+        let sent = sent.lock().unwrap();
+        let (_, path, body, _) = sent.last().unwrap();
+        assert!(path.contains("/mutate"));
+        assert_eq!(body["branch"], "proposal/act-writer/x");
     }
 
     /// A start the policy refuses sends no edit: the edit is refused with the server's words,

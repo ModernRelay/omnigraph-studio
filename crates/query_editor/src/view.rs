@@ -846,7 +846,9 @@ impl Item for QueryEditor {
                             return None;
                         };
                         let (held, _) = self.rows_read_at(output, cx);
-                        let note = RowNote::new(row, &output.table, held)?;
+                        // Rows read on the tab's own branch open their nodes there.
+                        let branch = held.is_none().then(|| self.on_branch.clone()).flatten();
+                        let note = RowNote::new(row, &output.table, held)?.on_branch(branch);
                         let note = cx.new(|_| note);
                         self.row_note = Some(note.clone());
                         note

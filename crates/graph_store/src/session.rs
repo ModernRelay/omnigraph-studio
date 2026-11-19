@@ -945,6 +945,9 @@ pub struct GraphSession {
     spare_proposal: Option<proposal::Spare>,
     /// A proposal being started, which the edits sent meanwhile wait for.
     starting_proposal: Option<proposal::Starting>,
+    /// A proposal made whose first edit is still out, by the branch it proposes to: the edits
+    /// sent meanwhile go to it too, not to another.
+    opening_proposal: Option<(String, String)>,
     _connection_watch: Option<ConnectionWatch>,
 }
 
@@ -1079,6 +1082,7 @@ impl GraphSession {
             proposal_changes: 0,
             spare_proposal: None,
             starting_proposal: None,
+            opening_proposal: None,
             _connection_watch: None,
         };
         session.credential = session.client(cx).credential_changes();
@@ -4786,7 +4790,13 @@ impl GraphSession {
         };
         let branch = log.branch.clone();
         let wrote = log.wrote.clone();
-        if commit.is_some() && branch == self.branch && self.proposal().is_some() {
+        // A change on the proposal the session is on, or on one whose first edit is out, which
+        // the session moves onto when it lands (spec 037).
+        let opening = self
+            .opening_proposal
+            .as_ref()
+            .is_some_and(|(_, opening)| *opening == branch);
+        if commit.is_some() && (opening || branch == self.branch && self.proposal().is_some()) {
             self.proposal_changes += 1;
         }
         self.log_outcome(log, outcome);
