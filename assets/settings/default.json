@@ -33,6 +33,9 @@
     "panel_ui_tools": true,
     "raise_window": false
   },
+  "notifications": {
+    "agent_turns": true
+  },
   "models": {
     "fast": "anthropic/claude-haiku-5.5",
     "filter": "google/gemini-3.8-flash",

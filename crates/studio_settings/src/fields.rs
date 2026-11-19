@@ -420,8 +420,14 @@ mod tests {
     #[test]
     fn every_setting_is_a_row_in_declaration_order() {
         let paths: Vec<String> = fields().iter().map(|f| f.path.join(".")).collect();
-        assert_eq!(
-            paths,
+        // Notifications are posted on macOS only so far (spec 045); elsewhere their section is
+        // hidden.
+        let notifications: &[&str] = if cfg!(target_os = "macos") {
+            &["notifications.agent_turns"]
+        } else {
+            &[]
+        };
+        let expected: Vec<&str> = [
             [
                 "theme.mode",
                 "theme.light",
@@ -449,25 +455,35 @@ mod tests {
                 "agent.keep_address",
                 "agent.panel_ui_tools",
                 "agent.raise_window",
+            ]
+            .as_slice(),
+            notifications,
+            [
                 "models.fast",
                 "models.filter",
                 "models.careful",
                 "models.key_stored",
-            ],
+            ]
+            .as_slice(),
+        ]
+        .concat();
+        assert_eq!(
+            paths, expected,
             "agent.env, a map, and panels are edited in settings.json or elsewhere"
         );
-        assert_eq!(
-            sections(),
-            [
-                "Appearance",
-                "Browsing",
-                "Connection",
-                "Updates",
-                "Omnigraph Cloud",
-                "Agent",
-                "Models"
-            ]
-        );
+        let mut expected_sections = vec![
+            "Appearance",
+            "Browsing",
+            "Connection",
+            "Updates",
+            "Omnigraph Cloud",
+            "Agent",
+        ];
+        if cfg!(target_os = "macos") {
+            expected_sections.push("Notifications");
+        }
+        expected_sections.push("Models");
+        assert_eq!(sections(), expected_sections);
     }
 
     #[test]

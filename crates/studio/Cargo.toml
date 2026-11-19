@@ -76,6 +76,8 @@ name = "keymaps"
 harness = false
 
 [dev-dependencies]
+# A conversation filed and its turn ended without an agent (`notifications.rs`).
+agent_panel = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 graph_store = { workspace = true, features = ["test-support"] }
 # A model service that never answers, for the settings' key test.

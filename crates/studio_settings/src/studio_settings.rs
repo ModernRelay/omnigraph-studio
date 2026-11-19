@@ -500,6 +500,24 @@ impl Default for AgentSettings {
     }
 }
 
+/// The system notifications Studio posts while you work in another app (spec 045), one setting
+/// per kind. macOS only for now: elsewhere the section is hidden and nothing is posted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct NotificationSettings {
+    /// While Studio is in the background, a notification says when an agent finishes, stops
+    /// short or waits for your answer. Clicking it opens the conversation. It names the graph
+    /// and the agent's branch, never what was said.
+    #[schemars(title = "Notify about agent conversations")]
+    pub agent_turns: bool,
+}
+
+impl Default for NotificationSettings {
+    fn default() -> Self {
+        Self { agent_turns: true }
+    }
+}
+
 /// Model calls through OpenRouter (spec 019): the model each kind of task runs on, whether a
 /// key is stored, and the tasks allowed to send their input.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -598,6 +616,16 @@ pub struct StudioSettings {
     pub omnigraph_cloud: String,
     #[schemars(extend("x-section" = "Agent"))]
     pub agent: AgentSettings,
+    // Spec 045: posted on macOS only so far, so the settings tab shows the section there alone.
+    #[cfg_attr(
+        target_os = "macos",
+        schemars(extend("x-section" = "Notifications"))
+    )]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        schemars(extend("x-section" = "Notifications", "x-hidden" = true))
+    )]
+    pub notifications: NotificationSettings,
     #[schemars(extend("x-section" = "Models"))]
     pub models: ModelSettings,
     /// Per-graph overrides, keyed by [`overrides_key`]; edited in the settings tab's graph
@@ -663,6 +691,7 @@ impl Default for StudioSettings {
             omnigraph_cli: None,
             omnigraph_cloud: OMNIGRAPH_CLOUD.to_owned(),
             agent: AgentSettings::default(),
+            notifications: NotificationSettings::default(),
             models: ModelSettings::default(),
             graphs: BTreeMap::new(),
             panels: BTreeMap::new(),

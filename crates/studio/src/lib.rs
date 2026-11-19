@@ -11,6 +11,9 @@ mod first_run;
 mod keymaps;
 pub mod logging;
 mod menus;
+// Spec 045, step 1: posted on macOS only so far.
+#[cfg(target_os = "macos")]
+mod notifications;
 mod open_graph;
 mod organizations;
 mod settings_view;
@@ -63,6 +66,9 @@ pub fn init(cx: &mut App) {
     review::init(cx);
     history::init(cx);
     agent_panel::init(cx);
+    // A conversation that needs the person while Studio is in the background (spec 045).
+    #[cfg(target_os = "macos")]
+    notifications::init(cx);
     // The UI tools and their server (spec 032). Nothing starts here.
     ui_tools::init(cx);
 
