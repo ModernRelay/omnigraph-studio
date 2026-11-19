@@ -116,16 +116,17 @@ impl Learnt {
 }
 
 /// The nodes a page of changes touched, in the order they come, the first [`TOUCHED_KEPT`]
-/// kept, and how many there are: the nodes it changed, or, when it changed none, the ends of
-/// the relationships it changed, which name no type.
+/// kept, and how many a row names: the nodes it changed first, then the ends of the
+/// relationships it changed, which name no type. A row names the nodes, or the ends when it
+/// changed no node; a search finds either.
 fn touched_by(changes: &[EntityChangeOutput]) -> (Vec<Touched>, usize) {
     fn take<'a>(
-        seen: &mut HashSet<(Option<&'a str>, &'a str)>,
+        seen: &mut HashSet<&'a str>,
         kept: &mut Vec<Touched>,
         type_name: Option<&'a str>,
         id: &'a str,
     ) {
-        if seen.insert((type_name, id)) && kept.len() < TOUCHED_KEPT {
+        if seen.insert(id) && kept.len() < TOUCHED_KEPT {
             kept.push(Touched {
                 type_name: type_name.map(str::to_owned),
                 id: id.to_owned(),
@@ -144,19 +145,19 @@ fn touched_by(changes: &[EntityChangeOutput]) -> (Vec<Touched>, usize) {
             );
         }
     }
-    if seen.is_empty() {
-        for change in changes {
-            let image = change.after.as_ref().or(change.before.as_ref());
-            let ends = image
-                .and_then(|image| image.endpoints.as_ref())
-                .and_then(|ends| Some((ends.get("from")?.as_str()?, ends.get("to")?.as_str()?)));
-            if let Some((from, to)) = ends {
-                take(&mut seen, &mut kept, None, from);
-                take(&mut seen, &mut kept, None, to);
-            }
+    let nodes = seen.len();
+    for change in changes {
+        let image = change.after.as_ref().or(change.before.as_ref());
+        let ends = image
+            .and_then(|image| image.endpoints.as_ref())
+            .and_then(|ends| Some((ends.get("from")?.as_str()?, ends.get("to")?.as_str()?)));
+        if let Some((from, to)) = ends {
+            take(&mut seen, &mut kept, None, from);
+            take(&mut seen, &mut kept, None, to);
         }
     }
-    (kept, seen.len())
+    let named = if nodes > 0 { nodes } else { seen.len() };
+    (kept, named)
 }
 
 /// A page's changes counted by type, in the order they come, node types before relationships'.
@@ -403,9 +404,17 @@ mod tests {
             "id": "e1", "op": "insert",
             "after": { "properties": {}, "endpoints": { "from": "c-1", "to": "lk-acl" } } }),
         );
-        let linked = Learnt::counted(&[edge], false);
+        let linked = Learnt::counted(std::slice::from_ref(&edge), false);
         assert_eq!(linked.about().as_deref(), Some("c-1 and 1 more"));
         assert!(linked.touches("lk-acl"));
+        // A comment added and linked: the row names the comment, a search finds the issue.
+        let comment = change(
+            json!({ "kind": "node", "type": { "id": "t3", "name": "Comment" },
+            "id": "c-1", "op": "insert", "after": { "properties": { "slug": "c-1" } } }),
+        );
+        let added = Learnt::counted(&[comment, edge], false);
+        assert_eq!(added.about().as_deref(), Some("Comment c-1"));
+        assert!(added.touches("lk-acl"));
         assert_eq!(Learnt::said(CommitCounts::First).about(), None);
     }
 }

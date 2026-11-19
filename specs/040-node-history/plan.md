@@ -115,7 +115,9 @@ why*, and Studio could not say:
      (`GraphSession::own_words`): "Set priority of lk-acl".
   2. A merge whose merged commit is a branch's head: "Merge agent/close-acl".
   3. The node it changed, once its counts are read: "Issue lk-acl", "Issue lk-acl and 2 more";
-     a commit that changed only relationships names their ends.
+     a commit that changed only relationships names their ends. The search finds the ends of
+     the relationships a commit changed too, so a comment linked to `lk-acl` is found by
+     `lk-acl`.
 - The row's card and the inspector say the same ("What").
 - **Search** finds a commit by its id, its actor, a node its counted changes touched, or
   Studio's words for it. The field reads "Find a commit by id, actor or node". A node's whole
@@ -176,6 +178,7 @@ Not in this spec: the per-field Revert of the review (study, Appendix A), and st
 | 2026-11-19 | A node's History is two requests a window and lists who changed the node, newest first | `node_view` tests `a_nodes_history_reads_a_window_of_commits_and_the_one_before` (250 commits; listing then feed from `after:c49` with the node's three types; older window from `page_token=200`, feed from `beginning`, stopping before `c50`) | Pass |
 | 2026-11-19 | The entries draw only for what they show | `the_history_draws_its_list_only_for_what_it_shows`: another branch's commit draws the list 0 times; a commit on the branch 1 (Refresh offered); reading older commits 2 | Pass |
 | 2026-11-19 | A review card names who set each value when more than one actor did | `graph_store` `a_fold_keeps_who_set_each_property_last` (beads B4's two commits) | Pass |
+| 2026-11-19 | It works against a real server, as the study walked beads B2 and B4 | Debug build, `crates/studio/examples/snapshot.rs` and the binary under Xvfb (1600×1000, lavapipe), against the beads cookbook on `omnigraph-server` `v0.15.0`: `claim`, `link_blocks`, `comment`, `close` and `defer` as `act-writer` on main and `plan/sharing-v2`, a priority set as `act-admin`, a description edited in Studio | `lk-share-api`'s History lists the admin's priority, the agent's close, the comment and block links and the claim, newest first, "6 changes on plan/sharing-v2 in the newest 11 commits". History's search for `lk-acl` finds 1/5 (the study's f05: "No match"); rows read "Set description of lk-acl", "Merge agent/close-acl", "Issue lk-share-api". The review's card of `lk-share-api` ends priority with `act-admin` and status, updated_at, closed_at, close_reason with `act-writer`. In the binary, Ctrl+Alt+4 on a table row opens the row's History |
 | 2026-11-19 | A row names the node a commit changed, and a search finds it | `history` `a_counted_commit_names_the_nodes_it_touched`, `a_commit_says_what_it_was`; `graph_store` `own_words` in the counts test | Pass |
 
 ## Corrections

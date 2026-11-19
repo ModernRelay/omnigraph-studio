@@ -452,10 +452,13 @@ fn entry_card(
     schema: Option<&SchemaModel>,
     cx: &App,
 ) -> AnyElement {
-    let kind = match &entry.node {
-        Some(node) => change_cards::kind_of_change(node),
-        None => studio_ui::ChangeKind::Changed,
-    };
+    // The node's own change, or, for a commit that changed only its relationships, the first
+    // of those.
+    let kind = entry
+        .node
+        .as_ref()
+        .or(entry.edges.first())
+        .map_or(studio_ui::ChangeKind::Changed, change_cards::kind_of_change);
     let what = words.or_else(|| {
         entry
             .merged_parent
