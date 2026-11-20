@@ -2088,6 +2088,35 @@ pub fn nodes_fields_by_id(
     })
 }
 
+/// Nodes of one type by `@id`, whole, in one read ordered by `@id`: a set of listed rows read a
+/// page at a time (spec 035, a gallery of the rows picked in a table). A row each that exists.
+pub fn nodes_by_ids(
+    schema: &SchemaModel,
+    type_name: &str,
+    ids: &[String],
+) -> Result<BuiltQuery, BuildError> {
+    let node = node(schema, type_name)?;
+    let mut params = Params::new();
+    let wanted = params.add("ids", "[String]", Value::from(ids.to_vec()));
+    let text = format!(
+        "query studio_nodes_by_id({sig}) {{\n  match {{\n    $n: {ty}\n    $n.@id in {wanted}\n  }}\n  return {{ $n }}\n  order {{ $n.@id asc }}\n  limit {limit}\n}}\n",
+        sig = params.signature(),
+        ty = node.name,
+        limit = ids.len().max(1),
+    );
+    Ok(BuiltQuery {
+        name: "studio_nodes_by_id".into(),
+        text,
+        params: params.values,
+        depends: Depends::Types {
+            nodes: vec![node.name.clone()],
+            edges: Vec::new(),
+        },
+        seeds: None,
+        empty_without: None,
+    })
+}
+
 /// The column a property is read into by [`node_fields_by_id`], [`nodes_fields_by_id`] and
 /// [`node_page_fields`].
 pub fn field_column(property: &str) -> String {
@@ -5211,6 +5240,24 @@ mod tests {
         assert!(query.text.contains("$n.name as v_name"), "{}", query.text);
         assert!(query.text.contains("limit 2"), "{}", query.text);
         assert!(nodes_fields_by_id(&schema, "Person", &ids, &["nope".to_owned()]).is_err());
+    }
+
+    /// A gallery of listed rows reads them whole, by id, in id order (spec 035).
+    #[test]
+    fn listed_nodes_are_read_whole_by_id() {
+        let schema = dev();
+        let ids = ["person-000001".to_owned(), "person-000000".to_owned()];
+        let query = nodes_by_ids(&schema, "Person", &ids).unwrap();
+        assert_compiles(&query);
+        assert_eq!(query.params["ids"], json!(ids));
+        assert!(query.text.contains("return { $n }"), "{}", query.text);
+        assert!(
+            query.text.contains("order { $n.@id asc }"),
+            "{}",
+            query.text
+        );
+        assert!(query.text.contains("limit 2"), "{}", query.text);
+        assert!(nodes_by_ids(&schema, "Nope", &ids).is_err());
     }
 
     #[test]

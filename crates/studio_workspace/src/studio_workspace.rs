@@ -33,8 +33,8 @@ use graph_store::{
     Loadable, OutcomeKind, SessionEvent,
 };
 use studio_actions::graph::{
-    OpenAsCanvas, OpenAsHistory, OpenAsMap, OpenAsPage, OpenAsReview, OpenAsSource, OpenAsTable,
-    OpenAsTree, OpenBranchHistory, OpenCommit,
+    OpenAsCanvas, OpenAsGallery, OpenAsHistory, OpenAsMap, OpenAsPage, OpenAsReview, OpenAsSource,
+    OpenAsTable, OpenAsTree, OpenBranchHistory, OpenCommit,
 };
 use studio_actions::workspace::OpenViewAt;
 use studio_actions::workspace::{
@@ -800,6 +800,7 @@ impl Workspace {
         this.register_view_action::<OpenAsSource>(ViewKind::Source);
         this.register_view_action::<OpenAsReview>(ViewKind::Review);
         this.register_view_action::<OpenAsHistory>(ViewKind::History);
+        this.register_view_action::<OpenAsGallery>(ViewKind::Gallery);
         this.register_action(|workspace, action: &OpenViewAt, window, cx| {
             let kind = workspace
                 .active_item()

@@ -266,6 +266,15 @@ pub mod size {
     pub const ACCENT_LINE: f32 = 2.;
     /// The tallest a preview (an image, a document's first page) shows before it opens.
     pub const PREVIEW_MAX_HEIGHT: f32 = 240.;
+    /// A gallery column's width at each tile size (spec 035), the narrowest the columns grow
+    /// from to fill the gallery.
+    pub const TILE_SMALL: f32 = 128.;
+    pub const TILE: f32 = 176.;
+    pub const TILE_LARGE: f32 = 240.;
+    /// A gallery tile's caption under its preview: a name line and a meta line.
+    pub const TILE_CAPTION: f32 = 44.;
+    /// The band at the end of a gallery's columns while rows wait to be placed.
+    pub const TILE_BAND: f32 = 48.;
     /// A short label before a value ("From", "To").
     pub const SHORT_LABEL: f32 = 40.;
     /// The tallest a modal grows before its body scrolls.
@@ -1138,6 +1147,15 @@ pub mod icon {
     /// extra small and muted.
     pub fn meta(name: IconName) -> Icon {
         Icon::new(name).size(IconSize::XSmall).color(Color::Muted)
+    }
+
+    /// An icon standing for a file a gallery tile does not draw (spec 035), 32 px: muted.
+    pub fn tile(name: IconName) -> Icon {
+        Icon::new(name)
+            .size(IconSize::Custom(rems_from_px(
+                size::ICON_TILE + space::MD + space::XS,
+            )))
+            .color(Color::Muted)
     }
 }
 
@@ -2928,6 +2946,19 @@ pub fn code_block(code: impl Into<SharedString>, cx: &App) -> Div {
         .text_xs()
         .text_color(cx.theme().colors().text)
         .child(code.into())
+}
+
+/// The first lines of a text file, as a gallery tile shows them in its preview (spec 035): the
+/// code face at the meta size, muted, from the top-left and cut at the tile's edge.
+pub fn preview_text(text: impl Into<SharedString>, cx: &App) -> Div {
+    div()
+        .size_full()
+        .overflow_hidden()
+        .p(px(space::MD))
+        .font_buffer(cx)
+        .text_xs()
+        .text_color(cx.theme().colors().text_muted)
+        .child(text.into())
 }
 
 /// A command to run, in a [`code_block`] with Copy at its end: what Studio shows where an

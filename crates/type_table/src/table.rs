@@ -503,6 +503,18 @@ async fn read_branch_diff(
     branch: &str,
     cx: &mut gpui::AsyncApp,
 ) -> Option<graph_store::FoldedChanges> {
+    read_branch_diff_from(session, branch, cx)
+        .await
+        .map(|(_, folded)| folded)
+}
+
+/// [`read_branch_diff`], with the merge base it read from: where a removed row last was (a
+/// gallery reads a removed row's file there, spec 035).
+pub(crate) async fn read_branch_diff_from(
+    session: &Entity<GraphSession>,
+    branch: &str,
+    cx: &mut gpui::AsyncApp,
+) -> Option<(String, graph_store::FoldedChanges)> {
     let base = session
         .update(cx, |session, cx| session.merge_base(branch, TARGET, cx))
         .await
@@ -510,7 +522,7 @@ async fn read_branch_diff(
     let (from, to) = (base.merge_base.graph_commit_id, base.source_commit_id);
     let mut fold = ChangeFold::new();
     if from == to {
-        return Some(fold.finish());
+        return Some((from, fold.finish()));
     }
     let cause = graph_client::api::ChangeCauseOutput {
         graph_commit_id: to.clone(),
@@ -546,11 +558,11 @@ async fn read_branch_diff(
             _ => break,
         }
     }
-    Some(
-        cx.background_executor()
-            .spawn(async move { fold.finish() })
-            .await,
-    )
+    let folded = cx
+        .background_executor()
+        .spawn(async move { fold.finish() })
+        .await;
+    Some((from, folded))
 }
 
 /// The hover group of a grid row, for the actions its cells show under the pointer.
@@ -1323,12 +1335,29 @@ impl Item for TypeTable {
             }
             None => ViewLink::disabled_because(ViewKind::Canvas, "Select a row to walk from it"),
         };
-        vec![ViewLink::current(ViewKind::Table), tree, canvas]
+        let mut views = vec![ViewLink::current(ViewKind::Table), tree, canvas];
+        // A type with files also shows them as tiles (spec 035).
+        if let Some(property) = self.gallery_property() {
+            let shown = if self.selection.is_empty() {
+                "these rows".to_owned()
+            } else {
+                format!(
+                    "the {}",
+                    studio_ui::plural(self.selection.len(), "selected row", "selected rows")
+                )
+            };
+            views.push(
+                ViewLink::to(ViewKind::Gallery)
+                    .saying(format!("Show {shown} as tiles of their {property}")),
+            );
+        }
+        views
     }
 
     fn view_action(&self, kind: ViewKind, cx: &App) -> Option<Box<dyn gpui::Action>> {
         match kind {
             ViewKind::Tree => Some(self.tree_action(cx)),
+            ViewKind::Gallery => self.gallery_action(),
             ViewKind::Canvas => {
                 let row = self.cursor_row()?;
                 Some(Box::new(studio_actions::graph::ShowNodeOnCanvas {
@@ -8198,6 +8227,71 @@ impl TypeTable {
             select: self.cursor_row().map(|row| row.id.clone()),
             preview: true,
         })
+    }
+
+    /// The Blob property a gallery of this table's rows shows first (spec 035): the one under
+    /// the cursor, else the type's first; `None` for a type with no file, or an edge type.
+    fn gallery_property(&self) -> Option<String> {
+        if self.kind != TableKind::Node {
+            return None;
+        }
+        let is_file = |column: &ColumnSpec| {
+            column
+                .property()
+                .filter(|property| property.kind == ScalarKind::Blob)
+                .map(|property| property.name.clone())
+        };
+        self.cursor
+            .and_then(|cursor| self.columns.get(cursor.col))
+            .and_then(is_file)
+            .or_else(|| self.all_columns.iter().find_map(is_file))
+    }
+
+    /// What Gallery opens from this table (spec 035): the selected rows, listed, or the rows
+    /// under the filters and in the table's order, at the commit the table read, the cursor's
+    /// row under the cursor.
+    fn gallery_action(&self) -> Option<Box<dyn gpui::Action>> {
+        let property = self.gallery_property()?;
+        let ids = (!self.selection.is_empty()).then(|| {
+            self.rows
+                .iter()
+                .filter(|row| self.selection.contains(&row.id))
+                .map(|row| row.id.clone())
+                .collect::<Vec<_>>()
+        });
+        let filters = self.resolved_filters();
+        let summary = match &ids {
+            Some(ids) => studio_ui::plural(ids.len(), "selected row", "selected rows"),
+            None => filters
+                .iter()
+                .map(|filter| {
+                    let (property, op, value) = filter_parts(filter);
+                    value.unwrap_or_else(|| format!("{property} {op}"))
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+        };
+        let title = if summary.is_empty() {
+            self.type_name.clone()
+        } else {
+            format!("{}, {summary}", self.type_name)
+        };
+        Some(Box::new(studio_actions::graph::ShowSetInGallery {
+            title,
+            type_name: self.type_name.clone(),
+            filters: (ids.is_none() && !filters.is_empty())
+                .then(|| serde_json::to_value(&filters).ok())
+                .flatten(),
+            sort: self.sort.as_ref().filter(|_| ids.is_none()).map(|sort| {
+                serde_json::json!({"property": sort.property, "descending": sort.descending})
+            }),
+            ids,
+            property: Some(property),
+            at_commit: self.at_commit.clone(),
+            snapshot: self.paging.pinned.clone().filter(|_| self.at_commit.is_none()),
+            select: self.cursor_row().map(|row| row.id.clone()),
+            preview: true,
+        }))
     }
 
     fn on_explore(&mut self, _: &ShowRowOnCanvas, window: &mut Window, cx: &mut Context<Self>) {
