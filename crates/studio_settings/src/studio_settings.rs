@@ -102,6 +102,20 @@ impl ReviewLayout {
     }
 }
 
+/// Whether Studio moves things on screen (constitution VII: reduced motion keeps fades only).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReduceMotion {
+    /// As the system's accessibility setting asks.
+    #[default]
+    System,
+    /// Nothing glides or slides: the canvas's chips and view land at once, and what comes up
+    /// fades in place.
+    On,
+    /// Motion whatever the system asks.
+    Off,
+}
+
 /// Where the bottom panel spans, as Zed's `bottom_dock_layout`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -158,6 +172,10 @@ pub struct StudioOptions {
     /// sidebar or the inspector beside it.
     #[schemars(title = "Bottom panel", extend("x-section" = "Appearance"))]
     pub bottom_dock_layout: BottomDockLayout,
+    /// Move nothing on screen: the canvas's chips and view land at once, and dialogs and toasts
+    /// fade in place. System follows the system's accessibility setting.
+    #[schemars(title = "Reduce motion", extend("x-section" = "Appearance"))]
+    pub reduce_motion: ReduceMotion,
     /// Rows read per page in type tables.
     #[schemars(
         title = "Table page size",
@@ -206,6 +224,7 @@ impl Default for StudioOptions {
             window_style: WindowStyle::default(),
             corner_radius: 10,
             bottom_dock_layout: BottomDockLayout::default(),
+            reduce_motion: ReduceMotion::default(),
             type_table_page_size: 100,
             tree_page_size: 50,
             canvas_max_nodes: 2000,

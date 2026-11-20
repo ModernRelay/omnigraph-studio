@@ -39,6 +39,7 @@ repository = "https://github.com/ModernRelay/omnigraph-studio"
 
 [workspace.dependencies]
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSAccessibility", "NSWorkspace"] }
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFData", "CFCGTypes"] }
 objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGAffineTransform", "CGBitmapContext", "CGColorSpace", "CGContext", "CGDataProvider", "CGImage", "CGPDFDocument", "CGPDFPage"] }
 # CommonMark, the parser Zed's `markdown` renders with: text values read as markdown (spec 014).

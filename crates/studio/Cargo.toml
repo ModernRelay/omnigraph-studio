@@ -60,12 +60,16 @@ history = { workspace = true }
 # Text needs `font-kit` on macOS; Linux needs a windowing backend.
 [target.'cfg(target_os = "macos")'.dependencies]
 gpui_platform = { workspace = true, features = ["font-kit"] }
+# The system's Reduce motion (`reduce_motion.rs`).
+objc2-app-kit = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gpui_platform = { workspace = true, features = ["wayland", "x11"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 gpui_platform = { workspace = true }
+# The system's animation effects (`reduce_motion.rs`).
+windows-sys = { workspace = true, features = ["Win32_UI_WindowsAndMessaging"] }
 
 [[test]]
 name = "settings_apply"

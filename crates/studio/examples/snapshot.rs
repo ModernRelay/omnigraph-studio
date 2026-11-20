@@ -259,6 +259,18 @@ fn settle(cx: &mut HeadlessAppContext, wait: Duration) {
     cx.run_until_parked();
 }
 
+/// Reduces motion, or not, through Studio's setting, which Studio applies (and applies again
+/// when a window comes to the front): set on GPUI alone, it would be overwritten.
+fn reduce_motion(reduce: bool, cx: &mut gpui::App) {
+    studio_settings::update(cx, |settings| {
+        settings.studio.reduce_motion = if reduce {
+            studio_settings::ReduceMotion::On
+        } else {
+            studio_settings::ReduceMotion::Off
+        };
+    });
+}
+
 /// A film being recorded by `record:`: the frames saved so far and the steps they show.
 struct Recorder {
     dir: std::path::PathBuf,
@@ -669,7 +681,7 @@ fn main() {
     cx.update(studio::init);
     // A headless window gets no animation frames, so a glide would be captured at its first
     // frame: snapshots are stills, taken with motion reduced.
-    cx.update(|cx| cx.set_reduce_motion(true));
+    cx.update(|cx| reduce_motion(true, cx));
     let opened = Instant::now();
     let window = cx
         .open_window(size(px(width), px(height)), studio::build_workspace)
@@ -767,12 +779,12 @@ fn main() {
             }
             if rest.trim() != "stop" {
                 // A film shows Studio's motion, which a still would catch halfway.
-                cx.update(|cx| cx.set_reduce_motion(false));
+                cx.update(|cx| reduce_motion(false, cx));
                 let mut started = Recorder::start(rest);
                 started.film(&mut cx, handle, started.frame);
                 recorder = Some(started);
             } else {
-                cx.update(|cx| cx.set_reduce_motion(true));
+                cx.update(|cx| reduce_motion(true, cx));
             }
             continue;
         }
