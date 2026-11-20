@@ -1830,6 +1830,7 @@ impl Render for SaveViewModal {
                     .child(
                         action_button("save-view", if replaces { "Replace" } else { "Save" })
                             .disabled(name.is_empty() || elsewhere)
+                            .key_binding(ui::KeyBinding::for_action(&menu::Confirm, cx))
                             .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
                     ),
             )

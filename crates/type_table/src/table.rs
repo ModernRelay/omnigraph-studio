@@ -3324,10 +3324,13 @@ impl TypeTable {
                 .label_hidden(self.compact_toolbar())
                 .disabled(self.all_columns.len() < 2)
                 .when(!open, |button| {
-                    button.tip(studio_ui::ds::tooltip(self.chip_tip(
-                        "Columns",
-                        "Show or hide columns · drag a column's header to move it",
-                    )))
+                    // Off, it says why rather than what it would do (constitution VI).
+                    let about = if self.all_columns.len() < 2 {
+                        format!("{} has one column", self.type_name)
+                    } else {
+                        "Show or hide columns · drag a column's header to move it".to_owned()
+                    };
+                    button.tip(studio_ui::ds::tooltip(self.chip_tip("Columns", &about)))
                 }),
             )
             .menu(move |window, cx| {
@@ -3417,10 +3420,16 @@ impl TypeTable {
                 .label_hidden(self.compact_toolbar())
                 .disabled(choices.is_empty())
                 .when(!open, |button| {
-                    button.tip(studio_ui::ds::tooltip(self.chip_tip(
-                        "Group",
-                        "Group the rows by a property, a relationship or a property of a neighbour",
-                    )))
+                    let about = if choices.is_empty() {
+                        format!(
+                            "No property or relationship of {} groups its rows",
+                            self.type_name
+                        )
+                    } else {
+                        "Group the rows by a property, a relationship or a property of a neighbour"
+                            .to_owned()
+                    };
+                    button.tip(studio_ui::ds::tooltip(self.chip_tip("Group", &about)))
                 }),
             )
             .menu(move |window, cx| {
@@ -3568,10 +3577,16 @@ impl TypeTable {
                     .label_hidden(self.compact_toolbar())
                     .disabled(choices.is_empty())
                     .when(!open, |button| {
-                        button.tip(studio_ui::ds::tooltip(self.chip_tip(
-                            "Sort",
-                            "Order the rows by a property · a column's header orders by it too",
-                        )))
+                        let about = if choices.is_empty() {
+                            format!(
+                                "{} has no property its rows can be ordered by",
+                                self.type_name
+                            )
+                        } else {
+                            "Order the rows by a property · a column's header orders by it too"
+                                .to_owned()
+                        };
+                        button.tip(studio_ui::ds::tooltip(self.chip_tip("Sort", &about)))
                     }),
             )
             .menu(move |window, cx| {
@@ -3602,13 +3617,17 @@ impl TypeTable {
     fn render_views_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let views = self.saved_views(cx);
         let active = self.active_view(&views);
+        let active_id = active
+            .as_ref()
+            .and_then(|name| views.iter().find(|view| &view.name == name))
+            .map(|view| view.key());
         let can_save = !self.filters.is_empty()
             || self.sort.is_some()
             || self.grouping.is_some()
             || self.layout != ColumnLayout::default();
         let table = cx.entity().downgrade();
         let graph = self.session.read(cx).overrides_key();
-        let type_name = self.type_name.clone();
+        let workspace = self.workspace.clone();
         let names = match self.kind {
             TableKind::Node => self.session.read(cx).type_naming(&self.type_name),
             TableKind::Edge => None,
@@ -3638,7 +3657,8 @@ impl TypeTable {
                 let active = active.clone();
                 let table = table.clone();
                 let graph = graph.clone();
-                let type_name = type_name.clone();
+                let workspace = workspace.clone();
+                let active_id = active_id.clone();
                 let names = names.clone();
                 Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
                     if views.is_empty() {
@@ -3673,14 +3693,16 @@ impl TypeTable {
                                     .ok();
                             }),
                     );
-                    if let Some(name) = active.clone() {
+                    if let Some((name, id)) = active.clone().zip(active_id.clone()) {
                         let graph = graph.clone();
+                        let workspace = workspace.clone();
                         menu = menu.entry(format!("Delete “{name}”"), None, move |_, cx| {
-                            let (graph, type_name, name) =
-                                (graph.clone(), type_name.clone(), name.clone());
-                            studio_settings::update(cx, move |settings| {
-                                settings.delete_view(&graph, &type_name, &name)
-                            });
+                            crate::types_list::delete_view(
+                                &workspace,
+                                graph.clone(),
+                                id.clone(),
+                                cx,
+                            );
                         });
                     }
                     if let Some(names) = names.clone() {
@@ -10326,6 +10348,9 @@ impl TypeTable {
         if empty {
             // The branch is the status bar's to name. Nodes and edges both add rows at the
             // head; a past commit adds none.
+            // A credential that may not change the branch sees Add Row disabled, saying why, as
+            // the toolbar's Row is.
+            let refused = self.change_refusal(cx);
             let state = if self.filters.is_empty() {
                 studio_ui::ds::empty_state(IconName::Table, format!("No {} rows", self.type_name))
                     .when(self.at_commit.is_none(), |state| {
@@ -10337,6 +10362,10 @@ impl TypeTable {
                                 &self.focus_handle,
                                 cx,
                             )
+                            .disabled(refused.is_some())
+                            .when_some(refused, |button, reason| {
+                                button.tip(studio_ui::ds::tooltip(reason))
+                            })
                             .on_click(cx.listener(
                                 |this, _, window, cx| this.on_insert(&InsertRow, window, cx),
                             )),

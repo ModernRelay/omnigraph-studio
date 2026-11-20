@@ -65,6 +65,7 @@
       "cmd-shift-\\": "studio::SplitDown",
       "cmd-alt-o": "studio::OpenGraph",
       "cmd-r": "studio::Refresh",
+      "cmd-alt-c": "studio::CopyLink",
       "cmd-alt-t": "studio::CloseOtherItems",
       "cmd-alt-w": "studio::CloseAllItems",
       "cmd-alt-right": "studio::ActivateNextPane",

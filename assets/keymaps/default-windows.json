@@ -65,6 +65,7 @@
       "ctrl-shift-\\": "studio::SplitDown",
       "ctrl-alt-o": "studio::OpenGraph",
       "ctrl-r": "studio::Refresh",
+      "ctrl-alt-c": "studio::CopyLink",
       "ctrl-shift-alt-t": "studio::CloseOtherItems",
       "ctrl-shift-alt-w": "studio::CloseAllItems",
       "ctrl-alt-right": "studio::ActivateNextPane",
@@ -311,8 +312,8 @@
       "right": "studio_tree::Expand",
       "left": "studio_tree::Collapse",
       "enter": "studio_tree::OpenSelected",
-      "alt-right": "studio_tree::ExpandAll",
-      "alt-left": "studio_tree::CollapseAll",
+      "shift-right": "studio_tree::ExpandAll",
+      "shift-left": "studio_tree::CollapseAll",
       "ctrl-enter": "studio_tree::OpenPage",
       "alt-enter": "studio_tree::OpenTable"
     }

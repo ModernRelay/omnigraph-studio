@@ -1438,7 +1438,9 @@ impl GraphSession {
     }
 
     /// The person's Refresh: [`Self::reload`], and a CLI server's token asked of the CLI again
-    /// ([`Connection::refresh_token`]). Only Refresh asks it: a graph first shown reads with the
+    /// ([`Connection::refresh_token`]); a server that did not answer is connected again at once
+    /// ([`Connection::connect_again`], which asks for the token itself), not at its next check, two
+    /// minutes after a failure. Only Refresh asks it: a graph first shown reads with the
     /// token its connect was given. A graph whose first reads have not gone yet sends them the
     /// way it would have ([`Self::open_when_ready`]): once its token is there, connecting a
     /// server left idle (a connect cancelled) to ask for it. Read at once, they would carry no
@@ -1449,8 +1451,13 @@ impl GraphSession {
             return;
         }
         self.reload(cx);
-        self.connection
-            .update(cx, |connection, cx| connection.refresh_token(cx));
+        self.connection.update(cx, |connection, cx| {
+            if matches!(connection.state, ConnectionState::Unreachable(_)) {
+                connection.connect_again(cx)
+            } else {
+                connection.refresh_token(cx)
+            }
+        });
     }
 
     /// Reads the graph's stored-query catalog, which a view wants from then on. A graph
@@ -5182,6 +5189,57 @@ mod tests {
                 session.branches.loaded().cloned(),
                 Some(vec!["main".to_owned()])
             );
+        });
+    }
+
+    /// Refresh connects again to a server that did not answer, at once: a server started again
+    /// is Connected on the person's key, not at the check two minutes after the failure.
+    #[gpui::test]
+    async fn refresh_connects_again_to_a_server_that_did_not_answer(cx: &mut TestAppContext) {
+        let up = Arc::new(AtomicBool::new(false));
+        let answering = up.clone();
+        let http = FakeHttpClient::create(move |request| {
+            let up = answering.load(Ordering::SeqCst);
+            let health = request.uri().path().ends_with("/healthz");
+            async move {
+                if !up {
+                    anyhow::bail!("connection refused");
+                }
+                let body = if health {
+                    r#"{"status":"ok","version":"0.14.0","internal_schema_version":16}"#
+                } else {
+                    r#"{"branches":["main"]}"#
+                };
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                    .body(AsyncBody::from(body))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let _watch = connection.update(cx, |connection, cx| {
+            connection.connect(cx);
+            connection.watch(cx)
+        });
+        let session = cx
+            .new(|cx| GraphSession::new(connection.clone(), "knowledge".into(), "main".into(), cx));
+        cx.run_until_parked();
+        connection.read_with(cx, |connection, _| {
+            assert!(matches!(connection.state, ConnectionState::Unreachable(_)))
+        });
+
+        up.store(true, Ordering::SeqCst);
+        session.update(cx, |session, cx| session.refresh(cx));
+        cx.run_until_parked();
+        connection.read_with(cx, |connection, _| {
+            assert_eq!(connection.state, ConnectionState::Ready)
         });
     }
 
