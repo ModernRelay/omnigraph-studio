@@ -1689,7 +1689,11 @@ impl GraphSession {
             other => other,
         };
         match &schema {
-            Loadable::Loaded(model) => self.start_schema_epoch(model),
+            Loadable::Loaded(model) => {
+                self.start_schema_epoch(model);
+                // The graph's types are drawn apart where their names hash to one tint.
+                studio_ui::assign_type_tints(model.nodes.iter().map(|node| node.name.as_str()), cx);
+            }
             // The schema held is still the graph's.
             _ if matches!(self.schema, Loadable::Loaded(_)) => return,
             _ => {}

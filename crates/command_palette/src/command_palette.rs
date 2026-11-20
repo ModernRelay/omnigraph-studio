@@ -1313,7 +1313,7 @@ impl CommandPalette {
         // A type's colour is data, so it stays, as its dot in the tile: the row names the type
         // already, where a lettered mark would name it again.
         let type_tile =
-            |type_name: &str| studio_ui::ds::tile(cx).child(studio_ui::ds::type_dot(type_name));
+            |type_name: &str| studio_ui::ds::tile(cx).child(studio_ui::ds::type_dot(type_name, cx));
         let start = match row {
             Row::Type { kind, .. } if *kind == "edge" => icon_tile(IconName::ArrowRight),
             Row::Type { .. } => type_tile(&candidate.label),

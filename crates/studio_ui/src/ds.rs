@@ -1048,8 +1048,8 @@ pub enum Status {
 /// A node type's colour as a small dot, centred in the width of a type mark so rows with
 /// either line up: for rows whose context already names the type, where a lettered mark would
 /// repeat it.
-pub fn type_dot(type_name: &str) -> Div {
-    icon_slot(dot(Color::Custom(studio_theme::type_color(type_name))))
+pub fn type_dot(type_name: &str, cx: &App) -> Div {
+    icon_slot(dot(Color::Custom(studio_theme::type_tint(type_name, cx))))
 }
 
 /// A dot that beats while given its `beat` (a server that answers): each beat sends one ring

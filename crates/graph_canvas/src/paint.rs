@@ -13,7 +13,7 @@ use gpui::{
     ShapedLine, SharedString, TextAlign, TextRun, Window, WrappedLine, point, px, quad, size,
 };
 use studio_ui::ds::elevation::Layer;
-use studio_ui::type_color;
+use studio_ui::type_tint;
 
 use crate::model::{Scene, SceneKind, SceneNode};
 
@@ -521,7 +521,14 @@ pub(crate) fn paint(
                         .entry(initial.clone())
                         .or_insert_with(|| shape_letter(initial, MARK_SIZE, palette, window))
                         .clone();
-                    paint_letter_mark(p, type_color(&node.color_key), &line, MARK_SIZE, window, cx)
+                    paint_letter_mark(
+                        p,
+                        type_tint(&node.color_key, cx),
+                        &line,
+                        MARK_SIZE,
+                        window,
+                        cx,
+                    )
                 }
             };
             continue;
@@ -531,7 +538,7 @@ pub(crate) fn paint(
         if open.as_ref().is_some_and(|(opened, _)| *opened == index) {
             continue;
         }
-        let tint = type_color(&node.color_key);
+        let tint = type_tint(&node.color_key, cx);
         let text = &texts[index];
         let mark = text.mark.then(|| (tint, text.initial.clone()));
         let size = text.size * scale;
@@ -561,7 +568,10 @@ pub(crate) fn paint(
         let focus = selected == Some(*index) || marked.contains(index);
         paint_open_chip(
             open,
-            (type_color(&node.color_key), texts[*index].initial.clone()),
+            (
+                type_tint(&node.color_key, cx),
+                texts[*index].initial.clone(),
+            ),
             PillStyle {
                 fill: palette.card,
                 border: focus.then_some(palette.here),
