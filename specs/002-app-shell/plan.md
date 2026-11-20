@@ -801,10 +801,12 @@ than styling one-off elements.
   `ds::switch`, an enum its menu's trigger, `ds::value_select` (a select's pill at a value's
   height, its chevron at its end).
 - **Relationships are rows, not values.** A relationship's neighbours are nodes to go to, and
-  a group may hold many, so they are listed rather than boxed: a `ds::fold_row` (the fold's
-  title and chevron as a sidebar row, the rest of the row for its count and its "+") over a
-  `ds::SidebarRow` per neighbour, `flush` on the panel's margin so its type mark sits on the
-  property icons' edge. A neighbour's `ds::value_remove` (a quiet ×) is the row's action,
+  a group may hold many, so they are listed rather than boxed: a `ds::fold_row` (a sidebar
+  row: its chevron first, in an icon slot, then its title, a `ds::fold_title` of a name and a
+  muted rest, and the rest of the row for its count and its "+") over a `ds::fold_body` of a
+  `ds::SidebarRow` per neighbour, `flush` and set in by the chevron's slot so its type mark
+  sits on the title's edge (since 2026-11-20; before, the chevron followed the title and a
+  neighbour's mark sat on the property icons' edge, left of it). A neighbour's `ds::value_remove` (a quiet ×) is the row's action,
   over its end under the pointer; the group's "+" sits in its header.
 - **Control chips** (since 2026-10-21, after the reference toolbar). A toolbar's controls are
   `ds::control_chip`s, the filter pill's family: one raised pill (`shadow-custom`, whose ring
@@ -1084,6 +1086,7 @@ link carries and no more, so it opens in a Studio that knows the server (since 2
 ## Validation log
 
 | Date | Claim | Check | Result |
+| 2026-11-20 | A fold row leads with its chevron, and the rows it folds start on its title's edge | `studio_ui` `property_and_control_parts_draw_at_their_sizes` (the title 24 px in from its row: 4 px, the 16 px slot, 4 px; a flush neighbour's mark in a `fold_body` on the same edge; both rows 26 px, one under the other) | Pass |
 | 2026-11-18 | A link copied on main opens on main, in a window already on another branch (Devin's review of #142) | `studio` `copy_link_copies_where_the_window_is`, extended: a window on knowledge at main copies a link naming `branch=main` | Before, a link copied on main named no branch, and `show_graph_in` keeps an open session's branch when a link names none: opened in a window on review, it showed review. Now a copied link always names its branch |
 | 2026-11-18 | Copy Link copies a link that opens where the window is | `studio` `deep_link::tests::a_copied_link_opens_what_it_was_copied_from` (a graph, a branch with spaces and `&`, a node id with `?&=`, each read back by `parse`); `copy_link_copies_where_the_window_is` (a window on knowledge at review: the clipboard holds its graph link); offscreen snapshot of the palette finding it with Ctrl-Alt-C | Studio opened links and the CLI made them, but nothing in Studio made one: to send someone a node, a person wrote the URL by hand |
 | 2026-11-15 | A page's group still being read when its neighbours' type is named otherwise lands renamed (review of #111) | `type_table` `a_group_read_out_when_nodes_are_named_otherwise_lands_renamed`: Ada's page, her companies' read held, Company named by `code`, then the read let go; failing with the check removed | Before: the group showed "Analytical Engines" for good, since only groups already read were renamed. Now a group's first read and its next page carry the schema they were built under, and land renamed when it names their type by another property than the view's (`NodePeek::rename_if_named_otherwise`), as a table's relationship cells do. The next page goes the same way; it has no test of its own |

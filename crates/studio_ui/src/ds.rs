@@ -3122,23 +3122,61 @@ pub fn fold(id: impl Into<ElementId>, title: impl Into<SharedString>, open: bool
         }))
 }
 
-/// A [`fold`] as a row over the rows it folds (a relationship's neighbours): a sidebar row's
-/// height on its panel's margin, its title and chevron, then the rest of the row for what the
-/// caller ends it with (a count, an add button).
+/// A fold as a row over the rows it folds (a relationship's neighbours): a sidebar row's
+/// height on its panel's margin. Its chevron comes first, in a row's icon slot, so every title
+/// in a list of them starts on one edge whatever its length; then its title
+/// ([`fold_title`]), and the rest of the row for what the caller ends it with (a count, an add
+/// button). The rows it folds go in a [`fold_body`], on the title's edge.
 pub fn fold_row(
     id: impl Into<ElementId>,
-    title: impl Into<SharedString>,
+    title: impl IntoElement,
     open: bool,
     cx: &App,
 ) -> Stateful<Div> {
     let hover = surface::hover(cx);
-    fold(id, title, open)
+    h_flex()
+        .id(id.into())
         .w_full()
         .h(px(size::SIDEBAR_ROW))
         .px(px(space::XS))
+        .gap(px(space::XS))
+        .items_center()
+        .cursor_pointer()
         .rounded(px(radii(cx).sm))
         .hover(move |style| style.bg(hover))
+        .child(icon_slot(icon::meta(if open {
+            IconName::ChevronDown
+        } else {
+            IconName::ChevronRight
+        })))
+        .child(title)
         .child(div().flex_1())
+}
+
+/// A [`fold_row`]'s title: what it is called, then, muted, what tells it from the others (a
+/// relationship's name in ink, then the way it runs and the type at its other end). Each part
+/// is cut short when the row is short of room. What belongs beside the title (a count) is
+/// added to it as a child.
+pub fn fold_title(name: Label, rest: impl Into<SharedString>) -> Div {
+    h_flex()
+        .min_w_0()
+        .flex_shrink(1.)
+        .gap(px(space::XS))
+        .items_center()
+        .child(div().min_w_0().flex_shrink(1.).child(name.truncate()))
+        .child(
+            div()
+                .min_w_0()
+                .flex_shrink(1.)
+                .child(text::muted(rest).truncate()),
+        )
+}
+
+/// What a [`fold_row`] folds, set in by the row's chevron slot and the gap after it: a flush
+/// row's start (a neighbour's mark), a note or a field under the title sits on the title's
+/// edge, so the list reads as titles with their rows under them.
+pub fn fold_body() -> Div {
+    v_flex().pl(px(size::ROW_ICON + space::XS))
 }
 
 /// interfaces.dev's `shadow-custom` on a surface: its ring outside the box and its two soft

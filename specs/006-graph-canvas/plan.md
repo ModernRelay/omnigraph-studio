@@ -35,7 +35,11 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
 - **Exploring:** expanding a node adds one hub per relationship group that has neighbours, once
   its count is in (since 2026-11-01; before, every group's hub appeared at once and the empty
   ones went as their counts came in, which read as flicker); opening a
-  hub adds 8 neighbours, then "+K more". State lives in `Exploration`, shared with the tree.
+  hub adds 8 neighbours, then "+K more". A hub is named as the tree and a node's page name the
+  relationship, then its count: "WorksAt → Org 4" (since 2026-11-20, spec 014, Decisions;
+  before, "→ WorksAt 4", which left the other type to be found by opening the hub). The
+  ontology's walk keeps its own pills, an arrow and a name between two type chips. State lives
+  in `Exploration`, shared with the tree.
 - **Rendering:** one custom element. Nodes as quads with labels shown above a zoom threshold;
   edges batched by color in one paint layer with cached geometry; hit-testing through an
   R-tree. Layout runs on a background thread and streams positions; the main thread only paints.
@@ -261,6 +265,7 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-11-20 | A hub is named as the tree and a node's page name the relationship | `graph_canvas` `model::tests::a_single_target_hub_reached_twice_is_open_by_either_path` (extended: "Employer → Company · 1", "Knows → Person · 2"); offscreen snapshot of person-01843's canvas on the dense sample graph (`script/dense-server`), 1440 × 900 | Pass. Six hubs, "ExpertIn → Topic 2" to "MentionsPerson ← Mention 2", the widest about 195 px. A hub is wider than it was by its other type's name; a walk with many hubs open was not looked at for crowding |
 | 2026-11-18 | A canvas says how many nodes it hides, and its menu offers them back | Offscreen snapshot: a canvas of Radia Knuth, `studio_canvas::HideNodes` as an agent's `canvas_hide_nodes` sends it, then a right-click on the canvas | The summary reads "From Radia Knuth · 1 node · 1 hidden" and the menu ends with Show hidden. Before, hidden nodes went without a sign, and only the palette's Show Hidden brought them back (spec 032 left this open) |
 | 2026-11-18 | ⌘R reads a canvas again, as it does a tree | `graph_canvas` `cmd_r_reads_the_canvas_again` (a walk from Ada, another writer's commit changing Ada, Newer data offered, ⌘R with the canvas focused; fails with the handler taken out) | The canvas reads its walk again and passes the key on, so the session reads too; "Newer data · Refresh" names the key in its tooltip. Before, ⌘R read only the session, and the canvas kept offering the newer data |
 | 2026-11-19 | The canvas's motion was audited against a real server, and every fault found is fixed (the request "fix the canvas animations") | Offscreen films at 60 fps (`snapshot` `record:`, `release-fast`) on Linux 4.19 under gVisor (`nproc` 2, lavapipe), against Omnigraph `v0.15.0`'s release `omnigraph-server`: `script/dev-server` (265 nodes, 966 edges), a walk from Donald Dijkstra (person-000001) opened from his page, expanded two levels to 67 nodes; and `script/dense-server` (17,000 nodes), a walk from topic-00000 expanded two levels to 436 nodes. Each film's motion was measured as the mean change of the canvas's pixels from frame to frame, per step. Main was filmed with one change, its `Instant::now()` read from GPUI's clock (in the app the same clock), since the recorder moves GPUI's clock and draws a frame in about 150 ms; on the wall clock every 220 ms glide fell inside one or two frames | Found on main at `98c7cea`: (1) Reduce motion was never honoured: GPUI reads no system setting and nothing in Studio called `set_reduce_motion`, so `motion::enabled` was always true. (2) A glide sent elsewhere started over from a standstill: three zoom keys 80 ms apart drew `.oooo.oooo.ooooooo` (the view stopping at each press), and Fit then Zoom out the same; the camera's curve was ease-in-out, against VII's ease-out, and the chips' ease-out, two curves for one canvas. (3) Every layout that landed while chips glided began their glides again, so they did not rest until the pages stopped. (4) Reset layout teleported the chips and snapped the view in one frame, though this plan said it glides. (5) A chip grabbed mid-glide jumped to where it was going (the drag took its place, not where it was drawn). (6) A resize while the view glided cut the glide to its end (`keep_selected_in`). (7) Arrow keys could select a chip out of sight, and the view stayed. (8) The canvas read the wall clock, which no test can move, so no test checked motion (one test cleared the glides by hand). Not faults: settle ends (each glide is finite and forgotten at rest); no redraw while idle; wheel, pinch and pans immediate; hover and selection not animated; a new walk's first fit at once. After, the same films: three zoom keys `ooooooooooo`, no stop; Fit then Zoom out, no stop; Reset layout glides over 13 frames; arrow keys keep the chip in view at once; on the dense graph two zoom keys 80 ms apart `ooooo#ooooooooooo` where main drew `.oooo.oooo####oooo` |
@@ -446,7 +451,7 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
   now ignored); its top left now says what is drawn (the walk's root and its nodes, or the
   query), beside the search and zoom pills.
 - **Relationships first.** A relationship with at most one target is a hub on the canvas like
-  any other ("→ WorksAt · 1"), so expanding a node shows its relationships before the nodes
+  any other ("WorksAt → Org 1"), so expanding a node shows its relationships before the nodes
   they reach; the tree still shows it inline, as a field.
 - **Fit** waits for the canvas's own bounds and fits again when they change (a dock opening),
   until the person moves the view by hand; Fit hands the camera back to fitting.

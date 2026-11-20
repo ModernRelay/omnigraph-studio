@@ -868,15 +868,31 @@ mod tests {
                     div().w(gpui::px(240.)).child(
                         v_flex()
                             .child(
-                                ds::fold_row("fold", "knows → Person", true, cx)
-                                    .debug_selector(|| "fold-row".into())
-                                    .child(ds::text::meta("4")),
+                                ds::fold_row(
+                                    "fold",
+                                    ds::fold_title(ds::text::body("Knows"), "→ Person")
+                                        .debug_selector(|| "fold-title".into()),
+                                    true,
+                                    cx,
+                                )
+                                .debug_selector(|| "fold-row".into())
+                                .child(ds::text::meta("4")),
                             )
                             .child(
-                                div().debug_selector(|| "neighbour".into()).child(
-                                    ds::SidebarRow::new("neighbour", "Barbara Dahl")
-                                        .flush()
-                                        .start(crate::type_mark("Person", "Barbara Dahl", cx)),
+                                ds::fold_body().child(
+                                    div().debug_selector(|| "neighbour".into()).child(
+                                        ds::SidebarRow::new("neighbour", "Barbara Dahl")
+                                            .flush()
+                                            .start(
+                                                div()
+                                                    .debug_selector(|| "neighbour-mark".into())
+                                                    .child(crate::type_mark(
+                                                        "Person",
+                                                        "Barbara Dahl",
+                                                        cx,
+                                                    )),
+                                            ),
+                                    ),
                                 ),
                             ),
                     ),
@@ -955,15 +971,23 @@ mod tests {
             ds::PILL_BUTTON_GAP,
             "the clear button inside the chip's round end"
         );
-        // A group's header and its neighbours are rows of one height, on one edge.
+        // A group's header and its neighbours are rows of one height. The header's chevron
+        // comes first, in an icon slot, and a neighbour's mark sits under the title's first
+        // letter.
         let fold = bounds(cx, "fold-row");
         let neighbour = bounds(cx, "neighbour");
         assert_eq!(f32::from(fold.size.height), ds::size::SIDEBAR_ROW);
         assert_eq!(f32::from(neighbour.size.height), ds::size::SIDEBAR_ROW);
+        let title = bounds(cx, "fold-title");
         assert_eq!(
-            fold.left(),
-            neighbour.left(),
-            "a flush row on its panel's margin"
+            f32::from(title.left() - fold.left()),
+            ds::space::XS + ds::size::ROW_ICON + ds::space::XS,
+            "the title after the chevron's slot"
+        );
+        let mark = bounds(cx, "neighbour-mark");
+        assert!(
+            f32::from(mark.left() - title.left()).abs() <= ds::space::XXS,
+            "a neighbour's mark on the title's edge: {mark:?} under {title:?}"
         );
         assert_eq!(neighbour.top(), fold.bottom());
         // A switch, shorter than a boxed value, sits level with its label too.

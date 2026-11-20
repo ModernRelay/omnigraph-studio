@@ -439,28 +439,40 @@ impl Render for DesignGallery {
                     v_flex()
                         .mx(px(-space::XS))
                         .child(
-                            ds::fold_row("g-knows", "knows → Person", true, cx)
-                                .child(text::meta("4")),
-                        )
-                        .children(
-                            [
-                                "Shafi Wirth",
-                                "Barbara Dahl",
-                                "Yukihiro Knuth",
-                                "Frances Lamarr",
-                            ]
-                            .into_iter()
-                            .enumerate()
-                            .map(|(n, name)| {
-                                ds::SidebarRow::new(("g-knows", n), name)
-                                    .flush()
-                                    .start(studio_ui::type_mark("Person", name, cx))
-                                    .actions(ds::value_remove(("g-remove", n)))
-                            }),
+                            ds::fold_row(
+                                "g-knows",
+                                ds::fold_title(text::body("Knows"), "→ Person"),
+                                true,
+                                cx,
+                            )
+                            .child(text::meta("4")),
                         )
                         .child(
-                            ds::fold_row("g-works", "worksAt → Company", false, cx)
-                                .child(text::meta("1")),
+                            ds::fold_body().children(
+                                [
+                                    "Shafi Wirth",
+                                    "Barbara Dahl",
+                                    "Yukihiro Knuth",
+                                    "Frances Lamarr",
+                                ]
+                                .into_iter()
+                                .enumerate()
+                                .map(|(n, name)| {
+                                    ds::SidebarRow::new(("g-knows", n), name)
+                                        .flush()
+                                        .start(studio_ui::type_mark("Person", name, cx))
+                                        .actions(ds::value_remove(("g-remove", n)))
+                                }),
+                            ),
+                        )
+                        .child(
+                            ds::fold_row(
+                                "g-works",
+                                ds::fold_title(text::body("WorksAt"), "→ Company"),
+                                false,
+                                cx,
+                            )
+                            .child(text::meta("1")),
                         ),
                 )
                 .child(

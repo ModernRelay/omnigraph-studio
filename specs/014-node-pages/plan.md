@@ -104,9 +104,19 @@ Four parts, built in this order; each lands on its own.
   height; a long text's sit in its head, beside its name, where a folded one shows its
   draft's dot. A field being edited stays level with its label and adds its key hints (and a
   refusal) under it.
-- **How a relationship reads**: under a rule and "Relationships", each group is a fold row,
-  "knows → Person ⌄" (← for one pointing at this node) with its count at the end, over its
-  neighbours, a row each: its type's mark and its name. On a page a click selects it, which
+- **How a relationship reads** (since 2026-11-20): under a rule and "Relationships", each
+  group is a fold row. Its chevron comes first, in an icon slot, so every name starts on one
+  edge. Its name is the one every view uses (`RelationshipGroup::title`): the edge type as
+  the schema declares it, in ink, then, muted, the way it runs from this node and the type at
+  the other end: "Knows → Person", "AuthoredBy ← Artifact". A group counted empty keeps a
+  muted name, as a tree dims it. The count follows the name on a page, whose rows are a
+  document's width; the inspector is narrow and keeps its counts at the rows' end, where they
+  line up. Under the row are its neighbours, a row each, set in so that a neighbour's mark
+  sits under the name's first letter: its type's mark and its name. An open group is followed
+  by 12 px before the next row. Until 2026-11-20 a group read "knows → Person ⌄": the name a
+  query walks the edge by, all of it muted, the chevron after it, the neighbours starting left
+  of it, 6 px after an open group, and a page's count about 540 px from its name. On a page a
+  click selects a neighbour, which
   the inspector shows, and a second opens its page; in the inspector a click opens its page
   (spec 020). Under the pointer
   a row shows its × and a header its "+" (the page shows the "+" always).
@@ -233,15 +243,17 @@ Four parts, built in this order; each lands on its own.
   it, shows its count and stays closed for a click, and the rows under it stay where they are
   (since 2026-11-11; before, each small group counted mid-scroll opened and pushed them down).
   Folding a group found empty would pull the next ones into view and read them all. The groups
-  known to have none before they were laid out (the table counted them) fold into one "Empty"
-  row after the rest, with their number; opening it lists them beneath it, each with its "+",
-  so the rows above do not move. A listed group whose last neighbour is removed moves under the
-  empty row; one added to from there moves up once it has a neighbour.
-- **A page hides the relationships with none** (Ragnor, 2026-11-09), as a tree does: no
-  "Empty" row, and a group leaves the page once it is counted empty. Its toolbar has the tree's
+  known to have none before they were laid out (the table counted them) fold into one row
+  after the rest, named by their number ("3 with none"; "Empty" with a count at its end until
+  2026-11-20, which named a state and left what was empty to be worked out); opening it lists
+  them beneath it, set in under its name, each with its "+", so the rows above do not move. A
+  listed group whose last neighbour is removed moves under that row; one added to from there
+  moves up once it has a neighbour.
+- **A page hides the relationships with none** (Ragnor, 2026-11-09), as a tree does: no row
+  of them, and a group leaves the page once it is counted empty. Its toolbar has the tree's
   eye, which shows them again after the others, and Collapse all; both are the tree's own
   buttons (`studio_workspace::empty_groups_toggle`, `collapse_all_button`). The peek in the
-  inspector keeps its Empty row.
+  inspector keeps its row.
 - **Built so far**: a group's "+" (§1 says where it sits) opens a
   search over the other type, eight matches by name or id; ↑↓ choose and ↵ adds, written at
   once as one commit with this node at the end its group points from. On an outgoing
@@ -284,6 +296,7 @@ Four parts, built in this order; each lands on its own.
 | Every String renders as markdown, parsed from its text | `@format("markdown")` in the schema; a Studio setting per property | Plain text renders as itself, so parsing everything costs nothing for text without markup; 0.13 refuses adding an annotation to an existing property, so a schema marker would reach only properties declared with it from the start; a setting lives on one machine |
 | Zed's `editor` and `markdown`, not `markdown_preview` | `markdown_preview` | It needs Zed's `workspace` and `project`, which Studio replaced |
 | D2 saves as two ordered commits, with "Save as one change" through a branch | Refuse mixed drafts | People edit relationships as one thought; the engine's documented way to make mixed work one result is a branch |
+| One name for a relationship in the inspector, the page, the tree and the canvas: the schema's edge type, the way it runs, the other type, "WorksAt → Org" (2026-11-20) | The name a query walks it by, "worksAt → Org" (the inspector and page until then); words, "WorksAt Org" and "Knows from Person" (the tree from 2026-11-01); the arrow first, "→ WorksAt" (the canvas) | The four views show the same group and named it four ways. The sidebar, the schema and the ontology already say `WorksAt`, and "name → type" is how the ontology lists a type's edges. An arrow says both the direction and where the name ends; "from" said the direction for incoming groups only. A filter or a column built from a traversal keeps the query's name (specs 023, 025), since it reads as the query does |
 
 ## Deferred
 
@@ -305,6 +318,7 @@ Four parts, built in this order; each lands on its own.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-11-20 | A group's chevron leads, its name is the one every view uses, its rows start under the name, a page's count follows the name, and the peek's row of groups with none says how many | `type_table` `a_groups_name_leads_its_rows_and_a_pages_count_follows_it` (a page of a person with two groups of neighbours and two with none: the title 24 px in from its row, the neighbours' marks on its edge, 12 px after the open group, the count inside the title and the title under half the row; then as the peek: the count 4 px from the row's end, the row of those with none among the groups, a group under it 20 px further in; "2 with none", "1,200 with none"); the layout test fails with the chevron put back after the title (the title 4 px in, not 24); `gq_language` `relationship_groups_cover_both_directions` (`title`, `toward`); offscreen snapshots of the dense sample graph (`script/dense-server`) at 1440 × 900, light theme: person-01843's page, and person-00002's inspector after a pick in the Person table, scrolled to its end and with its last row opened | Pass. The page reads "AdvisesOrg → Org 1", "ExpertIn → Topic 2", the names in ink, each group's neighbours under its name. The inspector lists eight groups, "EditedBy ← Artifact 0" and "SpokenBy ← Mention 0" in muted names where they were laid out, then "3 with none", which opened to its groups set in under it. Not looked at: the dark theme, a name too long for the inspector, and the app itself, only its offscreen drawing |
 | 2026-11-18 | ⌘R reads a node's page again at the head, as its Refresh button does | `type_table` `peek::tests::cmd_r_reads_a_nodes_page_again` (another writer's commit changing the node; ⌘R with the page focused reads it at c2; fails with the handler taken out) | Bound only for a node read at its branch's head: a page held at a commit never moves, and an edge is read with its table. "Newer data · Refresh" names the key. Before, ⌘R read only the session and the page kept its old values |
 | 2026-11-11 | A small group counted while the list scrolls stays closed | `type_table` `a_group_counted_while_scrolling_stays_closed` (30 relationships with one neighbour each: those counted before any scroll open; those counted over four scrolls stay closed; once still for `SCROLL_SETTLE`, the next one opens), failing with the rule undone (all 16 open); a person of the personal graph scrolled offscreen with its 60 groups landing (`snapshot` `measure:700,live`), 3.2 ms a frame median, 5.4 ms at most | Fixed. Ragnor saw the inspector stutter while its relationships loaded: no frame was slow, but each small group counted in view opened and pushed every row under it down while the list moved |
 | 2026-11-07 | A save made anywhere moves the views showing it | `type_table` `a_write_made_elsewhere_moves_the_table_with_it` (fails with the announcement off: the table stays at `c1`), `a_write_made_elsewhere_moves_the_page_with_it`, `an_open_editor_takes_a_value_written_elsewhere` (unsaved text stays bound to the value it was typed over) | A table and a page at `c1` move to the write's `c2` with the new name and no "Newer data"; an idle editor shows the new value. Before, a save in the editor left the table it was opened from at the old commit, so the editor opened again from it read the old value there |

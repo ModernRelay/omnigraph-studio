@@ -415,7 +415,8 @@ pub fn explore_scene(
                     continue;
                 }
                 progress.entry(owner).or_default().hubs += 1;
-                let arrow = key.group.direction.arrow();
+                // Named as the tree and a node's page name the relationship.
+                let title = key.group.title();
                 // Searched (the Explore tree's "Find among"), the hub's neighbours are the
                 // matches alone: counted once all are read, else unknown. The relationship's
                 // count would offer "+K more" that no page brings.
@@ -428,8 +429,8 @@ pub fn explore_scene(
                     false => count.loaded().copied(),
                 };
                 let label = match count_value {
-                    Some(count) => format!("{arrow} {} · {count}", key.group.edge),
-                    None => format!("{arrow} {} · …", key.group.edge),
+                    Some(count) => format!("{title} · {count}"),
+                    None => format!("{title} · …"),
                 };
                 let hub = add(
                     &mut scene,
@@ -475,7 +476,6 @@ pub fn explore_scene(
                         existing
                     }
                     None if scene.nodes.len() < cap => {
-                        let arrow = key.group.direction.arrow();
                         let hub = add(
                             &mut scene,
                             &mut by_id,
@@ -486,7 +486,7 @@ pub fn explore_scene(
                                     count: Some(1),
                                     open,
                                 },
-                                label: format!("{arrow} {} · 1", key.group.edge),
+                                label: format!("{} · 1", key.group.title()),
                                 color_key: key.group.edge.clone(),
                                 parent: Some(owner),
                                 path: Some(entry.path.clone()),
@@ -1270,7 +1270,7 @@ mod tests {
             .insert(ada_knows_key.clone(), Loadable::Loaded(2));
         state
             .neighbours
-            .insert(ada_knows_key, list(vec![bob.clone(), cid.clone()]));
+            .insert(ada_knows_key.clone(), list(vec![bob.clone(), cid.clone()]));
         let cid_knows_key = GroupKey::new(cid.clone(), knows.clone());
         state
             .counts
@@ -1304,6 +1304,10 @@ mod tests {
             SceneKind::Hub { open: true, .. }
         ));
         assert!(scene.index_of(&SceneId::Node(acme)).is_some());
+        // A hub is named as the tree and a node's page name the relationship, then its count.
+        assert_eq!(scene.nodes[hub].label, "Employer → Company · 1");
+        let knows_hub = scene.index_of(&SceneId::Hub(ada_knows_key)).unwrap();
+        assert_eq!(scene.nodes[knows_hub].label, "Knows → Person · 2");
     }
 
     #[test]

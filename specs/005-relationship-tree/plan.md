@@ -31,8 +31,8 @@ II (the tree reads one commit), V (rows do not jump), VIII (keyboard), IX (paged
 | Row | Shows | Opens to |
 |---|---|---|
 | Node | type colour dot, label property; one short edge value at the end ("role lead") when it fits whole; the key on the root and the selected row; in review mode `+ ~ −` | its relationship groups |
-| Relationship group | edge name, other type (muted; `from Person` for an incoming group, since 2026-11-01: the arrows read as clutter), the grouping and filters in words, count; zero-count groups dimmed or hidden (toggle) | neighbour nodes, 50 at a time |
-| Field | an edge with cardinality at most one, shown on its node as `manager → Charles` | nothing (Enter follows it) |
+| Relationship group | its name as every view of a node's relationships words it (spec 014, Decisions): the edge type, then, muted, the way it runs and the other type, `WorksAt → Org`, `AuthoredBy ← Artifact`; its count after the name; the grouping and filters in words; zero-count groups dimmed or hidden (toggle). From 2026-11-01 to 2026-11-20 it read `WorksAt Org` and `Knows from Person` with the count at the row's end (Ragnor: the arrow, which then led every row before the name, read as clutter) | neighbour nodes, 50 at a time |
+| Field | an edge with cardinality at most one, shown on its node as `Manager → Charles`, the node in the other type's place | nothing (Enter follows it) |
 | Value | one value of the property the group is grouped by, and how many neighbours have it; "No value" last | the neighbours with that value, paged like a group |
 | More | "Show 50 more of 418 · Filter…" | the next page; a filter box appears above 50 |
 | Cycle | a node already on its own path, "↺ already above" | Enter jumps to the ancestor |
@@ -183,6 +183,7 @@ one measure, and a schema of very many relationships still asks.
 | Path tree, cycles marked | De-duplicated node tree | A graph is not a tree; the path is what the person walked |
 | Single-cardinality edges as fields | A group with one row | Saves a level for the commonest case |
 | Counts per edge type by query | Wait for a neighbourhood route | Works on 0.13; the route is a deferred engine change |
+| A group's count follows its name (2026-11-20) | At the row's end, as a sidebar's counts are | A tree fills its tab, so the count sat a tab's width from the name it counts (about 690 px at 1440 wide); the row's end keeps the sort, group and filter buttons |
 
 ## Deferred
 
@@ -197,6 +198,7 @@ one measure, and a schema of very many relationships still asks.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-11-20 | A relationship's row reads the name every view uses, and its count follows it | `relationship_tree` `the_rows_fit_the_dock_and_the_selected_row_shows` (extended: the last row's count starts 6 px after the type it runs to, and more than a quarter of the row lies after it); offscreen snapshot of person-01843's tree on the dense sample graph (`script/dense-server`), 1440 × 900 | Pass. Six rows, "AdvisesOrg → Org 1" to "MentionsPerson ← Mention 2", each count after its name. A field's row (an edge with cardinality at most one) was not drawn: neither sample graph has one |
 | 2026-11-18 | A tree whose schema could not be read says so | `relationship_tree` `a_tree_without_its_schema_says_why` (a session whose schema read failed: the tree draws the error state) | "The schema could not be read" with the reason, as the canvas says it; "Reading the schema…" while it is read. Before, the tree said "Reading…" for ever, and a set's tree "No rows" until the schema came |
 | 2026-11-18 | Back and Forward work in a tree on Linux and Windows | `studio` `tests/keymaps.rs` `no_view_takes_the_keys_of_back_and_forward` (every block of the three keymaps; fails on the old Tree block, which bound `alt-left` and `alt-right`) | The tree's Expand All and Collapse All are `shift-right` and `shift-left` there; macOS keeps ⌥→ and ⌥←, as its Back is ⌘[. Before, ⌥← in a tree opened with F collapsed the selection instead of going back to the tab it came from, though the Back button's tooltip names ⌥← |
 | 2026-11-15 | What the Expand all bound means on the tree (review of #111) | `graph_store` `expanding_many_nodes_is_asked_first`: one node and every relationship of it, 20 groups, is 1 node and 40 reads (its counts and first lists), against bounds of 50 nodes and 500 reads | Noted under Keys: ⌥→ opens one node, about two reads per relationship, so it asks only past about 250 relationships; the code is kept as it is. Documentation only; the measure itself is the test's |
