@@ -185,6 +185,22 @@ pub struct RelationshipGroup {
     pub other_type: String,
 }
 
+impl RelationshipGroup {
+    /// What every view says after the edge's name: the way the group's edges run from this end,
+    /// and the type at the other one (`→ Org`, `← Artifact`).
+    pub fn toward(&self) -> String {
+        format!("{} {}", self.direction.arrow(), self.other_type)
+    }
+
+    /// The group's name, one wording in every view of a node's relationships: the edge type as
+    /// the schema declares it, then [`Self::toward`] (`WorksAt → Org`, `AuthoredBy ← Artifact`).
+    /// A query walks the edge by another name ([`traversal_name`]), which a filter or a column
+    /// built from a traversal shows.
+    pub fn title(&self) -> String {
+        format!("{} {}", self.edge, self.toward())
+    }
+}
+
 /// A compiled schema.
 #[derive(Clone)]
 pub struct SchemaModel {
@@ -699,6 +715,19 @@ edge Blocks: Task -> Task @instruction("Only for hard blockers")
             direction: Direction::Incoming,
             other_type: "Person".into(),
         }));
+        let works_at = RelationshipGroup {
+            edge: "WorksAt".into(),
+            direction: Direction::Outgoing,
+            other_type: "Company".into(),
+        };
+        assert_eq!(works_at.title(), "WorksAt → Company");
+        let known_by = RelationshipGroup {
+            edge: "Knows".into(),
+            direction: Direction::Incoming,
+            other_type: "Person".into(),
+        };
+        assert_eq!(known_by.toward(), "← Person");
+        assert_eq!(known_by.title(), "Knows ← Person");
         assert_eq!(traversal_name("WorksAt"), "worksAt");
         assert_eq!(traversal_token("WorksAt"), "worksAt");
         assert_eq!(traversal_token("In"), "\"in\"");

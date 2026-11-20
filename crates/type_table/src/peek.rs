@@ -4885,45 +4885,57 @@ impl NodePeek {
                 .is_some_and(|adding| adding.index == index)
     }
 
-    /// The row the groups with no neighbours fold into, with how many; a click shows them.
+    /// The row the groups with no neighbours fold into, named by how many they are ("4 with
+    /// none"); a click shows them, under it.
     fn render_empty_row(&self, cx: &mut Context<Self>) -> AnyElement {
         let folded = (0..self.groups.len())
             .filter(|&index| self.place(index) == Place::Folded)
             .count();
         let open = self.show_empty;
-        studio_ui::ds::fold_row("peek-empty-groups", "Empty", open, cx)
+        let title = studio_ui::ds::text::muted(empty_row_title(folded));
+        studio_ui::ds::fold_row("peek-empty-groups", title, open, cx)
+            .debug_selector(|| "peek-empty-groups".into())
             .tip(studio_ui::ds::tooltip(if open {
                 "Hide the relationships with none"
             } else {
                 "Show the relationships with none, to add one"
             }))
             .on_click(cx.listener(|this, _, _, cx| this.toggle_empty(cx)))
-            .child(studio_ui::ds::text::meta(studio_ui::group_count(
-                folded as i64,
-            )))
             .into_any_element()
     }
 
-    /// One relationship group: a fold row (its name, the way it points and the other type,
-    /// its count, its "+") over its neighbours, one row each; an open search and its notice
-    /// under the header. Unlike a property's values, neighbours are rows: each is a node to
-    /// go to, and a group may hold many.
+    /// One relationship group: a fold row (its chevron, its name as every view words it, its
+    /// count, its "+") over its neighbours, one row each, set in to the name's edge; an open
+    /// search and its notice under the header. Unlike a property's values, neighbours are rows:
+    /// each is a node to go to, and a group may hold many.
     fn render_group(&self, index: usize, cx: &mut Context<Self>) -> Div {
         let group = &self.groups[index];
-        let arrow = match group.group.direction {
-            Direction::Outgoing => "→",
-            Direction::Incoming => "←",
+        // The name in ink and the rest muted: down a list of them the names are what differ.
+        // A group known to hold none keeps the muted name, as a tree dims it.
+        let name = if matches!(group.count, Loadable::Loaded(0)) {
+            studio_ui::ds::text::muted(group.group.edge.clone())
+        } else {
+            studio_ui::ds::text::body(group.group.edge.clone())
         };
-        let title = format!(
-            "{} {arrow} {}",
-            gq_language::traversal_name(&group.group.edge),
-            group.group.other_type
-        );
+        let title = studio_ui::ds::fold_title(name, group.group.toward())
+            .debug_selector(move || format!("peek-group-title-{index}"));
         // Until its count is read a group says nothing about what it holds.
         let count = match &group.count {
             Loadable::Loaded(n) => studio_ui::group_count(*n),
             Loadable::Failed(_) => "?".into(),
             Loadable::NotLoaded | Loadable::Loading => "…".into(),
+        };
+        let count = div()
+            .flex_none()
+            .debug_selector(move || format!("peek-group-count-{index}"))
+            .child(studio_ui::ds::text::meta(count));
+        // A page is a document's width, where a count at the row's end sits far from the name
+        // it counts: there it follows the name. The peek is narrow, and its counts line up
+        // down its edge.
+        let (title, count_at_end) = if self.page {
+            (title.child(count.pl(px(space::XS))), None)
+        } else {
+            (title, Some(count))
         };
         let failed = match &group.count {
             Loadable::Failed(error) => Some(error.clone()),
@@ -4934,6 +4946,7 @@ impl NodePeek {
             .edits_relationships()
             .then(|| self.render_add_button(index, header_group.clone(), cx));
         let header = studio_ui::ds::fold_row(("peek-group", index), title, group.expanded, cx)
+            .debug_selector(move || format!("peek-group-{index}"))
             .group(header_group)
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_group(index, cx)))
             .when_some(failed, |d, error| d.tip(studio_ui::ds::tooltip(error)))
@@ -4941,7 +4954,7 @@ impl NodePeek {
                 header.child(studio_ui::ds::dot(Color::Warning))
             })
             .children(add)
-            .child(studio_ui::ds::text::meta(count));
+            .children(count_at_end);
         let adding = self
             .adding
             .as_ref()
@@ -4960,11 +4973,15 @@ impl NodePeek {
             .then(|| self.render_neighbours(index, group, cx));
         v_flex()
             .child(header)
-            .children(adding)
-            .children(notice)
-            .children(body)
-            // Room under an open group's rows before the next header.
-            .when(group.expanded, |group| group.pb(px(space::XS)))
+            .child(
+                studio_ui::ds::fold_body()
+                    .children(adding)
+                    .children(notice)
+                    .children(body),
+            )
+            // Room under an open group's rows before the next header: with the `XXS` over
+            // every item, `LG`, so where one group's rows end and the next begins shows.
+            .when(group.expanded, |group| group.pb(px(space::LG - space::XXS)))
     }
 
     /// A group's "+": a search for the node to relate; a relationship that needs properties
@@ -5175,6 +5192,7 @@ impl NodePeek {
                 let removes = self.edits_relationships();
                 let on_page = self.page;
                 v_flex()
+                    .debug_selector(move || format!("peek-neighbours-{index}"))
                     .children(neighbours.iter().enumerate().map(|(n, neighbour)| {
                         let open = open_node(&other, &neighbour.id, at_commit.clone());
                         let label = neighbour
@@ -5303,6 +5321,12 @@ fn open_node(type_name: &str, id: &str, at_commit: Option<String>) -> OpenNodePa
         at_commit,
         preview: true,
     }
+}
+
+/// What the peek's row of the groups with none is called: how many they are, so it reads as
+/// what it holds and needs no count of its own ("1 with none", "12 with none").
+fn empty_row_title(folded: usize) -> String {
+    format!("{} with none", studio_ui::group_count(folded as i64))
 }
 
 /// Where a relationship group's row sits (`NodePeek::place`); `active` when the person is
@@ -5458,11 +5482,11 @@ fn neighbours_from(rows: &Value) -> Vec<Neighbour> {
 }
 
 /// A line under a relationship group in place of its rows (none, reading, a failure), on the
-/// rows' labels' edge.
+/// group's name's edge, where its rows' marks would start.
 fn group_note(note: Label) -> AnyElement {
     div()
         .min_h(px(studio_ui::ds::size::SIDEBAR_ROW))
-        .pl(px(space::XS + studio_ui::ds::size::ROW_ICON + space::MD))
+        .pl(px(space::XS))
         .flex()
         .items_center()
         .child(note)
@@ -5572,7 +5596,7 @@ impl NodePeek {
         items.extend(listed);
         items.extend(as_drawn);
         if !folded.is_empty() {
-            // A page has no Empty row: its toolbar's eye shows or hides the groups.
+            // A page has no row of them: its toolbar's eye shows or hides the groups.
             if !self.page {
                 items.push(Item::Empty);
             }
@@ -5706,9 +5730,14 @@ impl NodePeek {
             })
             .pt(px(space::XXS))
             .when(last, |item| item.pb(px(space::XL)))
-            .child(match self.list_items.get(ix) {
+            .child(match self.list_items.get(ix).copied() {
                 // A group's rows carry an `XS` inset for their hover fill; pulled out by it,
-                // their text sits on the section labels' edge.
+                // their chevrons sit on the section labels' edge. A group under the peek's
+                // row of those with none is set in under that row's name, as a group's own
+                // rows are under its.
+                Some(Item::Group(index)) if !page && self.place(index) == Place::Folded => div()
+                    .mx(px(-space::XS))
+                    .child(studio_ui::ds::fold_body().child(item)),
                 Some(Item::Group(_) | Item::Empty) => div().mx(px(-space::XS)).child(item),
                 _ => div().child(item),
             })
@@ -7519,6 +7548,130 @@ mod tests {
             assert_eq!(view.snapshot.as_deref(), Some("c2"), "its own commit");
             assert!(!view.newer && view.group_notices.is_empty());
         });
+    }
+
+    /// How a node's relationships read (2026-11-20). A group's chevron comes first and its
+    /// name after it, so the names start on one edge; its neighbours start on that edge, under
+    /// the name; an open group is followed by `LG` of room before the next. On a page, a
+    /// document's width, the count follows the name; in the peek it ends the row. The peek's
+    /// row of the groups with none is named by how many they are, and they show set in under
+    /// it. Before, the chevron followed the name, the neighbours started left of it, 6 px
+    /// parted two open groups, a page's count sat at the far end of its row, and the row was
+    /// called "Empty".
+    #[gpui::test]
+    async fn a_groups_name_leads_its_rows_and_a_pages_count_follows_it(cx: &mut TestAppContext) {
+        use studio_ui::ds::size::ROW_ICON;
+        const KNOWS_AND_LIKES: &str = "node Person {\n  slug: String @key\n  name: String\n}\nedge Knows: Person -> Person\nedge Likes: Person -> Person\n";
+        let neighbours = |n: usize| {
+            Value::from(
+                (0..n)
+                    .map(|i| json!({ "id": format!("p{:03}", i + 10), "edge_id": format!("e{i}") }))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let (session, _asked) = session_routing(
+            KNOWS_AND_LIKES,
+            move |request| {
+                let query = request["query"].as_str().unwrap_or_default();
+                match request["name"].as_str() {
+                    Some("studio_node") => {
+                        json!([{ "n": { "@id": "p1", "slug": "p1", "name": "Ada" } }])
+                    }
+                    Some("studio_neighbours") if query.contains("$n $e:knows $m") => neighbours(3),
+                    Some("studio_neighbours") if query.contains("$n $e:likes $m") => neighbours(2),
+                    _ => json!([]),
+                }
+            },
+            cx,
+        );
+        let (view, cx) = page(session, cx);
+        view.read_with(cx, |view, _| {
+            let named: Vec<String> = view.groups.iter().map(|g| g.group.title()).collect();
+            assert_eq!(
+                named,
+                [
+                    "Knows → Person",
+                    "Likes → Person",
+                    "Knows ← Person",
+                    "Likes ← Person"
+                ],
+                "as the tree and the canvas name them"
+            );
+            assert!(view.groups[0].expanded && view.groups[1].expanded);
+        });
+        let bounds = |cx: &mut VisualTestContext, selector: String| {
+            cx.debug_bounds(Box::leak(selector.into_boxed_str()))
+                .unwrap()
+        };
+        let header = bounds(cx, "peek-group-0".into());
+        let title = bounds(cx, "peek-group-title-0".into());
+        assert_eq!(
+            f32::from(title.left() - header.left()),
+            space::XS + ROW_ICON + space::XS,
+            "the name after the chevron's slot"
+        );
+        let rows = bounds(cx, "peek-neighbours-0".into());
+        assert_eq!(
+            f32::from(rows.left()) + space::XS,
+            f32::from(title.left()),
+            "a neighbour's mark under the name's first letter"
+        );
+        let next = bounds(cx, "peek-group-1".into());
+        assert_eq!(
+            f32::from(next.top() - rows.bottom()),
+            space::LG,
+            "room after an open group's rows"
+        );
+        // A page's count is part of the title, which is as wide as its text; the row is far
+        // wider.
+        let count = bounds(cx, "peek-group-count-0".into());
+        assert_eq!(count.right(), title.right(), "the count follows the name");
+        assert!(
+            title.size.width < header.size.width / 2.,
+            "at the name, not the row's end: {title:?} in {header:?}"
+        );
+
+        // The peek: as if the table had counted the groups before it laid them out.
+        view.update(cx, |view, cx| {
+            view.page = false;
+            for group in &mut view.groups {
+                group.as_drawn = false;
+            }
+            view.show_empty = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.list_items()[1..],
+                [
+                    Item::Group(0),
+                    Item::Group(1),
+                    Item::Empty,
+                    Item::Group(2),
+                    Item::Group(3)
+                ]
+            );
+        });
+        let header = bounds(cx, "peek-group-0".into());
+        let title = bounds(cx, "peek-group-title-0".into());
+        let count = bounds(cx, "peek-group-count-0".into());
+        assert!(count.left() >= title.right(), "after the title");
+        assert_eq!(
+            f32::from(header.right() - count.right()),
+            space::XS,
+            "the peek's count ends its row"
+        );
+        let empty = bounds(cx, "peek-empty-groups".into());
+        assert_eq!(empty.left(), header.left(), "a row among the groups");
+        let folded = bounds(cx, "peek-group-title-2".into());
+        assert_eq!(
+            f32::from(folded.left() - title.left()),
+            ROW_ICON + space::XS,
+            "a group with none, set in under its row"
+        );
+        assert_eq!(empty_row_title(2), "2 with none");
+        assert_eq!(empty_row_title(1200), "1,200 with none");
     }
 
     /// A node lists first the relationships it is known to have; the ones known to have none

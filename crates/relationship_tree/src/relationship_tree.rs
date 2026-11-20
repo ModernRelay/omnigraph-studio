@@ -1177,9 +1177,15 @@ impl RelationshipTree {
                     .min_w_0()
                     .flex_1()
                     .gap(px(space::SM))
+                    // As a group's row names it, the one node it reaches in the other type's
+                    // place: `WorksAt → ● Perlman AI`.
                     .child(
-                        studio_ui::ds::text::meta(gq_language::traversal_name(&key.group.edge))
-                            .single_line(),
+                        studio_ui::ds::text::meta(format!(
+                            "{} {}",
+                            key.group.edge,
+                            key.group.direction.arrow()
+                        ))
+                        .single_line(),
                     )
                     // The target's dot, as on a neighbour row; none when there is no target.
                     .when(target.is_some(), |row| {
@@ -1202,12 +1208,10 @@ impl RelationshipTree {
                     Color::Default
                 };
                 let muted = if empty { Color::Disabled } else { Color::Muted };
-                // No arrow: an outgoing group reads "knows Person", an incoming one "knows from
-                // Person", the way the edge runs said in words.
-                let other = match key.group.direction {
-                    gq_language::Direction::Outgoing => key.group.other_type.clone(),
-                    gq_language::Direction::Incoming => format!("from {}", key.group.other_type),
-                };
+                // One wording in every view of a node's relationships
+                // (`RelationshipGroup::title`): the edge's name in ink, then the way it runs
+                // and the other type, muted: `WorksAt → Org`, `AuthoredBy ← Artifact`.
+                let other = key.group.toward();
                 let count_label = match count {
                     Loadable::Loaded(n) => n.to_string(),
                     Loadable::Failed(_) => "!".to_owned(),
@@ -1241,7 +1245,25 @@ impl RelationshipTree {
                         div()
                             .min_w_0()
                             .flex_shrink(1.)
+                            .debug_selector(move || format!("tree-toward-{row}"))
                             .child(studio_ui::ds::text::meta(other).color(muted).truncate()),
+                    )
+                    // The count follows the name it counts: a tree is as wide as its tab, and
+                    // at the row's end the count sat a tab's width from it.
+                    .child(
+                        div()
+                            .flex_none()
+                            .pl(px(space::XS))
+                            .debug_selector(move || format!("tree-count-{row}"))
+                            .child(
+                                studio_ui::ds::text::meta(count_label)
+                                    .color(if matches!(count, Loadable::Failed(_)) {
+                                        Color::Error
+                                    } else {
+                                        muted
+                                    })
+                                    .single_line(),
+                            ),
                     )
                     .children(grouped_by.map(|property| {
                         div().min_w_0().flex_shrink(1.).child(
@@ -1262,15 +1284,6 @@ impl RelationshipTree {
                     })
                     .child(div().flex_1())
                     .children(controls)
-                    .child(
-                        studio_ui::ds::text::meta(count_label)
-                            .color(if matches!(count, Loadable::Failed(_)) {
-                                Color::Error
-                            } else {
-                                muted
-                            })
-                            .single_line(),
-                    )
                     .into_any_element()
             }
             EntryKind::Bucket { key, count, .. } => {
@@ -1374,14 +1387,9 @@ impl RelationshipTree {
                     entry
                         .parent
                         .and_then(|parent| match &self.entries.get(parent)?.kind {
-                            // As the group row reads it: `WorksAt`, or `Knows from Person`.
+                            // As the group row reads it: `WorksAt → Org`.
                             EntryKind::Group { key, .. } | EntryKind::Bucket { key, .. } => {
-                                Some(match key.group.direction {
-                                    gq_language::Direction::Outgoing => key.group.edge.clone(),
-                                    gq_language::Direction::Incoming => {
-                                        format!("{} from {}", key.group.edge, key.group.other_type)
-                                    }
-                                })
+                                Some(key.group.title())
                             }
                             _ => None,
                         });
@@ -1779,7 +1787,7 @@ struct HoverCard {
     type_name: String,
     id: String,
     label: Option<String>,
-    /// The relationship as its group row reads (`→ WorksAt`), when the node was reached
+    /// The relationship as its group row reads (`WorksAt → Org`), when the node was reached
     /// through one.
     relationship: Option<String>,
     edge: Vec<(String, serde_json::Value)>,
@@ -2628,6 +2636,21 @@ mod tests {
         assert!(
             row.bottom() <= dock_bounds.bottom(),
             "the selected row {row:?} shows in the dock {dock_bounds:?}"
+        );
+        // A relationship's count follows its name and the type it runs to, a gap after them,
+        // not at the row's far end (2026-11-20).
+        let toward: &'static str = format!("tree-toward-{last}").leak();
+        let count: &'static str = format!("tree-count-{last}").leak();
+        let toward = cx.debug_bounds(toward).expect("a relationship's row");
+        let count = cx.debug_bounds(count).expect("its count");
+        assert_eq!(
+            f32::from(count.left() - toward.right()),
+            space::SM,
+            "the count after the name: {count:?} after {toward:?}"
+        );
+        assert!(
+            row.right() - count.right() > row.size.width / 4.,
+            "not at the row's end: {count:?} in {row:?}"
         );
     }
 }
