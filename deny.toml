@@ -8,21 +8,15 @@ all-features = false
 # Zed's crates at the pinned tag (docs/zed-pin.md) and has no fix within the version Zed allows;
 # drop the entry at the Zed bump that moves past it.
 ignore = [
-    { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.37 in wayland-scanner (build time, reads the protocol XML it ships) and 0.39 in zbus_xml (Linux accessibility); fixed in 0.41, which Zed does not allow yet" },
-    { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.37 and 0.39, as RUSTSEC-2026-0194" },
     { id = "RUSTSEC-2023-0071", reason = "rsa in Zed's rpc crate, used for Zed's collaboration-server handshake, which Studio never makes; no fixed rsa release exists" },
     { id = "RUSTSEC-2025-0052", reason = "async-std is unmaintained; reached through Zed's async-tar fork" },
     { id = "RUSTSEC-2026-0441", reason = "pin-utils is unmaintained, with no release that fixes it; reached only through async-std, as RUSTSEC-2025-0052" },
-    { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained; a build-time proc-macro of the metal crate GPUI uses on macOS" },
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile is unmaintained; reached through Zed's reqwest fork" },
     { id = "RUSTSEC-2026-0206", reason = "rustybuzz is unmaintained; reached through usvg, which GPUI uses for SVG icons" },
     { id = "RUSTSEC-2026-0192", reason = "ttf-parser is unmaintained; reached through usvg, as rustybuzz" },
     { id = "RUSTSEC-2026-0371", reason = "zbus_names is unmaintained, merged into zbus 6; zbus 5 comes in through gpui_linux (accesskit_unix, ashpd, notify-rust, oo7), on Linux only" },
     { id = "RUSTSEC-2026-0370", reason = "zvariant is unmaintained, merged into zbus 6; reached through zbus 5, as zbus_names" },
     { id = "RUSTSEC-2026-0372", reason = "zvariant_derive is unmaintained, merged into zbus 6; reached through zvariant, as zbus_names" },
-    { id = "RUSTSEC-2026-0391", reason = "zstd 0.11 in Zed's rpc crate (the collaboration server's protocol, which Studio never speaks) and 0.13 through Zed's util, rust-embed and include-flate (decompresses Studio's own embedded assets); fixed in 0.14.3, which neither allows" },
-    { id = "RUSTSEC-2026-0398", reason = "zstd-safe 7.3 through zstd 0.13, as RUSTSEC-2026-0391; Studio never seeks in a zstd frame; fixed in 8.2, which zstd 0.13 does not allow" },
-    { id = "RUSTSEC-2026-0403", reason = "zstd-safe 5.0 and 7.3 through zstd 0.11 and 0.13, as RUSTSEC-2026-0391; the legacy-frame decoder reads only Zed's protocol, unused, and Studio's own assets; fixed in 8.2" },
     { id = "RUSTSEC-2026-0459", reason = "SQLite before 3.54 bundled in libsqlite3-sys 0.30.1, through Zed's sqlez and db (editor and workspace state); Studio calls neither, and the only databases they open are Zed's own in the user's data folder, never a file another party wrote; fixed in 0.39, which Zed v1.26.2 and v1.27.0 do not allow (0.30.1)" },
     { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained, with no release that fixes it (no vulnerability is reported). Unlike the rest it is not Zed's alone: Zed's gpui, ui, workspace, client, scheduler and zlog depend on it, and so do arrow-array, arrow-cast and arrow-json through omnigraph-compiler, so Studio's own uses (agent_panel, graph_store, gq_language, relationship_tree, type_table) cannot take it out of the build. Drop it when both Zed and omnigraph-compiler move past chrono, and move Studio's own uses to a maintained crate then" },
 ]
