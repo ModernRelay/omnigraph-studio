@@ -25,7 +25,9 @@ use graph_store::{
 };
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use serde_json::{Map, Value};
-use studio_actions::graph::{OpenBlob, OpenNodePage, ShowNodeInTree, ShowNodeOnCanvas};
+use studio_actions::graph::{
+    OpenBlob, OpenNodePage, ShowNodeHistory, ShowNodeInTree, ShowNodeOnCanvas,
+};
 use studio_actions::node::{CancelField, EditNodeName, ExpandField, SaveField, SaveNodeDrafts};
 use studio_actions::table::{SelectNextSuggestion, SelectPreviousSuggestion};
 use studio_actions::workspace::Refresh;
@@ -625,6 +627,13 @@ impl NodePeek {
             }
             if let SessionEvent::CredentialChanged = event {
                 this.credential_changed(cx);
+                return;
+            }
+            // A page says who changed its node last once its history was read (spec 046).
+            if let SessionEvent::NodeHistoryRead { type_name, id } = event {
+                if this.page && this.subject.type_name() == type_name && this.subject.id() == id {
+                    cx.notify();
+                }
                 return;
             }
             // A view made before the schema was read (a page restored at start) reads its node
@@ -5869,6 +5878,23 @@ impl NodePeek {
                                         window.dispatch_action(Box::new(canvas.clone()), cx)
                                     }),
                             )
+                            // Its history, at the branch head: the inspector reads none itself
+                            // (spec 046).
+                            .children(is_node.then(|| {
+                                let history = ShowNodeHistory {
+                                    type_name: type_name.clone(),
+                                    id: id.clone(),
+                                    preview: true,
+                                };
+                                studio_ui::ds::button("peek-open-history", "History")
+                                    .style(ButtonStyle::Subtle)
+                                    .tip(studio_ui::ds::tooltip(
+                                        "Who changed this node, and when",
+                                    ))
+                                    .on_click(move |_, window, cx| {
+                                        window.dispatch_action(Box::new(history.clone()), cx)
+                                    })
+                            }))
                     })),
             )
             .child({
