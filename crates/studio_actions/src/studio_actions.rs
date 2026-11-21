@@ -835,6 +835,8 @@ pub mod node {
             SaveText,
             /// Save every unsaved change of the node shown as one commit.
             SaveNodeDrafts,
+            /// Edit the name of the node whose page is shown, which its title shows.
+            EditNodeName,
         ]
     );
 }

@@ -7,7 +7,7 @@ use gpui::{AnyElement, App, Div, Hsla, Pixels, SharedString};
 use serde_json::Value;
 use ui::prelude::*;
 
-pub use studio_theme::type_color;
+pub use studio_theme::{assign_type_tints, type_color, type_tint};
 
 mod button;
 mod cell_text;
@@ -226,7 +226,7 @@ pub fn kind_swatch(type_name: &str, is_edge: bool, cx: &App) -> Div {
 /// the type's tint, a 16-pixel rounded square. The tint says what kind of thing it is, the
 /// letter which one.
 pub fn type_mark(type_name: &str, label: &str, cx: &App) -> Div {
-    let color: Hsla = type_color(type_name);
+    let color: Hsla = type_tint(type_name, cx);
     let initial = text::initial(label, type_name);
     div()
         .size(px(ds::size::ROW_ICON))
