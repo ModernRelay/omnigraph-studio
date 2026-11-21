@@ -19,19 +19,20 @@ use gpui::{
     ListAlignment, ListState, Render, SharedString, StyleRefinement, Subscription, Task,
     WeakEntity, Window, list,
 };
+use gq_language::RelationshipGroup;
 use gq_language::{ScalarKind, SchemaModel};
 use graph_store::ledger::ReadView;
 use graph_store::node_history::{
-    Blame, BlameSet, InsertsSkipped, NODE_HISTORY_COMMITS, NODE_HISTORY_INSERT_CAP,
-    NodeHistoryEntry, NodeHistoryPage, NodeHistoryWindow, NodeScope, OlderWindow, SchemaBoundary,
-    WindowCommit, blame, net_of, newest_image, runs,
+    Blame, BlameSet, NODE_HISTORY_COMMITS, NODE_HISTORY_EDGES, NodeHistoryEntry, NodeHistoryPage,
+    NodeHistoryWindow, NodeScope, NodeState, OlderWindow, SchemaBoundary, SearchFound,
+    WindowCommit, blame, net_of, runs,
 };
 use graph_store::scope::ReadScope;
 use graph_store::{FoldedChange, GraphSession, SessionEvent, entity_name, relationship_words};
 use serde_json::Value;
 use studio_actions::changes::ToggleChange;
 use studio_actions::graph::{OpenCommit, OpenNodePage, ShowNodeInTree, ShowNodeOnCanvas};
-use studio_actions::history::ReadOlderCommits;
+use studio_actions::history::{FindWhenSet, ReadOlderCommits};
 use studio_actions::workspace::Refresh;
 use studio_actions::{ViewKind, ViewLink};
 use studio_ui::ds::Tipped as _;
@@ -49,6 +50,19 @@ enum State {
     Reading,
     Ready,
     /// The first window could not be read: the reason.
+    Failed(SharedString),
+}
+
+/// What a search past the windows asks: where the listing goes on, the oldest commit read with
+/// the node there, and the properties no commit read changed, with their value there.
+type SearchAsks = (OlderWindow, (String, NodeState), Vec<(String, Value)>);
+
+/// How the search past the windows stands.
+#[derive(Clone)]
+enum Search {
+    Idle,
+    Running,
+    Done,
     Failed(SharedString),
 }
 
@@ -105,16 +119,24 @@ pub struct NodeHistoryView {
     entries: Vec<NodeHistoryEntry>,
     /// Every window's commits, newest first.
     commits: Vec<WindowCommit>,
-    /// Each window whose insert pass stopped at its cap.
-    skipped: Vec<InsertsSkipped>,
+    /// The node now: at the newest commit of the first window.
+    newest: Option<NodeState>,
+    /// The oldest commit read, with the node there: where a search past the windows starts.
+    oldest: Option<(String, NodeState)>,
+    /// Relationship groups no window read between its ends, as none had an edge at either; and
+    /// groups that held [`NODE_HISTORY_EDGES`] edges at some commit.
+    skipped_groups: Vec<RelationshipGroup>,
+    full_groups: Vec<RelationshipGroup>,
+    /// What the search past the windows found, and how it stands.
+    found: Option<SearchFound>,
+    search: Search,
+    _search_task: Option<Task<()>>,
     boundary: Option<SchemaBoundary>,
-    cleaned_up: bool,
     older: Older,
     /// Why a window was not read to its end, when one was not.
     stopped: Option<SharedString>,
-    /// Requests sent and change-feed bytes read for the windows shown.
+    /// Requests sent for the windows shown.
     requests: usize,
-    feed_bytes: usize,
     /// The branch moved past the head read: Refresh reads it again.
     newer: bool,
     /// The runs of `entries`, and those unfolded, by their newest commit.
@@ -225,7 +247,9 @@ impl Item for NodeHistoryView {
     }
 
     fn settling(&self, _cx: &App) -> bool {
-        matches!(self.state, State::Reading) || matches!(self.older, Older::Reading(_))
+        matches!(self.state, State::Reading)
+            || matches!(self.older, Older::Reading(_))
+            || matches!(self.search, Search::Running)
     }
 
     fn caches_its_parts(&self) -> bool {
@@ -287,13 +311,17 @@ impl NodeHistoryView {
             scope,
             entries: Vec::new(),
             commits: Vec::new(),
-            skipped: Vec::new(),
+            newest: None,
+            oldest: None,
+            skipped_groups: Vec::new(),
+            full_groups: Vec::new(),
+            found: None,
+            search: Search::Idle,
+            _search_task: None,
             boundary: None,
-            cleaned_up: false,
             older: Older::None,
             stopped: None,
             requests: 0,
-            feed_bytes: 0,
             newer: false,
             runs: Vec::new(),
             unfolded: HashSet::new(),
@@ -323,13 +351,17 @@ impl NodeHistoryView {
         self.state = State::Reading;
         self.entries.clear();
         self.commits.clear();
-        self.skipped.clear();
+        self.newest = None;
+        self.oldest = None;
+        self.skipped_groups.clear();
+        self.full_groups.clear();
+        self.found = None;
+        self.search = Search::Idle;
+        self._search_task = None;
         self.boundary = None;
-        self.cleaned_up = false;
         self.older = Older::None;
         self.stopped = None;
         self.requests = 0;
-        self.feed_bytes = 0;
         self.head = None;
         self.selected = None;
         self.rebuild_rows(cx);
@@ -386,26 +418,44 @@ impl NodeHistoryView {
     fn take(&mut self, page: NodeHistoryPage, cx: &mut Context<Self>) {
         let NodeHistoryPage {
             head,
+            newest,
+            oldest,
             entries,
             commits,
             older,
             stopped,
-            inserts_skipped,
             boundary,
-            cleaned_up,
+            skipped_groups,
+            full_groups,
             requests,
-            feed_bytes,
         } = page;
         if self.head.is_none() {
             self.head = Some(head);
+            self.newest = newest;
             cx.emit(ItemEvent::Selected);
+        }
+        self.oldest = oldest;
+        for group in skipped_groups {
+            if !self.skipped_groups.contains(&group) {
+                self.skipped_groups.push(group);
+            }
+        }
+        for group in full_groups {
+            if !self.full_groups.contains(&group) {
+                self.full_groups.push(group);
+            }
         }
         if self.label.is_none() {
             let schema = self.session.read(cx).schema_model();
             let label = entries
                 .iter()
                 .find_map(|entry| entry.node.as_ref())
-                .and_then(|node| entity_name(node, schema.as_deref()));
+                .and_then(|node| entity_name(node, schema.as_deref()))
+                .or_else(|| {
+                    let newest = self.newest.as_ref().filter(|n| n.exists)?;
+                    let label = schema.as_ref()?.node(&self.type_name)?.label_property()?;
+                    newest.properties.get(label)?.as_str().map(str::to_owned)
+                });
             if label.is_some() {
                 self.label = label;
                 cx.emit(ItemEvent::UpdateTab);
@@ -413,13 +463,10 @@ impl NodeHistoryView {
         }
         self.entries.extend(entries);
         self.commits.extend(commits);
-        self.skipped.extend(inserts_skipped);
         if boundary.is_some() {
             self.boundary = boundary;
         }
-        self.cleaned_up |= cleaned_up;
         self.requests += requests;
-        self.feed_bytes += feed_bytes;
         self.stopped = stopped.map(Into::into);
         self.older = match older {
             Some(window) => Older::Waits(window),
@@ -477,6 +524,76 @@ impl NodeHistoryView {
 
     fn offers_older(&self) -> bool {
         matches!(self.older, Older::Waits(_) | Older::Failed(..))
+    }
+
+    /// What a search past the windows would ask: whether the node's creation is not read yet,
+    /// and the properties no commit read changed, with their value at the oldest commit read.
+    fn search_questions(&self, cx: &App) -> Option<SearchAsks> {
+        let Older::Waits(window) = &self.older else {
+            return None;
+        };
+        let oldest = self.oldest.clone()?;
+        let schema = self.session.read(cx).schema_model();
+        let values: Vec<(String, Value)> = self
+            .blame_rows(schema.as_deref())
+            .into_iter()
+            .filter(|row| matches!(row.set, BlameSet::Before(_)))
+            .filter(|row| !self.blob_names(schema.as_deref()).contains(&row.property))
+            .map(|row| {
+                let value = oldest.1.properties.get(&row.property).cloned();
+                (row.property, value.unwrap_or(Value::Null))
+            })
+            .collect();
+        let uncreated = oldest.1.exists && !self.entries.iter().any(|e| e.created());
+        (uncreated || !values.is_empty()).then(|| (window.clone(), oldest, values))
+    }
+
+    fn blob_names(&self, schema: Option<&SchemaModel>) -> Vec<String> {
+        schema
+            .and_then(|schema| schema.node(&self.type_name))
+            .map(|node| {
+                node.properties
+                    .iter()
+                    .filter(|p| p.kind == ScalarKind::Blob)
+                    .map(|p| p.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Searches the commits before those read for when the node was created and its values set
+    /// (spec 046): a listing of them, then a binary search of point reads. Only for these, never
+    /// for the list of changes.
+    fn find_when_set(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.search, Search::Running) {
+            return;
+        }
+        let Some((window, base, values)) = self.search_questions(cx) else {
+            return;
+        };
+        let Some(node) = self.scope_of(cx) else {
+            return;
+        };
+        let (branch, scope) = (self.branch.clone(), self.scope.clone());
+        let read = self.session.update(cx, |session, cx| {
+            session.node_history_search(&scope, &branch, node, window.page_token, base, values, cx)
+        });
+        self.search = Search::Running;
+        self._search_task = Some(cx.spawn(async move |this, cx| {
+            let answer = read.await;
+            this.update(cx, |this, cx| {
+                match answer {
+                    Ok(found) => {
+                        this.search = Search::Done;
+                        this.found = Some(found);
+                    }
+                    Err(error) => this.search = Search::Failed(error.to_string().into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
     }
 
     fn select(&mut self, row: usize, cx: &mut Context<Self>) {
@@ -567,12 +684,9 @@ impl NodeHistoryView {
         cx.notify();
     }
 
-    /// The oldest commit any property was read back to: past it a value was set "before".
+    /// The oldest commit whose change is known: a value no commit read set was set before it.
     fn blame_bound(&self) -> Option<WindowCommit> {
-        // A value no commit read set was set at or before the oldest commit read, or, where the
-        // inserts of newer commits were not read, at or before the newest of those.
-        let skipped = self.skipped.iter().map(|s| &s.newest).max_by_key(|c| c.at);
-        skipped.or(self.commits.last()).cloned()
+        self.commits.last().cloned()
     }
 
     fn blame_rows(&self, schema: Option<&SchemaModel>) -> Vec<Blame> {
@@ -580,7 +694,18 @@ impl NodeHistoryView {
             .and_then(|schema| schema.node(&self.type_name))
             .map(|node| node.properties.iter().map(|p| p.name.clone()).collect())
             .unwrap_or_default();
-        blame(&self.entries, &properties, self.blame_bound().as_ref())
+        let found = self
+            .found
+            .as_ref()
+            .map(|found| found.set.clone())
+            .unwrap_or_default();
+        blame(
+            &self.entries,
+            &properties,
+            self.newest.as_ref(),
+            &found,
+            self.blame_bound().as_ref(),
+        )
     }
 
     /// The node's history, as a test reads it: each row's commits, actor, whether it changed
@@ -628,7 +753,7 @@ impl NodeHistoryView {
         let selected = self.selected == Some(ix);
         let schema = self.session.read(cx).schema_model();
         let body = match row {
-            Row::Now => self.render_now(schema.as_deref()),
+            Row::Now => self.render_now(schema.as_deref(), cx),
             Row::End => self.render_end(cx),
             Row::Run(run) => {
                 let range = self.runs[run].clone();
@@ -666,27 +791,28 @@ impl NodeHistoryView {
     }
 
     /// "Now": each property, its value, and who set it, when and in which commit, within what
-    /// was read; "before" a time where the read did not reach.
-    fn render_now(&self, schema: Option<&SchemaModel>) -> AnyElement {
+    /// was read; "before" a time where the read did not reach, with a search past it.
+    fn render_now(&self, schema: Option<&SchemaModel>, cx: &mut Context<Self>) -> AnyElement {
         let title = change_cards::section_title("Now");
-        let image = newest_image(&self.entries);
-        if let Some((_, true)) = image {
-            let removal = self
-                .entries
-                .iter()
-                .find(|e| e.node.is_some())
-                .expect("the image's entry");
-            let who = removal.actor.clone().unwrap_or_else(|| "no actor".into());
+        if self.newest.as_ref().is_some_and(|newest| !newest.exists) {
+            let said = match self.entries.iter().find(|e| e.removed()) {
+                Some(removal) => format!(
+                    "Removed by {} in {}, {}. Its relationships went with it.",
+                    removal.actor.clone().unwrap_or_else(|| "no actor".into()),
+                    short_commit_id(&removal.commit),
+                    relative_time(removal.at, now_micros()),
+                ),
+                None => format!(
+                    "There is no {} {} on {} now, and none in the commits read.",
+                    self.type_name, self.id, self.branch
+                ),
+            };
             return v_flex()
                 .child(title)
                 .child(
                     div()
                         .px(px(space::EDGE))
-                        .child(studio_ui::ds::text::body(format!(
-                            "Removed by {who} in {}, {}. Its relationships went with it.",
-                            short_commit_id(&removal.commit),
-                            relative_time(removal.at, now_micros()),
-                        ))),
+                        .child(studio_ui::ds::text::body(said)),
                 )
                 .child(div().h(px(space::LG)))
                 .child(change_cards::section_title("Changes"))
@@ -735,11 +861,28 @@ impl NodeHistoryView {
                             format!("Set in commit {} · {}", e.commit, utc_date_time(e.at)).into(),
                         )
                     }
+                    BlameSet::Found(commit) => (
+                        format!(
+                            "{} · {} · {}",
+                            commit.actor.clone().unwrap_or_else(|| "no actor".into()),
+                            relative_time(commit.at, now_micros()),
+                            short_commit_id(&commit.id)
+                        )
+                        .into(),
+                        format!(
+                            "Found by a search of earlier commits: the newest commit before which \
+                             it held another value, {} · {}. A value that went back to an \
+                             earlier one may have been set later.",
+                            commit.id,
+                            utc_date_time(commit.at)
+                        )
+                        .into(),
+                    ),
                     BlameSet::Before(commit) => (
                         format!("before {}", short_time(commit.at)).into(),
                         format!(
-                            "No commit read set it: it was set at or before commit {}. Read \
-                             older commits to find it.",
+                            "No commit read set it: it was set before commit {}. Find when it \
+                             was set searches the commits before.",
                             commit.id
                         )
                         .into(),
@@ -771,7 +914,19 @@ impl NodeHistoryView {
                     .into_any_element()
             })
             .collect();
-        let unread = image.is_none() && !blame.is_empty();
+        let created = self
+            .found
+            .as_ref()
+            .and_then(|found| found.created.as_ref())
+            .map(|commit| {
+                format!(
+                    "Created by {} in {}, {}, found by a search of earlier commits.",
+                    commit.actor.clone().unwrap_or_else(|| "no actor".into()),
+                    short_commit_id(&commit.id),
+                    relative_time(commit.at, now_micros())
+                )
+            });
+        let search = self.render_search(cx);
         v_flex()
             .child(title)
             .child(
@@ -779,12 +934,8 @@ impl NodeHistoryView {
                     .px(px(space::EDGE))
                     .gap(px(space::WITHIN))
                     .children(rows)
-                    .when(unread, |rows| {
-                        rows.child(studio_ui::ds::text::meta(
-                            "No commit read changed the node itself, so its values are on its \
-                             page.",
-                        ))
-                    }),
+                    .children(created.map(studio_ui::ds::text::meta))
+                    .children(search),
             )
             .child(div().h(px(space::LG)))
             .child(change_cards::section_title("Changes"))
@@ -799,6 +950,56 @@ impl NodeHistoryView {
                 )
             })
             .into_any_element()
+    }
+
+    /// The search past the windows: its button while it has a question, its progress, its
+    /// failure, or what stopped it.
+    fn render_search(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let found = self.found.as_ref();
+        let note = match (&self.search, found.and_then(|f| f.stopped.as_ref())) {
+            (Search::Failed(error), _) => Some(format!("The search could not finish: {error}")),
+            (Search::Done, Some(why)) => Some(format!("The search stopped short: {why}.")),
+            (Search::Done, None) => found.map(|f| {
+                format!(
+                    "Searched with {}.",
+                    studio_ui::plural(f.requests, "request", "requests")
+                )
+            }),
+            _ => None,
+        };
+        let asks = !matches!(self.search, Search::Done) && self.search_questions(cx).is_some();
+        if note.is_none() && !asks {
+            return None;
+        }
+        let running = matches!(self.search, Search::Running);
+        let focus = self.focus_handle.clone();
+        Some(
+            h_flex()
+                .pt(px(space::SM))
+                .gap(px(space::MD))
+                .when(asks || running, |row| {
+                    row.child(
+                        studio_ui::ds::button(
+                            "find-when-set",
+                            if running {
+                                "Searching earlier commits…"
+                            } else {
+                                "Find when it was set"
+                            },
+                        )
+                        .style(ButtonStyle::Subtle)
+                        .disabled(running)
+                        .key_binding(KeyBinding::for_action_in(&FindWhenSet, &focus, cx))
+                        .tip(studio_ui::ds::tooltip(
+                            "Search the commits before those read, with a few point reads of the \
+                             node, for when it was created and each value before was set",
+                        ))
+                        .on_click(cx.listener(|this, _, _, cx| this.find_when_set(cx))),
+                    )
+                })
+                .children(note.map(studio_ui::ds::text::meta))
+                .into_any_element(),
+        )
     }
 
     /// One entry's card, or a folded run's: who made it, how and where, when, its commit; then
@@ -1031,7 +1232,9 @@ impl NodeHistoryView {
         };
         let read = studio_ui::plural(self.commits.len(), "commit", "commits");
         let (said, button): (String, Option<AnyElement>) = match &self.older {
-            Older::None if self.boundary.is_some() || self.cleaned_up => (format!("{back}."), None),
+            Older::None if self.boundary.is_some() || self.stopped.is_some() => {
+                (format!("{back}."), None)
+            }
             Older::None => (
                 format!("{back}, the graph's first commit. {read} read."),
                 None,
@@ -1066,28 +1269,40 @@ impl NodeHistoryView {
                 (said, Some(button))
             }
         };
-        let bytes = format!(
-            "{} · {} of changes",
+        let reads = format!(
+            "{} read, {} at once: the node at each commit and its edges through each \
+             relationship",
             studio_ui::plural(self.requests, "request", "requests"),
-            studio_ui::format_bytes(self.feed_bytes as u64)
+            graph_store::node_history::NODE_HISTORY_READS_AT_ONCE
         );
+        let words = |groups: &[RelationshipGroup]| {
+            groups
+                .iter()
+                .map(|g| match g.direction {
+                    gq_language::Direction::Outgoing => format!("{} → {}", g.edge, g.other_type),
+                    gq_language::Direction::Incoming => format!("{} ← {}", g.edge, g.other_type),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
         v_flex()
             .px(px(space::EDGE))
             .py(px(space::MD))
             .gap(px(space::SM))
-            .children(self.skipped.iter().map(|skipped| {
-                studio_ui::ds::text::muted(format!(
-                    "New nodes and relationships in {} were not read: they hold more than {} of \
-                     new rows, such as a load. A relationship added or the node's creation there \
-                     is not shown.",
-                    if skipped.commits == 1 {
-                        "one commit".to_owned()
-                    } else {
-                        format!("the newest {} commits of a window", skipped.commits)
-                    },
-                    studio_ui::format_bytes(NODE_HISTORY_INSERT_CAP as u64)
-                ))
-            }))
+            .when(!self.skipped_groups.is_empty(), |end| {
+                end.child(studio_ui::ds::text::muted(format!(
+                    "Not read between the ends of a window, as it had no relationship at either: \
+                     {}.",
+                    words(&self.skipped_groups)
+                )))
+            })
+            .when(!self.full_groups.is_empty(), |end| {
+                end.child(studio_ui::ds::text::muted(format!(
+                    "More than {NODE_HISTORY_EDGES} relationships at a commit, so changes past \
+                     them are not shown: {}.",
+                    words(&self.full_groups)
+                )))
+            })
             .children(self.boundary.as_ref().map(|boundary| {
                 studio_ui::ds::text::muted(format!(
                     "History stops at a schema change{} in {}. Omnigraph does not compare \
@@ -1100,11 +1315,6 @@ impl NodeHistoryView {
                     short_commit_id(&boundary.commit)
                 ))
             }))
-            .when(self.cleaned_up, |end| {
-                end.child(studio_ui::ds::text::muted(
-                    "The history before these commits was cleaned up.",
-                ))
-            })
             .children(self.stopped.clone().map(|why| {
                 studio_ui::ds::text::muted(format!(
                     "The read stopped short: {}. The changes shown are those read before it.",
@@ -1117,7 +1327,7 @@ impl NodeHistoryView {
                     .child(
                         div()
                             .id("history-read")
-                            .tip(studio_ui::ds::tooltip(bytes))
+                            .tip(studio_ui::ds::tooltip(reads))
                             .child(studio_ui::ds::text::meta(said)),
                     )
                     .children(button),
@@ -1300,11 +1510,6 @@ impl Render for NodeHistoryView {
                 studio_ui::ds::empty_state(IconName::Check, title)
                     .debug_selector(|| "node-history-empty".into())
                     .child(studio_ui::ds::state_detail(detail))
-                    .children(self.skipped.first().map(|_| {
-                        studio_ui::ds::state_detail(
-                            "Some commits held a load of new rows, which were not read.",
-                        )
-                    }))
                     .when(self.offers_older(), |state| {
                         state.child(
                             studio_ui::ds::button(
@@ -1339,6 +1544,15 @@ impl Render for NodeHistoryView {
             .when(self.offers_older(), |view| {
                 view.on_action(cx.listener(|this, _: &ReadOlderCommits, _, cx| this.read_older(cx)))
             })
+            .when(
+                !matches!(self.search, Search::Running | Search::Done)
+                    && self.search_questions(cx).is_some(),
+                |view| {
+                    view.on_action(
+                        cx.listener(|this, _: &FindWhenSet, _, cx| this.find_when_set(cx)),
+                    )
+                },
+            )
             .child(header)
             .child(body)
     }
@@ -1403,16 +1617,13 @@ mod tests {
     use super::*;
 
     const SCHEMA: &str = "node Person {\n    slug: String @key\n    name: String?\n    \
-        title: String?\n    email: String?\n    bio: String?\n}\n\
+        title: String?\n    email: String?\n}\n\
         node Company {\n    slug: String @key\n}\n\
         edge Knows: Person -> Person\n\
         edge WorksAt: Person -> Company\n";
 
     /// Commits `c0` (the graph's first) to `c249` on main, newest first.
     const COMMITS: usize = 250;
-
-    /// Commits a feed page covers, as Omnigraph ends a page on a whole commit.
-    const PAGE_COMMITS: usize = 20;
 
     fn id(n: usize) -> String {
         format!("c{n}")
@@ -1426,130 +1637,57 @@ mod tests {
     /// What the fake server holds beyond its history.
     #[derive(Default, Clone, Copy)]
     struct Served {
-        /// `c220` is a load of new people past the insert pass's cap.
-        load: bool,
-        /// `c200` changed Person's schema: the feed refuses to read across it (409).
+        /// Commits at or before `c200` predate a schema change to Person: a read there is
+        /// refused (E52).
         boundary: bool,
+        /// `c220` is a load of 50,000 new people.
+        load: bool,
     }
 
-    fn person(slug: &str, op: &str, before: Option<Value>, after: Option<Value>) -> Value {
-        let image = |p: Option<Value>| p.map(|p| json!({ "properties": p }));
-        json!({ "kind": "node", "type": { "id": "t1", "name": "Person" }, "id": slug, "op": op,
-            "before": image(before), "after": image(after) })
-    }
-
-    fn edge(name: &str, op: &str, from: &str, to: &str) -> Value {
-        let image = json!({ "properties": {}, "endpoints": { "from": from, "to": to } });
-        let (before, after) = if op == "delete" {
-            (Some(image), None)
-        } else {
-            (None, Some(image))
-        };
-        json!({ "kind": "edge", "type": { "id": format!("t-{name}"), "name": name },
-            "id": format!("{name}:{from}:{to}"), "op": op, "before": before, "after": after })
-    }
-
-    /// Ada as she was at each commit's side.
-    fn ada(name: &str, title: &str, email: &str) -> Value {
-        json!({ "slug": "ada", "name": name, "title": title, "email": email, "bio": null })
-    }
-
-    /// The changes of commit `n`, and who made it: the history of Ada, of Zed (created at c100,
-    /// linked to Bob at c101, removed with that relationship at c245), and of Bob's title.
-    fn changes_of(n: usize, served: Served) -> (&'static str, Value) {
+    /// Who made commit `n`.
+    fn actor(n: usize) -> &'static str {
         match n {
-            5 => (
-                "act-old",
-                json!([person("ada", "insert", None, Some(ada("Ada", "A", "a@x")))]),
-            ),
-            100 => (
-                "act-dev",
-                json!([person(
-                    "zed",
-                    "insert",
-                    None,
-                    Some(json!({ "slug": "zed", "name": "Zed" }))
-                )]),
-            ),
-            101 => ("act-dev", json!([edge("Knows", "insert", "zed", "bob")])),
-            220 if served.load => (
-                "act-load",
-                json!([person(
-                    "bulk",
-                    "insert",
-                    None,
-                    Some(json!({ "slug": "bulk", "bio": "x".repeat(NODE_HISTORY_INSERT_CAP) }))
-                )]),
-            ),
-            225 => (
-                "act-dev",
-                json!([person(
-                    "ada",
-                    "update",
-                    Some(ada("Ada", "A", "a@x")),
-                    Some(ada("Ada Lovelace", "A", "a@x"))
-                )]),
-            ),
-            230 => (
-                "act-dev",
-                json!([
-                    person(
-                        "ada",
-                        "update",
-                        Some(ada("Ada Lovelace", "A", "a@x")),
-                        Some(ada("Ada Lovelace", "A", "ada@x"))
-                    ),
-                    edge("WorksAt", "insert", "ada", "acme")
-                ]),
-            ),
-            235 => ("act-ops", json!([edge("Knows", "insert", "grace", "ada")])),
-            239 => (
-                "act-dev",
-                json!([person(
-                    "ada",
-                    "update",
-                    Some(ada("Ada Lovelace", "A", "ada@x")),
-                    Some(ada("Ada Lovelace", "B", "ada@x"))
-                )]),
-            ),
-            240 => (
-                "act-dev",
-                json!([person(
-                    "ada",
-                    "update",
-                    Some(ada("Ada Lovelace", "B", "ada@x")),
-                    Some(ada("Ada Lovelace", "C", "ada@x"))
-                )]),
-            ),
-            241 => (
-                "act-dev",
-                json!([person(
-                    "bob",
-                    "update",
-                    Some(json!({ "slug": "bob", "title": "A" })),
-                    Some(json!({ "slug": "bob", "title": "B" }))
-                )]),
-            ),
-            245 => (
-                "act-dev",
-                json!([
-                    person(
-                        "zed",
-                        "delete",
-                        Some(json!({ "slug": "zed", "name": "Zed" })),
-                        None
-                    ),
-                    edge("Knows", "delete", "zed", "bob")
-                ]),
-            ),
-            _ => ("act-dev", json!([])),
+            5 => "act-old",
+            235 => "act-ops",
+            _ => "act-dev",
         }
     }
 
-    /// A server whose main holds [`COMMITS`] commits ([`changes_of`]). It pages the listing as
-    /// Omnigraph does, answers the change feed from `start` (or a page token) to the head in
-    /// pages of [`PAGE_COMMITS`] commits filtered by `op`, names `b1`'s branch, and notes every
-    /// request. `/commits` fails with 500 while `failing` holds.
+    /// A person at commit `n`: her properties, or `None` before she exists or after she is
+    /// removed. Ada: created at c5, renamed by the merge at c225, email at c230, title at c239
+    /// and c240. Zed: created at c100, removed at c245. Bob: retitled at c241.
+    fn person(slug: &str, n: usize) -> Option<Value> {
+        match slug {
+            "ada" if n >= 5 => Some(json!({
+                "slug": "ada",
+                "name": if n >= 225 { "Ada Lovelace" } else { "Ada" },
+                "title": if n >= 240 { "C" } else if n >= 239 { "B" } else { "A" },
+                "email": if n >= 230 { "ada@x" } else { "a@x" },
+            })),
+            "zed" if (100..245).contains(&n) => Some(json!({ "slug": "zed", "name": "Zed" })),
+            "bob" => Some(json!({ "slug": "bob", "title": if n >= 241 { "B" } else { "A" } })),
+            _ => None,
+        }
+    }
+
+    /// The edges of a person at commit `n` through the relationship the query names, as
+    /// `(edge id, other end)`: Ada works at Acme from c230 and Grace knows her from c235; Zed
+    /// knows Bob from c101 until he is removed at c245.
+    fn edges(slug: &str, query: &str, n: usize) -> Vec<(&'static str, &'static str)> {
+        let incoming_knows = query.contains("$m $e:knows $n");
+        let outgoing_works = query.contains("$n $e:worksAt $m");
+        let outgoing_knows = query.contains("$n $e:knows $m");
+        match slug {
+            "ada" if outgoing_works && n >= 230 => vec![("w1", "acme")],
+            "ada" if incoming_knows && n >= 235 => vec![("k1", "grace")],
+            "zed" if outgoing_knows && (101..245).contains(&n) => vec![("k2", "bob")],
+            _ => Vec::new(),
+        }
+    }
+
+    /// A server whose main holds [`COMMITS`] commits. It pages the listing as Omnigraph does,
+    /// answers each point read at its snapshot, names `b1`'s branch, and notes every request.
+    /// `/commits` fails with 500 while `failing` holds.
     fn serve(
         served: Served,
         cx: &mut TestAppContext,
@@ -1568,6 +1706,7 @@ mod tests {
                 KeyBinding::new("enter", menu::Confirm, Some("NodeHistory")),
                 KeyBinding::new("space", ToggleChange, Some("NodeHistory")),
                 KeyBinding::new("cmd-alt-n", ReadOlderCommits, Some("NodeHistory")),
+                KeyBinding::new("cmd-alt-f", FindWhenSet, Some("NodeHistory")),
             ]);
         });
         let asked = Arc::new(Mutex::new(Vec::new()));
@@ -1578,99 +1717,90 @@ mod tests {
             json!({
                 "graph_commit_id": id(n), "graph_manifest_version": n, "kind": "published",
                 "created_at": at(n), "parent_commit_id": n.checked_sub(1).map(id),
-                "merged_parent_commit_id": merged, "actor_id": "act-dev",
+                "merged_parent_commit_id": merged, "actor_id": actor(n),
             })
-        };
-        let block = move |n: usize, ops: &[String]| -> Value {
-            let (actor, changes) = changes_of(n, served);
-            let changes: Vec<Value> = changes
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|c| ops.is_empty() || ops.iter().any(|op| c["op"] == json!(op)))
-                .cloned()
-                .collect();
-            let merged = (n == 225).then(|| "b1".to_owned());
-            json!({ "cause": { "graph_commit_id": id(n), "authored_branch": "main",
-                "authored_at": at(n), "actor_id": actor, "merged_parent_commit_id": merged,
-                "parent_commit_id": n.checked_sub(1).map(id) }, "changes": changes })
         };
         let http = FakeHttpClient::create(move |request| {
             let path = request.uri().path().to_owned();
             let query = request.uri().query().unwrap_or_default().to_owned();
-            noted.lock().unwrap().push(format!("{path}?{query}"));
-            let params = |name: &str| -> Vec<String> {
+            let param = |name: &str| {
                 query
                     .split('&')
-                    .filter_map(|pair| pair.strip_prefix(&format!("{name}=")))
-                    .map(|value| value.replace("%3A", ":"))
-                    .collect()
+                    .find_map(|pair| pair.strip_prefix(&format!("{name}=")))
+                    .map(str::to_owned)
             };
-            let param = |name: &str| params(name).into_iter().next();
-            let (status, body) = if path.ends_with("/schema") {
-                (200, json!({ "schema_source": SCHEMA }))
-            } else if path.ends_with("/commits") && fails.load(Ordering::SeqCst) {
-                (
-                    500,
-                    json!({ "error": "the server broke", "code": "internal" }),
-                )
-            } else if path.ends_with("/commits") {
-                let limit: usize = param("limit").and_then(|l| l.parse().ok()).unwrap_or(100);
-                let offset: usize = param("page_token")
-                    .and_then(|t| t.parse().ok())
-                    .unwrap_or(0);
-                let newest = COMMITS - 1 - offset;
-                let page: Vec<Value> = (0..=newest).rev().take(limit).map(commit).collect();
-                let next = (offset + limit < COMMITS).then(|| (offset + limit).to_string());
-                (
-                    200,
-                    json!({ "commits": page, "head_commit_id": id(COMMITS - 1),
-                        "next_page_token": next }),
-                )
-            } else if path.ends_with("/commits/b1") {
-                (
-                    200,
-                    json!({ "graph_commit_id": "b1", "graph_manifest_version": 1,
-                        "created_at": at(224), "kind": "published", "graph_branch": "feature" }),
-                )
-            } else if path.ends_with("/changes") {
-                let from = match (param("page_token"), param("start").as_deref()) {
-                    (Some(token), _) => token.parse::<usize>().unwrap(),
-                    (None, Some("beginning")) | (None, None) => 0,
-                    (None, Some(start)) => {
-                        start
-                            .trim_start_matches("after:c")
-                            .parse::<usize>()
-                            .unwrap()
-                            + 1
-                    }
-                };
-                let ops = params("op");
-                let to = (from + PAGE_COMMITS).min(COMMITS);
-                if served.boundary && from <= 200 {
-                    (
-                        409,
-                        json!({ "error": "schema boundary", "code": "conflict",
-                            "change_diff_refusal": { "reason": "schema_boundary",
-                            "graph_commit_id": "c200", "type_name": "Person" } }),
-                    )
+            let limit: usize = param("limit").and_then(|l| l.parse().ok()).unwrap_or(100);
+            let offset: usize = param("page_token")
+                .and_then(|t| t.parse().ok())
+                .unwrap_or(0);
+            let fails = fails.load(Ordering::SeqCst);
+            let noted = noted.clone();
+            async move {
+                let mut body = Vec::new();
+                use futures::AsyncReadExt as _;
+                request.into_body().read_to_end(&mut body).await.ok();
+                let sent: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                let name = sent["name"].as_str().unwrap_or_default().to_owned();
+                noted.lock().unwrap().push(if name.is_empty() {
+                    format!("{path}?{query}")
                 } else {
-                    let blocks: Vec<Value> = (from..to).map(|n| block(n, &ops)).collect();
-                    let more = to < COMMITS;
+                    format!("{path} {name} {}", sent["snapshot"].as_str().unwrap_or("-"))
+                });
+                let (status, answer) = if path.ends_with("/schema") {
+                    (200, json!({ "schema_source": SCHEMA }))
+                } else if path.ends_with("/commits") && fails {
+                    (
+                        500,
+                        json!({ "error": "the server broke", "code": "internal" }),
+                    )
+                } else if path.ends_with("/commits") {
+                    let newest = COMMITS - 1 - offset;
+                    let page: Vec<Value> = (0..=newest).rev().take(limit).map(commit).collect();
+                    let next = (offset + limit < COMMITS).then(|| (offset + limit).to_string());
                     (
                         200,
-                        json!({ "blocks": blocks, "cursor": "end", "caught_up": !more,
-                            "next_page_token": more.then(|| to.to_string()) }),
+                        json!({ "commits": page, "head_commit_id": id(COMMITS - 1),
+                            "next_page_token": next }),
                     )
-                }
-            } else {
-                (200, json!({}))
-            };
-            async move {
+                } else if path.ends_with("/commits/b1") {
+                    (
+                        200,
+                        json!({ "graph_commit_id": "b1", "graph_manifest_version": 1,
+                            "created_at": at(224), "kind": "published",
+                            "graph_branch": "feature" }),
+                    )
+                } else if path.ends_with("/query") {
+                    let snapshot = sent["snapshot"].as_str().unwrap_or("c249");
+                    let n: usize = snapshot.trim_start_matches('c').parse().unwrap();
+                    let slug = sent["params"]["id"].as_str().unwrap_or_default();
+                    let text = sent["query"].as_str().unwrap_or_default();
+                    if served.boundary && n <= 200 {
+                        (
+                            400,
+                            json!({ "error": "property 'email' of node type 'Person' does not \
+                                exist at this snapshot", "code": "bad_request" }),
+                        )
+                    } else if name == "node_history_node" {
+                        let mut row = person(slug, n);
+                        if let Some(Value::Object(node)) = &mut row {
+                            node.insert("@id".into(), json!(slug));
+                        }
+                        let rows: Vec<Value> = row.map(|n| json!({ "n": n })).into_iter().collect();
+                        (200, read(&name, snapshot, rows))
+                    } else {
+                        let rows: Vec<Value> = edges(slug, text, n)
+                            .into_iter()
+                            .map(|(edge, id)| json!({ "edge": edge, "id": id }))
+                            .collect();
+                        (200, read(&name, snapshot, rows))
+                    }
+                } else {
+                    (200, json!({}))
+                };
                 Ok(Response::builder()
                     .status(status)
                     .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
-                    .body(AsyncBody::from(body.to_string()))
+                    .body(AsyncBody::from(answer.to_string()))
                     .unwrap())
             }
         });
@@ -1685,7 +1815,14 @@ mod tests {
             cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
         session.update(cx, |session, cx| session.reload_schema(cx));
         cx.run_until_parked();
+        let _ = served.load;
         (session, asked, failing)
+    }
+
+    /// A query's answer at `snapshot`.
+    fn read(name: &str, snapshot: &str, rows: Vec<Value>) -> Value {
+        json!({ "query_name": name, "target": { "branch": null, "snapshot": snapshot },
+            "row_count": rows.len(), "rows": rows, "graph_commit_id": snapshot })
     }
 
     fn open<'a>(
@@ -1705,13 +1842,29 @@ mod tests {
         ids.iter().map(|&n| id(n)).collect()
     }
 
-    /// A node's history reads the branch's newest 200 commits: the listing, then the feed from
-    /// just before its oldest commit filtered to the node's types, updates and deletes first,
-    /// then inserts, then the merged branch's name, each read named in the ledger. It shows the
-    /// commits that changed the node or a relationship at either of its ends, newest first; a
-    /// run of one actor's edits within ten minutes folds into one, with its net change.
+    fn by_view(session: &Entity<GraphSession>, what: &str, cx: &mut VisualTestContext) -> u64 {
+        session.read_with(cx, |session, _| {
+            session
+                .ledger()
+                .tallies()
+                .filter(|((name, asker, answered), _)| {
+                    name.as_ref() == what
+                        && *asker == Asker::View(ReadView::NodeHistory)
+                        && answered.sent()
+                })
+                .map(|(_, tally)| tally.count)
+                .sum()
+        })
+    }
+
+    /// A node's history lists the branch's newest 200 commits and reads the node at each and at
+    /// the oldest one's parent, and its edges through each relationship group at both ends of
+    /// the window and, for the groups with an edge at either end, between them; then the merged
+    /// branch. Each read is named in the ledger. It shows the commits that changed the node or a
+    /// relationship at either of its ends, newest first; a run of one actor's edits within ten
+    /// minutes folds into one, with its net change.
     #[gpui::test]
-    async fn a_nodes_history_reads_a_window_and_shows_its_entries(cx: &mut TestAppContext) {
+    async fn a_nodes_history_reads_the_node_at_each_commit(cx: &mut TestAppContext) {
         let (session, asked, _) = serve(Served::default(), cx);
         asked.lock().unwrap().clear();
         let (view, cx) = open(&session, "ada", cx);
@@ -1722,64 +1875,36 @@ mod tests {
             (commits(&[230]), Some("act-dev".into()), true, 1),
             (commits(&[225]), Some("act-dev".into()), true, 0),
         ];
-        assert_eq!(
-            shown, rows,
-            "c241 and c245 changed others; c5 and c101 are older"
+        assert_eq!(shown, rows, "c241 and c245 changed others; c5 is older");
+        // 1 listing; the node at c249..c50 and c49; 3 groups at both ends; Knows → Person had
+        // no edge at either end, so 2 groups between them; 1 merge.
+        assert_eq!(by_view(&session, "node_history_commits", cx), 1);
+        assert_eq!(by_view(&session, "node_history_node", cx), 201);
+        assert_eq!(by_view(&session, "node_history_edges", cx), 6 + 2 * 199);
+        assert_eq!(by_view(&session, "node_history_merge", cx), 1);
+        let asked = asked.lock().unwrap();
+        assert!(
+            asked[0].contains("/commits?branch=main&limit=200"),
+            "{asked:?}"
         );
-        {
-            let asked = asked.lock().unwrap();
-            assert!(
-                asked[0].contains("/commits?branch=main&limit=200"),
-                "{asked:?}"
-            );
-            let feed: Vec<&String> = asked.iter().filter(|a| a.contains("/changes")).collect();
-            // 200 commits in pages of 20, twice: the edits, then the inserts.
-            assert_eq!(feed.len(), 20, "{feed:?}");
-            assert!(feed[0].contains("start=after%3Ac49"), "{feed:?}");
-            for part in ["type=Person", "type=Knows", "type=WorksAt"] {
-                assert!(feed[0].contains(part), "{feed:?}");
-            }
-            assert!(feed[0].contains("op=update") && feed[0].contains("op=delete"));
-            assert!(!feed[0].contains("op=insert"), "edits first");
-            assert!(feed[10].contains("op=insert") && !feed[10].contains("op=update"));
-            assert!(
-                asked.iter().any(|a| a.ends_with("/commits/b1?")),
-                "{asked:?}"
-            );
-            assert_eq!(asked.len(), 22, "{asked:?}");
-        }
-        // Every read is named in the ledger, as asked by this view.
-        session.read_with(cx, |session, _| {
-            let ledger = session.ledger();
-            let by_view = |what: &str| {
-                ledger
-                    .tallies()
-                    .filter(|((name, asker, answered), _)| {
-                        name.as_ref() == what
-                            && *asker == Asker::View(ReadView::NodeHistory)
-                            && answered.sent()
-                    })
-                    .map(|(_, tally)| tally.count)
-                    .sum::<u64>()
-            };
-            assert_eq!(by_view("node_history_commits"), 1);
-            assert_eq!(by_view("node_history_changes"), 10);
-            assert_eq!(by_view("node_history_inserts"), 10);
-            assert_eq!(by_view("node_history_merge"), 1);
-        });
+        assert!(
+            asked.iter().all(|a| !a.contains("/changes")),
+            "the change feed is not read"
+        );
+        assert!(asked.iter().any(|a| a.ends_with("node_history_node c49")));
+        drop(asked);
         view.read_with(cx, |view, cx| {
+            assert_eq!(view.requests, 1 + 201 + 404 + 1);
             assert_eq!(view.commits.len(), 200);
             assert_eq!(view.label.as_deref(), Some("Ada Lovelace"));
             assert!(view.offers_older());
-            // The fold's net change: the title from A to C over two commits.
+            assert_eq!(view.skipped_groups.len(), 1);
             let (node, _) = net_of(&view.entries[view.runs[0].clone()]);
             let node = node.unwrap();
             assert_eq!(node.before.unwrap().properties["title"], json!("A"));
             assert_eq!(node.after.unwrap().properties["title"], json!("C"));
-            // The merge names its branch.
             let merge = view.entries.iter().find(|e| e.commit == "c225").unwrap();
             assert_eq!(merge.merged_branch.as_deref(), Some("feature"));
-            // The page may now say who changed Ada last, at the head read.
             let last = view.session.read(cx).last_change("Person", "ada").cloned();
             assert_eq!(
                 last.map(|l| (l.commit, l.head)),
@@ -1797,8 +1922,7 @@ mod tests {
         view.read_with(cx, |view, _| {
             let ends = |commit: &str| {
                 let entry = view.entries.iter().find(|e| e.commit == commit).unwrap();
-                let edge = &entry.edges[0];
-                let (from, to) = edge.endpoints().unwrap();
+                let (from, to) = entry.edges[0].endpoints().unwrap();
                 (from == "ada", if from == "ada" { to } else { from })
             };
             assert_eq!(ends("c235"), (false, "grace".to_owned()), "incoming");
@@ -1806,11 +1930,12 @@ mod tests {
         });
     }
 
-    /// "Now" names each property's newest setter within the window, the merge's branch for the
-    /// name, and "before" the oldest commit read for the key, which no commit read set; reading
-    /// the 200 commits before finds its creation, and stops where the first window began.
+    /// "Now" names each property's newest setter within the window and "before" the oldest
+    /// commit read for the key; Find when it was set lists the commits before and binary-searches
+    /// them with point reads, finding the creation in a few reads; reading the 200 commits before
+    /// then shows the creation as an entry, read from the node, not searched.
     #[gpui::test]
-    async fn now_says_who_set_each_value_and_before_past_the_window(cx: &mut TestAppContext) {
+    async fn now_says_who_set_each_value_and_searches_past_the_window(cx: &mut TestAppContext) {
         let (session, asked, _) = serve(Served::default(), cx);
         let (view, cx) = open(&session, "ada", cx);
         let now = |view: &NodeHistoryView, cx: &App| -> Vec<(String, String)> {
@@ -1819,13 +1944,12 @@ mod tests {
                 .into_iter()
                 .map(|b| {
                     let set = match b.set {
-                        BlameSet::In { entry, created } => {
-                            format!(
-                                "{}{}",
-                                view.entries[entry].commit,
-                                if created { "+" } else { "" }
-                            )
-                        }
+                        BlameSet::In { entry, created } => format!(
+                            "{}{}",
+                            view.entries[entry].commit,
+                            if created { "+" } else { "" }
+                        ),
+                        BlameSet::Found(commit) => format!("found {}", commit.id),
                         BlameSet::Before(commit) => format!("before {}", commit.id),
                     };
                     (b.property, set)
@@ -1845,41 +1969,40 @@ mod tests {
                     ("name", "c225"),
                     ("title", "c240"),
                     ("email", "c230"),
-                    ("bio", "before c50"),
                 ])
             );
         });
-        asked.lock().unwrap().clear();
         cx.update(|window, cx| window.focus(&view.focus_handle(cx), cx));
+        asked.lock().unwrap().clear();
+        cx.simulate_keystrokes("cmd-alt-f");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            let found = view.found.as_ref().expect("searched");
+            assert_eq!(found.created.as_ref().map(|c| c.id.as_str()), Some("c5"));
+            assert_eq!(now(view, cx)[0], ("slug".into(), "found c5".into()));
+            assert!(found.requests <= 1 + 7, "a listing and log2(50) reads");
+        });
+        {
+            let asked = asked.lock().unwrap();
+            let reads = asked
+                .iter()
+                .filter(|a| a.contains("node_history_node"))
+                .count();
+            assert!((1..=6).contains(&reads), "{asked:?}");
+        }
+        assert!(by_view(&session, "node_history_search_commits", cx) >= 1);
         cx.simulate_keystrokes("cmd-alt-n");
         cx.run_until_parked();
         view.read_with(cx, |view, cx| {
             assert_eq!(
                 view.commits.len(),
                 COMMITS,
-                "it stopped where the first began"
+                "it reached the graph's first commit"
             );
-            assert!(!view.offers_older(), "it reached the graph's first commit");
-            assert_eq!(
-                now(view, cx),
-                pairs(&[
-                    ("slug", "c5+"),
-                    ("name", "c225"),
-                    ("title", "c240"),
-                    ("email", "c230"),
-                    ("bio", "c5+"),
-                ])
-            );
+            assert!(!view.offers_older());
             assert!(view.entries.last().unwrap().created());
+            assert_eq!(now(view, cx)[0], ("slug".into(), "c5+".into()));
         });
-        let asked = asked.lock().unwrap();
-        assert!(asked[0].contains("page_token=200"), "{asked:?}");
-        assert!(
-            asked
-                .iter()
-                .any(|a| a.contains("/changes") && a.contains("start=beginning")),
-            "{asked:?}"
-        );
     }
 
     /// A node removed at the head still opens its history: its removal, with the relationship
@@ -1902,58 +2025,16 @@ mod tests {
                     ("c100", true, false, 0)
                 ]
             );
-            assert!(matches!(newest_image(&view.entries), Some((_, true))));
-            // A creation and a removal never fold.
-            assert_eq!(view.runs.len(), 3);
+            assert!(view.newest.as_ref().is_some_and(|n| !n.exists));
+            assert_eq!(view.runs.len(), 3, "a creation and a removal never fold");
         });
     }
 
-    /// A load past the insert pass's cap stops that pass and the view says what it skipped:
-    /// the newer commits' inserts are not read, the edits still are, and a value no edit set
-    /// reads "before" the newest commit whose inserts were skipped.
-    #[gpui::test]
-    async fn the_insert_cap_stops_the_pass_and_says_what_it_skipped(cx: &mut TestAppContext) {
-        let (session, asked, _) = serve(
-            Served {
-                load: true,
-                ..Default::default()
-            },
-            cx,
-        );
-        let (view, cx) = open(&session, "ada", cx);
-        view.read_with(cx, |view, _| {
-            assert_eq!(view.skipped.len(), 1);
-            // Pages of 20 from c50: c210..c229 holds the load, so c209 is the newest read.
-            assert_eq!(view.skipped[0].commits, 40, "c210 to c249");
-            assert_eq!(view.skipped[0].newest.id, "c249");
-            let shown: Vec<Vec<String>> = view.shown().into_iter().map(|row| row.0).collect();
-            // c235's added relationship is in the skipped inserts, so the edits of c240, c239
-            // and c230, by one actor within ten minutes of each other, now run together.
-            assert_eq!(
-                shown,
-                [commits(&[240, 239, 230]), commits(&[225])],
-                "the edits are read"
-            );
-            assert!(view.entries.iter().all(|e| e.edges.is_empty()));
-            assert!(matches!(
-                view.blame_bound(),
-                Some(WindowCommit { ref id, .. }) if id == "c249"
-            ));
-        });
-        let inserts = asked
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|a| a.contains("/changes") && a.contains("op=insert"))
-            .count();
-        assert_eq!(inserts, 9, "eight pages read, the ninth past the cap");
-    }
-
-    /// A schema change in the window stops the history there: the feed is read again from just
-    /// after it, the commits since are shown, and no older window is offered (E52).
+    /// A schema change between two commits stops the history there (E52): the commits since it
+    /// are shown and no older window is offered.
     #[gpui::test]
     async fn a_schema_change_stops_the_history_and_says_so(cx: &mut TestAppContext) {
-        let (session, asked, _) = serve(
+        let (session, _, _) = serve(
             Served {
                 boundary: true,
                 ..Default::default()
@@ -1966,19 +2047,14 @@ mod tests {
             assert_eq!(
                 view.boundary,
                 Some(SchemaBoundary {
-                    commit: "c200".into(),
+                    commit: "c201".into(),
                     type_name: Some("Person".into())
                 })
             );
-            assert_eq!(view.commits.len(), 49, "c201 to c249");
-            assert_eq!(view.shown().len(), 4, "the changes since the boundary");
+            assert_eq!(view.commits.len(), 48, "c202 to c249");
+            assert_eq!(view.shown().len(), 4);
             assert!(!view.offers_older(), "the walk stops at the boundary");
         });
-        let asked = asked.lock().unwrap();
-        assert!(
-            asked.iter().any(|a| a.contains("start=after%3Ac200")),
-            "read again from just after it: {asked:?}"
-        );
     }
 
     /// No change in the window: the empty state says so and offers the commits before.
@@ -2001,11 +2077,7 @@ mod tests {
         let (session, asked, failing) = serve(Served::default(), cx);
         failing.store(true, Ordering::SeqCst);
         asked.lock().unwrap().clear();
-        let session_ = session.clone();
-        let (view, cx) = cx.add_window_view(move |_, cx| {
-            NodeHistoryView::new(session_, "Person".into(), "ada".into(), None, cx)
-        });
-        cx.run_until_parked();
+        let (view, cx) = open(&session, "ada", cx);
         view.read_with(cx, |view, _| match &view.state {
             State::Failed(why) => assert!(why.contains("the server broke"), "{why}"),
             _ => panic!("failed"),
@@ -2023,8 +2095,6 @@ mod tests {
         };
         assert_eq!(listings(&asked), 1, "nothing is asked again by itself");
         failing.store(false, Ordering::SeqCst);
-        cx.update(|window, cx| window.focus(&view.focus_handle(cx), cx));
-        // Try again reads it, showing the reading state meanwhile.
         view.update(cx, |view, cx| view.reload(cx));
         view.read_with(cx, |view, cx| {
             assert!(matches!(view.state, State::Reading), "reading again");
@@ -2032,11 +2102,11 @@ mod tests {
         });
         cx.run_until_parked();
         assert_eq!(listings(&asked), 2);
-        // ⌘R does too.
+        view.read_with(cx, |view, _| assert!(matches!(view.state, State::Ready)));
+        cx.update(|window, cx| window.focus(&view.focus_handle(cx), cx));
         cx.dispatch_action(Refresh);
         cx.run_until_parked();
-        assert_eq!(listings(&asked), 3);
-        view.read_with(cx, |view, _| assert!(matches!(view.state, State::Ready)));
+        assert_eq!(listings(&asked), 3, "⌘R reads it again");
     }
 
     /// The keyboard: ↓ and J move between entries, ↑ and K back; Space unfolds a run into its
@@ -2069,8 +2139,6 @@ mod tests {
         assert_eq!(selected(cx).as_deref(), Some("c240"));
         cx.simulate_keystrokes("up");
         assert_eq!(selected(cx).as_deref(), Some("c240"), "Now is not an entry");
-
-        // Space unfolds the run into its two commits, and folds it again.
         cx.simulate_keystrokes("space");
         view.read_with(cx, |view, _| {
             assert_eq!(view.shown()[0].0, commits(&[240]));
@@ -2083,7 +2151,6 @@ mod tests {
             assert_eq!(view.shown()[0].0, commits(&[240, 239]))
         });
         assert_eq!(selected(cx).as_deref(), Some("c240"), "on the folded run");
-
         cx.simulate_keystrokes("down enter");
         cx.run_until_parked();
         assert_eq!(*opened.lock().unwrap(), ["c235"]);

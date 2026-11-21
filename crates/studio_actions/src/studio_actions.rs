@@ -991,6 +991,9 @@ pub mod history {
             /// Read a node's history further back: the 200 commits before those read, or try
             /// again a read of them that failed (spec 046).
             ReadOlderCommits,
+            /// Search the commits before a node's history read for when the node was created
+            /// and each value no commit read changed was set (spec 046).
+            FindWhenSet,
         ]
     );
 }

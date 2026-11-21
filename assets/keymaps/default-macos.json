@@ -491,7 +491,8 @@
       "up": "menu::SelectPrevious",
       "enter": "menu::Confirm",
       "space": "studio_changes::ToggleChange",
-      "cmd-alt-n": "studio_history::ReadOlderCommits"
+      "cmd-alt-n": "studio_history::ReadOlderCommits",
+      "cmd-alt-f": "studio_history::FindWhenSet"
     }
   },
   {
