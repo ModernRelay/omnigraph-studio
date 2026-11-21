@@ -27,6 +27,7 @@ test-support = []
 
 [dev-dependencies]
 serde_json = { workspace = true }
+gpui = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true
