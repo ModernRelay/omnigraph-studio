@@ -296,7 +296,12 @@ impl NodeHistoryView {
             SessionEvent::SchemaChanged => this.reload(cx),
             // A new token may read less: what the old one read goes, and the history is read
             // again with the new one, as a node's page does.
-            SessionEvent::CredentialChanged => this.reload(cx),
+            SessionEvent::CredentialChanged => {
+                if this.label.take().is_some() {
+                    cx.emit(ItemEvent::UpdateTab);
+                }
+                this.reload(cx)
+            }
             _ => {}
         });
         let list_view = NodeHistoryRows::new(cx);
@@ -504,8 +509,16 @@ impl NodeHistoryView {
         }
         rows.push(Row::End);
         self.rows = rows;
+        self.keep_place();
+    }
+
+    /// Fits the list to its rows, keeping the row at the top of the view where it is: older
+    /// commits land below the reader, never under them.
+    fn keep_place(&mut self) {
         if self.list_state.item_count() != self.rows.len() {
+            let top = self.list_state.logical_scroll_top();
             self.list_state.reset(self.rows.len());
+            self.list_state.scroll_to(top);
         }
     }
 
@@ -733,9 +746,7 @@ impl NodeHistoryView {
     }
 
     fn render_list(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        if self.list_state.item_count() != self.rows.len() {
-            self.list_state.reset(self.rows.len());
-        }
+        self.keep_place();
         list(
             self.list_state.clone(),
             cx.processor(|this, ix, window, cx| this.render_row(ix, window, cx)),
@@ -1185,7 +1196,8 @@ impl NodeHistoryView {
             .iter()
             .enumerate()
             .map(|(line, edge)| {
-                relationship_line((ix, line), edge, &self.id, schema).into_any_element()
+                relationship_line((ix, line), edge, &self.type_name, &self.id, schema)
+                    .into_any_element()
             })
             .collect();
         let relationships = (!lines.is_empty()).then(|| {
@@ -1365,26 +1377,11 @@ fn short_time(micros: i64) -> String {
 fn relationship_line(
     id: (usize, usize),
     edge: &FoldedChange,
+    node_type: &str,
     node_id: &str,
     schema: Option<&SchemaModel>,
 ) -> RelationshipLine {
-    // The ends the node held: a relationship moved away from it is read from the image that
-    // still names it.
-    let ends = |image: Option<&graph_client::api::ChangeImageOutput>| {
-        let ends = image?.endpoints.as_ref()?;
-        Some((
-            ends.get("from")?.as_str()?.to_owned(),
-            ends.get("to")?.as_str()?.to_owned(),
-        ))
-    };
-    let (from, to) = [edge.after.as_ref(), edge.before.as_ref()]
-        .into_iter()
-        .filter_map(ends)
-        .find(|(from, to)| from == node_id || to == node_id)
-        .or_else(|| edge.endpoints())
-        .unwrap_or_default();
-    let outgoing = from == node_id;
-    let other = if outgoing { to } else { from };
+    let (outgoing, other) = node_end(edge, node_type, node_id, schema);
     let words = match schema.and_then(|schema| schema.edge(&edge.type_name)) {
         Some(edge_type) => relationship_words(&edge_type.name, &edge_type.from, &edge_type.to),
         None => edge.type_name.clone(),
@@ -1398,6 +1395,40 @@ fn relationship_line(
         other,
     )
     .rows(change_cards::rows_of(edge, schema).into())
+}
+
+/// Whether the node is a relationship's source, and the id at its other end. The schema says
+/// which end is the node's type; only where both ends are of its type are the ids compared, so a
+/// node of another type with the same key is never taken for it.
+fn node_end(
+    edge: &FoldedChange,
+    node_type: &str,
+    node_id: &str,
+    schema: Option<&SchemaModel>,
+) -> (bool, String) {
+    let ends = |image: Option<&graph_client::api::ChangeImageOutput>| {
+        let ends = image?.endpoints.as_ref()?;
+        Some((
+            ends.get("from")?.as_str()?.to_owned(),
+            ends.get("to")?.as_str()?.to_owned(),
+        ))
+    };
+    let (from, to) = [edge.after.as_ref(), edge.before.as_ref()]
+        .into_iter()
+        .filter_map(ends)
+        .find(|(from, to)| from == node_id || to == node_id)
+        .or_else(|| edge.endpoints())
+        .unwrap_or_default();
+    // Which end the node is: the schema says, unless both ends are of its type (another node
+    // may have the same key in another type).
+    let edge_type = schema.and_then(|schema| schema.edge(&edge.type_name));
+    let outgoing = match edge_type {
+        Some(e) if e.from == node_type && e.to != node_type => true,
+        Some(e) if e.to == node_type && e.from != node_type => false,
+        _ => from == node_id,
+    };
+    let other = if outgoing { to } else { from };
+    (outgoing, other)
 }
 
 impl Render for NodeHistoryView {
@@ -1910,6 +1941,59 @@ mod tests {
                 last.map(|l| (l.commit, l.head)),
                 Some(("c240".into(), "c249".into()))
             );
+        });
+    }
+
+    /// A relationship between two types whose nodes share a key reads from the schema's ends:
+    /// Company `acme`'s WorksAt from Person `acme` is incoming.
+    #[test]
+    fn a_shared_key_in_another_type_does_not_turn_a_line_around() {
+        let schema = gq_language::SchemaModel::parse(SCHEMA).unwrap();
+        let edge = FoldedChange {
+            kind: graph_store::EntityKind::Edge,
+            type_id: "WorksAt".into(),
+            type_name: "WorksAt".into(),
+            id: "w9".into(),
+            before: None,
+            after: Some(graph_client::api::ChangeImageOutput {
+                properties: Default::default(),
+                endpoints: Some(json!({ "from": "acme", "to": "acme" })),
+            }),
+            commits: vec!["c1".into()],
+        };
+        assert_eq!(
+            node_end(&edge, "Company", "acme", Some(&schema)),
+            (false, "acme".to_owned())
+        );
+        assert_eq!(
+            node_end(&edge, "Person", "acme", Some(&schema)),
+            (true, "acme".to_owned())
+        );
+    }
+
+    /// Older commits land below the reader: the row at the top of the view stays there.
+    #[gpui::test]
+    async fn older_commits_land_below_the_reader(cx: &mut TestAppContext) {
+        let (session, _, _) = serve(Served::default(), cx);
+        let (view, cx) = open(&session, "ada", cx);
+        // A window short enough that the list scrolls.
+        cx.simulate_resize(gpui::size(px(900.), px(240.)));
+        cx.run_until_parked();
+        view.update(cx, |view, _| {
+            view.list_state.scroll_to(gpui::ListOffset {
+                item_ix: 2,
+                offset_in_item: px(0.),
+            })
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.list_state.logical_scroll_top().item_ix, 2, "scrolled");
+        });
+        view.update(cx, |view, cx| view.read_older(cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.commits.len(), COMMITS);
+            assert_eq!(view.list_state.logical_scroll_top().item_ix, 2);
         });
     }
 
