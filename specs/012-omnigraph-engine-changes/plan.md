@@ -640,11 +640,12 @@ insert's whole image. Asked:
 
 Engine rule: the answer is pinned to one head, as a feed page is; a property filter keeps a
 change whose images differ in that property, or that inserted or deleted the entity. *Waits:*
-046. *Today:* windows of a branch's newest 200 first-parent commits read from the change feed
-filtered to the node's type and the relationship types that end at it: its updates and deletes
-first, then its inserts under 8 MiB a window, with what that cap skipped said; a merge is its
-merger's change, with the merged branch read from the merged commit; blame comes from the
-entries read, and says "before" the oldest commit read.
+046. *Today:* windows of a branch's newest 200 first-parent commits, the node read with a point
+query at each and its edges through each relationship group, about window × (1 + groups)
+requests, compared commit to commit; a merge is credited "via merge of *branch*"; blame says
+"before" the oldest commit read, and a binary search of point reads past the windows finds when
+the node was created and a value set. The change feed filtered by type and op is the alternative
+where a type changes rarely; its cost follows what the type wrote.
 
 ### In 0.14, not in 0.13.0
 
