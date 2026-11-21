@@ -9,6 +9,9 @@ use super::*;
 /// The mark [`NodePeek::copied`] holds while the page's key was just copied.
 const KEY_COPIED: &str = "@id";
 
+/// The mark [`NodePeek::copied`] holds while the page's title was just copied.
+const TITLE_COPIED: &str = "@title";
+
 /// The lines of a text Blob a page's card shows; the rest open with Open.
 const TEXT_LINES: usize = 6;
 
@@ -86,7 +89,11 @@ impl NodePeek {
     /// draft, and the commit shown holds it under its name. Editing the name (a click on the
     /// title, F2) opens its row.
     pub(super) fn page_hides(&self, name: &str, cx: &App) -> bool {
+        // A name picked from a menu or a switch keeps its row: the title edits text only, and
+        // the row is where its control is.
+        let picked = self.property_named(name).is_some_and(picked_by_control);
         self.page
+            && !picked
             && !self.edits.contains_key(name)
             && !self.saving.on(&self.branch, name)
             && !self.saving_elsewhere.contains(name)
@@ -105,10 +112,8 @@ impl NodePeek {
         }
         let name = names_by(self.schema.as_deref(), self.subject.type_name())?;
         let property = self.property_named(&name)?;
-        let picked = !property.list
-            && (property.enum_values.is_some() || property.kind == gq_language::ScalarKind::Bool);
         (self.edits_property(property, cx)
-            && !picked
+            && !picked_by_control(property)
             && !self.saving.on(&self.branch, &name)
             && !self.saving_elsewhere.contains(&name))
         .then(|| property.clone())
@@ -292,9 +297,21 @@ impl NodePeek {
 
     /// The page's one title, the node's name or its id; a click on it edits the name.
     fn render_page_title(&self, title: String, cx: &mut Context<Self>) -> AnyElement {
+        let text = title.clone();
         let title = studio_ui::ds::text::page_title(title);
         let Some(property) = self.title_edit(cx) else {
-            return div().child(title).into_any_element();
+            // A name that cannot be edited here, or an id, copies on a click: its row is not
+            // listed, so the title is where it is copied from.
+            return div()
+                .id("page-title")
+                .debug_selector(|| "page-title".into())
+                .cursor_pointer()
+                .tip(studio_ui::ds::tooltip("Click to copy"))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.copy_text(TITLE_COPIED.to_owned(), text.clone(), cx)
+                }))
+                .child(title)
+                .into_any_element();
         };
         let hover = studio_ui::ds::surface::hover(cx);
         let name = property.name.clone();
@@ -319,20 +336,23 @@ impl NodePeek {
             .into_any_element()
     }
 
-    /// The meta line under the title: the type; the key, when the title is the node's name,
-    /// which a click copies; "read at" a commit only when the page holds one or the branch
+    /// The meta line under the title: the type; the key, which a click copies, unless the title
+    /// shows it and copies it itself (an unnamed node whose name the title cannot edit); "read at" a commit only when the page holds one or the branch
     /// has moved past it; and "Newer data · Refresh".
     fn render_page_meta(&self, named: bool, cx: &mut Context<Self>) -> Div {
         let type_name = self.subject.type_name().to_owned();
         let id = self.subject.id().to_owned();
         let is_node = matches!(self.subject, PeekSubject::Node { .. });
         let separator = || studio_ui::ds::text::muted("·");
-        let key_copied = self.copied.as_deref() == Some(KEY_COPIED);
+        let key_copied = self.copied.as_deref() == Some(KEY_COPIED)
+            || self.copied.as_deref() == Some(TITLE_COPIED);
         let commit = self
             .snapshot
             .clone()
             .filter(|_| self.holds_commit || self.newer);
         let holds = self.holds_commit;
+        // The title copies what it shows unless it edits the name: then the key is copied here.
+        let key_shown = named || self.title_edit(cx).is_some();
         h_flex()
             .flex_wrap()
             .items_center()
@@ -345,11 +365,12 @@ impl NodePeek {
                     .child(studio_ui::type_swatch(&type_name, cx))
                     .child(studio_ui::ds::text::muted(type_name)),
             )
-            .when(named, |meta| {
+            .when(key_shown, |meta| {
                 let copy = id.clone();
                 meta.child(separator()).child(
                     div()
                         .id("page-key")
+                        .debug_selector(|| "page-key".into())
                         .cursor_pointer()
                         .tip(studio_ui::ds::tooltip("Key · click to copy"))
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -546,6 +567,13 @@ impl NodePeek {
     }
 }
 
+/// Whether a property is set with a control rather than typed: an enum's menu or a boolean's
+/// switch, which stays in its row.
+fn picked_by_control(property: &gq_language::Property) -> bool {
+    !property.list
+        && (property.enum_values.is_some() || property.kind == gq_language::ScalarKind::Bool)
+}
+
 /// The relationship type of a list item that is a group.
 fn edge_of<'a>(view: &'a NodePeek, item: &Item) -> Option<&'a String> {
     match item {
@@ -617,6 +645,58 @@ mod tests {
             "the peek keeps it"
         );
         assert!(cx.debug_bounds("peek-row-slug").is_some());
+    }
+
+    /// A name picked from an enum keeps its row on the page, where its menu is: the title does
+    /// not edit it, and a click on the title copies the name (review of #161).
+    #[gpui::test]
+    async fn an_enum_name_keeps_its_row_and_the_title_copies_it(cx: &mut TestAppContext) {
+        const PICKED: &str = "node Person {\n  slug: String @key\n  name: enum(Ada, Grace)\n}\n";
+        let (view, cx) = open(session(PICKED, cx), true, cx);
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.title_property().as_deref(), Some("name"));
+            assert!(
+                view.title_edit(cx).is_none(),
+                "an enum is picked in its row"
+            );
+            assert!(!view.page_hides("name", cx));
+        });
+        assert!(
+            cx.debug_bounds("peek-row-name").is_some(),
+            "its row, with its menu, stays"
+        );
+        let title = cx.debug_bounds("page-title").expect("the title");
+        cx.simulate_click(title.center(), gpui::Modifiers::none());
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("Ada".to_owned())
+        );
+        assert!(cx.debug_bounds("page-key").is_some(), "the key copies too");
+    }
+
+    /// A node with no name is titled by its id, which the title cannot edit as a name: the key
+    /// stays copyable in the meta line while the title edits the name (review of #161).
+    #[gpui::test]
+    async fn an_unnamed_nodes_key_stays_copyable(cx: &mut TestAppContext) {
+        const OPTIONAL: &str = "node Person {\n  slug: String @key\n  name: String?\n}\n";
+        let rows = json!([{"n": {"@id": "p1", "slug": "p1", "name": null}}]);
+        let (view, cx) = open(
+            crate::test_support::session_reading(OPTIONAL, rows, cx),
+            true,
+            cx,
+        );
+        view.read_with(cx, |view, cx| {
+            assert!(view.label().is_none());
+            assert!(view.title_edit(cx).is_some(), "the title sets a name");
+        });
+        let key = cx
+            .debug_bounds("page-key")
+            .expect("the key in the meta line");
+        cx.simulate_click(key.center(), gpui::Modifiers::none());
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("p1".to_owned())
+        );
     }
 
     /// A click on the title, or F2, opens the name for editing in its row; Esc closes it and
