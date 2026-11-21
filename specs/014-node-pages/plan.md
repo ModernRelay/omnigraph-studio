@@ -160,9 +160,12 @@ draws what differs).
   (`studio_node::EditNodeName`, bound in `NodeView`, so the palette lists it on a page whose name
   can be edited), opens the name's row with its field, as a row's click does; the row stays while
   it is edited, saving, held as a draft or absent at the commit shown, and goes when the field
-  closes. An enum naming a node keeps its row, with its menu, since the title edits text only
-  (review of #161). A title that does not edit the name (an enum's, one the credential may not
-  change, or an id) copies what it shows on a click; the key stays in the meta line, copied on
+  closes. One function says what the title does with the name (`title_role`): it edits it, or
+  copies one the credential may not change; the list leaves the name's row out only then, so the
+  two cannot drift (review of #161). An enum naming a node keeps its row, with its menu, since
+  the title edits text only. A title that does not edit the name (an enum's, one the credential
+  may not change, or an id) copies what it shows on a click. An empty name names nothing: the
+  title is the id and the name keeps its row; the key stays in the meta line, copied on
   a click, unless the title shows it and copies it itself. "Copied" shows beside what was copied:
   the title, or the key (second review of #161).
 - **Properties as plain text.** A label and value grid: the name, muted, in a 112 px column
@@ -186,16 +189,17 @@ draws what differs).
   rule.
 - **Reading.** Before the node's read lands, the title and three rows are still bars of the
   well's grey (`ds::skeleton`), with the type in the meta line, which the page knows already.
-- **Type tints.** Company and Person hashed to the same brick, so a company among people read as
-  a person. `studio_theme::type_tint` now keeps one graph's node types apart: each type takes the
+- **Type tints, per graph.** Company and Person hashed to the same brick, so a company among
+  people read as a person. One graph's node types now take different tints: each type takes the
   tint its name hashes to unless a type before it in name order took it, then the next free one;
   past eight types the rest keep their hashed tint. It depends only on the graph's set of types,
-  not the schema's order. The session notes the types when it takes a schema
-  (`assign_type_tints`); in the development graph Company keeps brick and Person turns teal. A
-  type named by a graph read before keeps that graph's tint, and a new type takes one that no
-  type of the graphs read holds, else one its own graph leaves free (`tints_beside`): a graph read
-  later never moves an earlier graph's types onto one tint (review of #161, where the last schema
-  read gave a shared name its tint).
+  not the schema's order. The tints are a fact about one graph, so the session makes them when it
+  takes the schema (`install_schema`, `studio_theme::TypeTints`) and keeps them with it; every
+  view draws a type in its own graph's tints (`GraphSession::type_tints`), and nothing is
+  process-wide. In the development graph Company keeps brick and Person turns teal; a second
+  graph with Person and Topic draws its Person brick and moves nothing of the first, in any
+  window (review of #161). The hashed colour is not public: a view cannot draw a type outside its
+  graph's tints.
 - **Not done.** The "+" and a property have no key of their own (a group cannot hold the focus
   yet), as before; the page's `+` shows on hover rather than on a keyboard focus it cannot take.
 
@@ -355,6 +359,14 @@ draws what differs).
 | D2 saves as two ordered commits, with "Save as one change" through a branch | Refuse mixed drafts | People edit relationships as one thought; the engine's documented way to make mixed work one result is a branch |
 | The page reads as a document: plain values, one title, both directions of a type together, centred (2026-11-20) | The peek's rows and pills at a page's width; a left-aligned column with a gutter | Pills made plain text read as tags or buttons; the name and key showed twice; a centred column keeps the same margin either side, so no control ends mid-screen, where a left-aligned one left a wide empty band to its right |
 | One graph's node types take different tints, assigned in name order | Hash alone (today's); a palette per schema order | Hash alone let Company and Person share brick; name order depends on the set of types, not on how the schema lists them |
+| The tints are kept with each graph's schema, in its session | One process-wide map by type name (this spec's first fix) | The map let a second graph with Person but no Company draw the first graph's people as companies again, in every window; a fact about one graph lives with that graph (review of #161) |
+
+## Follow-ups
+
+- **One owner for how the page and the peek look** (maintainer review of #161, item 6):
+  `peek.rs` branches on `page` in about 27 places (row, value, draft text, an editor's reach,
+  group header, count, list order). A small value that says how this view looks (`row`,
+  `value`, `reach`, `group_header`) would make a new look rule change one place. Not in #161.
 
 ## Deferred
 
@@ -377,6 +389,7 @@ draws what differs).
 | Date | Claim | Check | Result |
 |---|---|---|---|
 | 2026-11-20 | Review of #161: an enum name, copying, and tints across graphs | `type_table` `an_enum_name_keeps_its_row_and_the_title_copies_it`, `an_unnamed_nodes_key_stays_copyable`; `studio_theme` `a_second_graph_keeps_the_first_graphs_types_apart`, `a_second_graphs_schema_leaves_the_first_graphs_tints`; each fails with its fix taken out | Pass. An enum name's row and menu stay and the title copies it; an unnamed node's key is in the meta line and copies; a second graph without Company leaves Person teal |
+| 2026-11-21 | Maintainer review of #161: one owner for the title's rule, tints per graph, an empty name | `type_table` `peek::page::tests`: `a_graphs_schema_draws_its_types_apart` (fails with the session's `TypeTints::of` taken out), `two_graphs_sharing_a_type_keep_their_own_tints`, `the_title_and_the_list_agree_on_the_name`, `an_empty_name_titles_the_page_by_its_id` (fails with the empty-name filter taken out), and the enum test, which fails if `title_role` stops refusing a picker; `studio_theme` `two_graphs_sharing_a_type_keep_their_own_tints` | Pass |
 | 2026-11-20 | Second review of #161: the copied mark | `type_table` `an_enum_name_keeps_its_row_and_the_title_copies_it`, which fails with the fix taken out | Pass. Copying the title marks the title, not the key; copying the key marks the key |
 | 2026-11-20 | The page reads as a document, and one graph's types take different tints | `type_table` `peek::page::tests`: `a_page_lists_nothing_its_title_and_meta_show` (name and slug rows absent on a page, present in the peek), `the_title_edits_the_name_on_a_click_or_f2` (a click on the title and F2 open the name's row; Esc closes it), `both_directions_of_a_relationship_sit_together` (Knows → and ← adjacent, the second without the type's name, where before every outgoing group came first), `a_groups_add_shows_only_under_the_pointer_or_while_adding`, `a_page_being_read_shows_bars_not_its_id`, `a_blob_is_a_card_whose_bytes_show_on_asking`, `a_card_shows_a_texts_first_lines_and_a_line_of_bytes`; `studio_theme` `one_graphs_types_get_different_tints`. Two older tests changed for the new look only: `a_long_texts_controls_and_folded_draft_sit_in_its_head` uses a `bio` property, since the name is now the title rather than a row, and `only_the_groups_drawn_are_read_and_scrolling_reads_the_rest_once` counts drawn groups in the list's order, which pairs directions. Offscreen snapshots against `script/dev-server` of person-000000, project-00000 and the note lance-versions, light and dark, and of person-000000 before its read lands | person-000000: "Radia Knuth" over "Person · person-000000", then title, email, born and tags as plain text in a 112 px column, then "Contributes → Project 1", "Knows → Person 4" over "← Person 1", "WorksAt → Company 1"; the column centred in its pane. lance-versions: an "attachment" card reading "Bytes 1.0 KB" with "00 01 02 03 04 05 06 07 …", no dump. Reading: bars for the title and three rows under "Person". Company brick, Person teal. No draw-count guard added: the page draws fewer elements than before (no pill boxes or kind icons), the same list and cached parts |
 | 2026-11-18 | ⌘R reads a node's page again at the head, as its Refresh button does | `type_table` `peek::tests::cmd_r_reads_a_nodes_page_again` (another writer's commit changing the node; ⌘R with the page focused reads it at c2; fails with the handler taken out) | Bound only for a node read at its branch's head: a page held at a commit never moves, and an edge is read with its table. "Newer data · Refresh" names the key. Before, ⌘R read only the session and the page kept its old values |
