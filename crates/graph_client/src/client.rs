@@ -558,32 +558,6 @@ pub enum FeedAt<'a> {
     Page(&'a str),
 }
 
-/// What a change-feed read keeps: the types it names (none: every type) and the operations
-/// (none: every operation).
-#[derive(Debug, Clone, Copy, Default)]
-pub struct FeedFilter<'a> {
-    pub types: &'a [String],
-    pub ops: &'a [FeedOp],
-}
-
-/// An operation a change-feed read can keep, as the feed's `op` parameter spells it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum FeedOp {
-    Insert,
-    Update,
-    Delete,
-}
-
-impl FeedOp {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Insert => "insert",
-            Self::Update => "update",
-            Self::Delete => "delete",
-        }
-    }
-}
-
 /// Why a request has no answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NoAnswer {
@@ -2077,53 +2051,6 @@ impl GraphClient {
             .await
     }
 
-    /// One page of a branch's change feed from `at`, filtered to `types` and to the operations
-    /// `ops` (none: every one), in an answer of at most `cap` bytes, with how many bytes it took
-    /// (spec 046). A longer answer is [`ReadError::TooLarge`] after `cap` and one more byte were
-    /// read, and none of it is decoded: a caller that reads under a budget passes what is left
-    /// of it.
-    pub async fn changes_within(
-        &self,
-        graph: &str,
-        branch: &str,
-        at: FeedAt<'_>,
-        filter: &FeedFilter<'_>,
-        limit: u32,
-        cap: usize,
-    ) -> Result<(ChangeFeedOutput, usize), ReadError> {
-        let limit = limit.to_string();
-        let mut query = vec![("branch", branch), ("limit", limit.as_str())];
-        query.push(match at {
-            FeedAt::Start(start) => ("start", start),
-            FeedAt::Cursor(cursor) => ("cursor", cursor),
-            FeedAt::Page(token) => ("page_token", token),
-        });
-        query.extend(filter.types.iter().map(|name| ("type", name.as_str())));
-        query.extend(filter.ops.iter().map(|op| ("op", op.as_str())));
-        let url = self.url(&["graphs", graph, "changes"], &query);
-        let cap = cap.min(READ_ANSWER_MAX);
-        let raw = self
-            .fetch_reading(
-                Method::GET,
-                url,
-                None,
-                &[],
-                BodyLimit::First(cap.saturating_add(1)),
-                CHANGE_READ_TIMEOUT,
-            )
-            .await?;
-        if !raw.status.is_success() {
-            return Err(refusal(&raw));
-        }
-        check_contract(&raw)?;
-        if raw.body.len() > cap {
-            return Err(ReadError::TooLarge { limit: cap });
-        }
-        let page = serde_json::from_slice(&raw.body)
-            .map_err(|error| ReadError::Decode(error.to_string()))?;
-        Ok((page, raw.body.len()))
-    }
-
     // ---- writes ----
 
     /// `POST /mutate`, or `/mutate/if-graph-commit` when `if_commit` is set.
@@ -2869,19 +2796,6 @@ mod tests {
             at.changes(graph, "main", FeedAt::Start("now"), &[], 10)
                 .await
                 .ok();
-            at.changes_within(
-                graph,
-                "main",
-                FeedAt::Start("beginning"),
-                &FeedFilter {
-                    types: &["Person".to_owned()],
-                    ops: &[FeedOp::Update],
-                },
-                10,
-                1_000,
-            )
-            .await
-            .ok();
             let _ = at.mutate(graph, &change, None).await;
             let _ = at.mutate(graph, &change, Some("c1")).await;
             let _ = at.create_branch(graph, &create).await;
@@ -2908,7 +2822,7 @@ mod tests {
                     .all(|(part, segment)| part.starts_with('{') || part == segment)
         };
         let sent = sent.lock().unwrap();
-        assert_eq!(sent.len(), 29, "one request per call: {sent:?}");
+        assert_eq!(sent.len(), 28, "one request per call: {sent:?}");
         for (method, path, carried) in sent.iter() {
             let public = path.ends_with("/healthz");
             assert_eq!(*carried, !public, "{method} {path} and the token");
@@ -4791,52 +4705,6 @@ mod tests {
             block_on(client.blob_bytes("g", &cell("whole"), BlobAt::Branch("main"), 10..14));
         assert_eq!(bytes.unwrap(), [7, 7, 7, 7]);
         assert_eq!(read.load(std::sync::atomic::Ordering::SeqCst), 14);
-    }
-
-    /// A filtered feed read names its types and operations, says how many bytes its answer
-    /// took, and refuses an answer past its cap (spec 046).
-    #[test]
-    fn a_filtered_feed_read_names_its_ops_and_keeps_to_its_cap() {
-        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let noted = asked.clone();
-        let body = r#"{"blocks":[],"caught_up":true,"cursor":"c9"}"#;
-        let http = FakeHttpClient::create(move |request| {
-            noted
-                .lock()
-                .unwrap()
-                .push(request.uri().query().unwrap_or_default().to_owned());
-            async move {
-                Ok(Response::builder()
-                    .status(200)
-                    .header(CONTRACT_HEADER, CONTRACT)
-                    .body(AsyncBody::from(body))
-                    .unwrap())
-            }
-        });
-        let client = client(http);
-        let types = ["Person".to_owned(), "Knows".to_owned()];
-        let filter = FeedFilter {
-            types: &types,
-            ops: &[FeedOp::Update, FeedOp::Delete],
-        };
-        let at = FeedAt::Start("after:c1");
-        let (page, bytes) =
-            block_on(client.changes_within("g", "main", at, &filter, 8_192, 1_000)).unwrap();
-        assert_eq!(bytes, body.len());
-        assert_eq!(page.caught_up, Some(true));
-        let query = asked.lock().unwrap()[0].clone();
-        for part in [
-            "type=Person",
-            "type=Knows",
-            "op=update",
-            "op=delete",
-            "limit=8192",
-        ] {
-            assert!(query.contains(part), "{query}");
-        }
-        assert!(!query.contains("op=insert"), "{query}");
-        let over = block_on(client.changes_within("g", "main", at, &filter, 10, body.len() - 1));
-        assert!(matches!(over, Err(ReadError::TooLarge { .. })));
     }
 
     /// A query's answer past its cap is refused whole, read one byte past the cap and no
