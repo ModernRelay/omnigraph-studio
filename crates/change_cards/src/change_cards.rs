@@ -154,6 +154,27 @@ pub fn change_rows(
     })
 }
 
+/// One change's property rows, as a card draws them: the ends a lone relationship moved, then
+/// its changed properties, a Blob by its size. For a view that keeps its own changes, as a
+/// node's history does (spec 046).
+pub fn rows_of(change: &FoldedChange, schema: Option<&SchemaModel>) -> Vec<PropertyRow> {
+    let mut rows = moved_end_rows(change);
+    rows.extend(property_rows(change, schema));
+    rows
+}
+
+/// A value as a card says it: a Blob (`blob`) by its size or address, never its bytes; any
+/// other value as Studio writes values.
+pub fn value_words(value: &Value, blob: bool) -> String {
+    if blob {
+        return match blob_words(value) {
+            Value::String(words) => words,
+            other => studio_ui::format_value(&other),
+        };
+    }
+    studio_ui::format_value(value)
+}
+
 /// What a change did to its entity, as a card says it.
 pub fn kind_of_change(change: &FoldedChange) -> ChangeKind {
     kind_of(change.net())

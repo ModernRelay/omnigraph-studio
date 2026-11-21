@@ -141,6 +141,8 @@ impl Item for NodePage {
             ViewLink::current(ViewKind::Page),
             ViewLink::to(ViewKind::Tree),
             ViewLink::to(ViewKind::Canvas),
+            // Read at the branch head, also from a page held at a commit (spec 046).
+            ViewLink::to(ViewKind::History),
         ]
     }
 
@@ -161,6 +163,11 @@ impl Item for NodePage {
                 type_name,
                 id,
                 at_commit,
+                preview: true,
+            })),
+            ViewKind::History => Some(Box::new(studio_actions::graph::ShowNodeHistory {
+                type_name,
+                id,
                 preview: true,
             })),
             _ => None,
