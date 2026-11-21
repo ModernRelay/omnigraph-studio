@@ -1,5 +1,5 @@
 //! Zed's settings, themes and assets, set up for Studio, plus the one graph token: a colour per
-//! node or edge type ([`type_color`]).
+//! node type, one graph's tints ([`TypeTints`]).
 //!
 //! Layer 1 (`docs/architecture.md`). Plan: `specs/002-app-shell/plan.md`.
 //!
@@ -10,7 +10,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use gpui::{App, AssetSource, Global, Hsla, SharedString};
+use gpui::{App, AssetSource, Hsla, SharedString};
 
 mod icons;
 
@@ -126,90 +126,59 @@ fn hashed_tint(type_name: &str) -> usize {
     (hash % TINTS.len() as u32) as usize
 }
 
-/// A stable color for a node or edge type, derived from its name alone. Views draw
-/// [`type_tint`], which keeps the types of one graph apart where their names hash alike.
-pub fn type_color(type_name: &str) -> Hsla {
+/// The color a type's name hashes to: what [`TypeTints`] draws for a type its graph does not
+/// name.
+fn hashed_color(type_name: &str) -> Hsla {
     gpui::rgb(TINTS[hashed_tint(type_name)]).into()
 }
-
-/// The tints of the node types of the graphs read, by name ([`assign_type_tints`]).
-#[derive(Default)]
-struct TypeTints(HashMap<String, usize>);
-
-impl Global for TypeTints {}
 
 /// Each of `names`' tint when they are one graph's node types: the one its name hashes to,
 /// unless a type before it in name order took it, when the next one free. So a graph's types
 /// differ while it has no more than there are tints, and a type keeps its tint as long as the
 /// graph's set of types does: it depends on the set, not on the order the schema lists them.
 /// Past [`TINTS`]' count, the rest keep their hashed tint.
-pub fn type_tints<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<(&'a str, usize)> {
-    tints_beside(&HashMap::new(), names)
-}
-
-/// [`type_tints`] for one more graph's node types (`names`) beside the tints `held` gives the
-/// types of the graphs read before: a name held keeps its tint, so no graph read later moves
-/// another graph's types onto one tint; a new name takes the tint its name hashes to, else the
-/// next one that neither another graph's type nor one of this graph's holds, else the next one
-/// this graph's types leave free, else its hashed tint. So each graph's types differ while the
-/// graphs read have no more types than there are tints, and one graph's while it has no more.
-pub fn tints_beside<'a>(
-    held: &HashMap<String, usize>,
-    names: impl IntoIterator<Item = &'a str>,
-) -> Vec<(&'a str, usize)> {
+fn type_tints<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<(&'a str, usize)> {
     let mut names: Vec<&str> = names.into_iter().collect();
     names.sort_unstable();
     names.dedup();
-    let mut here = [false; TINTS.len()];
-    let mut anywhere = [false; TINTS.len()];
-    for &tint in held.values() {
-        anywhere[tint] = true;
-    }
-    for name in &names {
-        if let Some(&tint) = held.get(*name) {
-            here[tint] = true;
-        }
-    }
+    let mut taken = [false; TINTS.len()];
     names
         .into_iter()
         .map(|name| {
-            if let Some(&tint) = held.get(name) {
-                return (name, tint);
-            }
             let hashed = hashed_tint(name);
-            let next = |free: &dyn Fn(usize) -> bool| {
-                (0..TINTS.len())
-                    .map(|step| (hashed + step) % TINTS.len())
-                    .find(|&tint| free(tint))
-            };
-            let tint = next(&|tint| !here[tint] && !anywhere[tint])
-                .or_else(|| next(&|tint| !here[tint]))
+            let tint = (0..TINTS.len())
+                .map(|step| (hashed + step) % TINTS.len())
+                .find(|&tint| !taken[tint])
                 .unwrap_or(hashed);
-            here[tint] = true;
-            anywhere[tint] = true;
+            taken[tint] = true;
             (name, tint)
         })
         .collect()
 }
 
-/// Notes a graph's node types (`names`, all of them), so [`type_tint`] keeps them apart
-/// ([`tints_beside`]): a type another graph named already keeps that graph's tint.
-pub fn assign_type_tints<'a>(names: impl IntoIterator<Item = &'a str>, cx: &mut App) {
-    let tints = cx.default_global::<TypeTints>();
-    for (name, tint) in tints_beside(&tints.0, names) {
-        tints.0.insert(name.to_owned(), tint);
-    }
-}
+/// One graph's tints for its node types, kept with its schema (the session's): views draw a
+/// type in its own graph's tint, so another graph's types never move it. A type the graph does
+/// not name, or every type before its schema is read, takes the tint its name hashes to.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TypeTints(HashMap<String, usize>);
 
-/// The color a node type is drawn in: its graph's tint for it ([`assign_type_tints`]), or the
-/// one its name hashes to ([`type_color`]) before a graph has named it.
-pub fn type_tint(type_name: &str, cx: &App) -> Hsla {
-    match cx
-        .try_global::<TypeTints>()
-        .and_then(|tints| tints.0.get(type_name))
-    {
-        Some(&tint) => gpui::rgb(TINTS[tint]).into(),
-        None => type_color(type_name),
+impl TypeTints {
+    /// The tints of one graph's node types, `names` ([`type_tints`]).
+    pub fn of<'a>(names: impl IntoIterator<Item = &'a str>) -> Self {
+        Self(
+            type_tints(names)
+                .into_iter()
+                .map(|(name, tint)| (name.to_owned(), tint))
+                .collect(),
+        )
+    }
+
+    /// The color a type is drawn in.
+    pub fn color(&self, type_name: &str) -> Hsla {
+        match self.0.get(type_name) {
+            Some(&tint) => gpui::rgb(TINTS[tint]).into(),
+            None => hashed_color(type_name),
+        }
     }
 }
 
@@ -255,12 +224,13 @@ mod tests {
 
     #[test]
     fn a_type_name_always_gets_the_same_tint() {
-        assert_eq!(type_color("Person"), type_color("Person"));
+        let none = TypeTints::default();
+        assert_eq!(none.color("Person"), none.color("Person"));
         // Project slate blue, Note green, Topic ochre, Person brick.
-        assert_eq!(type_color("Project"), gpui::rgb(0x3f6aa8).into());
-        assert_eq!(type_color("Note"), gpui::rgb(0x467350).into());
-        assert_eq!(type_color("Topic"), gpui::rgb(0x8a6d1f).into());
-        assert_eq!(type_color("Person"), gpui::rgb(0xa55651).into());
+        assert_eq!(none.color("Project"), gpui::rgb(0x3f6aa8).into());
+        assert_eq!(none.color("Note"), gpui::rgb(0x467350).into());
+        assert_eq!(none.color("Topic"), gpui::rgb(0x8a6d1f).into());
+        assert_eq!(none.color("Person"), gpui::rgb(0xa55651).into());
     }
 
     /// Company and Person hash to the same brick: as one graph's types they differ, the first
@@ -284,46 +254,23 @@ mod tests {
         assert_eq!(tints[8].1, hashed_tint("T8"));
     }
 
-    /// A second graph never moves the first graph's types onto one tint: Person, which hashes
-    /// to Company's brick, keeps the teal the first graph gave it when a graph without Company
-    /// is read, where alone it would take brick; and the second graph's own types differ.
+    /// Two graphs that share a type name each keep their own tints: Person is teal beside
+    /// Company in one and brick beside Topic in the other, and neither table moves the other.
     #[test]
-    fn a_second_graph_keeps_the_first_graphs_types_apart() {
-        let mut held: HashMap<String, usize> = HashMap::new();
-        for (name, tint) in tints_beside(&held, ["Company", "Person"]) {
-            held.insert(name.to_owned(), tint);
-        }
-        assert_ne!(held["Company"], held["Person"]);
+    fn two_graphs_sharing_a_type_keep_their_own_tints() {
+        let a = TypeTints::of(["Company", "Person"]);
+        let b = TypeTints::of(["Person", "Topic"]);
+        assert_ne!(a.color("Company"), a.color("Person"));
+        assert_ne!(b.color("Person"), b.color("Topic"));
         assert_eq!(
-            type_tints(["Person", "Topic"])[0],
-            ("Person", 5),
+            b.color("Person"),
+            gpui::rgb(0xa55651).into(),
             "alone: brick"
         );
-        for (name, tint) in tints_beside(&held, ["Person", "Topic", "Note"]) {
-            held.insert(name.to_owned(), tint);
-        }
-        assert_ne!(
-            held["Company"], held["Person"],
-            "the first graph's types stay apart"
+        assert_eq!(
+            a,
+            TypeTints::of(["Person", "Company"]),
+            "b read after a moves nothing"
         );
-        let second: std::collections::HashSet<usize> = ["Person", "Topic", "Note"]
-            .iter()
-            .map(|n| held[*n])
-            .collect();
-        assert_eq!(second.len(), 3, "the second graph's types differ");
-    }
-
-    /// The same through the app's tints, as two sessions note their schemas: before 2026-11-20
-    /// the second graph's Person took brick and drew the first graph's people as companies.
-    #[gpui::test]
-    fn a_second_graphs_schema_leaves_the_first_graphs_tints(cx: &mut gpui::TestAppContext) {
-        cx.update(|cx| {
-            assign_type_tints(["Company", "Person"], cx);
-            let person = type_tint("Person", cx);
-            assign_type_tints(["Person", "Topic"], cx);
-            assert_eq!(type_tint("Person", cx), person);
-            assert_ne!(type_tint("Company", cx), type_tint("Person", cx));
-            assert_ne!(type_tint("Topic", cx), type_tint("Person", cx));
-        });
     }
 }

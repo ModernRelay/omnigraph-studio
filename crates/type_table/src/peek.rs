@@ -5252,7 +5252,12 @@ impl NodePeek {
                             label.clone(),
                         )
                         .flush()
-                        .start(studio_ui::type_mark(&other, &label, cx));
+                        .start(studio_ui::type_mark(
+                            &other,
+                            &label,
+                            self.session.read(cx).type_tints(),
+                            cx,
+                        ));
                         let row = if on_page {
                             // A page holds a selection, as a table and a tree do: a click
                             // selects the related node, which the inspector shows, and a second
@@ -5329,18 +5334,23 @@ impl NodePeek {
                     .px(px(space::XS))
                     .child(
                         studio_ui::ds::property_value().child(
-                            studio_ui::ds::node_value(ty, id.clone(), cx)
-                                .id(label)
-                                .hover(move |s| s.bg(hover))
-                                .cursor_pointer()
-                                .tip(studio_ui::ds::tooltip(format!(
-                                    "Open {id} · {ty} · double-click keeps the tab"
-                                )))
-                                .on_click(move |event, window, cx| {
-                                    let mut open = open.clone();
-                                    open.preview = event.click_count() < 2;
-                                    window.dispatch_action(Box::new(open), cx);
-                                }),
+                            studio_ui::ds::node_value(
+                                ty,
+                                id.clone(),
+                                self.session.read(cx).type_tints(),
+                                cx,
+                            )
+                            .id(label)
+                            .hover(move |s| s.bg(hover))
+                            .cursor_pointer()
+                            .tip(studio_ui::ds::tooltip(format!(
+                                "Open {id} · {ty} · double-click keeps the tab"
+                            )))
+                            .on_click(move |event, window, cx| {
+                                let mut open = open.clone();
+                                open.preview = event.click_count() < 2;
+                                window.dispatch_action(Box::new(open), cx);
+                            }),
                         ),
                     ),
             )
@@ -5834,7 +5844,7 @@ impl NodePeek {
             .child(
                 h_flex()
                     .gap(px(space::SM))
-                    .child(studio_ui::type_swatch(&type_name, cx))
+                    .child(studio_ui::type_swatch(&type_name, self.session.read(cx).type_tints(), cx))
                     .child(
                         studio_ui::ds::text::muted(type_name.clone()),
                     )

@@ -26,6 +26,8 @@ pub(crate) struct RowNote {
     fields: Vec<Field>,
     /// The commit the result's rows are held at, which a node opened from here is held at too.
     at_commit: Option<String>,
+    /// The tints of the graph's types, which a node's mark is drawn in.
+    tints: studio_ui::TypeTints,
 }
 
 struct Field {
@@ -92,7 +94,12 @@ fn cut(text: String) -> String {
 
 impl RowNote {
     /// The note for row `row` of `table`, or none when the table has no such row.
-    pub(crate) fn new(row: usize, table: &ResultTable, at_commit: Option<String>) -> Option<Self> {
+    pub(crate) fn new(
+        row: usize,
+        table: &ResultTable,
+        at_commit: Option<String>,
+        tints: studio_ui::TypeTints,
+    ) -> Option<Self> {
         let values = table.rows.get(row)?;
         let fields = table
             .columns
@@ -117,6 +124,7 @@ impl RowNote {
             of: table.rows.len(),
             fields,
             at_commit,
+            tints,
         })
     }
 
@@ -201,7 +209,7 @@ impl Render for RowNote {
                                     "{type_name} {id} · click to open its page"
                                 )))
                                 .on_click(open)
-                                .child(ds::node_value(type_name, id.clone(), cx)),
+                                .child(ds::node_value(type_name, id.clone(), &self.tints, cx)),
                         ),
                     )
                 }
@@ -258,7 +266,7 @@ mod tests {
                 ],
             ],
         };
-        let note = RowNote::new(1, &table, None).expect("the second row");
+        let note = RowNote::new(1, &table, None, Default::default()).expect("the second row");
         assert_eq!(note.place(), (2, 2));
         let kinds: Vec<&Shown> = note.fields.iter().map(|field| &field.value).collect();
         assert_eq!(
@@ -280,6 +288,9 @@ mod tests {
             "every item, where the grid shows three"
         );
         assert_eq!(kinds[5], &Shown::Nothing);
-        assert!(RowNote::new(2, &table, None).is_none(), "no such row");
+        assert!(
+            RowNote::new(2, &table, None, Default::default()).is_none(),
+            "no such row"
+        );
     }
 }

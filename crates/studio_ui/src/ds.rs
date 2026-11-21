@@ -1057,8 +1057,8 @@ pub enum Status {
 /// A node type's colour as a small dot, centred in the width of a type mark so rows with
 /// either line up: for rows whose context already names the type, where a lettered mark would
 /// repeat it.
-pub fn type_dot(type_name: &str, cx: &App) -> Div {
-    icon_slot(dot(Color::Custom(studio_theme::type_tint(type_name, cx))))
+pub fn type_dot(type_name: &str, tints: &crate::TypeTints) -> Div {
+    icon_slot(dot(Color::Custom(tints.color(type_name))))
 }
 
 /// A dot that beats while given its `beat` (a server that answers): each beat sends one ring
@@ -3117,10 +3117,15 @@ pub fn value_text(value: impl Into<SharedString>, cx: &App) -> Div {
 }
 
 /// A neighbour as a value: its type's mark and its name in a [`value_box`].
-pub fn node_value(type_name: &str, label: impl Into<SharedString>, cx: &App) -> Div {
+pub fn node_value(
+    type_name: &str,
+    label: impl Into<SharedString>,
+    tints: &crate::TypeTints,
+    cx: &App,
+) -> Div {
     let label = label.into();
     value_box(cx)
-        .child(crate::type_mark(type_name, &label, cx))
+        .child(crate::type_mark(type_name, &label, tints, cx))
         .child(
             div()
                 .min_w_0()

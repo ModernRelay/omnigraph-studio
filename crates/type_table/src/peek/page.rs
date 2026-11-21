@@ -84,39 +84,66 @@ impl NodePeek {
         (self.values.loaded()?.get(&key)?.as_str() == Some(id.as_str())).then_some(key)
     }
 
-    /// Whether a page leaves property `name` out of its list: its title or its meta line shows
-    /// it, and nothing about it needs its row: it is not being edited, saved or held as a
-    /// draft, and the commit shown holds it under its name. Editing the name (a click on the
-    /// title, F2) opens its row.
+    /// Whether a page leaves property `name` out of its list: the title or the meta line gives
+    /// everything its row gave, and nothing about it needs its row: it is not being edited or
+    /// held as a draft, and the commit shown holds it under its name. The name's case is
+    /// [`Self::title_covers_name`]'s alone, so what the title does and what the list leaves out
+    /// cannot drift apart. Editing the name (a click on the title, F2) opens its row.
     pub(super) fn page_hides(&self, name: &str, cx: &App) -> bool {
-        // A name picked from a menu or a switch keeps its row: the title edits text only, and
-        // the row is where its control is.
-        let picked = self.property_named(name).is_some_and(picked_by_control);
+        let shown_above = if self.title_property().as_deref() == Some(name) {
+            self.title_covers_name(cx)
+        } else if self.key_property().as_deref() == Some(name) {
+            // The key is never edited; a menu or a switch keeps its row.
+            !self.property_named(name).is_some_and(picked_by_control)
+                && !self.saving.on(&self.branch, name)
+                && !self.saving_elsewhere.contains(name)
+        } else {
+            false
+        };
         self.page
-            && !picked
+            && shown_above
             && !self.edits.contains_key(name)
-            && !self.saving.on(&self.branch, name)
-            && !self.saving_elsewhere.contains(name)
             && !self.absent.contains_key(name)
             && self.draft_of(name, cx).is_none()
-            && (self.title_property().as_deref() == Some(name)
-                || self.key_property().as_deref() == Some(name))
+    }
+
+    /// What a click on the page's title does with the name it shows: edits it
+    /// ([`Self::title_edit`]) or copies it, when the credential may not change it. `None` when
+    /// the title does neither for the name, and the name keeps its row: an enum's menu or a
+    /// boolean's switch, or a name being saved.
+    fn title_role(&self, cx: &App) -> Option<TitleRole> {
+        if !self.page {
+            return None;
+        }
+        let name = names_by(self.schema.as_deref(), self.subject.type_name())?;
+        let property = self.property_named(&name)?;
+        if picked_by_control(property)
+            || self.saving.on(&self.branch, &name)
+            || self.saving_elsewhere.contains(&name)
+        {
+            return None;
+        }
+        Some(if self.edits_property(property, cx) {
+            TitleRole::Edits(property.clone())
+        } else {
+            TitleRole::Copies
+        })
+    }
+
+    /// Whether the title gives everything the name's row gave: it edits the name, or it copies
+    /// a name the credential may not change.
+    pub(super) fn title_covers_name(&self, cx: &App) -> bool {
+        self.title_role(cx).is_some()
     }
 
     /// The property a click on the page's title, or F2, edits: the one that names the node,
     /// where the credential may change it and it is edited as text (an enum's menu and a
     /// boolean's switch stay in their rows).
     pub(super) fn title_edit(&self, cx: &App) -> Option<gq_language::Property> {
-        if !self.page {
-            return None;
+        match self.title_role(cx)? {
+            TitleRole::Edits(property) => Some(property),
+            TitleRole::Copies => None,
         }
-        let name = names_by(self.schema.as_deref(), self.subject.type_name())?;
-        let property = self.property_named(&name)?;
-        (self.edits_property(property, cx)
-            && !picked_by_control(property)
-            && !self.saving.on(&self.branch, &name)
-            && !self.saving_elsewhere.contains(&name))
-        .then(|| property.clone())
     }
 
     /// F2: edits the name the title shows, in its row, which shows while it is open.
@@ -374,7 +401,7 @@ impl NodePeek {
                 h_flex()
                     .gap(px(space::SM))
                     .items_center()
-                    .child(studio_ui::type_swatch(&type_name, cx))
+                    .child(studio_ui::type_swatch(&type_name, self.session.read(cx).type_tints(), cx))
                     .child(studio_ui::ds::text::muted(type_name)),
             )
             .when(key_shown, |meta| {
@@ -641,6 +668,14 @@ impl NodePeek {
     }
 }
 
+/// What the page's title does with the name it shows ([`NodePeek::title_role`]).
+enum TitleRole {
+    /// A click or F2 edits it, in its row.
+    Edits(gq_language::Property),
+    /// A click copies it: the credential may not change it.
+    Copies,
+}
+
 /// Whether a property is set with a control rather than typed: an enum's menu or a boolean's
 /// switch, which stays in its row.
 fn picked_by_control(property: &gq_language::Property) -> bool {
@@ -793,6 +828,96 @@ mod tests {
         cx.simulate_click(key.center(), gpui::Modifiers::none());
         assert!(cx.debug_bounds("key-copied").is_some());
         assert!(cx.debug_bounds("title-copied").is_none());
+    }
+
+    /// What the list leaves out follows what the title does, from one owner: a page held at a
+    /// commit cannot change the name, so the title copies it and its row goes; an enum's title
+    /// neither edits nor covers it, so its row stays (review of #161).
+    #[gpui::test]
+    async fn the_title_and_the_list_agree_on_the_name(cx: &mut TestAppContext) {
+        init(cx);
+        let session = session(PEOPLE, cx);
+        let (view, cx) = cx.add_window_view(move |_, cx| {
+            NodePeek::page(session, "Person".into(), "p1".into(), Some("c1".into()), cx)
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(view.title_edit(cx).is_none(), "held at a commit");
+            assert!(view.title_covers_name(cx), "the title copies it");
+            assert!(view.page_hides("name", cx));
+        });
+        assert!(cx.debug_bounds("peek-row-name").is_none());
+        let title = cx.debug_bounds("page-title").expect("the title");
+        cx.simulate_click(title.center(), gpui::Modifiers::none());
+        assert!(
+            cx.read_from_clipboard()
+                .is_some_and(|item| item.text().is_some())
+        );
+    }
+
+    /// An empty name names nothing: the title shows the id, which a click still answers, and
+    /// the name keeps its row (review of #161).
+    #[gpui::test]
+    async fn an_empty_name_titles_the_page_by_its_id(cx: &mut TestAppContext) {
+        let rows = json!([{"n": {"@id": "p1", "slug": "p1", "name": ""}}]);
+        let (view, cx) = open(
+            crate::test_support::session_reading(PEOPLE, rows, cx),
+            true,
+            cx,
+        );
+        view.read_with(cx, |view, cx| {
+            assert!(view.label().is_none(), "no blank title");
+            assert!(!view.page_hides("name", cx));
+        });
+        assert!(cx.debug_bounds("peek-row-name").is_some(), "its row stays");
+        assert!(cx.debug_bounds("page-title").is_some(), "clickable");
+    }
+
+    /// A graph's schema, read through its session, draws Company and Person in different tints,
+    /// where their names hash to one (review of #161: no test failed with the session's call
+    /// taken out).
+    #[gpui::test]
+    async fn a_graphs_schema_draws_its_types_apart(cx: &mut TestAppContext) {
+        init(cx);
+        const FIRMS: &str =
+            "node Person {\n  slug: String @key\n}\nnode Company {\n  slug: String @key\n}\n";
+        let session = session(FIRMS, cx);
+        cx.run_until_parked();
+        session.read_with(cx, |session, _| {
+            let tints = session.type_tints();
+            assert_ne!(
+                tints.color("Company"),
+                tints.color("Person"),
+                "Company and Person draw in one tint"
+            );
+        });
+    }
+
+    /// Two graphs open together that share a type name each draw it in their own tint: reading
+    /// the second never moves the first's types onto one tint (review of #161).
+    #[gpui::test]
+    async fn two_graphs_sharing_a_type_keep_their_own_tints(cx: &mut TestAppContext) {
+        init(cx);
+        const A: &str =
+            "node Person {\n  slug: String @key\n}\nnode Company {\n  slug: String @key\n}\n";
+        const B: &str =
+            "node Person {\n  slug: String @key\n}\nnode Topic {\n  slug: String @key\n}\n";
+        let a = session(A, cx);
+        cx.run_until_parked();
+        let drawn = |session: &Entity<GraphSession>, name: &str, cx: &mut TestAppContext| {
+            session.read_with(cx, |session, _| session.type_tints().color(name))
+        };
+        let (company, person) = (drawn(&a, "Company", cx), drawn(&a, "Person", cx));
+        let b = session(B, cx);
+        cx.run_until_parked();
+        assert_eq!(drawn(&a, "Company", cx), company);
+        assert_eq!(
+            drawn(&a, "Person", cx),
+            person,
+            "the second graph moves nothing"
+        );
+        assert_ne!(drawn(&a, "Company", cx), drawn(&a, "Person", cx));
+        assert_ne!(drawn(&b, "Person", cx), drawn(&b, "Topic", cx));
     }
 
     /// A node with no name is titled by its id, which the title cannot edit as a name: the key

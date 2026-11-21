@@ -732,6 +732,9 @@ pub struct GraphSession {
     /// nothing saved.
     server_key: String,
     pub schema: Loadable<Arc<SchemaModel>>,
+    /// The tints of this graph's node types, made with its schema: views of the graph draw its
+    /// types in them, so another graph's types never move them (spec 014).
+    type_tints: studio_ui::TypeTints,
     /// Why the last read of the schema failed, while [`Self::schema`] is failed: what the
     /// window's page for a graph that would not open says and offers (spec 029).
     pub schema_failure: Option<SchemaFailure>,
@@ -983,6 +986,7 @@ impl GraphSession {
             canvas_positions: Default::default(),
             server_key,
             schema: Loadable::NotLoaded,
+            type_tints: studio_ui::TypeTints::default(),
             schema_failure: None,
             branches: Loadable::NotLoaded,
             counts: Loadable::NotLoaded,
@@ -1330,6 +1334,11 @@ impl GraphSession {
 
     pub fn schema_model(&self) -> Option<Arc<SchemaModel>> {
         self.schema.loaded().cloned()
+    }
+
+    /// The tints this graph's types are drawn in: its own, kept with its schema.
+    pub fn type_tints(&self) -> &studio_ui::TypeTints {
+        &self.type_tints
     }
 
     /// Notes what a read says about the graph's availability: a 503 marks it unavailable and
@@ -1704,7 +1713,8 @@ impl GraphSession {
             Loadable::Loaded(model) => {
                 self.start_schema_epoch(model);
                 // The graph's types are drawn apart where their names hash to one tint.
-                studio_ui::assign_type_tints(model.nodes.iter().map(|node| node.name.as_str()), cx);
+                self.type_tints =
+                    studio_ui::TypeTints::of(model.nodes.iter().map(|node| node.name.as_str()));
             }
             // The schema held is still the graph's.
             _ if matches!(self.schema, Loadable::Loaded(_)) => return,
