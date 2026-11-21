@@ -1,6 +1,5 @@
-//! A node's history (spec 046): the node's fourth view, beside its page, tree and canvas. It
-//! opens on "Now", who last set each property within what was read, then the changes, newest
-//! first: who made each, on which branch or through which merge, when and in which commit, its
+//! A node's history (spec 046): the node's fourth view, beside its page, tree and canvas. It is
+//! a timeline of the node's changes, newest first: who made each, on which branch or through which merge, when and in which commit, its
 //! properties before and after and its relationship lines at either end. A run of one actor's
 //! small edits folds into one entry with its net change.
 //!
@@ -20,19 +19,17 @@ use gpui::{
     WeakEntity, Window, list,
 };
 use gq_language::RelationshipGroup;
-use gq_language::{ScalarKind, SchemaModel};
+use gq_language::SchemaModel;
 use graph_store::ledger::ReadView;
 use graph_store::node_history::{
-    Blame, BlameSet, NODE_HISTORY_COMMITS, NODE_HISTORY_EDGES, NodeHistoryEntry, NodeHistoryPage,
-    NodeHistoryWindow, NodeScope, NodeState, OlderWindow, SchemaBoundary, SearchFound,
-    WindowCommit, blame, net_of, runs,
+    NODE_HISTORY_COMMITS, NODE_HISTORY_EDGES, NodeHistoryEntry, NodeHistoryPage, NodeHistoryWindow,
+    NodeScope, NodeState, OlderWindow, SchemaBoundary, SearchFound, WindowCommit, net_of, runs,
 };
 use graph_store::scope::ReadScope;
 use graph_store::{FoldedChange, GraphSession, SessionEvent, entity_name, relationship_words};
-use serde_json::Value;
 use studio_actions::changes::ToggleChange;
 use studio_actions::graph::{OpenCommit, OpenNodePage, ShowNodeInTree, ShowNodeOnCanvas};
-use studio_actions::history::{FindWhenSet, ReadOlderCommits};
+use studio_actions::history::{FindWhenCreated, ReadOlderCommits};
 use studio_actions::workspace::Refresh;
 use studio_actions::{ViewKind, ViewLink};
 use studio_ui::ds::Tipped as _;
@@ -53,11 +50,11 @@ enum State {
     Failed(SharedString),
 }
 
-/// What a search past the windows asks: where the listing goes on, the oldest commit read with
-/// the node there, and the properties no commit read changed, with their value there.
-type SearchAsks = (OlderWindow, (String, NodeState), Vec<(String, Value)>);
+/// What a search for the node's creation starts from: where the listing goes on, and the oldest
+/// commit read, with the node there.
+type SearchFrom = (OlderWindow, (String, NodeState));
 
-/// How the search past the windows stands.
+/// How the search for the node's creation stands.
 #[derive(Clone)]
 enum Search {
     Idle,
@@ -81,8 +78,6 @@ enum Older {
 /// One row of the list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Row {
-    /// Who set each property ("Now").
-    Now,
     /// A folded run of entries, by its index in the runs.
     Run(usize),
     /// One entry; `run` is the run it belongs to, `first` when it heads an unfolded run of more
@@ -119,14 +114,14 @@ pub struct NodeHistoryView {
     entries: Vec<NodeHistoryEntry>,
     /// Every window's commits, newest first.
     commits: Vec<WindowCommit>,
-    /// The node now: at the newest commit of the first window.
+    /// The node at the newest commit of the first window: its name when no entry has it.
     newest: Option<NodeState>,
-    /// The oldest commit read, with the node there: where a search past the windows starts.
+    /// The oldest commit read, with the node there: where a search for its creation starts.
     oldest: Option<(String, NodeState)>,
     /// Relationship groups that held [`NODE_HISTORY_EDGES`] edges at some commit: too large to
     /// follow there.
     full_groups: Vec<RelationshipGroup>,
-    /// What the search past the windows found, and how it stands.
+    /// What the search for the node's creation found, and how it stands.
     found: Option<SearchFound>,
     search: Search,
     _search_task: Option<Task<()>>,
@@ -485,7 +480,7 @@ impl NodeHistoryView {
             .map(|e| session.own_words(&e.commit).is_some())
             .collect();
         self.runs = runs(&self.entries, &studio);
-        let mut rows = vec![Row::Now];
+        let mut rows = Vec::new();
         for (ix, run) in self.runs.iter().enumerate() {
             let folded = run.len() > 1 && !self.unfolded.contains(&self.entries[run.start].commit);
             if folded {
@@ -531,49 +526,30 @@ impl NodeHistoryView {
         matches!(self.older, Older::Waits(_) | Older::Failed(..))
     }
 
-    /// What a search past the windows would ask: whether the node's creation is not read yet,
-    /// and the properties no commit read changed, with their value at the oldest commit read.
-    fn search_questions(&self, cx: &App) -> Option<SearchAsks> {
+    /// Where a search for the node's creation would start, while the windows read did not reach
+    /// it: the node is there at the oldest commit read, and older commits remain.
+    fn search_from(&self) -> Option<SearchFrom> {
         let (Older::Waits(window) | Older::Failed(window, _)) = &self.older else {
             return None;
         };
-        let oldest = self.oldest.clone()?;
-        let schema = self.session.read(cx).schema_model();
-        let values: Vec<(String, Value)> = self
-            .blame_rows(schema.as_deref())
-            .into_iter()
-            .filter(|row| matches!(row.set, BlameSet::Before(_)))
-            .filter(|row| !self.blob_names(schema.as_deref()).contains(&row.property))
-            .map(|row| {
-                let value = oldest.1.properties.get(&row.property).cloned();
-                (row.property, value.unwrap_or(Value::Null))
-            })
-            .collect();
-        let uncreated = oldest.1.exists && !self.entries.iter().any(|e| e.created());
-        (uncreated || !values.is_empty()).then(|| (window.clone(), oldest, values))
+        let oldest = self.oldest.clone().filter(|(_, node)| node.exists)?;
+        let uncreated = !self.entries.iter().any(|e| e.created());
+        uncreated.then(|| (window.clone(), oldest))
     }
 
-    fn blob_names(&self, schema: Option<&SchemaModel>) -> Vec<String> {
-        schema
-            .and_then(|schema| schema.node(&self.type_name))
-            .map(|node| {
-                node.properties
-                    .iter()
-                    .filter(|p| p.kind == ScalarKind::Blob)
-                    .map(|p| p.name.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
+    /// Whether the end row offers the search: it has somewhere to start and has not run.
+    fn offers_search(&self) -> bool {
+        !matches!(self.search, Search::Running | Search::Done) && self.search_from().is_some()
     }
 
-    /// Searches the commits before those read for when the node was created and its values set
-    /// (spec 046): a listing of them, then a binary search of point reads. Only for these, never
-    /// for the list of changes.
-    fn find_when_set(&mut self, cx: &mut Context<Self>) {
+    /// Searches the commits before those read for when the node was created (spec 046): a
+    /// listing of them, then a binary search of point reads. Only for its creation, never for
+    /// the list of changes.
+    fn find_when_created(&mut self, cx: &mut Context<Self>) {
         if matches!(self.search, Search::Running) {
             return;
         }
-        let Some((window, base, values)) = self.search_questions(cx) else {
+        let Some((window, base)) = self.search_from() else {
             return;
         };
         let Some(node) = self.scope_of(cx) else {
@@ -581,7 +557,7 @@ impl NodeHistoryView {
         };
         let (branch, scope) = (self.branch.clone(), self.scope.clone());
         let read = self.session.update(cx, |session, cx| {
-            session.node_history_search(&scope, &branch, node, window.page_token, base, values, cx)
+            session.node_history_search(&scope, &branch, node, window.page_token, base, cx)
         });
         self.search = Search::Running;
         self._search_task = Some(cx.spawn(async move |this, cx| {
@@ -636,7 +612,7 @@ impl NodeHistoryView {
         match row {
             Row::Run(run) => Some(self.entries[self.runs[run].start].commit.as_str()),
             Row::Entry { entry, .. } => Some(self.entries[entry].commit.as_str()),
-            Row::Now | Row::End => None,
+            Row::End => None,
         }
     }
 
@@ -689,33 +665,6 @@ impl NodeHistoryView {
         cx.notify();
     }
 
-    /// The oldest commit whose change is known: a value no commit read set was set before it.
-    fn blame_bound(&self) -> Option<WindowCommit> {
-        self.found
-            .as_ref()
-            .and_then(|found| found.before.clone())
-            .or_else(|| self.commits.last().cloned())
-    }
-
-    fn blame_rows(&self, schema: Option<&SchemaModel>) -> Vec<Blame> {
-        let properties: Vec<String> = schema
-            .and_then(|schema| schema.node(&self.type_name))
-            .map(|node| node.properties.iter().map(|p| p.name.clone()).collect())
-            .unwrap_or_default();
-        let found = self
-            .found
-            .as_ref()
-            .map(|found| found.set.clone())
-            .unwrap_or_default();
-        blame(
-            &self.entries,
-            &properties,
-            self.newest.as_ref(),
-            &found,
-            self.blame_bound().as_ref(),
-        )
-    }
-
     /// The node's history, as a test reads it: each row's commits, actor, whether it changed
     /// the node itself, and how many relationships.
     #[cfg(test)]
@@ -759,7 +708,6 @@ impl NodeHistoryView {
         let selected = self.selected == Some(ix);
         let schema = self.session.read(cx).schema_model();
         let body = match row {
-            Row::Now => self.render_now(schema.as_deref(), cx),
             Row::End => self.render_end(cx),
             Row::Run(run) => {
                 let range = self.runs[run].clone();
@@ -796,211 +744,59 @@ impl NodeHistoryView {
             .into_any_element()
     }
 
-    /// "Now": each property, its value, and who set it, when and in which commit, within what
-    /// was read; "before" a time where the read did not reach, with a search past it.
-    fn render_now(&self, schema: Option<&SchemaModel>, cx: &mut Context<Self>) -> AnyElement {
-        let title = change_cards::section_title("Now");
-        if self.newest.as_ref().is_some_and(|newest| !newest.exists) {
-            let said = match self.entries.iter().find(|e| e.removed()) {
-                Some(removal) => format!(
-                    "Removed by {} in {}, {}. Its relationships went with it.",
-                    removal.actor.clone().unwrap_or_else(|| "no actor".into()),
-                    short_commit_id(&removal.commit),
-                    relative_time(removal.at, now_micros()),
-                ),
-                None => format!(
-                    "There is no {} {} on {} now, and none in the commits read.",
-                    self.type_name, self.id, self.branch
-                ),
-            };
-            return v_flex()
-                .child(title)
-                .child(
-                    div()
-                        .px(px(space::EDGE))
-                        .child(studio_ui::ds::text::body(said)),
-                )
-                .child(div().h(px(space::LG)))
-                .child(change_cards::section_title("Changes"))
-                .into_any_element();
-        }
-        let blame = self.blame_rows(schema);
-        let blobs: Vec<&str> = schema
-            .and_then(|schema| schema.node(&self.type_name))
-            .map(|node| {
-                node.properties
-                    .iter()
-                    .filter(|p| p.kind == ScalarKind::Blob)
-                    .map(|p| p.name.as_str())
-                    .collect()
-            })
-            .unwrap_or_default();
-        let rows: Vec<AnyElement> = blame
-            .iter()
-            .enumerate()
-            .map(|(n, row)| {
-                let value: SharedString = match &row.value {
-                    None => "—".into(),
-                    Some(Value::Null) => "—".into(),
-                    Some(value) if blobs.contains(&row.property.as_str()) => {
-                        change_cards::value_words(value, true).into()
-                    }
-                    Some(value) => studio_ui::format_value(value).into(),
-                };
-                let (who, tip): (SharedString, SharedString) = match &row.set {
-                    BlameSet::In { entry, created } => {
-                        let e = &self.entries[*entry];
-                        let actor = e.actor.clone().unwrap_or_else(|| "no actor".into());
-                        let how = match (created, &e.merged_branch, &e.merged_parent) {
-                            (true, ..) => " · created".to_owned(),
-                            (false, Some(branch), _) => format!(" · via merge of {branch}"),
-                            (false, None, Some(_)) => " · via merge".to_owned(),
-                            _ => String::new(),
-                        };
-                        (
-                            format!(
-                                "{actor}{how} · {} · {}",
-                                relative_time(e.at, now_micros()),
-                                short_commit_id(&e.commit)
-                            )
-                            .into(),
-                            format!("Set in commit {} · {}", e.commit, utc_date_time(e.at)).into(),
-                        )
-                    }
-                    BlameSet::Found(commit) => (
-                        format!(
-                            "{} · {} · {}",
-                            commit.actor.clone().unwrap_or_else(|| "no actor".into()),
-                            relative_time(commit.at, now_micros()),
-                            short_commit_id(&commit.id)
-                        )
-                        .into(),
-                        format!(
-                            "Found by a search of earlier commits: the newest commit before which \
-                             it held another value, {} · {}. A value that went back to an \
-                             earlier one may have been set later.",
-                            commit.id,
-                            utc_date_time(commit.at)
-                        )
-                        .into(),
-                    ),
-                    BlameSet::Before(commit) => (
-                        format!("before {}", short_time(commit.at)).into(),
-                        format!(
-                            "No commit read set it: it was set before commit {}. Find when it \
-                             was set searches the commits before.",
-                            commit.id
-                        )
-                        .into(),
-                    ),
-                };
-                let muted = row.value.is_none();
-                studio_ui::ds::document_row(row.property.clone(), size::DOCUMENT_LABEL)
-                    .child(
-                        h_flex()
-                            .h(px(size::PROPERTY_ROW))
-                            .items_center()
-                            .flex_1()
-                            .min_w_0()
-                            .child(if muted {
-                                studio_ui::ds::text::muted(value).truncate()
-                            } else {
-                                studio_ui::ds::text::body(value).truncate()
-                            }),
-                    )
-                    .child(
-                        h_flex()
-                            .id(("now-set", n))
-                            .h(px(size::PROPERTY_ROW))
-                            .items_center()
-                            .flex_none()
-                            .tip(studio_ui::ds::tooltip(tip))
-                            .child(studio_ui::ds::text::meta(who).single_line()),
-                    )
-                    .into_any_element()
-            })
-            .collect();
-        let created = self
-            .found
-            .as_ref()
-            .and_then(|found| found.created.as_ref())
-            .map(|commit| {
-                format!(
-                    "Created by {} in {}, {}, found by a search of earlier commits.",
-                    commit.actor.clone().unwrap_or_else(|| "no actor".into()),
-                    short_commit_id(&commit.id),
-                    relative_time(commit.at, now_micros())
-                )
-            });
-        let search = self.render_search(cx);
-        v_flex()
-            .child(title)
-            .child(
-                v_flex()
-                    .px(px(space::EDGE))
-                    .gap(px(space::WITHIN))
-                    .children(rows)
-                    .children(created.map(studio_ui::ds::text::meta))
-                    .children(search),
-            )
-            .child(div().h(px(space::LG)))
-            .child(change_cards::section_title("Changes"))
-            .when(self.entries.is_empty(), |now| {
-                now.child(
-                    div()
-                        .px(px(space::EDGE))
-                        .child(studio_ui::ds::text::muted(format!(
-                            "No changes in the last {}.",
-                            studio_ui::plural(self.commits.len(), "commit", "commits")
-                        ))),
-                )
-            })
-            .into_any_element()
-    }
-
-    /// The search past the windows: its button while it has a question, its progress, its
-    /// failure, or what stopped it.
+    /// The search for the node's creation, in the end row: its button while it is offered, its
+    /// progress, what it found, its failure, or what stopped it.
     fn render_search(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let found = self.found.as_ref();
-        let note = match (&self.search, found.and_then(|f| f.stopped.as_ref())) {
+        let note = match (&self.search, found) {
             (Search::Failed(error), _) => Some(format!("The search could not finish: {error}")),
-            (Search::Done, Some(why)) => Some(format!("The search stopped short: {why}.")),
-            (Search::Done, None) => found.map(|f| {
-                format!(
-                    "Searched with {}.",
-                    studio_ui::plural(f.requests, "request", "requests")
-                )
-            }),
+            (Search::Done, Some(found)) => {
+                let requests = studio_ui::plural(found.requests, "request", "requests");
+                Some(match (&found.created, &found.before, &found.stopped) {
+                    (_, _, Some(why)) => format!("The search stopped short: {why}."),
+                    (Some(commit), ..) => format!(
+                        "Created by {} in {}, {}: found by a search of earlier commits with {requests}.",
+                        commit.actor.clone().unwrap_or_else(|| "no actor".into()),
+                        short_commit_id(&commit.id),
+                        relative_time(commit.at, now_micros())
+                    ),
+                    (None, Some(commit), None) => format!(
+                        "Created before {}, {}, the oldest commit searched ({requests}).",
+                        short_commit_id(&commit.id),
+                        relative_time(commit.at, now_micros())
+                    ),
+                    (None, None, None) => format!("Searched with {requests}."),
+                })
+            }
             _ => None,
         };
-        let asks = !matches!(self.search, Search::Done) && self.search_questions(cx).is_some();
-        if note.is_none() && !asks {
+        let running = matches!(self.search, Search::Running);
+        let offered = self.offers_search();
+        if note.is_none() && !offered && !running {
             return None;
         }
-        let running = matches!(self.search, Search::Running);
         let focus = self.focus_handle.clone();
         Some(
             h_flex()
-                .pt(px(space::SM))
                 .gap(px(space::MD))
-                .when(asks || running, |row| {
+                .when(offered || running, |row| {
                     row.child(
                         studio_ui::ds::button(
-                            "find-when-set",
+                            "find-when-created",
                             if running {
                                 "Searching earlier commits…"
                             } else {
-                                "Find when it was set"
+                                "Find when it was created"
                             },
                         )
                         .style(ButtonStyle::Subtle)
                         .disabled(running)
-                        .key_binding(KeyBinding::for_action_in(&FindWhenSet, &focus, cx))
+                        .key_binding(KeyBinding::for_action_in(&FindWhenCreated, &focus, cx))
                         .tip(studio_ui::ds::tooltip(
                             "Search the commits before those read, with a few point reads of the \
-                             node, for when it was created and each value before was set",
+                             node, for the one that created it",
                         ))
-                        .on_click(cx.listener(|this, _, _, cx| this.find_when_set(cx))),
+                        .on_click(cx.listener(|this, _, _, cx| this.find_when_created(cx))),
                     )
                 })
                 .children(note.map(studio_ui::ds::text::meta))
@@ -1332,6 +1128,7 @@ impl NodeHistoryView {
                     )
                     .children(button),
             )
+            .children(self.render_search(cx))
             .into_any_element()
     }
 }
@@ -1352,12 +1149,6 @@ struct Card<'a> {
 /// `14:02` for Unix microseconds, in UTC.
 fn clock(micros: i64) -> String {
     utc_date_time(micros)[11..16].to_owned()
-}
-
-/// `2026-11-17 14:02 UTC` for Unix microseconds.
-fn short_time(micros: i64) -> String {
-    let full = utc_date_time(micros);
-    format!("{} UTC", &full[..16])
 }
 
 /// A relationship of the node a commit changed, read from the node: "+ knows → grace", at
@@ -1563,15 +1354,11 @@ impl Render for NodeHistoryView {
             .when(self.offers_older(), |view| {
                 view.on_action(cx.listener(|this, _: &ReadOlderCommits, _, cx| this.read_older(cx)))
             })
-            .when(
-                !matches!(self.search, Search::Running | Search::Done)
-                    && self.search_questions(cx).is_some(),
-                |view| {
-                    view.on_action(
-                        cx.listener(|this, _: &FindWhenSet, _, cx| this.find_when_set(cx)),
-                    )
-                },
-            )
+            .when(self.offers_search(), |view| {
+                view.on_action(
+                    cx.listener(|this, _: &FindWhenCreated, _, cx| this.find_when_created(cx)),
+                )
+            })
             .child(header)
             .child(body)
     }
@@ -1729,7 +1516,7 @@ mod tests {
                 KeyBinding::new("enter", menu::Confirm, Some("NodeHistory")),
                 KeyBinding::new("space", ToggleChange, Some("NodeHistory")),
                 KeyBinding::new("cmd-alt-n", ReadOlderCommits, Some("NodeHistory")),
-                KeyBinding::new("cmd-alt-f", FindWhenSet, Some("NodeHistory")),
+                KeyBinding::new("cmd-alt-f", FindWhenCreated, Some("NodeHistory")),
             ]);
         });
         let asked = Arc::new(Mutex::new(Vec::new()));
@@ -2017,57 +1804,26 @@ mod tests {
         });
     }
 
-    /// "Now" names each property's newest setter within the window and "before" the oldest
-    /// commit read for the key; Find when it was set lists the commits before and binary-searches
-    /// them with point reads, finding the creation in a few reads; reading the 200 commits before
-    /// then shows the creation as an entry, read from the node, not searched.
+    /// A window that does not reach the node's creation offers Find when it was created, which
+    /// lists the commits before and binary-searches them with point reads, finding it in a few;
+    /// reading the 200 commits before then shows the creation as an entry, read from the node,
+    /// and the search is offered no more.
     #[gpui::test]
-    async fn now_says_who_set_each_value_and_searches_past_the_window(cx: &mut TestAppContext) {
+    async fn the_end_row_finds_when_the_node_was_created(cx: &mut TestAppContext) {
         let (session, asked, _) = serve(Served::default(), cx);
         let (view, cx) = open(&session, "ada", cx);
-        let now = |view: &NodeHistoryView, cx: &App| -> Vec<(String, String)> {
-            let schema = view.session.read(cx).schema_model();
-            view.blame_rows(schema.as_deref())
-                .into_iter()
-                .map(|b| {
-                    let set = match b.set {
-                        BlameSet::In { entry, created } => format!(
-                            "{}{}",
-                            view.entries[entry].commit,
-                            if created { "+" } else { "" }
-                        ),
-                        BlameSet::Found(commit) => format!("found {}", commit.id),
-                        BlameSet::Before(commit) => format!("before {}", commit.id),
-                    };
-                    (b.property, set)
-                })
-                .collect()
-        };
-        let pairs = |list: &[(&str, &str)]| -> Vec<(String, String)> {
-            list.iter()
-                .map(|(a, b)| ((*a).to_owned(), (*b).to_owned()))
-                .collect()
-        };
-        view.read_with(cx, |view, cx| {
-            assert_eq!(
-                now(view, cx),
-                pairs(&[
-                    ("slug", "before c50"),
-                    ("name", "c225"),
-                    ("title", "c240"),
-                    ("email", "c230"),
-                ])
-            );
+        view.read_with(cx, |view, _| {
+            assert!(view.offers_search(), "c5 is before the window");
         });
         cx.update(|window, cx| window.focus(&view.focus_handle(cx), cx));
         asked.lock().unwrap().clear();
         cx.simulate_keystrokes("cmd-alt-f");
         cx.run_until_parked();
-        view.read_with(cx, |view, cx| {
+        view.read_with(cx, |view, _| {
             let found = view.found.as_ref().expect("searched");
             assert_eq!(found.created.as_ref().map(|c| c.id.as_str()), Some("c5"));
-            assert_eq!(now(view, cx)[0], ("slug".into(), "found c5".into()));
             assert!(found.requests <= 1 + 7, "a listing and log2(50) reads");
+            assert!(!view.offers_search(), "it ran");
         });
         {
             let asked = asked.lock().unwrap();
@@ -2080,7 +1836,7 @@ mod tests {
         assert!(by_view(&session, "node_history_search_commits", cx) >= 1);
         cx.simulate_keystrokes("cmd-alt-n");
         cx.run_until_parked();
-        view.read_with(cx, |view, cx| {
+        view.read_with(cx, |view, _| {
             assert_eq!(
                 view.commits.len(),
                 COMMITS,
@@ -2088,12 +1844,23 @@ mod tests {
             );
             assert!(!view.offers_older());
             assert!(view.entries.last().unwrap().created());
-            assert_eq!(now(view, cx)[0], ("slug".into(), "c5+".into()));
+            assert!(view.search_from().is_none(), "its creation is an entry");
+        });
+    }
+
+    /// A window that holds the node's creation offers no search.
+    #[gpui::test]
+    async fn a_window_with_the_creation_offers_no_search(cx: &mut TestAppContext) {
+        let (session, _, _) = serve(Served::default(), cx);
+        let (view, cx) = open(&session, "zed", cx);
+        view.read_with(cx, |view, _| {
+            assert!(view.entries.iter().any(|e| e.created()));
+            assert!(!view.offers_search());
         });
     }
 
     /// A node removed at the head still opens its history: its removal, with the relationship
-    /// that went with it, and its creation are entries, and "Now" says who removed it.
+    /// that went with it, and its creation are entries.
     #[gpui::test]
     async fn a_removed_node_shows_its_removal_and_creation(cx: &mut TestAppContext) {
         let (session, _, _) = serve(Served::default(), cx);
@@ -2175,8 +1942,8 @@ mod tests {
         });
     }
 
-    /// A failed read of older commits leaves Find when it was set offered: it needs only where
-    /// they go on, which the failed read keeps.
+    /// A failed read of older commits leaves Find when it was created offered: it needs only
+    /// where they go on, which the failed read keeps.
     #[gpui::test]
     async fn the_search_stays_offered_after_a_failed_older_read(cx: &mut TestAppContext) {
         let (session, _, failing) = serve(Served::default(), cx);
@@ -2184,12 +1951,9 @@ mod tests {
         failing.store(true, Ordering::SeqCst);
         view.update(cx, |view, cx| view.read_older(cx));
         cx.run_until_parked();
-        view.read_with(cx, |view, cx| {
+        view.read_with(cx, |view, _| {
             assert!(matches!(view.older, Older::Failed(..)));
-            assert!(
-                view.search_questions(cx).is_some(),
-                "the search is still offered"
-            );
+            assert!(view.offers_search(), "the search is still offered");
         });
         failing.store(false, Ordering::SeqCst);
         cx.update(|window, cx| window.focus(&view.focus_handle(cx), cx));
@@ -2301,7 +2065,11 @@ mod tests {
         cx.simulate_keystrokes("k up");
         assert_eq!(selected(cx).as_deref(), Some("c240"));
         cx.simulate_keystrokes("up");
-        assert_eq!(selected(cx).as_deref(), Some("c240"), "Now is not an entry");
+        assert_eq!(
+            selected(cx).as_deref(),
+            Some("c240"),
+            "the newest stays selected"
+        );
         cx.simulate_keystrokes("space");
         view.read_with(cx, |view, _| {
             assert_eq!(view.shown()[0].0, commits(&[240]));

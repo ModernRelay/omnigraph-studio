@@ -492,7 +492,7 @@
       "enter": "menu::Confirm",
       "space": "studio_changes::ToggleChange",
       "ctrl-alt-n": "studio_history::ReadOlderCommits",
-      "ctrl-alt-f": "studio_history::FindWhenSet"
+      "ctrl-alt-f": "studio_history::FindWhenCreated"
     }
   },
   {

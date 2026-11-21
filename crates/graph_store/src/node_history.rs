@@ -1,6 +1,6 @@
 //! One node's history (spec 046): the commits of a branch's recent first-parent history that
-//! changed the node or one of its relationships, newest first, each with who made it and how;
-//! who last set each property (blame); and runs of one actor's small edits folded into one.
+//! changed the node or one of its relationships, newest first, each with who made it and how,
+//! and runs of one actor's small edits folded into one.
 //!
 //! Omnigraph has no read of the commits that changed one entity (E62). Studio reads the node
 //! itself instead: the commit listing names a window of the branch's newest
@@ -379,81 +379,6 @@ pub fn entries_of(
         .collect()
 }
 
-/// Who last set one property, within what was read ("Now", spec 046).
-#[derive(Debug, Clone, PartialEq)]
-pub struct Blame {
-    pub property: String,
-    /// The value now, from the node at the head; `None` when the node is not there.
-    pub value: Option<Value>,
-    pub set: BlameSet,
-}
-
-/// How a property's value came to be, as far as the history read reaches.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BlameSet {
-    /// Entry `entry` (an index into the entries, newest first) set it; `created` when it was the
-    /// node's creation.
-    In { entry: usize, created: bool },
-    /// A search of point reads past the windows found this commit setting the value: the newest
-    /// commit before which it held another (not exact for a value that went back to an earlier
-    /// one).
-    Found(WindowCommit),
-    /// No commit read set it: it was set at or before this commit, the oldest read.
-    Before(WindowCommit),
-}
-
-/// The node's properties (`properties`, the schema's order) as `now` holds them, each with the
-/// newest entry of `entries` (newest first) that set it: an update whose images differ there, or
-/// the node's creation, which sets every property. Past them, what a search `found`, else
-/// "before" `bound`.
-pub fn blame(
-    entries: &[NodeHistoryEntry],
-    properties: &[String],
-    now: Option<&NodeState>,
-    found: &HashMap<String, WindowCommit>,
-    bound: Option<&WindowCommit>,
-) -> Vec<Blame> {
-    properties
-        .iter()
-        .filter_map(|name| {
-            let set = entries.iter().enumerate().find_map(|(ix, entry)| {
-                let node = entry.node.as_ref()?;
-                let before = node.before.as_ref().map(|i| i.properties.get(name));
-                let after = node.after.as_ref().map(|i| i.properties.get(name));
-                match (before, after) {
-                    (None, Some(_)) => Some(BlameSet::In {
-                        entry: ix,
-                        created: true,
-                    }),
-                    (Some(b), Some(a)) if b != a => Some(BlameSet::In {
-                        entry: ix,
-                        created: false,
-                    }),
-                    _ => None,
-                }
-            });
-            let set = match (set, found.get(name), bound) {
-                (Some(set), ..) => set,
-                (None, Some(found), _) => BlameSet::Found(found.clone()),
-                (None, None, Some(bound)) => BlameSet::Before(bound.clone()),
-                (None, None, None) => return None,
-            };
-            let value = now.filter(|now| now.exists).map(|now| {
-                now.blobs
-                    .get(name)
-                    .map(BlobState::value)
-                    .or_else(|| now.properties.get(name).cloned())
-                    .unwrap_or(Value::Null)
-            });
-            Some(Blame {
-                property: name.clone(),
-                value,
-                set,
-            })
-        })
-        .collect()
-}
-
 /// The runs of `entries` (newest first) that fold into one: consecutive entries by the same
 /// actor on the same branch, of the same kind of author (`studio`, one flag an entry: Studio made
 /// it this session), each less than [`FOLD_WINDOW`] after the one before, none a merge, a
@@ -525,16 +450,14 @@ pub struct LastChange {
     pub at: i64,
 }
 
-/// What the search past the windows found: the commit that created the node, and for each
-/// property it was asked about the commit that set its value now.
+/// What the search past the windows found: the commit that created the node.
 #[derive(Debug, Clone, Default)]
 pub struct SearchFound {
     pub created: Option<WindowCommit>,
-    pub set: HashMap<String, WindowCommit>,
     /// Requests sent: listing pages and point reads.
     pub requests: usize,
-    /// The oldest commit listed, when the listing stopped at its cap before the graph's first:
-    /// an answer that still held there was set before it, which is all the search can say.
+    /// The oldest commit listed, when the listing stopped at its cap before the graph's first
+    /// with the node still there: it was created before it, which is all the search can say.
     pub before: Option<WindowCommit>,
     /// Why it stopped short, when it did.
     pub stopped: Option<String>,
@@ -1004,13 +927,10 @@ impl GraphSession {
     }
 
     /// Searches past the windows read (spec 046), asked for through `scope`: when node `node`
-    /// was created, if it existed at `base` (the oldest commit read, with the node there), and
-    /// which commit set each of `values` (properties no commit read changed, with their value at
-    /// `base`). It lists the commits from `base` back, from `page_token` for the head the windows
-    /// answer for, in pages of 1,000, then binary-searches them with point reads of the node,
-    /// shared by every question. Only for these: a list of changes is never searched, since a
-    /// search misses a value that changed and changed back.
-    #[allow(clippy::too_many_arguments)]
+    /// was created, it being there at `base` (the oldest commit read). It lists the commits from
+    /// `base` back, from `page_token` for the head the windows answer for, in pages of 1,000,
+    /// then binary-searches them with point reads of the node. Only for its creation: a list of
+    /// changes is never searched, since a search misses a value that changed and changed back.
     pub fn node_history_search(
         &mut self,
         scope: &ReadScope,
@@ -1018,12 +938,16 @@ impl GraphSession {
         node: NodeScope,
         page_token: String,
         base: (String, NodeState),
-        values: Vec<(String, Value)>,
         cx: &mut Context<Self>,
     ) -> Task<Result<SearchFound, ReadError>> {
         let Some(mut reader) = self.history_reader(scope, branch, node, cx) else {
             return Task::ready(Err(ReadError::Decode("the schema is not read yet".into())));
         };
+        if !base.1.exists {
+            return Task::ready(Err(ReadError::Decode(
+                "the node is not there at the oldest commit read".into(),
+            )));
+        }
         cx.spawn(async move |_, cx| {
             let mut found = SearchFound::default();
             // The commits from `base` back towards the graph's first.
@@ -1058,56 +982,22 @@ impl GraphSession {
                     "the commits before the windows do not go on from where they ended".into(),
                 ));
             }
-            let mut known: HashMap<usize, NodeState> = HashMap::from([(0, base.1.clone())]);
-            let questions: Vec<Option<(String, Value)>> = base
-                .1
-                .exists
-                .then_some(None)
-                .into_iter()
-                .chain(values.into_iter().map(Some))
-                .collect();
-            for question in questions {
-                // Binary search for the oldest commit the answer still holds at.
-                let (mut lo, mut hi) = (0usize, older.len());
-                let mut failed = None;
-                while let Some(mid) = search_step(lo, hi) {
-                    let state = match known.get(&mid) {
-                        Some(state) => state.clone(),
-                        None => match reader.node_at(&older[mid].id, cx).await {
-                            Ok(state) => {
-                                known.insert(mid, state.clone());
-                                state
-                            }
-                            Err(error) => {
-                                failed = Some(error);
-                                break;
-                            }
-                        },
-                    };
-                    let holds = state.exists
-                        && match &question {
-                            None => true,
-                            Some((name, value)) => {
-                                state.properties.get(name).unwrap_or(&Value::Null) == value
-                            }
-                        };
-                    if holds {
-                        lo = mid;
-                    } else {
-                        hi = mid;
+            // Binary search for the oldest commit the node is still there at.
+            let (mut lo, mut hi) = (0usize, older.len());
+            while let Some(mid) = search_step(lo, hi) {
+                match reader.node_at(&older[mid].id, cx).await {
+                    Ok(state) if state.exists => lo = mid,
+                    Ok(_) => hi = mid,
+                    Err(error) => {
+                        found.stopped = Some(error.to_string());
+                        found.requests = reader.requests;
+                        return Ok(found);
                     }
                 }
-                if let Some(error) = failed {
-                    found.stopped = Some(error.to_string());
-                    break;
-                }
-                match (question, settled(lo, older.len(), reached_first)) {
-                    (None, Some(at)) => found.created = Some(older[at].clone()),
-                    (Some((name, _)), Some(at)) => {
-                        found.set.insert(name, older[at].clone());
-                    }
-                    (_, None) => found.before = older.last().cloned(),
-                }
+            }
+            match settled(lo, older.len(), reached_first) {
+                Some(at) => found.created = Some(older[at].clone()),
+                None => found.before = older.last().cloned(),
             }
             found.requests = reader.requests;
             Ok(found)
@@ -1228,43 +1118,6 @@ mod tests {
         );
     }
 
-    /// "Now": each property's newest setter within what was read, what a search found, and
-    /// "before" the bound otherwise.
-    #[test]
-    fn blame_names_the_newest_setter_and_says_before_past_the_window() {
-        let scope = scope();
-        let commits: Vec<WindowCommit> = (2..=3).rev().map(|n| commit(n, "act-a")).collect();
-        let states = vec![
-            state(json!({"name": "Ada", "title": "B", "email": "b@x"}), &[]),
-            state(json!({"name": "Ada", "title": "B", "email": "a@x"}), &[]),
-            state(json!({"name": "Ada", "title": "A", "email": "a@x"}), &[]),
-        ];
-        let entries = entries_of(&scope, &commits, &states);
-        let props: Vec<String> = ["name", "title", "email"].map(String::from).into();
-        let bound = commit(1, "act-a");
-        let mut found = HashMap::new();
-        let now = blame(&entries, &props, states.first(), &found, Some(&bound));
-        assert_eq!(now[0].set, BlameSet::Before(bound.clone()));
-        assert_eq!(now[0].value, Some(json!("Ada")));
-        assert_eq!(
-            now[1].set,
-            BlameSet::In {
-                entry: 1,
-                created: false
-            }
-        );
-        assert_eq!(
-            now[2].set,
-            BlameSet::In {
-                entry: 0,
-                created: false
-            }
-        );
-        found.insert("name".to_owned(), commit(0, "act-old"));
-        let now = blame(&entries, &props, states.first(), &found, Some(&bound));
-        assert_eq!(now[0].set, BlameSet::Found(commit(0, "act-old")));
-    }
-
     fn entry(
         commit: &str,
         actor: &str,
@@ -1358,7 +1211,7 @@ mod tests {
     }
 
     /// A search that listed commits up to its cap, its answer still holding at the oldest it
-    /// listed, names no commit: the value was set before it, not by it.
+    /// listed, names no commit: the node was created before it, not by it.
     #[test]
     fn a_capped_search_names_no_commit_at_its_end() {
         assert_eq!(settled(3, 10, false), Some(3));

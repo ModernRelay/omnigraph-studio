@@ -624,8 +624,7 @@ pub mod graph {
         pub preview: bool,
     }
 
-    /// Show a node's history: who changed it, when and how, newest first, and who set each
-    /// value it holds (spec 046).
+    /// Show a node's history: who changed it, when and how, newest first (spec 046).
     #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
     #[action(namespace = studio_graph)]
     pub struct ShowNodeHistory {
@@ -991,9 +990,9 @@ pub mod history {
             /// Read a node's history further back: the 200 commits before those read, or try
             /// again a read of them that failed (spec 046).
             ReadOlderCommits,
-            /// Search the commits before a node's history read for when the node was created
-            /// and each value no commit read changed was set (spec 046).
-            FindWhenSet,
+            /// Search the commits before a node's history read for the one that created the
+            /// node (spec 046).
+            FindWhenCreated,
         ]
     );
 }
