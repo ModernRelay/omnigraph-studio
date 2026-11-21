@@ -9895,6 +9895,7 @@ impl TypeTable {
             .child(studio_ui::kind_swatch(
                 &self.type_name,
                 self.kind == TableKind::Edge,
+                self.session.read(cx).type_tints(),
                 cx,
             ))
             .child(studio_ui::ds::text::title(self.type_name.clone()))

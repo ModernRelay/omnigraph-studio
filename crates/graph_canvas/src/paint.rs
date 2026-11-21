@@ -12,8 +12,8 @@ use gpui::{
     App, BorderStyle, Bounds, BoxShadow, Corners, Font, FontWeight, Hsla, Pixels, Point,
     ShapedLine, SharedString, TextAlign, TextRun, Window, WrappedLine, point, px, quad, size,
 };
+use studio_ui::TypeTints;
 use studio_ui::ds::elevation::Layer;
-use studio_ui::type_tint;
 
 use crate::model::{Scene, SceneKind, SceneNode};
 
@@ -41,6 +41,8 @@ pub(crate) struct Palette {
     /// A hub's or "+K more"'s dot from afar.
     pub hub_dot: Hsla,
     pub font: Font,
+    /// The tints of the graph's types, which a chip's mark is drawn in.
+    pub tints: TypeTints,
 }
 
 /// The dot grid's dots, across.
@@ -523,7 +525,7 @@ pub(crate) fn paint(
                         .clone();
                     paint_letter_mark(
                         p,
-                        type_tint(&node.color_key, cx),
+                        palette.tints.color(&node.color_key),
                         &line,
                         MARK_SIZE,
                         window,
@@ -538,7 +540,7 @@ pub(crate) fn paint(
         if open.as_ref().is_some_and(|(opened, _)| *opened == index) {
             continue;
         }
-        let tint = type_tint(&node.color_key, cx);
+        let tint = palette.tints.color(&node.color_key);
         let text = &texts[index];
         let mark = text.mark.then(|| (tint, text.initial.clone()));
         let size = text.size * scale;
@@ -569,7 +571,7 @@ pub(crate) fn paint(
         paint_open_chip(
             open,
             (
-                type_tint(&node.color_key, cx),
+                palette.tints.color(&node.color_key),
                 texts[*index].initial.clone(),
             ),
             PillStyle {

@@ -3246,6 +3246,7 @@ impl GraphCanvas {
             canvas: studio_ui::ds::surface::canvas(cx),
             hub_dot: studio_ui::ds::surface::canvas_hub(cx),
             font: theme::theme_settings(cx).ui_font(cx).clone(),
+            tints: self.session.read(cx).type_tints().clone(),
         };
         let scene = self.scene.clone();
         let texts = self.texts.clone();

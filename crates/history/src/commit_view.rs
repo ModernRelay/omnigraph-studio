@@ -560,7 +560,11 @@ impl CommitView {
                     .gap(px(studio_ui::ds::space::MD))
                     .items_center()
                     .flex_wrap()
-                    .child(change_cards::summary_line(&self.counts, cx))
+                    .child(change_cards::summary_line(
+                        &self.counts,
+                        self.session.read(cx).type_tints(),
+                        cx,
+                    ))
                     .when(self.next_page_token.is_some(), |line| {
                         line.child(studio_ui::ds::text::meta("so far"))
                     })
@@ -1010,6 +1014,7 @@ impl CommitView {
                         }
                         cx.notify();
                     }),
+                    self.session.read(cx).type_tints(),
                     cx,
                 )
             }

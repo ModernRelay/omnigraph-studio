@@ -2729,7 +2729,9 @@ impl ReviewView {
             data.counts
                 .iter()
                 .any(|c| c.added + c.changed + c.removed > 0)
-                .then(|| change_cards::summary_line(&data.counts, cx))
+                .then(|| {
+                    change_cards::summary_line(&data.counts, self.session.read(cx).type_tints(), cx)
+                })
         });
         if ready {
             if summary.is_none() {
@@ -3358,7 +3360,11 @@ impl ReviewView {
                             .child(
                                 h_flex()
                                     .gap(px(space::MD))
-                                    .child(type_swatch(&conflict.type_name, cx))
+                                    .child(type_swatch(
+                                        &conflict.type_name,
+                                        self.session.read(cx).type_tints(),
+                                        cx,
+                                    ))
                                     .child(studio_ui::ds::text::muted(conflict.type_name.clone()))
                                     .child(studio_ui::ds::text::body(entity).buffer_font(cx)),
                             )
@@ -3439,6 +3445,7 @@ impl ReviewView {
             },
             folded,
             cx.listener(move |this, _, _, cx| this.toggle_run(key.clone(), cx)),
+            self.session.read(cx).type_tints(),
             cx,
         )
     }
@@ -3563,7 +3570,12 @@ impl ReviewView {
                     .gap(px(space::SM))
                     .items_center()
                     .cursor_pointer()
-                    .child(studio_ui::kind_swatch(&run.type_name, run.is_edge, cx))
+                    .child(studio_ui::kind_swatch(
+                        &run.type_name,
+                        run.is_edge,
+                        self.session.read(cx).type_tints(),
+                        cx,
+                    ))
                     .child(
                         div().flex_1().min_w_0().child(
                             studio_ui::ds::text::muted(run.type_name.clone())
@@ -3654,7 +3666,12 @@ impl ReviewView {
         let crumb = h_flex()
             .gap(px(space::SM))
             .items_center()
-            .child(studio_ui::kind_swatch(&g.type_name, g.is_edge, cx))
+            .child(studio_ui::kind_swatch(
+                &g.type_name,
+                g.is_edge,
+                self.session.read(cx).type_tints(),
+                cx,
+            ))
             .child(studio_ui::ds::text::muted(g.type_name.clone()))
             .child(studio_ui::ds::text::meta(format!("· {}", kind.label())));
         let sub = id.map(|id| studio_ui::ds::text::meta(id).buffer_font(cx));

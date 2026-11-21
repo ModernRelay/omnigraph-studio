@@ -211,18 +211,18 @@ impl Render for DesignGallery {
                     .child(ds::section_label("Types"))
                     .child(
                         SidebarRow::new("g-company", "Company")
-                            .start(studio_ui::type_swatch("Company", cx))
+                            .start(studio_ui::type_swatch("Company", &demo_tints(), cx))
                             .end(ds::sidebar_count("25")),
                     )
                     .child(
                         SidebarRow::new("g-person", "Person")
-                            .start(studio_ui::type_swatch("Person", cx))
+                            .start(studio_ui::type_swatch("Person", &demo_tints(), cx))
                             .end(ds::sidebar_count("200"))
                             .selected(true),
                     )
                     .child(
                         SidebarRow::new("g-knows", "Knows")
-                            .start(studio_ui::kind_swatch("Knows", true, cx))
+                            .start(studio_ui::kind_swatch("Knows", true, &demo_tints(), cx))
                             .end(ds::sidebar_count("412"))
                             .muted(true),
                     )
@@ -365,7 +365,7 @@ impl Render for DesignGallery {
                     .child(
                         palette_row(
                             "g-palette-person",
-                            ds::tile(cx).child(ds::type_dot("Person", cx)),
+                            ds::tile(cx).child(ds::type_dot("Person", &demo_tints())),
                             "Person",
                             text::muted("node · 200 rows").into_any_element(),
                         )
@@ -454,7 +454,7 @@ impl Render for DesignGallery {
                             .map(|(n, name)| {
                                 ds::SidebarRow::new(("g-knows", n), name)
                                     .flush()
-                                    .start(studio_ui::type_mark("Person", name, cx))
+                                    .start(studio_ui::type_mark("Person", name, &demo_tints(), cx))
                                     .actions(ds::value_remove(("g-remove", n)))
                             }),
                         )
@@ -812,7 +812,7 @@ impl Render for DesignGallery {
                             .h(px(size::SIDEBAR_ROW))
                             .px(px(space::MD))
                             .gap(px(space::MD))
-                            .child(studio_ui::type_swatch("Person", cx))
+                            .child(studio_ui::type_swatch("Person", &demo_tints(), cx))
                             .child(studio_ui::ds::text::body("Ada Lovelace"))
                             .child(div().flex_1())
                             .child(studio_ui::ds::text::meta("needs WorksAt")),
@@ -934,4 +934,10 @@ impl Render for DesignGallery {
                 ),
             ))
     }
+}
+
+/// The tints of the gallery's sample graph: Company and Person drawn apart, as one graph draws
+/// them.
+fn demo_tints() -> studio_ui::TypeTints {
+    studio_ui::TypeTints::of(["Company", "Person", "Project"])
 }

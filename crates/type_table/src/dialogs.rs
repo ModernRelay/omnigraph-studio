@@ -1539,7 +1539,11 @@ impl DeleteRowModal {
                             .h(px(studio_ui::ds::size::SIDEBAR_ROW))
                             .px(px(studio_ui::ds::space::MD))
                             .gap(px(studio_ui::ds::space::MD))
-                            .child(studio_ui::type_swatch(&d.type_name, cx))
+                            .child(studio_ui::type_swatch(
+                                &d.type_name,
+                                self.session.read(cx).type_tints(),
+                                cx,
+                            ))
                             .child(
                                 div().min_w_0().flex_1().child(
                                     studio_ui::ds::text::body(

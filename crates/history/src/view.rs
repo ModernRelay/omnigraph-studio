@@ -405,7 +405,8 @@ impl Item for HistoryView {
             Some(note) => note.clone(),
             None => {
                 let (heads, counts) = self.learnt_of(commit);
-                let note = CommitNote::new(commit.clone(), heads.to_vec(), counts);
+                let tints = self.session.read(cx).type_tints().clone();
+                let note = CommitNote::new(commit.clone(), heads.to_vec(), counts, tints);
                 let note = cx.new(|_| note);
                 self.commit_note = Some(note.clone());
                 note

@@ -472,7 +472,12 @@ impl TypesList {
                     separate: false,
                 };
                 studio_ui::ds::SidebarRow::new(("type", ix), name.clone())
-                    .start(studio_ui::kind_swatch(name, *is_edge, cx))
+                    .start(studio_ui::kind_swatch(
+                        name,
+                        *is_edge,
+                        session.read(cx).type_tints(),
+                        cx,
+                    ))
                     .end(studio_ui::ds::sidebar_count(count))
                     .muted(*is_edge)
                     .selected(selected)

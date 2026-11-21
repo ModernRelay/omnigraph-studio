@@ -841,7 +841,8 @@ impl Item for QueryEditor {
                             return None;
                         };
                         let (held, _) = self.rows_read_at(output, cx);
-                        let note = RowNote::new(row, &output.table, held)?;
+                        let tints = self.session.read(cx).type_tints().clone();
+                        let note = RowNote::new(row, &output.table, held, tints)?;
                         let note = cx.new(|_| note);
                         self.row_note = Some(note.clone());
                         note

@@ -374,7 +374,7 @@ impl NodePeek {
                 h_flex()
                     .gap(px(space::SM))
                     .items_center()
-                    .child(studio_ui::type_swatch(&type_name, cx))
+                    .child(studio_ui::type_swatch(&type_name, self.session.read(cx).type_tints(), cx))
                     .child(studio_ui::ds::text::muted(type_name)),
             )
             .when(key_shown, |meta| {
@@ -699,6 +699,53 @@ mod tests {
         cx.simulate_click(key.center(), gpui::Modifiers::none());
         assert!(cx.debug_bounds("key-copied").is_some());
         assert!(cx.debug_bounds("title-copied").is_none());
+    }
+
+    /// A graph's schema, read through its session, draws Company and Person in different tints,
+    /// where their names hash to one (review of #161: no test failed with the session's call
+    /// taken out).
+    #[gpui::test]
+    async fn a_graphs_schema_draws_its_types_apart(cx: &mut TestAppContext) {
+        init(cx);
+        const FIRMS: &str =
+            "node Person {\n  slug: String @key\n}\nnode Company {\n  slug: String @key\n}\n";
+        let session = session(FIRMS, cx);
+        cx.run_until_parked();
+        session.read_with(cx, |session, _| {
+            let tints = session.type_tints();
+            assert_ne!(
+                tints.color("Company"),
+                tints.color("Person"),
+                "Company and Person draw in one tint"
+            );
+        });
+    }
+
+    /// Two graphs open together that share a type name each draw it in their own tint: reading
+    /// the second never moves the first's types onto one tint (review of #161).
+    #[gpui::test]
+    async fn two_graphs_sharing_a_type_keep_their_own_tints(cx: &mut TestAppContext) {
+        init(cx);
+        const A: &str =
+            "node Person {\n  slug: String @key\n}\nnode Company {\n  slug: String @key\n}\n";
+        const B: &str =
+            "node Person {\n  slug: String @key\n}\nnode Topic {\n  slug: String @key\n}\n";
+        let a = session(A, cx);
+        cx.run_until_parked();
+        let drawn = |session: &Entity<GraphSession>, name: &str, cx: &mut TestAppContext| {
+            session.read_with(cx, |session, _| session.type_tints().color(name))
+        };
+        let (company, person) = (drawn(&a, "Company", cx), drawn(&a, "Person", cx));
+        let b = session(B, cx);
+        cx.run_until_parked();
+        assert_eq!(drawn(&a, "Company", cx), company);
+        assert_eq!(
+            drawn(&a, "Person", cx),
+            person,
+            "the second graph moves nothing"
+        );
+        assert_ne!(drawn(&a, "Company", cx), drawn(&a, "Person", cx));
+        assert_ne!(drawn(&b, "Person", cx), drawn(&b, "Topic", cx));
     }
 
     /// A node with no name is titled by its id, which the title cannot edit as a name: the key
