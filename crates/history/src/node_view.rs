@@ -2201,6 +2201,25 @@ mod tests {
         });
     }
 
+    /// A new credential forgets the name the old one read: the tab is named by the id until the
+    /// history is read again under the new one.
+    #[gpui::test]
+    async fn a_new_credential_forgets_the_old_name(cx: &mut TestAppContext) {
+        let (session, _, failing) = serve(Served::default(), cx);
+        let (view, cx) = open(&session, "ada", cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.label.as_deref(), Some("Ada Lovelace"))
+        });
+        failing.store(true, Ordering::SeqCst);
+        session.update(cx, |_, cx| cx.emit(SessionEvent::CredentialChanged));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(matches!(view.state, State::Failed(_)));
+            assert_eq!(view.label, None, "the old credential's name is gone");
+            assert_eq!(Item::tab_title(view, cx).as_ref(), "History · ada");
+        });
+    }
+
     /// No change in the window: the empty state says so and offers the commits before.
     #[gpui::test]
     async fn an_unchanged_node_says_so_and_offers_the_commits_before(cx: &mut TestAppContext) {
