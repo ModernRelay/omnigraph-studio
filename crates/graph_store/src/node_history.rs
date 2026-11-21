@@ -134,6 +134,9 @@ pub struct NodeState {
     pub properties: Map<String, Value>,
     pub blobs: BTreeMap<String, BlobState>,
     pub edges: BTreeMap<usize, BTreeMap<String, String>>,
+    /// The groups whose read at this commit listed [`NODE_HISTORY_EDGES`] edges: only the first
+    /// of them, by id, so an edge added or removed may push another past the page.
+    pub full: std::collections::BTreeSet<usize>,
 }
 
 /// What a node's history reads at each commit: the node's type and id, its relationship groups
@@ -206,6 +209,11 @@ impl NodeScope {
         let mut edges = Vec::new();
         let empty = BTreeMap::new();
         for (ix, group) in self.groups.iter().enumerate() {
+            // A page cut at its limit says nothing exact of what changed: the group is too large
+            // to follow, and the view says so in place of edges that may not have changed.
+            if older.full.contains(&ix) || newer.full.contains(&ix) {
+                continue;
+            }
             let was = older.edges.get(&ix).unwrap_or(&empty);
             let now = newer.edges.get(&ix).unwrap_or(&empty);
             let image = |other: &str| {
@@ -300,7 +308,10 @@ pub struct OlderWindow {
 #[derive(Debug, Clone, PartialEq)]
 pub enum NodeHistoryWindow {
     Newest,
-    Older { head: String, window: OlderWindow },
+    Older {
+        head: String,
+        window: Box<OlderWindow>,
+    },
 }
 
 /// A schema change between two commits that a read at the older one could not cross (E52): the
@@ -331,8 +342,6 @@ pub struct NodeHistoryPage {
     /// Why the window was not read to its end, in words, when it was not.
     pub stopped: Option<String>,
     pub boundary: Option<SchemaBoundary>,
-    /// Relationship groups with no edge at either end of the window, not read between them.
-    pub skipped_groups: Vec<RelationshipGroup>,
     /// Relationship groups with [`NODE_HISTORY_EDGES`] edges at some commit: what they did past
     /// those is not known.
     pub full_groups: Vec<RelationshipGroup>,
@@ -524,6 +533,9 @@ pub struct SearchFound {
     pub set: HashMap<String, WindowCommit>,
     /// Requests sent: listing pages and point reads.
     pub requests: usize,
+    /// The oldest commit listed, when the listing stopped at its cap before the graph's first:
+    /// an answer that still held there was set before it, which is all the search can say.
+    pub before: Option<WindowCommit>,
     /// Why it stopped short, when it did.
     pub stopped: Option<String>,
 }
@@ -533,6 +545,13 @@ pub struct SearchFound {
 /// `lo` is the answer.
 pub fn search_step(lo: usize, hi: usize) -> Option<usize> {
     (hi - lo > 1).then(|| lo + (hi - lo) / 2)
+}
+
+/// What a binary search over `len` listed commits found, its answer holding at `lo`: that
+/// commit, unless it is the oldest listed and the listing stopped short of the graph's first
+/// commit (`reached_first` false), where the answer may hold further back still.
+pub fn settled(lo: usize, len: usize, reached_first: bool) -> Option<usize> {
+    (lo + 1 < len || reached_first).then_some(lo)
 }
 
 /// Who asks, through which client, of which graph and branch: what each read of a window needs.
@@ -732,8 +751,11 @@ impl Reader {
                         state.properties = node.unwrap_or_default();
                     }
                     Ok(Answer::Edges(ix, edges, was_full)) => {
-                        if was_full && !full.contains(&ix) {
-                            full.push(ix);
+                        if was_full {
+                            states[at].full.insert(ix);
+                            if !full.contains(&ix) {
+                                full.push(ix);
+                            }
                         }
                         states[at].edges.insert(ix, edges);
                     }
@@ -803,8 +825,8 @@ impl GraphSession {
     /// newest [`NODE_HISTORY_COMMITS`] first-parent commits, or the ones before a window read
     /// already. One commit listing, then at each commit and at the oldest one's parent the node
     /// itself, its edges through each relationship group and its Blobs' sizes, at most
-    /// [`NODE_HISTORY_READS_AT_ONCE`] at once; a group with no edge at either end of the window
-    /// is not read between them. Then the branch of each merge that changed the node. Each read
+    /// [`NODE_HISTORY_READS_AT_ONCE`] at once; the edges and Blobs only where the node exists.
+    /// Then the branch of each merge that changed the node. Each read
     /// is named in the ledger; nothing is asked again by itself. The newest window keeps the
     /// node's last change for its page ([`Self::last_change`]).
     pub fn node_history_in(
@@ -857,7 +879,6 @@ impl GraphSession {
                 older: None,
                 stopped: None,
                 boundary: None,
-                skipped_groups: Vec::new(),
                 full_groups: Vec::new(),
                 requests: 0,
             };
@@ -880,48 +901,20 @@ impl GraphSession {
             let blobs = reader.node.blobs.len();
             let mut full = Vec::new();
 
-            // The node at every commit, and its edges at both ends of the window.
-            let mut jobs: Vec<(usize, Read)> =
-                (first..ids.len()).map(|at| (at, Read::Node)).collect();
-            for ix in 0..groups {
-                if first == 0 {
-                    jobs.push((0, Read::Edges(ix)));
-                }
-                if last > 0 {
-                    jobs.push((last, Read::Edges(ix)));
-                }
-            }
+            // The node at every commit; then, at each commit that holds it, its edges through
+            // every relationship group and its Blobs. No group is left out: a group read only at
+            // the window's ends would miss an edge added and removed between them, and with it
+            // who changed the node last.
+            let jobs: Vec<(usize, Read)> = (first..ids.len()).map(|at| (at, Read::Node)).collect();
             let mut failed = reader.run(&ids, jobs, &mut states, &mut full, cx).await;
-
-            // Between the ends: every group while the node was created or removed in the window,
-            // else the groups with an edge at either end; then the Blobs of each commit that
-            // holds the node. A group empty at both ends of a window the node lived through is
-            // not read between them: an edge added and removed within it is not seen.
-            let lived = states[0].exists && states[last].exists;
-            let read_groups: Vec<usize> = (0..groups)
-                .filter(|ix| {
-                    !lived
-                        || [0, last]
-                            .iter()
-                            .any(|&at| states[at].edges.get(ix).is_some_and(|e| !e.is_empty()))
-                })
-                .collect();
-            if last > 1 {
-                page.skipped_groups = (0..groups)
-                    .filter(|ix| !read_groups.contains(ix))
-                    .map(|ix| reader.node.groups[ix].clone())
-                    .collect();
-            }
             let mut jobs = Vec::new();
-            for at in (1..last).filter(|&at| states[at].exists) {
-                jobs.extend(read_groups.iter().map(|&ix| (at, Read::Edges(ix))));
-            }
             for (at, _) in states
                 .iter()
                 .enumerate()
                 .skip(first)
                 .filter(|(_, s)| s.exists)
             {
+                jobs.extend((0..groups).map(|ix| (at, Read::Edges(ix))));
                 jobs.extend((0..blobs).map(|ix| (at, Read::Blob(ix))));
             }
             failed.extend(reader.run(&ids, jobs, &mut states, &mut full, cx).await);
@@ -987,7 +980,11 @@ impl GraphSession {
 
             page.commits = commits;
             page.requests = reader.requests;
-            if newest && let Some(last) = page.entries.first() {
+            // A group too large to follow may hide a newer change: the page then says nothing.
+            if newest
+                && page.full_groups.is_empty()
+                && let Some(last) = page.entries.first()
+            {
                 let last = LastChange {
                     head: page.head.clone(),
                     commit: last.commit.clone(),
@@ -1055,6 +1052,7 @@ impl GraphSession {
                 older.extend(listing.commits.iter().map(WindowCommit::of));
                 token = listing.next_page_token;
             }
+            let reached_first = token.is_none() && found.stopped.is_none();
             if older.first().map(|c| c.id.as_str()) != Some(base.0.as_str()) {
                 return Err(ReadError::Decode(
                     "the commits before the windows do not go on from where they ended".into(),
@@ -1103,11 +1101,12 @@ impl GraphSession {
                     found.stopped = Some(error.to_string());
                     break;
                 }
-                match question {
-                    None => found.created = Some(older[lo].clone()),
-                    Some((name, _)) => {
-                        found.set.insert(name, older[lo].clone());
+                match (question, settled(lo, older.len(), reached_first)) {
+                    (None, Some(at)) => found.created = Some(older[at].clone()),
+                    (Some((name, _)), Some(at)) => {
+                        found.set.insert(name, older[at].clone());
                     }
+                    (_, None) => found.before = older.last().cloned(),
                 }
             }
             found.requests = reader.requests;
@@ -1336,6 +1335,39 @@ mod tests {
         }
         assert_eq!(lo, 300);
         assert!(asked <= 9, "{asked} probes");
+    }
+
+    /// A group read full at either of two commits is not diffed between them: its page holds the
+    /// first 1,000 edges by id, so an edge added before them pushes the last one off the page,
+    /// which is no removal.
+    #[test]
+    fn a_full_group_is_not_diffed() {
+        let scope = scope();
+        let commits = vec![commit(2, "act-a")];
+        let mut older = state(json!({"name": "Ada"}), &[(0, "e2", "x"), (0, "e3", "y")]);
+        let mut newer = state(json!({"name": "Ada"}), &[(0, "e1", "z"), (0, "e2", "x")]);
+        older.full.insert(0);
+        newer.full.insert(0);
+        assert!(entries_of(&scope, &commits, &[newer.clone(), older.clone()]).is_empty());
+        newer.full.clear();
+        older.full.clear();
+        assert_eq!(
+            entries_of(&scope, &commits, &[newer, older])[0].edges.len(),
+            2
+        );
+    }
+
+    /// A search that listed commits up to its cap, its answer still holding at the oldest it
+    /// listed, names no commit: the value was set before it, not by it.
+    #[test]
+    fn a_capped_search_names_no_commit_at_its_end() {
+        assert_eq!(settled(3, 10, false), Some(3));
+        assert_eq!(settled(9, 10, true), Some(9), "the graph's first commit");
+        assert_eq!(
+            settled(9, 10, false),
+            None,
+            "the listing stopped at its cap"
+        );
     }
 
     /// Blob cells compare by kind and size, said as a size.
