@@ -359,6 +359,8 @@ pub fn node_label(node: &NodeType, values: &Map<String, Value>) -> Option<String
     (Some(label) != node.key.as_deref())
         .then(|| values.get(label)?.as_str().map(str::to_owned))
         .flatten()
+        // An empty name names nothing: the node is shown by its id.
+        .filter(|label| !label.trim().is_empty())
 }
 
 /// Rows of `node_page` / `node_by_id`: each result row is `{"n": {"@id": …, props…}}`.
