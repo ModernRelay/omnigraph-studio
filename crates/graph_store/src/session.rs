@@ -283,6 +283,12 @@ pub enum SessionEvent {
     /// under the old one offers Refresh, which takes it. Unlike
     /// [`SessionEvent::SchemaChanged`], nothing on screen changes by itself.
     SchemaMoved,
+    /// A node's history was read, and its last change is held (spec 046,
+    /// [`GraphSession::last_change`]): a page of the node may say who changed it last.
+    NodeHistoryRead {
+        type_name: String,
+        id: String,
+    },
     /// The session's branch is not in a branch list read after it moved there (deleted
     /// elsewhere, or since the last run), so the session moved to main.
     BranchMissing {
@@ -855,6 +861,9 @@ pub struct GraphSession {
     next_scope: u64,
     /// The view each live scope reads for (spec 030).
     scope_views: HashMap<u64, ReadView>,
+    /// Each node's last change, by type and id, as its history last read it (spec 046): a page
+    /// shows it, and reads nothing for it. Forgotten with a new token, as the read memo is.
+    last_changes: HashMap<(String, String), crate::node_history::LastChange>,
     /// How each read was answered (spec 030).
     ledger: ReadLedger,
     /// Who is asking for the read being started: set by the scoped reads around their call.
@@ -1027,6 +1036,7 @@ impl GraphSession {
             scopes: HashMap::new(),
             next_scope: 0,
             scope_views: HashMap::new(),
+            last_changes: HashMap::new(),
             ledger: ReadLedger::default(),
             asking: Asker::Unnamed,
             carried_keys: HashSet::new(),
@@ -1250,6 +1260,8 @@ impl GraphSession {
         }
         self.counts_reading = false;
         self.counts_again = false;
+        // What the old token's history reads said of each node (spec 046).
+        self.last_changes.clear();
         // Not kept while it is read: it is the old token's.
         self.branches = Loadable::Loading;
         if self.shown {
@@ -1689,7 +1701,11 @@ impl GraphSession {
             other => other,
         };
         match &schema {
-            Loadable::Loaded(model) => self.start_schema_epoch(model),
+            Loadable::Loaded(model) => {
+                self.start_schema_epoch(model);
+                // The graph's types are drawn apart where their names hash to one tint.
+                studio_ui::assign_type_tints(model.nodes.iter().map(|node| node.name.as_str()), cx);
+            }
             // The schema held is still the graph's.
             _ if matches!(self.schema, Loadable::Loaded(_)) => return,
             _ => {}
@@ -2328,6 +2344,55 @@ impl GraphSession {
         let result = read(self);
         self.asking = before;
         result
+    }
+
+    /// Who asks for reads through `scope`, as the ledger names them.
+    pub(crate) fn asker_of(&self, scope: &ReadScope) -> Asker {
+        self.scope_views
+            .get(&scope.id)
+            .map_or(Asker::Unnamed, |view| Asker::View(*view))
+    }
+
+    /// Node `type_name` `id`'s last change, as its history last read it (spec 046).
+    pub fn last_change(
+        &self,
+        type_name: &str,
+        id: &str,
+    ) -> Option<&crate::node_history::LastChange> {
+        self.last_changes
+            .get(&(type_name.to_owned(), id.to_owned()))
+    }
+
+    /// Keeps what a read of a node's history found as its last change, and tells the views.
+    pub(crate) fn note_last_change(
+        &mut self,
+        type_name: &str,
+        id: &str,
+        change: crate::node_history::LastChange,
+        cx: &mut Context<Self>,
+    ) {
+        let key = (type_name.to_owned(), id.to_owned());
+        if self.last_changes.get(&key) == Some(&change) {
+            return;
+        }
+        self.last_changes.insert(key, change);
+        cx.emit(SessionEvent::NodeHistoryRead {
+            type_name: type_name.to_owned(),
+            id: id.to_owned(),
+        });
+    }
+
+    /// Holds `change` as node `type_name` `id`'s last change, as a read of its history would,
+    /// for the tests of a view that shows it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn hold_last_change(
+        &mut self,
+        type_name: &str,
+        id: &str,
+        change: crate::node_history::LastChange,
+        cx: &mut Context<Self>,
+    ) {
+        self.note_last_change(type_name, id, change, cx);
     }
 
     /// Records a read the session answered without sending it.
@@ -3760,6 +3825,24 @@ impl GraphSession {
         self.counted_read_as(Some(sending), request, cx)
     }
 
+    /// [`Self::counted_read`] asked for by `asker`, for a read a session method sends after it
+    /// returned, as a node's history sends each of its pages (spec 046).
+    pub(crate) fn counted_read_by<T: Send + 'static>(
+        &mut self,
+        what: &'static str,
+        asker: Asker,
+        request: impl Future<Output = Result<T, ReadError>> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<T, ReadError>> {
+        let sending = Sending {
+            what: what.into(),
+            asker,
+            target: Target::Route,
+            started: cx.background_executor().now(),
+        };
+        self.counted_read_as(Some(sending), request, cx)
+    }
+
     /// [`Self::counted_read`], recorded in the ledger as `sending` says when it ends or is
     /// dropped.
     fn counted_read_as<T: Send + 'static>(
@@ -4619,6 +4702,25 @@ impl GraphSession {
             merge,
         });
         self.outcomes_logged += 1;
+    }
+
+    /// What Studio wrote in commit `commit`, in its own words, when it made the commit this
+    /// session: one of its writes, or one it sent for the agent's CLI (spec 046, after #146).
+    /// Omnigraph keeps no operation or message with a commit (E60), so another writer's commit
+    /// has none.
+    pub fn own_words(&self, commit: &str) -> Option<&str> {
+        self.outcomes
+            .iter()
+            .rev()
+            .find_map(|entry| match &entry.outcome {
+                OutcomeKind::Committed { commit: Some(made) } if made == commit => {
+                    Some(entry.description.as_str())
+                }
+                OutcomeKind::Held { commit: made, .. } if made == commit => {
+                    Some(entry.description.as_str())
+                }
+                _ => None,
+            })
     }
 
     /// The newest merge of `source` into `target` the log holds: its entry says whether that

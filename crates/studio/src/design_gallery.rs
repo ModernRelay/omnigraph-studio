@@ -365,7 +365,7 @@ impl Render for DesignGallery {
                     .child(
                         palette_row(
                             "g-palette-person",
-                            ds::tile(cx).child(ds::type_dot("Person")),
+                            ds::tile(cx).child(ds::type_dot("Person", cx)),
                             "Person",
                             text::muted("node · 200 rows").into_any_element(),
                         )

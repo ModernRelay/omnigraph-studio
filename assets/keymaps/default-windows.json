@@ -112,7 +112,8 @@
   {
     "context": "NodeView",
     "bindings": {
-      "ctrl-s": "studio_node::SaveNodeDrafts"
+      "ctrl-s": "studio_node::SaveNodeDrafts",
+      "f2": "studio_node::EditNodeName"
     }
   },
   {
@@ -479,6 +480,19 @@
       "up": "menu::SelectPrevious",
       "space": "studio_changes::ToggleChange",
       "ctrl-enter": "studio_changes::OpenChanged"
+    }
+  },
+  {
+    "context": "NodeHistory",
+    "bindings": {
+      "j": "menu::SelectNext",
+      "down": "menu::SelectNext",
+      "k": "menu::SelectPrevious",
+      "up": "menu::SelectPrevious",
+      "enter": "menu::Confirm",
+      "space": "studio_changes::ToggleChange",
+      "ctrl-alt-n": "studio_history::ReadOlderCommits",
+      "ctrl-alt-f": "studio_history::FindWhenSet"
     }
   },
   {

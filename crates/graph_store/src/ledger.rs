@@ -28,6 +28,8 @@ pub enum ReadView {
     Search,
     /// A type's gallery: its pages and its tiles' files (spec 035).
     Gallery,
+    /// A node's history: its window's commit listing, change-feed pages and merges (spec 046).
+    NodeHistory,
 }
 
 /// Who asked for a read: a view through its scope, or a caller the ledger cannot name yet.

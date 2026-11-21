@@ -393,6 +393,7 @@ impl Item for RelationshipTree {
                 ViewLink::to(ViewKind::Page),
                 ViewLink::current(ViewKind::Tree),
                 ViewLink::to(ViewKind::Canvas),
+                ViewLink::to(ViewKind::History),
             ],
             Subject::Set(set) => {
                 let canvas = match self.walks_from() {
@@ -432,6 +433,14 @@ impl Item for RelationshipTree {
                 at_commit,
                 preview: true,
             })),
+            // The root's history, at the branch head (spec 046).
+            (Subject::Node(root), ViewKind::History) => {
+                Some(Box::new(studio_actions::graph::ShowNodeHistory {
+                    type_name: root.type_name.clone(),
+                    id: root.id.clone(),
+                    preview: true,
+                }))
+            }
             (Subject::Set(_), ViewKind::Canvas) => {
                 let node = self.walks_from()?;
                 Some(Box::new(ShowNodeOnCanvas {
@@ -1120,7 +1129,7 @@ impl RelationshipTree {
                     .child(if root {
                         type_swatch(&node.type_name, cx)
                     } else {
-                        studio_ui::ds::type_dot(&node.type_name)
+                        studio_ui::ds::type_dot(&node.type_name, cx)
                     })
                     .child(
                         div().min_w_0().flex_shrink(1.).child(
@@ -1183,7 +1192,7 @@ impl RelationshipTree {
                     )
                     // The target's dot, as on a neighbour row; none when there is no target.
                     .when(target.is_some(), |row| {
-                        row.child(studio_ui::ds::type_dot(&key.group.other_type))
+                        row.child(studio_ui::ds::type_dot(&key.group.other_type, cx))
                     })
                     .child(
                         div().min_w_0().flex_shrink(1.).child(
@@ -1802,7 +1811,7 @@ impl HoverCard {
             .child(
                 h_flex()
                     .gap(px(space::SM))
-                    .child(studio_ui::ds::type_dot(&self.type_name))
+                    .child(studio_ui::ds::type_dot(&self.type_name, cx))
                     .child(
                         div().min_w_0().flex_shrink(1.).child(
                             studio_ui::ds::text::body(

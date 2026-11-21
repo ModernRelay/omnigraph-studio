@@ -602,6 +602,51 @@ holds both sides. A description (size, digest; the commit to read each side at) 
 page to what changed. *Waits:* 035, 008. *Today:* Studio reads the diff as it comes and marks a
 tile whose file changed; the target's side is read from the Blob route at the merge base.
 
+### Why something changed: a node's history (spec 046)
+
+Filed from the cookbook study (#143, `docs/ux/2026-11-18-cookbook-study.md` on
+`docs/ux-cookbook-study`), where seven of eight teams asked who changed a node and why, and from
+the node-history design study (#160, `docs/ux/2026-11-20-node-history.md`), which measured what
+today's API costs. First recorded by the closed #146 (spec 040), which never landed.
+
+**E60. A commit's operation and message, and who created a branch.**
+[ModernRelay/omnigraph#1470](https://github.com/ModernRelay/omnigraph/issues/1470). A write's
+receipt names the stored query it ran (`ChangeOutput.query_name`), but the commit keeps none of
+it: `CommitOutput` and the feed's `ChangeCauseOutput` carry the actor and the time alone. The
+operation (the stored query's name, or `mutate`, `load`, `merge`, `blob put`) and an optional
+message the writer supplies, in both, would let a node's History read "act-writer · close" for
+any writer's commit, and E9's branch details naming the actor who created a branch would say
+whose a branch is. Engine rule: both are recorded when the commit is made and never change; a
+message is the writer's text, bounded in length. *Waits:* 046. *Today:* Studio's own words for
+the writes it made or sent for the agent's CLI this session (`GraphSession::own_words`), else
+nothing: an operation is never guessed from the values.
+
+**E62. The commits that changed one entity, and what each changed.**
+[ModernRelay/omnigraph#1472](https://github.com/ModernRelay/omnigraph/issues/1472). No route
+takes an entity id, so a node's history means reading a branch's commits and keeping those that
+touched it. The study measured the cost: one changed person cost 13.2 MiB in a window of 200
+commits that held a load of 50,000 people, because a feed filtered by type carries every
+insert's whole image. Asked:
+
+1. The commits that changed one entity (a node, or an edge by its id; for a node, optionally the
+   edges with an end at it), paged newest first, each with its change and its cause, and
+   including the commits a merge brought in with their own actors and branches, so a merged
+   change names who made it on the branch rather than who merged it.
+2. *Extension, proposed on #1472 by spec 046:* each change names the properties it set
+   (`changed: ["title", "email"]`), so a client need not compare two whole images; a property
+   filter (`property=title`, like `git log -L`), answering only the commits that set it; and a
+   blame answer, the newest change of each property of the entity as one response, so "who set
+   this value" is exact at any depth.
+
+Engine rule: the answer is pinned to one head, as a feed page is; a property filter keeps a
+change whose images differ in that property, or that inserted or deleted the entity. *Waits:*
+046. *Today:* windows of a branch's newest 200 first-parent commits, the node read with a point
+query at each and its edges through each relationship group, about window × (1 + groups)
+requests, compared commit to commit; a merge is credited "via merge of *branch*"; blame says
+"before" the oldest commit read, and a binary search of point reads past the windows finds when
+the node was created and a value set. The change feed filtered by type and op is the alternative
+where a type changes rarely; its cost follows what the type wrote.
+
 ### In 0.14, not in 0.13.0
 
 Studio's minimum server serves these, so it uses them without asking the server's OpenAPI
@@ -642,6 +687,8 @@ Then engine changes still open:
    disposition.
 10. E49 to E51, which would make finding a node one request and right on every type, however
     large; E49 is the smallest.
+11. E62 and E60, which would read one node's history in one request with no window or cap, name
+    who changed a merged value on its branch, and say what each commit did; E60 is the smaller.
 11. E56 and E58, which let one page say what every Blob cell holds; then E55 and E57, which
     make a gallery's screen cost what it shows; E59 with E35, since both weigh down a diff.
 

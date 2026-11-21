@@ -25,8 +25,10 @@ use graph_store::{
 };
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use serde_json::{Map, Value};
-use studio_actions::graph::{OpenBlob, OpenNodePage, ShowNodeInTree, ShowNodeOnCanvas};
-use studio_actions::node::{CancelField, ExpandField, SaveField, SaveNodeDrafts};
+use studio_actions::graph::{
+    OpenBlob, OpenNodePage, ShowNodeHistory, ShowNodeInTree, ShowNodeOnCanvas,
+};
+use studio_actions::node::{CancelField, EditNodeName, ExpandField, SaveField, SaveNodeDrafts};
 use studio_actions::table::{SelectNextSuggestion, SelectPreviousSuggestion};
 use studio_actions::workspace::Refresh;
 use studio_ui::ds::Tipped;
@@ -50,6 +52,8 @@ use gq_language::input::same_value;
 use graph_client::api::{ChangeOutput, ReadOutput};
 use graph_client::{BlobCell, BlobMeta, HistoricalGap, PropertyThen, ReadError, WriteOutcome};
 use studio_workspace::property_icon;
+
+mod page;
 
 /// First neighbours shown under an expanded relationship group.
 pub const NEIGHBOUR_LIMIT: u32 = 8;
@@ -464,6 +468,9 @@ pub struct NodePeek {
     show_empty: bool,
     /// The long texts folded under their names, by property.
     folded: HashSet<String>,
+    /// The Blob slots whose bytes a page shows as a hex dump ("Show bytes"); a page shows a
+    /// value's kind, size and a line of it by default.
+    bytes_shown: HashSet<String>,
     /// The node's drafts being saved together.
     saving_drafts: bool,
     /// Why the drafts' last save did not land; the second press of Discard drops them.
@@ -622,6 +629,13 @@ impl NodePeek {
                 this.credential_changed(cx);
                 return;
             }
+            // A page says who changed its node last once its history was read (spec 046).
+            if let SessionEvent::NodeHistoryRead { type_name, id } = event {
+                if this.page && this.subject.type_name() == type_name && this.subject.id() == id {
+                    cx.notify();
+                }
+                return;
+            }
             // A view made before the schema was read (a page restored at start) reads its node
             // once the schema is in.
             if let SessionEvent::SchemaChanged = event
@@ -776,6 +790,7 @@ impl NodePeek {
             selected: None,
             show_empty: false,
             folded: HashSet::new(),
+            bytes_shown: HashSet::new(),
             scope: Some(scope),
             list: ListState::new(0, ListAlignment::Top, px(DRAW_AHEAD)),
             list_items: Vec::new(),
@@ -1992,48 +2007,122 @@ impl NodePeek {
         cx.notify();
     }
 
+    /// What a Blob slot's line says of its value: its size, or what it is instead.
+    fn blob_facts(&self, slot: &BlobSlot) -> String {
+        let saving = self.saving.on(&self.branch, &slot.property);
+        match &slot.meta {
+            _ if saving => format!("saving to {}…", self.branch),
+            Loadable::Loaded(BlobMeta::Managed { size, .. }) => studio_ui::format_bytes(*size),
+            Loadable::Loaded(BlobMeta::External { .. }) => "external reference".into(),
+            Loadable::Loaded(BlobMeta::Null) => "null".into(),
+            Loadable::Failed(_) => "could not be read".into(),
+            _ => "reading…".into(),
+        }
+    }
+
+    /// Why slot `index`'s last write did not land, with its "Write it again" where it has one.
+    fn blob_notice(
+        &self,
+        index: usize,
+        slot: &BlobSlot,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        match &slot.edit {
+            Some(BlobEdit::Failed { notice, again }) => {
+                let again = again.as_ref().map(|(change, now)| {
+                    studio_ui::ds::row_button(
+                        ("peek-blob-again", index),
+                        blob_write::again_label(change, now),
+                    )
+                    .style(ButtonStyle::Subtle)
+                    .tip(studio_ui::ds::tooltip(format!(
+                        "Write it over what {} holds now, on {}",
+                        slot.property, self.branch
+                    )))
+                    .on_click(cx.listener(move |this, _, _, cx| this.send_blob_again(index, cx)))
+                    .into_any_element()
+                });
+                Some(
+                    blob_write::notice_row(format!("peek-blob-{index}"), notice, again)
+                        .into_any_element(),
+                )
+            }
+            _ => None,
+        }
+    }
+
+    /// Slot `index`'s Open and Save…, or how a save of it to a file goes.
+    fn blob_save(
+        &self,
+        index: usize,
+        slot: &BlobSlot,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let managed = matches!(slot.meta, Loadable::Loaded(BlobMeta::Managed { .. }));
+        match &slot.save {
+            Some(SaveState::Saving { done, of }) => Some(
+                studio_ui::ds::text::meta(format!(
+                    "Saving {}%",
+                    (*done * 100).checked_div(*of).unwrap_or(100)
+                ))
+                .into_any_element(),
+            ),
+            Some(SaveState::Saved(path)) => {
+                let path = path.clone();
+                Some(
+                    studio_ui::ds::button(("show-saved", index), "Show in Finder")
+                        .style(ButtonStyle::Subtle)
+                        .color(Color::Muted)
+                        .tip(studio_ui::ds::tooltip(format!(
+                            "Saved to {}",
+                            path.display()
+                        )))
+                        .on_click(move |_, _, cx| cx.reveal_path(&path))
+                        .into_any_element(),
+                )
+            }
+            Some(SaveState::Failed(error)) => {
+                Some(studio_ui::ds::text::error_note(error.clone()).into_any_element())
+            }
+            None if managed => Some(
+                h_flex()
+                    .gap(px(space::XXS))
+                    .child({
+                        let open = self.open_blob_action(&slot.property);
+                        studio_ui::ds::button(("open-blob", index), "Open")
+                            .style(ButtonStyle::Subtle)
+                            .color(Color::Muted)
+                            .tip(studio_ui::ds::tooltip("Show the whole value in a tab"))
+                            .on_click(move |_, window, cx| {
+                                window.dispatch_action(Box::new(open.clone()), cx)
+                            })
+                    })
+                    .child({
+                        let refused = self.save_refusal(index);
+                        studio_ui::ds::button(("save-blob", index), "Save…")
+                            .style(ButtonStyle::Subtle)
+                            .color(Color::Muted)
+                            .disabled(refused.is_some())
+                            .tip(studio_ui::ds::tooltip(
+                                refused.unwrap_or("Save the whole value to a file"),
+                            ))
+                            .on_click(cx.listener(move |this, _, _, cx| this.save_blob(index, cx)))
+                    })
+                    .into_any_element(),
+            ),
+            None => None,
+        }
+    }
+
     fn render_blobs(&self, cx: &mut Context<Self>) -> AnyElement {
         let drop_bg = studio_ui::ds::surface::drop_target(cx);
         v_flex()
             .gap(px(space::MD))
             .children(self.blobs.iter().enumerate().map(|(index, slot)| {
                 let saving = self.saving.on(&self.branch, &slot.property);
-                let facts = match &slot.meta {
-                    _ if saving => format!("saving to {}…", self.branch),
-                    Loadable::Loaded(BlobMeta::Managed { size, .. }) => {
-                        studio_ui::format_bytes(*size)
-                    }
-                    Loadable::Loaded(BlobMeta::External { .. }) => "external reference".into(),
-                    Loadable::Loaded(BlobMeta::Null) => "null".into(),
-                    Loadable::Failed(_) => "could not be read".into(),
-                    _ => "reading…".into(),
-                };
+                let facts = self.blob_facts(slot);
                 let writes = self.render_blob_writes(index, slot, cx);
-                let notice = match &slot.edit {
-                    Some(BlobEdit::Failed { notice, again }) => {
-                        let again = again.as_ref().map(|(change, now)| {
-                            studio_ui::ds::row_button(
-                                ("peek-blob-again", index),
-                                blob_write::again_label(change, now),
-                            )
-                            .style(ButtonStyle::Subtle)
-                            .tip(studio_ui::ds::tooltip(format!(
-                                "Write it over what {} holds now, on {}",
-                                slot.property, self.branch
-                            )))
-                            .on_click(
-                                cx.listener(move |this, _, _, cx| this.send_blob_again(index, cx)),
-                            )
-                            .into_any_element()
-                        });
-                        Some(blob_write::notice_row(
-                            format!("peek-blob-{index}"),
-                            notice,
-                            again,
-                        ))
-                    }
-                    _ => None,
-                };
+                let notice = self.blob_notice(index, slot, cx);
                 let droppable = self.blob_write_refusal(&slot.property, cx).is_none() && !saving;
                 let body: Option<AnyElement> = match (&slot.meta, &slot.preview) {
                     (Loadable::Failed(error), _) | (_, Loadable::Failed(error)) => {
@@ -2095,64 +2184,7 @@ impl NodePeek {
                     ),
                     _ => None,
                 };
-                let managed = matches!(slot.meta, Loadable::Loaded(BlobMeta::Managed { .. }));
-                let save: Option<AnyElement> = match &slot.save {
-                    Some(SaveState::Saving { done, of }) => Some(
-                        studio_ui::ds::text::meta(format!(
-                            "Saving {}%",
-                            (*done * 100).checked_div(*of).unwrap_or(100)
-                        ))
-                        .into_any_element(),
-                    ),
-                    Some(SaveState::Saved(path)) => {
-                        let path = path.clone();
-                        Some(
-                            studio_ui::ds::button(("show-saved", index), "Show in Finder")
-                                .style(ButtonStyle::Subtle)
-                                .color(Color::Muted)
-                                .tip(studio_ui::ds::tooltip(format!(
-                                    "Saved to {}",
-                                    path.display()
-                                )))
-                                .on_click(move |_, _, cx| cx.reveal_path(&path))
-                                .into_any_element(),
-                        )
-                    }
-                    Some(SaveState::Failed(error)) => {
-                        Some(studio_ui::ds::text::error_note(error.clone()).into_any_element())
-                    }
-                    None if managed => Some(
-                        h_flex()
-                            .gap(px(space::XXS))
-                            .child({
-                                let open = self.open_blob_action(&slot.property);
-                                studio_ui::ds::button(("open-blob", index), "Open")
-                                    .style(ButtonStyle::Subtle)
-                                    .color(Color::Muted)
-                                    .tip(studio_ui::ds::tooltip("Show the whole value in a tab"))
-                                    .on_click(move |_, window, cx| {
-                                        window.dispatch_action(Box::new(open.clone()), cx)
-                                    })
-                            })
-                            .child({
-                                let refused = self.save_refusal(index);
-                                studio_ui::ds::button(("save-blob", index), "Save…")
-                                    .style(ButtonStyle::Subtle)
-                                    .color(Color::Muted)
-                                    .disabled(refused.is_some())
-                                    .tip(studio_ui::ds::tooltip(
-                                        refused.unwrap_or("Save the whole value to a file"),
-                                    ))
-                                    .on_click(
-                                        cx.listener(move |this, _, _, cx| {
-                                            this.save_blob(index, cx)
-                                        }),
-                                    )
-                            })
-                            .into_any_element(),
-                    ),
-                    None => None,
-                };
+                let save = self.blob_save(index, slot, cx);
                 let slot_view = v_flex()
                     .id(("peek-blob", index))
                     .gap(px(space::XS))
@@ -4138,8 +4170,13 @@ impl NodePeek {
     /// Copies a property's value as it is when clicked.
     fn copy(&mut self, name: String, cx: &mut Context<Self>) {
         let text = studio_ui::value_text(&self.value_of(&name));
+        self.copy_text(name, text, cx);
+    }
+
+    /// Copies `text`, marking `mark` (a property's name) "Copied" for a moment.
+    fn copy_text(&mut self, mark: String, text: String, cx: &mut Context<Self>) {
         cx.write_to_clipboard(ClipboardItem::new_string(text));
-        self.copied = Some(name);
+        self.copied = Some(mark);
         cx.notify();
         self._copied = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
@@ -4239,13 +4276,14 @@ impl NodePeek {
             .as_deref()
             .map(|schema| listed_properties(schema, &self.subject))
             .unwrap_or_default();
-        let (rows, texts): (Vec<_>, Vec<_>) =
-            properties
-                .into_iter()
-                .enumerate()
-                .partition(|(_, property)| {
-                    !self.reads_long(property, values.get(&property.name).unwrap_or(&NULL))
-                });
+        let (rows, texts): (Vec<_>, Vec<_>) = properties
+            .into_iter()
+            .enumerate()
+            // A page leaves out what its title and meta line show (spec 014).
+            .filter(|(_, property)| !self.page_hides(&property.name, cx))
+            .partition(|(_, property)| {
+                !self.reads_long(property, values.get(&property.name).unwrap_or(&NULL))
+            });
         // Pulled out by the rows' hover inset, as a relationship group's rows are.
         v_flex()
             .mx(px(-space::XS))
@@ -4361,22 +4399,25 @@ impl NodePeek {
             Some(edit) => self.render_field_edit(edit, window, cx),
             None if let Some(draft) = &state.draft => {
                 let text = draft.text.as_str();
+                let shown = if text.trim().is_empty() {
+                    "—".to_owned()
+                } else {
+                    studio_ui::text::first_line(text)
+                };
                 h_flex()
                     .gap(px(space::SM))
                     .min_w_0()
-                    .child(studio_ui::ds::value_text(
-                        if text.trim().is_empty() {
-                            "—".to_owned()
-                        } else {
-                            studio_ui::text::first_line(text)
-                        },
-                        cx,
-                    ))
+                    .child(if self.page {
+                        page::plain_value(shown).into_any_element()
+                    } else {
+                        studio_ui::ds::value_text(shown, cx).into_any_element()
+                    })
                     .child(studio_ui::ds::dot(Color::Accent))
                     .into_any_element()
             }
             None => match state.picker.take() {
                 Some(picker) => picker,
+                None if self.page => page::render_value(Some(property), value),
                 None => self.render_value(Some(property), value, cx),
             },
         };
@@ -4395,7 +4436,15 @@ impl NodePeek {
                     / 2.))
             })
             .child(body);
-        let row = studio_ui::ds::property_row(property_icon(property), title, self.label_width())
+        // A page's rows read as a document's: a name and plain text, the kind in the tooltip.
+        let row = if self.page {
+            studio_ui::ds::document_row(title, self.label_width())
+        } else {
+            studio_ui::ds::property_row(property_icon(property), title, self.label_width())
+        };
+        let row_selector = format!("peek-row-{name}");
+        let row = row
+            .debug_selector(move || row_selector.clone())
             .id(("peek-property", index))
             .group(group.clone())
             .px(px(space::XS))
@@ -4458,7 +4507,9 @@ impl NodePeek {
             .h(px(studio_ui::ds::size::PROPERTY_ROW))
             .gap(px(space::SM))
             .items_center()
-            .child(studio_ui::ds::icon::meta(property_icon(property)))
+            .when(!self.page, |head| {
+                head.child(studio_ui::ds::icon::meta(property_icon(property)))
+            })
             .child(
                 studio_ui::ds::fold(("peek-fold", index), name.to_owned(), open)
                     .tip(studio_ui::ds::tooltip(if open { "Fold" } else { "Unfold" }))
@@ -4608,10 +4659,11 @@ impl NodePeek {
         }
     }
 
-    /// The label column of a property row: a page's is wider, at a document's width.
+    /// The label column of a property row: a page's has no kind icon in it, so its names sit
+    /// as close to their values as the inspector's.
     fn label_width(&self) -> f32 {
         if self.page {
-            studio_ui::ds::size::FIELD_LABEL_WIDE
+            studio_ui::ds::size::DOCUMENT_LABEL
         } else {
             studio_ui::ds::size::FIELD_LABEL
         }
@@ -4764,7 +4816,12 @@ impl NodePeek {
             .map(|values| format!("One of: {}", values.join(", ")));
         // The frame reaches past the values' edge by its padding, its border and the editor's
         // own inset, so the text stays where it read before the edit.
-        let reach = px(space::MD + 1.) + editor_inset(window, cx);
+        // A page's value is plain text on the value column's edge, with no pill around it.
+        let reach = if self.page {
+            px(space::CONTROL_INSET) + editor_inset(window, cx)
+        } else {
+            px(space::MD + 1.) + editor_inset(window, cx)
+        };
         v_flex()
             .key_context("NodeField")
             .w_full()
@@ -4933,7 +4990,12 @@ impl NodePeek {
         let add = self
             .edits_relationships()
             .then(|| self.render_add_button(index, header_group.clone(), cx));
-        let header = studio_ui::ds::fold_row(("peek-group", index), title, group.expanded, cx)
+        let header = if self.page {
+            self.page_group_header(index, cx)
+        } else {
+            studio_ui::ds::fold_row(("peek-group", index), title, group.expanded, cx)
+        };
+        let header = header
             .group(header_group)
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_group(index, cx)))
             .when_some(failed, |d, error| d.tip(studio_ui::ds::tooltip(error)))
@@ -4941,7 +5003,9 @@ impl NodePeek {
                 header.child(studio_ui::ds::dot(Color::Warning))
             })
             .children(add)
-            .child(studio_ui::ds::text::meta(count));
+            .when(!self.page, |header| {
+                header.child(studio_ui::ds::text::meta(count))
+            });
         let adding = self
             .adding
             .as_ref()
@@ -4997,10 +5061,12 @@ impl NodePeek {
             format!("Add a {}", group.other_type)
         };
         let edge = group.edge.clone();
-        // In the group's header, quiet; in the peek, shown under the pointer.
+        // Shown under the pointer, and while its search is open.
         studio_ui::ds::row_icon_button(("peek-add", index), IconName::Plus)
             .icon_color(Color::Muted)
-            .when(!self.page, |button| button.visible_on_hover(header))
+            .when(!self.add_shows_at_rest(index), |button| {
+                button.visible_on_hover(header)
+            })
             .disabled(refused.is_some())
             .tip(studio_ui::ds::tooltip(tooltip))
             .on_click(cx.listener(move |this, _, window, cx| {
@@ -5569,6 +5635,11 @@ impl NodePeek {
                 Place::Folded => folded.push(index),
             }
         }
+        if self.page {
+            // A page lists both directions of one relationship together.
+            self.pair_directions(&mut listed);
+            self.pair_directions(&mut as_drawn);
+        }
         items.extend(listed);
         items.extend(as_drawn);
         if !folded.is_empty() {
@@ -5633,6 +5704,10 @@ impl NodePeek {
                 view.on_action(cx.listener(Self::save_drafts))
                     .on_action(cx.listener(Self::on_save_field))
             })
+            // F2 edits the name a page's title shows, as a click on the title does.
+            .when(self.page && self.title_edit(cx).is_some(), |view| {
+                view.on_action(cx.listener(Self::on_edit_name))
+            })
             .on_action(cx.listener(Self::on_cancel_field))
             .on_action(cx.listener(Self::on_expand_field))
             // A node read at its branch's head reads again on ⌘R, as its Refresh button does;
@@ -5671,13 +5746,20 @@ impl NodePeek {
             None => ix..ix + 1,
         });
         let item = match self.list_items.get(ix).copied() {
+            Some(Item::Head) if page => {
+                // A page groups its values and its relationships by space alone.
+                let relationships = self.shows_relationships();
+                self.render_page_head(window, cx)
+                    .pt(px(space::XXL))
+                    .gap(px(space::MD))
+                    .when(relationships, |head| {
+                        head.child(div().pt(px(space::LG)).child(section("Relationships")))
+                    })
+                    .into_any_element()
+            }
             Some(Item::Head) => {
                 let head = self.render_head(window, cx);
-                let head = if page {
-                    head.pt(px(space::XL)).gap(px(space::MD))
-                } else {
-                    head.pt(px(space::XL)).gap(px(space::SM))
-                };
+                let head = head.pt(px(space::XL)).gap(px(space::SM));
                 // A hairline between the node's own values and its relationships, as the
                 // reference card rules its details from its participants.
                 head.when(self.shows_relationships(), |head| {
@@ -5694,24 +5776,36 @@ impl NodePeek {
             Some(Item::Empty) => self.render_empty_row(cx),
             _ => div().into_any_element(),
         };
-        // A page reads at a document's width, with its margins; the peek fills its dock.
+        let item = match self.list_items.get(ix) {
+            // A group's rows carry an `XS` inset for their hover fill; pulled out by it,
+            // their text sits on the section labels' edge.
+            Some(Item::Group(_) | Item::Empty) => div().mx(px(-space::XS)).child(item),
+            _ => div().child(item),
+        };
+        if page {
+            // A page reads as a document: one column at a reading width, centred in its pane,
+            // so it has the same margin either side however wide the pane is.
+            return h_flex()
+                .w_full()
+                .justify_center()
+                .px(px(space::PAGE))
+                .child(
+                    div()
+                        .w_full()
+                        .max_w(px(PAGE_WIDTH))
+                        .pt(px(space::XXS))
+                        .when(last, |column| column.pb(px(space::XXXL)))
+                        .child(item),
+                )
+                .into_any_element();
+        }
+        // The peek fills its dock.
         div()
             .w_full()
-            .map(|item| {
-                if page {
-                    item.max_w(px(PAGE_WIDTH)).px(px(space::PAGE))
-                } else {
-                    item.px(px(space::XL))
-                }
-            })
+            .px(px(space::XL))
             .pt(px(space::XXS))
             .when(last, |item| item.pb(px(space::XL)))
-            .child(match self.list_items.get(ix) {
-                // A group's rows carry an `XS` inset for their hover fill; pulled out by it,
-                // their text sits on the section labels' edge.
-                Some(Item::Group(_) | Item::Empty) => div().mx(px(-space::XS)).child(item),
-                _ => div().child(item),
-            })
+            .child(item)
             .into_any_element()
     }
 
@@ -5784,6 +5878,23 @@ impl NodePeek {
                                         window.dispatch_action(Box::new(canvas.clone()), cx)
                                     }),
                             )
+                            // Its history, at the branch head: the inspector reads none itself
+                            // (spec 046).
+                            .children(is_node.then(|| {
+                                let history = ShowNodeHistory {
+                                    type_name: type_name.clone(),
+                                    id: id.clone(),
+                                    preview: true,
+                                };
+                                studio_ui::ds::button("peek-open-history", "History")
+                                    .style(ButtonStyle::Subtle)
+                                    .tip(studio_ui::ds::tooltip(
+                                        "Who changed this node, and when",
+                                    ))
+                                    .on_click(move |_, window, cx| {
+                                        window.dispatch_action(Box::new(history.clone()), cx)
+                                    })
+                            }))
                     })),
             )
             .child({
@@ -6090,37 +6201,41 @@ mod tests {
     /// no line under the text, and a folded text shows its draft's dot there (spec 014).
     #[gpui::test]
     async fn a_long_texts_controls_and_folded_draft_sit_in_its_head(cx: &mut TestAppContext) {
-        let session = session(PEOPLE, cx);
+        // Not the name, which a page shows as its title rather than as a row.
+        let session = session(
+            "node Person {\n  slug: String @key\n  name: String\n  bio: String?\n}\n",
+            cx,
+        );
         let (view, cx) = page(session.clone(), cx);
         let long = "Wrote the first published algorithm meant for a machine, and notes on it";
         view.update(cx, |view, cx| {
             if let Loadable::Loaded(values) = &mut view.values {
-                values.insert("name".into(), json!(long));
+                values.insert("bio".into(), json!(long));
             }
             cx.notify();
         });
         cx.run_until_parked();
         let head = cx
-            .debug_bounds("peek-head-name")
+            .debug_bounds("peek-head-bio")
             .expect("a long text's head");
         let open = cx
-            .debug_bounds("peek-open-editor-name")
+            .debug_bounds("peek-open-editor-bio")
             .expect("Open in the editor");
         assert!(
             open.top() >= head.top() && open.bottom() <= head.bottom(),
             "Open in the editor in the head, not under the text: {open:?} in {head:?}"
         );
-        assert!(cx.debug_bounds("peek-folded-draft-name").is_none());
+        assert!(cx.debug_bounds("peek-folded-draft-bio").is_none());
 
         view.update(cx, |view, cx| {
-            view.folded.insert("name".into());
+            view.folded.insert("bio".into());
             cx.notify();
         });
         session.update(cx, |session, cx| {
             let key = DraftKey {
                 type_name: "Person".into(),
                 id: "p1".into(),
-                property: "name".into(),
+                property: "bio".into(),
             };
             let draft = DraftEntry {
                 old: json!(long),
@@ -6130,7 +6245,7 @@ mod tests {
         });
         cx.run_until_parked();
         assert!(
-            cx.debug_bounds("peek-folded-draft-name").is_some(),
+            cx.debug_bounds("peek-folded-draft-bio").is_some(),
             "a folded text's draft shows its dot"
         );
     }
@@ -6679,9 +6794,23 @@ mod tests {
         let cx = VisualTestContext::from_window(window.into(), cx).into_mut();
         cx.run_until_parked();
 
+        // The groups in the page's order, which lists both directions of a relationship
+        // together.
+        let listed = |view: &NodePeek| -> Vec<usize> {
+            view.list_items
+                .iter()
+                .filter_map(|item| match item {
+                    Item::Group(index) => Some(*index),
+                    _ => None,
+                })
+                .collect()
+        };
         let drawn = |cx: &mut VisualTestContext| {
             view.read_with(cx, |view, _| {
-                view.groups.iter().take_while(|group| group.drawn).count()
+                listed(view)
+                    .into_iter()
+                    .take_while(|&index| view.groups[index].drawn)
+                    .count()
             })
         };
         let groups = view.read_with(cx, |view, _| view.groups.len());
@@ -6692,8 +6821,9 @@ mod tests {
             "only the rows in view and a few past them: {first} of {groups}"
         );
         view.read_with(cx, |view, _| {
-            for (index, group) in view.groups.iter().enumerate() {
-                assert_eq!(group.drawn, index < first, "the rows from the top");
+            for (at, index) in listed(view).into_iter().enumerate() {
+                let group = &view.groups[index];
+                assert_eq!(group.drawn, at < first, "the rows from the top");
                 let counted = matches!(group.count, Loadable::Loaded(0));
                 assert_eq!(counted, group.drawn, "read once drawn, and only then");
                 assert_eq!(view.place(index), Place::AsDrawn, "each keeps its row");

@@ -25,6 +25,7 @@ change_cards = { workspace = true }
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
 http_client = { workspace = true }
+futures = { workspace = true }
 studio_theme = { workspace = true, features = ["test-support"] }
 
 [lints]

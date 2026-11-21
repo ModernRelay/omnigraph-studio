@@ -624,6 +624,18 @@ pub mod graph {
         pub preview: bool,
     }
 
+    /// Show a node's history: who changed it, when and how, newest first, and who set each
+    /// value it holds (spec 046).
+    #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = studio_graph)]
+    pub struct ShowNodeHistory {
+        pub type_name: String,
+        pub id: String,
+        /// Open as the pane's preview tab, which the next preview replaces.
+        #[serde(default)]
+        pub preview: bool,
+    }
+
     /// Walk a node's relationships on a canvas of its own.
     #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
     #[action(namespace = studio_graph)]
@@ -835,6 +847,8 @@ pub mod node {
             SaveText,
             /// Save every unsaved change of the node shown as one commit.
             SaveNodeDrafts,
+            /// Edit the name of the node whose page is shown, which its title shows.
+            EditNodeName,
         ]
     );
 }
@@ -974,6 +988,12 @@ pub mod history {
             NewBranchHere,
             /// Read the commit's next changes, or try again a read of them that failed.
             LoadMoreChanges,
+            /// Read a node's history further back: the 200 commits before those read, or try
+            /// again a read of them that failed (spec 046).
+            ReadOlderCommits,
+            /// Search the commits before a node's history read for when the node was created
+            /// and each value no commit read changed was set (spec 046).
+            FindWhenSet,
         ]
     );
 }

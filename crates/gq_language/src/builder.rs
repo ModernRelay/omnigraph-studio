@@ -2019,6 +2019,54 @@ pub fn node_by_id(
     Ok(one_by_id(node(schema, type_name)?, id, "studio_node", "$n"))
 }
 
+/// One node by `@id` as its history reads it at each commit (spec 046): at most one row, the
+/// node's object (`n`) with its non-Blob properties. Named apart from the page's read, so the
+/// ledger tells the two apart.
+pub fn history_node(
+    schema: &SchemaModel,
+    type_name: &str,
+    id: &str,
+) -> Result<BuiltQuery, BuildError> {
+    Ok(one_by_id(
+        node(schema, type_name)?,
+        id,
+        "node_history_node",
+        "$n",
+    ))
+}
+
+/// The edges of node `id` through one relationship group as its history reads them at each
+/// commit (spec 046): each edge's id (`edge`) and its other end's (`id`), by edge id, at most
+/// `limit` rows. Edges are never updated (T16), so their ids say all a commit did to them.
+pub fn history_edges(
+    schema: &SchemaModel,
+    type_name: &str,
+    group: &RelationshipGroup,
+    id: &str,
+    limit: u32,
+) -> Result<BuiltQuery, BuildError> {
+    let node = node(schema, type_name)?;
+    if schema.edge(&group.edge).is_none() {
+        return Err(BuildError::UnknownEdge(group.edge.clone()));
+    }
+    let mut params = Params::new();
+    let id_param = params.add("id", "String", Value::String(id.to_owned()));
+    let text = format!(
+        "query node_history_edges({sig}) {{\n  match {{\n    $n: {ty}\n    $n.@id = {id_param}\n    {traversal}\n  }}\n  return {{ $e.@id as edge, $m.@id as id }}\n  order {{ $e.@id asc }}\n  limit {limit}\n}}\n",
+        sig = params.signature(),
+        ty = node.name,
+        traversal = traversal_clause(group, Some("e")),
+    );
+    Ok(BuiltQuery {
+        name: "node_history_edges".into(),
+        text,
+        params: params.values,
+        depends: Depends::Unknown,
+        seeds: None,
+        empty_without: None,
+    })
+}
+
 /// Query `name`: the node of `node`'s type whose `@id` is `id`, at most one row, returning
 /// `returns`.
 fn one_by_id(node: &NodeType, id: &str, name: &str, returns: &str) -> BuiltQuery {
@@ -5240,6 +5288,21 @@ mod tests {
         assert!(query.text.contains("$n.name as v_name"), "{}", query.text);
         assert!(query.text.contains("limit 2"), "{}", query.text);
         assert!(nodes_fields_by_id(&schema, "Person", &ids, &["nope".to_owned()]).is_err());
+    }
+
+    /// A node's history reads the node, and each relationship group's edges with their ids,
+    /// at either end (spec 046).
+    #[test]
+    fn a_nodes_history_reads_compile() {
+        let schema = dev();
+        let query = history_node(&schema, "Person", "person-000000").unwrap();
+        assert_compiles(&query);
+        assert_eq!(query.name, "node_history_node");
+        for group in schema.relationships_of("Person") {
+            let query = history_edges(&schema, "Person", group, "person-000000", 1000).unwrap();
+            assert_compiles(&query);
+            assert!(query.text.contains("$e.@id as edge"), "{}", query.text);
+        }
     }
 
     /// A gallery of listed rows reads them whole, by id, in id order (spec 035).
