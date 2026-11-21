@@ -160,7 +160,10 @@ draws what differs).
   (`studio_node::EditNodeName`, bound in `NodeView`, so the palette lists it on a page whose name
   can be edited), opens the name's row with its field, as a row's click does; the row stays while
   it is edited, saving, held as a draft or absent at the commit shown, and goes when the field
-  closes. An enum or a boolean naming a node keeps its control in its row.
+  closes. An enum naming a node keeps its row, with its menu, since the title edits text only
+  (review of #161). A title that does not edit the name (an enum's, one the credential may not
+  change, or an id) copies what it shows on a click; the key stays in the meta line, copied on
+  a click, unless the title shows it and copies it itself.
 - **Properties as plain text.** A label and value grid: the name, muted, in a 112 px column
   (`ds::size::DOCUMENT_LABEL`, the inspector's `FIELD_LABEL`) with no kind glyph
   (`ds::document_row`), the value as body text beside it, a list's items with commas, none a
@@ -186,10 +189,12 @@ draws what differs).
   a person. `studio_theme::type_tint` now keeps one graph's node types apart: each type takes the
   tint its name hashes to unless a type before it in name order took it, then the next free one;
   past eight types the rest keep their hashed tint. It depends only on the graph's set of types,
-  not the schema's order, so a type keeps its tint until a type is added that takes it. The
-  session notes the types when it takes a schema (`assign_type_tints`); in the development graph
-  Company keeps brick and Person turns teal. Two graphs open at once with a type of the same name
-  share the tint the last schema read gave it.
+  not the schema's order. The session notes the types when it takes a schema
+  (`assign_type_tints`); in the development graph Company keeps brick and Person turns teal. A
+  type named by a graph read before keeps that graph's tint, and a new type takes one that no
+  type of the graphs read holds, else one its own graph leaves free (`tints_beside`): a graph read
+  later never moves an earlier graph's types onto one tint (review of #161, where the last schema
+  read gave a shared name its tint).
 - **Not done.** The "+" and a property have no key of their own (a group cannot hold the focus
   yet), as before; the page's `+` shows on hover rather than on a keyboard focus it cannot take.
 
@@ -370,6 +375,7 @@ draws what differs).
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-11-20 | Review of #161: an enum name, copying, and tints across graphs | `type_table` `an_enum_name_keeps_its_row_and_the_title_copies_it`, `an_unnamed_nodes_key_stays_copyable`; `studio_theme` `a_second_graph_keeps_the_first_graphs_types_apart`, `a_second_graphs_schema_leaves_the_first_graphs_tints`; each fails with its fix taken out | Pass. An enum name's row and menu stay and the title copies it; an unnamed node's key is in the meta line and copies; a second graph without Company leaves Person teal |
 | 2026-11-20 | The page reads as a document, and one graph's types take different tints | `type_table` `peek::page::tests`: `a_page_lists_nothing_its_title_and_meta_show` (name and slug rows absent on a page, present in the peek), `the_title_edits_the_name_on_a_click_or_f2` (a click on the title and F2 open the name's row; Esc closes it), `both_directions_of_a_relationship_sit_together` (Knows → and ← adjacent, the second without the type's name, where before every outgoing group came first), `a_groups_add_shows_only_under_the_pointer_or_while_adding`, `a_page_being_read_shows_bars_not_its_id`, `a_blob_is_a_card_whose_bytes_show_on_asking`, `a_card_shows_a_texts_first_lines_and_a_line_of_bytes`; `studio_theme` `one_graphs_types_get_different_tints`. Two older tests changed for the new look only: `a_long_texts_controls_and_folded_draft_sit_in_its_head` uses a `bio` property, since the name is now the title rather than a row, and `only_the_groups_drawn_are_read_and_scrolling_reads_the_rest_once` counts drawn groups in the list's order, which pairs directions. Offscreen snapshots against `script/dev-server` of person-000000, project-00000 and the note lance-versions, light and dark, and of person-000000 before its read lands | person-000000: "Radia Knuth" over "Person · person-000000", then title, email, born and tags as plain text in a 112 px column, then "Contributes → Project 1", "Knows → Person 4" over "← Person 1", "WorksAt → Company 1"; the column centred in its pane. lance-versions: an "attachment" card reading "Bytes 1.0 KB" with "00 01 02 03 04 05 06 07 …", no dump. Reading: bars for the title and three rows under "Person". Company brick, Person teal. No draw-count guard added: the page draws fewer elements than before (no pill boxes or kind icons), the same list and cached parts |
 | 2026-11-18 | ⌘R reads a node's page again at the head, as its Refresh button does | `type_table` `peek::tests::cmd_r_reads_a_nodes_page_again` (another writer's commit changing the node; ⌘R with the page focused reads it at c2; fails with the handler taken out) | Bound only for a node read at its branch's head: a page held at a commit never moves, and an edge is read with its table. "Newer data · Refresh" names the key. Before, ⌘R read only the session and the page kept its old values |
 | 2026-11-11 | A small group counted while the list scrolls stays closed | `type_table` `a_group_counted_while_scrolling_stays_closed` (30 relationships with one neighbour each: those counted before any scroll open; those counted over four scrolls stay closed; once still for `SCROLL_SETTLE`, the next one opens), failing with the rule undone (all 16 open); a person of the personal graph scrolled offscreen with its 60 groups landing (`snapshot` `measure:700,live`), 3.2 ms a frame median, 5.4 ms at most | Fixed. Ragnor saw the inspector stutter while its relationships loaded: no frame was slow, but each small group counted in view opened and pushed every row under it down while the list moved |
