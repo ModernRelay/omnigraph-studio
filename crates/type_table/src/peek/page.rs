@@ -301,16 +301,29 @@ impl NodePeek {
         let title = studio_ui::ds::text::page_title(title);
         let Some(property) = self.title_edit(cx) else {
             // A name that cannot be edited here, or an id, copies on a click: its row is not
-            // listed, so the title is where it is copied from.
-            return div()
-                .id("page-title")
-                .debug_selector(|| "page-title".into())
-                .cursor_pointer()
-                .tip(studio_ui::ds::tooltip("Click to copy"))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.copy_text(TITLE_COPIED.to_owned(), text.clone(), cx)
-                }))
-                .child(title)
+            // listed, so the title is where it is copied from, and says so beside itself.
+            let copied = self.copied.as_deref() == Some(TITLE_COPIED);
+            return h_flex()
+                .items_center()
+                .gap(px(space::SM))
+                .child(
+                    div()
+                        .id("page-title")
+                        .debug_selector(|| "page-title".into())
+                        .cursor_pointer()
+                        .tip(studio_ui::ds::tooltip("Click to copy"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.copy_text(TITLE_COPIED.to_owned(), text.clone(), cx)
+                        }))
+                        .child(title),
+                )
+                .when(copied, |row| {
+                    row.child(
+                        div()
+                            .debug_selector(|| "title-copied".into())
+                            .child(studio_ui::ds::text::meta("Copied").color(Color::Success)),
+                    )
+                })
                 .into_any_element();
         };
         let hover = studio_ui::ds::surface::hover(cx);
@@ -344,8 +357,7 @@ impl NodePeek {
         let id = self.subject.id().to_owned();
         let is_node = matches!(self.subject, PeekSubject::Node { .. });
         let separator = || studio_ui::ds::text::muted("·");
-        let key_copied = self.copied.as_deref() == Some(KEY_COPIED)
-            || self.copied.as_deref() == Some(TITLE_COPIED);
+        let key_copied = self.copied.as_deref() == Some(KEY_COPIED);
         let commit = self
             .snapshot
             .clone()
@@ -380,7 +392,11 @@ impl NodePeek {
                 )
             })
             .when(key_copied, |meta| {
-                meta.child(studio_ui::ds::text::meta("Copied").color(Color::Success))
+                meta.child(
+                    div()
+                        .debug_selector(|| "key-copied".into())
+                        .child(studio_ui::ds::text::meta("Copied").color(Color::Success)),
+                )
             })
             .children(commit.map(|commit| {
                 let short = studio_ui::short_commit_id(&commit);
@@ -671,7 +687,18 @@ mod tests {
             cx.read_from_clipboard().and_then(|item| item.text()),
             Some("Ada".to_owned())
         );
-        assert!(cx.debug_bounds("page-key").is_some(), "the key copies too");
+        assert!(
+            cx.debug_bounds("title-copied").is_some(),
+            "the title says it was copied"
+        );
+        assert!(
+            cx.debug_bounds("key-copied").is_none(),
+            "the key was not copied"
+        );
+        let key = cx.debug_bounds("page-key").expect("the key copies too");
+        cx.simulate_click(key.center(), gpui::Modifiers::none());
+        assert!(cx.debug_bounds("key-copied").is_some());
+        assert!(cx.debug_bounds("title-copied").is_none());
     }
 
     /// A node with no name is titled by its id, which the title cannot edit as a name: the key
