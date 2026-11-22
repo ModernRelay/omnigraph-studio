@@ -156,14 +156,15 @@ pub(crate) fn cluster_row(cluster: &ClusterView, managed: &[ManagedTarget]) -> C
 }
 
 /// The CLI command that creates a cluster in the organization `profile` names, for an
-/// organization with none (constitution VI): Studio creates none itself (spec 022). Without a
-/// profile, the CLI's default one. `<NAME>` is the person's to fill.
+/// organization with none (constitution VI): Studio creates none itself (spec 022). The CLI picks
+/// the organization by its profile, so with no profile in this one the command names a
+/// `<PROFILE>` to fill rather than leaving it to the default profile, which may be another
+/// organization's. `<NAME>` is the person's to fill too.
 pub(crate) fn create_command(profile: Option<&str>) -> String {
-    let command = "omnigraph cluster create <NAME>".to_owned();
-    match profile {
-        Some(profile) => format!("{command} --profile {profile}"),
-        None => command,
-    }
+    format!(
+        "omnigraph cluster create <NAME> --profile {}",
+        profile.unwrap_or("<PROFILE>")
+    )
 }
 
 /// What a sign-in that could not start says, with the control plane called by its name: the
@@ -181,7 +182,7 @@ pub(crate) fn plane_words(why: &str, cloud: bool) -> String {
 
 /// What "No clusters" says: how a cluster is made, beside the command that makes it.
 pub(crate) const NO_CLUSTERS: &str = "Nothing to open yet. A member whose role allows it creates \
-     a cluster with the Omnigraph CLI, then Refresh.";
+     a cluster with the Omnigraph CLI, through a profile in this organization, then Refresh.";
 
 /// What a sign-in in no organization says: on Omnigraph Cloud, that it is in private preview
 /// and how to be invited (spec 047); on another control plane, to ask an owner.

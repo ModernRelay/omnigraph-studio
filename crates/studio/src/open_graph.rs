@@ -800,11 +800,12 @@ impl OpenGraphModal {
         }
         match choice {
             Choice::Cloud => {
+                // Omnigraph Cloud's plane only, as the row's line reads it: a plane a CLI profile
+                // names is not Cloud, and stays in the sidebar under its own name.
                 let plane = self
                     .planes
                     .iter()
                     .find(|plane| plane.read(cx).is_default())
-                    .or_else(|| self.planes.first())
                     .map(|plane| plane.entity_id());
                 match plane {
                     Some(id) => self.move_to(Place::Plane(id), window, cx),
@@ -3703,7 +3704,7 @@ mod tests {
         assert!(cx.debug_bounds("waitlist-no-organizations").is_none());
         assert_eq!(
             organizations::create_command(None),
-            "omnigraph cluster create <NAME>"
+            "omnigraph cluster create <NAME> --profile <PROFILE>"
         );
 
         // Get started, with that sign-in held, offers no waitlist either.
@@ -3738,6 +3739,15 @@ mod tests {
     #[gpui::test]
     fn cloud_off_links_to_its_setting_and_offers_no_waitlist(cx: &mut TestAppContext) {
         let (modal, cx) = dialog(Vec::new(), cx);
+        // A plane a CLI profile names stays, and is not taken for Omnigraph Cloud.
+        let elsewhere = cx.new(|cx| {
+            let mut plane = ControlPlane::new("https://control.test".into(), None, cx);
+            plane.profiles = vec![("work".into(), Some("org_1".into()))];
+            plane
+        });
+        modal.update(cx, |modal, cx| {
+            modal.follow_planes(vec![elsewhere.clone()], Vec::new(), cx)
+        });
         cx.run_until_parked();
         assert!(cx.debug_bounds("waitlist-get-started").is_none());
         let dismissed = Rc::new(Cell::new(false));
@@ -3751,6 +3761,10 @@ mod tests {
         assert_eq!(
             modal.read_with(cx, |modal, _| (modal.error.clone(), modal.error_at)),
             (Some(CLOUD_OFF.into()), Said::CloudOff)
+        );
+        assert!(
+            modal.read_with(cx, |modal, _| modal.plane_shown.is_none()),
+            "the other plane is not opened in Cloud's place"
         );
         assert!(cx.debug_bounds("cloud-off").is_some());
         let open = cx

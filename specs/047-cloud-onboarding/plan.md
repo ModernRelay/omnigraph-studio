@@ -78,7 +78,7 @@ sign-in, unless that sign-in lists no organization. So:
 | No organizations, Omnigraph Cloud | …Ask an owner of one to invite you, then Refresh. · Refresh · Sign out | You are signed in as ACCOUNT, but no organization has you as a member yet. Omnigraph Cloud is in private preview: an owner of an organization can invite you, or join the waitlist for an invitation. · **Join the waitlist ↗** · Refresh · Sign out |
 | No organizations, another plane | unchanged | unchanged |
 | Settings → Clusters, no organization | You are a member of no organization here. | The No organizations sentence, and Join the waitlist ↗ on Omnigraph Cloud |
-| No clusters (dialog and Settings) | No clusters / No clusters in this organization. | Nothing to open yet. A member whose role allows it creates a cluster with the Omnigraph CLI, then Refresh. · `omnigraph cluster create <NAME> --profile P` with Copy (no `--profile` without a profile naming the organization) |
+| No clusters (dialog and Settings) | No clusters / No clusters in this organization. | Nothing to open yet. A member whose role allows it creates a cluster with the Omnigraph CLI, through a profile in this organization, then Refresh. · `omnigraph cluster create <NAME> --profile P` with Copy, P the CLI profile naming the organization, or `<PROFILE>` to fill when none does: the CLI picks the organization by profile, and its default profile may be another organization's |
 | Sign-in unavailable (dialog and Settings) | The server's sign-in details could not be read: … | Omnigraph Cloud's sign-in details could not be read: … ("the control plane" for another plane); Settings gains **Try again**, as the dialog has |
 | Cloud off, on choosing the row | Omnigraph Cloud's address is not set. Set it in Settings → Omnigraph Cloud. (as an error) | Omnigraph Cloud is off: its address is empty. · Open Omnigraph Cloud settings (closes the dialog, opens Settings at that section), muted rather than an error |
 
@@ -123,4 +123,8 @@ No engine change.
 
 ## Corrections
 
-None yet.
+- 2026-11-21, review: No clusters left `--profile` off when no CLI profile names the
+  organization, so the copied command ran in the CLI's default profile, which may be another
+  organization's. It now names `<PROFILE>` to fill. And choosing Get started's Cloud row with
+  Cloud off opened the first plane a CLI profile names, though the row said Cloud was off; it now
+  shows the link to the setting, as the row says.
