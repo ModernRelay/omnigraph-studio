@@ -186,10 +186,11 @@ pub(crate) const NO_CLUSTERS: &str = "This organization has no clusters. A membe
      allows it creates one with the Omnigraph CLI, through a profile in this organization. Then \
      Refresh.";
 
-/// What a sign-in in no organization says: on Omnigraph Cloud, that it is in private preview
-/// and how invitations are given (spec 047); on another control plane, to ask an owner.
-pub(crate) fn no_organizations(account: &str, cloud: bool) -> String {
-    if cloud {
+/// What a sign-in in no organization says: where the waitlist is offered (`waitlist::offered`,
+/// the same rule as its links), that Omnigraph Cloud is in private preview and how invitations
+/// are given (spec 047); on any other plane or address, to ask an owner.
+pub(crate) fn no_organizations(plane: &ControlPlane, account: &str) -> String {
+    if crate::waitlist::offered(plane) {
         format!(
             "Signed in as {account}. No organization has you as a member yet. Omnigraph Cloud is \
              in private preview. An owner of an organization can invite you, and invitations go \
@@ -207,6 +208,16 @@ pub(crate) fn no_organizations(account: &str, cloud: bool) -> String {
 /// anyone can sign in and get a cluster.
 pub(crate) const CLOUD_SIGN_IN: &str = "Omnigraph Cloud is in private preview. Invitations go out \
      from the waitlist. Once invited, sign in to open your organization's clusters.";
+
+/// What a plane's sign-in pane says before a sign-in, with no reason to give: [`CLOUD_SIGN_IN`]
+/// where the waitlist is offered, by the same rule as its link; otherwise what one sign-in does.
+pub(crate) fn signed_out_words(plane: &ControlPlane) -> &'static str {
+    if crate::waitlist::offered(plane) {
+        CLOUD_SIGN_IN
+    } else {
+        "One sign-in lists every organization you are a member of, with its clusters."
+    }
+}
 
 /// The CLI's targets on the control plane's profiles that name a cluster its list does not
 /// have: "Not in org_… on the control plane".
@@ -462,7 +473,7 @@ fn sign_in_pane(plane: &Entity<ControlPlane>, cx: &mut Context<OpenGraphModal>) 
         (SignIn::SignedIn { account, .. }, Some(Organizations::Listed(_))) => {
             let refresh = p.clone();
             (
-                no_organizations(account, cloud),
+                no_organizations(plane.read(cx), account),
                 Some(
                     h_flex()
                         .gap(px(space::SM))
@@ -510,14 +521,9 @@ fn sign_in_pane(plane: &Entity<ControlPlane>, cx: &mut Context<OpenGraphModal>) 
             ),
         ),
         (SignIn::Offered { why, .. }, _) => (
-            why.clone().map(|why| why.to_string()).unwrap_or_else(|| {
-                if cloud {
-                    CLOUD_SIGN_IN.to_owned()
-                } else {
-                    "One sign-in lists every organization you are a member of, with its clusters."
-                        .to_owned()
-                }
-            }),
+            why.clone()
+                .map(|why| why.to_string())
+                .unwrap_or_else(|| signed_out_words(plane.read(cx)).to_owned()),
             Some(
                 h_flex()
                     .gap(px(space::SM))

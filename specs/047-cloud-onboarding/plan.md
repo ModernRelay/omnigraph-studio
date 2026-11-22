@@ -177,3 +177,7 @@ No engine change.
   became two sentences; No organizations dropped "but" and "join the waitlist for an invitation";
   "Nothing to open yet." became "This organization has no clusters.". The rule gained Omnigraph
   Cloud's own address, and six more places were added.
+- 2026-11-21, review: the sign-in pane's and No organizations' words still keyed off
+  `is_default` alone, so at another address they spoke of the waitlist with no link beside them.
+  Both now follow `waitlist::offered` (`signed_out_words`, `no_organizations` take the plane);
+  `open_graph::tests::the_words_follow_the_waitlists_rule`.

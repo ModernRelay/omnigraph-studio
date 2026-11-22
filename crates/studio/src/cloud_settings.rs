@@ -256,7 +256,7 @@ impl CloudPage {
                     h_flex()
                         .gap(px(space::CONTROLS))
                         .child(div().flex_1().min_w_0().child(ds::text::muted(
-                            organizations::no_organizations(account, cloud),
+                            organizations::no_organizations(plane.read(cx), account),
                         )))
                         .when(waitlist, |row| {
                             row.child(

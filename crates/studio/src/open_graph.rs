@@ -3658,10 +3658,54 @@ mod tests {
             Some(crate::waitlist::url(crate::waitlist::Surface::NoOrganizations).as_str())
         );
         assert!(
-            organizations::no_organizations("user_test", true).contains("private preview"),
+            plane
+                .read_with(cx, |plane, _| organizations::no_organizations(
+                    plane,
+                    "user_test"
+                ))
+                .contains("private preview"),
             "it says why"
         );
-        assert!(!organizations::no_organizations("user_test", false).contains("waitlist"));
+    }
+
+    /// The words follow the waitlist's rule as its links do: a plane at another address than
+    /// Omnigraph Cloud's own, though the setting names it, says nothing of the waitlist, signed
+    /// out or in no organization; Omnigraph Cloud's own does.
+    #[gpui::test]
+    fn the_words_follow_the_waitlists_rule(cx: &mut TestAppContext) {
+        let (_modal, cx) = dialog(Vec::new(), cx);
+        let elsewhere = cx.new(|cx| {
+            let mut plane = ControlPlane::new("http://127.0.0.1:8874".into(), None, cx);
+            plane.set_default_for_test(true, cx);
+            plane
+        });
+        let cloud = cloud_plane(cx);
+        let words = |plane: &Entity<ControlPlane>, cx: &mut VisualTestContext| {
+            plane.read_with(cx, |plane, _| {
+                (
+                    organizations::signed_out_words(plane).to_owned(),
+                    organizations::no_organizations(plane, "user_test"),
+                )
+            })
+        };
+        let (signed_out, none) = words(&elsewhere, cx);
+        assert!(!signed_out.contains("waitlist"), "{signed_out}");
+        assert!(!none.contains("waitlist"), "{none}");
+        let (signed_out, none) = words(&cloud, cx);
+        assert_eq!(signed_out, organizations::CLOUD_SIGN_IN);
+        assert!(
+            none.contains("invitations go out from the waitlist"),
+            "{none}"
+        );
+        // In no organization: still offered, so still said.
+        cloud.update(cx, |plane, cx| {
+            plane.signed_in_for_test(Vec::new(), Vec::new(), cx)
+        });
+        assert!(words(&cloud, cx).1.contains("waitlist"));
+        elsewhere.update(cx, |plane, cx| {
+            plane.signed_in_for_test(Vec::new(), Vec::new(), cx)
+        });
+        assert!(!words(&elsewhere, cx).1.contains("waitlist"));
     }
 
     /// An organization with no clusters says how one is made, with the CLI command that makes it
