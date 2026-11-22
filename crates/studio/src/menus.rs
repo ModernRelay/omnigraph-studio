@@ -10,10 +10,10 @@ use studio_actions::query::{Save, SaveAs};
 use studio_actions::update::{CheckForUpdates, RestartToUpdate};
 use studio_actions::workspace::{
     About, ActivateNextPane, ActivatePreviousPane, CloseActiveItem, CloseAllItems, CloseOtherItems,
-    CopyLink, DecreaseFontSize, GoBack, GoForward, GoTo, IncreaseFontSize, NewWindow, OpenGraph,
-    OpenSettings, Quit, Refresh, ResetFontSize, RevealLog, ShowKeyBindings, SplitDown, SplitRight,
-    SwitchBranch, ToggleActivity, ToggleCommandPalette, ToggleFocusMode, ToggleInspector,
-    TogglePinTab, ToggleSidebar,
+    CopyLink, DecreaseFontSize, GoBack, GoForward, GoTo, IncreaseFontSize, JoinCloudWaitlist,
+    NewWindow, OpenGraph, OpenSettings, Quit, Refresh, ResetFontSize, RevealLog, ShowKeyBindings,
+    SplitDown, SplitRight, SwitchBranch, ToggleActivity, ToggleCommandPalette, ToggleFocusMode,
+    ToggleInspector, TogglePinTab, ToggleSidebar,
 };
 
 pub fn set(cx: &mut App) {
@@ -104,6 +104,11 @@ pub fn set(cx: &mut App) {
         Menu::new("Help").items([
             MenuItem::action("Keyboard Shortcuts", ShowKeyBindings),
             MenuItem::action("Reveal Log File", RevealLog),
+            MenuItem::separator(),
+            MenuItem::action(
+                "Join the Omnigraph Cloud Waitlist",
+                JoinCloudWaitlist::default(),
+            ),
         ]),
     ]);
 }

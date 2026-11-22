@@ -62,6 +62,14 @@ struct Waiting {
     _task: Option<Task<()>>,
 }
 
+/// Get started's Omnigraph Cloud row while it offers the waitlist (spec 047): what Cloud is
+/// today, its waitlist link beside it (the row's own ↵ goes to Sign in).
+pub(crate) const CLOUD_PREVIEW_LINE: &str = "In private preview.";
+/// Get started's Omnigraph Cloud row with the `omnigraph_cloud` address empty.
+pub(crate) const CLOUD_OFF_LINE: &str = "Turned off in Settings.";
+/// What choosing that row says, beside the link to the setting.
+pub(crate) const CLOUD_OFF: &str = "Omnigraph Cloud is off: its address is empty.";
+
 /// Where a line the dialog says is shown: beside what it is about (constitution VII).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Said {
@@ -75,6 +83,8 @@ pub(crate) enum Said {
     Add,
     /// Under the add form's buttons, as progress rather than an error.
     Adding,
+    /// Under the pane: Omnigraph Cloud is off, with a link to its setting (spec 047).
+    CloudOff,
 }
 
 pub struct OpenGraphModal {
@@ -692,10 +702,37 @@ impl OpenGraphModal {
     }
 
     /// What is said at `at`, if anything, drawn there.
-    fn said_at(&self, at: Said) -> Option<AnyElement> {
+    fn said_at(&self, at: Said, cx: &mut Context<Self>) -> Option<AnyElement> {
         let text = self.error.clone().filter(|_| self.error_at == at)?;
         Some(match at {
             Said::Adding => ds::text::muted(text).into_any_element(),
+            // Not an error: the address was emptied on purpose, or shipped that way. The link
+            // goes to the setting instead of describing where it is.
+            Said::CloudOff => h_flex()
+                .debug_selector(|| "cloud-off".into())
+                .gap(px(space::SM))
+                .child(ds::text::muted(text))
+                .child(
+                    div().debug_selector(|| "open-cloud-settings".into()).child(
+                        ds::button("open-cloud-settings", "Open Omnigraph Cloud settings")
+                            .variant(ds::Variant::Ghost)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let workspace = this.workspace.clone();
+                                cx.emit(DismissEvent);
+                                workspace
+                                    .update(cx, |workspace, cx| {
+                                        crate::open_settings_at(
+                                            workspace,
+                                            crate::settings_view::CLOUD,
+                                            window,
+                                            cx,
+                                        )
+                                    })
+                                    .ok();
+                            })),
+                    ),
+                )
+                .into_any_element(),
             _ => ds::text::error(text).into_any_element(),
         })
     }
@@ -763,20 +800,17 @@ impl OpenGraphModal {
         }
         match choice {
             Choice::Cloud => {
+                // Omnigraph Cloud's plane only, as the row's line reads it: a plane a CLI profile
+                // names is not Cloud, and stays in the sidebar under its own name.
                 let plane = self
                     .planes
                     .iter()
                     .find(|plane| plane.read(cx).is_default())
-                    .or_else(|| self.planes.first())
                     .map(|plane| plane.entity_id());
                 match plane {
                     Some(id) => self.move_to(Place::Plane(id), window, cx),
                     None => {
-                        self.say(
-                            Said::Pane,
-                            "Omnigraph Cloud's address is not set. Set it in Settings → Omnigraph \
-                             Cloud.",
-                        );
+                        self.say(Said::CloudOff, CLOUD_OFF);
                         cx.notify();
                     }
                 }
@@ -1261,8 +1295,28 @@ impl OpenGraphModal {
     /// there is none, saying so (spec 029).
     fn render_start(&self, cx: &mut Context<Self>) -> AnyElement {
         let no_cli = self.no_cli(cx);
+        let cloud = self
+            .planes
+            .iter()
+            .find(|plane| plane.read(cx).is_default())
+            .map(|plane| crate::waitlist::offered(plane.read(cx)));
         let rows = Choice::ALL.into_iter().enumerate().map(|(index, choice)| {
             let disabled = no_cli && choice.needs_cli();
+            let line = match (choice, cloud) {
+                (Choice::Cloud, None) => CLOUD_OFF_LINE,
+                (Choice::Cloud, Some(true)) => CLOUD_PREVIEW_LINE,
+                _ => choice.line(),
+            };
+            // Beside the row's Sign in, which ↵ and a click on the row lead to (spec 047).
+            let waitlist = (choice == Choice::Cloud && cloud == Some(true)).then(|| {
+                div()
+                    .debug_selector(|| "waitlist-get-started".into())
+                    .child(crate::waitlist::link(
+                        "start-waitlist",
+                        crate::waitlist::Surface::GetStarted,
+                        false,
+                    ))
+            });
             let icon = match choice {
                 Choice::Cloud => IconName::UserCheck,
                 Choice::Server => IconName::Server,
@@ -1276,13 +1330,18 @@ impl OpenGraphModal {
                 .child(
                     h_flex()
                         .gap(px(space::MD))
+                        .min_w_0()
                         .child(studio_ui::ds::text::body(choice.title()))
-                        .child(studio_ui::ds::text::meta(if disabled {
-                            "Needs the Omnigraph CLI"
-                        } else {
-                            choice.line()
-                        })),
+                        .child(
+                            studio_ui::ds::text::meta(if disabled {
+                                "Needs the Omnigraph CLI"
+                            } else {
+                                line
+                            })
+                            .truncate(),
+                        ),
                 )
+                .when_some(waitlist, |row, link| row.end_slot(link))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.cursor = Some(Place::Choice(choice));
                     this.take_choice(choice, window, cx)
@@ -1304,6 +1363,10 @@ impl OpenGraphModal {
     /// Connect, which adds the server they start and waits for it (spec 029).
     fn render_local(&self, cx: &mut Context<Self>) -> AnyElement {
         let steps = first_run::steps(cfg!(windows));
+        let waitlist_shown = self
+            .planes
+            .iter()
+            .any(|plane| crate::waitlist::offered(plane.read(cx)));
         let footer = match &self.waiting {
             Some(waiting) if waiting.gave_up => {
                 h_flex()
@@ -1378,9 +1441,16 @@ impl OpenGraphModal {
                             ))
                     })),
             )
+            // Under the steps, above nothing that matters; it never moves Connect (spec 047).
+            .when(waitlist_shown, |pane| {
+                pane.child(div().px(px(space::MD)).child(crate::waitlist::note(
+                    crate::waitlist::Surface::LocalRecipe,
+                    crate::waitlist::PREVIEW_SHORT,
+                )))
+            })
             .child(footer)
-            .children(self.said_at(Said::Add))
-            .children(self.said_at(Said::Adding))
+            .children(self.said_at(Said::Add, cx))
+            .children(self.said_at(Said::Adding, cx))
             .into_any_element()
     }
 
@@ -1475,7 +1545,7 @@ impl OpenGraphModal {
                                 ),
                         ),
                 )
-                .children(self.said_at(Said::Token))
+                .children(self.said_at(Said::Token, cx))
             })
             .child(
                 v_flex()
@@ -1543,7 +1613,7 @@ impl OpenGraphModal {
                             })),
                     ),
             )
-            .children(self.said_at(Said::GraphId))
+            .children(self.said_at(Said::GraphId, cx))
     }
 
     fn render_add(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1599,8 +1669,8 @@ impl OpenGraphModal {
                         ),
                     ),
             )
-            .children(self.said_at(Said::Add))
-            .children(self.said_at(Said::Adding))
+            .children(self.said_at(Said::Add, cx))
+            .children(self.said_at(Said::Adding, cx))
     }
 }
 
@@ -2206,7 +2276,8 @@ impl Render for OpenGraphModal {
                             .gap(px(space::MD))
                             .children(cli_band)
                             .child(div().flex_1().min_h_0().child(body))
-                            .children(self.said_at(Said::Pane)),
+                            .children(self.said_at(Said::Pane, cx))
+                            .children(self.said_at(Said::CloudOff, cx)),
                     ),
             )
     }
@@ -3504,5 +3575,358 @@ mod tests {
         );
         cx.run_until_parked();
         assert!(cx.debug_bounds("new-token-disabled").is_none());
+    }
+
+    /// Omnigraph Cloud's plane, as the `omnigraph_cloud` setting makes it, signed out.
+    fn cloud_plane(cx: &mut VisualTestContext) -> Entity<ControlPlane> {
+        cx.new(|cx| {
+            let mut plane = ControlPlane::new(studio_settings::OMNIGRAPH_CLOUD.into(), None, cx);
+            plane.set_default_for_test(true, cx);
+            plane
+        })
+    }
+
+    /// Get started says Cloud is in private preview and offers the waitlist beside its Sign in,
+    /// which stays the row's ↵; the pane does the same beside Sign in, still the primary button.
+    /// Each link opens the Cloud page with its own place in Studio (spec 047).
+    #[gpui::test]
+    fn cloud_says_it_is_in_private_preview_and_offers_the_waitlist(cx: &mut TestAppContext) {
+        let (modal, cx) = dialog(Vec::new(), cx);
+        let plane = cloud_plane(cx);
+        modal.update(cx, |modal, cx| {
+            modal.follow_planes(vec![plane.clone()], Vec::new(), cx)
+        });
+        cx.run_until_parked();
+        let link = cx
+            .debug_bounds("waitlist-get-started")
+            .expect("the Cloud row's waitlist link");
+        cx.simulate_click(link.center(), gpui::Modifiers::none());
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some(crate::waitlist::url(crate::waitlist::Surface::GetStarted).as_str())
+        );
+        assert_eq!(
+            modal.read_with(cx, |modal, _| modal.start),
+            Some(Start::Choices),
+            "the link does not take the row"
+        );
+        assert!(CLOUD_PREVIEW_LINE.contains("private preview"));
+
+        // ↵ still goes to the sign-in pane, which says Cloud is in private preview.
+        cx.dispatch_action(menu::Confirm);
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("waitlist-get-started").is_none());
+        let link = cx
+            .debug_bounds("waitlist-sign-in")
+            .expect("the pane's waitlist link");
+        cx.simulate_click(link.center(), gpui::Modifiers::none());
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some(crate::waitlist::url(crate::waitlist::Surface::SignIn).as_str())
+        );
+        assert!(organizations::CLOUD_SIGN_IN.contains("private preview"));
+        assert!(organizations::CLOUD_SIGN_IN.starts_with(crate::waitlist::PREVIEW));
+        assert!(matches!(
+            plane.read_with(cx, |plane, _| plane.sign_in_state().clone()),
+            SignIn::Offered { .. }
+        ));
+    }
+
+    /// A sign-in in no organization of Omnigraph Cloud says why, and offers the waitlist first,
+    /// beside Refresh and Sign out (spec 047).
+    #[gpui::test]
+    fn no_organizations_offers_the_waitlist_first(cx: &mut TestAppContext) {
+        let (modal, cx) = dialog(Vec::new(), cx);
+        let plane = cloud_plane(cx);
+        plane.update(cx, |plane, cx| {
+            plane.signed_in_for_test(Vec::new(), Vec::new(), cx)
+        });
+        modal.update(cx, |modal, cx| {
+            modal.follow_planes(vec![plane.clone()], Vec::new(), cx)
+        });
+        let id = plane.entity_id();
+        modal.update_in(cx, |modal, window, cx| {
+            modal.move_to(Place::Plane(id), window, cx)
+        });
+        cx.run_until_parked();
+        let link = cx
+            .debug_bounds("waitlist-no-organizations")
+            .expect("No organizations' waitlist button");
+        cx.simulate_click(link.center(), gpui::Modifiers::none());
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some(crate::waitlist::url(crate::waitlist::Surface::NoOrganizations).as_str())
+        );
+        assert!(
+            plane
+                .read_with(cx, |plane, _| organizations::no_organizations(
+                    plane,
+                    "user_test"
+                ))
+                .contains("private preview"),
+            "it says why"
+        );
+    }
+
+    /// The words follow the waitlist's rule as its links do: a plane at another address than
+    /// Omnigraph Cloud's own, though the setting names it, says nothing of the waitlist, signed
+    /// out or in no organization; Omnigraph Cloud's own does.
+    #[gpui::test]
+    fn the_words_follow_the_waitlists_rule(cx: &mut TestAppContext) {
+        let (_modal, cx) = dialog(Vec::new(), cx);
+        let elsewhere = cx.new(|cx| {
+            let mut plane = ControlPlane::new("http://127.0.0.1:8874".into(), None, cx);
+            plane.set_default_for_test(true, cx);
+            plane
+        });
+        let cloud = cloud_plane(cx);
+        let words = |plane: &Entity<ControlPlane>, cx: &mut VisualTestContext| {
+            plane.read_with(cx, |plane, _| {
+                (
+                    organizations::signed_out_words(plane).to_owned(),
+                    organizations::no_organizations(plane, "user_test"),
+                )
+            })
+        };
+        let (signed_out, none) = words(&elsewhere, cx);
+        assert!(!signed_out.contains("waitlist"), "{signed_out}");
+        assert!(!none.contains("waitlist"), "{none}");
+        let (signed_out, none) = words(&cloud, cx);
+        assert_eq!(signed_out, organizations::CLOUD_SIGN_IN);
+        assert!(
+            none.contains("invitations go out from the waitlist"),
+            "{none}"
+        );
+        // In no organization: still offered, so still said.
+        cloud.update(cx, |plane, cx| {
+            plane.signed_in_for_test(Vec::new(), Vec::new(), cx)
+        });
+        assert!(words(&cloud, cx).1.contains("waitlist"));
+        elsewhere.update(cx, |plane, cx| {
+            plane.signed_in_for_test(Vec::new(), Vec::new(), cx)
+        });
+        assert!(!words(&elsewhere, cx).1.contains("waitlist"));
+    }
+
+    /// An organization with no clusters says how one is made, with the CLI command that makes it
+    /// in the organization's profile; a member of an organization sees no waitlist.
+    #[gpui::test]
+    fn no_clusters_gives_the_command_that_makes_one(cx: &mut TestAppContext) {
+        let (modal, cx) = dialog(Vec::new(), cx);
+        let listed: control_client::Envelope<control_client::ClusterList> =
+            serde_json::from_value(serde_json::json!({
+                "data": {"clusters": []},
+                "meta": {"provenance": "service_db", "assurance": "observed", "stale": false,
+                         "observed_at": "2026-11-05T00:00:00Z"},
+            }))
+            .unwrap();
+        let plane = cx.new(|cx| {
+            let mut plane = ControlPlane::new(studio_settings::OMNIGRAPH_CLOUD.into(), None, cx);
+            plane.set_default_for_test(true, cx);
+            plane.profiles = vec![("work".into(), Some("org_1".into()))];
+            plane.signed_in_for_test(
+                vec![control_client::OrganizationSummary {
+                    organization_id: "org_1".into(),
+                    name: Some("Acme".into()),
+                }],
+                vec![("org_1".into(), graph_store::Listing::Listed(listed))],
+                cx,
+            );
+            plane
+        });
+        modal.update(cx, |modal, cx| {
+            modal.follow_planes(vec![plane.clone()], Vec::new(), cx)
+        });
+        let id = plane.entity_id();
+        modal.update_in(cx, |modal, window, cx| {
+            modal.move_to(Place::Organization(id, "org_1".into()), window, cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("no-clusters").is_some());
+        // Its Copy is the block's last control, at its right end.
+        let block = cx
+            .debug_bounds("create-cluster")
+            .expect("the command to create one");
+        cx.simulate_click(
+            gpui::point(block.right() - gpui::px(8.), block.top() + gpui::px(8.)),
+            gpui::Modifiers::none(),
+        );
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("omnigraph cluster create <NAME> --profile work".to_owned())
+        );
+        assert!(cx.debug_bounds("waitlist-sign-in").is_none());
+        assert!(cx.debug_bounds("waitlist-no-organizations").is_none());
+        assert_eq!(
+            organizations::create_command(None),
+            "omnigraph cluster create <NAME> --profile <PROFILE>"
+        );
+
+        // Get started, with that sign-in held, offers no waitlist either.
+        modal.update_in(cx, |modal, window, cx| {
+            modal.show_start(Start::Choices, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("waitlist-get-started").is_none());
+    }
+
+    /// A failed read of the sign-in details calls the control plane by its name, not "the
+    /// server".
+    #[test]
+    fn a_failed_sign_in_names_the_control_plane() {
+        let why = "The server's sign-in details could not be read: the connection was refused.";
+        assert_eq!(
+            organizations::plane_words(why, true),
+            "Omnigraph Cloud's sign-in details could not be read: the connection was refused."
+        );
+        assert_eq!(
+            organizations::plane_words(
+                "The server asks for tokens issued for x, which is not the server's own address.",
+                false
+            ),
+            "The control plane asks for tokens issued for x, which is not the control plane's \
+             own address."
+        );
+    }
+
+    /// With Omnigraph Cloud off, choosing its row links to the setting instead of naming where it
+    /// is, and no waitlist shows.
+    #[gpui::test]
+    fn cloud_off_links_to_its_setting_and_offers_no_waitlist(cx: &mut TestAppContext) {
+        let (modal, cx) = dialog(Vec::new(), cx);
+        // A plane a CLI profile names stays, and is not taken for Omnigraph Cloud.
+        let elsewhere = cx.new(|cx| {
+            let mut plane = ControlPlane::new("https://control.test".into(), None, cx);
+            plane.profiles = vec![("work".into(), Some("org_1".into()))];
+            plane
+        });
+        modal.update(cx, |modal, cx| {
+            modal.follow_planes(vec![elsewhere.clone()], Vec::new(), cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("waitlist-get-started").is_none());
+        let dismissed = Rc::new(Cell::new(false));
+        let heard = dismissed.clone();
+        cx.update(|_, cx| {
+            cx.subscribe(&modal, move |_, _: &DismissEvent, _| heard.set(true))
+                .detach()
+        });
+        cx.dispatch_action(menu::Confirm);
+        cx.run_until_parked();
+        assert_eq!(
+            modal.read_with(cx, |modal, _| (modal.error.clone(), modal.error_at)),
+            (Some(CLOUD_OFF.into()), Said::CloudOff)
+        );
+        assert!(
+            modal.read_with(cx, |modal, _| modal.plane_shown.is_none()),
+            "the other plane is not opened in Cloud's place"
+        );
+        assert!(cx.debug_bounds("cloud-off").is_some());
+        let open = cx
+            .debug_bounds("open-cloud-settings")
+            .expect("the link to the setting");
+        cx.simulate_click(open.center(), gpui::Modifiers::none());
+        assert!(dismissed.get(), "the dialog makes way for Settings");
+        assert!(cx.opened_url().is_none(), "nothing opened in the browser");
+    }
+
+    /// A control plane only a CLI profile names is not Omnigraph Cloud: its pane offers no
+    /// waitlist, signed out or in no organization.
+    #[gpui::test]
+    fn another_control_plane_offers_no_waitlist(cx: &mut TestAppContext) {
+        let (modal, cx) = dialog(vec![server(&["knowledge"], cx)], cx);
+        let plane = cx.new(|cx| {
+            let mut plane = ControlPlane::new("https://control.test".into(), None, cx);
+            plane.profiles = vec![("work".into(), Some("org_1".into()))];
+            plane
+        });
+        modal.update(cx, |modal, cx| {
+            modal.follow_planes(vec![plane.clone()], Vec::new(), cx)
+        });
+        let id = plane.entity_id();
+        modal.update_in(cx, |modal, window, cx| {
+            modal.move_to(Place::Plane(id), window, cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("waitlist-sign-in").is_none());
+        plane.update(cx, |plane, cx| {
+            plane.signed_in_for_test(Vec::new(), Vec::new(), cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("waitlist-no-organizations").is_none());
+    }
+
+    /// Signed out of Omnigraph Cloud, its sidebar row has a second line with the waitlist, and
+    /// the local recipe one under its steps; each opens its own page address.
+    #[gpui::test]
+    fn the_sidebar_and_the_recipe_offer_the_waitlist(cx: &mut TestAppContext) {
+        let (modal, cx) = dialog(Vec::new(), cx);
+        let plane = cloud_plane(cx);
+        modal.update(cx, |modal, cx| {
+            modal.follow_planes(vec![plane.clone()], Vec::new(), cx)
+        });
+        cx.run_until_parked();
+        let note = cx
+            .debug_bounds("waitlist-link-sidebar")
+            .expect("the sidebar row's second line");
+        cx.simulate_click(note.center(), gpui::Modifiers::none());
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some(crate::waitlist::url(crate::waitlist::Surface::Sidebar).as_str())
+        );
+
+        modal.update_in(cx, |modal, window, cx| {
+            modal.show_start(Start::Local, window, cx)
+        });
+        cx.run_until_parked();
+        let note = cx
+            .debug_bounds("waitlist-link-local-recipe")
+            .expect("the line under the recipe");
+        cx.simulate_click(note.center(), gpui::Modifiers::none());
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some(crate::waitlist::url(crate::waitlist::Surface::LocalRecipe).as_str())
+        );
+
+        // Signed in to an organization: neither.
+        plane.update(cx, |plane, cx| {
+            plane.signed_in_for_test(
+                vec![control_client::OrganizationSummary {
+                    organization_id: "org_1".into(),
+                    name: Some("Acme".into()),
+                }],
+                Vec::new(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("waitlist-local-recipe").is_none());
+        assert!(cx.debug_bounds("waitlist-sidebar").is_none());
+    }
+
+    /// Omnigraph Cloud's setting at another address than Omnigraph Cloud's own: no place in the
+    /// dialog offers the waitlist, and the words are the plane's own.
+    #[gpui::test]
+    fn another_cloud_address_offers_no_waitlist(cx: &mut TestAppContext) {
+        let (modal, cx) = dialog(Vec::new(), cx);
+        let plane = cx.new(|cx| {
+            let mut plane = ControlPlane::new("http://127.0.0.1:8874".into(), None, cx);
+            plane.set_default_for_test(true, cx);
+            plane
+        });
+        modal.update(cx, |modal, cx| {
+            modal.follow_planes(vec![plane.clone()], Vec::new(), cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("waitlist-get-started").is_none());
+        assert!(cx.debug_bounds("waitlist-sidebar").is_none());
+        cx.dispatch_action(menu::Confirm);
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("waitlist-sign-in").is_none());
+        modal.update_in(cx, |modal, window, cx| {
+            modal.show_start(Start::Local, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("waitlist-local-recipe").is_none());
     }
 }

@@ -19,6 +19,7 @@
       "alt-right": "studio::GoForward",
       "ctrl-q": "studio::Quit",
       "ctrl-alt-shift-f": "studio::ToggleFrameOverlay",
+      "ctrl-alt-shift-j": "studio::JoinCloudWaitlist",
       "ctrl-=": "studio::IncreaseFontSize",
       "ctrl-+": "studio::IncreaseFontSize",
       "ctrl--": "studio::DecreaseFontSize",

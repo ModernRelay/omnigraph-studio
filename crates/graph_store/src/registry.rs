@@ -523,9 +523,19 @@ impl ConnectionRegistry {
         this.transported = Arc::new(transport_client);
         this.known = load_known_graphs(&known_graphs_path());
         this.saving = true;
+        // A debug build run with `OMNIGRAPH_STUDIO_KEYCHAIN=none` reads and keeps no sign-in,
+        // so it can draw Omnigraph Cloud at its own address offscreen without reading the
+        // sign-in this computer's keychain holds there (spec 047, screenshots).
+        let none = cfg!(debug_assertions)
+            && std::env::var("OMNIGRAPH_STUDIO_KEYCHAIN").is_ok_and(|keychain| keychain == "none");
+        let keychain: Arc<dyn sign_in::Keychain> = if none {
+            Arc::new(sign_in::NoKeychain)
+        } else {
+            PlatformKeychain::start(cx)
+        };
         this.sign_in = Some(SignInContext {
             elsewhere: this.http.clone(),
-            keychain: PlatformKeychain::start(cx),
+            keychain,
             turns: sign_in::KeychainTurns::default(),
             identities: sign_in::studio_identities(),
         });
