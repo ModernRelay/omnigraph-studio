@@ -50,9 +50,10 @@ impl NodePage {
         // itself.
         let subscription = cx.observe(&view, |this, _, cx| {
             // The label read last names the tab while the view reads the node again, as it
-            // does after a branch switch once the tab is shown.
-            if let Some(label) = this.view.read(cx).label() {
-                this.saved_label = Some(label);
+            // does after a branch switch once the tab is shown; a node read with no name (an
+            // empty or cleared one) forgets the old name.
+            if let Some(label) = this.view.read(cx).read_label() {
+                this.saved_label = label;
             }
             let tab = (this.title(cx), this.view.read(cx).is_newer());
             if tab != this.tab {
@@ -96,11 +97,11 @@ impl NodePage {
     /// What names the tab: the node's label once the page reads it, else the one the tab was
     /// saved with, else the node's id.
     fn title(&self, cx: &App) -> String {
-        self.view
-            .read(cx)
-            .label()
-            .or_else(|| self.saved_label.clone())
-            .unwrap_or_else(|| self.id.clone())
+        match self.view.read(cx).read_label() {
+            Some(label) => label,
+            None => self.saved_label.clone(),
+        }
+        .unwrap_or_else(|| self.id.clone())
     }
 
     fn toolbar_state(&self, cx: &App) -> (bool, bool) {
@@ -200,11 +201,10 @@ impl Item for NodePage {
     }
 
     fn serialize(&self, cx: &App) -> Option<SavedItem> {
-        let label = self
-            .view
-            .read(cx)
-            .label()
-            .or_else(|| self.saved_label.clone());
+        let label = match self.view.read(cx).read_label() {
+            Some(label) => label,
+            None => self.saved_label.clone(),
+        };
         Some(SavedItem {
             kind: "node".into(),
             data: json!({
@@ -256,5 +256,37 @@ impl Render for NodePage {
             .child(self.render_toolbar(cx))
             // The page scrolls as a list of its own, drawing only what is in view.
             .child(div().flex_1().min_h_0().child(self.view.clone()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+    use serde_json::json;
+
+    /// A page saved under a name whose node now has none (cleared to empty) names its tab by
+    /// the id once the node is read, as its title does, not by the old name (Bugbot, #161).
+    #[gpui::test]
+    async fn a_cleared_name_leaves_no_stale_tab_title(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let schema = "node Person {\n  slug: String @key\n  name: String\n}\n";
+        let rows = json!([{"n": {"@id": "p1", "slug": "p1", "name": ""}}]);
+        let session = crate::test_support::session_reading(schema, rows, cx);
+        let (page, cx) = cx.add_window_view(move |_, cx| {
+            NodePage::new(
+                session,
+                "Person".into(),
+                "p1".into(),
+                None,
+                Some("Old name".into()),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        page.read_with(cx, |page, cx| assert_eq!(page.title(cx), "p1"));
     }
 }

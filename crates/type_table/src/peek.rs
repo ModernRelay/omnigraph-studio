@@ -909,6 +909,13 @@ impl NodePeek {
         !scrolling && self.opens_by_itself(count)
     }
 
+    /// What names the node once its values are read: its label, or `Some(None)` when it has
+    /// none (an empty or cleared name); `None` while they are not read yet.
+    pub(crate) fn read_label(&self) -> Option<Option<String>> {
+        self.values.loaded()?;
+        Some(self.label())
+    }
+
     pub(crate) fn label(&self) -> Option<String> {
         let values = self.values.loaded()?;
         if let PeekSubject::Edge { .. } = &self.subject {
