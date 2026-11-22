@@ -150,10 +150,13 @@ says "History stops at a schema change to *Type* in *X*". Another failure (histo
 410; a 5xx) ends the window there in the same way, with its reason, and the tab never says the
 node had no changes since the graph began; a failure of the head's read fails the tab. A search
 that reaches its cap of 20,000 listed commits with the node still there names no commit: it says
-the node was created before the oldest it listed.
+the node was created before the oldest it listed. A search whose listing or point read fails has
+failed: it says why and is offered again, never left as a finished search.
 
 The newest window keeps the node's last change, its newest entry, in the session (`GraphSession::last_change`,
-`SessionEvent::NodeHistoryRead`) for the page, only while every group was followed.
+`SessionEvent::NodeHistoryRead`) for the page, only while every group was followed. When the
+first window changed nothing, an older window's newest entry is the last change: the view tells the
+read that nothing above it changed (`NodeHistoryWindow::Older { nothing_newer }`).
 
 **Coverage.** Each window comes with what it followed (`node_history::Coverage`): the groups too
 large to follow, how far back it reaches (more commits, the graph's first commit, a schema
@@ -172,7 +175,7 @@ list rather than that none were read.
 |---|---|---|
 | Reading | "Reading the history…" (`ds::loading_state`) | — |
 | Failed | "The node's history could not be read" and the reason | Try again (⌘R) |
-| Nothing in the window | "No changes in the last 50 commits" · "No commit in the newest 50 on main changed *name* or its relationships." | Read the 200 commits before ⌘⌥N |
+| Nothing in the window | "No changes in the last 50 commits" · "No commit in the newest 50 on main changed *name* or its relationships." The older read shows there as in the end row: "Reading older commits…", or its failure with Try again | Read the 200 commits before ⌘⌥N |
 | Nothing since the graph began | "No changes" · "No commit on main changed *name* or its relationships since the graph began." Only when every group was followed | — |
 | Nothing found, a group too large | "… changed *name* or the relationships Studio could follow. Not followed, too large: *group*." | Read the 200 commits before ⌘⌥N, while there are more |
 | Schema boundary, nothing after it | The schema-change state with the commit | — |
@@ -262,6 +265,7 @@ In spec 012 and `docs/deferred-engine-changes.md`:
 | 2026-11-21 | Maintainer review of #162: keyed edges, exact Blobs, coverage, reads kept running | `gq_language` `a_keyed_edges_history_reads_what_an_upsert_changes` (a keyed edge's history reads `since`, an unkeyed one only ids; both compile); `graph_store` `a_keyed_edge_changed_in_place_is_an_entry` (fails with the in-place comparison taken out), `a_blob_is_compared_by_its_exact_size` (the reviewer's 1,200 B vs 1,240 B: one entry), `coverage_says_only_what_the_reads_support`; `change_cards` `a_blob_reads_as_its_size_not_its_bytes` (an exact size formats as "1.2 KB" and two that round alike still differ); `history` `a_group_too_large_to_follow_is_named_and_never_claims_the_start` (a node with 1,000 WorksAt edges: the empty state names the group, never says "or its relationships", and no last change is kept), `a_removal_says_when_its_relationships_were_too_large`, and the view's tests on a first window of 50 | Pass |
 | 2026-11-21 | A full window of 200 commits, measured | The scratch dev graph with 230 commits on main (the earlier 29, then 201 title edits of person-000006 through `POST /mutate`, none of person-000000); the debug `snapshot` example's `reads:` step opening History on person-000000 with windows of 200; `measure_points.py` for bytes; Apple M5 Pro, a busy machine (load average 13 to 34) | **1,006 requests** (1 listing, 201 node reads, 804 edge reads over 4 groups), settled in **17.9 s** at load average 34 and **11.3 s** at about 15, 4 at once; each read 35 to 73 ms on the server. **466.5 KiB**, 23.9 s one at a time. Remote latency not measured. Hence a first window of 50; its time was not measured |
 | 2026-11-21 | Bugbot on #162: the empty state hid the creation search | `history` `an_unchanged_node_offers_the_search_in_its_empty_state` (a node unchanged in the window offers ⌘⌥F there and shows its result), which fails with the fix taken out. The cap case Bugbot also named is gone: a capped listing now says the node was created before the oldest commit listed (`Creation::Before`) | Pass |
+| 2026-11-21 | Bugbot on #162: the last change from an older window, the empty state's older read, a failed search retried | `history` `an_older_windows_newest_entry_is_the_last_change` (a node changed only at c150, before the first window: its last change is c150 once the older window is read), `the_empty_state_shows_a_failed_older_read`, `a_failed_creation_search_is_offered_again` (a point read failing during the search); each fails with its fix taken out | Pass |
 | — | Not checked | A remote server's latency; the 230,000-person seed; a real schema boundary; a Blob-holding type against a server; a 0.14 server; Studio's own writes labelled "Studio" in the running app; two actors | Open |
 
 ## Corrections
