@@ -29,7 +29,7 @@ says who set it.
   `node_history_search`). Studio keeps no history of its own: the session holds only the node's
   last change as its history read last found it, for the page, and forgets it with a new token.
 - **II.** Every window answers for the head the first listing resolved; each read is pinned to
-  its commit's snapshot. A commit on the branch offers Refresh.
+  its commit's snapshot. Any move of the branch's head past it offers Refresh.
 - **V.** Nothing is drawn until a window is whole; a newer commit shows "Newer commits ·
   Refresh", never a jump. The page's line appears only once the history is read.
 - **VI.** The end row says what was read, a relationship group too large to follow, and where it
@@ -266,6 +266,7 @@ In spec 012 and `docs/deferred-engine-changes.md`:
 | 2026-11-21 | A full window of 200 commits, measured | The scratch dev graph with 230 commits on main (the earlier 29, then 201 title edits of person-000006 through `POST /mutate`, none of person-000000); the debug `snapshot` example's `reads:` step opening History on person-000000 with windows of 200; `measure_points.py` for bytes; Apple M5 Pro, a busy machine (load average 13 to 34) | **1,006 requests** (1 listing, 201 node reads, 804 edge reads over 4 groups), settled in **17.9 s** at load average 34 and **11.3 s** at about 15, 4 at once; each read 35 to 73 ms on the server. **466.5 KiB**, 23.9 s one at a time. Remote latency not measured. Hence a first window of 50; its time was not measured |
 | 2026-11-21 | Bugbot on #162: the empty state hid the creation search | `history` `an_unchanged_node_offers_the_search_in_its_empty_state` (a node unchanged in the window offers ⌘⌥F there and shows its result), which fails with the fix taken out. The cap case Bugbot also named is gone: a capped listing now says the node was created before the oldest commit listed (`Creation::Before`) | Pass |
 | 2026-11-21 | Bugbot on #162: the last change from an older window, the empty state's older read, a failed search retried | `history` `an_older_windows_newest_entry_is_the_last_change` (a node changed only at c150, before the first window: its last change is c150 once the older window is read), `the_empty_state_shows_a_failed_older_read`, `a_failed_creation_search_is_offered_again` (a point read failing during the search); each fails with its fix taken out | Pass |
+| 2026-11-21 | Bugbot on #162 at 440b0c77: a group full only past a failed read, and a head moved however it was seen | `history` `a_group_full_only_past_a_failed_read_is_not_named` (coverage takes its groups from the commits kept, not every read), `a_head_moved_past_the_one_read_offers_refresh` (any `HeadMoved` past the head read offers Refresh, as well as `Committed`); each fails with its fix taken out | Pass |
 | — | Not checked | A remote server's latency; the 230,000-person seed; a real schema boundary; a Blob-holding type against a server; a 0.14 server; Studio's own writes labelled "Studio" in the running app; two actors | Open |
 
 ## Corrections
