@@ -112,7 +112,8 @@
   {
     "context": "NodeView",
     "bindings": {
-      "cmd-s": "studio_node::SaveNodeDrafts"
+      "cmd-s": "studio_node::SaveNodeDrafts",
+      "f2": "studio_node::EditNodeName"
     }
   },
   {

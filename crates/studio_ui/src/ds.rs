@@ -229,8 +229,17 @@ pub mod size {
     pub const STATE_DETAIL_WIDTH: f32 = 360.;
     /// Width of a field's label column: a dialog's, an inspector's properties, storage's facts.
     pub const FIELD_LABEL: f32 = 112.;
-    /// A label column on a page, which reads at a document's width.
+    /// A label column in a form at a document's width (a query's parameters).
     pub const FIELD_LABEL_WIDE: f32 = 160.;
+    /// A node page's label column ([`super::document_row`]): an inspector's, so a value sits
+    /// close to its name on a page too, the page's width going to the values.
+    pub const DOCUMENT_LABEL: f32 = FIELD_LABEL;
+    /// A text not read yet ([`super::skeleton`]): a body line's bar and a page title's, and
+    /// the widths they stand in for.
+    pub const SKELETON_LINE: f32 = 12.;
+    pub const SKELETON_TITLE: f32 = 24.;
+    pub const SKELETON_SHORT: f32 = 96.;
+    pub const SKELETON_LONG: f32 = 240.;
     /// The gap around and between glass sheets.
     pub const SHEET_GAP: f32 = 8.;
     /// The hit area of a divider that resizes a dock or a split, centred on its line.
@@ -1048,8 +1057,8 @@ pub enum Status {
 /// A node type's colour as a small dot, centred in the width of a type mark so rows with
 /// either line up: for rows whose context already names the type, where a lettered mark would
 /// repeat it.
-pub fn type_dot(type_name: &str) -> Div {
-    icon_slot(dot(Color::Custom(studio_theme::type_color(type_name))))
+pub fn type_dot(type_name: &str, tints: &crate::TypeTints) -> Div {
+    icon_slot(dot(Color::Custom(tints.color(type_name))))
 }
 
 /// A dot that beats while given its `beat` (a server that answers): each beat sends one ring
@@ -3007,10 +3016,10 @@ pub fn field(label: impl Into<SharedString>, value: impl IntoElement) -> Div {
 // side, and a long text under a section that folds.
 
 /// A row of an object's properties (spec 002, "Property rows"): the property's kind as an icon
-/// and its name, muted, in a label column `label_width` wide ([`size::FIELD_LABEL`], or
-/// [`size::FIELD_LABEL_WIDE`] on a page) and [`size::PROPERTY_ROW`] tall. Its value goes in a
-/// [`property_value`], and whatever follows it (a row's action, its state) after that, as the
-/// caller's children. A value that wraps (a list) keeps its first line level with the label.
+/// and its name, muted, in a label column `label_width` wide ([`size::FIELD_LABEL`]) and
+/// [`size::PROPERTY_ROW`] tall. Its value goes in a [`property_value`], and whatever follows it
+/// (a row's action, its state) after that, as the caller's children. A node's page draws
+/// [`document_row`]s instead. A value that wraps (a list) keeps its first line level with the label.
 pub fn property_row(icon: IconName, label: impl Into<SharedString>, label_width: f32) -> Div {
     h_flex().w_full().gap(px(space::LG)).items_start().child(
         h_flex()
@@ -3026,6 +3035,39 @@ pub fn property_row(icon: IconName, label: impl Into<SharedString>, label_width:
                     .child(text::muted(label).single_line().truncate()),
             ),
     )
+}
+
+/// A row of a document's properties (a node's page, spec 014): the property's name, muted, in
+/// a label column `label_width` wide ([`size::DOCUMENT_LABEL`]) and [`size::PROPERTY_ROW`]
+/// tall, with no kind icon; its value, plain text rather than a pill, goes in a
+/// [`property_value`] as the caller's child. A page reads as prose, where the inspector's
+/// [`property_row`] reads as a form.
+pub fn document_row(label: impl Into<SharedString>, label_width: f32) -> Div {
+    h_flex().w_full().gap(px(space::LG)).items_start().child(
+        h_flex()
+            .w(px(label_width))
+            .h(px(size::PROPERTY_ROW))
+            .flex_none()
+            .items_center()
+            .child(
+                div()
+                    .min_w_0()
+                    .child(text::muted(label).single_line().truncate()),
+            ),
+    )
+}
+
+/// A bar standing for text not read yet, `width` wide and `height` tall
+/// ([`size::SKELETON_LINE`], [`size::SKELETON_TITLE`]): the well's grey with the scale's small
+/// corner, still, since a read that takes long is rare (constitution VII).
+pub fn skeleton(width: f32, height: f32, cx: &App) -> Div {
+    div()
+        .w(px(width))
+        .max_w_full()
+        .h(px(height))
+        .flex_none()
+        .rounded(px(radii(cx).xs))
+        .bg(surface::well(cx))
 }
 
 /// Where a [`property_row`]'s value goes: the rest of the row, its first line centred in the
@@ -3075,10 +3117,15 @@ pub fn value_text(value: impl Into<SharedString>, cx: &App) -> Div {
 }
 
 /// A neighbour as a value: its type's mark and its name in a [`value_box`].
-pub fn node_value(type_name: &str, label: impl Into<SharedString>, cx: &App) -> Div {
+pub fn node_value(
+    type_name: &str,
+    label: impl Into<SharedString>,
+    tints: &crate::TypeTints,
+    cx: &App,
+) -> Div {
     let label = label.into();
     value_box(cx)
-        .child(crate::type_mark(type_name, &label, cx))
+        .child(crate::type_mark(type_name, &label, tints, cx))
         .child(
             div()
                 .min_w_0()

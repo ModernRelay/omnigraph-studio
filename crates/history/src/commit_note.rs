@@ -24,14 +24,22 @@ pub(crate) struct CommitNote {
     heads: Vec<String>,
     /// Its changes counted, once History has read them, or why there are none.
     counts: Option<Learnt>,
+    /// The tints of the graph's types, which the counts' marks are drawn in.
+    tints: studio_ui::TypeTints,
 }
 
 impl CommitNote {
-    pub(crate) fn new(commit: CommitOutput, heads: Vec<String>, counts: Option<Learnt>) -> Self {
+    pub(crate) fn new(
+        commit: CommitOutput,
+        heads: Vec<String>,
+        counts: Option<Learnt>,
+        tints: studio_ui::TypeTints,
+    ) -> Self {
         Self {
             commit,
             heads,
             counts,
+            tints,
         }
     }
 
@@ -160,7 +168,7 @@ impl Render for CommitNote {
                 .gap(px(space::XS))
                 .child(change_cards::commit_counts("note-counts", &learnt.counts))
                 .when(!learnt.by_type.is_empty(), |value| {
-                    value.child(change_cards::summary_line(&learnt.by_type, cx))
+                    value.child(change_cards::summary_line(&learnt.by_type, &self.tints, cx))
                 })
                 .into_any_element()
         });

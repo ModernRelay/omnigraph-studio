@@ -559,7 +559,11 @@ impl TextEditor {
             ),
         };
         studio_ui::ds::toolbar(cx)
-            .child(studio_ui::type_swatch(&self.type_name, cx))
+            .child(studio_ui::type_swatch(
+                &self.type_name,
+                self.session.read(cx).type_tints(),
+                cx,
+            ))
             .child(
                 studio_ui::ds::text::muted(self.label.clone().unwrap_or_else(|| self.id.clone()))
                     .single_line(),

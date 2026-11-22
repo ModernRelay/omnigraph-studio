@@ -93,7 +93,8 @@ Four parts, built in this order; each lands on its own.
   spec 004 stores and clears a value; every relationship as a section with its count, read
   in pages of 50 (IX), with "Show more"; for an edge, its endpoints and properties. Back and
   Forward walk pages as any tab.
-- **How a property reads**, on the page and in the peek alike, from spec 002's property rows
+- **How a property reads** in the peek (the page reads as a document since 2026-11-20: see
+  "The page as a document" below), from spec 002's property rows
   (`studio_ui::ds::property_row` and the values in pills): each property is a row, its type's
   icon and its name in a label column, its value in a pill beside it, with no heading over
   them. A list's elements are pills that wrap. A text longer than a pill holds, with words to
@@ -104,12 +105,14 @@ Four parts, built in this order; each lands on its own.
   height; a long text's sit in its head, beside its name, where a folded one shows its
   draft's dot. A field being edited stays level with its label and adds its key hints (and a
   refusal) under it.
-- **How a relationship reads**: under a rule and "Relationships", each group is a fold row,
+- **How a relationship reads** in the peek (a page's groups since 2026-11-20: below): under a
+  rule and "Relationships", each group is a fold row,
   "knows → Person ⌄" (← for one pointing at this node) with its count at the end, over its
   neighbours, a row each: its type's mark and its name. On a page a click selects it, which
   the inspector shows, and a second opens its page; in the inspector a click opens its page
   (spec 020). Under the pointer
-  a row shows its × and a header its "+" (the page shows the "+" always).
+  a row shows its × and a header its "+", on a page too (until 2026-11-20 the page showed the
+  "+" always); the "+" also shows while its group's search is open.
 - **Keys, the same on every surface**:
   - Space shows or hides the inspector, which shows what is selected in the tab in front
     (spec 020, since 2026-11-13). What is selected never opens the dock and never closes it.
@@ -129,6 +132,76 @@ Four parts, built in this order; each lands on its own.
     typing to edit is deferred). A double click on the key cell opens the page.
   - In a relationship cell each chip is a link: a click peeks that node, ⌘-click opens its
     page; the count ("+N") opens the related table, as the cell does today.
+
+### The page as a document (2026-11-20)
+
+Ragnor saw the page as the inspector stretched to a page's width: every value in a pill, the
+name and the key each shown twice, a kind glyph before every label, a raw commit id, a 160 px
+label column, the column against the pane's left edge with an empty band to its right,
+relationship headers in lower camel case with both directions of one type apart, a 1 KB Blob
+drawn as a 16-line hex dump, and a loading page titled by its raw id over a lone "#". The page
+now reads as a document; the peek in the inspector keeps its compact look, and both share every
+field, edit, draft, conflict, relationship write and Blob slot (`type_table/src/peek/page.rs`
+draws what differs).
+
+- **One column, centred.** The page is one column at the reading width
+  (`ds::size::READING_WIDTH`, 720 px) centred in its pane, with the page's margin
+  (`space::PAGE`) when the pane is narrower. Centred rather than left-aligned with a gutter: a
+  document is read, not scanned beside other columns, and centring leaves the same margin either
+  side however wide the pane is, so nothing (a group's "+", a Blob card's actions) ends
+  mid-screen and the toolbar's view strip above keeps its own edge (better-layout: align to
+  shared edges, one per level).
+- **One title, one quiet meta line.** The title is the node's name, or its id when it has none.
+  Under it, muted: the type's swatch and name; the key, in the buffer font, when the title is a
+  name (a click copies it); "read at <commit>" only when the page holds a commit or the branch
+  has moved past it; and "Newer data · Refresh". No commit id otherwise, and no `#`.
+- **Nothing twice.** The property the title shows (the label property) and the key, when its
+  value is the id, are left out of the property list. A click on the title, or F2
+  (`studio_node::EditNodeName`, bound in `NodeView`, so the palette lists it on a page whose name
+  can be edited), opens the name's row with its field, as a row's click does; the row stays while
+  it is edited, saving, held as a draft or absent at the commit shown, and goes when the field
+  closes. One function says what the title does with the name (`title_role`): it edits it, or
+  copies one the credential may not change; the list leaves the name's row out only then, so the
+  two cannot drift (review of #161). An enum naming a node keeps its row, with its menu, since
+  the title edits text only. A title that does not edit the name (an enum's, one the credential
+  may not change, or an id) copies what it shows on a click. An empty name names nothing: the
+  title is the id and the name keeps its row; the key stays in the meta line, copied on
+  a click, unless the title shows it and copies it itself. "Copied" shows beside what was copied:
+  the title, or the key (second review of #161).
+- **Properties as plain text.** A label and value grid: the name, muted, in a 112 px column
+  (`ds::size::DOCUMENT_LABEL`, the inspector's `FIELD_LABEL`) with no kind glyph
+  (`ds::document_row`), the value as body text beside it, a list's items with commas, none a
+  dim dash. The kind stays in the tooltip. A long text shows under its name at the full width,
+  as markdown when it has markup, as before. Enum menus and switches stay controls. A field
+  being edited keeps its text where the value read (`reach` measured from the column's edge, not
+  a pill's inset).
+- **Blobs as compact cards**, each under its name: a `ds::card` whose first line holds the
+  value's kind (PNG, Text, Bytes…, `tile::kind_word`) and size, then Open, Save…, Choose File…
+  and Clear; under it an image's preview, a text's first six lines, or one line of the first
+  eight bytes in hex. "Show bytes" reveals the 128-byte dump and "Hide bytes" folds it again; the
+  peek keeps its dump. A file dropped on the card is stored as before.
+- **Relationships by type, both directions together.** A group's header is the type as the
+  sidebar names it ("Knows"), the arrow and the other type, muted ("→ Person"), its count, then
+  its chevron. The groups of one type sit together, each pair where its first group was in the
+  list; the second direction leaves out the type's name, so "Knows → Person 4" reads over
+  "← Person 1". The "+" shows under the pointer and while its search is open, with its tooltip.
+  The values and the relationships are set apart by space and the "Relationships" label, not a
+  rule.
+- **Reading.** Before the node's read lands, the title and three rows are still bars of the
+  well's grey (`ds::skeleton`), with the type in the meta line, which the page knows already.
+- **Type tints, per graph.** Company and Person hashed to the same brick, so a company among
+  people read as a person. One graph's node types now take different tints: each type takes the
+  tint its name hashes to unless a type before it in name order took it, then the next free one;
+  past eight types the rest keep their hashed tint. It depends only on the graph's set of types,
+  not the schema's order. The tints are a fact about one graph, so the session makes them when it
+  takes the schema (`install_schema`, `studio_theme::TypeTints`) and keeps them with it; every
+  view draws a type in its own graph's tints (`GraphSession::type_tints`), and nothing is
+  process-wide. In the development graph Company keeps brick and Person turns teal; a second
+  graph with Person and Topic draws its Person brick and moves nothing of the first, in any
+  window (review of #161). The hashed colour is not public: a view cannot draw a type outside its
+  graph's tints.
+- **Not done.** The "+" and a property have no key of their own (a group cannot hold the focus
+  yet), as before; the page's `+` shows on hover rather than on a keyboard focus it cannot take.
 
 ### 2. Edit where you read: typed fields and one draft per branch
 
@@ -284,6 +357,16 @@ Four parts, built in this order; each lands on its own.
 | Every String renders as markdown, parsed from its text | `@format("markdown")` in the schema; a Studio setting per property | Plain text renders as itself, so parsing everything costs nothing for text without markup; 0.13 refuses adding an annotation to an existing property, so a schema marker would reach only properties declared with it from the start; a setting lives on one machine |
 | Zed's `editor` and `markdown`, not `markdown_preview` | `markdown_preview` | It needs Zed's `workspace` and `project`, which Studio replaced |
 | D2 saves as two ordered commits, with "Save as one change" through a branch | Refuse mixed drafts | People edit relationships as one thought; the engine's documented way to make mixed work one result is a branch |
+| The page reads as a document: plain values, one title, both directions of a type together, centred (2026-11-20) | The peek's rows and pills at a page's width; a left-aligned column with a gutter | Pills made plain text read as tags or buttons; the name and key showed twice; a centred column keeps the same margin either side, so no control ends mid-screen, where a left-aligned one left a wide empty band to its right |
+| One graph's node types take different tints, assigned in name order | Hash alone (today's); a palette per schema order | Hash alone let Company and Person share brick; name order depends on the set of types, not on how the schema lists them |
+| The tints are kept with each graph's schema, in its session | One process-wide map by type name (this spec's first fix) | The map let a second graph with Person but no Company draw the first graph's people as companies again, in every window; a fact about one graph lives with that graph (review of #161) |
+
+## Follow-ups
+
+- **One owner for how the page and the peek look** (maintainer review of #161, item 6):
+  `peek.rs` branches on `page` in about 27 places (row, value, draft text, an editor's reach,
+  group header, count, list order). A small value that says how this view looks (`row`,
+  `value`, `reach`, `group_header`) would make a new look rule change one place. Not in #161.
 
 ## Deferred
 
@@ -305,6 +388,11 @@ Four parts, built in this order; each lands on its own.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-11-20 | Review of #161: an enum name, copying, and tints across graphs | `type_table` `an_enum_name_keeps_its_row_and_the_title_copies_it`, `an_unnamed_nodes_key_stays_copyable`; `studio_theme` `a_second_graph_keeps_the_first_graphs_types_apart`, `a_second_graphs_schema_leaves_the_first_graphs_tints`; each fails with its fix taken out | Pass. An enum name's row and menu stay and the title copies it; an unnamed node's key is in the meta line and copies; a second graph without Company leaves Person teal |
+| 2026-11-21 | Bugbot on #161: a cleared name left the old name in the tab | `type_table` `node_page::tests::a_cleared_name_leaves_no_stale_tab_title`, which fails with the fix taken out | Pass. Once the node is read, a node with no name names its tab by its id |
+| 2026-11-21 | Maintainer review of #161: one owner for the title's rule, tints per graph, an empty name | `type_table` `peek::page::tests`: `a_graphs_schema_draws_its_types_apart` (fails with the session's `TypeTints::of` taken out), `two_graphs_sharing_a_type_keep_their_own_tints`, `the_title_and_the_list_agree_on_the_name`, `an_empty_name_titles_the_page_by_its_id` (fails with the empty-name filter taken out), and the enum test, which fails if `title_role` stops refusing a picker; `studio_theme` `two_graphs_sharing_a_type_keep_their_own_tints` | Pass |
+| 2026-11-20 | Second review of #161: the copied mark | `type_table` `an_enum_name_keeps_its_row_and_the_title_copies_it`, which fails with the fix taken out | Pass. Copying the title marks the title, not the key; copying the key marks the key |
+| 2026-11-20 | The page reads as a document, and one graph's types take different tints | `type_table` `peek::page::tests`: `a_page_lists_nothing_its_title_and_meta_show` (name and slug rows absent on a page, present in the peek), `the_title_edits_the_name_on_a_click_or_f2` (a click on the title and F2 open the name's row; Esc closes it), `both_directions_of_a_relationship_sit_together` (Knows → and ← adjacent, the second without the type's name, where before every outgoing group came first), `a_groups_add_shows_only_under_the_pointer_or_while_adding`, `a_page_being_read_shows_bars_not_its_id`, `a_blob_is_a_card_whose_bytes_show_on_asking`, `a_card_shows_a_texts_first_lines_and_a_line_of_bytes`; `studio_theme` `one_graphs_types_get_different_tints`. Two older tests changed for the new look only: `a_long_texts_controls_and_folded_draft_sit_in_its_head` uses a `bio` property, since the name is now the title rather than a row, and `only_the_groups_drawn_are_read_and_scrolling_reads_the_rest_once` counts drawn groups in the list's order, which pairs directions. Offscreen snapshots against `script/dev-server` of person-000000, project-00000 and the note lance-versions, light and dark, and of person-000000 before its read lands | person-000000: "Radia Knuth" over "Person · person-000000", then title, email, born and tags as plain text in a 112 px column, then "Contributes → Project 1", "Knows → Person 4" over "← Person 1", "WorksAt → Company 1"; the column centred in its pane. lance-versions: an "attachment" card reading "Bytes 1.0 KB" with "00 01 02 03 04 05 06 07 …", no dump. Reading: bars for the title and three rows under "Person". Company brick, Person teal. No draw-count guard added: the page draws fewer elements than before (no pill boxes or kind icons), the same list and cached parts |
 | 2026-11-18 | ⌘R reads a node's page again at the head, as its Refresh button does | `type_table` `peek::tests::cmd_r_reads_a_nodes_page_again` (another writer's commit changing the node; ⌘R with the page focused reads it at c2; fails with the handler taken out) | Bound only for a node read at its branch's head: a page held at a commit never moves, and an edge is read with its table. "Newer data · Refresh" names the key. Before, ⌘R read only the session and the page kept its old values |
 | 2026-11-11 | A small group counted while the list scrolls stays closed | `type_table` `a_group_counted_while_scrolling_stays_closed` (30 relationships with one neighbour each: those counted before any scroll open; those counted over four scrolls stay closed; once still for `SCROLL_SETTLE`, the next one opens), failing with the rule undone (all 16 open); a person of the personal graph scrolled offscreen with its 60 groups landing (`snapshot` `measure:700,live`), 3.2 ms a frame median, 5.4 ms at most | Fixed. Ragnor saw the inspector stutter while its relationships loaded: no frame was slow, but each small group counted in view opened and pushed every row under it down while the list moved |
 | 2026-11-07 | A save made anywhere moves the views showing it | `type_table` `a_write_made_elsewhere_moves_the_table_with_it` (fails with the announcement off: the table stays at `c1`), `a_write_made_elsewhere_moves_the_page_with_it`, `an_open_editor_takes_a_value_written_elsewhere` (unsaved text stays bound to the value it was typed over) | A table and a page at `c1` move to the write's `c2` with the new name and no "Newer data"; an idle editor shows the new value. Before, a save in the editor left the table it was opened from at the old commit, so the editor opened again from it read the old value there |

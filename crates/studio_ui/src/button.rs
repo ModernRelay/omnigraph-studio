@@ -876,7 +876,12 @@ mod tests {
                                 div().debug_selector(|| "neighbour".into()).child(
                                     ds::SidebarRow::new("neighbour", "Barbara Dahl")
                                         .flush()
-                                        .start(crate::type_mark("Person", "Barbara Dahl", cx)),
+                                        .start(crate::type_mark(
+                                            "Person",
+                                            "Barbara Dahl",
+                                            &crate::TypeTints::default(),
+                                            cx,
+                                        )),
                                 ),
                             ),
                     ),

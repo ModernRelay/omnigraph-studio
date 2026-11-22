@@ -7,7 +7,7 @@ use gpui::{AnyElement, App, Div, Hsla, Pixels, SharedString};
 use serde_json::Value;
 use ui::prelude::*;
 
-pub use studio_theme::type_color;
+pub use studio_theme::TypeTints;
 
 mod button;
 mod cell_text;
@@ -207,26 +207,26 @@ pub fn is_numeric(value: &Value) -> bool {
     matches!(value, Value::Number(_))
 }
 
-/// A small colored square for a node or edge type.
-pub fn type_swatch(type_name: &str, cx: &App) -> Div {
-    type_mark(type_name, type_name, cx)
+/// A small colored square for a node or edge type, in its graph's tint (`tints`).
+pub fn type_swatch(type_name: &str, tints: &TypeTints, cx: &App) -> Div {
+    type_mark(type_name, type_name, tints, cx)
 }
 
 /// A node type's tinted mark, or for a relationship a neutral arrow: a relationship is a line,
 /// not a thing, so only node types carry a colour.
-pub fn kind_swatch(type_name: &str, is_edge: bool, cx: &App) -> Div {
+pub fn kind_swatch(type_name: &str, is_edge: bool, tints: &TypeTints, cx: &App) -> Div {
     if is_edge {
         ds::icon_slot(crate::ds::icon::meta(IconName::ArrowRight))
     } else {
-        type_swatch(type_name, cx)
+        type_swatch(type_name, tints, cx)
     }
 }
 
 /// The type mark: the initial of `label` (a node's label, or the type's name) in white on
 /// the type's tint, a 16-pixel rounded square. The tint says what kind of thing it is, the
-/// letter which one.
-pub fn type_mark(type_name: &str, label: &str, cx: &App) -> Div {
-    let color: Hsla = type_color(type_name);
+/// letter which one. The tint is its graph's (`tints`).
+pub fn type_mark(type_name: &str, label: &str, tints: &TypeTints, cx: &App) -> Div {
+    let color: Hsla = tints.color(type_name);
     let initial = text::initial(label, type_name);
     div()
         .size(px(ds::size::ROW_ICON))

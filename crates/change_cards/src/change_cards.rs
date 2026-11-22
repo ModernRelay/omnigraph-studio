@@ -300,7 +300,7 @@ pub fn kind_mark(id: impl Into<ElementId>, kind: ChangeKind) -> Stateful<Div> {
 /// its counts ("Person +1 ~1 · WorksAt +1"), node types before relationship types. A review and
 /// a commit put it under their heading, so the size and spread of a change read before its
 /// first card.
-pub fn summary_line(counts: &[TypeCounts], cx: &App) -> Div {
+pub fn summary_line(counts: &[TypeCounts], tints: &studio_ui::TypeTints, cx: &App) -> Div {
     let mut ordered: Vec<&TypeCounts> = counts
         .iter()
         .filter(|c| c.added + c.changed + c.removed > 0)
@@ -321,7 +321,7 @@ pub fn summary_line(counts: &[TypeCounts], cx: &App) -> Div {
                 .gap(px(space::SM))
                 .items_center()
                 .tip(studio_ui::ds::tooltip(tip))
-                .child(studio_ui::kind_swatch(&c.type_name, c.is_edge, cx))
+                .child(studio_ui::kind_swatch(&c.type_name, c.is_edge, tints, cx))
                 .child(studio_ui::ds::text::body(c.type_name.clone()))
                 .child(change_counts(c.added, c.changed, c.removed))
         }))
@@ -606,6 +606,7 @@ pub fn run_row(
     words: RunWords,
     folded: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    tints: &studio_ui::TypeTints,
     cx: &App,
 ) -> AnyElement {
     let RunWords {
@@ -631,7 +632,12 @@ pub fn run_row(
         } else {
             IconName::ChevronDown
         }))
-        .child(studio_ui::kind_swatch(&run.type_name, run.is_edge, cx))
+        .child(studio_ui::kind_swatch(
+            &run.type_name,
+            run.is_edge,
+            tints,
+            cx,
+        ))
         .child(studio_ui::ds::text::body(run.type_name.clone()))
         .child(change_counts(run.added, run.changed, run.removed))
         .child(

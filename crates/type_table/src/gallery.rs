@@ -1684,7 +1684,12 @@ impl TypeGallery {
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         studio_ui::ds::toolbar(cx)
             .children(studio_workspace::view_strip(Item::views(self, cx), cx))
-            .child(studio_ui::kind_swatch(&self.type_name, false, cx))
+            .child(studio_ui::kind_swatch(
+                &self.type_name,
+                false,
+                self.session.read(cx).type_tints(),
+                cx,
+            ))
             .child(studio_ui::ds::text::title(self.type_name.clone()))
             .child(studio_ui::ds::text::muted(self.count_text()))
             .children(self.render_diff_counts())

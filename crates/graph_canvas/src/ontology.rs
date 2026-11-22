@@ -124,7 +124,7 @@ impl Render for TypeNote {
             .child(
                 h_flex()
                     .gap(px(space::SM))
-                    .child(ds::type_dot(&name))
+                    .child(ds::type_dot(&name, self.session.read(cx).type_tints()))
                     .child(
                         div()
                             .flex_1()
@@ -679,7 +679,7 @@ impl OntologyPage {
             .child(
                 ds::card_header(cx)
                     .h(px(CENTRE_HEADER))
-                    .child(ds::type_dot(&name))
+                    .child(ds::type_dot(&name, self.session.read(cx).type_tints()))
                     .child(
                         div()
                             .flex_1()
@@ -795,7 +795,10 @@ impl OntologyPage {
                             .flex_none()
                             .max_w(relative(0.5))
                             .gap(px(space::SM))
-                            .child(ds::type_dot(&other_name))
+                            .child(ds::type_dot(
+                                &other_name,
+                                self.session.read(cx).type_tints(),
+                            ))
                             .child(ds::text::body(other_name.clone()).single_line().truncate());
                         let tooltip = match &edge.about {
                             Some(about) => {
