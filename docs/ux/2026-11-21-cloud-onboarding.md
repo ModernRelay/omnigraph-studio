@@ -134,9 +134,9 @@ public site copy is quoted, in short phrases.
 
 - **Status.** Cloud is in "private preview · waitlist", and the waitlist is the way in:
   "Invitations go out from this list." Studio must not imply anyone can sign in and get a cluster.
-- **The pitch.** "Omnigraph, managed for you": a dedicated cluster per organisation, managed upgrades
-  and backups, and a control plane with SSO, scoped tokens, policy and audit. The open engine is
-  framed as the way out ("exportable at any time"), not as the pitch.
+- **What Cloud is.** A dedicated cluster per organisation, managed upgrades and backups, and a
+  control plane with SSO, scoped tokens, policy and audit. The site has a pitch line for it; Studio
+  does not repeat it, or any other benefit slogan (see Copy, below).
 - **Voice.** Plain and literal: headings say what the section holds, no slogans. That is Studio's
   voice too. Studio keeps its own spelling ("organization").
 - **Promises Studio should not repeat.** The site's copy is marked draft until signed off, and it
@@ -158,15 +158,25 @@ public site copy is quoted, in short phrases.
 ### Principles
 
 1. **Answer, don't advertise.** The waitlist appears only where the person is already looking at
-   Cloud, or where Studio would otherwise leave them stuck. No toast, badge, banner, modal or count
-   of sessions.
+   Cloud, or where Studio would otherwise leave them stuck. No badge, banner, modal or count of
+   sessions. The one toast is the Copy Link note for a server on this computer (touchpoint 7),
+   which says a fact the person needs first.
 2. **The browser does the asking.** Studio opens the site's Cloud page; the person types their email
    there. Studio sends nothing, stores no email and makes no new request (constitution I is
    unchanged: opening the browser is not a request of Studio's).
 3. **Say only what the site says.** "Private preview", "invitations go out from the waitlist".
    Anything more is a link.
 4. **Gone once it is moot.** Every waitlist line disappears while Studio holds an Omnigraph Cloud
-   sign-in that lists an organization, and while `omnigraph_cloud` is empty.
+   sign-in that lists an organization, while `omnigraph_cloud` is empty, and while it names
+   another address than Omnigraph Cloud's own.
+
+### Copy
+
+Studio's Cloud copy is factual, never promotional. It states the fact and the action, for example
+"Omnigraph Cloud is in private preview. Invitations go out from the waitlist." with "Join the
+waitlist ↗", or "No organization has you as a member yet." It has no rhetorical question, no
+pitch line or benefit slogan ("managed for you", "runs it for you"), no exclamation mark and no
+urgency. An earlier draft of this study had such lines; they are gone.
 
 ### The link
 
@@ -174,15 +184,16 @@ public site copy is quoted, in short phrases.
 https://www.omnigraph.dev/cloud?utm_source=omnigraph-studio&utm_medium=app&utm_content=<surface>#join
 ```
 
-`<surface>` is one of `get-started`, `sign-in`, `no-organizations`, `settings`, `local-recipe`,
-`help`. The query is constant text: no version, no ID, nothing about the person or their graphs. It
-lives in one constant beside `OMNIGRAPH_CLOUD` in `studio_settings`, and the surfaces are an enum, so
-a test can check every link and that none carries anything else.
+`<surface>` is one of `get-started`, `sign-in`, `no-organizations`, `sidebar`, `settings`,
+`copy-link`, `help`, `about`, `local-recipe`. The query is constant text: no version, no ID,
+nothing about the person or their graphs. It lives in one constant beside `OMNIGRAPH_CLOUD` in
+`studio_settings`, and the surfaces are an enum, so a test can check every link and that none
+carries anything else.
 
-One action, `studio::JoinCloudWaitlist { surface }`, opens it, so it is in the palette as
-"Omnigraph Cloud: Join the Waitlist" and in the Help menu, and buttons dispatch it. AGENTS.md asks
-every action for a default binding; this one should be the documented exception, since a shortcut
-for a web page earns nothing. If the rule stands, give it a chord no one will hit by accident.
+One action, `studio::JoinCloudWaitlist`, opens it from the Help menu and the palette as "Join the
+Omnigraph Cloud Waitlist". AGENTS.md asks every action for a default binding, and it has one, a
+chord no one hits by accident (⌘⌥⇧J). It follows the same rule: disabled in the menu and absent
+from the palette where the waitlist is not offered.
 
 ### The touchpoints, in order
 
@@ -193,15 +204,15 @@ offers both ways in. This is the first run with no server, and the one place eve
 Get started
 Open a graph you have, or make one.
 
- [◎] Omnigraph Cloud      Hosted Omnigraph, in private preview. Sign in, or join the waitlist.
+ [◎] Omnigraph Cloud      In private preview.              Join the waitlist ↗
  [▤] Connect to a server  Add a server by its address.
  [>] Make a local graph   Run a graph on this computer with the Omnigraph CLI.
 ```
 
 ```
                          Omnigraph Cloud
-     Omnigraph, managed for you. In private preview: invitations go
-                     out from the waitlist.
+   Omnigraph Cloud is in private preview. Invitations go out from the
+   waitlist. Once invited, sign in to open your organization's clusters.
 
                  ( Sign in )   Join the waitlist ↗
 ```
@@ -215,9 +226,9 @@ words):
 
 ```
                          Omnigraph Cloud
-   You are signed in as ACCOUNT, but no organization has you as a member
-   yet. Omnigraph Cloud is in private preview: an owner can invite you, or
-                  join the waitlist for an invitation.
+   Signed in as ACCOUNT. No organization has you as a member yet.
+   Omnigraph Cloud is in private preview. An owner of an organization can
+        invite you, and invitations go out from the waitlist.
 
           ( Join the waitlist ↗ )   ( Refresh )   ( Sign out )
 ```
@@ -229,32 +240,40 @@ no organization here." Surface `no-organizations`.
 **3. Settings → Omnigraph Cloud, Account row, signed out.**
 
 ```
-Account                                                     ( Sign in )
-Not signed in. Omnigraph Cloud is in private preview; invitations go
-out from the waitlist. Join the waitlist ↗
+Account                              Join the waitlist ↗   ( Sign in )
+Not signed in. Omnigraph Cloud is in private preview. Invitations go
+out from the waitlist.
 ```
 
-The link sits in the description, after the facts, as Settings links elsewhere. Surface `settings`.
-The same change gives "Sign-in unavailable" its Try again here (dead end 3).
+The link sits beside Sign in, which stays the primary button. Surface `settings`. The same change
+gives "Sign-in unavailable" its Try again here (dead end 3).
 
-**4. The local recipe, one line under its steps.** The moment a person chooses to run a server
-themselves is the one moment the hosted alternative is relevant and new to them.
+**4. The local recipe, one line under its steps.**
 
 ```
 4. Start the server, and leave it running.
    omnigraph-server --cluster ~/omnigraph/data --bind 127.0.0.1:8787 …
 
-Rather not keep a server running? Omnigraph Cloud runs it for you,
-in private preview. Join the waitlist ↗
+Omnigraph Cloud: private preview · Join the waitlist ↗
                                                   ( Cancel ) ( Connect )
 ```
 
-Muted text, below the steps and above nothing that matters; it never moves Connect. Surface
-`local-recipe`.
+Muted text, below the steps and above nothing that matters; it never moves Connect. Nothing else,
+and no question. Surface `local-recipe`.
 
-**5. Help menu and palette.** "Omnigraph Cloud Waitlist…" under Help, beside a new "Omnigraph
-Website" item (the Help menu has no link to the site today). Surface `help`. This is where people who
-dismissed nothing, but want it later, will look.
+**5. Help menu and palette.** "Join the Omnigraph Cloud Waitlist" under Help and in the palette,
+with its binding. Surface `help`. This is where people who want it later will look.
+
+**6. The Open dialog's sidebar, Omnigraph Cloud's row, signed out.** A muted second line under
+"Sign in": "Private preview · Join the waitlist ↗". Surface `sidebar`.
+
+**7. Copy Link to a server on this computer.** A link to `127.0.0.1`, `localhost` or `[::1]`
+opens nowhere else, so Copy Link says so in a toast: "This link opens only on this Mac." with
+"Omnigraph Cloud: private preview" and Join the waitlist while the waitlist is offered. A server
+others reach gets no toast, as before. Surface `copy-link`.
+
+**8. About.** One line under the version: "Omnigraph Cloud: private preview · Join the waitlist ↗".
+Surface `about`.
 
 ### Rejected
 
@@ -263,8 +282,6 @@ dismissed nothing, but want it later, will look.
 | After N local sessions | Needs Studio to count sessions to market to the person, and is a nag by design. |
 | When a local graph grows | No size means "needs Cloud"; reading sizes for marketing is work Studio should not do. |
 | Cloud-only features (backups, sharing, access control, hosted agents) | Studio has no such gate: Cedar policy, branches and the agent panel work on any server. Inventing locked features to sell Cloud would be dishonest. |
-| Copy Link on a loopback server | A real limit (the link opens only on this computer), worth a tooltip that says so; tying an upsell to it would read as a trap. Possibly later, as the tooltip alone. |
-| About window | People open it for the version. A line there is harmless but nobody looks; the Help item covers it. |
 | In-app release notes | Studio has none; GitHub release notes are the brand's call, not the app's. |
 | An in-app email form | See below. |
 
@@ -282,8 +299,9 @@ better design.
 
 ### Frequency, dismissal and special cases
 
-- **No frequency to manage.** Each touchpoint is part of a screen the person opened. Nothing appears
-  on a timer, on launch or after an event, so there is nothing to snooze.
+- **No frequency to manage.** Each touchpoint is part of a screen the person opened, or, for
+  Copy Link, follows what they just did. Nothing appears on a timer or on launch, so there is
+  nothing to snooze.
 - **No dismissal needed, and none faked.** The lines are static and small; a close button on them
   would imply they come back. If one is ever made more prominent (a band, a card), it gets a close
   button whose choice Studio keeps in its data folder forever, and never shows again.
@@ -291,8 +309,8 @@ better design.
   from the waitlist" read correctly for someone already on it, and the site handles a second signup.
 - **Already in Cloud.** A held Omnigraph Cloud sign-in with at least one organization removes every
   touchpoint. A person signed out of Cloud sees touchpoints 1 and 3, which still begin with Sign in.
-- **Cloud turned off** (`omnigraph_cloud` empty, as an admin might ship it): no touchpoint at all,
-  including Help.
+- **Cloud turned off** (`omnigraph_cloud` empty, as an admin might ship it), or pointed at another
+  address: no touchpoint at all; Help's item is disabled.
 - **Offline.** Studio checks nothing before opening the link; the browser shows its own offline page.
   Studio never fetches the site, so offline costs nothing and leaks nothing.
 - **Another control plane** named by a CLI profile: no waitlist on its panes. The waitlist is
@@ -317,11 +335,10 @@ better design.
 1. **Fix the dead ends** (no marketing): Try again in Settings when sign-in is unavailable; "the
    control plane", not "the server", in its reason; "No clusters" shows `omnigraph cluster create`;
    the empty-address message links to the setting.
-2. **Touchpoints 1 and 2** with the action, the link constant and its test, and the privacy.md
-   sentence. These carry the most people and the clearest "why now".
-3. **The brand-repo change** so the site attributes signups to Studio. Ship it before or with step 2.
-4. **Touchpoints 3 and 4.**
-5. **Help menu**, with the website item.
+2. **Touchpoints 1 to 8**, through one module for the rule, text and link, with the action, the
+   link constant and its test, and the privacy.md sentence. Built in #164 (spec 047).
+3. **The brand-repo change** so the site attributes signups to Studio.
+4. **An "Omnigraph Website" Help item**, if wanted.
 
 ## What this study could not check
 
