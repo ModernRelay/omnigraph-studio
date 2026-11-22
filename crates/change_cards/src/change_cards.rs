@@ -154,6 +154,15 @@ pub fn change_rows(
     })
 }
 
+/// One change's property rows, as a card draws them: the ends a lone relationship moved, then
+/// its changed properties, a Blob by its size. For a view that keeps its own changes, as a
+/// node's history does (spec 046).
+pub fn rows_of(change: &FoldedChange, schema: Option<&SchemaModel>) -> Vec<PropertyRow> {
+    let mut rows = moved_end_rows(change);
+    rows.extend(property_rows(change, schema));
+    rows
+}
+
 /// What a change did to its entity, as a card says it.
 pub fn kind_of_change(change: &FoldedChange) -> ChangeKind {
     kind_of(change.net())
@@ -978,6 +987,13 @@ fn blob_words(value: &Value) -> Value {
             Some(payload) => format!("Blob · {}", format_bytes(base64_len(payload))),
             None => format!("Blob · {text}"),
         },
+        // A node's history holds a stored file by its exact size (spec 046).
+        Value::Object(cell) if cell.len() == 1 && cell.contains_key("size") => {
+            match cell.get("size").and_then(Value::as_u64) {
+                Some(size) => format!("Blob · {}", format_bytes(size)),
+                None => "Blob".to_owned(),
+            }
+        }
         Value::Object(range) => {
             let uri = range.get("uri").and_then(Value::as_str).unwrap_or("?");
             match range.get("length").and_then(Value::as_u64) {
@@ -1106,6 +1122,12 @@ mod tests {
         );
         let (b, a) = blob_sides(None, Some(&json!("base64:aGk=")));
         assert_eq!((b, a.unwrap()), (None, json!("Blob · 2 B")));
+        // A node's history holds a stored file by its exact size: formatted here, and two sizes
+        // that round alike still read changed.
+        let (b, a) = blob_sides(Some(&json!({"size": 1_200})), Some(&json!({"size": 1_240})));
+        let (b, a) = (b.unwrap(), a.unwrap());
+        assert!(b.as_str().unwrap().starts_with("Blob · 1.2 KB · "), "{b}");
+        assert_ne!(b, a);
     }
 
     /// A card of many relationships shows its first few, more each time they are asked for,

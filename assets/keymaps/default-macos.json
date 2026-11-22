@@ -484,6 +484,19 @@
     }
   },
   {
+    "context": "NodeHistory",
+    "bindings": {
+      "j": "menu::SelectNext",
+      "down": "menu::SelectNext",
+      "k": "menu::SelectPrevious",
+      "up": "menu::SelectPrevious",
+      "enter": "menu::Confirm",
+      "space": "studio_changes::ToggleChange",
+      "cmd-alt-n": "studio_history::ReadOlderCommits",
+      "cmd-alt-f": "studio_history::FindWhenCreated"
+    }
+  },
+  {
     "context": "History && searching",
     "bindings": {
       "enter": "studio_history::NextMatch",

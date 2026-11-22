@@ -2019,6 +2019,61 @@ pub fn node_by_id(
     Ok(one_by_id(node(schema, type_name)?, id, "studio_node", "$n"))
 }
 
+/// One node by `@id` as its history reads it at each commit (spec 046): at most one row, the
+/// node's object (`n`) with its non-Blob properties. Named apart from the page's read, so the
+/// ledger tells the two apart.
+pub fn history_node(
+    schema: &SchemaModel,
+    type_name: &str,
+    id: &str,
+) -> Result<BuiltQuery, BuildError> {
+    Ok(one_by_id(
+        node(schema, type_name)?,
+        id,
+        "node_history_node",
+        "$n",
+    ))
+}
+
+/// The edges of node `id` through one relationship group as its history reads them at each
+/// commit (spec 046): each edge's id (`edge`) and its other end's (`id`), by edge id, at most
+/// `limit` rows. An edge without a key is never updated (T16), so its id says all a commit did
+/// to it; a keyed edge is changed in place by an upsert under the same id, so its properties
+/// outside the key ([`EdgeType::changed_in_place`]) are read too, each as `v_<name>`.
+pub fn history_edges(
+    schema: &SchemaModel,
+    type_name: &str,
+    group: &RelationshipGroup,
+    id: &str,
+    limit: u32,
+) -> Result<BuiltQuery, BuildError> {
+    let node = node(schema, type_name)?;
+    let Some(edge) = schema.edge(&group.edge) else {
+        return Err(BuildError::UnknownEdge(group.edge.clone()));
+    };
+    let mut params = Params::new();
+    let id_param = params.add("id", "String", Value::String(id.to_owned()));
+    let values: String = edge
+        .changed_in_place()
+        .iter()
+        .map(|p| format!(", $e.{} as v_{}", p.name, p.name))
+        .collect();
+    let text = format!(
+        "query node_history_edges({sig}) {{\n  match {{\n    $n: {ty}\n    $n.@id = {id_param}\n    {traversal}\n  }}\n  return {{ $e.@id as edge, $m.@id as id{values} }}\n  order {{ $e.@id asc }}\n  limit {limit}\n}}\n",
+        sig = params.signature(),
+        ty = node.name,
+        traversal = traversal_clause(group, Some("e")),
+    );
+    Ok(BuiltQuery {
+        name: "node_history_edges".into(),
+        text,
+        params: params.values,
+        depends: Depends::Unknown,
+        seeds: None,
+        empty_without: None,
+    })
+}
+
 /// Query `name`: the node of `node`'s type whose `@id` is `id`, at most one row, returning
 /// `returns`.
 fn one_by_id(node: &NodeType, id: &str, name: &str, returns: &str) -> BuiltQuery {
@@ -5240,6 +5295,50 @@ mod tests {
         assert!(query.text.contains("$n.name as v_name"), "{}", query.text);
         assert!(query.text.contains("limit 2"), "{}", query.text);
         assert!(nodes_fields_by_id(&schema, "Person", &ids, &["nope".to_owned()]).is_err());
+    }
+
+    /// A node's history reads the node, and each relationship group's edges with their ids,
+    /// at either end (spec 046).
+    #[test]
+    fn a_nodes_history_reads_compile() {
+        let schema = dev();
+        let query = history_node(&schema, "Person", "person-000000").unwrap();
+        assert_compiles(&query);
+        assert_eq!(query.name, "node_history_node");
+        for group in schema.relationships_of("Person") {
+            let query = history_edges(&schema, "Person", group, "person-000000", 1000).unwrap();
+            assert_compiles(&query);
+            assert!(query.text.contains("$e.@id as edge"), "{}", query.text);
+        }
+    }
+
+    /// A keyed edge is changed in place by an upsert under the same id, so its history reads
+    /// its properties outside the key; an edge without a key is read by its id alone (review of
+    /// #162).
+    #[test]
+    fn a_keyed_edges_history_reads_what_an_upsert_changes() {
+        let schema = SchemaModel::parse(
+            "node Person {\n  name: String @key\n}\n\
+             edge Knows: Person -> Person {\n  since: String?\n  @key(@src, @dst)\n}\n\
+             edge Met: Person -> Person {\n  place: String?\n}\n",
+        )
+        .unwrap();
+        let knows = schema.edge("Knows").unwrap();
+        assert!(knows.keyed);
+        let names: Vec<&str> = knows
+            .changed_in_place()
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(names, ["since"]);
+        assert!(!schema.edge("Met").unwrap().keyed);
+        for group in schema.relationships_of("Person") {
+            let query = history_edges(&schema, "Person", group, "ada", 1000).unwrap();
+            assert_compiles_in(&schema, &query);
+            let reads_since = query.text.contains("$e.since as v_since");
+            assert_eq!(reads_since, group.edge == "Knows", "{}", query.text);
+            assert!(!query.text.contains("place"), "{}", query.text);
+        }
     }
 
     /// A gallery of listed rows reads them whole, by id, in id order (spec 035).

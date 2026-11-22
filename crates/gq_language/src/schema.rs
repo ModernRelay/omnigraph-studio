@@ -142,9 +142,26 @@ pub struct EdgeType {
     pub properties: Vec<Property>,
     /// What the schema says the relationship is ([`about`]).
     pub about: Option<String>,
+    /// The edge type declares a `@key` (`@key(@src, @dst, …)`): its id is derived from the key,
+    /// so inserting the key again changes the edge in place, under the same id (an upsert).
+    pub keyed: bool,
 }
 
 impl EdgeType {
+    /// The properties a change to an edge of this type can set in place: a keyed edge's
+    /// properties outside its key, which an upsert changes under the same id. None for an edge
+    /// without a key, which is never updated: a change to it is a new edge. Blobs and vectors
+    /// are left out, as a history compares no bytes.
+    pub fn changed_in_place(&self) -> Vec<&Property> {
+        if !self.keyed {
+            return Vec::new();
+        }
+        self.properties
+            .iter()
+            .filter(|p| !p.is_key && !matches!(p.kind, ScalarKind::Blob | ScalarKind::Vector))
+            .collect()
+    }
+
     /// How a query names the edge in a traversal ([`traversal_token`]).
     pub fn traversal(&self) -> String {
         traversal_token(&self.name)
@@ -280,6 +297,10 @@ impl SchemaModel {
                     min: edge.cardinality.min,
                     properties,
                     about: declared(&file, &edge.name).and_then(about),
+                    keyed: edge
+                        .constraints
+                        .iter()
+                        .any(|c| matches!(c, Constraint::Key(_))),
                 }
             })
             .collect();

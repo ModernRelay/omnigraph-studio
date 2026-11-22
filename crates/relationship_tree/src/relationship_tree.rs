@@ -393,6 +393,7 @@ impl Item for RelationshipTree {
                 ViewLink::to(ViewKind::Page),
                 ViewLink::current(ViewKind::Tree),
                 ViewLink::to(ViewKind::Canvas),
+                ViewLink::to(ViewKind::History),
             ],
             Subject::Set(set) => {
                 let canvas = match self.walks_from() {
@@ -432,6 +433,14 @@ impl Item for RelationshipTree {
                 at_commit,
                 preview: true,
             })),
+            // The root's history, at the branch head (spec 046).
+            (Subject::Node(root), ViewKind::History) => {
+                Some(Box::new(studio_actions::graph::ShowNodeHistory {
+                    type_name: root.type_name.clone(),
+                    id: root.id.clone(),
+                    preview: true,
+                }))
+            }
             (Subject::Set(_), ViewKind::Canvas) => {
                 let node = self.walks_from()?;
                 Some(Box::new(ShowNodeOnCanvas {

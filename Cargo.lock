@@ -4228,6 +4228,7 @@ version = "0.4.11"
 dependencies = [
  "change_cards",
  "editor",
+ "futures",
  "gpui",
  "gq_language",
  "graph_client",

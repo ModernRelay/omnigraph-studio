@@ -443,6 +443,7 @@ impl NodePeek {
                             .child(studio_ui::ds::text::code(short, cx).color(Color::Muted)),
                     )
             }))
+            .children(self.render_last_change(cx))
             // A node opened by id reads again by id; an edge is read with its table.
             .when(self.newer && is_node, |meta| {
                 meta.child(
@@ -458,6 +459,63 @@ impl NodePeek {
                         .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
                 )
             })
+    }
+
+    /// "Last changed by <actor> · <time>", once the node's history was read at the commit the
+    /// page shows (spec 046): the page reads no history itself, and says nothing until then. A
+    /// click opens the History.
+    fn render_last_change(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let PeekSubject::Node { type_name, id } = &self.subject else {
+            return None;
+        };
+        if self.holds_commit {
+            return None;
+        }
+        let last = self.session.read(cx).last_change(type_name, id)?.clone();
+        if self.snapshot.as_deref() != Some(last.head.as_str()) {
+            return None;
+        }
+        let who = last.actor.clone().unwrap_or_else(|| "no actor".to_owned());
+        let when = studio_ui::relative_time(last.at, studio_ui::now_micros());
+        let tip = format!(
+            "In commit {} · {}",
+            studio_ui::short_commit_id(&last.commit),
+            studio_ui::utc_date_time(last.at)
+        );
+        let open = studio_actions::graph::ShowNodeHistory {
+            type_name: type_name.clone(),
+            id: id.clone(),
+            preview: true,
+        };
+        Some(
+            h_flex()
+                .gap(px(space::SM))
+                .items_center()
+                .child(studio_ui::ds::text::muted("·"))
+                .child(
+                    div()
+                        .id("page-last-change")
+                        .debug_selector(|| "page-last-change".into())
+                        .cursor_pointer()
+                        .tip_fn(move |_, cx| {
+                            studio_ui::ds::tooltip_for_action_view(
+                                format!("{tip}. Open its History"),
+                                &studio_actions::workspace::OpenViewAt {
+                                    index: 3,
+                                    beside: false,
+                                },
+                                cx,
+                            )
+                        })
+                        .on_click(move |_, window, cx| {
+                            window.dispatch_action(Box::new(open.clone()), cx)
+                        })
+                        .child(studio_ui::ds::text::muted(format!(
+                            "Last changed by {who} · {when}"
+                        ))),
+                )
+                .into_any_element(),
+        )
     }
 
     /// The node's Blobs on a page, each under its name as a compact card: its kind and size,
@@ -668,6 +726,42 @@ mod tests {
         });
         cx.run_until_parked();
         (view, cx)
+    }
+
+    /// The page reads no history; once the node's history was read at the commit it shows, its
+    /// meta line says who changed it last, and not for a history read at another commit.
+    #[gpui::test]
+    async fn the_meta_line_says_who_changed_the_node_once_its_history_is_read(
+        cx: &mut TestAppContext,
+    ) {
+        let session = session(PEOPLE, cx);
+        let (view, cx) = open(session.clone(), true, cx);
+        assert!(
+            cx.debug_bounds("page-last-change").is_none(),
+            "nothing read"
+        );
+        let shown = view
+            .read_with(cx, |view, _| view.snapshot.clone())
+            .expect("read");
+        let last = |head: &str| graph_store::node_history::LastChange {
+            head: head.to_owned(),
+            commit: "c9".into(),
+            actor: Some("act-dev".into()),
+            at: 0,
+        };
+        session.update(cx, |session, cx| {
+            session.hold_last_change("Person", "p1", last("another-head"), cx)
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("page-last-change").is_none(),
+            "read at another commit"
+        );
+        session.update(cx, |session, cx| {
+            session.hold_last_change("Person", "p1", last(&shown), cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("page-last-change").is_some());
     }
 
     /// A page shows the name as its title and the key in its meta line, and lists neither

@@ -613,6 +613,7 @@ impl Item for GraphCanvas {
             ViewLink::to(ViewKind::Page),
             ViewLink::to(ViewKind::Tree),
             ViewLink::current(ViewKind::Canvas),
+            ViewLink::to(ViewKind::History),
         ]
     }
 
@@ -635,6 +636,12 @@ impl Item for GraphCanvas {
                 type_name: root.type_name.clone(),
                 id: root.id.clone(),
                 at_commit: at_commit.clone(),
+                preview: true,
+            })),
+            // The root's history, at the branch head (spec 046).
+            ViewKind::History => Some(Box::new(studio_actions::graph::ShowNodeHistory {
+                type_name: root.type_name.clone(),
+                id: root.id.clone(),
                 preview: true,
             })),
             _ => None,
