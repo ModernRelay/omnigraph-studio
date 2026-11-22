@@ -768,6 +768,7 @@ impl NodeHistoryView {
         let focus = self.focus_handle.clone();
         Some(
             h_flex()
+                .debug_selector(|| "node-history-search".into())
                 .gap(px(space::MD))
                 .when(offered || running, |row| {
                     row.child(
@@ -1370,6 +1371,9 @@ impl Render for NodeHistoryView {
                                 .on_click(cx.listener(|this, _, _, cx| this.read_older(cx))),
                             )
                         })
+                        // The search for its creation is offered here too: the node is there,
+                        // unchanged, and created before the window.
+                        .children(self.render_search(cx))
                         .into_any_element()
                 }
             },
@@ -2068,6 +2072,26 @@ mod tests {
             session.last_change("Person", "hub").cloned()
         });
         assert!(last.is_none(), "no last change is claimed");
+    }
+
+    /// A node that is there, unchanged in the window and created before it, offers Find when it
+    /// was created in its empty state, and shows what the search found there (Bugbot, #162).
+    #[gpui::test]
+    async fn an_unchanged_node_offers_the_search_in_its_empty_state(cx: &mut TestAppContext) {
+        let (session, _, _) = serve(Served::default(), cx);
+        let (view, cx) = open(&session, "hub", cx);
+        assert!(cx.debug_bounds("node-history-empty").is_some());
+        assert!(cx.debug_bounds("node-history-search").is_some(), "offered");
+        cx.update(|window, cx| window.focus(&view.focus_handle(cx), cx));
+        cx.simulate_keystrokes("cmd-alt-f");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(matches!(&view.coverage.creation, Creation::Found(c) if c.id == "c0"));
+        });
+        assert!(
+            cx.debug_bounds("node-history-search").is_some(),
+            "its note shows"
+        );
     }
 
     /// A removal whose relationships were too large to follow says so, not that none were read
