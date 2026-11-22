@@ -234,6 +234,18 @@ pub mod workspace {
         ]
     );
 
+    /// Join the Omnigraph Cloud waitlist: opens its page on omnigraph.dev in the browser.
+    /// Studio sends nothing itself. Offered while Omnigraph Cloud is on at its own address and
+    /// no sign-in there is in an organization (spec 047).
+    #[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = studio)]
+    #[serde(default)]
+    pub struct JoinCloudWaitlist {
+        /// The place in Studio it is chosen from, which the page's address names: `help`
+        /// (the menu, the palette and the key) when empty, or `copy-link`.
+        pub from: Option<String>,
+    }
+
     /// Open an `omnigraph-studio://` link: a graph, a node, or a query to read. A link never
     /// runs a query or adds a server.
     #[derive(Clone, Debug, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action)]

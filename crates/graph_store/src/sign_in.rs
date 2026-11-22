@@ -86,6 +86,25 @@ pub trait Keychain: Send + Sync + 'static {
     fn delete(&self, key: String) -> BoxFuture<'static, Result<(), String>>;
 }
 
+/// A keychain that holds nothing and keeps nothing: what a debug build drawn offscreen uses with
+/// `OMNIGRAPH_STUDIO_KEYCHAIN=none`, so it never reads the sign-ins this computer's keychain
+/// holds (spec 047, screenshots).
+pub struct NoKeychain;
+
+impl Keychain for NoKeychain {
+    fn read(&self, _: String) -> KeychainRead {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn write(&self, _: String, _: String, _: Vec<u8>) -> BoxFuture<'static, Result<(), String>> {
+        Box::pin(async { Err("This build keeps no sign-in.".to_owned()) })
+    }
+
+    fn delete(&self, _: String) -> BoxFuture<'static, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
 /// Deletes `key`'s item, and says what the keychain holds there after: nothing once the next
 /// launch would read none, so a key that held nothing is no refusal, and neither is one the
 /// keychain cannot read: a launch takes such a read as nothing kept, as where no keychain is

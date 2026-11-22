@@ -1,6 +1,6 @@
 # Omnigraph Studio privacy notice
 
-Last updated: 18 November 2026
+Last updated: 21 November 2026
 
 This notice covers the Omnigraph Studio desktop app ("Studio"). It says where your graphs go;
 what Studio sends to us, which from version 0.4.7 is no report of any kind; which requests
@@ -39,6 +39,11 @@ nothing there until you have signed in to it.
 and your IP address under [GitHub's privacy statement](https://docs.github.com/site-policy/privacy-policies/github-general-privacy-statement).
 We receive nothing from these checks. With **Update automatically** off in Settings, Studio
 checks only when you ask it to.
+
+**Join the waitlist.** Where Studio offers Omnigraph Cloud's waitlist, the link opens
+omnigraph.dev's Cloud page in your browser, with the place in Studio you clicked it in the
+address (`utm_content`, for example `get-started`). Studio sends nothing itself and stores
+nothing about it; you give your email on the page, under the site's own privacy notice.
 
 **The list of AI models, in versions 0.3.0 to 0.4.10.** When one of these versions starts and
 its copy of the list is more than a day old, it reads the list of AI models and their prices

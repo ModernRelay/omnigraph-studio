@@ -74,7 +74,7 @@ const NODE_NAMES: &str = "Node names";
 
 /// The section of the Omnigraph Cloud address, which also shows its sign-in (spec 021, The
 /// settings pages).
-const CLOUD: &str = "Omnigraph Cloud";
+pub(crate) const CLOUD: &str = "Omnigraph Cloud";
 
 /// Every control plane's clusters, Omnigraph Cloud's or not (spec 021, The settings pages).
 const CLUSTERS: &str = "Clusters";

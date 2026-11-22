@@ -104,6 +104,13 @@ impl Render for AboutWindow {
                     .debug_selector(|| "about-version".into())
                     .child(ds::text::body(version_line())),
             )
+            // One line under the version while Studio offers the waitlist (spec 047).
+            .when(crate::waitlist::offered_now(cx), |about| {
+                about.child(crate::waitlist::note(
+                    crate::waitlist::Surface::About,
+                    crate::waitlist::PREVIEW_SHORT,
+                ))
+            })
             .child(
                 v_flex()
                     .items_center()
@@ -161,6 +168,46 @@ mod tests {
         for part in ["about-icon", "about-name", "about-version", "about-licence"] {
             assert!(cx.debug_bounds(part).is_some(), "{part} was not drawn");
         }
+    }
+
+    /// One line under the version offers the waitlist while Studio offers it, and none once
+    /// signed in to an organization (spec 047).
+    #[gpui::test]
+    fn the_window_offers_the_waitlist_by_its_rule(cx: &mut TestAppContext) {
+        init(cx);
+        let (registry, _) = cx.update(graph_store::ConnectionRegistry::init_for_tests);
+        let cloud = cx.new(|cx| {
+            let mut plane =
+                graph_store::ControlPlane::new(studio_settings::OMNIGRAPH_CLOUD.into(), None, cx);
+            plane.set_default_for_test(true, cx);
+            plane
+        });
+        registry.update(cx, |registry, _| {
+            registry.control_planes = vec![cloud.clone()]
+        });
+        let (about, cx): (_, &mut VisualTestContext) = cx.add_window_view(AboutWindow::new);
+        cx.run_until_parked();
+        let note = cx
+            .debug_bounds("waitlist-link-about")
+            .expect("the waitlist line");
+        cx.simulate_click(note.center(), gpui::Modifiers::none());
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some(crate::waitlist::url(crate::waitlist::Surface::About).as_str())
+        );
+        cloud.update(cx, |plane, cx| {
+            plane.signed_in_for_test(
+                vec![control_client::OrganizationSummary {
+                    organization_id: "org_1".into(),
+                    name: Some("Acme".into()),
+                }],
+                Vec::new(),
+                cx,
+            )
+        });
+        about.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("waitlist-link-about").is_none());
     }
 
     /// Cmd-W is File → Close Tab's key, and macOS sends the menu's action before the keymap

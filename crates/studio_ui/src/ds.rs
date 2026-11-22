@@ -1761,6 +1761,14 @@ pub fn button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Butto
     Button::new(id, label)
 }
 
+/// A link inside a line of muted text ("Omnigraph Cloud: private preview · Join the waitlist ↗"):
+/// a ghost button with no height or padding of its own, so it sits on the line as a word does.
+pub fn link_button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
+    button(id, label)
+        .variant(Variant::Ghost)
+        .size(ButtonSize::None)
+}
+
 /// Work under way that the person waits on (a search, a run, rows being read): a small turning
 /// circle, muted, beside or in place of what it will fill. It turns once in two seconds, every
 /// spinner in step, redrawing its view at most [`motion::AMBIENT_FPS`] times a second (Zed's

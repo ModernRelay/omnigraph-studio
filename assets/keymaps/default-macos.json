@@ -19,6 +19,7 @@
       "cmd-]": "studio::GoForward",
       "cmd-q": "studio::Quit",
       "cmd-alt-shift-f": "studio::ToggleFrameOverlay",
+      "cmd-alt-shift-j": "studio::JoinCloudWaitlist",
       "cmd-=": "studio::IncreaseFontSize",
       "cmd-+": "studio::IncreaseFontSize",
       "cmd--": "studio::DecreaseFontSize",

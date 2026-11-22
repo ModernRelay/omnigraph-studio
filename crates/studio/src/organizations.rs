@@ -155,6 +155,70 @@ pub(crate) fn cluster_row(cluster: &ClusterView, managed: &[ManagedTarget]) -> C
     }
 }
 
+/// The CLI command that creates a cluster in the organization `profile` names, for an
+/// organization with none (constitution VI): Studio creates none itself (spec 022). The CLI picks
+/// the organization by its profile, so with no profile in this one the command names a
+/// `<PROFILE>` to fill rather than leaving it to the default profile, which may be another
+/// organization's. `<NAME>` is the person's to fill too.
+pub(crate) fn create_command(profile: Option<&str>) -> String {
+    format!(
+        "omnigraph cluster create <NAME> --profile {}",
+        profile.unwrap_or("<PROFILE>")
+    )
+}
+
+/// What a sign-in that could not start says, with the control plane called by its name: the
+/// reason is worded for any server (`oauth_client`), and here the server is Omnigraph Cloud, or
+/// another control plane.
+pub(crate) fn plane_words(why: &str, cloud: bool) -> String {
+    let (capital, lower) = if cloud {
+        ("Omnigraph Cloud", "Omnigraph Cloud")
+    } else {
+        ("The control plane", "the control plane")
+    };
+    why.replace("The server", capital)
+        .replace("the server", lower)
+}
+
+/// What "No clusters" says: how a cluster is made, beside the command that makes it. Cloud's copy
+/// states the fact and the action, never a pitch (spec 047, Copy).
+pub(crate) const NO_CLUSTERS: &str = "This organization has no clusters. A member whose role \
+     allows it creates one with the Omnigraph CLI, through a profile in this organization. Then \
+     Refresh.";
+
+/// What a sign-in in no organization says: where the waitlist is offered (`waitlist::offered`,
+/// the same rule as its links), that Omnigraph Cloud is in private preview and how invitations
+/// are given (spec 047); on any other plane or address, to ask an owner.
+pub(crate) fn no_organizations(plane: &ControlPlane, account: &str) -> String {
+    if crate::waitlist::offered(plane) {
+        format!(
+            "Signed in as {account}. No organization has you as a member yet. Omnigraph Cloud is \
+             in private preview. An owner of an organization can invite you, and invitations go \
+             out from the waitlist."
+        )
+    } else {
+        format!(
+            "You are signed in as {account}, but no organization has you as a member. Ask an \
+             owner of one to invite you, then Refresh."
+        )
+    }
+}
+
+/// What Omnigraph Cloud's sign-in pane says before a sign-in (spec 047): it does not imply that
+/// anyone can sign in and get a cluster.
+pub(crate) const CLOUD_SIGN_IN: &str = "Omnigraph Cloud is in private preview. Invitations go out \
+     from the waitlist. Once invited, sign in to open your organization's clusters.";
+
+/// What a plane's sign-in pane says before a sign-in, with no reason to give: [`CLOUD_SIGN_IN`]
+/// where the waitlist is offered, by the same rule as its link; otherwise what one sign-in does.
+pub(crate) fn signed_out_words(plane: &ControlPlane) -> &'static str {
+    if crate::waitlist::offered(plane) {
+        CLOUD_SIGN_IN
+    } else {
+        "One sign-in lists every organization you are a member of, with its clusters."
+    }
+}
+
 /// The CLI's targets on the control plane's profiles that name a cluster its list does not
 /// have: "Not in org_… on the control plane".
 pub(crate) fn missing_targets<'a>(
@@ -256,6 +320,20 @@ pub(crate) fn nav(
                     )
                     .into_any_element(),
             );
+            // Signed out of Omnigraph Cloud: a muted second line under its row (spec 047).
+            let signed_out = !matches!(state, SignIn::SignedIn { .. });
+            if signed_out && crate::waitlist::offered(plane.read(cx)) {
+                rows.push(
+                    div()
+                        // Under the row's icon: its margin and padding.
+                        .pl(px(space::SM + space::SM))
+                        .child(crate::waitlist::note(
+                            crate::waitlist::Surface::Sidebar,
+                            crate::waitlist::PREVIEW_UNDER_NAME,
+                        ))
+                        .into_any_element(),
+                );
+            }
             continue;
         };
         for (row, organization) in list.iter().enumerate() {
@@ -380,6 +458,7 @@ fn sign_in_pane(plane: &Entity<ControlPlane>, cx: &mut Context<OpenGraphModal>) 
     let action =
         |label: &'static str, id: &'static str| ds::button(id, label).style(ButtonStyle::Outlined);
     let p = plane.clone();
+    let waitlist = crate::waitlist::offered(plane.read(cx));
     let (detail, button): (String, Option<AnyElement>) = match (&state, &organizations) {
         (SignIn::SignedIn { .. }, Some(Organizations::Failed(error))) => (
             failure(error, "this control plane"),
@@ -394,13 +473,22 @@ fn sign_in_pane(plane: &Entity<ControlPlane>, cx: &mut Context<OpenGraphModal>) 
         (SignIn::SignedIn { account, .. }, Some(Organizations::Listed(_))) => {
             let refresh = p.clone();
             (
-                format!(
-                    "You are signed in as {account}, but no organization has you as a member. \
-                     Ask an owner of one to invite you, then Refresh."
-                ),
+                no_organizations(plane.read(cx), account),
                 Some(
                     h_flex()
                         .gap(px(space::SM))
+                        // The one way on for most people, so the primary button (spec 047).
+                        .when(waitlist, |row| {
+                            row.child(
+                                div()
+                                    .debug_selector(|| "waitlist-no-organizations".into())
+                                    .child(crate::waitlist::link(
+                                        "plane-waitlist",
+                                        crate::waitlist::Surface::NoOrganizations,
+                                        true,
+                                    )),
+                            )
+                        })
                         .child(action("Refresh", "plane-refresh").on_click(cx.listener(
                             move |_, _, _, cx| refresh.update(cx, |p, cx| p.read_clusters(cx)),
                         )))
@@ -425,7 +513,7 @@ fn sign_in_pane(plane: &Entity<ControlPlane>, cx: &mut Context<OpenGraphModal>) 
         ),
         (SignIn::Reading, _) => ("Reading the control plane's sign-in…".to_owned(), None),
         (SignIn::Unavailable(refusal), _) => (
-            refusal.why.to_string(),
+            plane_words(&refusal.why, cloud),
             Some(
                 action("Try again", "plane-sign-in-again")
                     .on_click(cx.listener(move |_, _, _, cx| p.update(cx, |p, cx| p.sign_in(cx))))
@@ -433,14 +521,29 @@ fn sign_in_pane(plane: &Entity<ControlPlane>, cx: &mut Context<OpenGraphModal>) 
             ),
         ),
         (SignIn::Offered { why, .. }, _) => (
-            why.clone().map(|why| why.to_string()).unwrap_or_else(|| {
-                "One sign-in lists every organization you are a member of, with its clusters."
-                    .to_owned()
-            }),
+            why.clone()
+                .map(|why| why.to_string())
+                .unwrap_or_else(|| signed_out_words(plane.read(cx)).to_owned()),
             Some(
-                ds::action_button("plane-sign-in", "Sign in")
-                    .tip(ds::tooltip(format!("Opens {host} in your browser")))
-                    .on_click(cx.listener(move |_, _, _, cx| p.update(cx, |p, cx| p.sign_in(cx))))
+                h_flex()
+                    .gap(px(space::SM))
+                    // Sign in stays the primary button: invited people are not slowed.
+                    .child(
+                        ds::action_button("plane-sign-in", "Sign in")
+                            .tip(ds::tooltip(format!("Opens {host} in your browser")))
+                            .on_click(
+                                cx.listener(move |_, _, _, cx| p.update(cx, |p, cx| p.sign_in(cx))),
+                            ),
+                    )
+                    .when(waitlist, |row| {
+                        row.child(div().debug_selector(|| "waitlist-sign-in".into()).child(
+                            crate::waitlist::link(
+                                "plane-waitlist",
+                                crate::waitlist::Surface::SignIn,
+                                false,
+                            ),
+                        ))
+                    })
                     .into_any_element(),
             ),
         ),
@@ -533,7 +636,24 @@ fn organization_pane(
             let missing = missing_targets(clusters, managed, &named);
             if clusters.len() == purged && missing.is_empty() {
                 ds::empty_state(IconName::Server, "No clusters")
-                    .children((purged > 0).then(|| ds::state_detail(purged_note(purged))))
+                    .debug_selector(|| "no-clusters".into())
+                    .child(
+                        v_flex()
+                            .items_center()
+                            .gap(px(space::XS))
+                            .child(ds::state_detail(NO_CLUSTERS))
+                            .children((purged > 0).then(|| ds::state_detail(purged_note(purged)))),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| "create-cluster".into())
+                            .w(px(size::STATE_DETAIL_WIDTH))
+                            .child(ds::command_block(
+                                "create-cluster",
+                                create_command(named.first().map(String::as_str)),
+                                cx,
+                            )),
+                    )
                     .into_any_element()
             } else {
                 let mut rows: Vec<AnyElement> = Vec::new();
