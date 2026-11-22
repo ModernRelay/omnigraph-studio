@@ -505,7 +505,17 @@ impl NodeHistoryView {
         };
         self.older = Older::Reading(window.clone());
         let window = Box::new(window);
-        self.read(NodeHistoryWindow::Older { head, window }, cx);
+        // No entry read yet, and every group followed: the older window's newest entry is the
+        // node's last change, which the page shows.
+        let nothing_newer = self.entries.is_empty() && self.coverage.last_change_known();
+        self.read(
+            NodeHistoryWindow::Older {
+                head,
+                window,
+                nothing_newer,
+            },
+            cx,
+        );
         cx.notify();
     }
 
@@ -740,7 +750,6 @@ impl NodeHistoryView {
             (Search::Done, Some(found)) => {
                 let requests = studio_ui::plural(found.requests, "request", "requests");
                 Some(match &self.coverage.creation {
-                    Creation::SearchStopped(why) => format!("The search stopped short: {why}."),
                     Creation::Found(commit) => format!(
                         "Created by {} in {}, {}: found by a search of earlier commits with \
                          {requests}.",
@@ -1079,6 +1088,39 @@ impl NodeHistoryView {
         }
     }
 
+    /// Why the read of older commits failed, in words, when it did.
+    fn older_failure(&self) -> Option<String> {
+        match &self.older {
+            Older::Failed(_, error) => Some(format!("Older commits could not be read: {error}")),
+            _ => None,
+        }
+    }
+
+    /// The control for the commits before those read, wherever it shows: "Read the 200 commits
+    /// before", "Reading older commits…" while they are read, or "Try again" after a failure.
+    /// None once there are no older commits.
+    fn older_button(&self, id: &'static str, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let label = match &self.older {
+            Older::None => return None,
+            Older::Waits(_) => format!("Read the {NODE_HISTORY_COMMITS} commits before"),
+            Older::Reading(_) => "Reading older commits…".to_owned(),
+            Older::Failed(..) => "Try again".to_owned(),
+        };
+        let reading = matches!(self.older, Older::Reading(_));
+        Some(
+            studio_ui::ds::button(id, label)
+                .style(ButtonStyle::Subtle)
+                .disabled(reading)
+                .key_binding(KeyBinding::for_action_in(
+                    &ReadOlderCommits,
+                    &self.focus_handle,
+                    cx,
+                ))
+                .on_click(cx.listener(|this, _, _, cx| this.read_older(cx)))
+                .into_any_element(),
+        )
+    }
+
     /// The list's last row: how far back the history was read, what it could not follow, and the
     /// commits before them.
     fn render_end(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1098,33 +1140,11 @@ impl NodeHistoryView {
             ),
             Older::None => (format!("{back}."), None),
             Older::Waits(_) | Older::Failed(..) | Older::Reading(_) => {
-                let reading = matches!(self.older, Older::Reading(_));
-                let failed = match &self.older {
-                    Older::Failed(_, error) => Some(error.clone()),
-                    _ => None,
-                };
-                let label = if reading {
-                    "Reading older commits…".to_owned()
-                } else if failed.is_some() {
-                    "Try again".to_owned()
-                } else {
-                    format!("Read the {NODE_HISTORY_COMMITS} commits before")
-                };
-                let button = studio_ui::ds::button("read-older", label)
-                    .style(ButtonStyle::Subtle)
-                    .disabled(reading)
-                    .key_binding(KeyBinding::for_action_in(
-                        &ReadOlderCommits,
-                        &self.focus_handle,
-                        cx,
-                    ))
-                    .on_click(cx.listener(|this, _, _, cx| this.read_older(cx)))
-                    .into_any_element();
-                let said = match failed {
-                    Some(error) => format!("{back}. Older commits could not be read: {error}"),
+                let said = match self.older_failure() {
+                    Some(failure) => format!("{back}. {failure}"),
                     None => format!("{back}. {read} read."),
                 };
-                (said, Some(button))
+                (said, self.older_button("read-older", cx))
             }
         };
         let reads = format!(
@@ -1356,21 +1376,13 @@ impl Render for NodeHistoryView {
                     studio_ui::ds::empty_state(IconName::Check, title)
                         .debug_selector(|| "node-history-empty".into())
                         .child(studio_ui::ds::state_detail(detail))
-                        .when(self.offers_older(), |state| {
-                            state.child(
-                                studio_ui::ds::button(
-                                    "read-older-empty",
-                                    format!("Read the {NODE_HISTORY_COMMITS} commits before"),
-                                )
-                                .style(ButtonStyle::Subtle)
-                                .key_binding(KeyBinding::for_action_in(
-                                    &ReadOlderCommits,
-                                    &self.focus_handle,
-                                    cx,
-                                ))
-                                .on_click(cx.listener(|this, _, _, cx| this.read_older(cx))),
-                            )
-                        })
+                        // The older read's progress and failure show here as in the end row.
+                        .children(self.older_failure().map(|failure| {
+                            div()
+                                .debug_selector(|| "node-history-older-failed".into())
+                                .child(studio_ui::ds::state_detail(failure))
+                        }))
+                        .children(self.older_button("read-older-empty", cx))
                         // The search for its creation is offered here too: the node is there,
                         // unchanged, and created before the window.
                         .children(self.render_search(cx))
@@ -1490,6 +1502,8 @@ mod tests {
         load: bool,
         /// History at or before `c200` was reclaimed: a read there answers 410.
         gone: bool,
+        /// A point read of the node before `c150` fails with a 500, as a search's might.
+        old_reads_fail: bool,
     }
 
     /// Who made commit `n`.
@@ -1517,6 +1531,8 @@ mod tests {
             "zed" if (100..245).contains(&n) => Some(json!({ "slug": "zed", "name": "Zed" })),
             "bob" => Some(json!({ "slug": "bob", "title": if n >= 241 { "B" } else { "A" } })),
             "hub" => Some(json!({ "slug": "hub" })),
+            // There from the first commit, retitled at c150 only: before the first window.
+            "early" => Some(json!({ "slug": "early", "title": if n >= 150 { "B" } else { "A" } })),
             "big" if n < 245 => Some(json!({ "slug": "big" })),
             _ => None,
         }
@@ -1650,6 +1666,11 @@ mod tests {
                             410,
                             json!({ "error": "history before this commit was reclaimed",
                                 "code": "gone" }),
+                        )
+                    } else if served.old_reads_fail && n < 150 {
+                        (
+                            500,
+                            json!({ "error": "the server broke", "code": "internal" }),
                         )
                     } else if name == "node_history_node" {
                         let mut row = person(slug, n);
@@ -2092,6 +2113,68 @@ mod tests {
             cx.debug_bounds("node-history-search").is_some(),
             "its note shows"
         );
+    }
+
+    /// A node unchanged in the first window gets its last change from an older window's newest
+    /// entry, which the page then shows (Bugbot, #162).
+    #[gpui::test]
+    async fn an_older_windows_newest_entry_is_the_last_change(cx: &mut TestAppContext) {
+        let (session, _, _) = serve(Served::default(), cx);
+        let (view, cx) = open(&session, "early", cx);
+        let last = |cx: &mut VisualTestContext| {
+            session.read_with(cx, |session, _| {
+                session
+                    .last_change("Person", "early")
+                    .map(|l| (l.commit.clone(), l.head.clone()))
+            })
+        };
+        assert_eq!(last(cx), None, "nothing in the first window");
+        view.update(cx, |view, cx| view.read_older(cx));
+        cx.run_until_parked();
+        assert_eq!(last(cx), Some(("c150".into(), "c249".into())));
+    }
+
+    /// With nothing changed in the window, the empty state shows the older read's progress and
+    /// its failure, with Try again, as the end row does (Bugbot, #162).
+    #[gpui::test]
+    async fn the_empty_state_shows_a_failed_older_read(cx: &mut TestAppContext) {
+        let (session, _, failing) = serve(Served::default(), cx);
+        let (view, cx) = open(&session, "early", cx);
+        assert!(cx.debug_bounds("node-history-empty").is_some());
+        failing.store(true, Ordering::SeqCst);
+        view.update(cx, |view, cx| view.read_older(cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(matches!(view.older, Older::Failed(..)))
+        });
+        assert!(cx.debug_bounds("node-history-empty").is_some());
+        assert!(
+            cx.debug_bounds("node-history-older-failed").is_some(),
+            "the failure is shown"
+        );
+    }
+
+    /// A creation search whose point read fails can be run again: it failed, it did not finish
+    /// (Bugbot, #162).
+    #[gpui::test]
+    async fn a_failed_creation_search_is_offered_again(cx: &mut TestAppContext) {
+        let (session, _, _) = serve(
+            Served {
+                old_reads_fail: true,
+                ..Default::default()
+            },
+            cx,
+        );
+        let (view, cx) = open(&session, "early", cx);
+        view.read_with(cx, |view, _| assert!(view.offers_search()));
+        cx.update(|window, cx| window.focus(&view.focus_handle(cx), cx));
+        cx.simulate_keystrokes("cmd-alt-f");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(matches!(view.search, Search::Failed(_)), "it failed");
+            assert!(view.offers_search(), "and is offered again");
+            assert_eq!(view.coverage.creation, Creation::NotSearched);
+        });
     }
 
     /// A removal whose relationships were too large to follow says so, not that none were read

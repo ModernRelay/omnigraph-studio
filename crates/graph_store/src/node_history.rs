@@ -345,6 +345,9 @@ pub enum NodeHistoryWindow {
     Older {
         head: String,
         window: Box<OlderWindow>,
+        /// The windows above changed nothing and followed every group: this window's newest
+        /// entry, if it has one, is the node's last change.
+        nothing_newer: bool,
     },
 }
 
@@ -383,8 +386,6 @@ pub enum Creation {
     /// The search listed commits up to its cap with the node still there: it was created
     /// before this commit, the oldest listed.
     Before(WindowCommit),
-    /// The search stopped short, for this reason.
-    SearchStopped(String),
 }
 
 /// What a node's history followed, and what it could not (spec 046): every sentence that says
@@ -898,11 +899,18 @@ impl GraphSession {
             } else {
                 NODE_HISTORY_COMMITS
             };
-            let (token, head, carried) = match window {
-                NodeHistoryWindow::Newest => (None, None, None),
-                NodeHistoryWindow::Older { head, window } => {
-                    (Some(window.page_token), Some(head), window.base)
-                }
+            let (token, head, carried, nothing_newer) = match window {
+                NodeHistoryWindow::Newest => (None, None, None, true),
+                NodeHistoryWindow::Older {
+                    head,
+                    window,
+                    nothing_newer,
+                } => (
+                    Some(window.page_token),
+                    Some(head),
+                    window.base,
+                    nothing_newer,
+                ),
             };
             let (client, graph, branch) = (
                 reader.client.clone(),
@@ -1050,8 +1058,10 @@ impl GraphSession {
 
             page.commits = commits;
             page.requests = reader.requests;
-            // A group too large to follow may hide a newer change: the page then says nothing.
-            if newest
+            // The node's last change is this window's newest entry when no window above it
+            // changed anything. A group too large to follow may hide a newer change: the page then
+            // says nothing.
+            if nothing_newer
                 && page.coverage.last_change_known()
                 && let Some(last) = page.entries.first()
             {
@@ -1133,11 +1143,8 @@ impl GraphSession {
                 match reader.node_at(&older[mid].id, cx).await {
                     Ok(state) if state.exists => lo = mid,
                     Ok(_) => hi = mid,
-                    Err(error) => {
-                        found.creation = Creation::SearchStopped(error.to_string());
-                        found.requests = reader.requests;
-                        return Ok(found);
-                    }
+                    // A read that failed answers nothing: the search fails, and is offered again.
+                    Err(error) => return Err(error),
                 }
             }
             found.creation = match (settled(lo, older.len(), reached_first), older.last()) {
