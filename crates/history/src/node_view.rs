@@ -4,9 +4,10 @@
 //! small edits folds into one entry with its net change.
 //!
 //! Omnigraph has no read of one entity's commits (E62) and keeps no operation or message with a
-//! commit (E60): a window covers the branch's newest [`NODE_HISTORY_COMMITS`] commits, read from
-//! the change feed filtered to the node's types ([`GraphSession::node_history_in`]), with an
-//! honest exit to the commits before them. It reads only once its tab is shown.
+//! commit (E60): the first window covers the branch's newest
+//! [`NODE_HISTORY_FIRST_COMMITS`](graph_store::node_history::NODE_HISTORY_FIRST_COMMITS) commits, read as point reads of the node at each
+//! ([`GraphSession::node_history_in`]), with an honest exit to the [`NODE_HISTORY_COMMITS`]
+//! before them. It reads only once its tab is shown.
 //!
 //! Forked in part from the closed #146 (spec 040, `feat/ux-p5-node-history`).
 
@@ -22,8 +23,9 @@ use gq_language::RelationshipGroup;
 use gq_language::SchemaModel;
 use graph_store::ledger::ReadView;
 use graph_store::node_history::{
-    NODE_HISTORY_COMMITS, NODE_HISTORY_EDGES, NodeHistoryEntry, NodeHistoryPage, NodeHistoryWindow,
-    NodeScope, NodeState, OlderWindow, SchemaBoundary, SearchFound, WindowCommit, net_of, runs,
+    Coverage, Creation, NODE_HISTORY_COMMITS, NODE_HISTORY_EDGES, NodeHistoryEntry,
+    NodeHistoryPage, NodeHistoryWindow, NodeScope, NodeState, OlderWindow, Reach, SearchFound,
+    WindowCommit, net_of, runs,
 };
 use graph_store::scope::ReadScope;
 use graph_store::{FoldedChange, GraphSession, SessionEvent, entity_name, relationship_words};
@@ -118,17 +120,14 @@ pub struct NodeHistoryView {
     newest: Option<NodeState>,
     /// The oldest commit read, with the node there: where a search for its creation starts.
     oldest: Option<(String, NodeState)>,
-    /// Relationship groups that held [`NODE_HISTORY_EDGES`] edges at some commit: too large to
-    /// follow there.
-    full_groups: Vec<RelationshipGroup>,
+    /// What the windows read followed, how far back they reach, and what is known of the
+    /// node's creation: every sentence about what was read reads it.
+    coverage: Coverage,
     /// What the search for the node's creation found, and how it stands.
     found: Option<SearchFound>,
     search: Search,
     _search_task: Option<Task<()>>,
-    boundary: Option<SchemaBoundary>,
     older: Older,
-    /// Why a window was not read to its end, when one was not.
-    stopped: Option<SharedString>,
     /// Requests sent for the windows shown.
     requests: usize,
     /// The branch moved past the head read: Refresh reads it again.
@@ -312,13 +311,11 @@ impl NodeHistoryView {
             commits: Vec::new(),
             newest: None,
             oldest: None,
-            full_groups: Vec::new(),
+            coverage: Coverage::default(),
             found: None,
             search: Search::Idle,
             _search_task: None,
-            boundary: None,
             older: Older::None,
-            stopped: None,
             requests: 0,
             newer: false,
             runs: Vec::new(),
@@ -351,13 +348,11 @@ impl NodeHistoryView {
         self.commits.clear();
         self.newest = None;
         self.oldest = None;
-        self.full_groups.clear();
+        self.coverage = Coverage::default();
         self.found = None;
         self.search = Search::Idle;
         self._search_task = None;
-        self.boundary = None;
         self.older = Older::None;
-        self.stopped = None;
         self.requests = 0;
         self.head = None;
         self.selected = None;
@@ -420,22 +415,18 @@ impl NodeHistoryView {
             entries,
             commits,
             older,
-            stopped,
-            boundary,
-            full_groups,
+            coverage,
             requests,
         } = page;
         if self.head.is_none() {
             self.head = Some(head);
             self.newest = newest;
+            self.coverage = coverage;
             cx.emit(ItemEvent::Selected);
+        } else {
+            self.coverage.below(coverage);
         }
         self.oldest = oldest;
-        for group in full_groups {
-            if !self.full_groups.contains(&group) {
-                self.full_groups.push(group);
-            }
-        }
         if self.label.is_none() {
             let schema = self.session.read(cx).schema_model();
             let label = entries
@@ -454,11 +445,7 @@ impl NodeHistoryView {
         }
         self.entries.extend(entries);
         self.commits.extend(commits);
-        if boundary.is_some() {
-            self.boundary = boundary;
-        }
         self.requests += requests;
-        self.stopped = stopped.map(Into::into);
         self.older = match older {
             Some(window) => Older::Waits(window),
             None => Older::None,
@@ -533,7 +520,7 @@ impl NodeHistoryView {
             return None;
         };
         let oldest = self.oldest.clone().filter(|(_, node)| node.exists)?;
-        let uncreated = !self.entries.iter().any(|e| e.created());
+        let uncreated = self.coverage.creation != Creation::InEntries;
         uncreated.then(|| (window.clone(), oldest))
     }
 
@@ -566,6 +553,7 @@ impl NodeHistoryView {
                 match answer {
                     Ok(found) => {
                         this.search = Search::Done;
+                        this.coverage.searched(&found);
                         this.found = Some(found);
                     }
                     Err(error) => this.search = Search::Failed(error.to_string().into()),
@@ -747,25 +735,27 @@ impl NodeHistoryView {
     /// The search for the node's creation, in the end row: its button while it is offered, its
     /// progress, what it found, its failure, or what stopped it.
     fn render_search(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let found = self.found.as_ref();
-        let note = match (&self.search, found) {
+        let note = match (&self.search, self.found.as_ref()) {
             (Search::Failed(error), _) => Some(format!("The search could not finish: {error}")),
             (Search::Done, Some(found)) => {
                 let requests = studio_ui::plural(found.requests, "request", "requests");
-                Some(match (&found.created, &found.before, &found.stopped) {
-                    (_, _, Some(why)) => format!("The search stopped short: {why}."),
-                    (Some(commit), ..) => format!(
-                        "Created by {} in {}, {}: found by a search of earlier commits with {requests}.",
+                Some(match &self.coverage.creation {
+                    Creation::SearchStopped(why) => format!("The search stopped short: {why}."),
+                    Creation::Found(commit) => format!(
+                        "Created by {} in {}, {}: found by a search of earlier commits with \
+                         {requests}.",
                         commit.actor.clone().unwrap_or_else(|| "no actor".into()),
                         short_commit_id(&commit.id),
                         relative_time(commit.at, now_micros())
                     ),
-                    (None, Some(commit), None) => format!(
+                    Creation::Before(commit) => format!(
                         "Created before {}, {}, the oldest commit searched ({requests}).",
                         short_commit_id(&commit.id),
                         relative_time(commit.at, now_micros())
                     ),
-                    (None, None, None) => format!("Searched with {requests}."),
+                    Creation::NotSearched | Creation::InEntries => {
+                        format!("Searched with {requests}.")
+                    }
                 })
             }
             _ => None,
@@ -1002,9 +992,7 @@ impl NodeHistoryView {
             studio_ui::ds::dotted(div().border_t_1(), cx)
                 .px(px(space::LG))
                 .py(px(space::SM))
-                .child(studio_ui::ds::text::meta(
-                    "Its relationships went with it; none were read in this window.",
-                ))
+                .child(studio_ui::ds::text::meta(self.removal_words()))
         });
         div()
             .pb(px(space::LG))
@@ -1022,6 +1010,74 @@ impl NodeHistoryView {
             .into_any_element()
     }
 
+    /// The groups too large to follow, in words, when there are any: "Too large to follow, … :
+    /// WorksAt → Company."
+    fn too_large_words(&self) -> Option<String> {
+        if self.coverage.follows_every_group() {
+            return None;
+        }
+        Some(format!(
+            "Too large to follow, with {NODE_HISTORY_EDGES} relationships or more at a commit, \
+             so its changes there are not shown: {}.",
+            group_words(&self.coverage.too_large)
+        ))
+    }
+
+    /// The end of a sentence that says what no commit changed: "." when every group was
+    /// followed, else which relationships were not.
+    fn followed_words(&self) -> String {
+        if self.coverage.follows_every_group() {
+            " or its relationships.".to_owned()
+        } else {
+            format!(
+                " or the relationships Studio could follow. Not followed, too large: {}.",
+                group_words(&self.coverage.too_large)
+            )
+        }
+    }
+
+    /// The empty state's title and sentence: "since the graph began" only when the windows
+    /// reach it and every group was followed.
+    fn empty_words(&self) -> (String, String) {
+        let name = self.label.as_deref().unwrap_or(&self.id);
+        let commits = studio_ui::plural(self.commits.len(), "commit", "commits");
+        let followed = self.followed_words();
+        if self.coverage.reaches_the_start() {
+            return (
+                "No changes".to_owned(),
+                format!(
+                    "No commit on {} changed {name} or its relationships since the graph began.",
+                    self.branch
+                ),
+            );
+        }
+        let title = if self.offers_older() {
+            format!("No changes in the last {commits}")
+        } else {
+            "No changes found".to_owned()
+        };
+        (
+            title,
+            format!(
+                "No commit in the newest {commits} on {} changed {name}{followed}",
+                self.branch
+            ),
+        )
+    }
+
+    /// What a removal says of relationships it lists none of: the node had none when it was
+    /// removed, or a group was too large to follow there.
+    fn removal_words(&self) -> String {
+        if self.coverage.follows_every_group() {
+            "It had no relationships when it was removed.".to_owned()
+        } else {
+            format!(
+                "Its relationships went with it. Not listed, too large to follow: {}.",
+                group_words(&self.coverage.too_large)
+            )
+        }
+    }
+
     /// The list's last row: how far back the history was read, what it could not follow, and the
     /// commits before them.
     fn render_end(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1035,13 +1091,11 @@ impl NodeHistoryView {
         };
         let read = studio_ui::plural(self.commits.len(), "commit", "commits");
         let (said, button): (String, Option<AnyElement>) = match &self.older {
-            Older::None if self.boundary.is_some() || self.stopped.is_some() => {
-                (format!("{back}."), None)
-            }
-            Older::None => (
+            Older::None if self.coverage.reach == Reach::GraphStart => (
                 format!("{back}, the graph's first commit. {read} read."),
                 None,
             ),
+            Older::None => (format!("{back}."), None),
             Older::Waits(_) | Older::Failed(..) | Older::Reading(_) => {
                 let reading = matches!(self.older, Older::Reading(_));
                 let failed = match &self.older {
@@ -1078,45 +1132,29 @@ impl NodeHistoryView {
             studio_ui::plural(self.requests, "request", "requests"),
             graph_store::node_history::NODE_HISTORY_READS_AT_ONCE
         );
-        let words = |groups: &[RelationshipGroup]| {
-            groups
-                .iter()
-                .map(|g| match g.direction {
-                    gq_language::Direction::Outgoing => format!("{} → {}", g.edge, g.other_type),
-                    gq_language::Direction::Incoming => format!("{} ← {}", g.edge, g.other_type),
-                })
-                .collect::<Vec<_>>()
-                .join(", ")
+        let reach = match &self.coverage.reach {
+            Reach::Boundary(boundary) => Some(format!(
+                "History stops at a schema change{} in {}. Omnigraph does not compare across \
+                 one.",
+                boundary
+                    .type_name
+                    .as_ref()
+                    .map(|t| format!(" to {t}"))
+                    .unwrap_or_default(),
+                short_commit_id(&boundary.commit)
+            )),
+            Reach::Stopped(why) => Some(format!(
+                "The read stopped short: {}. The changes shown are those read before it.",
+                studio_ui::clause(why)
+            )),
+            Reach::Window | Reach::GraphStart => None,
         };
         v_flex()
             .px(px(space::EDGE))
             .py(px(space::MD))
             .gap(px(space::SM))
-            .when(!self.full_groups.is_empty(), |end| {
-                end.child(studio_ui::ds::text::muted(format!(
-                    "Too large to follow, with {NODE_HISTORY_EDGES} relationships or more at a \
-                     commit, so its changes there are not shown: {}.",
-                    words(&self.full_groups)
-                )))
-            })
-            .children(self.boundary.as_ref().map(|boundary| {
-                studio_ui::ds::text::muted(format!(
-                    "History stops at a schema change{} in {}. Omnigraph does not compare \
-                     across one.",
-                    boundary
-                        .type_name
-                        .as_ref()
-                        .map(|t| format!(" to {t}"))
-                        .unwrap_or_default(),
-                    short_commit_id(&boundary.commit)
-                ))
-            }))
-            .children(self.stopped.clone().map(|why| {
-                studio_ui::ds::text::muted(format!(
-                    "The read stopped short: {}. The changes shown are those read before it.",
-                    studio_ui::clause(why.as_ref())
-                ))
-            }))
+            .children(self.too_large_words().map(studio_ui::ds::text::muted))
+            .children(reach.map(studio_ui::ds::text::muted))
             .child(
                 h_flex()
                     .gap(px(space::MD))
@@ -1144,6 +1182,18 @@ struct Card<'a> {
     /// The run it folds or heads, and whether it is folded.
     fold: Option<(usize, bool)>,
     selected: bool,
+}
+
+/// Relationship groups as their headers name them: "WorksAt → Company, Knows ← Person".
+fn group_words(groups: &[RelationshipGroup]) -> String {
+    groups
+        .iter()
+        .map(|g| match g.direction {
+            gq_language::Direction::Outgoing => format!("{} → {}", g.edge, g.other_type),
+            gq_language::Direction::Incoming => format!("{} ← {}", g.edge, g.other_type),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// `14:02` for Unix microseconds, in UTC.
@@ -1283,60 +1333,46 @@ impl Render for NodeHistoryView {
             State::Reading => {
                 studio_ui::ds::loading_state("Reading the history…").into_any_element()
             }
-            State::Ready if self.entries.is_empty() && self.boundary.is_some() => {
-                let boundary = self.boundary.as_ref().expect("a boundary");
-                change_cards::schema_change_state(boundary.type_name.as_deref())
-                    .child(studio_ui::ds::state_detail(format!(
+            State::Ready if self.entries.is_empty() => match self.coverage.reach.clone() {
+                Reach::Boundary(boundary) => {
+                    let detail = format!(
                         "History stops at commit {}: Omnigraph does not compare across a schema \
-                         change, and no commit since changed {}.",
+                         change, and no commit since changed {}{}",
                         short_commit_id(&boundary.commit),
-                        self.label.as_deref().unwrap_or(&self.id)
-                    )))
-                    .into_any_element()
-            }
-            State::Ready if self.entries.is_empty() && self.stopped.is_none() => {
-                let name = self.label.as_deref().unwrap_or(&self.id);
-                let detail = if self.offers_older() {
-                    format!(
-                        "No commit in the newest {} on {} changed {name} or its relationships.",
-                        studio_ui::plural(self.commits.len(), "commit", "commits"),
-                        self.branch
-                    )
-                } else {
-                    format!(
-                        "No commit on {} changed {name} or its relationships since the graph \
-                         began.",
-                        self.branch
-                    )
-                };
-                let title = if self.offers_older() {
-                    format!(
-                        "No changes in the last {}",
-                        studio_ui::plural(self.commits.len(), "commit", "commits")
-                    )
-                } else {
-                    "No changes".to_owned()
-                };
-                studio_ui::ds::empty_state(IconName::Check, title)
-                    .debug_selector(|| "node-history-empty".into())
-                    .child(studio_ui::ds::state_detail(detail))
-                    .when(self.offers_older(), |state| {
-                        state.child(
-                            studio_ui::ds::button(
-                                "read-older-empty",
-                                format!("Read the {NODE_HISTORY_COMMITS} commits before"),
+                        self.label.as_deref().unwrap_or(&self.id),
+                        self.followed_words()
+                    );
+                    change_cards::schema_change_state(boundary.type_name.as_deref())
+                        .child(studio_ui::ds::state_detail(detail))
+                        .into_any_element()
+                }
+                // What was read before the read stopped, with its reason, in the end row.
+                Reach::Stopped(_) => AnyView::from(self.list_view.clone())
+                    .cached(StyleRefinement::default().size_full())
+                    .into_any_element(),
+                Reach::Window | Reach::GraphStart => {
+                    let (title, detail) = self.empty_words();
+                    studio_ui::ds::empty_state(IconName::Check, title)
+                        .debug_selector(|| "node-history-empty".into())
+                        .child(studio_ui::ds::state_detail(detail))
+                        .when(self.offers_older(), |state| {
+                            state.child(
+                                studio_ui::ds::button(
+                                    "read-older-empty",
+                                    format!("Read the {NODE_HISTORY_COMMITS} commits before"),
+                                )
+                                .style(ButtonStyle::Subtle)
+                                .key_binding(KeyBinding::for_action_in(
+                                    &ReadOlderCommits,
+                                    &self.focus_handle,
+                                    cx,
+                                ))
+                                .on_click(cx.listener(|this, _, _, cx| this.read_older(cx))),
                             )
-                            .style(ButtonStyle::Subtle)
-                            .key_binding(KeyBinding::for_action_in(
-                                &ReadOlderCommits,
-                                &self.focus_handle,
-                                cx,
-                            ))
-                            .on_click(cx.listener(|this, _, _, cx| this.read_older(cx))),
-                        )
-                    })
-                    .into_any_element()
-            }
+                        })
+                        .into_any_element()
+                }
+            },
             State::Ready => AnyView::from(self.list_view.clone())
                 .cached(StyleRefinement::default().size_full())
                 .into_any_element(),
@@ -1463,7 +1499,9 @@ mod tests {
 
     /// A person at commit `n`: her properties, or `None` before she exists or after she is
     /// removed. Ada: created at c5, renamed by the merge at c225, email at c230, title at c239
-    /// and c240. Zed: created at c100, removed at c245. Bob: retitled at c241.
+    /// and c240. Zed: created at c100, removed at c245. Bob: retitled at c241. Hub: there from
+    /// the graph's first commit, never changed. Big: there from the first commit, removed at
+    /// c245.
     fn person(slug: &str, n: usize) -> Option<Value> {
         match slug {
             "ada" if n >= 5 => Some(json!({
@@ -1474,23 +1512,36 @@ mod tests {
             })),
             "zed" if (100..245).contains(&n) => Some(json!({ "slug": "zed", "name": "Zed" })),
             "bob" => Some(json!({ "slug": "bob", "title": if n >= 241 { "B" } else { "A" } })),
+            "hub" => Some(json!({ "slug": "hub" })),
+            "big" if n < 245 => Some(json!({ "slug": "big" })),
             _ => None,
         }
     }
 
     /// The edges of a person at commit `n` through the relationship the query names, as
     /// `(edge id, other end)`: Ada works at Acme from c230 and Grace knows her from c235; Zed
-    /// knows Bob from c101 until he is removed at c245.
-    fn edges(slug: &str, query: &str, n: usize) -> Vec<(&'static str, &'static str)> {
+    /// knows Bob from c101 until he is removed at c245. Hub and Big work at 1,000 companies at
+    /// every commit they are there: a page of 1,000, too large to follow.
+    fn edges(slug: &str, query: &str, n: usize) -> Vec<(String, String)> {
         let incoming_knows = query.contains("$m $e:knows $n");
         let outgoing_works = query.contains("$n $e:worksAt $m");
         let outgoing_knows = query.contains("$n $e:knows $m");
+        let pairs = |list: &[(&str, &str)]| -> Vec<(String, String)> {
+            list.iter()
+                .map(|(a, b)| ((*a).to_owned(), (*b).to_owned()))
+                .collect()
+        };
+        if matches!(slug, "hub" | "big") && outgoing_works {
+            return (0..NODE_HISTORY_EDGES)
+                .map(|e| (format!("w{e:04}"), format!("co-{e:04}")))
+                .collect();
+        }
         match slug {
-            "ada" if outgoing_works && n >= 230 => vec![("w1", "acme")],
+            "ada" if outgoing_works && n >= 230 => pairs(&[("w1", "acme")]),
             // Linked to Eve at c100 and unlinked at c120: empty at both ends of the window.
-            "ada" if outgoing_knows && (100..120).contains(&n) => vec![("k9", "eve")],
-            "ada" if incoming_knows && n >= 235 => vec![("k1", "grace")],
-            "zed" if outgoing_knows && (101..245).contains(&n) => vec![("k2", "bob")],
+            "ada" if outgoing_knows && (100..120).contains(&n) => pairs(&[("k9", "eve")]),
+            "ada" if incoming_knows && n >= 235 => pairs(&[("k1", "grace")]),
+            "zed" if outgoing_knows && (101..245).contains(&n) => pairs(&[("k2", "bob")]),
             _ => Vec::new(),
         }
     }
@@ -1673,12 +1724,12 @@ mod tests {
         })
     }
 
-    /// A node's history lists the branch's newest 200 commits and reads the node at each and at
-    /// the oldest one's parent, and its edges through each relationship group at both ends of
-    /// the window and, for the groups with an edge at either end, between them; then the merged
-    /// branch. Each read is named in the ledger. It shows the commits that changed the node or a
-    /// relationship at either of its ends, newest first; a run of one actor's edits within ten
-    /// minutes folds into one, with its net change.
+    /// A node's history lists the branch's newest 50 commits and reads the node at each and at
+    /// the oldest one's parent, and its edges through every relationship group at each; then
+    /// the merged branch. Each read is named in the ledger. It shows the commits that changed
+    /// the node or a relationship at either of its ends, newest first; a run of one actor's edits
+    /// within ten minutes folds into one, with its net change. The 200 commits before are read
+    /// on asking.
     #[gpui::test]
     async fn a_nodes_history_reads_the_node_at_each_commit(cx: &mut TestAppContext) {
         let (session, asked, _) = serve(Served::default(), cx);
@@ -1690,34 +1741,29 @@ mod tests {
             (commits(&[235]), Some("act-ops".into()), false, 1),
             (commits(&[230]), Some("act-dev".into()), true, 1),
             (commits(&[225]), Some("act-dev".into()), true, 0),
-            (commits(&[120]), Some("act-dev".into()), false, 1),
-            (commits(&[100]), Some("act-dev".into()), false, 1),
         ];
-        assert_eq!(
-            shown, rows,
-            "c241 and c245 changed others; c5 is older; Eve's link, made and unmade between \
-             the window's ends, is seen"
-        );
-        // 1 listing; the node at c249..c50 and c49; its 3 relationship groups at each, as she
+        assert_eq!(shown, rows, "c241 and c245 changed others; c5 is older");
+        // 1 listing; the node at c249..c200 and c199; its 3 relationship groups at each, as she
         // exists at each; 1 merge.
         assert_eq!(by_view(&session, "node_history_commits", cx), 1);
-        assert_eq!(by_view(&session, "node_history_node", cx), 201);
-        assert_eq!(by_view(&session, "node_history_edges", cx), 3 * 201);
+        assert_eq!(by_view(&session, "node_history_node", cx), 51);
+        assert_eq!(by_view(&session, "node_history_edges", cx), 3 * 51);
         assert_eq!(by_view(&session, "node_history_merge", cx), 1);
-        let asked = asked.lock().unwrap();
-        assert!(
-            asked[0].contains("/commits?branch=main&limit=200"),
-            "{asked:?}"
-        );
-        assert!(
-            asked.iter().all(|a| !a.contains("/changes")),
-            "the change feed is not read"
-        );
-        assert!(asked.iter().any(|a| a.ends_with("node_history_node c49")));
-        drop(asked);
+        {
+            let asked = asked.lock().unwrap();
+            assert!(
+                asked[0].contains("/commits?branch=main&limit=50"),
+                "{asked:?}"
+            );
+            assert!(
+                asked.iter().all(|a| !a.contains("/changes")),
+                "the change feed is not read"
+            );
+            assert!(asked.iter().any(|a| a.ends_with("node_history_node c199")));
+        }
         view.read_with(cx, |view, cx| {
-            assert_eq!(view.requests, 1 + 201 + 603 + 1);
-            assert_eq!(view.commits.len(), 200);
+            assert_eq!(view.requests, 1 + 51 + 153 + 1);
+            assert_eq!(view.commits.len(), 50);
             assert_eq!(view.label.as_deref(), Some("Ada Lovelace"));
             assert!(view.offers_older());
             let (node, _) = net_of(&view.entries[view.runs[0].clone()]);
@@ -1732,6 +1778,24 @@ mod tests {
                 Some(("c240".into(), "c249".into()))
             );
         });
+        // The 200 commits before: Eve's link, made at c100 and unmade at c120 with Ada's
+        // outgoing Knows empty at both ends of the window, is seen.
+        view.update(cx, |view, cx| view.read_older(cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            let shown = view.shown();
+            assert_eq!(shown[shown.len() - 3].0, commits(&[120]));
+            assert_eq!(shown[shown.len() - 2].0, commits(&[100]));
+            assert_eq!(shown[shown.len() - 1].0, commits(&[5]), "her creation");
+            assert_eq!(view.commits.len(), COMMITS);
+        });
+        let asked = asked.lock().unwrap();
+        assert!(
+            asked
+                .iter()
+                .any(|a| a.contains("/commits?branch=main&limit=200&page_token=50")),
+            "{asked:?}"
+        );
     }
 
     /// A relationship between two types whose nodes share a key reads from the schema's ends:
@@ -1821,8 +1885,12 @@ mod tests {
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             let found = view.found.as_ref().expect("searched");
-            assert_eq!(found.created.as_ref().map(|c| c.id.as_str()), Some("c5"));
-            assert!(found.requests <= 1 + 7, "a listing and log2(50) reads");
+            assert!(
+                matches!(&view.coverage.creation, Creation::Found(c) if c.id == "c5"),
+                "{:?}",
+                view.coverage.creation
+            );
+            assert!(found.requests <= 1 + 8, "a listing and log2(200) reads");
             assert!(!view.offers_search(), "it ran");
         });
         {
@@ -1831,7 +1899,7 @@ mod tests {
                 .iter()
                 .filter(|a| a.contains("node_history_node"))
                 .count();
-            assert!((1..=6).contains(&reads), "{asked:?}");
+            assert!((1..=8).contains(&reads), "{asked:?}");
         }
         assert!(by_view(&session, "node_history_search_commits", cx) >= 1);
         cx.simulate_keystrokes("cmd-alt-n");
@@ -1853,6 +1921,9 @@ mod tests {
     async fn a_window_with_the_creation_offers_no_search(cx: &mut TestAppContext) {
         let (session, _, _) = serve(Served::default(), cx);
         let (view, cx) = open(&session, "zed", cx);
+        view.read_with(cx, |view, _| assert!(view.offers_search(), "c100 is older"));
+        view.update(cx, |view, cx| view.read_older(cx));
+        cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert!(view.entries.iter().any(|e| e.created()));
             assert!(!view.offers_search());
@@ -1865,6 +1936,8 @@ mod tests {
     async fn a_removed_node_shows_its_removal_and_creation(cx: &mut TestAppContext) {
         let (session, _, _) = serve(Served::default(), cx);
         let (view, cx) = open(&session, "zed", cx);
+        view.update(cx, |view, cx| view.read_older(cx));
+        cx.run_until_parked();
         view.read_with(cx, |view, _| {
             let kinds: Vec<(&str, bool, bool, usize)> = view
                 .entries
@@ -1899,8 +1972,8 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert!(matches!(view.state, State::Ready));
             assert_eq!(
-                view.boundary,
-                Some(SchemaBoundary {
+                view.coverage.reach,
+                Reach::Boundary(graph_store::node_history::SchemaBoundary {
                     commit: "c201".into(),
                     type_name: Some("Person".into())
                 })
@@ -1926,7 +1999,9 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert!(matches!(view.state, State::Ready));
             assert!(view.entries.is_empty());
-            let stopped = view.stopped.clone().expect("the reason");
+            let Reach::Stopped(stopped) = &view.coverage.reach else {
+                panic!("the reason: {:?}", view.coverage.reach)
+            };
             assert!(stopped.contains("reclaimed"), "{stopped}");
             assert!(!view.offers_older(), "no older window past a stop");
         });
@@ -1936,7 +2011,7 @@ mod tests {
         );
         let (view, cx) = open(&session, "ada", cx);
         view.read_with(cx, |view, _| {
-            assert!(view.stopped.is_some());
+            assert!(matches!(view.coverage.reach, Reach::Stopped(_)));
             assert!(!view.offers_older());
             assert_eq!(view.shown().len(), 4, "what was read stays");
         });
@@ -1960,8 +2035,57 @@ mod tests {
         cx.simulate_keystrokes("cmd-alt-f");
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
-            let found = view.found.as_ref().expect("searched");
-            assert_eq!(found.created.as_ref().map(|c| c.id.as_str()), Some("c5"));
+            assert!(view.found.is_some(), "searched");
+            assert!(matches!(&view.coverage.creation, Creation::Found(c) if c.id == "c5"));
+        });
+    }
+
+    /// A node with a relationship group too large to follow never reads that no commit changed
+    /// its relationships, nor "since the graph began": the empty state names the group, and no
+    /// last change is claimed (review of #162).
+    #[gpui::test]
+    async fn a_group_too_large_to_follow_is_named_and_never_claims_the_start(
+        cx: &mut TestAppContext,
+    ) {
+        let (session, _, _) = serve(Served::default(), cx);
+        let (view, cx) = open(&session, "hub", cx);
+        view.read_with(cx, |view, _| {
+            assert!(view.entries.is_empty());
+            assert!(!view.coverage.follows_every_group());
+            assert!(!view.coverage.reaches_the_start());
+            let (title, detail) = view.empty_words();
+            assert_eq!(title, "No changes in the last 50 commits");
+            assert!(!detail.contains("since the graph began"), "{detail}");
+            assert!(!detail.contains("or its relationships"), "{detail}");
+            assert!(
+                detail.contains("relationships Studio could follow"),
+                "{detail}"
+            );
+            assert!(detail.contains("WorksAt → Company"), "{detail}");
+        });
+        assert!(cx.debug_bounds("node-history-empty").is_some());
+        let last = session.read_with(cx, |session, _| {
+            session.last_change("Person", "hub").cloned()
+        });
+        assert!(last.is_none(), "no last change is claimed");
+    }
+
+    /// A removal whose relationships were too large to follow says so, not that none were read
+    /// (review of #162; Bugbot).
+    #[gpui::test]
+    async fn a_removal_says_when_its_relationships_were_too_large(cx: &mut TestAppContext) {
+        let (session, _, _) = serve(Served::default(), cx);
+        let (view, cx) = open(&session, "big", cx);
+        view.read_with(cx, |view, _| {
+            assert!(view.entries[0].removed());
+            assert!(view.entries[0].edges.is_empty());
+            let said = view.removal_words();
+            assert!(said.contains("too large to follow"), "{said}");
+            assert!(said.contains("WorksAt → Company"), "{said}");
+        });
+        let (view, cx) = open(&session, "zed", cx);
+        view.read_with(cx, |view, _| {
+            assert!(view.coverage.follows_every_group());
         });
     }
 

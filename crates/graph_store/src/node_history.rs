@@ -4,14 +4,20 @@
 //!
 //! Omnigraph has no read of the commits that changed one entity (E62). Studio reads the node
 //! itself instead: the commit listing names a window of the branch's newest
-//! [`NODE_HISTORY_COMMITS`] first-parent commits, and at each of them, and at the parent of the
-//! oldest, Studio reads the node with a point query at that commit's snapshot, the ids of its
-//! edges through each relationship group, and the size and kind of each Blob. Two consecutive
-//! reads that differ are the change the newer commit made. The cost follows the window and the
+//! [`NODE_HISTORY_FIRST_COMMITS`] first-parent commits (then [`NODE_HISTORY_COMMITS`] a window
+//! further back), and at each of them, and at the parent of the
+//! oldest, Studio reads the node with a point query at that commit's snapshot, its edges through
+//! each relationship group (their ids, and a keyed edge's properties outside its key, which an
+//! upsert changes under the same id), and the size and kind of each Blob. Two consecutive reads
+//! that differ are the change the newer commit made. The cost follows the window and the
 //! node's relationship groups, never what the node's type wrote: a load of 50,000 nodes of the
 //! type in the window costs what any other commit costs. It is exact for properties, a value
 //! changed and changed back included. An older window goes on from the listing's page token, for
 //! the head the first window resolved (constitution II).
+//!
+//! What a window followed and what it could not ([`Coverage`]) comes with it, so the view says
+//! nothing the reads do not support. Entries and coverage do not depend on how they were read:
+//! E62 can replace the read plan alone.
 //!
 //! The change feed (`GET /changes` with `type` and `op`) is the alternative where a type changes
 //! rarely; it is not used here (spec 046, Decisions).
@@ -19,6 +25,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 
+use futures::StreamExt as _;
+use futures::stream::FuturesUnordered;
 use gpui::{AsyncApp, Context, Task, WeakEntity};
 use gq_language::{BuiltQuery, Direction, RelationshipGroup, ScalarKind, SchemaModel, builder};
 use graph_client::api::{ChangeImageOutput, EntityKind, QueryRequest};
@@ -30,9 +38,14 @@ use crate::changes::{FoldedChange, NetChange};
 use crate::ledger::Asker;
 use crate::scope::ReadScope;
 
-/// First-parent commits a window of a node's history covers, with "Read the 200 commits before"
-/// as the honest exit.
+/// First-parent commits an older window of a node's history covers ("Read the 200 commits
+/// before").
 pub const NODE_HISTORY_COMMITS: u32 = 200;
+
+/// First-parent commits the first window covers: smaller, so History opens in a few seconds. A
+/// full window of 200 on a person with four relationship groups is about 1,000 requests, which
+/// settled in 18 s against a local server (spec 046, validation log).
+pub const NODE_HISTORY_FIRST_COMMITS: u32 = 50;
 
 /// Reads a window sends at once.
 pub const NODE_HISTORY_READS_AT_ONCE: usize = 4;
@@ -100,40 +113,34 @@ impl BlobState {
         }
     }
 
-    /// The cell as an image holds it, which a card says as "Blob · 1.2 KB": its size, or its
-    /// address.
-    pub fn value(&self) -> Value {
+    /// The cell as an image holds it, exact: `{"size": n}` for a file Omnigraph stores,
+    /// `{"uri": …}` for an external one. Images are compared as they are, so two files that
+    /// differ by a byte are two values; a card formats the size (`change_cards`).
+    pub fn image(&self) -> Value {
         match self {
             Self::Null => Value::Null,
-            Self::Stored { size } => Value::String(size_words(*size)),
-            Self::External { uri } => Value::String(uri.clone()),
+            Self::Stored { size } => serde_json::json!({ "size": size }),
+            Self::External { uri } => serde_json::json!({ "uri": uri }),
         }
     }
 }
 
-/// `1.2 KB`, as Studio writes sizes (`studio_ui::format_bytes`, a layer up).
-fn size_words(bytes: u64) -> String {
-    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
-    if bytes < 1000 {
-        return format!("{bytes} B");
-    }
-    let mut value = bytes as f64 / 1000.0;
-    let mut unit = 0;
-    while value >= 1000.0 && unit < UNITS.len() - 1 {
-        value /= 1000.0;
-        unit += 1;
-    }
-    format!("{value:.1} {}", UNITS[unit])
+/// One edge of the node as a commit holds it: its other end, and for a keyed edge its
+/// properties outside the key, which an upsert changes in place.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EdgeAt {
+    pub other: String,
+    pub values: Map<String, Value>,
 }
 
 /// The node as one commit holds it: whether it exists, its properties, its Blobs and its edges
-/// through each relationship group (by the group's index), each edge's id with its other end.
+/// through each relationship group (by the group's index), each edge by its id.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct NodeState {
     pub exists: bool,
     pub properties: Map<String, Value>,
     pub blobs: BTreeMap<String, BlobState>,
-    pub edges: BTreeMap<usize, BTreeMap<String, String>>,
+    pub edges: BTreeMap<usize, BTreeMap<String, EdgeAt>>,
     /// The groups whose read at this commit listed [`NODE_HISTORY_EDGES`] edges: only the first
     /// of them, by id, so an edge added or removed may push another past the page.
     pub full: std::collections::BTreeSet<usize>,
@@ -146,6 +153,9 @@ pub struct NodeScope {
     pub type_name: String,
     pub id: String,
     groups: Vec<RelationshipGroup>,
+    /// For each group, the properties a keyed edge of its type changes in place, read with its
+    /// ids; none for an edge without a key.
+    in_place: Vec<Vec<String>>,
     blobs: Vec<String>,
 }
 
@@ -163,10 +173,26 @@ impl NodeScope {
                     .collect()
             })
             .unwrap_or_default();
+        let groups = schema.relationships_of(type_name).to_vec();
+        let in_place = groups
+            .iter()
+            .map(|group| {
+                schema
+                    .edge(&group.edge)
+                    .map(|edge| {
+                        edge.changed_in_place()
+                            .iter()
+                            .map(|p| p.name.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
+            .collect();
         Self {
             type_name: type_name.to_owned(),
             id: id.to_owned(),
-            groups: schema.relationships_of(type_name).to_vec(),
+            groups,
+            in_place,
             blobs,
         }
     }
@@ -176,8 +202,8 @@ impl NodeScope {
         1 + self.groups.len() + self.blobs.len()
     }
 
-    /// What changed from `older` to `newer` in `commit`: the node itself, and each edge added or
-    /// removed.
+    /// What changed from `older` to `newer` in `commit`: the node itself, and each edge added,
+    /// removed, or for a keyed edge changed in place.
     pub fn change(
         &self,
         older: &NodeState,
@@ -188,7 +214,7 @@ impl NodeScope {
             state.exists.then(|| {
                 let mut properties = state.properties.clone();
                 for (name, blob) in &state.blobs {
-                    properties.insert(name.clone(), blob.value());
+                    properties.insert(name.clone(), blob.image());
                 }
                 ChangeImageOutput {
                     properties,
@@ -216,13 +242,14 @@ impl NodeScope {
             }
             let was = older.edges.get(&ix).unwrap_or(&empty);
             let now = newer.edges.get(&ix).unwrap_or(&empty);
-            let image = |other: &str| {
+            let image = |edge: &EdgeAt| {
+                let other = edge.other.as_str();
                 let (from, to) = match group.direction {
                     Direction::Outgoing => (self.id.as_str(), other),
                     Direction::Incoming => (other, self.id.as_str()),
                 };
                 ChangeImageOutput {
-                    properties: Map::new(),
+                    properties: edge.values.clone(),
                     endpoints: Some(serde_json::json!({ "from": from, "to": to })),
                 }
             };
@@ -235,11 +262,18 @@ impl NodeScope {
                 after,
                 commits: vec![commit.to_owned()],
             };
-            for (id, other) in now.iter().filter(|(id, _)| !was.contains_key(*id)) {
-                edges.push(edge(id, None, Some(image(other))));
+            for (id, at) in now {
+                match was.get(id) {
+                    None => edges.push(edge(id, None, Some(image(at)))),
+                    // A keyed edge upserted under the same id: its properties changed in place.
+                    Some(before) if before != at => {
+                        edges.push(edge(id, Some(image(before)), Some(image(at))))
+                    }
+                    Some(_) => {}
+                }
             }
-            for (id, other) in was.iter().filter(|(id, _)| !now.contains_key(*id)) {
-                edges.push(edge(id, Some(image(other)), None));
+            for (id, at) in was.iter().filter(|(id, _)| !now.contains_key(*id)) {
+                edges.push(edge(id, Some(image(at)), None));
             }
         }
         (node, edges)
@@ -322,6 +356,89 @@ pub struct SchemaBoundary {
     pub type_name: Option<String>,
 }
 
+/// How far back the windows of a node's history reach.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Reach {
+    /// Older commits remain unread.
+    #[default]
+    Window,
+    /// The graph's first commit.
+    GraphStart,
+    /// A schema change a read could not cross (E52).
+    Boundary(SchemaBoundary),
+    /// A read failed, for this reason: what is older is not known.
+    Stopped(String),
+}
+
+/// What is known of the node's creation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Creation {
+    /// Not searched, and no entry read created it.
+    #[default]
+    NotSearched,
+    /// An entry read created it.
+    InEntries,
+    /// A search of the commits before the windows found the commit that created it.
+    Found(WindowCommit),
+    /// The search listed commits up to its cap with the node still there: it was created
+    /// before this commit, the oldest listed.
+    Before(WindowCommit),
+    /// The search stopped short, for this reason.
+    SearchStopped(String),
+}
+
+/// What a node's history followed, and what it could not (spec 046): every sentence that says
+/// what was read, or that nothing changed, reads it from here, so none claims more than the
+/// reads support.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Coverage {
+    /// Relationship groups too large to follow at some commit read ([`NODE_HISTORY_EDGES`] edges
+    /// or more): their changes there are not known. Every other group was followed.
+    pub too_large: Vec<RelationshipGroup>,
+    pub reach: Reach,
+    pub creation: Creation,
+}
+
+impl Coverage {
+    /// Whether every relationship group was followed at every commit read.
+    pub fn follows_every_group(&self) -> bool {
+        self.too_large.is_empty()
+    }
+
+    /// Whether "no commit changed it since the graph began" can be said: the windows reach the
+    /// graph's first commit and followed every group.
+    pub fn reaches_the_start(&self) -> bool {
+        self.reach == Reach::GraphStart && self.follows_every_group()
+    }
+
+    /// Whether the newest entry is the node's last change: no group too large to follow may
+    /// hide a newer one.
+    pub fn last_change_known(&self) -> bool {
+        self.follows_every_group()
+    }
+
+    /// Takes an older window's coverage below this one's: the groups it could not follow, how
+    /// far it reaches, and a creation among its entries.
+    pub fn below(&mut self, older: Coverage) {
+        for group in older.too_large {
+            if !self.too_large.contains(&group) {
+                self.too_large.push(group);
+            }
+        }
+        self.reach = older.reach;
+        if older.creation == Creation::InEntries {
+            self.creation = Creation::InEntries;
+        }
+    }
+
+    /// Takes what a search past the windows found of the node's creation.
+    pub fn searched(&mut self, found: &SearchFound) {
+        if self.creation != Creation::InEntries {
+            self.creation = found.creation.clone();
+        }
+    }
+}
+
 /// A window of a node's history, as it was read.
 #[derive(Debug, Clone)]
 pub struct NodeHistoryPage {
@@ -339,12 +456,8 @@ pub struct NodeHistoryPage {
     /// Where an older window goes on; `None` once the window reached the graph's first commit or
     /// a schema boundary, or stopped short.
     pub older: Option<OlderWindow>,
-    /// Why the window was not read to its end, in words, when it was not.
-    pub stopped: Option<String>,
-    pub boundary: Option<SchemaBoundary>,
-    /// Relationship groups with [`NODE_HISTORY_EDGES`] edges at some commit: what they did past
-    /// those is not known.
-    pub full_groups: Vec<RelationshipGroup>,
+    /// What the window followed and what it could not.
+    pub coverage: Coverage,
     /// Requests sent, for the end row and the validation log.
     pub requests: usize,
 }
@@ -450,17 +563,12 @@ pub struct LastChange {
     pub at: i64,
 }
 
-/// What the search past the windows found: the commit that created the node.
+/// What the search past the windows found of the node's creation.
 #[derive(Debug, Clone, Default)]
 pub struct SearchFound {
-    pub created: Option<WindowCommit>,
+    pub creation: Creation,
     /// Requests sent: listing pages and point reads.
     pub requests: usize,
-    /// The oldest commit listed, when the listing stopped at its cap before the graph's first
-    /// with the node still there: it was created before it, which is all the search can say.
-    pub before: Option<WindowCommit>,
-    /// Why it stopped short, when it did.
-    pub stopped: Option<String>,
 }
 
 /// The next step of a binary search over `0..len` for the oldest index a question holds at, it
@@ -500,7 +608,7 @@ enum Read {
 /// What one read of a commit answered.
 enum Answer {
     Node(Option<Map<String, Value>>),
-    Edges(usize, BTreeMap<String, String>, bool),
+    Edges(usize, BTreeMap<String, EdgeAt>, bool),
     Blob(usize, BlobState),
 }
 
@@ -586,6 +694,7 @@ impl Reader {
             }
             Read::Edges(ix) => {
                 let group = self.node.groups[ix].clone();
+                let in_place = self.node.in_place[ix].clone();
                 let query = match builder::history_edges(
                     &self.schema,
                     &self.node.type_name,
@@ -616,9 +725,19 @@ impl Reader {
                     let edges = rows
                         .iter()
                         .filter_map(|row| {
+                            let values = in_place
+                                .iter()
+                                .map(|name| {
+                                    let value = row.get(format!("v_{name}")).cloned();
+                                    (name.clone(), value.unwrap_or(Value::Null))
+                                })
+                                .collect();
                             Some((
                                 row.get("edge")?.as_str()?.to_owned(),
-                                row.get("id")?.as_str()?.to_owned(),
+                                EdgeAt {
+                                    other: row.get("id")?.as_str()?.to_owned(),
+                                    values,
+                                },
                             ))
                         })
                         .collect();
@@ -649,8 +768,9 @@ impl Reader {
         }
     }
 
-    /// Runs `jobs` (a commit's index into `ids` and a read), [`NODE_HISTORY_READS_AT_ONCE`] at
-    /// a time, and writes each answer into `states`. Returns the failures, by commit index, and
+    /// Runs `jobs` (a commit's index into `ids` and a read), keeping
+    /// [`NODE_HISTORY_READS_AT_ONCE`] running, a new one starting as each answers, and writes
+    /// each answer into `states`. Returns the failures, by commit index, and
     /// adds to `full` each group a read found full.
     async fn run(
         &mut self,
@@ -661,13 +781,21 @@ impl Reader {
         cx: &mut AsyncApp,
     ) -> Vec<(usize, ReadError)> {
         let mut failed = Vec::new();
-        for chunk in jobs.chunks(NODE_HISTORY_READS_AT_ONCE) {
-            let tasks: Vec<_> = chunk
-                .iter()
-                .map(|&(at, read)| (at, self.read_at(read, &ids[at], cx)))
-                .collect();
-            for (at, task) in tasks {
-                match task.await {
+        let mut jobs = jobs.into_iter();
+        let mut running = FuturesUnordered::new();
+        loop {
+            while running.len() < NODE_HISTORY_READS_AT_ONCE {
+                let Some((at, read)) = jobs.next() else {
+                    break;
+                };
+                let task = self.read_at(read, &ids[at], cx);
+                running.push(async move { (at, task.await) });
+            }
+            let Some((at, answer)) = running.next().await else {
+                break;
+            };
+            {
+                match answer {
                     Ok(Answer::Node(node)) => {
                         let state = &mut states[at];
                         state.exists = node.is_some();
@@ -745,8 +873,8 @@ impl GraphSession {
     }
 
     /// A window of node `node`'s history on `branch` (spec 046), asked for through `scope`: the
-    /// newest [`NODE_HISTORY_COMMITS`] first-parent commits, or the ones before a window read
-    /// already. One commit listing, then at each commit and at the oldest one's parent the node
+    /// newest [`NODE_HISTORY_FIRST_COMMITS`] first-parent commits, or the
+    /// [`NODE_HISTORY_COMMITS`] before a window read already. One commit listing, then at each commit and at the oldest one's parent the node
     /// itself, its edges through each relationship group and its Blobs' sizes, at most
     /// [`NODE_HISTORY_READS_AT_ONCE`] at once; the edges and Blobs only where the node exists.
     /// Then the branch of each merge that changed the node. Each read
@@ -765,6 +893,11 @@ impl GraphSession {
         };
         cx.spawn(async move |_, cx| {
             let newest = matches!(window, NodeHistoryWindow::Newest);
+            let limit = if newest {
+                NODE_HISTORY_FIRST_COMMITS
+            } else {
+                NODE_HISTORY_COMMITS
+            };
             let (token, head, carried) = match window {
                 NodeHistoryWindow::Newest => (None, None, None),
                 NodeHistoryWindow::Older { head, window } => {
@@ -781,7 +914,7 @@ impl GraphSession {
                     "node_history_commits",
                     async move {
                         client
-                            .commit_page(&graph, &branch, NODE_HISTORY_COMMITS, token.as_deref())
+                            .commit_page(&graph, &branch, limit, token.as_deref())
                             .await
                     },
                     cx,
@@ -800,12 +933,11 @@ impl GraphSession {
                 entries: Vec::new(),
                 commits: Vec::new(),
                 older: None,
-                stopped: None,
-                boundary: None,
-                full_groups: Vec::new(),
+                coverage: Coverage::default(),
                 requests: 0,
             };
             let Some(oldest) = commits.last().cloned() else {
+                page.coverage.reach = Reach::GraphStart;
                 page.requests = reader.requests;
                 return Ok(page);
             };
@@ -841,7 +973,8 @@ impl GraphSession {
                 jobs.extend((0..blobs).map(|ix| (at, Read::Blob(ix))));
             }
             failed.extend(reader.run(&ids, jobs, &mut states, &mut full, cx).await);
-            page.full_groups = full
+            full.sort_unstable();
+            page.coverage.too_large = full
                 .iter()
                 .map(|&ix| reader.node.groups[ix].clone())
                 .collect();
@@ -853,15 +986,13 @@ impl GraphSession {
                 if at == 0 {
                     return Err(error);
                 }
-                match gap_of(&error) {
-                    Some(type_name) => {
-                        page.boundary = Some(SchemaBoundary {
-                            commit: ids[at - 1].clone(),
-                            type_name,
-                        });
-                    }
-                    None => page.stopped = Some(error.to_string()),
-                }
+                page.coverage.reach = match gap_of(&error) {
+                    Some(type_name) => Reach::Boundary(SchemaBoundary {
+                        commit: ids[at - 1].clone(),
+                        type_name,
+                    }),
+                    None => Reach::Stopped(error.to_string()),
+                };
                 // Commit `at - 1` is measured against `at`, which was not read.
                 commits.truncate(at - 1);
                 states.truncate(at);
@@ -874,8 +1005,14 @@ impl GraphSession {
                         base: oldest.parent.clone().map(|id| (id, states[last].clone())),
                     });
                 page.oldest = Some((ids[last].clone(), states[last].clone()));
+                if page.older.is_none() {
+                    page.coverage.reach = Reach::GraphStart;
+                }
             }
             page.entries = entries_of(&reader.node, &commits, &states);
+            if page.entries.iter().any(NodeHistoryEntry::created) {
+                page.coverage.creation = Creation::InEntries;
+            }
             page.newest = states.first().cloned();
 
             // The branch each merge came from, a commit read each, the newest first.
@@ -886,15 +1023,25 @@ impl GraphSession {
                 .filter_map(|(ix, e)| e.merged_parent.clone().map(|m| (ix, m)))
                 .take(NODE_HISTORY_MERGE_NAMES)
                 .collect();
-            for (ix, merged) in merges {
-                let (client, graph) = (reader.client.clone(), reader.graph.clone());
-                let read = reader
-                    .start(
+            // Read as the window's reads are, at most NODE_HISTORY_READS_AT_ONCE at once.
+            let mut merges = merges.into_iter();
+            let mut running = FuturesUnordered::new();
+            loop {
+                while running.len() < NODE_HISTORY_READS_AT_ONCE {
+                    let Some((ix, merged)) = merges.next() else {
+                        break;
+                    };
+                    let (client, graph) = (reader.client.clone(), reader.graph.clone());
+                    let read = reader.start(
                         "node_history_merge",
                         async move { client.commit(&graph, &merged).await },
                         cx,
-                    )
-                    .await;
+                    );
+                    running.push(async move { (ix, read.await) });
+                }
+                let Some((ix, read)) = running.next().await else {
+                    break;
+                };
                 if let Ok(commit) = read {
                     page.entries[ix].merged_branch =
                         Some(commit.graph_branch.unwrap_or_else(|| "main".to_owned()));
@@ -905,7 +1052,7 @@ impl GraphSession {
             page.requests = reader.requests;
             // A group too large to follow may hide a newer change: the page then says nothing.
             if newest
-                && page.full_groups.is_empty()
+                && page.coverage.last_change_known()
                 && let Some(last) = page.entries.first()
             {
                 let last = LastChange {
@@ -950,15 +1097,13 @@ impl GraphSession {
         }
         cx.spawn(async move |_, cx| {
             let mut found = SearchFound::default();
+            let mut capped = false;
             // The commits from `base` back towards the graph's first.
             let mut older: Vec<WindowCommit> = Vec::new();
             let mut token = Some(page_token);
             while let Some(at) = token.take() {
                 if older.len() >= NODE_HISTORY_SEARCH_COMMITS {
-                    found.stopped = Some(format!(
-                        "Studio searched the {NODE_HISTORY_SEARCH_COMMITS} commits before the \
-                         windows read"
-                    ));
+                    capped = true;
                     break;
                 }
                 let (client, graph, branch) = (
@@ -976,7 +1121,7 @@ impl GraphSession {
                 older.extend(listing.commits.iter().map(WindowCommit::of));
                 token = listing.next_page_token;
             }
-            let reached_first = token.is_none() && found.stopped.is_none();
+            let reached_first = token.is_none() && !capped;
             if older.first().map(|c| c.id.as_str()) != Some(base.0.as_str()) {
                 return Err(ReadError::Decode(
                     "the commits before the windows do not go on from where they ended".into(),
@@ -989,16 +1134,17 @@ impl GraphSession {
                     Ok(state) if state.exists => lo = mid,
                     Ok(_) => hi = mid,
                     Err(error) => {
-                        found.stopped = Some(error.to_string());
+                        found.creation = Creation::SearchStopped(error.to_string());
                         found.requests = reader.requests;
                         return Ok(found);
                     }
                 }
             }
-            match settled(lo, older.len(), reached_first) {
-                Some(at) => found.created = Some(older[at].clone()),
-                None => found.before = older.last().cloned(),
-            }
+            found.creation = match (settled(lo, older.len(), reached_first), older.last()) {
+                (Some(at), _) => Creation::Found(older[at].clone()),
+                (None, Some(oldest)) => Creation::Before(oldest.clone()),
+                (None, None) => Creation::NotSearched,
+            };
             found.requests = reader.requests;
             Ok(found)
         })
@@ -1038,11 +1184,13 @@ mod tests {
             ..Default::default()
         };
         for (ix, id, other) in edges {
-            state
-                .edges
-                .entry(*ix)
-                .or_default()
-                .insert((*id).into(), (*other).into());
+            state.edges.entry(*ix).or_default().insert(
+                (*id).into(),
+                EdgeAt {
+                    other: (*other).into(),
+                    values: Map::new(),
+                },
+            );
         }
         state
     }
@@ -1223,16 +1371,116 @@ mod tests {
         );
     }
 
-    /// Blob cells compare by kind and size, said as a size.
+    /// Blob cells compare exactly, by kind and size: a file of 1,200 bytes replaced by one of
+    /// 1,240 is a change, where their rounded sizes ("1.2 KB") read alike (review of #162).
     #[test]
-    fn a_blob_is_compared_by_kind_and_size() {
-        assert_eq!(BlobState::Stored { size: 1_200 }.value(), json!("1.2 KB"));
+    fn a_blob_is_compared_by_its_exact_size() {
+        let scope = NodeScope::new(
+            &SchemaModel::parse("node Doc {\n  slug: String @key\n  file: Blob?\n}\n").unwrap(),
+            "Doc",
+            "d1",
+        );
+        let with = |size: u64| {
+            let mut state = state(json!({"slug": "d1"}), &[]);
+            state
+                .blobs
+                .insert("file".into(), BlobState::Stored { size });
+            state
+        };
+        let (older, newer) = (with(1_200), with(1_240));
+        assert_ne!(older, newer);
+        let entries = entries_of(&scope, &[commit(2, "act-a")], &[newer, older]);
+        assert_eq!(entries.len(), 1, "one entry");
+        assert_eq!(
+            BlobState::Stored { size: 1_240 }.image(),
+            json!({"size": 1_240})
+        );
+        assert_eq!(BlobState::Null.image(), Value::Null);
         assert_ne!(
             BlobState::Stored { size: 1 },
             BlobState::External {
                 uri: "s3://x".into()
             }
         );
-        assert_eq!(BlobState::Null.value(), Value::Null);
+    }
+
+    /// A keyed edge upserted under the same id with a new property value is an entry: its id
+    /// alone would miss it (review of #162).
+    #[test]
+    fn a_keyed_edge_changed_in_place_is_an_entry() {
+        let schema = SchemaModel::parse(
+            "node Person {\n  slug: String @key\n}\n\
+             edge Knows: Person -> Person {\n  since: String?\n  @key(@src, @dst)\n}\n",
+        )
+        .unwrap();
+        let scope = NodeScope::new(&schema, "Person", "ada");
+        assert!(scope.in_place.iter().any(|names| names == &["since"]));
+        let ix = scope
+            .groups
+            .iter()
+            .position(|g| g.direction == Direction::Outgoing)
+            .unwrap();
+        let knows = |since: &str| {
+            let mut state = state(json!({"slug": "ada"}), &[]);
+            let mut values = Map::new();
+            values.insert("since".into(), json!(since));
+            state.edges.entry(ix).or_default().insert(
+                "k1".into(),
+                EdgeAt {
+                    other: "grace".into(),
+                    values,
+                },
+            );
+            state
+        };
+        let entries = entries_of(
+            &scope,
+            &[commit(2, "act-a")],
+            &[knows("2025"), knows("2024")],
+        );
+        assert_eq!(entries.len(), 1);
+        let edge = &entries[0].edges[0];
+        assert!(
+            edge.before.is_some() && edge.after.is_some(),
+            "changed, not added"
+        );
+        assert!(
+            entries_of(
+                &scope,
+                &[commit(2, "act-a")],
+                &[knows("2024"), knows("2024")]
+            )
+            .is_empty()
+        );
+    }
+
+    /// Coverage says what can be claimed: "since the graph began" only when the windows reach
+    /// it and every group was followed; the last change only when no group was too large; an
+    /// older window's groups and reach join it, and a search's creation, unless an entry holds
+    /// it (review of #162).
+    #[test]
+    fn coverage_says_only_what_the_reads_support() {
+        let group = scope().groups[0].clone();
+        let mut coverage = Coverage {
+            reach: Reach::GraphStart,
+            ..Default::default()
+        };
+        assert!(coverage.reaches_the_start() && coverage.last_change_known());
+        coverage.too_large.push(group.clone());
+        assert!(!coverage.reaches_the_start(), "a group too large to follow");
+        assert!(!coverage.last_change_known());
+        let mut newest = Coverage::default();
+        newest.below(coverage.clone());
+        assert_eq!(newest.too_large, [group]);
+        assert_eq!(newest.reach, Reach::GraphStart);
+        let found = SearchFound {
+            creation: Creation::Found(commit(5, "act-old")),
+            requests: 7,
+        };
+        newest.searched(&found);
+        assert_eq!(newest.creation, found.creation);
+        newest.creation = Creation::InEntries;
+        newest.searched(&found);
+        assert_eq!(newest.creation, Creation::InEntries, "an entry holds it");
     }
 }
