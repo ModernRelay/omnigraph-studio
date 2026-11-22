@@ -21,6 +21,7 @@ mod ui_tools_canvas_tests;
 #[cfg(test)]
 mod ui_tools_tests;
 mod update_status;
+mod waitlist;
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -296,6 +297,19 @@ fn copy_link(workspace: &mut Workspace, cx: &mut Context<Workspace>) {
 }
 
 /// Opens the settings tab, offering the workspace's graph as a scope.
+/// Opens Settings at `section`, as `OpenAgentSettings` opens it at Agent: what a link to a
+/// setting does in place of naming where it is (spec 047).
+pub(crate) fn open_settings_at(
+    workspace: &mut Workspace,
+    section: &'static str,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    if let Some(view) = open_settings(workspace, window, cx) {
+        view.update(cx, |view, cx| view.show_section(section, window, cx));
+    }
+}
+
 fn open_settings(
     workspace: &mut Workspace,
     window: &mut Window,

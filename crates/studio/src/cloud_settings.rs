@@ -248,9 +248,29 @@ impl CloudPage {
                 .child(account_row(plane, "Sign-in", cx))
         });
         let body: Option<AnyElement> = match (&state, listed) {
-            (SignIn::SignedIn { .. }, Some(Organizations::Listed(listed))) if listed.is_empty() => {
+            (SignIn::SignedIn { account, .. }, Some(Organizations::Listed(listed)))
+                if listed.is_empty() =>
+            {
+                let waitlist = crate::waitlist::offered(plane.read(cx));
                 Some(
-                    ds::text::muted("You are a member of no organization here.").into_any_element(),
+                    h_flex()
+                        .gap(px(space::CONTROLS))
+                        .child(div().flex_1().min_w_0().child(ds::text::muted(
+                            organizations::no_organizations(account, cloud),
+                        )))
+                        .when(waitlist, |row| {
+                            row.child(
+                                div()
+                                    .flex_none()
+                                    .debug_selector(|| "settings-waitlist".into())
+                                    .child(crate::waitlist::link(
+                                        ("settings-waitlist", id),
+                                        crate::waitlist::Surface::NoOrganizations,
+                                        false,
+                                    )),
+                            )
+                        })
+                        .into_any_element(),
                 )
             }
             (SignIn::SignedIn { .. }, Some(Organizations::Listed(listed))) => Some(
@@ -351,8 +371,21 @@ impl CloudPage {
                 ds::card(cx)
                     .child(header(Some(counted), cx))
                     .when(count == 0, |card| {
+                        let profile = profiles
+                            .iter()
+                            .find(|(_, of)| of.as_deref() == Some(organization))
+                            .map(|(profile, _)| profile.as_str());
                         card.child(message(
-                            ds::text::muted("No clusters in this organization.").into_any_element(),
+                            v_flex()
+                                .debug_selector(|| "settings-no-clusters".into())
+                                .gap(px(space::SM))
+                                .child(ds::text::muted(organizations::NO_CLUSTERS))
+                                .child(ds::command_block(
+                                    SharedString::from(format!("create-cluster-{organization}")),
+                                    organizations::create_command(profile),
+                                    cx,
+                                ))
+                                .into_any_element(),
                         ))
                     })
                     .when(count > 0, |card| {
@@ -394,10 +427,11 @@ fn account_row(
     title: &'static str,
     cx: &mut Context<CloudPage>,
 ) -> AnyElement {
-    let (route, state, profiles) = {
+    let (route, cloud, state, profiles) = {
         let p = plane.read(cx);
         (
             p.route.clone(),
+            p.is_default(),
             p.sign_in_state().clone(),
             p.profiles.clone(),
         )
@@ -467,7 +501,21 @@ fn account_row(
             "Reading the control plane's sign-in…".to_owned(),
             div().into_any_element(),
         ),
-        SignIn::Unavailable(refusal) => (refusal.why.to_string(), div().into_any_element()),
+        // What failed may have passed: Try again reads the sign-in details again, as the Open
+        // dialog's does (spec 047).
+        SignIn::Unavailable(refusal) => (
+            organizations::plane_words(&refusal.why, cloud),
+            div()
+                .debug_selector(|| "cloud-sign-in-again".into())
+                .child(
+                    ds::button(("cloud-sign-in-again", id), "Try again")
+                        .style(ButtonStyle::Outlined)
+                        .on_click(
+                            cx.listener(move |_, _, _, cx| p.update(cx, |p, cx| p.sign_in(cx))),
+                        ),
+                )
+                .into_any_element(),
+        ),
         SignIn::Offered { why, .. } => (
             why.as_ref().map(|why| why.to_string()).unwrap_or_else(|| {
                 "Not signed in. One sign-in lists every organization you are a member of, with \
@@ -748,6 +796,96 @@ mod tests {
         page.update(cx, |page, cx| page.set_shown(None, cx));
         cx.run_until_parked();
         assert!(plane.read_with(cx, |plane, _| plane.organizations().is_none()));
+    }
+
+    /// Omnigraph Cloud's plane, as the `omnigraph_cloud` setting makes it.
+    fn cloud_plane(cx: &mut VisualTestContext) -> Entity<ControlPlane> {
+        cx.new(|cx| {
+            let mut plane = ControlPlane::new("https://control.test".into(), None, cx);
+            plane.set_default_for_test(true, cx);
+            plane
+        })
+    }
+
+    /// A sign-in whose details could not be read offers Try again on Omnigraph Cloud's page, as
+    /// the Open dialog does, and calls the service by its name (spec 047).
+    #[gpui::test]
+    fn sign_in_unavailable_offers_try_again(cx: &mut TestAppContext) {
+        cx.update(studio_theme::init_test);
+        let (page, cx): (_, &mut VisualTestContext) =
+            cx.add_window_view(|_, cx| CloudPage::new(cx));
+        let plane = cloud_plane(cx);
+        plane.update(cx, |plane, cx| {
+            plane.unavailable_for_test(
+                "The server's sign-in details could not be read: the connection was refused.",
+                cx,
+            )
+        });
+        page.update(cx, |page, cx| {
+            page.planes = vec![plane.clone()];
+            page.set_shown(Some(Part::Account), cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("cloud-sign-in-again").is_some(),
+            "Try again"
+        );
+        // Without a sign-in context there is nothing to read again with: it stays as it was,
+        // and nothing is sent.
+        let again = cx.debug_bounds("cloud-sign-in-again").unwrap();
+        cx.simulate_click(again.center(), gpui::Modifiers::none());
+        assert!(plane.read_with(cx, |plane, _| matches!(
+            plane.sign_in_state(),
+            SignIn::Unavailable(_)
+        )));
+    }
+
+    /// Clusters, signed in to Omnigraph Cloud in no organization: why, and Join the waitlist;
+    /// in an organization with no clusters: the command that makes one, and no waitlist.
+    #[gpui::test]
+    fn clusters_point_forward_where_there_are_none(cx: &mut TestAppContext) {
+        cx.update(studio_theme::init_test);
+        let (page, cx): (_, &mut VisualTestContext) =
+            cx.add_window_view(|_, cx| CloudPage::new(cx));
+        let plane = cloud_plane(cx);
+        plane.update(cx, |plane, cx| {
+            plane.signed_in_for_test(Vec::new(), Vec::new(), cx)
+        });
+        page.update(cx, |page, cx| {
+            page.planes = vec![plane.clone()];
+            page.part = Some(Part::Clusters);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let link = cx
+            .debug_bounds("settings-waitlist")
+            .expect("Join the waitlist");
+        cx.simulate_click(link.center(), gpui::Modifiers::none());
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some(crate::waitlist::url(crate::waitlist::Surface::NoOrganizations).as_str())
+        );
+
+        let listed: control_client::Envelope<control_client::ClusterList> =
+            serde_json::from_value(serde_json::json!({
+                "data": {"clusters": []},
+                "meta": {"provenance": "service_db", "assurance": "observed", "stale": false,
+                         "observed_at": "2026-11-05T00:00:00Z"},
+            }))
+            .unwrap();
+        plane.update(cx, |plane, cx| {
+            plane.signed_in_for_test(
+                vec![control_client::OrganizationSummary {
+                    organization_id: "org_1".into(),
+                    name: Some("Acme".into()),
+                }],
+                vec![("org_1".into(), Listing::Listed(listed))],
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("settings-waitlist").is_none());
+        assert!(cx.debug_bounds("settings-no-clusters").is_some());
     }
 
     /// A cluster a target names is managed through that target; one no target names first gets

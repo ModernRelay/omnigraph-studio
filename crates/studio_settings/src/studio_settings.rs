@@ -562,6 +562,11 @@ impl Default for ModelSettings {
 /// Omnigraph Cloud's control plane, which Studio offers by default (spec 021).
 pub const OMNIGRAPH_CLOUD: &str = "https://platform.omnigraph.dev";
 
+/// Omnigraph Cloud's page on omnigraph.dev, whose form joins its waitlist: Studio opens it in
+/// the browser, with a constant query naming the place in Studio it was opened from, and sends
+/// nothing itself (spec 047).
+pub const OMNIGRAPH_CLOUD_WAITLIST: &str = "https://www.omnigraph.dev/cloud";
+
 /// The whole settings document. Each field's doc comment is its row's description in the
 /// settings tab, and its `schemars` attributes give the title, section, range and control
 /// ([`fields`]).

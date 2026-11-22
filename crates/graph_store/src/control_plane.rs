@@ -172,6 +172,21 @@ impl ControlPlane {
         cx.notify();
     }
 
+    /// Makes it Omnigraph Cloud's plane, or not, as the `omnigraph_cloud` setting would: what a
+    /// view that words Omnigraph Cloud apart from other planes is tested with, without a registry.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_default_for_test(&mut self, is_default: bool, cx: &mut Context<Self>) {
+        self.set_default(is_default, cx);
+    }
+
+    /// Its sign-in details could not be read, for `why`: what a view of "Sign-in unavailable" is
+    /// tested with, without a sign-in service.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn unavailable_for_test(&mut self, why: &str, cx: &mut Context<Self>) {
+        self.sign_in = SignIn::Unavailable(oauth_client::Refusal::passing(why));
+        cx.notify();
+    }
+
     /// What a cluster's data token source reads its sign-in through ([`ControlTokenSource`]):
     /// `None` without a sign-in context, as in tests of other crates.
     ///
