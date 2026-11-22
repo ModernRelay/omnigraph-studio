@@ -2,7 +2,7 @@
 
 Status: step 1 built 2026-11-20 · a node's History view (its fourth view, ⌘⌥4): a timeline of
 its changes, newest first with runs folded, read as **point reads of the node at each commit** of
-a window of 200, a search past the window for when it was created, and the page's "Last changed
+a first window of 50 (then 200 at a time), a search past the window for when it was created, and the page's "Last changed
 by" line. Compare, Restore and the "not merged" section are the
 next steps. One entity's commits (E62) and a commit's operation (E60) wait on the engine.
 
@@ -37,7 +37,8 @@ says who set it.
 - **VIII.** Every action has a key and a palette entry: ⌘⌥4 (`OpenViewAt` place 4) and
   `studio_graph::OpenAsHistory`, `ReadOlderCommits` ⌘⌥N, `FindWhenCreated` ⌘⌥F, ↑/↓ and J/K, ↵,
   Space, ⌘R.
-- **IX.** Windows of 200 commits; about window × (1 + relationship groups) requests, 4 at once;
+- **IX.** A first window of 50 commits, then windows of 200; about window × (1 + relationship
+  groups) requests, 4 running at once;
   1,000 edges a group a commit; 20 merges named a window; a search lists at most 20,000 commits.
 - **X.** Designed against contract 0.14 (`omnigraph-0.15.0.json`). Waits on E60 and E62
   (recorded in spec 012 and `docs/deferred-engine-changes.md`).
@@ -54,8 +55,11 @@ says who set it.
   `HistoricalGap`. No route takes an entity id (E62); no commit names its operation (E60).
 - **A point read is small.** The node at one commit is one row of its non-Blob properties
   (`return { $n }`), about 0.4 KB; its edges through one relationship group are their ids
-  (`$e.@id`, `$m.@id`), about 0.2 KB for a few. Edges are never updated (T16), so their ids say
-  everything a commit did to them.
+  (`$e.@id`, `$m.@id`), about 0.2 KB for a few. An edge without a key is never updated (T16), so
+  its id says everything a commit did to it. A keyed edge (`@key(@src, @dst, …)`) derives its id
+  from its key, and inserting the key again changes its other properties in place, under the same
+  id (an upsert, `docs/user/mutations/index.md` at v0.15.0); so its properties outside the key
+  are read with its id.
 - **Studio before this spec:** History listed a branch's commits; `change_cards` drew a change's
   rows only from a folded review; the node page's view strip had Page, Tree and Canvas; ⌘⌥4 was
   bound on every platform to `OpenViewAt { index: 3 }`, which reached a type table's Gallery
@@ -97,14 +101,14 @@ Read back to YSJP572K, 32 min ago, the graph's first commit. 29 commits read.
   `GET /commits/{id}` each, at most 20 a window; "via merge of commit *X*" past them); Studio's own
   words for its own write; the relative time (UTC in the tooltip); the short commit, which opens
   the commit's tab (↵ too). Under it the property rows as a review draws them
-  (`change_cards::rows_of`, a Blob by size since #138), and a line for each edge added or removed,
-  naming the other end whichever end the node is.
+  (`change_cards::rows_of`, a Blob by size since #138), and a line for each edge added, removed
+  or, for a keyed edge, changed in place, naming the other end whichever end the node is.
 - **Folding.** Consecutive entries fold into one when they share the actor, the branch and the
   kind of author (Studio's own or not), each is less than 10 minutes after the one before, and
   none is a merge, a creation or a removal (the study's rule). A run of more than one starts
   folded: "*N* commits ⌄" and "*N* changes · 14:02–14:09, *time*", with its net change. Space or
   the button unfolds it into its entries, the first carrying "Fold ⌃".
-- **The end row** says how far it read ("Read back to *X*, *time*. 200 commits read.", or "…, the
+- **The end row** says how far it read ("Read back to *X*, *time*. 50 commits read.", or "…, the
   graph's first commit."), with **Read the 200 commits before ⌘⌥N**; its tooltip gives the
   requests sent. It names a relationship group too large to follow (1,000 edges or more at a
   commit), a schema change, and a read that stopped short with its reason.
@@ -118,20 +122,23 @@ Read back to YSJP572K, 32 min ago, the graph's first commit. 29 commits read.
 
 Per window (`GraphSession::node_history_in`, `graph_store::node_history`):
 
-1. `node_history_commits`: `GET /commits?branch=&limit=200` (`page_token` for an older window).
+1. `node_history_commits`: `GET /commits?branch=&limit=50` for the first window, `limit=200` and
+   `page_token` for an older one.
 2. `node_history_node`: the node at each commit of the window and at the oldest one's parent,
    a point query at that commit's snapshot (`builder::history_node`). An older window reuses the
    read of its newest commit, which the window above read as its base.
 3. `node_history_edges`: the node's edges through each relationship group (each edge type at
    each end the node's type can be, `builder::history_edges`, at most 1,000 a group), at every
-   commit where the node exists. A page of 1,000 holds only the first edges by id, so a group
+   commit where the node exists: each edge's id and other end, and for a keyed edge its
+   properties outside the key (`EdgeType::changed_in_place`), compared so an upsert is an entry. A page of 1,000 holds only the first edges by id, so a group
    read full at either of two commits is not compared between them: the end row says it is too
    large to follow, and the page's "Last changed by" line is not offered.
 4. `node_history_blob`: `HEAD /blob` at the snapshot for each Blob property, at each commit where
-   the node exists: kind and size, never bytes.
+   the node exists: kind and exact size, never bytes. Compared exactly; `change_cards` formats
+   the size only when it draws it.
 5. `node_history_merge`: `GET /commits/{merged}` for each merge entry, at most 20.
 
-Reads run at most 4 at once, each named in the read ledger under `ReadView::NodeHistory`; none is
+Four reads run at once, a new one starting as each answers (the merge names too), each named in the read ledger under `ReadView::NodeHistory`; none is
 sent again by itself, and no token, query text or row is logged. Two consecutive reads that differ
 are the newer commit's change, by its actor: exact for properties, a value changed and changed
 back included. A request costs what the node holds, not what its type wrote, so the cost is about
@@ -146,7 +153,18 @@ that reaches its cap of 20,000 listed commits with the node still there names no
 the node was created before the oldest it listed.
 
 The newest window keeps the node's last change, its newest entry, in the session (`GraphSession::last_change`,
-`SessionEvent::NodeHistoryRead`) for the page.
+`SessionEvent::NodeHistoryRead`) for the page, only while every group was followed.
+
+**Coverage.** Each window comes with what it followed (`node_history::Coverage`): the groups too
+large to follow, how far back it reaches (more commits, the graph's first commit, a schema
+boundary, a read that stopped), and what is known of the node's creation (an entry, found by the
+search, before a commit the search reached, or not searched). The view joins the windows'
+coverage and the search's, and every sentence about what was read reads it: the end row, the
+empty state, the removal card, the search's note and the page's line. "Since the graph began" is
+said only when the windows reach the first commit and every group was followed; with a group too
+large to follow, the empty state says "No commit … changed *name* or the relationships Studio
+could follow" and names the group, and a removal says its relationships there were too large to
+list rather than that none were read.
 
 ### States
 
@@ -154,8 +172,9 @@ The newest window keeps the node's last change, its newest entry, in the session
 |---|---|---|
 | Reading | "Reading the history…" (`ds::loading_state`) | — |
 | Failed | "The node's history could not be read" and the reason | Try again (⌘R) |
-| Nothing in the window | "No changes in the last 200 commits" · "No commit in the newest 200 on main changed *name* or its relationships." | Read the 200 commits before ⌘⌥N |
-| Nothing since the graph began | "No changes" · "No commit on main changed *name* or its relationships since the graph began." | — |
+| Nothing in the window | "No changes in the last 50 commits" · "No commit in the newest 50 on main changed *name* or its relationships." | Read the 200 commits before ⌘⌥N |
+| Nothing since the graph began | "No changes" · "No commit on main changed *name* or its relationships since the graph began." Only when every group was followed | — |
+| Nothing found, a group too large | "… changed *name* or the relationships Studio could follow. Not followed, too large: *group*." | Read the 200 commits before ⌘⌥N, while there are more |
 | Schema boundary, nothing after it | The schema-change state with the commit | — |
 | The node created before the window | The end row | Find when it was created ⌘⌥F |
 | Older read failed | The end row's reason, and Try again in place of the button | ⌘⌥N |
@@ -186,12 +205,14 @@ The rows are a cached view of their own (`NodeHistoryRows`), made with the tab, 
 | Decision | Rejected | Why |
 |---|---|---|
 | Read the node itself at each commit of the window | The change feed filtered by type and op (#146, and this spec's first build); `GET /commits/{id}/changes` a commit at a time | The feed and the walk cost what the node's *type* wrote: 13.2 MiB for one person across a load of 50,000 (study), and a byte cap only hides it. A point read costs what the node holds: a window across 10 loads of 5,000 people read 64.9 KiB (validation log). It is exact for a value changed and changed back, which a net diff misses. The feed stays the alternative where a type changes rarely and a window is long; E62 is the real fix |
-| Edge ids per relationship group, diffed between reads | Reading edge properties; the neighbours' ids | Edges are never updated (T16), so an id that comes or goes is the whole change; two edges to one neighbour stay two lines. An added edge's properties are on its page, one click away |
+| Edge ids per relationship group, diffed between reads, with a keyed edge's properties outside its key | Every edge's properties; ids alone (this spec's earlier builds) | An edge without a key is never updated (T16), so an id that comes or goes is the whole change. A keyed edge is upserted in place under the same id, so ids alone miss a change to its properties and name an older commit as the last change (maintainer review of #162). Two edges to one neighbour stay two lines |
 | Read every relationship group at every commit that holds the node | Skip a group with no edge at either end of a window (this spec's second build) | A skipped group misses an edge added and removed inside the window, and with it who changed the node last (review of #162). Exactness is the point of point reads; the cost stays window × (1 + groups) |
 | A group read full is not compared there, and says so | Compare its first 1,000 edges | An edge added before them pushes the last off the page, which reads as a removal that did not happen (review of #162) |
 | The view is the timeline alone | "Now" above it: each property, its value and who last set it (this spec's first builds) | Ragnor: the History page needs only the timeline. The newest entry that changed a value already says who set it, and the page's "Last changed by" line is the timeline's newest entry |
 | Binary search only for the node's creation past the windows, on demand | Binary search for the list of changes, or for when each value was set; searching by itself | A search finds a commit where an answer flips, so it misses a change undone later; creation happens once, so its answer is exact. On demand, since the windows already answer most questions |
-| Blobs by kind and size (`HEAD` at the snapshot) | Their bytes; their `ETag` | Bytes are the whole file; the `ETag` names the type's table version, which moves with any row (E57). Two files of one size read alike, and the spec says so |
+| Blobs by kind and exact size (`HEAD` at the snapshot), formatted only when drawn | Their bytes; their `ETag`; their rounded size ("1.2 KB", this spec's earlier builds) | Bytes are the whole file; the `ETag` names the type's table version, which moves with any row (E57). The rounded text read 1,200 B and 1,240 B as one (maintainer review of #162). Two files of exactly one size read alike, and the spec says so |
+| One coverage value from `graph_store` with each window and the search | Each sentence putting the page's and the search's fields together by hand (this spec's earlier builds) | Three sentences claimed more than was read (maintainer review of #162); one value makes the rule hold by construction. Entries and coverage do not depend on how they were read, so E62 can replace the read plan alone |
+| A first window of 50 commits | 200, as the later windows | A full window of 200 on a person with 4 groups is 1,006 requests, 11 to 18 s against a local server (validation log), and longer remotely; 50 is about a quarter of that and holds most recent changes |
 | A schema change ends the history | Read past it with a query of the older schema | The node's query is built from the schema Studio holds; across E52 Studio has no other |
 | A merge is credited "via merge of *branch*" | Walking the merged branch for who made it (study) | The point reads see the change land on the branch read; who made it on the other branch is the next step, and E62's job |
 | ⌘⌥4 keeps meaning "the fourth view" | A History key of its own | It is bound already; on a node the fourth place was empty, and a table's Gallery keeps it |
@@ -238,9 +259,17 @@ In spec 012 and `docs/deferred-engine-changes.md`:
 | 2026-11-20 | The cost no longer follows the node's type | The same server after 10 loads of 5,000 `Person` (50,199 people) and two more title edits of person-000000 through `POST /mutate`; 29 commits on main | **152 requests**, settled **1,408 ms**; **64.9 KiB** for the 146 reads: 2.2 KiB a commit before and after the loads. The loads draw nothing (the node did not change); the two edits fold into one entry. The feed's first page of the same types was 2.1 MB (8,192 changes of 50,000) |
 | 2026-11-20 | It looks right, light and dark | Offscreen snapshots at 1440 × 900, 2x, against the same server after the loads: History of person-000000 light and dark, a run of commits unfolded by ↓ ↓ ↓ Space, the page's "Last changed by" line after History was read, person-000099 removed at the head, and person-999999 (no changes) | As in the PR |
 | 2026-11-20 | The view is the timeline alone; the search asks only for the creation | `history` `node_view::tests`: `the_end_row_finds_when_the_node_was_created` (⌘⌥F in the end row finds Ada's creation at c5 in a listing and ≤ 6 point reads, is offered no more, and ⌘⌥N then reads the creation as an entry), `a_window_with_the_creation_offers_no_search` (Zed), `the_search_stays_offered_after_a_failed_older_read`, and the rest of the view's tests with no "Now" row; `type_table` `the_meta_line_says_who_changed_the_node_once_its_history_is_read`; `studio` `keymaps`; offscreen snapshots of person-000000, light, dark and a run unfolded | Pass. The tab opens on the newest entry; the page's line comes from the newest entry, as before |
+| 2026-11-21 | Maintainer review of #162: keyed edges, exact Blobs, coverage, reads kept running | `gq_language` `a_keyed_edges_history_reads_what_an_upsert_changes` (a keyed edge's history reads `since`, an unkeyed one only ids; both compile); `graph_store` `a_keyed_edge_changed_in_place_is_an_entry` (fails with the in-place comparison taken out), `a_blob_is_compared_by_its_exact_size` (the reviewer's 1,200 B vs 1,240 B: one entry), `coverage_says_only_what_the_reads_support`; `change_cards` `a_blob_reads_as_its_size_not_its_bytes` (an exact size formats as "1.2 KB" and two that round alike still differ); `history` `a_group_too_large_to_follow_is_named_and_never_claims_the_start` (a node with 1,000 WorksAt edges: the empty state names the group, never says "or its relationships", and no last change is kept), `a_removal_says_when_its_relationships_were_too_large`, and the view's tests on a first window of 50 | Pass |
+| 2026-11-21 | A full window of 200 commits, measured | The scratch dev graph with 230 commits on main (the earlier 29, then 201 title edits of person-000006 through `POST /mutate`, none of person-000000); the debug `snapshot` example's `reads:` step opening History on person-000000 with windows of 200; `measure_points.py` for bytes; Apple M5 Pro, a busy machine (load average 13 to 34) | **1,006 requests** (1 listing, 201 node reads, 804 edge reads over 4 groups), settled in **17.9 s** at load average 34 and **11.3 s** at about 15, 4 at once; each read 35 to 73 ms on the server. **466.5 KiB**, 23.9 s one at a time. Remote latency not measured. Hence a first window of 50; its time was not measured |
 | — | Not checked | A remote server's latency; the 230,000-person seed; a real schema boundary; a Blob-holding type against a server; a 0.14 server; Studio's own writes labelled "Studio" in the running app; two actors | Open |
 
 ## Corrections
+
+- 2026-11-21, maintainer review of #162: ids alone missed a keyed edge's change in place (now
+  its properties outside the key are read and compared); Blobs were compared by rounded text
+  (now exactly, formatted when drawn); the empty state, the removal card and the search's bound
+  claimed more than was read (now all read one coverage value); reads waited for each batch of 4
+  (now 4 keep running). A full window measured 11 to 18 s locally, so the first is now 50.
 
 - 2026-11-20, design change on #162: Ragnor asked for the timeline alone on the History page.
   "Now" (each property's value and who last set it) and the per-property search, Find when it
