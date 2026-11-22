@@ -180,18 +180,20 @@ pub(crate) fn plane_words(why: &str, cloud: bool) -> String {
         .replace("the server", lower)
 }
 
-/// What "No clusters" says: how a cluster is made, beside the command that makes it.
-pub(crate) const NO_CLUSTERS: &str = "Nothing to open yet. A member whose role allows it creates \
-     a cluster with the Omnigraph CLI, through a profile in this organization, then Refresh.";
+/// What "No clusters" says: how a cluster is made, beside the command that makes it. Cloud's copy
+/// states the fact and the action, never a pitch (spec 047, Copy).
+pub(crate) const NO_CLUSTERS: &str = "This organization has no clusters. A member whose role \
+     allows it creates one with the Omnigraph CLI, through a profile in this organization. Then \
+     Refresh.";
 
 /// What a sign-in in no organization says: on Omnigraph Cloud, that it is in private preview
-/// and how to be invited (spec 047); on another control plane, to ask an owner.
+/// and how invitations are given (spec 047); on another control plane, to ask an owner.
 pub(crate) fn no_organizations(account: &str, cloud: bool) -> String {
     if cloud {
         format!(
-            "You are signed in as {account}, but no organization has you as a member yet. \
-             Omnigraph Cloud is in private preview: an owner of an organization can invite you, \
-             or join the waitlist for an invitation."
+            "Signed in as {account}. No organization has you as a member yet. Omnigraph Cloud is \
+             in private preview. An owner of an organization can invite you, and invitations go \
+             out from the waitlist."
         )
     } else {
         format!(
@@ -203,8 +205,8 @@ pub(crate) fn no_organizations(account: &str, cloud: bool) -> String {
 
 /// What Omnigraph Cloud's sign-in pane says before a sign-in (spec 047): it does not imply that
 /// anyone can sign in and get a cluster.
-pub(crate) const CLOUD_SIGN_IN: &str = "Omnigraph Cloud is in private preview, and invitations \
-     go out from the waitlist. Once invited, sign in to open your organization's clusters.";
+pub(crate) const CLOUD_SIGN_IN: &str = "Omnigraph Cloud is in private preview. Invitations go out \
+     from the waitlist. Once invited, sign in to open your organization's clusters.";
 
 /// The CLI's targets on the control plane's profiles that name a cluster its list does not
 /// have: "Not in org_… on the control plane".
@@ -307,6 +309,20 @@ pub(crate) fn nav(
                     )
                     .into_any_element(),
             );
+            // Signed out of Omnigraph Cloud: a muted second line under its row (spec 047).
+            let signed_out = !matches!(state, SignIn::SignedIn { .. });
+            if signed_out && crate::waitlist::offered(plane.read(cx)) {
+                rows.push(
+                    div()
+                        // Under the row's icon: its margin and padding.
+                        .pl(px(space::SM + space::SM))
+                        .child(crate::waitlist::note(
+                            crate::waitlist::Surface::Sidebar,
+                            crate::waitlist::PREVIEW_UNDER_NAME,
+                        ))
+                        .into_any_element(),
+                );
+            }
             continue;
         };
         for (row, organization) in list.iter().enumerate() {

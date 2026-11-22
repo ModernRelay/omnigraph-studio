@@ -64,7 +64,7 @@ struct Waiting {
 
 /// Get started's Omnigraph Cloud row while it offers the waitlist (spec 047): what Cloud is
 /// today, its waitlist link beside it (the row's own ↵ goes to Sign in).
-pub(crate) const CLOUD_PREVIEW_LINE: &str = "Hosted Omnigraph, in private preview.";
+pub(crate) const CLOUD_PREVIEW_LINE: &str = "In private preview.";
 /// Get started's Omnigraph Cloud row with the `omnigraph_cloud` address empty.
 pub(crate) const CLOUD_OFF_LINE: &str = "Turned off in Settings.";
 /// What choosing that row says, beside the link to the setting.
@@ -1363,6 +1363,10 @@ impl OpenGraphModal {
     /// Connect, which adds the server they start and waits for it (spec 029).
     fn render_local(&self, cx: &mut Context<Self>) -> AnyElement {
         let steps = first_run::steps(cfg!(windows));
+        let waitlist_shown = self
+            .planes
+            .iter()
+            .any(|plane| crate::waitlist::offered(plane.read(cx)));
         let footer = match &self.waiting {
             Some(waiting) if waiting.gave_up => {
                 h_flex()
@@ -1437,6 +1441,13 @@ impl OpenGraphModal {
                             ))
                     })),
             )
+            // Under the steps, above nothing that matters; it never moves Connect (spec 047).
+            .when(waitlist_shown, |pane| {
+                pane.child(div().px(px(space::MD)).child(crate::waitlist::note(
+                    crate::waitlist::Surface::LocalRecipe,
+                    crate::waitlist::PREVIEW_SHORT,
+                )))
+            })
             .child(footer)
             .children(self.said_at(Said::Add, cx))
             .children(self.said_at(Said::Adding, cx))
@@ -3569,7 +3580,7 @@ mod tests {
     /// Omnigraph Cloud's plane, as the `omnigraph_cloud` setting makes it, signed out.
     fn cloud_plane(cx: &mut VisualTestContext) -> Entity<ControlPlane> {
         cx.new(|cx| {
-            let mut plane = ControlPlane::new("https://control.test".into(), None, cx);
+            let mut plane = ControlPlane::new(studio_settings::OMNIGRAPH_CLOUD.into(), None, cx);
             plane.set_default_for_test(true, cx);
             plane
         })
@@ -3614,7 +3625,7 @@ mod tests {
             Some(crate::waitlist::url(crate::waitlist::Surface::SignIn).as_str())
         );
         assert!(organizations::CLOUD_SIGN_IN.contains("private preview"));
-        assert!(organizations::CLOUD_SIGN_IN.contains("invitations go out from the waitlist"));
+        assert!(organizations::CLOUD_SIGN_IN.starts_with(crate::waitlist::PREVIEW));
         assert!(matches!(
             plane.read_with(cx, |plane, _| plane.sign_in_state().clone()),
             SignIn::Offered { .. }
@@ -3666,7 +3677,7 @@ mod tests {
             }))
             .unwrap();
         let plane = cx.new(|cx| {
-            let mut plane = ControlPlane::new("https://control.test".into(), None, cx);
+            let mut plane = ControlPlane::new(studio_settings::OMNIGRAPH_CLOUD.into(), None, cx);
             plane.set_default_for_test(true, cx);
             plane.profiles = vec![("work".into(), Some("org_1".into()))];
             plane.signed_in_for_test(
@@ -3799,5 +3810,79 @@ mod tests {
         });
         cx.run_until_parked();
         assert!(cx.debug_bounds("waitlist-no-organizations").is_none());
+    }
+
+    /// Signed out of Omnigraph Cloud, its sidebar row has a second line with the waitlist, and
+    /// the local recipe one under its steps; each opens its own page address.
+    #[gpui::test]
+    fn the_sidebar_and_the_recipe_offer_the_waitlist(cx: &mut TestAppContext) {
+        let (modal, cx) = dialog(Vec::new(), cx);
+        let plane = cloud_plane(cx);
+        modal.update(cx, |modal, cx| {
+            modal.follow_planes(vec![plane.clone()], Vec::new(), cx)
+        });
+        cx.run_until_parked();
+        let note = cx
+            .debug_bounds("waitlist-link-sidebar")
+            .expect("the sidebar row's second line");
+        cx.simulate_click(note.center(), gpui::Modifiers::none());
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some(crate::waitlist::url(crate::waitlist::Surface::Sidebar).as_str())
+        );
+
+        modal.update_in(cx, |modal, window, cx| {
+            modal.show_start(Start::Local, window, cx)
+        });
+        cx.run_until_parked();
+        let note = cx
+            .debug_bounds("waitlist-link-local-recipe")
+            .expect("the line under the recipe");
+        cx.simulate_click(note.center(), gpui::Modifiers::none());
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some(crate::waitlist::url(crate::waitlist::Surface::LocalRecipe).as_str())
+        );
+
+        // Signed in to an organization: neither.
+        plane.update(cx, |plane, cx| {
+            plane.signed_in_for_test(
+                vec![control_client::OrganizationSummary {
+                    organization_id: "org_1".into(),
+                    name: Some("Acme".into()),
+                }],
+                Vec::new(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("waitlist-local-recipe").is_none());
+        assert!(cx.debug_bounds("waitlist-sidebar").is_none());
+    }
+
+    /// Omnigraph Cloud's setting at another address than Omnigraph Cloud's own: no place in the
+    /// dialog offers the waitlist, and the words are the plane's own.
+    #[gpui::test]
+    fn another_cloud_address_offers_no_waitlist(cx: &mut TestAppContext) {
+        let (modal, cx) = dialog(Vec::new(), cx);
+        let plane = cx.new(|cx| {
+            let mut plane = ControlPlane::new("http://127.0.0.1:8874".into(), None, cx);
+            plane.set_default_for_test(true, cx);
+            plane
+        });
+        modal.update(cx, |modal, cx| {
+            modal.follow_planes(vec![plane.clone()], Vec::new(), cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("waitlist-get-started").is_none());
+        assert!(cx.debug_bounds("waitlist-sidebar").is_none());
+        cx.dispatch_action(menu::Confirm);
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("waitlist-sign-in").is_none());
+        modal.update_in(cx, |modal, window, cx| {
+            modal.show_start(Start::Local, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("waitlist-local-recipe").is_none());
     }
 }

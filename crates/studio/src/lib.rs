@@ -201,6 +201,16 @@ pub fn init(cx: &mut App) {
             |workspace, _| workspace.session().is_some(),
             |workspace, _: &studio_actions::workspace::CopyLink, _, cx| copy_link(workspace, cx),
         );
+        // Offered by the waitlist's one rule: otherwise disabled in the Help menu and not in the
+        // palette (spec 047).
+        workspace.register_action_when(
+            |_, cx| waitlist::offered_now(cx),
+            |_, action: &studio_actions::workspace::JoinCloudWaitlist, _, cx| {
+                cx.open_url(&waitlist::url(waitlist::Surface::named(
+                    action.from.as_deref(),
+                )))
+            },
+        );
         workspace.register_action(|_, _: &studio_actions::workspace::ToggleMcpServer, _, cx| {
             studio_settings::update(cx, |settings| {
                 settings.agent.outside_agents = !settings.agent.outside_agents
@@ -294,6 +304,45 @@ fn copy_link(workspace: &mut Workspace, cx: &mut Context<Workspace>) {
             .map(|(type_name, id)| (type_name.as_str(), id.as_str())),
     );
     cx.write_to_clipboard(gpui::ClipboardItem::new_string(link));
+    // A copy is silent, unless the link reaches no one else: a server on this computer.
+    if let Some((message, waitlist)) = copied_link_note(&target.server, cx) {
+        match waitlist {
+            Some(follow_up) => workspace.show_toast_with_action(
+                ToastKind::Info,
+                message,
+                waitlist::JOIN,
+                Box::new(follow_up),
+                cx,
+            ),
+            None => workspace.show_toast(ToastKind::Info, message, cx),
+        }
+    }
+}
+
+/// What a copied link to `server` says (spec 047): nothing for a server others reach; for one
+/// on this computer, that the link opens only here, with the waitlist while Studio offers it.
+fn copied_link_note(
+    server: &str,
+    cx: &App,
+) -> Option<(String, Option<studio_actions::workspace::JoinCloudWaitlist>)> {
+    if !graph_client::is_loopback(server) {
+        return None;
+    }
+    let here = if cfg!(target_os = "macos") {
+        "This link opens only on this Mac."
+    } else {
+        "This link opens only on this computer."
+    };
+    Some(if waitlist::offered_now(cx) {
+        (
+            format!("{here} {}.", waitlist::PREVIEW_SHORT),
+            Some(studio_actions::workspace::JoinCloudWaitlist {
+                from: Some(waitlist::Surface::CopyLink.content().to_owned()),
+            }),
+        )
+    } else {
+        (here.to_owned(), None)
+    })
 }
 
 /// Opens the settings tab, offering the workspace's graph as a scope.
@@ -1971,6 +2020,88 @@ mod start_tests {
             work.read_with(cx, |work, _| work.state.clone()),
             ConnectionState::Idle,
             "the other credential is not used"
+        );
+    }
+
+    /// Copy Link stays silent for a server others reach. For one on this computer it says the
+    /// link opens only here, with the waitlist while Studio offers it, by the waitlist's one rule
+    /// (spec 047).
+    #[gpui::test]
+    fn a_copied_link_to_this_computer_says_so(cx: &mut TestAppContext) {
+        let (registry, _servers, _asked) = studio_with_servers(cx);
+        let here = if cfg!(target_os = "macos") {
+            "This link opens only on this Mac."
+        } else {
+            "This link opens only on this computer."
+        };
+        let note = |server: &str, cx: &mut TestAppContext| {
+            let server = server.to_owned();
+            cx.read(|cx| copied_link_note(&server, cx))
+        };
+        let cloud = cx.new(|cx| {
+            let mut plane =
+                graph_store::ControlPlane::new(studio_settings::OMNIGRAPH_CLOUD.into(), None, cx);
+            plane.set_default_for_test(true, cx);
+            plane
+        });
+        registry.update(cx, |registry, _| {
+            registry.control_planes = vec![cloud.clone()]
+        });
+        assert_eq!(note("https://graph.example.com", cx), None);
+        assert_eq!(note("http://a.test", cx), None);
+        for loopback in [
+            "http://127.0.0.1:8787",
+            "http://localhost:8787",
+            "http://[::1]:8787",
+        ] {
+            assert_eq!(
+                note(loopback, cx),
+                Some((
+                    format!("{here} Omnigraph Cloud: private preview."),
+                    Some(studio_actions::workspace::JoinCloudWaitlist {
+                        from: Some("copy-link".into())
+                    })
+                )),
+                "{loopback}"
+            );
+        }
+        assert_eq!(
+            waitlist::url(waitlist::Surface::named(Some("copy-link"))),
+            waitlist::url(waitlist::Surface::CopyLink)
+        );
+        // The Help menu's action, with no place named, opens the Help address.
+        assert_eq!(
+            waitlist::url(waitlist::Surface::named(
+                studio_actions::workspace::JoinCloudWaitlist::default()
+                    .from
+                    .as_deref()
+            )),
+            waitlist::url(waitlist::Surface::Help)
+        );
+
+        // In an organization, or with Cloud off: the note alone.
+        cloud.update(cx, |plane, cx| {
+            plane.signed_in_for_test(
+                vec![control_client::OrganizationSummary {
+                    organization_id: "org_1".into(),
+                    name: Some("Acme".into()),
+                }],
+                Vec::new(),
+                cx,
+            )
+        });
+        assert_eq!(
+            note("http://127.0.0.1:8787", cx),
+            Some((here.to_owned(), None))
+        );
+        assert!(
+            !cx.read(waitlist::offered_now),
+            "Help's action is not offered"
+        );
+        registry.update(cx, |registry, _| registry.control_planes.clear());
+        assert_eq!(
+            note("http://127.0.0.1:8787", cx),
+            Some((here.to_owned(), None))
         );
     }
 

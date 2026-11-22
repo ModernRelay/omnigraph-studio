@@ -516,17 +516,41 @@ fn account_row(
                 )
                 .into_any_element(),
         ),
-        SignIn::Offered { why, .. } => (
-            why.as_ref().map(|why| why.to_string()).unwrap_or_else(|| {
-                "Not signed in. One sign-in lists every organization you are a member of, with \
-                 its clusters."
-                    .to_owned()
-            }),
-            ds::action_button(("cloud-sign-in", id), "Sign in")
-                .tip(ds::tooltip(format!("Opens {host} in your browser")))
-                .on_click(cx.listener(move |_, _, _, cx| p.update(cx, |p, cx| p.sign_in(cx))))
-                .into_any_element(),
-        ),
+        SignIn::Offered { why, .. } => {
+            // Omnigraph Cloud, signed out: what it is today, and the waitlist beside Sign in,
+            // which stays the primary button (spec 047).
+            let waitlist = crate::waitlist::offered(plane.read(cx));
+            (
+                why.as_ref().map(|why| why.to_string()).unwrap_or_else(|| {
+                    if waitlist {
+                        format!("Not signed in. {}", crate::waitlist::PREVIEW)
+                    } else {
+                        "Not signed in. One sign-in lists every organization you are a member \
+                         of, with its clusters."
+                            .to_owned()
+                    }
+                }),
+                h_flex()
+                    .gap(px(space::XS))
+                    .when(waitlist, |row| {
+                        row.child(div().debug_selector(|| "waitlist-settings".into()).child(
+                            crate::waitlist::link(
+                                ("cloud-waitlist", id),
+                                crate::waitlist::Surface::Settings,
+                                false,
+                            ),
+                        ))
+                    })
+                    .child(
+                        ds::action_button(("cloud-sign-in", id), "Sign in")
+                            .tip(ds::tooltip(format!("Opens {host} in your browser")))
+                            .on_click(
+                                cx.listener(move |_, _, _, cx| p.update(cx, |p, cx| p.sign_in(cx))),
+                            ),
+                    )
+                    .into_any_element(),
+            )
+        }
         SignIn::NotOffered => (
             format!("{host} offers no sign-in Studio can use."),
             div().into_any_element(),
@@ -801,10 +825,58 @@ mod tests {
     /// Omnigraph Cloud's plane, as the `omnigraph_cloud` setting makes it.
     fn cloud_plane(cx: &mut VisualTestContext) -> Entity<ControlPlane> {
         cx.new(|cx| {
-            let mut plane = ControlPlane::new("https://control.test".into(), None, cx);
+            let mut plane = ControlPlane::new(studio_settings::OMNIGRAPH_CLOUD.into(), None, cx);
             plane.set_default_for_test(true, cx);
             plane
         })
+    }
+
+    /// Signed out of Omnigraph Cloud, its Account row says it is in private preview and offers
+    /// the waitlist beside Sign in; not at another address, nor once in an organization.
+    #[gpui::test]
+    fn the_account_row_offers_the_waitlist_signed_out(cx: &mut TestAppContext) {
+        cx.update(studio_theme::init_test);
+        let (page, cx): (_, &mut VisualTestContext) =
+            cx.add_window_view(|_, cx| CloudPage::new(cx));
+        let plane = cloud_plane(cx);
+        page.update(cx, |page, cx| {
+            page.planes = vec![plane.clone()];
+            page.set_shown(Some(Part::Account), cx);
+        });
+        cx.run_until_parked();
+        let link = cx
+            .debug_bounds("waitlist-settings")
+            .expect("Join the waitlist");
+        cx.simulate_click(link.center(), gpui::Modifiers::none());
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some(crate::waitlist::url(crate::waitlist::Surface::Settings).as_str())
+        );
+
+        plane.update(cx, |plane, cx| {
+            plane.signed_in_for_test(
+                vec![control_client::OrganizationSummary {
+                    organization_id: "org_1".into(),
+                    name: Some("Acme".into()),
+                }],
+                Vec::new(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("waitlist-settings").is_none());
+
+        let elsewhere = cx.new(|cx| {
+            let mut plane = ControlPlane::new("http://127.0.0.1:8874".into(), None, cx);
+            plane.set_default_for_test(true, cx);
+            plane
+        });
+        page.update(cx, |page, cx| {
+            page.planes = vec![elsewhere];
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("waitlist-settings").is_none());
     }
 
     /// A sign-in whose details could not be read offers Try again on Omnigraph Cloud's page, as
