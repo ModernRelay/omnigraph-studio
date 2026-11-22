@@ -771,14 +771,12 @@ impl Reader {
 
     /// Runs `jobs` (a commit's index into `ids` and a read), keeping
     /// [`NODE_HISTORY_READS_AT_ONCE`] running, a new one starting as each answers, and writes
-    /// each answer into `states`. Returns the failures, by commit index, and
-    /// adds to `full` each group a read found full.
+    /// each answer into `states`. Returns the failures, by commit index.
     async fn run(
         &mut self,
         ids: &[String],
         jobs: Vec<(usize, Read)>,
         states: &mut [NodeState],
-        full: &mut Vec<usize>,
         cx: &mut AsyncApp,
     ) -> Vec<(usize, ReadError)> {
         let mut failed = Vec::new();
@@ -805,9 +803,6 @@ impl Reader {
                     Ok(Answer::Edges(ix, edges, was_full)) => {
                         if was_full {
                             states[at].full.insert(ix);
-                            if !full.contains(&ix) {
-                                full.push(ix);
-                            }
                         }
                         states[at].edges.insert(ix, edges);
                     }
@@ -826,13 +821,7 @@ impl Reader {
     async fn node_at(&mut self, commit: &str, cx: &mut AsyncApp) -> Result<NodeState, ReadError> {
         let mut states = vec![NodeState::default()];
         let failed = self
-            .run(
-                &[commit.to_owned()],
-                vec![(0, Read::Node)],
-                &mut states,
-                &mut Vec::new(),
-                cx,
-            )
+            .run(&[commit.to_owned()], vec![(0, Read::Node)], &mut states, cx)
             .await;
         match failed.into_iter().next() {
             Some((_, error)) => Err(error),
@@ -962,14 +951,13 @@ impl GraphSession {
             let last = ids.len() - 1;
             let groups = reader.node.groups.len();
             let blobs = reader.node.blobs.len();
-            let mut full = Vec::new();
 
             // The node at every commit; then, at each commit that holds it, its edges through
             // every relationship group and its Blobs. No group is left out: a group read only at
             // the window's ends would miss an edge added and removed between them, and with it
             // who changed the node last.
             let jobs: Vec<(usize, Read)> = (first..ids.len()).map(|at| (at, Read::Node)).collect();
-            let mut failed = reader.run(&ids, jobs, &mut states, &mut full, cx).await;
+            let mut failed = reader.run(&ids, jobs, &mut states, cx).await;
             let mut jobs = Vec::new();
             for (at, _) in states
                 .iter()
@@ -980,13 +968,7 @@ impl GraphSession {
                 jobs.extend((0..groups).map(|ix| (at, Read::Edges(ix))));
                 jobs.extend((0..blobs).map(|ix| (at, Read::Blob(ix))));
             }
-            failed.extend(reader.run(&ids, jobs, &mut states, &mut full, cx).await);
-            full.sort_unstable();
-            page.coverage.too_large = full
-                .iter()
-                .map(|&ix| reader.node.groups[ix].clone())
-                .collect();
-
+            failed.extend(reader.run(&ids, jobs, &mut states, cx).await);
             // A failed read ends what is known at the newest commit it failed at: a schema change
             // between it and the commit above it (E52), or a read that stopped short.
             failed.sort_by_key(|(at, _)| *at);
@@ -1017,6 +999,16 @@ impl GraphSession {
                     page.coverage.reach = Reach::GraphStart;
                 }
             }
+            // The groups too large to follow at the commits kept: one full only at a commit a
+            // failed read cut off says nothing of the history shown.
+            let full: std::collections::BTreeSet<usize> = states
+                .iter()
+                .flat_map(|state| state.full.iter().copied())
+                .collect();
+            page.coverage.too_large = full
+                .into_iter()
+                .map(|ix| reader.node.groups[ix].clone())
+                .collect();
             page.entries = entries_of(&reader.node, &commits, &states);
             if page.entries.iter().any(NodeHistoryEntry::created) {
                 page.coverage.creation = Creation::InEntries;

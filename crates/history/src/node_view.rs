@@ -282,6 +282,18 @@ impl NodeHistoryView {
                     cx.notify();
                 }
             }
+            // Any move of the branch's head past the one read, however it was seen: a head
+            // placed by a read after a write raced another writer's says so only this way.
+            SessionEvent::HeadMoved { branch, head }
+                if *branch == this.branch
+                    && this.head.as_ref().is_some_and(|read| read != head) =>
+            {
+                if !this.newer {
+                    this.newer = true;
+                    cx.emit(ItemEvent::UpdateTab);
+                    cx.notify();
+                }
+            }
             SessionEvent::BranchChanged => {
                 this.branch = session.read(cx).branch.clone();
                 this.reload(cx);
@@ -1504,6 +1516,8 @@ mod tests {
         gone: bool,
         /// A point read of the node before `c150` fails with a 500, as a search's might.
         old_reads_fail: bool,
+        /// A point read of the node at `c230` fails with a 500.
+        fails_at_c230: bool,
     }
 
     /// Who made commit `n`.
@@ -1533,6 +1547,8 @@ mod tests {
             "hub" => Some(json!({ "slug": "hub" })),
             // There from the first commit, retitled at c150 only: before the first window.
             "early" => Some(json!({ "slug": "early", "title": if n >= 150 { "B" } else { "A" } })),
+            // There from the first commit; works at 1,000 companies only before c210.
+            "was-hub" => Some(json!({ "slug": "was-hub" })),
             "big" if n < 245 => Some(json!({ "slug": "big" })),
             _ => None,
         }
@@ -1551,7 +1567,7 @@ mod tests {
                 .map(|(a, b)| ((*a).to_owned(), (*b).to_owned()))
                 .collect()
         };
-        if matches!(slug, "hub" | "big") && outgoing_works {
+        if (matches!(slug, "hub" | "big") || (slug == "was-hub" && n < 210)) && outgoing_works {
             return (0..NODE_HISTORY_EDGES)
                 .map(|e| (format!("w{e:04}"), format!("co-{e:04}")))
                 .collect();
@@ -1667,7 +1683,9 @@ mod tests {
                             json!({ "error": "history before this commit was reclaimed",
                                 "code": "gone" }),
                         )
-                    } else if served.old_reads_fail && n < 150 {
+                    } else if (served.fails_at_c230 && n == 230 && name == "node_history_node")
+                        || (served.old_reads_fail && n < 150)
+                    {
                         (
                             500,
                             json!({ "error": "the server broke", "code": "internal" }),
@@ -2175,6 +2193,53 @@ mod tests {
             assert!(view.offers_search(), "and is offered again");
             assert_eq!(view.coverage.creation, Creation::NotSearched);
         });
+    }
+
+    /// A group full only at commits a failed read cut off says nothing of the history shown: the
+    /// window stops at c231 and follows every group there (Bugbot, #162).
+    #[gpui::test]
+    async fn a_group_full_only_past_a_failed_read_is_not_named(cx: &mut TestAppContext) {
+        let (session, _, _) = serve(
+            Served {
+                fails_at_c230: true,
+                ..Default::default()
+            },
+            cx,
+        );
+        let (view, _cx) = open(&session, "was-hub", cx);
+        view.read_with(_cx, |view, _| {
+            assert!(matches!(view.coverage.reach, Reach::Stopped(_)));
+            assert!(
+                view.coverage.follows_every_group(),
+                "{:?}",
+                view.coverage.too_large
+            );
+        });
+    }
+
+    /// Any move of the branch's head past the one read offers Refresh, not only a commit the
+    /// session reports as such (Bugbot, #162).
+    #[gpui::test]
+    async fn a_head_moved_past_the_one_read_offers_refresh(cx: &mut TestAppContext) {
+        let (session, _, _) = serve(Served::default(), cx);
+        let (view, cx) = open(&session, "ada", cx);
+        let moved = |head: &str, cx: &mut VisualTestContext| {
+            let head = head.to_owned();
+            session.update(cx, |_, cx| {
+                cx.emit(SessionEvent::HeadMoved {
+                    branch: "main".into(),
+                    head,
+                })
+            });
+            cx.run_until_parked();
+        };
+        moved("c249", cx);
+        assert!(!view.read_with(cx, |view, _| view.newer), "the head read");
+        moved("c250", cx);
+        assert!(
+            view.read_with(cx, |view, _| view.newer),
+            "Refresh is offered"
+        );
     }
 
     /// A removal whose relationships were too large to follow says so, not that none were read
