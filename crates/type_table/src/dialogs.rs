@@ -21,13 +21,53 @@ use ui::prelude::*;
 use crate::model::{Notice, SaveResult, TableKind, Tone, parse_input, save_result};
 use crate::offers::Offers;
 use crate::suggest;
-use crate::table::TypeTable;
 use studio_actions::table::{SelectNextSuggestion, SelectPreviousSuggestion};
 use studio_ui::ds::{
     ModalHeader, Variant, action_button, cancel_button, modal, modal_body, modal_footer,
     write_target,
 };
-use studio_workspace::ModalView;
+use studio_workspace::{ModalView, Workspace};
+
+/// The table a dialog was opened from, as the dialogs know it: what their writes tell it as
+/// they go out and come back (spec 004), and the view a table's tab becomes once it is saved as
+/// one. The dialogs sit below the table: it opens them and hands itself over as this.
+pub trait DialogTable: Sized + 'static {
+    /// The workspace the table is in, for a dialog's outcome that comes after it closed.
+    fn workspace(&self) -> WeakEntity<Workspace>;
+    /// A write on the table's behalf is going out (a dialog's insert or delete).
+    fn save_started(&mut self);
+    /// A write on the table's behalf came back and its outcome is applied.
+    fn save_finished(&mut self, cx: &mut Context<Self>);
+    /// A write bound to the table's pin was refused because the branch moved.
+    fn branch_moved(&mut self, cx: &mut Context<Self>);
+    /// A row the table's insert dialog inserted on `branch` committed in `commit`.
+    fn row_inserted(
+        &mut self,
+        branch: &str,
+        key: Option<String>,
+        values: Map<String, Value>,
+        commit: &str,
+        parent: Option<&str>,
+        cx: &mut Context<Self>,
+    );
+    /// The table's delete of `ids` on `branch` was sent.
+    fn rows_deleting(&mut self, branch: &str, ids: &[String], cx: &mut Context<Self>);
+    /// The table's delete of `ids` on `branch` committed in `commit`.
+    fn rows_deleted(
+        &mut self,
+        branch: &str,
+        ids: &[String],
+        commit: &str,
+        parent: Option<&str>,
+        cx: &mut Context<Self>,
+    );
+    /// The table's delete of `ids` was not made, or, `unknown`, may not have been.
+    fn delete_not_made(&mut self, ids: &[String], unknown: bool, cx: &mut Context<Self>);
+    /// The table's delete of `ids` found none of them at the head of the branch.
+    fn delete_found_nothing(&mut self, ids: &[String], several: bool, cx: &mut Context<Self>);
+    /// The table's tab was saved as the view `id`, and is that view now.
+    fn become_view(&mut self, id: String, cx: &mut Context<Self>);
+}
 
 struct Field {
     property: Property,
@@ -173,16 +213,16 @@ fn field_values(fields: &mut [Field], cx: &App) -> Option<Vec<(String, Value)>> 
 /// nothing typed is lost (constitution III); `no_match` says why one that matched nothing
 /// inserted nothing.
 #[expect(clippy::too_many_arguments)]
-fn send_insert<T: InsertForm + ModalView>(
+fn send_insert<F: InsertForm + ModalView, T: DialogTable>(
     session: &Entity<GraphSession>,
-    table: WeakEntity<TypeTable>,
+    table: WeakEntity<T>,
     branch: String,
     query: &BuiltQuery,
     description: String,
     (key, values): (Option<String>, Map<String, Value>),
     no_match: &'static str,
     window: &mut Window,
-    cx: &mut Context<T>,
+    cx: &mut Context<F>,
 ) {
     let write = session.update(cx, |session, cx| {
         session.write_on(&branch, query, None, description, None, cx)
@@ -250,8 +290,8 @@ fn field_box(editor: &Entity<Editor>, invalid: bool, cx: &App) -> impl IntoEleme
 /// that checks `@card` minimums on every write (Omnigraph 0.15,
 /// [`ServerFeature::CardMinimumOnEveryWrite`]), it also asks for each edge the node must have,
 /// and saves the node with them in one mutation; a 0.14 server takes the node alone.
-pub struct InsertRowModal {
-    table: WeakEntity<TypeTable>,
+pub struct InsertRowModal<T: DialogTable> {
+    table: WeakEntity<T>,
     session: Entity<GraphSession>,
     schema: Arc<SchemaModel>,
     type_name: String,
@@ -272,9 +312,9 @@ struct Required {
     endpoint: Endpoint,
 }
 
-impl EventEmitter<DismissEvent> for InsertRowModal {}
+impl<T: DialogTable> EventEmitter<DismissEvent> for InsertRowModal<T> {}
 
-impl InsertForm for InsertRowModal {
+impl<T: DialogTable> InsertForm for InsertRowModal<T> {
     fn fields_mut(&mut self) -> &mut Vec<Field> {
         &mut self.fields
     }
@@ -427,9 +467,9 @@ impl InsertForm for InsertRowModal {
     }
 }
 
-impl ModalView for InsertRowModal {}
+impl<T: DialogTable> ModalView for InsertRowModal<T> {}
 
-impl Focusable for InsertRowModal {
+impl<T: DialogTable> Focusable for InsertRowModal<T> {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.fields
             .first()
@@ -438,7 +478,7 @@ impl Focusable for InsertRowModal {
     }
 }
 
-impl NodeFields for InsertRowModal {
+impl<T: DialogTable> NodeFields for InsertRowModal<T> {
     type Slot = usize;
 
     fn slots(&self) -> Vec<usize> {
@@ -468,9 +508,9 @@ impl NodeFields for InsertRowModal {
     }
 }
 
-impl InsertRowModal {
+impl<T: DialogTable> InsertRowModal<T> {
     pub fn new(
-        table: WeakEntity<TypeTable>,
+        table: WeakEntity<T>,
         session: Entity<GraphSession>,
         schema: Arc<SchemaModel>,
         type_name: String,
@@ -614,7 +654,7 @@ fn render_field(field: &Field, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-impl Render for InsertRowModal {
+impl<T: DialogTable> Render for InsertRowModal<T> {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let required: Vec<AnyElement> = (0..self.required.len())
             .map(|slot| {
@@ -927,8 +967,8 @@ enum End {
 
 /// The form for a new edge: its source and target nodes, picked by search, then its
 /// properties. An unkeyed edge gets its id from the engine, so the table shows it after a read.
-pub struct InsertEdgeModal {
-    table: WeakEntity<TypeTable>,
+pub struct InsertEdgeModal<T: DialogTable> {
+    table: WeakEntity<T>,
     session: Entity<GraphSession>,
     schema: Arc<SchemaModel>,
     edge_name: String,
@@ -943,9 +983,9 @@ pub struct InsertEdgeModal {
     _subscriptions: Vec<Subscription>,
 }
 
-impl EventEmitter<DismissEvent> for InsertEdgeModal {}
+impl<T: DialogTable> EventEmitter<DismissEvent> for InsertEdgeModal<T> {}
 
-impl InsertForm for InsertEdgeModal {
+impl<T: DialogTable> InsertForm for InsertEdgeModal<T> {
     fn fields_mut(&mut self) -> &mut Vec<Field> {
         &mut self.fields
     }
@@ -1038,17 +1078,17 @@ impl InsertForm for InsertEdgeModal {
     }
 }
 
-impl ModalView for InsertEdgeModal {}
+impl<T: DialogTable> ModalView for InsertEdgeModal<T> {}
 
-impl Focusable for InsertEdgeModal {
+impl<T: DialogTable> Focusable for InsertEdgeModal<T> {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.from.editor.focus_handle(cx)
     }
 }
 
-impl InsertEdgeModal {
+impl<T: DialogTable> InsertEdgeModal<T> {
     pub fn new(
-        table: WeakEntity<TypeTable>,
+        table: WeakEntity<T>,
         session: Entity<GraphSession>,
         schema: Arc<SchemaModel>,
         edge_name: String,
@@ -1086,7 +1126,7 @@ impl InsertEdgeModal {
     }
 }
 
-impl NodeFields for InsertEdgeModal {
+impl<T: DialogTable> NodeFields for InsertEdgeModal<T> {
     type Slot = End;
 
     fn slots(&self) -> Vec<End> {
@@ -1123,7 +1163,7 @@ impl NodeFields for InsertEdgeModal {
     }
 }
 
-impl Render for InsertEdgeModal {
+impl<T: DialogTable> Render for InsertEdgeModal<T> {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let from = self.render_endpoint(End::From, "From", window, cx);
         let to = self.render_endpoint(End::To, "To", window, cx);
@@ -1160,8 +1200,8 @@ const DEPENDENTS_NAMED: usize = 6;
 /// commit: other writers' commits do not refuse it, and the server refuses one that would leave
 /// a node without a relationship it needs (spec 004, 2026-11-13). ↵ deletes, and the toast offers Undo; typing the key
 /// is asked for only when Undo could not bring it all back.
-pub struct DeleteRowModal {
-    table: WeakEntity<TypeTable>,
+pub struct DeleteRowModal<T: DialogTable> {
+    table: WeakEntity<T>,
     session: Entity<GraphSession>,
     schema: Arc<SchemaModel>,
     type_name: String,
@@ -1186,13 +1226,13 @@ pub struct DeleteRowModal {
     _subscription: Subscription,
 }
 
-impl EventEmitter<DismissEvent> for DeleteRowModal {}
+impl<T: DialogTable> EventEmitter<DismissEvent> for DeleteRowModal<T> {}
 
 /// The dialog closes as the delete goes, so no write is ever waiting in it (spec 004): its
 /// outcome is the table's and the session's to show.
-impl ModalView for DeleteRowModal {}
+impl<T: DialogTable> ModalView for DeleteRowModal<T> {}
 
-impl Focusable for DeleteRowModal {
+impl<T: DialogTable> Focusable for DeleteRowModal<T> {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         if self.undo_unavailable.is_some() {
             self.confirm.focus_handle(cx)
@@ -1202,10 +1242,10 @@ impl Focusable for DeleteRowModal {
     }
 }
 
-impl DeleteRowModal {
+impl<T: DialogTable> DeleteRowModal<T> {
     #[expect(clippy::too_many_arguments)]
     pub fn new(
-        table: WeakEntity<TypeTable>,
+        table: WeakEntity<T>,
         session: Entity<GraphSession>,
         schema: Arc<SchemaModel>,
         type_name: String,
@@ -1600,7 +1640,7 @@ impl DeleteRowModal {
     }
 }
 
-impl Render for DeleteRowModal {
+impl<T: DialogTable> Render for DeleteRowModal<T> {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ready = self.ready();
         let confirmed = self.confirmed(cx);
@@ -1656,33 +1696,33 @@ impl Render for DeleteRowModal {
 
 /// Names the table's filters and order as a view of its type, saved per graph in the
 /// settings (spec 004). A name already used for this type is replaced.
-pub struct SaveViewModal {
+pub struct SaveViewModal<T: DialogTable> {
     graph: String,
     view: studio_settings::SavedView,
     taken: Vec<String>,
     /// A view's tab, which becomes the view saved.
-    table: Option<WeakEntity<crate::table::TypeTable>>,
+    table: Option<WeakEntity<T>>,
     name: Entity<Editor>,
     _subscription: Subscription,
 }
 
-impl EventEmitter<DismissEvent> for SaveViewModal {}
+impl<T: DialogTable> EventEmitter<DismissEvent> for SaveViewModal<T> {}
 
-impl ModalView for SaveViewModal {}
+impl<T: DialogTable> ModalView for SaveViewModal<T> {}
 
-impl Focusable for SaveViewModal {
+impl<T: DialogTable> Focusable for SaveViewModal<T> {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.name.focus_handle(cx)
     }
 }
 
-impl SaveViewModal {
+impl<T: DialogTable> SaveViewModal<T> {
     /// `view` is the table's state without a name; `taken` the names of this type's views.
     pub fn new(
         graph: String,
         view: studio_settings::SavedView,
         taken: Vec<String>,
-        table: Option<WeakEntity<crate::table::TypeTable>>,
+        table: Option<WeakEntity<T>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -1746,7 +1786,7 @@ impl SaveViewModal {
     }
 }
 
-impl Render for SaveViewModal {
+impl<T: DialogTable> Render for SaveViewModal<T> {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let name = self.entered(cx);
         let elsewhere = self.held_by_another_type(&name, cx);
@@ -1831,6 +1871,7 @@ impl Render for SaveViewModal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::table::TypeTable;
     use gpui::{KeyBinding, TestAppContext};
     use graph_store::{Connection, ServerEntry, ServerSource};
     use http_client::{AsyncBody, FakeHttpClient, Response};
@@ -1890,7 +1931,7 @@ mod tests {
         );
         let (modal, cx) = cx.add_window_view(|window, cx| {
             InsertEdgeModal::new(
-                WeakEntity::new_invalid(),
+                WeakEntity::<TypeTable>::new_invalid(),
                 session,
                 schema,
                 "WorksAt".into(),
@@ -1947,7 +1988,7 @@ mod tests {
             let (session, schema, target) = (session(cx), schema.clone(), target.clone());
             let (modal, cx) = cx.add_window_view(|window, cx| {
                 DeleteRowModal::new(
-                    WeakEntity::new_invalid(),
+                    WeakEntity::<TypeTable>::new_invalid(),
                     session,
                     schema,
                     "Review".into(),
@@ -1997,7 +2038,7 @@ mod tests {
         };
         let (modal, cx) = cx.add_window_view(|window, cx| {
             DeleteRowModal::new(
-                WeakEntity::new_invalid(),
+                WeakEntity::<TypeTable>::new_invalid(),
                 session.clone(),
                 schema,
                 "Person".into(),
@@ -2067,7 +2108,7 @@ mod tests {
             let (session, schema) = (session(cx), schema.clone());
             let (modal, cx) = cx.add_window_view(|window, cx| {
                 DeleteRowModal::new(
-                    WeakEntity::new_invalid(),
+                    WeakEntity::<TypeTable>::new_invalid(),
                     session,
                     schema,
                     "Knows".into(),
@@ -2293,7 +2334,7 @@ mod tests {
             let workspace = workspace.clone();
             move |cx: &mut gpui::VisualTestContext| {
                 workspace.read_with(cx, |workspace, _| {
-                    workspace.active_modal::<InsertRowModal>()
+                    workspace.active_modal::<InsertRowModal<TypeTable>>()
                 })
             }
         };
