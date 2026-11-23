@@ -2904,6 +2904,8 @@ async fn a_preview_tab_the_person_changed_is_kept(cx: &mut TestAppContext) {
     cx.run_until_parked();
     let (workspace, cx) = cx.add_window_view(Workspace::new);
     workspace.update_in(cx, |workspace, window, cx| {
+        // The tabs another test of this binary left open for the graph are not this one's.
+        workspace.start_with_no_saved_tabs();
         workspace.set_session(session.clone(), window, cx)
     });
     cx.run_until_parked();
@@ -3025,6 +3027,8 @@ async fn a_saved_tab_comes_back_with_its_filters_order_and_format(cx: &mut TestA
     // In another window, as the next launch restores it.
     let (workspace, cx) = cx.add_window_view(Workspace::new);
     workspace.update_in(cx, |workspace, window, cx| {
+        // The tabs another test of this binary left open for the graph are not this one's.
+        workspace.start_with_no_saved_tabs();
         workspace.set_session(session.clone(), window, cx)
     });
     cx.run_until_parked();
