@@ -1177,7 +1177,6 @@ pub struct DeleteRowModal {
     undo_unavailable: Option<String>,
     confirm: Entity<Editor>,
     notice: Option<Notice>,
-    saving: bool,
     focus_handle: FocusHandle,
     _plan: Option<Task<()>>,
     /// How far the plan has got: the reads it sent and those answered, shown while it reads.
@@ -1189,12 +1188,9 @@ pub struct DeleteRowModal {
 
 impl EventEmitter<DismissEvent> for DeleteRowModal {}
 
-impl ModalView for DeleteRowModal {
-    /// A write still running keeps the dialog open: its outcome shows here.
-    fn on_before_dismiss(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
-        !self.saving
-    }
-}
+/// The dialog closes as the delete goes, so no write is ever waiting in it (spec 004): its
+/// outcome is the table's and the session's to show.
+impl ModalView for DeleteRowModal {}
 
 impl Focusable for DeleteRowModal {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
@@ -1262,7 +1258,6 @@ impl DeleteRowModal {
             undo_unavailable: None,
             confirm,
             notice: None,
-            saving: false,
             focus_handle: cx.focus_handle(),
             _plan: None,
             progress: deletes::PlanProgress::default(),
@@ -1374,7 +1369,7 @@ impl DeleteRowModal {
     }
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.saving || !self.ready() {
+        if !self.ready() {
             return;
         }
         if !self.confirmed(cx) {
@@ -1424,9 +1419,6 @@ impl DeleteRowModal {
             n => format!("{} and {n} that needed them", self.what()),
         };
         let description = format!("Delete {} {}", self.type_name, what);
-        self.saving = true;
-        self.notice = None;
-        cx.notify();
         // The outcome's toast offers Undo when Undo can put it all back.
         let follow_up = self
             .undo_unavailable
@@ -1498,9 +1490,7 @@ impl DeleteRowModal {
     }
 
     fn cancel(&mut self, cx: &mut Context<Self>) {
-        if !self.saving {
-            cx.emit(DismissEvent);
-        }
+        cx.emit(DismissEvent);
     }
 
     /// The waiting line: what the plan does, then how many of its reads have come back.
@@ -1614,7 +1604,6 @@ impl Render for DeleteRowModal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ready = self.ready();
         let confirmed = self.confirmed(cx);
-        let saving = self.saving;
         let headline = format!("Delete {}", self.what());
         let description = self.description();
         let plan = self.render_plan(cx);
@@ -1632,11 +1621,10 @@ impl Render for DeleteRowModal {
                         self.session.read(cx).write_scope(&self.branch, cx),
                         cx,
                     ))
-                    .close_disabled(saving)
                     .on_close(cx.listener(|this, _, _, cx| this.cancel(cx))),
             )
-            // The body only when it has something: the dependents, the confirm field, or the
-            // write's outcome.
+            // The body only when it has something: the dependents, the confirm field, or why
+            // the delete could not be built.
             .when(plan.is_some() || typing || notice.is_some(), |dialog| {
                 dialog.child(
                     modal_body()
@@ -1653,13 +1641,12 @@ impl Render for DeleteRowModal {
                 modal_footer(cx)
                     .child(
                         cancel_button("cancel-delete")
-                            .disabled(saving)
                             .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
                     )
                     .child(
-                        action_button("delete", if saving { "Deleting…" } else { "Delete" })
+                        action_button("delete", "Delete")
                             .variant(Variant::Destructive)
-                            .disabled(saving || !ready || !confirmed)
+                            .disabled(!ready || !confirmed)
                             .key_binding(ui::KeyBinding::for_action(&menu::Confirm, cx))
                             .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
                     ),
@@ -1847,6 +1834,8 @@ mod tests {
     use gpui::{KeyBinding, TestAppContext};
     use graph_store::{Connection, ServerEntry, ServerSource};
     use http_client::{AsyncBody, FakeHttpClient, Response};
+    use std::cell::Cell;
+    use std::rc::Rc;
 
     /// A server for the dev graph whose every type's name index holds two people.
     fn session(cx: &mut TestAppContext) -> Entity<GraphSession> {
@@ -2028,7 +2017,19 @@ mod tests {
             );
             assert!(modal.ready(), "{:?}", modal.plan.is_loading());
         });
+        let dismissed = Rc::new(Cell::new(false));
+        let _subscription = cx.update({
+            let dismissed = dismissed.clone();
+            |_, cx| cx.subscribe(&modal, move |_, _: &DismissEvent, _| dismissed.set(true))
+        });
         modal.update_in(cx, |modal, window, cx| modal.submit(window, cx));
+        // The dialog closes as the delete goes, and the modal layer lets it: one that refused
+        // while the write ran stayed open on "Deleting…" for good (2026-11-22).
+        assert!(dismissed.get(), "the dialog asked to close");
+        assert!(
+            modal.update_in(cx, |modal, window, cx| modal.on_before_dismiss(window, cx)),
+            "the modal layer may close it"
+        );
         cx.run_until_parked();
         let writes = writes.lock().unwrap();
         assert_eq!(writes.len(), 1);
