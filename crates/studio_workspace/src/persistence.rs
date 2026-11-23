@@ -3,18 +3,17 @@
 //! shown. Plain JSON under Studio's data directory; no database.
 //!
 //! A tab is remembered only if its item returns [`SavedItem`] from `Item::serialize`, and comes
-//! back only if a feature registered its kind with [`register_item_kind`]. A query tab keeps its
-//! draft, so the files are readable by their owner only.
+//! back only if a feature registered its kind with `register_item_kind`: this module keeps what
+//! is saved and knows nothing of opening it. A query tab keeps its draft, so the files are
+//! readable by their owner only.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
-use gpui::{App, Bounds, Context, Global, Pixels, Window, WindowId, point, px, size};
+use gpui::{App, Bounds, Global, Pixels, Window, WindowId, point, px, size};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-
-use crate::Workspace;
 
 /// One remembered tab: the kind its feature registered, and what that feature needs to open it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -55,26 +54,6 @@ pub struct SavedWorkspace {
     /// canvases each had a root: a new canvas starts from these (spec 020).
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub canvas_positions: std::collections::BTreeMap<String, [f32; 2]>,
-}
-
-/// Opens a remembered tab of one kind.
-pub type OpenSavedItem = fn(&Value, &mut Workspace, &mut Window, &mut Context<Workspace>);
-
-#[derive(Default)]
-struct ItemKinds(HashMap<String, OpenSavedItem>);
-
-impl Global for ItemKinds {}
-
-/// Lets tabs of `kind` come back after a restart.
-pub fn register_item_kind(cx: &mut App, kind: &str, open: OpenSavedItem) {
-    cx.default_global::<ItemKinds>()
-        .0
-        .insert(kind.to_owned(), open);
-}
-
-pub(crate) fn opener(cx: &App, kind: &str) -> Option<OpenSavedItem> {
-    cx.try_global::<ItemKinds>()
-        .and_then(|kinds| kinds.0.get(kind).copied())
 }
 
 /// `OMNIGRAPH_STUDIO_NO_RESTORE=1` starts with no remembered tabs (the snapshot tool sets it).
