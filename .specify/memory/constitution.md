@@ -1,8 +1,8 @@
 # Omnigraph Studio constitution
 
-Version 1.6.0 · ratified 2026-10-11 · amended 2026-10-17 (IV: ↵ and Undo for what Studio can
+Version 1.6.1 · ratified 2026-10-11 · amended 2026-10-17 (IV: ↵ and Undo for what Studio can
 put back) · amended 2026-10-18 (IV: ↵ for what loses no data) · amended 2026-10-22 (I: the
-updater's requests) · amended 2026-10-24 (X: Omnigraph `v0.14.0` and later) · amended 2026-10-30 (I: model calls) · amended 2026-11-01 (XIII: one rule for what a pick does) · amended 2026-11-05 (I: control-plane calls) · amended 2026-11-10 (II, V: a view in front may take new data itself) · amended 2026-11-11 (I: telemetry's uploads) · amended 2026-11-14 (I: telemetry removed) · amended 2026-11-24 (IV: nothing is confirmed by typing)
+updater's requests) · amended 2026-10-24 (X: Omnigraph `v0.14.0` and later) · amended 2026-10-30 (I: model calls) · amended 2026-11-01 (XIII: one rule for what a pick does) · amended 2026-11-05 (I: control-plane calls) · amended 2026-11-10 (II, V: a view in front may take new data itself) · amended 2026-11-11 (I: telemetry's uploads) · amended 2026-11-14 (I: telemetry removed) · amended 2026-11-24 (IV: nothing is confirmed by typing) · amended 2026-11-28 (XIII: Cards holds a set)
 
 Omnigraph Studio is a native desktop app for exploring and changing Omnigraph graphs: type
 tables, a relationship tree, a graph canvas, a `.gq` query editor, branches, review, merge and
@@ -107,7 +107,7 @@ The top says which server, graph and branch; the left lists what there is; the c
 right describes what is selected there; the bottom reports what ran.
 
 *In practice:* a sidebar row names a thing, never a view. A view holds only what can answer its
-question: Table a set, Tree a set or one node, Canvas and Page one node. A view is a tab, opened from
+question: Table and Cards a set, Tree a set or one node, Canvas and Page one node. A view is a tab, opened from
 the view strip of the tab it comes from, which stays. A view opened from a tab holding a commit holds that commit. A
 new "how" control is a tab if it has state, selection or reads of its own, and a toggle only if it
 redraws the same state. Plan: `specs/020-ui-unification/plan.md`.

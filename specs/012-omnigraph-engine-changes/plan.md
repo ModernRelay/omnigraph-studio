@@ -558,7 +558,10 @@ results of a scan and of an index are the same. *Waits:* 031. *Today:* Studio ru
 search only on properties that declare an index, merges its hits after its own matches, and
 leaves out a property whose search fails.
 
-### Galleries of Blob values (spec 035)
+### A grid of Blob values: a card's cover (spec 048, first spec 035's gallery)
+
+Spec 048 replaces the gallery with Cards, whose cover is read as a tile's file is; the entries
+below speak of the gallery and its tiles until 048's slice 1 lands.
 
 A gallery shows a type's rows as tiles of one of their files. Contract 0.14 reads a Blob one
 cell at a time, as its whole bytes or one range, and says nothing else of it; checked against a
@@ -569,7 +572,7 @@ parameter (an edge length; a format) answering a small image of a picture, or of
 page, cacheable by the Blob's content (E57). A screen of 24 photos of about 3 MB costs a client
 today about 48 requests and 72 MB, all decoded by the client; with a preview, 24 requests and
 well under a megabyte. Engine rule: a preview is derived and never stored as graph data; a value
-the server cannot preview answers its kind and no image. *Waits:* 035. *Today:* Studio reads a
+the server cannot preview answers its kind and no image. *Waits:* 048. *Today:* Studio reads a
 tile's file whole up to 8 MiB and 40 megapixels, decodes and scales it to 480 px off the main
 thread, and holds at most 64 MiB of previews; a PDF's first page is drawn on macOS only.
 
@@ -578,18 +581,18 @@ thread, and holds at most 64 MiB of previews; a PDF's first page is drawn on mac
 today with `T7: blob comparisons in filters are not supported`). One page would then say what
 each tile holds, a gallery could leave out rows without a file, and the type table's Blob
 column would need no `HEAD` per cell. Engine rule: the bytes are still never projected.
-*Waits:* 035, 004. *Today:* one `HEAD` per drawn tile or cell, shared at a commit by the
+*Waits:* 048, 004. *Today:* one `HEAD` per drawn tile or cell, shared at a commit by the
 table, the peek and the gallery; a gallery pages through rows without a file.
 
 **E57. A validator that names a Blob's bytes.** ([#1467](https://github.com/ModernRelay/omnigraph/issues/1467)) A strong validator stable across commits that
 did not change the value: a content digest in `HEAD` and `GET` (`Repr-Digest`, or a `digest`
 field in `blob stat`). Today an `ETag` names the type's table version: after a write to another
-row's title an unchanged value answers a new `ETag`. *Waits:* 035. *Today:* a preview is kept
+row's title an unchanged value answers a new `ETag`. *Waits:* 048. *Today:* a preview is kept
 only at the commit it was read at, and read again when the gallery's pin moves.
 
 **E58. A media type and an image's size kept with a Blob.** ([#1468](https://github.com/ModernRelay/omnigraph/issues/1468)) `PUT /blob` taking the body's
 `Content-Type` (or a `media_type` field on a load) and `HEAD` answering it, with an image's
-pixel size. Today every value answers `application/octet-stream`. *Waits:* 035. *Today:*
+pixel size. Today every value answers `application/octet-stream`. *Waits:* 048. *Today:*
 Studio judges a value by its first bytes (`blob::value_kind`) and reads an image's size from its
 header in the first 64 KiB. A gallery places its masonry from that read (spec 035), made a
 screen ahead of the view for the rows below; with E58 a row would be placed from its `HEAD`, and
@@ -599,7 +602,7 @@ a picture whose header is past 64 KiB would not be placed as a square.
 `GET /branches/diff` and the change feed carry a changed Blob whole, as `base64:` text, in both
 the `before` and the `after` image, so a page of changes to photos is megabytes and a client
 holds both sides. A description (size, digest; the commit to read each side at) would keep a
-page to what changed. *Waits:* 035, 008. *Today:* Studio reads the diff as it comes and marks a
+page to what changed. *Waits:* 048, 008. *Today:* Studio reads the diff as it comes and marks a
 tile whose file changed; the target's side is read from the Blob route at the merge base.
 
 ### Why something changed: a node's history (spec 046)
