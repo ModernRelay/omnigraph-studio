@@ -166,16 +166,24 @@ impl NodePeek {
             .is_some_and(|adding| adding.index == index)
     }
 
+    /// The relationship type of a list item that is a group.
+    fn edge_of(&self, item: &Item) -> Option<&String> {
+        match item {
+            Item::Group(index) => self.groups.get(*index).map(|group| &group.group.edge),
+            _ => None,
+        }
+    }
+
     /// Orders `items` so the groups of one relationship type sit together, each pair where its
     /// first group was: a page lists `Knows → Person` and `Knows ← Person` as one.
     pub(super) fn pair_directions(&self, items: &mut Vec<Item>) {
         let firsts: Vec<usize> = items
             .iter()
             .enumerate()
-            .map(|(at, item)| match edge_of(self, item) {
+            .map(|(at, item)| match self.edge_of(item) {
                 Some(edge) => items
                     .iter()
-                    .position(|other| edge_of(self, other) == Some(edge))
+                    .position(|other| self.edge_of(other) == Some(edge))
                     .unwrap_or(at),
                 None => at,
             })
@@ -197,7 +205,7 @@ impl NodePeek {
         };
         at.checked_sub(1)
             .and_then(|before| self.list_items.get(before))
-            .and_then(|before| edge_of(self, before))
+            .and_then(|before| self.edge_of(before))
             .is_some_and(|edge| Some(edge) == self.groups.get(index).map(|g| &g.group.edge))
     }
 
@@ -681,14 +689,6 @@ enum TitleRole {
 fn picked_by_control(property: &gq_language::Property) -> bool {
     !property.list
         && (property.enum_values.is_some() || property.kind == gq_language::ScalarKind::Bool)
-}
-
-/// The relationship type of a list item that is a group.
-fn edge_of<'a>(view: &'a NodePeek, item: &Item) -> Option<&'a String> {
-    match item {
-        Item::Group(index) => view.groups.get(*index).map(|group| &group.group.edge),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
