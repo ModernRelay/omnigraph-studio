@@ -217,15 +217,25 @@ fn every_keymap_binding_names_a_studio_action(cx: &mut HeadlessAppContext) {
     }
 }
 
-/// A Cards tab's keys that type a character (G, X, F, = and −, and Space) act while its cards
-/// have the keyboard and not while a field in the tab does (`editing`, the filter's field of
-/// spec 048's slice 5): there they are text. Its other keys act in both.
+/// A Cards tab's keys, while its cards have the keyboard and while its filter's value field
+/// does (`editing`, spec 048's slice 5). A key that types a character (G, X, F, = and −, and
+/// Space) is text in the field. So is every key that would act on the cards while a person
+/// writes: the arrows, Home and End move in the text, ⌘A selects it and ⌘C copies it, and ↵
+/// there applies the filter and opens no page. Esc, Refresh and the filter's two keys act in
+/// both.
 fn the_cards_letter_keys_are_text_in_a_field(cx: &mut HeadlessAppContext) {
     let context = |text: &str| KeyContext::parse(text).unwrap();
     let on_cards = [context("Workspace"), context("Cards")];
     let in_field = [
         context("Workspace"),
         context("Cards editing"),
+        context("Editor mode=single_line"),
+    ];
+    // The same places in another tab: a binding that acts there is not the Cards tab's own.
+    let elsewhere = [context("Workspace"), context("Other")];
+    let elsewhere_in_field = [
+        context("Workspace"),
+        context("Other editing"),
         context("Editor mode=single_line"),
     ];
     for (platform, content) in KEYMAPS {
@@ -235,18 +245,22 @@ fn the_cards_letter_keys_are_text_in_a_field(cx: &mut HeadlessAppContext) {
             panic!("{platform}: the keymap did not load");
         };
         let mut letters = Vec::new();
-        let mut others = 0;
+        // The keys that do not type, by where they act: on the cards alone, in both, and in
+        // the field alone. ⌘ and Ctrl read as `mod`.
+        let (mut on_the_cards, mut in_both, mut in_the_field) =
+            (Vec::new(), Vec::new(), Vec::new());
         for binding in &key_bindings {
             let [stroke] = binding.keystrokes() else {
                 continue;
             };
-            // The Cards blocks' own bindings: those that need its context.
             let Some(predicate) = binding.predicate() else {
                 continue;
             };
-            if predicate.depth_of(&on_cards[..1]).is_some()
-                || predicate.depth_of(&on_cards).is_none()
-            {
+            let on =
+                predicate.depth_of(&on_cards).is_some() && predicate.depth_of(&elsewhere).is_none();
+            let field = predicate.depth_of(&in_field).is_some()
+                && predicate.depth_of(&elsewhere_in_field).is_none();
+            if !on && !field {
                 continue;
             }
             let held = stroke.modifiers();
@@ -257,19 +271,30 @@ fn the_cards_letter_keys_are_text_in_a_field(cx: &mut HeadlessAppContext) {
                 && (stroke.key().chars().count() == 1 || stroke.key() == "space");
             if types {
                 assert!(
-                    predicate.depth_of(&in_field).is_none(),
+                    on && !field,
                     "{platform}: `{}` runs {} in a Cards tab's field instead of typing",
                     stroke.key(),
                     binding.action().name()
                 );
                 letters.push(stroke.key().to_owned());
-            } else {
-                assert!(
-                    predicate.depth_of(&in_field).is_some(),
-                    "{platform}: `{}` is lost while a Cards tab's field has the keyboard",
-                    stroke.key()
-                );
-                others += 1;
+                continue;
+            }
+            let mut key = String::new();
+            if held.platform || held.control {
+                key.push_str("mod-");
+            }
+            if held.alt {
+                key.push_str("alt-");
+            }
+            if held.shift {
+                key.push_str("shift-");
+            }
+            key.push_str(stroke.key());
+            let entry = (key, binding.action().name().to_owned());
+            match (on, field) {
+                (true, true) => in_both.push(entry),
+                (true, false) => on_the_cards.push(entry),
+                _ => in_the_field.push(entry),
             }
         }
         letters.sort();
@@ -278,7 +303,48 @@ fn the_cards_letter_keys_are_text_in_a_field(cx: &mut HeadlessAppContext) {
             ["-", "=", "f", "g", "space", "x"],
             "{platform}: the Cards keys that type"
         );
-        assert_eq!(others, 13, "{platform}: the Cards keys that do not type");
+        let named = |keys: &[(&str, &str)]| {
+            let mut keys: Vec<(String, String)> = keys
+                .iter()
+                .map(|(key, action)| ((*key).to_owned(), (*action).to_owned()))
+                .collect();
+            keys.sort();
+            keys
+        };
+        on_the_cards.sort();
+        assert_eq!(
+            on_the_cards,
+            named(&[
+                ("left", "studio_cards::MoveLeft"),
+                ("right", "studio_cards::MoveRight"),
+                ("up", "studio_cards::MoveUp"),
+                ("down", "studio_cards::MoveDown"),
+                ("home", "studio_cards::MoveToFirst"),
+                ("end", "studio_cards::MoveToLast"),
+                ("enter", "studio_cards::OpenPage"),
+                ("mod-enter", "studio_cards::OpenPage"),
+                ("alt-enter", "studio_cards::OpenCover"),
+                ("mod-a", "studio_cards::PickAll"),
+                ("mod-c", "studio_cards::CopyIds"),
+            ]),
+            "{platform}: the Cards keys a field keeps for its text"
+        );
+        in_both.sort();
+        assert_eq!(
+            in_both,
+            named(&[
+                ("escape", "studio_cards::Cancel"),
+                ("mod-r", "studio_cards::Refresh"),
+                ("mod-f", "studio_table::AddFilter"),
+                ("mod-alt-backspace", "studio_table::ClearFilters"),
+            ]),
+            "{platform}: the Cards keys that act while a field has the keyboard too"
+        );
+        assert_eq!(
+            in_the_field,
+            named(&[("enter", "studio_table::ConfirmEdit")]),
+            "{platform}: the keys of a Cards tab's field"
+        );
     }
 }
 

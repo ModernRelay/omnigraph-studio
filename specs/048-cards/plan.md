@@ -1,9 +1,11 @@
 # 048: Cards, a view of a type's nodes
 
-Status: accepted 2026-11-23 · slices 1 and 2 built 2026-11-23 (1: Gallery is Cards: the names
+Status: accepted 2026-11-23 · slices 1 to 5 built 2026-11-23 (1: Gallery is Cards: the names
 and their aliases, a saved `gallery` tab restored, the uniform grid, ↵, ⌥↵ and G. 2: a card
 shows fields under its title, the format with its Fields menu, kept by tab and by type; Cards
-for every node type and from a tree of a set); slices 3 to 7 not built · supersedes
+for every node type and from a tree of a set. 3 and 4: the table's filter bar in a file of its
+own, behind `FilterHost`. 5: that bar and a Sort chip in Cards, a change read at the commit the
+tab shows); slices 6 and 7 not built · supersedes
 [035](../035-gallery/plan.md), whose Gallery left the app with slice 1 · Studio's claims checked
 against `7f3e7e92` on 2026-11-23; Omnigraph's are spec 035's, checked against `v0.15.0` on
 2026-11-18 and not rechecked
@@ -230,21 +232,25 @@ A format is which fields a card shows and in what order, its cover, and its size
   move out of `table.rs` into a part both tabs use (How it is built). ⌘F adds a filter, ⌘⌥⌫
   clears them, ↵ applies the draft and Esc closes it, as in the table.
 - A filter or order change reads the set again from its first page **at the tab's pinned
-  commit**, keeps the picks that are still shown, and puts the cursor on the first card.
+  commit**, keeps the picks by id, as the table keeps its selection (Corrections), and puts
+  the cursor on the first card.
 - A date preset ("today", "this week") is kept as the preset and resolved at each read, so it
   does not freeze at the day the tab opened. A filter on a property the schema no longer has
-  is dropped with the toolbar notice the table gives.
+  is dropped, and the bar says which (Corrections: the table drops it and says nothing).
 - **Sort** is a chip of its own with the table's menu (`ds::sort_menu`).
-- **A tab of selected rows** shows a lead pill "3 picked rows ×" and the Filters chip disabled:
-  "Showing 3 picked rows. Clear the pill to filter Note". Clearing it shows the type's rows.
+- **A tab of selected rows** shows a lead pill "3 picked rows ×" and the Filters and Sort
+  chips disabled: "Showing 3 picked rows. Clear the pill to filter Note". Clearing it shows
+  the type's rows.
 - **Filter in words** (slice 7) asks the same model with the same question. In Cards its
   answer sets filters and order; a grouping or columns in the answer are left out.
 - "Newer data · Refresh" and ⌘R as in every data view.
 
 ### Selection and the keyboard
 
-Key context `Cards`; every key is an action in `studio_cards` unless named. The single-letter
-keys are bound in `Cards && !editing`, so they are text in the filter's field.
+Key context `Cards`; every key is an action in `studio_cards` unless named. Every key that
+acts on cards is bound in `Cards && !editing`, so while the filter's value field has the
+keyboard the letters are text, the arrows, Home and End move in it, ⌘A selects it and ⌘C
+copies it. Esc, ⌘R, ⌘F and ⌘⌥⌫ are bound in `Cards` and act in both.
 
 | Key (macOS; Ctrl for ⌘ elsewhere) | Action | Does |
 |---|---|---|
@@ -253,6 +259,7 @@ keys are bound in `Cards && !editing`, so they are text in the filter's field.
 | Home, End | `MoveToFirst`, `MoveToLast` | the first card; the last card read |
 | Space | `studio::ToggleInspector` | the inspector shows the cursor's node whole: every property, its files, its relationships |
 | ↵, ⌘↵ | `OpenPage` | the node's page |
+| ↵ while a filter is written | `studio_table::ConfirmEdit`, in `Cards && editing` | applies the draft, and opens no page |
 | ⌥↵ | `OpenCover` | the cover's file in its Blob tab (spec 004), at the tab's commit |
 | G | `ShowOnCanvas` | a canvas walking from the cursor's node, as the strip's Canvas |
 | X | `TogglePick` | picks the cursor's card, or takes it out |
@@ -326,6 +333,11 @@ filter's field, and a move through its suggestions, draws it no times.
   its own `filters`, answers what the bar asks (the schema, the type, the session, the pinned
   commit, where focus returns) and re-reads in `filters_changed`. The bodies, the notify
   pattern, ↵ and Esc, and the key contexts stay as they are, so the table behaves as before.
+  Slice 5 lifted what else the two tabs share: the test of a filter against a schema
+  (`filter_bar::filter_stands`, out of the table's schema load), what rows can be ordered by
+  and how a Sort chip words it (`model::sort_choices`, `can_sort_by`, `sort_label`), and a
+  set's words (`model::filters_summary`, `set_title`). The trait gained `bar_lead`, what a
+  host draws before the pills, for the pill of a listed set (`ds::set_pill`).
 - **Relationship reads** move out of `TypeTable` into `relations.rs`, which both tabs call.
 - **Names.** Old names keep working:
 
@@ -410,7 +422,9 @@ Each slice is a pull request that stands alone.
 | 2026-11-23 | A saved tab of an unregistered kind is dropped, and kinds have no aliases | Read `persistence.rs` and `Workspace::restore_saved` | Confirmed by reading |
 | 2026-11-23 | A saved view's shape is never read; a results canvas is not saved | Read `studio_settings.rs`, `type_table.rs` (`open_saved_view`), `graph_canvas.rs` (`serialize`) | Confirmed by reading |
 
-Slices 1 and 2 are built; slices 3 to 7 are not. Each slice adds its rows.
+Slices 1, 2 and 5 have their rows below. Slices 3 and 4 were built on branches of their own
+and reached this log's branch by a merge; their rows are theirs to add. Slices 6 and 7 are
+not built.
 
 ### Slice 1 (2026-11-23)
 
@@ -447,7 +461,7 @@ are held for rows measured ahead; a preview of a file that is no longer the cove
 
 What slice 1 left as Gallery had it, for the slices named: Cards is offered only for a type
 with a file (2, built); the toolbar's File chip stays, named Cover, and F goes round the type's
-files without None (2, built: the Fields menu); the set is fixed at opening (5).
+files without None (2, built: the Fields menu); the set is fixed at opening (5, built).
 
 ### Slice 2 (2026-11-23)
 
@@ -473,6 +487,34 @@ Built on `feat/cards-fields`, on `6f917dee`. The same machine and toolchain.
 assert more (a card's height with fields and without a cover; F through none; the format a
 restored tab has and saves), and 5 new. The table's strip test changed what it asserts: a table
 of a type with no file listed three views and now lists four.
+
+### Slice 5 (2026-11-23)
+
+Built on `feat/cards-filters`, on the merge `769c0e55`, which holds slices 3 and 4. The same
+machine and toolchain. The fake server of `type_table`'s tests answers a read at the commit it
+names, or at the head another writer moved, and keeps every request.
+
+| Date | Claim | Check | Result |
+|---|---|---|---|
+| 2026-11-23 | What the two tabs now share was moved, not changed | `cargo test -p type_table` after `filter_stands`, the sort choices and a set's words were lifted out of `table.rs`, before anything else changed | 322 passed, 1 ignored, the count reported for the merge; `a_schema_changed_elsewhere_waits_for_refresh`, which drops the table's filters under two schema changes, unedited |
+| 2026-11-23 | A filter reads the set again at the commit the tab shows, not at the head | `cards::tests` `a_filter_reads_again_at_the_pin_and_not_at_the_head`: 12 notes read at `c1`; another writer commits `c2` and the head watch finds it; a filter written with ⌘F, typed, ↵; a second; ⌘⌥⌫; ⌘R | Pass: one read, asked with `snapshot: c1`, answered at `c1`, from the first page; the pin holds and Refresh is still offered; the cursor on the first card; the two picks kept by id and the range's start gone; the title "Cards: Note, 1" and the tab's key follow. ⌘⌥⌫ shows every note at `c1` with no request (the session holds what it read there); ⌘R reads `c2`. With the read made at the head instead, the test fails |
+| 2026-11-23 | Sort orders the cards and reads at the pin | `sort_orders_the_cards_and_reads_at_the_pin`: the head moved; the chip's menu opened and `title` taken with the keyboard; descending; the same order again and one the type cannot give; the chip's × | Pass: `order { $n.title asc … }` then `desc`, each one read at `c1`, the cursor on the first card, the title unchanged; nothing read for the same order or a file's; × puts the ids' order back with no request |
+| 2026-11-23 | A date preset is resolved at each read and saved as itself | `a_date_preset_is_resolved_at_each_read_and_saved_as_itself`: "due is today" written with ⌘F and ↵; ⌘R. `type_table` `a_date_preset_judges_edited_and_inserted_rows_by_its_days`, extended: what the table hands Cards. `relationship_tree.rs` read: its Cards action passes the set's filters as it holds them | Pass: each page is sent today's two days as `f0` and `f0_end`; the tab holds and saves `{"property": "due", "op": "Today", "value": null}`; the table's action carries the same, where it carried the days. With `filters` read in place of `resolved_filters()` the page is sent `null` and the test fails |
+| 2026-11-23 | A filter the schema lost is dropped and said | `a_filter_the_schema_lost_is_dropped_and_said`: a saved tab with a filter on `topic`, which Note never had, one on `title`, and an order by `title`; another writer drops `title`; ⌘R; a new filter | Pass: read once, without it; "The schema no longer has topic: its filter was left out" in the bar, and not counted as the person's change; after the refresh the filter and the order on `title` are gone, the notice names `title`, the Filter menu no longer offers it; the next filter takes the notice away |
+| 2026-11-23 | A tab of picked rows says so until its pill is cleared | `a_tab_of_picked_rows_says_so_until_its_pill_is_cleared`: three listed notes; ⌘F, ⌘⌥⌫, a click on each chip, an order set in code; a click on the pill's ×; a click on each chip | Pass: the pill is drawn; no draft, no menu, no order, no page read, and the status bar offers no filter key; cleared, the 12 notes are read at `c1` under no filter, the title is "Cards: Note", the tab saves no ids, and the chips open the draft and the menu |
+| 2026-11-23 | Keys typed in the value field are the text's | `keys_typed_in_the_value_field_are_the_texts` (the editor's own ←, Home, ⌘A, ⌘C and Esc bound as Zed's keymap binds them): ← and Home move the caret, → ↓ ↑ End move no cursor, ⌘A and ⌘C select and copy the text, G X F = − Space are typed; ↵; ↵ again. `studio` `keymaps` `the_cards_letter_keys_are_text_in_a_field`, rewritten: every Cards binding of the three keymaps by where it acts | Pass: the cursor, the picks and the size never change; ↵ applies the filter and opens no page; the next ↵ opens the first card's page. The keymaps bind 6 keys that type and 11 that do not (the arrows, Home, End, ↵, ⌘↵, ⌥↵, ⌘A, ⌘C) on the cards alone, Esc, ⌘R, ⌘F and ⌘⌥⌫ in both, and ↵ as `ConfirmEdit` in the field. With `editing` not set, the test fails |
+| 2026-11-23 | Esc closes the draft first and the picks second | `esc_closes_the_draft_first_and_clears_the_picks_second`; then ⌘⌥⌫ over a filter and an open draft | Pass: the draft, then the picks, no read for either; after ⌘⌥⌫ the cards have the keyboard and → moves the cursor |
+| 2026-11-23 | A draft with no value field takes ↵ and Esc | `a_draft_with_no_value_field_takes_enter_and_esc`: "due is empty" set as the menus leave it; → ↓ X G; Esc; again; ↵ | Pass: the cards have the keyboard, not the field that is not drawn; their keys wait; Esc closes the draft and leaves the picks; ↵ adds the filter and opens no page (Corrections) |
+| 2026-11-23 | Typing a filter draws the cards no times | `typing_a_filter_draws_the_cards_no_times`: 300 tasks, no cover; four letters, ← and Home; ↓ ↓ ↑ through an enum's two members; ↵ with the page and the count each held | Pass: no draw of `CardsGrid` for the letters or the moves; one as the filter is applied, without its rows, one as the page lands, one as the count lands, and no more |
+| 2026-11-23 | A preview tab the person changed is kept | `a_preview_tab_the_person_changed_is_kept`, through the workspace: a preview replaced by the next; then an order, a filter and a size, each in a new preview | Pass: untouched, one tab; after each change the tab is no longer the preview and the next preview opens beside it |
+| 2026-11-23 | A saved tab comes back with its filters, order and format | `a_saved_tab_comes_back_with_its_filters_order_and_format`: two filters (one "due is this week"), an order, Large, a field hidden; saved; reopened in another window through the workspace's opener | Pass: the same filters, the preset a preset, the order, the format and the title "Cards: Task, Task, due is this week"; its first page sent the filter's text, the week's days and `$n.points desc`; not counted as changed |
+| 2026-11-23 | A filter keeps what was read at its commit | `a_filter_keeps_the_covers_and_the_branchs_marks`: 12 notes with files on a branch that added one and removed one; a filter | Pass: no file is read again; the removed row first, the added one marked, the counts as they were; the cursor on the first card the branch still has; past the cap every preview of a row the filter no longer shows is let go and those shown stay |
+| 2026-11-23 | The bar and the chips in the app | Offscreen snapshots of the `notes` graph at 1440 × 900 against `script/dev-server` on a port of its own (`omnigraph` 0.15.0), driven with keys and clicks through Studio's keymap, read: "written is in the last 30 days" from the menus and ↵; a filter through `filedUnder Topic`, "is related to", "de" typed, the offer picked with ↵; Sort by `written`, its menu open; three listed notes with the pointer on Filters; a saved filter on a property Note lacks; the dark theme twice | 7 of 13 notes under the preset, its pill and "Filters 1 ×"; "Design" offered under the field and, picked, the 7 notes filed under it, the tab "Cards: Note, design"; "Sort written ↑ ×" with the menu's two ticks; "3 picked rows ×", both chips dimmed, the tooltip as written; the notice after the kept pill. The toolbar reads view strip, type and count, Fields, Sort, Filters, S M L, Refresh |
+| 2026-11-23 | The same draft in the table | The same tool on the Note table: `written`, "is in the last 30 days", ↵, Esc | The draft stays open and 13 rows show: no key reaches the table while its draft has no value field. As before this slice; not changed here (Corrections) |
+| 2026-11-23 | The workspace's checks | The same seven commands | All pass. Tests: 1,772 passed, 0 failed, 9 ignored in the 54 harnessed binaries (`type_table` 334 and 1 ignored), and the 7 checks of `keymaps`; `PALETTE_ONLY` is still 33 names. `layers ok: 24 crates; 64 UI tools in their crate`, `design tokens ok`, `brand ok: 546 files`, 8 release-file tests OK |
+
+`cards::tests` holds 42 tests: slice 2's 30, unedited but for the keys their `init` binds, now
+as the keymaps bind them, and 12 new. The table's preset test asserts one thing more.
 
 ## Corrections
 
@@ -537,3 +579,44 @@ Slice 2:
 - 2026-11-23 · **An action that names a cover** (`ShowSetInCards.cover`, as the gallery's
   keymap entries could) still shows that file, for the tab it opens, over the type's format,
   and writes nothing. Studio itself no longer sets it.
+
+Slice 5:
+
+- 2026-11-23 · **The picks stay by id through a filter or order change**, shown or not, as the
+  table's selection does (`TypeTable::clear_rows`): a card filtered out and back is still
+  picked, and ⌘C copies it meanwhile. The card a ⇧-click would range from is a place in the
+  old order, and goes. Filters and order said "keeps the picks that are still shown".
+- 2026-11-23 · **The table says nothing when it drops a filter the schema lost**; its schema
+  load only drops it. Cards drops it by the same test and says which in the bar, after the
+  pills ("The schema no longer has topic: its filter was left out"), until the filters next
+  change or the tab is refreshed. An order by a property that is gone is dropped unsaid, as
+  the table drops it.
+- 2026-11-23 · **A draft whose test takes no value takes no key in the table.** "is today",
+  the test a date's draft starts on, "is empty" and "has any" draw no value field, the field
+  keeps the keyboard, and a key sent to a field that is not drawn reaches nothing: ↵ and Esc
+  do nothing, and the ✓ whose tooltip says ↵ is the only way on. In Cards the keyboard comes
+  back to the cards while such a draft is open, ↵ adds it and Esc closes it, and the keys that
+  act on cards wait. The table is as it was: the same lines belong in the bar, for both, and
+  change what the table does with its keys, which is not this slice's to decide.
+- 2026-11-23 · **A draft closed under its field gives the keyboard back to the cards**: ⌘⌥⌫,
+  "Clear all" and the chip's × close the draft and leave its field focused and not drawn. The
+  table's handler is the same call, by reading; it was not tried there.
+- 2026-11-23 · **Esc with one of the draft's menus open closes the menu and the draft**, in
+  Cards as in the table: the menu passes the key on.
+- 2026-11-23 · **"Reads again at the pin" is a read asked of the session at that commit.** The
+  session sends a read at the commit it takes for the head as a read of the branch and reads
+  again, pinned, when the answer is from another commit (spec 015); and what it read at a
+  commit it does not ask for twice, so clearing the filters of a tab opened without any shows
+  its rows with no request. Neither shows rows of another commit.
+- 2026-11-23 · **Covers read at the commit are kept through a filter or order change**, as the
+  table keeps its Blob cells: a card that is still shown does not read its file again. A
+  preview of a row no longer shown is let go first once the previews pass their cap.
+- 2026-11-23 · **Where a branch's removed rows stand first, the cursor goes to the first card
+  the branch still has**, which is where an opening leaves it when the diff lands after the
+  first page.
+- 2026-11-23 · **A tab of listed rows keeps the title it opened with** ("Cards: Note, 3
+  selected rows", the table's words), beside a pill that says "3 picked rows", the words this
+  plan gives it. A filter on a related node words the title by the node's id ("Note, design")
+  where the pill shows its name ("Design"): the table's words for a set, which the tree's tab
+  has too.
+- 2026-11-23 · **The toolbar has a Refresh button**, last, as the table's has.

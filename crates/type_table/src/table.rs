@@ -69,9 +69,9 @@ use crate::grouping::{GROUP_LIMIT, Grouping, Line, Lines, SECTION_FIRST_PAGE};
 use crate::model::{
     ColumnLayout, ColumnRole, ColumnSpec, Notice, Paging, RELATION_CHIPS_SHOWN,
     RELATION_SAMPLE_BUDGET, Row, SaveResult, TableKind, Tone, changed_elsewhere, chips_that_fit,
-    display_value, edge_columns, edge_rows, edit_text, edited, field_rows, filter_parts,
-    insert_position, node_columns, node_rows, parse_input, published, reads_as_markdown,
-    relation_sample, row_matches,
+    display_value, edge_columns, edge_rows, edit_text, edited, field_rows, insert_position,
+    node_columns, node_rows, parse_input, published, reads_as_markdown, relation_sample,
+    row_matches,
 };
 use crate::peek::{
     KnownRelation, NEIGHBOUR_LIMIT, Neighbour, NodePeek, PeekSubject, TableBlobs, TableWrote,
@@ -1601,45 +1601,11 @@ impl TypeTable {
         };
         self.missing = false;
         let names: HashSet<&str> = columns.iter().map(|c| c.key.as_str()).collect();
-        // A filter stays while what it tests is still in the schema: its column, its
-        // relationship, or the neighbours' property it reaches through one. A condition stays
-        // whatever it names: the next read judges it against this schema, and says why it
-        // cannot run.
+        // A filter stays while what it tests is still in the schema
+        // ([`crate::filter_bar::filter_stands`]).
         let type_name = self.type_name.clone();
-        self.filters.retain(|f| {
-            if f.op == FilterOp::Expr || f.property == builder::ID_FILTER {
-                return true;
-            }
-            // A group stays while it can still be built against this schema.
-            if f.op == FilterOp::Where {
-                return builder::node_page(
-                    &schema,
-                    &type_name,
-                    std::slice::from_ref(f),
-                    None,
-                    &PageStart::First,
-                    1,
-                )
-                .is_ok();
-            }
-            match builder::parse_group_key(&f.property) {
-                builder::GroupKey::Relationship(_, edge) => schema.edge(edge).is_some(),
-                builder::GroupKey::NeighbourProperty {
-                    direction,
-                    edge,
-                    property,
-                } => schema.relationships_of(&type_name).iter().any(|group| {
-                    group.direction == direction
-                        && group.edge == edge
-                        && schema
-                            .node(&group.other_type)
-                            .is_some_and(|other| other.property(property).is_some())
-                }),
-                builder::GroupKey::Property(_) | builder::GroupKey::EndpointProperty { .. } => {
-                    names.contains(f.property.as_str())
-                }
-            }
-        });
+        self.filters
+            .retain(|f| crate::filter_bar::filter_stands(&schema, &type_name, &names, f));
         self.all_columns = columns;
         self.show_columns(cx);
         self.schema = Some(schema);
@@ -3328,27 +3294,11 @@ impl TypeTable {
     /// The toolbar's Sort menu: the properties the rows can be ordered by, then the direction.
     /// A column header's menu orders by its column as well.
     fn render_sort_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let choices: Vec<(String, String)> = self
-            .all_columns
-            .iter()
-            .filter_map(|column| {
-                column
-                    .property()
-                    .filter(|property| Sort::allowed(property))
-                    .map(|property| (property.name.clone(), column.title.clone()))
-            })
-            .collect();
+        let choices = crate::model::sort_choices(&self.all_columns);
         let current = self.sort.clone();
-        let current_label = current.as_ref().map(|sort| {
-            let title = choices
-                .iter()
-                .find(|(name, _)| *name == sort.property)
-                .map_or(sort.property.as_str(), |(_, title)| title.as_str());
-            SharedString::from(format!(
-                "{title} {}",
-                if sort.descending { "↓" } else { "↑" }
-            ))
-        });
+        let current_label = current
+            .as_ref()
+            .map(|sort| SharedString::from(crate::model::sort_label(&choices, sort)));
         let sorted = current.is_some();
         let table = cx.entity().downgrade();
         let open = self.toolbar_menus[3].is_deployed();
@@ -3518,10 +3468,7 @@ impl TypeTable {
     }
 
     fn can_sort_by(&self, sort: &Sort) -> bool {
-        self.all_columns
-            .iter()
-            .filter_map(ColumnSpec::property)
-            .any(|p| p.name == sort.property && Sort::allowed(p))
+        crate::model::can_sort_by(&self.all_columns, sort)
     }
 
     /// The count of the table's rows, through its filters (`filtered`) or of every row; `None`
@@ -7921,21 +7868,9 @@ impl TypeTable {
         });
         let summary = match &nodes {
             Some(nodes) => studio_ui::plural(nodes.len(), "selected row", "selected rows"),
-            None => self
-                .filters
-                .iter()
-                .map(|filter| {
-                    let (property, op, value) = filter_parts(filter);
-                    value.unwrap_or_else(|| format!("{property} {op}"))
-                })
-                .collect::<Vec<_>>()
-                .join(", "),
+            None => crate::model::filters_summary(&self.filters),
         };
-        let title = if summary.is_empty() {
-            self.type_name.clone()
-        } else {
-            format!("{}, {summary}", self.type_name)
-        };
+        let title = crate::model::set_title(&self.type_name, &summary);
         let total = match &self.count {
             Loadable::Loaded(count) if !picked => Some((*count).max(0) as u64),
             _ => None,
@@ -7956,8 +7891,10 @@ impl TypeTable {
 
     /// What Cards opens from this table (spec 048): the selected rows, listed, or the rows
     /// under the filters and in the table's order, at the commit the table read, the cursor's
-    /// row under the cursor. What a card shows is the type's format, not the table's to say:
-    /// the file under the cursor is no longer handed over as the cover.
+    /// row under the cursor. The filters go as the table keeps them, a date preset still a
+    /// preset: the tab resolves it at each read of its own, so "today" is the day it reads.
+    /// What a card shows is the type's format, not the table's to say: the file under the
+    /// cursor is no longer handed over as the cover.
     fn cards_action(&self) -> Option<Box<dyn gpui::Action>> {
         if self.kind != TableKind::Node {
             return None;
@@ -7969,28 +7906,17 @@ impl TypeTable {
                 .map(|row| row.id.clone())
                 .collect::<Vec<_>>()
         });
-        let filters = self.resolved_filters();
+        let filters = &self.filters;
         let summary = match &ids {
             Some(ids) => studio_ui::plural(ids.len(), "selected row", "selected rows"),
-            None => filters
-                .iter()
-                .map(|filter| {
-                    let (property, op, value) = filter_parts(filter);
-                    value.unwrap_or_else(|| format!("{property} {op}"))
-                })
-                .collect::<Vec<_>>()
-                .join(", "),
+            None => crate::model::filters_summary(filters),
         };
-        let title = if summary.is_empty() {
-            self.type_name.clone()
-        } else {
-            format!("{}, {summary}", self.type_name)
-        };
+        let title = crate::model::set_title(&self.type_name, &summary);
         Some(Box::new(studio_actions::graph::ShowSetInCards {
             title,
             type_name: self.type_name.clone(),
             filters: (ids.is_none() && !filters.is_empty())
-                .then(|| serde_json::to_value(&filters).ok())
+                .then(|| serde_json::to_value(filters).ok())
                 .flatten(),
             sort: self.sort.as_ref().filter(|_| ids.is_none()).map(|sort| {
                 serde_json::json!({"property": sort.property, "descending": sort.descending})
@@ -11325,6 +11251,7 @@ mod tests {
     use super::*;
     use gpui::{TestAppContext, VisualTestContext};
 
+    use crate::model::filter_parts;
     use crate::test_support::{PEOPLE, changed, session, session_followed};
 
     fn grid_renders(table: &Entity<TypeTable>, cx: &mut VisualTestContext) -> usize {
@@ -17071,6 +16998,26 @@ mod tests {
             )
         });
         cx.run_until_parked();
+        // Cards is handed the preset, not the days it means now (spec 048): the tab resolves
+        // it at each read of its own, as the table does.
+        table.read_with(cx, |table, _| {
+            assert!(
+                table.resolved_filters()[0].value.is_array(),
+                "the table reads under its days"
+            );
+            let cards = table.cards_action().expect("a node table opens Cards");
+            let cards = cards
+                .as_any()
+                .downcast_ref::<studio_actions::graph::ShowSetInCards>()
+                .expect("the Cards action");
+            assert_eq!(
+                cards.filters,
+                Some(serde_json::json!([
+                    { "property": "born", "op": "Today", "value": null }
+                ]))
+            );
+            assert_eq!(cards.title, "Person, born is today");
+        });
         type_in_name(&table, "Ada Lovelace", cx);
         table.update_in(cx, |table, window, cx| table.confirm_edit(window, cx));
         cx.run_until_parked();

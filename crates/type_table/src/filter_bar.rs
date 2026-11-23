@@ -6,7 +6,7 @@
 //! holds it: the view keeps its filters and reads its rows again when they change, and all the
 //! bar does is the trait's provided methods, so every host has the same bar.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -393,6 +393,51 @@ pub(crate) fn filter_menu(
     entries
 }
 
+/// Whether the filter `f` of `type_name`'s rows stays under `schema`, whose columns for the type
+/// are named `names`: what it tests is still in the schema, be it its column, its relationship,
+/// or the neighbours' property it reaches through one. A condition stays whatever it names: the
+/// next read judges it against this schema, and says why it cannot run. A host drops the others
+/// when it takes a schema (the table's schema load, a Cards tab's read from the start).
+pub(crate) fn filter_stands(
+    schema: &SchemaModel,
+    type_name: &str,
+    names: &HashSet<&str>,
+    f: &Filter,
+) -> bool {
+    if f.op == FilterOp::Expr || f.property == builder::ID_FILTER {
+        return true;
+    }
+    // A group stays while it can still be built against this schema.
+    if f.op == FilterOp::Where {
+        return builder::node_page(
+            schema,
+            type_name,
+            std::slice::from_ref(f),
+            None,
+            &PageStart::First,
+            1,
+        )
+        .is_ok();
+    }
+    match builder::parse_group_key(&f.property) {
+        builder::GroupKey::Relationship(_, edge) => schema.edge(edge).is_some(),
+        builder::GroupKey::NeighbourProperty {
+            direction,
+            edge,
+            property,
+        } => schema.relationships_of(type_name).iter().any(|group| {
+            group.direction == direction
+                && group.edge == edge
+                && schema
+                    .node(&group.other_type)
+                    .is_some_and(|other| other.property(property).is_some())
+        }),
+        builder::GroupKey::Property(_) | builder::GroupKey::EndpointProperty { .. } => {
+            names.contains(f.property.as_str())
+        }
+    }
+}
+
 /// What the filter bar asks of the view that holds it. The view keeps its own filters and reads
 /// its rows again when they change ([`Self::filters_changed`]), and holds the bar's state
 /// ([`FilterBar`]); what the bar does is the provided methods, the same for every host.
@@ -434,6 +479,13 @@ pub(crate) trait FilterHost: Sized + 'static {
 
     /// A note the host puts in the bar, after the pills; the bar shows for it alone.
     fn bar_note(&self) -> Option<Label> {
+        None
+    }
+
+    /// What the host puts in the bar before the pills: what its rows are when they are not
+    /// the type's under filters (a Cards tab of rows picked in a table). The bar shows for it
+    /// alone.
+    fn bar_lead(&self, _cx: &mut Context<Self>) -> Option<AnyElement> {
         None
     }
 
@@ -1462,7 +1514,12 @@ pub(crate) trait FilterHost: Sized + 'static {
 
     fn render_filter_bar(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let note = self.bar_note();
-        if self.filters().is_empty() && self.bar().draft.is_none() && note.is_none() {
+        let lead = self.bar_lead(cx);
+        if self.filters().is_empty()
+            && self.bar().draft.is_none()
+            && note.is_none()
+            && lead.is_none()
+        {
             return None;
         }
         let mut bar = h_flex()
@@ -1473,7 +1530,8 @@ pub(crate) trait FilterHost: Sized + 'static {
             .gap(px(space::SM))
             .items_center()
             .border_b_1()
-            .border_color(studio_ui::ds::surface::rule(cx));
+            .border_color(studio_ui::ds::surface::rule(cx))
+            .children(lead);
         // The filter being edited shows as the draft, after the others.
         let editing = self
             .bar()

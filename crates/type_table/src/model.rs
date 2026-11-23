@@ -8,7 +8,7 @@ use gq_language::builder::{Group, GroupTest, Quantifier, edge_property_column};
 use gq_language::input::{compare_values as compare, list_texts, parse_scalar, same_value, typed};
 pub use gq_language::input::{edit_text, parse_input};
 use gq_language::{
-    EdgeType, Filter, FilterOp, NodeType, PageStart, Property, RelationshipGroup, ScalarKind,
+    EdgeType, Filter, FilterOp, NodeType, PageStart, Property, RelationshipGroup, ScalarKind, Sort,
 };
 use graph_client::WriteOutcome;
 use graph_client::api::{ChangeOutput, CommitOutput};
@@ -927,6 +927,60 @@ pub fn group_parts(key: &str, group: &Group) -> (String, String, Option<String>)
     let test = quantifier_text(&relationship, group, !tests.is_empty());
     let value = (!tests.is_empty()).then(|| tests.join(" · "));
     (relationship, test, value)
+}
+
+/// A set's filters in a few words, for the title of a tab that holds it: each filter's value,
+/// or its field and test when it compares with none (`design`, `email is empty`).
+pub fn filters_summary(filters: &[Filter]) -> String {
+    filters
+        .iter()
+        .map(|filter| {
+            let (property, op, value) = filter_parts(filter);
+            value.unwrap_or_else(|| format!("{property} {op}"))
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A set in words, as its tab names it: its type, then what narrows it (`Note`,
+/// `Note, design`, `Note, 3 selected rows`).
+pub fn set_title(type_name: &str, summary: &str) -> String {
+    if summary.is_empty() {
+        type_name.to_owned()
+    } else {
+        format!("{type_name}, {summary}")
+    }
+}
+
+/// The properties a type's rows can be ordered by, as a Sort menu lists them: each one's name
+/// and its column's title, in column order.
+pub fn sort_choices(columns: &[ColumnSpec]) -> Vec<(String, String)> {
+    columns
+        .iter()
+        .filter_map(|column| {
+            column
+                .property()
+                .filter(|property| Sort::allowed(property))
+                .map(|property| (property.name.clone(), column.title.clone()))
+        })
+        .collect()
+}
+
+/// Whether `sort` orders by a property of these columns that rows can be ordered by.
+pub fn can_sort_by(columns: &[ColumnSpec], sort: &Sort) -> bool {
+    columns
+        .iter()
+        .filter_map(ColumnSpec::property)
+        .any(|p| p.name == sort.property && Sort::allowed(p))
+}
+
+/// How a Sort chip says an order: the property's title among `choices`, and an arrow.
+pub fn sort_label(choices: &[(String, String)], sort: &Sort) -> String {
+    let title = choices
+        .iter()
+        .find(|(name, _)| *name == sort.property)
+        .map_or(sort.property.as_str(), |(_, title)| title.as_str());
+    format!("{title} {}", if sort.descending { "↓" } else { "↑" })
 }
 
 /// The whole sentence a filter reads as, for a pill's tooltip: a group's parts joined.

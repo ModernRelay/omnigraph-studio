@@ -233,6 +233,21 @@
   {
     "context": "Cards",
     "bindings": {
+      "escape": "studio_cards::Cancel",
+      "ctrl-r": "studio_cards::Refresh",
+      "ctrl-f": "studio_table::AddFilter",
+      "ctrl-alt-backspace": "studio_table::ClearFilters"
+    }
+  },
+  {
+    "context": "Cards && editing",
+    "bindings": {
+      "enter": "studio_table::ConfirmEdit"
+    }
+  },
+  {
+    "context": "Cards && !editing",
+    "bindings": {
       "left": "studio_cards::MoveLeft",
       "right": "studio_cards::MoveRight",
       "up": "studio_cards::MoveUp",
@@ -243,14 +258,7 @@
       "ctrl-enter": "studio_cards::OpenPage",
       "alt-enter": "studio_cards::OpenCover",
       "ctrl-a": "studio_cards::PickAll",
-      "escape": "studio_cards::Cancel",
       "ctrl-c": "studio_cards::CopyIds",
-      "ctrl-r": "studio_cards::Refresh"
-    }
-  },
-  {
-    "context": "Cards && !editing",
-    "bindings": {
       "space": "studio::ToggleInspector",
       "g": "studio_cards::ShowOnCanvas",
       "x": "studio_cards::TogglePick",

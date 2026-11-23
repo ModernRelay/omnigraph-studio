@@ -53,8 +53,9 @@ Studio at `43176b80`; Omnigraph CLI `0.14.1-edge+269299b`.
   block for "is empty" (`neighbour_property_clause`, `builder.rs:910`). Two such filters are
   two blocks, each with its own record. Edge properties can't be filtered from a node table.
 - **Menu.** The filter menu nests each relationship's neighbour properties
-  (`table.rs:695`, `:7638`). It doesn't list edge properties or the related type's own
-  relationships.
+  (`filter_menu`, `filter_bar.rs:365`, drawn in `render_filter_bar`, `:1662`; in `table.rs`
+  until spec 048 moved the filter bar to a file of its own). It doesn't list edge properties
+  or the related type's own relationships.
 - **Rows after an edit.** `row_matches` skips relationship and neighbour-property filters, so
   the engine judges them on the next read (`crates/type_table/src/model.rs:810`).
 - **Sentence filter.** `filter_words` builds the answer's schema: `filters[]` with `property`

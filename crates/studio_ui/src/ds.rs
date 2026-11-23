@@ -1974,6 +1974,37 @@ pub fn filter_pill(
         ))
 }
 
+/// What a view's rows are when they are not its type's under filters, as a pill before the
+/// filter pills ("3 picked rows"): the words with their icon, and a button that lets the set
+/// go, which says what that does (`clears`).
+pub fn set_pill(
+    id: impl Into<ElementId>,
+    icon: IconName,
+    label: impl Into<SharedString>,
+    clears: impl Into<SharedString>,
+    on_clear: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> Stateful<Div> {
+    pill_frame(id, cx)
+        .child(
+            h_flex()
+                .h_full()
+                .px(px(space::MD))
+                .gap(px(space::XS))
+                .items_center()
+                .flex_none()
+                .child(icon::meta(icon))
+                .child(Label::new(label.into()).size(LabelSize::Small)),
+        )
+        .child(pill_rule(cx))
+        .child(pill_end(
+            pill_button("clear", IconName::Close, Color::Muted, cx)
+                .debug_selector(|| "set-pill-clear".into())
+                .tip(crate::ds::tooltip(clears))
+                .on_click(on_clear),
+        ))
+}
+
 /// A raised pill of segments ([`filter_pill`], [`control_chip`]): the document's fill and
 /// `shadow-custom`, whose ring is its edge, [`size::PILL`] tall, its segments clipped to its
 /// round ends. No border, so a segment's content starts where a button's does.

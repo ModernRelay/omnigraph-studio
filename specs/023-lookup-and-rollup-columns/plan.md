@@ -61,7 +61,8 @@ Studio at `77ca3964`; Omnigraph `v0.14.0` compiler (`Cargo.lock`), and the CLI
   `GroupKey::NeighbourProperty` (`builder.rs:437`, `:455`, `:484`). A filter on one is an
   `exists { … }` block (`neighbour_property_clause`, `builder.rs:893`), and grouping by one
   counts `$g.city` per value (`neighbour_value_counts`, `builder.rs:1540`). The filter menu nests
-  each relationship's neighbour properties (`table.rs:696`).
+  each relationship's neighbour properties (`filter_menu`, `filter_bar.rs:365`; in `table.rs`
+  until spec 048 moved the filter bar to a file of its own).
 - **What a view and a tab keep:** `ColumnLayout { hidden, order, widths }` keyed by column key
   (`model.rs:195`); `arranged()` keeps only keys the schema's columns have (`model.rs:241`).
   `SavedView` keeps filters, sort, grouping, hidden and order (`studio_settings.rs:243`); a tab
