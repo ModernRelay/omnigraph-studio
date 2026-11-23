@@ -3625,6 +3625,8 @@ async fn a_saved_tab_keeps_its_relationship_fields(cx: &mut TestAppContext) {
     // In another window, as the next launch restores it.
     let (workspace, cx) = cx.add_window_view(Workspace::new);
     workspace.update_in(cx, |workspace, window, cx| {
+        // The tabs another test of this binary left open for the graph are not this one's.
+        workspace.start_with_no_saved_tabs();
         workspace.set_session(session.clone(), window, cx)
     });
     cx.run_until_parked();
