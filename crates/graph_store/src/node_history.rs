@@ -34,7 +34,7 @@ use graph_client::{BlobAt, BlobCell, BlobMeta, GraphClient, HistoricalGap, ReadE
 use serde_json::{Map, Value};
 
 use crate::changes::{FoldedChange, NetChange};
-use crate::ledger::Asker;
+use crate::ledger::{Asker, SendsReads};
 use crate::scope::ReadScope;
 use crate::{GraphSession, LastChange};
 
@@ -575,8 +575,8 @@ pub fn settled(lo: usize, len: usize, reached_first: bool) -> Option<usize> {
 }
 
 /// Who asks, through which client, of which graph and branch: what each read of a window needs.
-struct Reader {
-    session: WeakEntity<GraphSession>,
+struct Reader<S: SendsReads> {
+    session: WeakEntity<S>,
     asker: Asker,
     client: GraphClient,
     graph: String,
@@ -601,7 +601,7 @@ enum Answer {
     Blob(usize, BlobState),
 }
 
-impl Reader {
+impl<S: SendsReads> Reader<S> {
     /// Starts `request` through the session, counted and named in its ledger as `what`.
     fn start<T: Send + 'static>(
         &mut self,
@@ -837,7 +837,7 @@ impl GraphSession {
         branch: &str,
         node: NodeScope,
         cx: &mut Context<Self>,
-    ) -> Option<Reader> {
+    ) -> Option<Reader<Self>> {
         Some(Reader {
             session: cx.entity().downgrade(),
             asker: self.asker_of(scope),

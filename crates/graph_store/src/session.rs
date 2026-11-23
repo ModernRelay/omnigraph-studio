@@ -32,7 +32,7 @@ use crate::carry::{ChangeLog, ChangesSince, FeedFold, Since, TypeRef, answer_unc
 use crate::connection::{Connection, ConnectionEvent, ConnectionState, ConnectionWatch};
 use crate::degrees::{DEGREE_BATCH, DegreeBatchKey, DegreeBatches, page_counts};
 use crate::ledger::{
-    Answered, Asker, Origin, ReadEvent, ReadLedger, ReadView, Sending, Status, Target,
+    Answered, Asker, Origin, ReadEvent, ReadLedger, ReadView, Sending, SendsReads, Status, Target,
 };
 use crate::memo::{Held, Memo};
 use crate::node_search::{
@@ -3847,24 +3847,6 @@ impl GraphSession {
         self.counted_read_as(Some(sending), request, cx)
     }
 
-    /// [`Self::counted_read`] asked for by `asker`, for a read a session method sends after it
-    /// returned, as a node's history sends each of its pages (spec 046).
-    pub(crate) fn counted_read_by<T: Send + 'static>(
-        &mut self,
-        what: &'static str,
-        asker: Asker,
-        request: impl Future<Output = Result<T, ReadError>> + Send + 'static,
-        cx: &mut Context<Self>,
-    ) -> Task<Result<T, ReadError>> {
-        let sending = Sending {
-            what: what.into(),
-            asker,
-            target: Target::Route,
-            started: cx.background_executor().now(),
-        };
-        self.counted_read_as(Some(sending), request, cx)
-    }
-
     /// [`Self::counted_read`], recorded in the ledger as `sending` says when it ends or is
     /// dropped.
     fn counted_read_as<T: Send + 'static>(
@@ -5167,6 +5149,26 @@ fn read_status<T>(result: &Result<T, ReadError>) -> Status {
         Ok(_) => Status::Ok,
         Err(ReadError::Refused(refusal)) => Status::Refused(refusal.status),
         Err(_) => Status::Failed,
+    }
+}
+
+/// [`GraphSession::counted_read`] asked for by `asker`, for a read a session method sends after
+/// it returned, as a node's history sends each of its pages (spec 046).
+impl SendsReads for GraphSession {
+    fn counted_read_by<T: Send + 'static>(
+        &mut self,
+        what: &'static str,
+        asker: Asker,
+        request: impl Future<Output = Result<T, ReadError>> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<T, ReadError>> {
+        let sending = Sending {
+            what: what.into(),
+            asker,
+            target: Target::Route,
+            started: cx.background_executor().now(),
+        };
+        self.counted_read_as(Some(sending), request, cx)
     }
 }
 
