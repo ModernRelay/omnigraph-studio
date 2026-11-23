@@ -1,12 +1,13 @@
 # 048: Cards, a view of a type's nodes
 
-Status: accepted 2026-11-23 · slices 1 to 6 built 2026-11-23 (1: Gallery is Cards: the names
+Status: accepted 2026-11-23 · every slice built 2026-11-23 (1: Gallery is Cards: the names
 and their aliases, a saved `gallery` tab restored, the uniform grid, ↵, ⌥↵ and G. 2: a card
 shows fields under its title, the format with its Fields menu, kept by tab and by type; Cards
 for every node type and from a tree of a set. 3 and 4: the table's filter bar in a file of its
 own, behind `FilterHost`. 5: that bar and a Sort chip in Cards, a change read at the commit the
 tab shows. 6: a relationship as a card's field, read by the table's relationship reads, moved
-to a module both tabs call); slice 7 not built · supersedes
+to a module both tabs call. 7: "Filter in words" in Cards, the table's sentence field moved to
+a module both tabs call) · supersedes
 [035](../035-gallery/plan.md), whose Gallery left the app with slice 1 · Studio's claims checked
 against `7f3e7e92` on 2026-11-23; Omnigraph's are spec 035's, checked against `v0.15.0` on
 2026-11-18 and not rechecked
@@ -242,8 +243,11 @@ A format is which fields a card shows and in what order, its cover, and its size
 - **A tab of selected rows** shows a lead pill "3 selected rows ×", the words its title has,
   and the Filters and Sort chips disabled: "Showing 3 selected rows. Clear the pill to filter
   Note". Clearing it shows the type's rows. "Picked" is the word for cards picked in the tab.
-- **Filter in words** (slice 7) asks the same model with the same question. In Cards its
-  answer sets filters and order; a grouping or columns in the answer are left out.
+- **Filter in words** (slice 7) asks the same model with the same question, in the same field
+  in the toolbar, before the chips (⌘⇧F). In Cards its answer sets filters and order. A
+  sentence is offered no grouping and no column, which Cards has not; an answer that names one
+  all the same has it left out, and the bar says so as the table says what it could not use.
+  A tab of selected rows has no such field until its pill is cleared.
 - "Newer data · Refresh" and ⌘R as in every data view.
 
 ### Selection and the keyboard
@@ -270,6 +274,7 @@ copies it. Esc, ⌘R, ⌘F and ⌘⌥⌫ are bound in `Cards` and act in both.
 | F | `ShowNextCover` | the next file property as the cover, then none |
 | = and − | `LargerCards`, `SmallerCards` | the card size |
 | ⌘F, ⌘⌥⌫ | `studio_table::AddFilter`, `ClearFilters` | as in the table |
+| ⌘⇧F | `studio_table::FilterInWords` | the keyboard goes to the sentence field; ↵ there asks, Esc leaves it |
 | ⌘R | `Refresh` | reads the set again: from the head, or at the held commit |
 
 A click puts the cursor on a card; a second click opens its page, as ↵; ⌘-click picks it;
@@ -344,6 +349,14 @@ filter's field, and a move through its suggestions, draws it no times.
   takes no value, with the host (`focus_filter_draft`), takes it back from a field no longer
   drawn as it draws (`keep_filter_keys`), and tells a host when its own keys wait
   (`filter_draft_takes_keys`, each host's `editing`).
+- **The sentence field** (slice 7) is `words_field.rs`: a `WordsField` each host holds (the
+  field, what its call is doing, the filters its last answer made, whether a key is stored)
+  and a `WordsHost` trait that builds on `FilterHost`. A host answers four things: its
+  `WordsField`, mutably too, what a sentence may set beside its filters (`view_choices`), and
+  how it takes that (`apply_words_view`); the table's two are what they were. The question,
+  the call, the judging of the answer, the pick among several nodes, the field's drawing and
+  its ↵ and Esc are provided, moved as they were. The answer's filters go into the host's own
+  and it reads again through the filter bar's `filters_changed`.
 - **Relationship reads** move out of `TypeTable` into `relations.rs`, which both tabs call. As
   built (slice 6): a `Relations` each host holds (what was read by row and relationship key,
   the reads out, what was asked for) and a `RelationHost` trait, on the pattern of the filter
@@ -439,8 +452,8 @@ Each slice is a pull request that stands alone.
 | 2026-11-23 | A saved view's shape is never read; a results canvas is not saved | Read `studio_settings.rs`, `type_table.rs` (`open_saved_view`), `graph_canvas.rs` (`serialize`) | Confirmed by reading |
 
 Slices 1, 2 and 5 have their rows below. Slices 3 and 4 were built on branches of their own
-and reached this log's branch by a merge; their rows are theirs to add. Slice 6 has its rows
-below. Slice 7 is not built.
+and reached this log's branch by a merge; their rows are theirs to add. Slices 6 and 7 have
+their rows below.
 
 ### Slice 1 (2026-11-23)
 
@@ -574,6 +587,39 @@ Part B, relationship fields:
 
 `type_table` after the slice: the 341 names of before, each with the result it had, and 7 new.
 `cards::tests` holds 48 tests, none of the 42 edited.
+
+### Slice 7 (2026-11-23)
+
+Built on `feat/cards-words`, on `ad6e7565`. The same machine and toolchain. The model in every
+test is a fake HTTP client behind `Models::init_for_tests`: it answers a call with what the
+test gave it and keeps what it was sent; nothing leaves the process and its key is not one.
+
+Part A, the move:
+
+| Date | Claim | Check | Result |
+|---|---|---|---|
+| 2026-11-23 | The table's sentence field moved and the table behaves as before | `cargo test -p type_table`, its names and results listed before any change and after the move alone, and compared | The same 348 names, each with the same result (347 passed, 1 ignored). `git diff` of `table.rs` for the move: 91 lines added, 410 removed |
+| 2026-11-23 | No test of it asserts anything else | The tests of `table.rs` the move touched, read | One line in one test: `the_sentence_field_says_it_needs_a_key_before_a_sentence_is_typed` reads the field as `table.words.editor`, where it read `table.words_editor`, the state being one struct now. `a_sentence_sets_the_order_grouping_and_columns` and the test of the pick call the same methods, now the trait's, unedited |
+
+Part B, the field in Cards:
+
+| Date | Claim | Check | Result |
+|---|---|---|---|
+| 2026-11-23 | A sentence sets the filters and the order, read once at the pin; the model is offered no grouping or column | `cards::tests` `a_sentence_sets_the_filters_and_the_order_and_reads_at_the_pin`: 12 notes at `c1`, the head moved to `c2`; ⌘⇧F, a sentence, ↵; an answer of two filters and an order | Pass: one call, holding the sentence; its schema asks for `filters` and `sort` and has no `group_by` or `columns`; two filters and the order set; one read, `snapshot: c1`, ordered by `title desc`; the cursor on the first card; the title and the preview follow. With the order not taken, the test fails |
+| 2026-11-23 | The next answer replaces the last answer's filters and keeps one written by hand; what Cards has not is left out and said | `a_second_sentence_replaces_the_firsts_filters_and_keeps_a_hand_written_one`: an answer, a filter written in the bar, a second answer that also names a grouping and a column; Esc | Pass: the hand-written filter and the second answer's; the bar's note "Could not use: the rows cannot be grouped by title; title is not a column", the table's words; one read; Esc clears the note and leaves the filters |
+| 2026-11-23 | A failed call shows and changes nothing | `a_failed_call_shows_and_changes_nothing`: the model answers 500 | Pass: the field failed, why in the bar and in the tooltip; no filter, no order, no read, the preview not kept; Esc clears it and gives the cards the keyboard |
+| 2026-11-23 | Without a key the field says so, and follows the key | `the_sentence_field_says_it_needs_a_key`: no key; a sentence sent all the same; a key stored | Pass: "OpenRouter key needed · Filter in words" and the table's tooltip; the sentence asks nothing of the model and is told why; with a key, "Filter in words…" |
+| 2026-11-23 | A name several nodes match asks which | `a_name_that_matches_several_nodes_asks_which`: "related to de", two topics found | Pass: "2 Topic nodes match "de": pick one in the filter."; the filter open as a draft, the name in its field, which has the keyboard, two offers, nothing filtered; ↵ filters by the first one's id |
+| 2026-11-23 | Keys typed in the sentence field are its text, and draw the cards no times | `keys_typed_in_the_sentence_field_are_its_text` (the editor's own keys bound as Zed's keymap binds them): ⌘⇧F; ↵ on the empty field; letters, ←, Home, → ↓ ↑ End, ⌘A ⌘C, G X F = − Space; Esc; →. `studio` `keymaps` `the_cards_letter_keys_are_text_in_a_field`, extended to the sentence field's context and ⌘⇧F | Pass: no call and no page for ↵; the text edited and copied; the cursor, the picks and the size unchanged; no draw of `CardsGrid`; Esc gives the cards the keyboard and leaves the picks. Every Cards binding acts in the sentence field exactly where it acts in the filter's value field, on the three platforms. With `editing` not set for the field, the test fails |
+| 2026-11-23 | A tab of selected rows has no such field | `a_tab_of_selected_rows_has_no_sentence_field`: two listed notes; ⌘⇧F; the pill cleared; ⌘⇧F | Pass: not drawn, the key does nothing and the status bar does not offer it; cleared, the field is drawn and takes the keyboard |
+| 2026-11-23 | A saved tab keeps an answer's filters as ordinary ones | `a_saved_tab_keeps_an_answers_filters_as_ordinary_ones`: an answer; saved; reopened in another window; another answer there | Pass: the filters and the order saved, nothing of the sentence; the restored tab holds them and a sentence there adds to them |
+| 2026-11-23 | The toolbar fits a narrow tab | `a_narrow_tab_leaves_the_toolbars_labels_out`: the tab's width at 0, 836 and 1,176 px | Pass: the chips are their icons under 960 px and their tooltips then name them (Corrections) |
+| 2026-11-23 | A pick's draft has the keyboard in its field, in the table too | `table::tests` `a_pick_among_several_nodes_has_the_keyboard_in_its_field`, added | Failed first, on the code as slice 5's follow-up left it (Corrections); passes with the keyboard placed once the draft's test is "is related to" |
+| 2026-11-23 | The field in the app | Offscreen snapshots of the `notes` graph at 1440 × 900 against `script/dev-server` on a port of its own, through Studio's keymap. The tool's run holds no model key, so it shows the field as it is without one, and no call can leave it | With the inspector open (a tab of 836 px): the view strip, the type, the field reading "OpenRouter key needed · Filter…", three chips as icons, S M L and Refresh, where the first picture cut Refresh off. With it closed: the field at its full width and the chips with their labels. A sentence typed and sent: the field's red line and "No OpenRouter key is stored. Add one in Settings, under Models." in the bar. A tab of three selected rows: no field. The dark theme twice. An answer is covered by the tests alone |
+| 2026-11-23 | The workspace's checks | The same seven commands | All pass. Tests: 1,796 passed, 0 failed, 9 ignored in the 54 harnessed binaries (`type_table` 357 and 1 ignored), and the 7 checks of `keymaps`. `layers ok: 24 crates; 64 UI tools in their crate`, `design tokens ok`, `brand ok: 547 files`, 8 release-file tests OK |
+
+`type_table` after the slice: the 348 names of before, each with the result it had, and 10 new.
+`cards::tests` holds 57 tests, none of the 48 edited but for one key their `init` binds.
 
 ## Corrections
 
@@ -718,3 +764,31 @@ Slice 6:
   The table's cell called `chips_that_fit` and worded "+N" itself; it now calls the function
   the lines moved into. Part A's comparison was made before this, and the whole of it again
   after.
+
+Slice 7:
+
+- 2026-11-23 · **The Cards toolbar leaves its chips' labels out in a narrow tab**, as the
+  table's does. With the sentence field at its least it takes about 880 px, and beside the
+  inspector in a window of the default size the tab is 836: the first picture of the slice
+  showed Refresh cut off. Under 960 px Fields, Sort and Filters are their icons, what each is
+  set to still showing, and their tooltips name them.
+- 2026-11-23 · **A sentence is offered no grouping and no column in Cards.** The question's
+  format leaves out a part with no choices, so the model is not asked for what would be thrown
+  away. "Left out" in Filters and order is what happens to an answer that names one all the
+  same, which only a model that ignores its schema gives: the answer's own check refuses it,
+  in the table's words.
+- 2026-11-23 · **Slice 5's follow-up left the pick's draft without the keyboard in its field,
+  in the table.** A sentence naming a node several match opens its filter as a draft on the
+  relationship, whose first test takes no value; the follow-up gives such a draft the host's
+  keyboard, and the pick then set the test to "is related to" without placing the keyboard
+  again, so the name sat in a field that did not have it and ↵ did nothing. No test asserted
+  where the keyboard was. The pick now places it, for both hosts, and a table test holds it.
+- 2026-11-23 · **Esc clears what the field said before it does anything else**, as in the
+  table: with a note or a failure showing, the first Esc clears it, the next closes a draft,
+  the next takes the picks out.
+- 2026-11-23 · **The bar's note is the sentence's when there is one**, else the filters the
+  schema lost (slice 5): an answer changes the filters, which takes that notice away.
+- 2026-11-23 · **Nothing of a sentence is saved with the tab**: its filters are the tab's, and
+  a restored tab's next sentence adds to them, as it adds to filters written by hand.
+- 2026-11-23 · **The module is `words_field.rs`**: `filter_words` is the crate that holds the
+  question and the answer's types, which `type_table` names `words`.

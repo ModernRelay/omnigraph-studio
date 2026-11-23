@@ -87,6 +87,7 @@ fn init(cx: &mut TestAppContext) {
             KeyBinding::new("escape", Cancel, Some("Cards")),
             KeyBinding::new("cmd-r", Refresh, Some("Cards")),
             KeyBinding::new("cmd-f", AddFilter, Some("Cards")),
+            KeyBinding::new("cmd-shift-f", FilterInWords, Some("Cards")),
             KeyBinding::new("cmd-alt-backspace", ClearFilters, Some("Cards")),
             KeyBinding::new("enter", ConfirmEdit, Some("Cards && editing")),
             // The value field's own keys: its offers, and the text's, as Zed's keymap binds
@@ -3673,4 +3674,623 @@ async fn a_saved_tab_keeps_its_relationship_fields(cx: &mut TestAppContext) {
         assert!(back.relations.get("n001", FILED_UNDER).is_none());
     });
     assert_eq!(served.sent("studio_page_degrees").len(), read_before);
+}
+
+// ---- filter in words (spec 048, slice 7) ----
+
+/// A model service for a test: every call is answered with what it holds then (a status and,
+/// as the model writes it, a sentence's answer), and what it was sent is kept. Nothing leaves
+/// the process, and the key is not one.
+struct FakeModel {
+    answer: std::sync::Arc<std::sync::Mutex<(u16, Value)>>,
+    sent: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+}
+
+impl FakeModel {
+    /// The model as the app's, with a key stored unless `key` is `None`.
+    fn new(answer: Value, key: Option<&str>, cx: &mut TestAppContext) -> Self {
+        use futures::AsyncReadExt as _;
+        use http_client::{AsyncBody, FakeHttpClient, Response};
+        let model = Self {
+            answer: std::sync::Arc::new(std::sync::Mutex::new((200, answer))),
+            sent: Default::default(),
+        };
+        let (answer, sent) = (model.answer.clone(), model.sent.clone());
+        let http = FakeHttpClient::create(move |request| {
+            let (answer, sent) = (answer.clone(), sent.clone());
+            async move {
+                let mut body = String::new();
+                request.into_body().read_to_string(&mut body).await.unwrap();
+                // A request with no body is the list of models, read when a key is stored.
+                let Ok(call) = serde_json::from_str::<Value>(&body) else {
+                    return Ok(Response::builder()
+                        .status(200)
+                        .body(AsyncBody::from(r#"{"data":[]}"#.to_owned()))
+                        .unwrap());
+                };
+                sent.lock().unwrap().push(call);
+                let (status, answer) = answer.lock().unwrap().clone();
+                let reply = json!({
+                    "model": "test/model",
+                    "choices": [{ "message": { "content": answer.to_string() } }],
+                    "usage": { "cost": 0.0 },
+                });
+                Ok(Response::builder()
+                    .status(status)
+                    .body(AsyncBody::from(reply.to_string()))
+                    .unwrap())
+            }
+        });
+        cx.update(|cx| studio_workspace::models::Models::init_for_tests(http, key, cx));
+        model
+    }
+
+    fn answers(&self, answer: Value) {
+        *self.answer.lock().unwrap() = (200, answer);
+    }
+
+    fn fails(&self, status: u16) {
+        self.answer.lock().unwrap().0 = status;
+    }
+
+    fn calls(&self) -> usize {
+        self.sent.lock().unwrap().len()
+    }
+}
+
+/// Writes `sentence` in the sentence field as a person does: ⌘⇧F, the words, ↵; and lets the
+/// model's answer, the node searches it asks for and the read that follows land.
+fn ask_in_words(sentence: &str, cx: &mut VisualTestContext) {
+    cx.simulate_keystrokes("cmd-shift-f");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("cmd-a");
+    cx.simulate_input(sentence);
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(crate::suggest::NODE_SEARCH_DELAY);
+    settle(cx);
+}
+
+fn words_note(cards: &Entity<TypeCards>, cx: &mut VisualTestContext) -> Option<String> {
+    cards.read_with(cx, |cards, _| match &cards.words.state {
+        crate::words_field::WordsState::Typing(note) => note.clone(),
+        crate::words_field::WordsState::Failed(why) => Some(format!("failed: {why}")),
+        crate::words_field::WordsState::Running { .. } => Some("running".into()),
+    })
+}
+
+fn title_filter(op: FilterOp, text: &str) -> Filter {
+    Filter {
+        property: "title".into(),
+        op,
+        value: json!(text),
+    }
+}
+
+/// A sentence's answer sets the tab's filters and its order, and the set is read once, at the
+/// commit the tab shows. The model is offered the type's filter keys and the orders Cards
+/// has, and no grouping or column, which it has not.
+#[gpui::test]
+async fn a_sentence_sets_the_filters_and_the_order_and_reads_at_the_pin(cx: &mut TestAppContext) {
+    init(cx);
+    let model = FakeModel::new(
+        json!({
+            "filters": [
+                { "property": "title", "op": "contains", "value": ["1"] },
+                { "property": "title", "op": "starts_with", "value": ["Note"] },
+            ],
+            "sort": [{ "property": "title", "descending": true }],
+        }),
+        Some("sk-or-test"),
+        cx,
+    );
+    let (session, writer, served) = session_served(NOTES, notes_under(12), cx);
+    let (cards, cx) = open(session.clone(), opening("Note"), cx);
+    head_moves_to("c2", &session, &writer, &cards, cx);
+    assert!(
+        cx.debug_bounds("filter-words").is_some(),
+        "the field is drawn"
+    );
+    cards.read_with(cx, |cards, cx| {
+        let offered = cards.view_choices();
+        assert_eq!(offered.sorts, ["title"]);
+        assert!(offered.groups.is_empty() && offered.columns.is_empty());
+        assert_eq!(
+            cards
+                .words_choices()
+                .iter()
+                .map(|choice| choice.key.as_str())
+                .collect::<Vec<_>>(),
+            ["title", "@where"],
+            "what the Filter menu offers"
+        );
+        assert!(cards.words_about(cx).starts_with("Filter in words (↵): "));
+    });
+
+    ask_in_words("notes about one, newest title first", cx);
+    assert_eq!(model.calls(), 1);
+    let sent = model.sent.lock().unwrap()[0].clone();
+    assert!(
+        sent["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("notes about one, newest title first"),
+        "{sent}"
+    );
+    let asked_for = &sent["response_format"]["json_schema"]["schema"]["properties"];
+    assert!(asked_for.get("filters").is_some() && asked_for.get("sort").is_some());
+    assert_eq!(
+        asked_for.get("group_by"),
+        None,
+        "Cards has no grouping to offer"
+    );
+    assert_eq!(asked_for.get("columns"), None, "nor columns");
+
+    let pages = served.sent("studio_page");
+    assert_eq!(pages.len(), 2, "one read for the answer");
+    assert_eq!(pages[1]["snapshot"], json!("c1"), "at the pin");
+    assert!(
+        pages[1]["query"]
+            .as_str()
+            .unwrap()
+            .contains("$n.title desc")
+    );
+    assert_eq!(pages[1]["params"]["f0"], json!("1"));
+    assert_eq!(row_ids(&cards, cx), ["n011", "n010", "n001"]);
+    assert_eq!(words_note(&cards, cx), None, "it used all of it");
+    cards.update_in(cx, |cards, window, cx| {
+        assert_eq!(
+            cards.filters,
+            [
+                title_filter(FilterOp::Contains, "1"),
+                title_filter(FilterOp::StartsWith, "Note")
+            ]
+        );
+        assert_eq!(cards.words.made, cards.filters);
+        assert_eq!(
+            cards.sort,
+            Some(Sort {
+                property: "title".into(),
+                descending: true,
+            })
+        );
+        assert_eq!(cards.paging.pinned.as_deref(), Some("c1"));
+        assert_eq!(cards.cursor, Some(0));
+        assert!(
+            Item::keeps_preview(cards, cx),
+            "the tab is the person's now"
+        );
+        assert_eq!(Item::tab_title(cards, cx), "Cards: Note, 1, Note");
+        assert!(cards.render_filter_bar(window, cx).is_some(), "its pills");
+    });
+}
+
+/// The next answer's filters take the place of the last answer's and leave the ones written
+/// by hand. An answer that names a grouping and columns all the same has its filters used,
+/// and the bar says what was left out, as the table says what it could not use.
+#[gpui::test]
+async fn a_second_sentence_replaces_the_firsts_filters_and_keeps_a_hand_written_one(
+    cx: &mut TestAppContext,
+) {
+    init(cx);
+    let model = FakeModel::new(
+        json!({ "filters": [{ "property": "title", "op": "contains", "value": ["1"] }] }),
+        Some("sk-or-test"),
+        cx,
+    );
+    let (session, _, served) = session_served(NOTES, notes_under(12), cx);
+    let (cards, cx) = open(session, opening("Note"), cx);
+    ask_in_words("notes about one", cx);
+    let first = title_filter(FilterOp::Contains, "1");
+    cards.read_with(cx, |cards, _| {
+        assert_eq!(cards.filters, std::slice::from_ref(&first))
+    });
+    write_filter(&cards, "title", FilterOp::StartsWith, "Note", cx);
+    let by_hand = title_filter(FilterOp::StartsWith, "Note");
+    cards.read_with(cx, |cards, _| {
+        assert_eq!(cards.filters, [first.clone(), by_hand.clone()]);
+        assert_eq!(cards.words.made, std::slice::from_ref(&first));
+    });
+
+    // The second answer also names a grouping and a column, which a Cards tab has not.
+    model.answers(json!({
+        "filters": [{ "property": "title", "op": "contains", "value": ["0"] }],
+        "group_by": ["title"],
+        "columns": ["title"],
+    }));
+    let reads = served.sent("studio_page").len();
+    ask_in_words(
+        "notes about zero, grouped by title, only the title column",
+        cx,
+    );
+    assert_eq!(model.calls(), 2);
+    let second = title_filter(FilterOp::Contains, "0");
+    cards.update_in(cx, |cards, window, cx| {
+        assert_eq!(
+            cards.filters,
+            [by_hand.clone(), second.clone()],
+            "the hand-written one stays, the first answer's goes"
+        );
+        assert_eq!(cards.words.made, std::slice::from_ref(&second));
+        assert!(cards.render_filter_bar(window, cx).is_some());
+        assert!(cards.bar_note().is_some(), "the bar says what was left out");
+    });
+    assert_eq!(
+        words_note(&cards, cx).as_deref(),
+        Some("Could not use: the rows cannot be grouped by title; title is not a column")
+    );
+    assert_eq!(served.sent("studio_page").len(), reads + 1, "one read");
+
+    // Esc, the cards having the keyboard, clears what the field said; the filters stay.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(words_note(&cards, cx), None);
+    cards.read_with(cx, |cards, _| assert_eq!(cards.filters.len(), 2));
+}
+
+/// A call that fails shows why in the bar and changes nothing: no filter, no order, no read.
+/// With no key stored the field says so before a sentence is typed, as the table's does, and
+/// a sentence sent all the same is told the same.
+#[gpui::test]
+async fn a_failed_call_shows_and_changes_nothing(cx: &mut TestAppContext) {
+    init(cx);
+    let model = FakeModel::new(json!({ "filters": [] }), Some("sk-or-test"), cx);
+    model.fails(500);
+    let (session, _, served) = session_served(NOTES, notes_under(12), cx);
+    let (cards, cx) = open(session, opening("Note"), cx);
+    ask_in_words("notes about one", cx);
+    assert_eq!(model.calls(), 1);
+    let said = words_note(&cards, cx).expect("the field says why");
+    assert!(said.starts_with("failed: "), "{said}");
+    cards.update_in(cx, |cards, window, cx| {
+        assert!(cards.filters.is_empty() && cards.sort.is_none());
+        assert!(cards.words.made.is_empty());
+        assert!(
+            cards.render_filter_bar(window, cx).is_some(),
+            "shown in the bar"
+        );
+        assert!(cards.bar_note().is_some());
+        assert_eq!(cards.words_about(cx), said.trim_start_matches("failed: "));
+        assert!(!Item::keeps_preview(cards, cx), "nothing was changed");
+    });
+    assert_eq!(served.sent("studio_page").len(), 1, "nothing was read");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(words_note(&cards, cx), None);
+    cards.update_in(cx, |cards, window, _| {
+        assert!(
+            cards.focus_handle.is_focused(window),
+            "Esc leaves the field"
+        );
+    });
+}
+
+/// Without a key the field says it needs one, empty and in its tooltip, in the table's words,
+/// and follows the key when one is stored.
+#[gpui::test]
+async fn the_sentence_field_says_it_needs_a_key(cx: &mut TestAppContext) {
+    init(cx);
+    let model = FakeModel::new(json!({ "filters": [] }), None, cx);
+    let (session, _, _) = session_served(NOTES, notes_under(12), cx);
+    let (cards, cx) = open(session, opening("Note"), cx);
+    let says = |cx: &mut VisualTestContext| {
+        cards.update(cx, |cards, cx| {
+            let empty = cards
+                .words
+                .editor
+                .update(cx, |editor, cx| editor.placeholder_text(cx));
+            (empty.unwrap_or_default(), cards.words_about(cx))
+        })
+    };
+    assert_eq!(
+        says(cx),
+        (
+            "OpenRouter key needed · Filter in words".to_owned(),
+            "Filter in words needs an OpenRouter key. Add one in Settings, under Models."
+                .to_owned()
+        )
+    );
+    // A sentence sent all the same asks nothing of the model and is told why.
+    ask_in_words("notes about one", cx);
+    assert_eq!(model.calls(), 0);
+    assert!(
+        words_note(&cards, cx).is_some_and(|said| said.starts_with("failed: ")),
+        "{:?}",
+        words_note(&cards, cx)
+    );
+
+    let models = cx.update(|_, cx| studio_workspace::models::Models::try_global(cx).unwrap());
+    models
+        .update(cx, |models, cx| models.set_key("sk-or-test".into(), cx))
+        .await
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(says(cx).0, "Filter in words…", "a key is stored");
+}
+
+/// A sentence that names a related node by a name several nodes match asks which one, as in
+/// the table: the filter opens as a draft with the name typed and the nodes offered, nothing
+/// is filtered meanwhile, and the one picked filters by its id.
+#[gpui::test]
+async fn a_name_that_matches_several_nodes_asks_which(cx: &mut TestAppContext) {
+    init(cx);
+    FakeModel::new(
+        json!({ "filters": [{ "property": FILED_UNDER, "op": "related_to", "value": ["de"] }] }),
+        Some("sk-or-test"),
+        cx,
+    );
+    let notes = filed_answering(12);
+    let answer = move |request: &Value| match request["name"].as_str() {
+        Some("studio_search_index") => json!([
+            { "id": "design", "p0": "Design" },
+            { "id": "decisions", "p0": "Decisions" },
+        ]),
+        _ => notes(request),
+    };
+    let (session, _, _) = session_served(FILED, answer, cx);
+    let (cards, cx) = open(session, opening("Note"), cx);
+    ask_in_words("notes filed under de", cx);
+    assert_eq!(
+        words_note(&cards, cx).as_deref(),
+        Some("2 Topic nodes match \"de\": pick one in the filter.")
+    );
+    cards.update_in(cx, |cards, window, cx| {
+        assert!(
+            cards.filters.is_empty(),
+            "nothing is filtered until one is picked"
+        );
+        let draft = cards
+            .bar()
+            .draft
+            .as_ref()
+            .expect("its filter opens as a draft");
+        assert_eq!(
+            (draft.property.as_str(), draft.op),
+            (FILED_UNDER, FilterOp::RelatedTo)
+        );
+        assert_eq!(draft.offers.len(), 2);
+        assert_eq!(cards.bar().editor.read(cx).text(cx), "de");
+        assert!(cards.bar().editor.focus_handle(cx).is_focused(window));
+    });
+    // Its rows are the type's meanwhile, which the session holds at this commit.
+    assert_eq!(row_ids(&cards, cx).len(), 12);
+    // ↵ takes the node offered first.
+    cx.simulate_keystrokes("enter");
+    settle(cx);
+    cards.read_with(cx, |cards, _| {
+        assert_eq!(
+            cards.filters,
+            [Filter {
+                property: FILED_UNDER.into(),
+                op: FilterOp::RelatedTo,
+                value: json!("design"),
+            }]
+        );
+        assert!(cards.bar().draft.is_none());
+    });
+}
+
+/// ⌘⇧F gives the sentence field the keyboard. What is typed there is text: the letters the
+/// cards act on, the arrows, ⌘A and ⌘C act on no card; ↵ on an empty field asks nothing and
+/// opens no page; Esc gives the cards the keyboard back. Typing draws the cards no times
+/// (`docs/drawing.md`): the field is in the toolbar, and the cards are a cached view.
+#[gpui::test]
+async fn keys_typed_in_the_sentence_field_are_its_text(cx: &mut TestAppContext) {
+    init(cx);
+    let model = FakeModel::new(json!({ "filters": [] }), Some("sk-or-test"), cx);
+    let heard: Rc<RefCell<Vec<String>>> = Rc::default();
+    cx.update(|cx| {
+        let log = heard.clone();
+        cx.on_action(move |open: &OpenNodePage, _| log.borrow_mut().push(open.id.clone()));
+        let log = heard.clone();
+        cx.on_action(move |show: &ShowNodeOnCanvas, _| {
+            log.borrow_mut().push(format!("canvas {}", show.id));
+        });
+    });
+    let (session, _, served) = session_served(NOTES, notes_under(12), cx);
+    let (cards, cx) = open(session, opening("Note"), cx);
+    cx.simulate_keystrokes("right x");
+    let state = |cx: &mut VisualTestContext| {
+        cards.read_with(cx, |cards, _| {
+            (cards.cursor, cards.picks.len(), cards.format.size)
+        })
+    };
+    let before = state(cx);
+    let text = |cx: &mut VisualTestContext| {
+        cards.read_with(cx, |cards, cx| cards.words.editor.read(cx).text(cx))
+    };
+
+    cx.simulate_keystrokes("cmd-shift-f");
+    cx.run_until_parked();
+    cards.update_in(cx, |cards, window, cx| {
+        assert!(cards.words_field_focused(window, cx), "⌘⇧F opens the field");
+    });
+    // An empty field asks nothing, and ↵ there is not the cards'.
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(model.calls(), 0);
+    assert!(heard.borrow().is_empty(), "↵ in the field opened a page");
+
+    let renders = grid_renders(&cards, cx);
+    cx.simulate_input("ab");
+    cx.simulate_keystrokes("left");
+    cx.simulate_input("X");
+    assert_eq!(text(cx), "aXb", "← moved in the text");
+    cx.simulate_keystrokes("home");
+    cx.simulate_input("H");
+    cx.simulate_keystrokes("right down up end");
+    cx.simulate_keystrokes("cmd-a cmd-c");
+    assert_eq!(
+        cx.read_from_clipboard()
+            .and_then(|item| item.text())
+            .as_deref(),
+        Some("HaXb"),
+        "⌘C copied the text"
+    );
+    cx.simulate_keystrokes("g x f = - space");
+    cx.run_until_parked();
+    assert_eq!(
+        text(cx),
+        "gxf=- ",
+        "the letters were typed over the selection"
+    );
+    assert_eq!(state(cx), before, "a key acted on the cards");
+    assert!(heard.borrow().is_empty(), "{:?}", heard.borrow());
+    assert_eq!(
+        grid_renders(&cards, cx),
+        renders,
+        "typing in the sentence field drew the cards"
+    );
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cards.update_in(cx, |cards, window, cx| {
+        assert!(!cards.words_field_focused(window, cx));
+        assert!(
+            cards.focus_handle.is_focused(window),
+            "Esc gives the cards the keyboard"
+        );
+        assert_eq!(
+            cards.picks.len(),
+            1,
+            "and leaves the picks for the next Esc"
+        );
+    });
+    cx.simulate_keystrokes("right");
+    cards.read_with(cx, |cards, _| assert_eq!(cards.cursor, Some(2)));
+    assert_eq!(model.calls(), 0);
+    assert_eq!(served.sent("studio_page").len(), 1);
+}
+
+/// A tab of selected rows does not offer the field, as it does not offer the Filters and Sort
+/// chips, whose tooltip says why; ⌘⇧F does nothing there. Cleared of its pill, the tab has it.
+#[gpui::test]
+async fn a_tab_of_selected_rows_has_no_sentence_field(cx: &mut TestAppContext) {
+    init(cx);
+    let model = FakeModel::new(json!({ "filters": [] }), Some("sk-or-test"), cx);
+    let (session, _, _) = session_served(NOTES, notes_under(12), cx);
+    let mut listed = opening("Note");
+    listed.title = "Note, 2 selected rows".into();
+    listed.ids = Some(vec!["n003".into(), "n001".into()]);
+    let (cards, cx) = open(session, listed, cx);
+    assert!(cx.debug_bounds("filter-words").is_none(), "no field");
+    cx.simulate_keystrokes("cmd-shift-f");
+    cx.run_until_parked();
+    cards.update_in(cx, |cards, window, cx| {
+        assert!(!cards.words_field_focused(window, cx));
+        assert!(cards.focus_handle.is_focused(window));
+        assert_eq!(
+            cards.listed_note().as_deref(),
+            Some("Showing 2 selected rows. Clear the pill to filter Note")
+        );
+        let status = Item::status(cards, window, cx).expect("a status");
+        assert!(!status.keys.iter().any(|key| key.label == "Filter in words"));
+    });
+    click("set-pill-clear", cx);
+    settle(cx);
+    assert!(
+        cx.debug_bounds("filter-words").is_some(),
+        "the type's rows take a sentence"
+    );
+    cx.simulate_keystrokes("cmd-shift-f");
+    cx.run_until_parked();
+    cards.update_in(cx, |cards, window, cx| {
+        assert!(cards.words_field_focused(window, cx));
+    });
+    assert_eq!(model.calls(), 0);
+}
+
+/// The filters an answer made are saved as the tab's filters, and come back as ordinary ones:
+/// the restored tab knows of no answer, so its next sentence adds to them.
+#[gpui::test]
+async fn a_saved_tab_keeps_an_answers_filters_as_ordinary_ones(cx: &mut TestAppContext) {
+    init(cx);
+    cx.update(crate::init);
+    let model = FakeModel::new(
+        json!({
+            "filters": [{ "property": "title", "op": "contains", "value": ["1"] }],
+            "sort": [{ "property": "title", "descending": false }],
+        }),
+        Some("sk-or-test"),
+        cx,
+    );
+    let (session, _, _) = session_served(NOTES, notes_under(12), cx);
+    let (cards, cx) = open(session.clone(), opening("Note"), cx);
+    ask_in_words("notes about one, by title", cx);
+    let saved = cards.read_with(cx, |cards, cx| Item::serialize(cards, cx).expect("saved"));
+    assert_eq!(
+        saved.data["filters"],
+        json!([{ "property": "title", "op": "Contains", "value": "1" }])
+    );
+    assert_eq!(
+        saved.data["sort"],
+        json!({ "property": "title", "descending": false })
+    );
+    assert_eq!(
+        saved.data.get("words"),
+        None,
+        "nothing of the sentence is saved"
+    );
+
+    let (workspace, cx) = cx.add_window_view(Workspace::new);
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.set_session(session.clone(), window, cx)
+    });
+    cx.run_until_parked();
+    assert!(workspace.update_in(cx, |workspace, window, cx| {
+        workspace.reopen_saved(&saved, window, cx)
+    }));
+    settle(cx);
+    let back = workspace
+        .read_with(cx, |workspace, _| {
+            workspace
+                .active_item()
+                .and_then(|item| item.to_any().downcast::<TypeCards>().ok())
+        })
+        .expect("a Cards tab is open");
+    let first = title_filter(FilterOp::Contains, "1");
+    back.read_with(cx, |back, _| {
+        assert_eq!(back.filters, std::slice::from_ref(&first));
+        assert!(back.words.made.is_empty(), "ordinary filters");
+        assert!(back.sort.is_some());
+    });
+    // A sentence in the restored tab leaves them, as it leaves filters written by hand.
+    model.answers(json!({
+        "filters": [{ "property": "title", "op": "starts_with", "value": ["Note"] }],
+    }));
+    back.update_in(cx, |back, window, cx| {
+        window.focus(&back.focus_handle, cx);
+    });
+    ask_in_words("notes whose title starts with Note", cx);
+    back.read_with(cx, |back, _| {
+        assert_eq!(
+            back.filters,
+            [first.clone(), title_filter(FilterOp::StartsWith, "Note")]
+        );
+    });
+}
+
+/// In a tab too narrow for the toolbar's labels (beside the inspector, in a window of the
+/// default size) its chips are their icons, their tooltips naming them, so the sentence field
+/// and the chips after it all show. In a wide tab, and before the tab is measured, they keep
+/// their labels.
+#[gpui::test]
+async fn a_narrow_tab_leaves_the_toolbars_labels_out(cx: &mut TestAppContext) {
+    init(cx);
+    let (session, _, _) = session_served(NOTES, notes_under(12), cx);
+    let (cards, cx) = open(session, opening("Note"), cx);
+    let about = "Order the cards by a property";
+    cards.update(cx, |cards, _| {
+        assert!(cards.width.get() > 0., "measured when drawn");
+        cards.width.set(0.);
+        assert!(!cards.compact_toolbar(), "not before it is measured");
+        cards.width.set(836.);
+        assert!(cards.compact_toolbar());
+        assert_eq!(cards.chip_tip("Sort", about), format!("Sort · {about}"));
+        cards.width.set(1176.);
+        assert!(!cards.compact_toolbar());
+        assert_eq!(cards.chip_tip("Sort", about), about);
+    });
 }

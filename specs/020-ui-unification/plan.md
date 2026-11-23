@@ -774,7 +774,8 @@ The first four record changes to the draft before it was built.
   preset still a preset, the tab's title and key follow the filters it has now, and a preview tab
   whose filters, order or format the person changed is kept. Slice 6 (2026-11-23) made a
   relationship a field a card can show, read as the table's relationship column is, by code the
-  two now share (`relations.rs`).
+  two now share (`relations.rs`). Slice 7 (2026-11-23) gave the tab the table's "Filter in words"
+  field (`words_field.rs`), whose answer sets its filters and its order.
 
 ## What this branch leaves open
 
