@@ -453,6 +453,9 @@ pub struct Workspace {
     _performance_subscription: Subscription,
     /// What was last written for this graph, so unchanged state is not rewritten.
     saved: Option<SavedWorkspace>,
+    /// Whether a graph's saved tabs open when it is shown here. Always, but in a test that
+    /// asked for none ([`Workspace::start_with_no_saved_tabs`]).
+    restores: bool,
     _save: Option<Task<()>>,
     /// The next comparison of the state with what was last written.
     _save_check: Option<Task<()>>,
@@ -792,6 +795,7 @@ impl Workspace {
             _performance: None,
             _performance_subscription: performance_subscription,
             saved: None,
+            restores: true,
             _save: None,
             _save_check: None,
             beat: 0,
@@ -1181,7 +1185,7 @@ impl Workspace {
         }
         self.graph_order.push(session.entity_id());
         self.subscribe_session(session, cx);
-        if persistence::restore_enabled() {
+        if self.restores && persistence::restore_enabled() {
             self.saved = None;
             self.restore(window, cx);
         }
@@ -1197,7 +1201,7 @@ impl Workspace {
     /// it. Its saved tabs open when it is first shown. A graph the window has open already is
     /// left as it is.
     pub fn add_session_behind(&mut self, session: Entity<GraphSession>, cx: &mut Context<Self>) {
-        let saved = persistence::restore_enabled()
+        let saved = (self.restores && persistence::restore_enabled())
             .then(|| persistence::load(&saved_key_of(&session, cx)))
             .flatten();
         self.add_behind(session, saved, cx);
@@ -3199,6 +3203,16 @@ impl Workspace {
             .iter()
             .map(|toast| toast.message.clone())
             .collect()
+    }
+
+    /// Shows every graph in this window with no saved tabs, whatever was saved for it. The
+    /// tests of one binary share a data directory ([`studio_settings::data_dir`]) and a
+    /// workspace saves its tabs there, so the tabs one test left open would otherwise open in
+    /// the window another test makes for the same graph. Call it before the first session is
+    /// set. For the tests of crates that open a workspace and count its tabs.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn start_with_no_saved_tabs(&mut self) {
+        self.restores = false;
     }
 
     /// Opens a saved tab as a restart does, by the opener its kind registered

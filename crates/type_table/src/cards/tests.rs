@@ -894,6 +894,8 @@ async fn a_saved_gallery_tab_comes_back_as_cards(cx: &mut TestAppContext) {
     cx.run_until_parked();
     let (workspace, cx) = cx.add_window_view(Workspace::new);
     workspace.update_in(cx, |workspace, window, cx| {
+        // The tabs another test of this binary left open for the graph are not this one's.
+        workspace.start_with_no_saved_tabs();
         workspace.set_session(session.clone(), window, cx)
     });
     cx.run_until_parked();
