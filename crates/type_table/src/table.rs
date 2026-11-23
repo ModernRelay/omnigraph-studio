@@ -8400,6 +8400,9 @@ impl TypeTable {
             draft.offers.set(offers, true);
             draft.answers = Some(name);
         }
+        // The keyboard goes where the name is, to pick with: the relationship's own first
+        // test takes no value, and a draft of that has the host's keyboard.
+        self.focus_filter_draft(window, cx);
         self.redraw_offers(cx);
         cx.notify();
         true
@@ -18608,6 +18611,78 @@ mod tests {
         cx.run_until_parked();
         table.read_with(cx, |table, _| {
             assert_eq!(table.cursor.map(|cursor| cursor.row), Some(1));
+        });
+    }
+
+    /// The draft a sentence opens to pick among the nodes a name matches has the keyboard in
+    /// its value field, where the name is: ↵ takes the node offered first. The relationship's
+    /// own first test takes no value, and a draft of that has the table's keyboard, so the
+    /// keyboard is placed again once the test is "is related to".
+    #[gpui::test]
+    async fn a_pick_among_several_nodes_has_the_keyboard_in_its_field(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+            cx.bind_keys([gpui::KeyBinding::new(
+                "enter",
+                ConfirmEdit,
+                Some("TypeTable && editing"),
+            )]);
+        });
+        let schema = "node Person {\n  slug: String @key\n  name: String\n}\n\
+            node Org {\n  slug: String @key\n  name: String\n}\n\
+            edge WorksAt: Person -> Org\n";
+        let session = session(schema, cx);
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session,
+                "Person".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let key = table.read_with(cx, |table, _| {
+            let schema = table.schema.clone().unwrap();
+            builder::relationship_key(&schema.relationships_of("Person")[0])
+        });
+        let offers = vec![
+            suggest::Suggestion {
+                value: "acme.com".into(),
+                label: Some("ACME Corp".into()),
+            },
+            suggest::Suggestion {
+                value: "acme-labs.ai".into(),
+                label: Some("Acme Labs".into()),
+            },
+        ];
+        table.update_in(cx, |table, window, cx| {
+            window.focus(&table.focus_handle, cx);
+            assert!(table.ask_to_pick(key.clone(), "Acme".into(), offers.clone(), window, cx));
+        });
+        cx.run_until_parked();
+        table.update_in(cx, |table, window, cx| {
+            assert!(
+                table.bar().editor.focus_handle(cx).is_focused(window),
+                "the value field has the keyboard"
+            );
+            assert!(table.filter_draft_takes_keys(window, cx));
+        });
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert_eq!(
+                table.filters,
+                [Filter {
+                    property: key.clone(),
+                    op: FilterOp::RelatedTo,
+                    value: serde_json::json!("acme.com"),
+                }],
+                "↵ took the node offered first"
+            );
+            assert!(table.bar().draft.is_none());
         });
     }
 }
