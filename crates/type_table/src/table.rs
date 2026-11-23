@@ -3697,12 +3697,7 @@ impl TypeTable {
                         let graph = graph.clone();
                         let workspace = workspace.clone();
                         menu = menu.entry(format!("Delete “{name}”"), None, move |_, cx| {
-                            crate::types_list::delete_view(
-                                &workspace,
-                                graph.clone(),
-                                id.clone(),
-                                cx,
-                            );
+                            crate::delete_view(&workspace, graph.clone(), id.clone(), cx);
                         });
                     }
                     if let Some(names) = names.clone() {

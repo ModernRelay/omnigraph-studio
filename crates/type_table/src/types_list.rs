@@ -13,7 +13,7 @@ use gpui::{
 use gq_language::SchemaModel;
 use graph_store::{GraphSession, Loadable, SessionEvent};
 use studio_actions::Thing;
-use studio_actions::graph::{OpenMap, OpenSavedView, OpenType, RestoreSavedView};
+use studio_actions::graph::{OpenMap, OpenSavedView, OpenType};
 use studio_settings::StudioSettings;
 use studio_ui::ds::Prose as _;
 use studio_ui::ds::Tipped;
@@ -261,7 +261,7 @@ impl TypesList {
 
     fn delete(&mut self, id: String, cx: &mut Context<Self>) {
         let Some(graph) = self.graph(cx) else { return };
-        delete_view(&self.workspace, graph, id, cx);
+        crate::delete_view(&self.workspace, graph, id, cx);
     }
 
     /// Saves what the active table shows as a new view.
@@ -604,93 +604,9 @@ impl TypesList {
     }
 }
 
-/// Deletes the view `id` of `graph`, with Undo on the toast, wherever it is deleted from: a view
-/// is a setting, so Undo puts it back.
-pub(crate) fn delete_view(
-    workspace: &WeakEntity<Workspace>,
-    graph: String,
-    id: String,
-    cx: &mut App,
-) {
-    let views = StudioSettings::get(cx).graph_views(&graph);
-    let Some(at) = views.iter().position(|view| view.key() == id) else {
-        return;
-    };
-    let view = views[at].clone();
-    let name = view.name.clone();
-    let restore = RestoreSavedView {
-        graph: graph.clone(),
-        at,
-        view: serde_json::to_value(&view).unwrap_or_default(),
-    };
-    studio_settings::update(cx, move |settings| {
-        settings.remove_view(&graph, &id);
-    });
-    if let Some(workspace) = workspace.upgrade() {
-        workspace.update(cx, |workspace, cx| {
-            workspace.show_toast_with_action(
-                ToastKind::Success,
-                format!("Deleted the view “{name}”."),
-                "Undo",
-                Box::new(restore),
-                cx,
-            )
-        });
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A view deleted from a table's Views menu goes as one deleted from the sidebar: that view
-    /// alone, by its id, with Undo on the toast (constitution IV). The menu used to delete by
-    /// type and name, at once and with no toast.
-    #[gpui::test]
-    fn a_deleted_view_offers_undo(cx: &mut gpui::TestAppContext) {
-        cx.update(|cx| {
-            studio_theme::init_test(cx);
-            studio_settings::init_test(cx);
-            studio_settings::keep_changes_in_memory(cx);
-        });
-        let graph = "dev/knowledge";
-        cx.update(|cx| {
-            studio_settings::update(cx, move |settings| {
-                for name in ["Founders", "Engineers"] {
-                    settings.save_view(
-                        graph,
-                        studio_settings::SavedView {
-                            name: name.into(),
-                            type_name: "Person".into(),
-                            ..Default::default()
-                        },
-                    );
-                }
-            })
-        });
-        let (workspace, cx) = cx.add_window_view(Workspace::new);
-        let names = |cx: &mut gpui::VisualTestContext| {
-            cx.update(|_, cx| {
-                StudioSettings::get(cx)
-                    .views_for(graph, "Person")
-                    .into_iter()
-                    .map(|view| view.name)
-                    .collect::<Vec<_>>()
-            })
-        };
-        let founders =
-            cx.update(|_, cx| StudioSettings::get(cx).views_for(graph, "Person")[0].key());
-        let weak = workspace.downgrade();
-        cx.update(|_, cx| delete_view(&weak, graph.into(), founders, cx));
-        cx.run_until_parked();
-        assert_eq!(names(cx), ["Engineers"]);
-        workspace.read_with(cx, |workspace, _| {
-            assert_eq!(
-                workspace.toast_messages(),
-                [SharedString::from("Deleted the view “Founders”.")]
-            )
-        });
-    }
 
     /// A graph's saved views list first, by name, under their own label; with none, the label
     /// does not show (spec 024).
