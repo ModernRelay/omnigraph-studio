@@ -1975,7 +1975,7 @@ pub fn filter_pill(
 }
 
 /// What a view's rows are when they are not its type's under filters, as a pill before the
-/// filter pills ("3 picked rows"): the words with their icon, and a button that lets the set
+/// filter pills ("3 selected rows"): the words with their icon, and a button that lets the set
 /// go, which says what that does (`clears`).
 pub fn set_pill(
     id: impl Into<ElementId>,

@@ -2538,11 +2538,11 @@ async fn a_filter_the_schema_lost_is_dropped_and_said(cx: &mut TestAppContext) {
     });
 }
 
-/// A tab of rows picked in a table says so in a pill before any filter, and its Filters and
+/// A tab of rows selected in a table says so in a pill before any filter, and its Filters and
 /// Sort chips are off, each saying why: its rows are the ones listed. Clearing the pill shows
 /// the type's rows with no filter, at the commit the tab shows, and the chips work.
 #[gpui::test]
-async fn a_tab_of_picked_rows_says_so_until_its_pill_is_cleared(cx: &mut TestAppContext) {
+async fn a_tab_of_selected_rows_says_so_until_its_pill_is_cleared(cx: &mut TestAppContext) {
     init(cx);
     let (session, writer, served) = session_served(NOTES, notes_under(12), cx);
     let mut listed = opening("Note");
@@ -2555,7 +2555,7 @@ async fn a_tab_of_picked_rows_says_so_until_its_pill_is_cleared(cx: &mut TestApp
         assert_eq!(Item::tab_title(cards, cx), "Cards: Note, 3 selected rows");
         assert_eq!(
             cards.listed_note().as_deref(),
-            Some("Showing 3 picked rows. Clear the pill to filter Note")
+            Some("Showing 3 selected rows. Clear the pill to filter Note")
         );
         let status = Item::status(cards, window, cx).expect("a status");
         assert!(
@@ -3158,7 +3158,8 @@ async fn a_draft_with_no_value_field_takes_enter_and_esc(cx: &mut TestAppContext
         });
         cx.run_until_parked();
         cards.update_in(cx, |cards, window, cx| {
-            assert!(cards.draft_has_no_field());
+            let draft = cards.bar().draft.as_ref().expect("a draft is open");
+            assert!(!draft.op.takes_value(), "its test takes no value");
             assert!(
                 !cards.bar().editor.focus_handle(cx).is_focused(window),
                 "a field that is not drawn has the keyboard"

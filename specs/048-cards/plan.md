@@ -238,9 +238,9 @@ A format is which fields a card shows and in what order, its cover, and its size
   does not freeze at the day the tab opened. A filter on a property the schema no longer has
   is dropped, and the bar says which (Corrections: the table drops it and says nothing).
 - **Sort** is a chip of its own with the table's menu (`ds::sort_menu`).
-- **A tab of selected rows** shows a lead pill "3 picked rows ×" and the Filters and Sort
-  chips disabled: "Showing 3 picked rows. Clear the pill to filter Note". Clearing it shows
-  the type's rows.
+- **A tab of selected rows** shows a lead pill "3 selected rows ×", the words its title has,
+  and the Filters and Sort chips disabled: "Showing 3 selected rows. Clear the pill to filter
+  Note". Clearing it shows the type's rows. "Picked" is the word for cards picked in the tab.
 - **Filter in words** (slice 7) asks the same model with the same question. In Cards its
   answer sets filters and order; a grouping or columns in the answer are left out.
 - "Newer data · Refresh" and ⌘R as in every data view.
@@ -337,7 +337,12 @@ filter's field, and a move through its suggestions, draws it no times.
   (`filter_bar::filter_stands`, out of the table's schema load), what rows can be ordered by
   and how a Sort chip words it (`model::sort_choices`, `can_sort_by`, `sort_label`), and a
   set's words (`model::filters_summary`, `set_title`). The trait gained `bar_lead`, what a
-  host draws before the pills, for the pill of a listed set (`ds::set_pill`).
+  host draws before the pills, for the pill of a listed set (`ds::set_pill`). Its follow-up
+  made the draft's keyboard the bar's to place, which is the one thing the table now does
+  differently (Corrections): the bar puts the keyboard in the value field or, for a test that
+  takes no value, with the host (`focus_filter_draft`), takes it back from a field no longer
+  drawn as it draws (`keep_filter_keys`), and tells a host when its own keys wait
+  (`filter_draft_takes_keys`, each host's `editing`).
 - **Relationship reads** move out of `TypeTable` into `relations.rs`, which both tabs call.
 - **Names.** Old names keep working:
 
@@ -501,7 +506,7 @@ names, or at the head another writer moved, and keeps every request.
 | 2026-11-23 | Sort orders the cards and reads at the pin | `sort_orders_the_cards_and_reads_at_the_pin`: the head moved; the chip's menu opened and `title` taken with the keyboard; descending; the same order again and one the type cannot give; the chip's × | Pass: `order { $n.title asc … }` then `desc`, each one read at `c1`, the cursor on the first card, the title unchanged; nothing read for the same order or a file's; × puts the ids' order back with no request |
 | 2026-11-23 | A date preset is resolved at each read and saved as itself | `a_date_preset_is_resolved_at_each_read_and_saved_as_itself`: "due is today" written with ⌘F and ↵; ⌘R. `type_table` `a_date_preset_judges_edited_and_inserted_rows_by_its_days`, extended: what the table hands Cards. `relationship_tree.rs` read: its Cards action passes the set's filters as it holds them | Pass: each page is sent today's two days as `f0` and `f0_end`; the tab holds and saves `{"property": "due", "op": "Today", "value": null}`; the table's action carries the same, where it carried the days. With `filters` read in place of `resolved_filters()` the page is sent `null` and the test fails |
 | 2026-11-23 | A filter the schema lost is dropped and said | `a_filter_the_schema_lost_is_dropped_and_said`: a saved tab with a filter on `topic`, which Note never had, one on `title`, and an order by `title`; another writer drops `title`; ⌘R; a new filter | Pass: read once, without it; "The schema no longer has topic: its filter was left out" in the bar, and not counted as the person's change; after the refresh the filter and the order on `title` are gone, the notice names `title`, the Filter menu no longer offers it; the next filter takes the notice away |
-| 2026-11-23 | A tab of picked rows says so until its pill is cleared | `a_tab_of_picked_rows_says_so_until_its_pill_is_cleared`: three listed notes; ⌘F, ⌘⌥⌫, a click on each chip, an order set in code; a click on the pill's ×; a click on each chip | Pass: the pill is drawn; no draft, no menu, no order, no page read, and the status bar offers no filter key; cleared, the 12 notes are read at `c1` under no filter, the title is "Cards: Note", the tab saves no ids, and the chips open the draft and the menu |
+| 2026-11-23 | A tab of selected rows says so until its pill is cleared | `a_tab_of_selected_rows_says_so_until_its_pill_is_cleared` (named `…picked_rows…` until the follow-up): three listed notes; ⌘F, ⌘⌥⌫, a click on each chip, an order set in code; a click on the pill's ×; a click on each chip | Pass: the pill is drawn; no draft, no menu, no order, no page read, and the status bar offers no filter key; cleared, the 12 notes are read at `c1` under no filter, the title is "Cards: Note", the tab saves no ids, and the chips open the draft and the menu |
 | 2026-11-23 | Keys typed in the value field are the text's | `keys_typed_in_the_value_field_are_the_texts` (the editor's own ←, Home, ⌘A, ⌘C and Esc bound as Zed's keymap binds them): ← and Home move the caret, → ↓ ↑ End move no cursor, ⌘A and ⌘C select and copy the text, G X F = − Space are typed; ↵; ↵ again. `studio` `keymaps` `the_cards_letter_keys_are_text_in_a_field`, rewritten: every Cards binding of the three keymaps by where it acts | Pass: the cursor, the picks and the size never change; ↵ applies the filter and opens no page; the next ↵ opens the first card's page. The keymaps bind 6 keys that type and 11 that do not (the arrows, Home, End, ↵, ⌘↵, ⌥↵, ⌘A, ⌘C) on the cards alone, Esc, ⌘R, ⌘F and ⌘⌥⌫ in both, and ↵ as `ConfirmEdit` in the field. With `editing` not set, the test fails |
 | 2026-11-23 | Esc closes the draft first and the picks second | `esc_closes_the_draft_first_and_clears_the_picks_second`; then ⌘⌥⌫ over a filter and an open draft | Pass: the draft, then the picks, no read for either; after ⌘⌥⌫ the cards have the keyboard and → moves the cursor |
 | 2026-11-23 | A draft with no value field takes ↵ and Esc | `a_draft_with_no_value_field_takes_enter_and_esc`: "due is empty" set as the menus leave it; → ↓ X G; Esc; again; ↵ | Pass: the cards have the keyboard, not the field that is not drawn; their keys wait; Esc closes the draft and leaves the picks; ↵ adds the filter and opens no page (Corrections) |
@@ -515,6 +520,20 @@ names, or at the head another writer moved, and keeps every request.
 
 `cards::tests` holds 42 tests: slice 2's 30, unedited but for the keys their `init` binds, now
 as the keymaps bind them, and 12 new. The table's preset test asserts one thing more.
+
+### Slice 5, follow-up (2026-11-23)
+
+Built on `feat/cards-filters`, on `10949470`. The same machine and toolchain.
+
+| Date | Claim | Check | Result |
+|---|---|---|---|
+| 2026-11-23 | In the table, a draft with no value field takes ↵ and Esc, and the table's keys wait meanwhile | `table::tests`, three added, keys bound as the keymaps bind them, a Person table with a Date column: `a_draft_with_no_value_field_takes_enter` (⌘F on the date opens "born is today"; ↓, J and Tab; ↵; ↓ ↓), `a_draft_with_no_value_field_takes_esc`, `clear_all_with_a_draft_open_gives_the_table_its_keys` (a filter, a draft with "Ad" typed, the bar's clear) | Pass: the table has the keyboard, not the field; the cursor does not move and ↵ opens no cell; ↵ adds `born` `Today`, Esc closes with nothing added; after the clear the table has the keyboard and ↓ moves. With the keyboard left where it was before (the field focused and never taken back), all three fail |
+| 2026-11-23 | The same in a second host | `filter_bar::tests`, three added against the probe, which now has a key context and a key of its own (J): `a_second_hosts_draft_with_no_value_field_takes_enter` ("has any" on its relationship), `…_takes_esc` (and "is empty" taken from the test menu over a draft with a field), `clearing_a_second_hosts_filters_gives_it_the_keys_back` | Pass, and fail the same way with the old focus. The first failed once more before it passed: a host that already has the keyboard is not drawn again by a focus change when the draft is applied, so its key context kept `editing`; the bar now notifies as it applies |
+| 2026-11-23 | Nothing else about the table changed | `git diff` of `table.rs`: two lines outside its tests (`editing` and Tab ask `filter_draft_takes_keys`), and tests only added. `cargo test -p type_table` | 340 passed, 1 ignored: the 334 of slice 5, none edited in `table.rs`, and 6 new |
+| 2026-11-23 | Cards calls the same code | `cards.rs` lost its own guard, its `editing` rule and its ↵ for a draft with no field; `cards::tests` | The 42 pass. `a_draft_with_no_value_field_takes_enter_and_esc` spells out the check a removed helper made; nothing it asserts changed |
+| 2026-11-23 | One word for the rows a tab holds | `a_tab_of_selected_rows_says_so_until_its_pill_is_cleared`, renamed, its tooltip's words changed | Pass: "Showing 3 selected rows. Clear the pill to filter Note" |
+| 2026-11-23 | The table in the app, before and after | The offscreen snapshot tool on the Note table of the `notes` graph, through Studio's keymap: `written`, "is today"; ↓ and J; Esc; the draft again; ↵. Then Cards: a preset and ↵; three listed notes | Before (slice 5's row): the draft stays open after ↵ and Esc. After: the draft "written · is today" open with 13 rows; ↓ and J put no cursor on a row; Esc closes it; ↵ adds the pill "written is today" and the table reads "0 of 13". Cards as in slice 5, its pill "3 selected rows ×" under the title "Cards: Note, 3 selected rows" |
+| 2026-11-23 | The workspace's checks | The same seven commands | All pass. Tests: 1,778 passed, 0 failed, 9 ignored in the 54 harnessed binaries (`type_table` 340 and 1 ignored), and the 7 checks of `keymaps`. `layers ok: 24 crates; 64 UI tools in their crate`, `design tokens ok`, `brand ok: 546 files`, 8 release-file tests OK |
 
 ## Corrections
 
@@ -594,13 +613,11 @@ Slice 5:
 - 2026-11-23 · **A draft whose test takes no value takes no key in the table.** "is today",
   the test a date's draft starts on, "is empty" and "has any" draw no value field, the field
   keeps the keyboard, and a key sent to a field that is not drawn reaches nothing: ↵ and Esc
-  do nothing, and the ✓ whose tooltip says ↵ is the only way on. In Cards the keyboard comes
-  back to the cards while such a draft is open, ↵ adds it and Esc closes it, and the keys that
-  act on cards wait. The table is as it was: the same lines belong in the bar, for both, and
-  change what the table does with its keys, which is not this slice's to decide.
-- 2026-11-23 · **A draft closed under its field gives the keyboard back to the cards**: ⌘⌥⌫,
-  "Clear all" and the chip's × close the draft and leave its field focused and not drawn. The
-  table's handler is the same call, by reading; it was not tried there.
+  do nothing, and the ✓ whose tooltip says ↵ is the only way on. Slice 5 answered it in Cards
+  alone; the follow-up moved the answer into the bar, for both (below).
+- 2026-11-23 · **A draft closed under its field left the field focused and not drawn**: ⌘⌥⌫,
+  "Clear all" and the chip's × close the draft without moving the keyboard. Slice 5 gave it
+  back to the cards; the follow-up does it in the bar, for both (below).
 - 2026-11-23 · **Esc with one of the draft's menus open closes the menu and the draft**, in
   Cards as in the table: the menu passes the key on.
 - 2026-11-23 · **"Reads again at the pin" is a read asked of the session at that commit.** The
@@ -615,8 +632,23 @@ Slice 5:
   the branch still has**, which is where an opening leaves it when the diff lands after the
   first page.
 - 2026-11-23 · **A tab of listed rows keeps the title it opened with** ("Cards: Note, 3
-  selected rows", the table's words), beside a pill that says "3 picked rows", the words this
-  plan gives it. A filter on a related node words the title by the node's id ("Note, design")
-  where the pill shows its name ("Design"): the table's words for a set, which the tree's tab
-  has too.
+  selected rows", the table's words). A filter on a related node words the title by the
+  node's id ("Note, design") where the pill shows its name ("Design"): the table's words for
+  a set, which the tree's tab has too.
 - 2026-11-23 · **The toolbar has a Refresh button**, last, as the table's has.
+
+Slice 5, follow-up:
+
+- 2026-11-23 · **The draft's keyboard is the bar's to place, in the table as in Cards.** Two
+  views with one bar must not differ in its keys. A draft whose test takes no value has the
+  host's keyboard, and a draft closed by any path gives it back: the bar focuses the host
+  where it has the window, and takes the keyboard from a field no longer drawn as the bar is
+  drawn, which covers the paths that have none ("Clear all", the chip's ×, a host that
+  replaces its filters). A host's `editing` comes from the bar's one answer. So the table
+  changed in one way: with such a draft open ↵ adds it and Esc closes it, where neither did
+  anything, and ↓, J, Tab and ↵ on a cell wait as they do while a value field has the
+  keyboard. A click on a row does not end that wait; ↵ or Esc does. How it is built said the
+  key contexts stay as they are.
+- 2026-11-23 · **The rows a tab holds are "selected" in its pill and its tooltip too**, the
+  word its title has from the table. The plan said "3 picked rows"; "picked" stays the word
+  for cards picked in the tab.

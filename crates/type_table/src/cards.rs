@@ -1147,21 +1147,12 @@ impl TypeCards {
         self.person_changed(cx);
     }
 
-    /// A filter is being written whose test takes no value ("is today", "is empty"): the bar
-    /// draws no value field for it, so the keyboard stays with the cards.
-    fn draft_has_no_field(&self) -> bool {
-        self.bar()
-            .draft
-            .as_ref()
-            .is_some_and(|draft| !draft.op.takes_value())
-    }
-
     /// Why the Filters and Sort chips are off, when they are: the tab holds listed rows.
     fn listed_note(&self) -> Option<String> {
         let ids = self.ids.as_ref()?;
         Some(format!(
             "Showing {}. Clear the pill to filter {}",
-            plural(ids.len(), "picked row", "picked rows"),
+            plural(ids.len(), "selected row", "selected rows"),
             self.type_name
         ))
     }
@@ -2824,15 +2815,15 @@ impl FilterHost for TypeCards {
         Some(studio_ui::ds::text::muted(note))
     }
 
-    /// A tab of rows picked in a table says so before any filter: its rows are those listed,
-    /// until the pill is cleared.
+    /// A tab of rows selected in a table says so before any filter, in the words its title
+    /// has ("3 selected rows"): its rows are those listed, until the pill is cleared.
     fn bar_lead(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let ids = self.ids.as_ref()?;
         Some(
             studio_ui::ds::set_pill(
                 "cards-listed",
                 IconName::ListTodo,
-                plural(ids.len(), "picked row", "picked rows"),
+                plural(ids.len(), "selected row", "selected rows"),
                 format!("Show every {} row", self.type_name),
                 cx.listener(|this, _, _, cx| this.clear_listed(cx)),
                 cx,
@@ -3245,24 +3236,10 @@ impl Render for TypeCards {
         context.add("Cards");
         // The gallery's context too (spec 035), so the bindings a person wrote for it still act.
         context.add("Gallery");
-        // The filter's value field has the keyboard but is not drawn, so no key would reach
-        // the tab: its draft closed under it (the filters cleared from the toolbar, or dropped
-        // with the schema), or the draft's test takes no value ("is today") and has no field.
-        // The keys come back to the cards, as a table's do from a cell editor no longer drawn.
-        let fieldless = self.draft_has_no_field();
-        if self.bar().editor.focus_handle(cx).is_focused(window)
-            && (fieldless || self.bar().draft.is_none())
-        {
-            window.focus(&self.focus_handle, cx);
-        }
-        // Keys typed into the filter's value field are text, not the cards'. A draft with no
-        // field is written with the cards' keyboard: ↵ adds it and Esc closes it, and the keys
-        // that act on cards wait for one of them.
-        let writing = match fieldless {
-            true => self.focus_handle.is_focused(window),
-            false => self.bar().editor.focus_handle(cx).is_focused(window),
-        };
-        if writing {
+        // Keys typed into the filter's value field are text, not the cards'; a draft with no
+        // field takes ↵ and Esc all the same, and the keys that act on cards wait for one of
+        // them. The bar says which (`FilterHost::filter_draft_takes_keys`), as for the table.
+        if self.filter_draft_takes_keys(window, cx) {
             context.add("editing");
         }
         let filter_bar = self.render_filter_bar(window, cx);
@@ -3293,13 +3270,7 @@ impl Render for TypeCards {
             // The filter bar's keys (spec 048): ↵ applies the filter being written, and is
             // bound only while one is (`editing`); listed rows take no filter.
             .on_action(cx.listener(|this, _: &ConfirmEdit, window, cx| {
-                if this.confirm_filter_draft(window, cx) {
-                    return;
-                }
-                // The bar's ↵ is its value field's; a draft with no field is added here.
-                if this.draft_has_no_field() {
-                    this.apply_filter_draft(window, cx);
-                }
+                this.confirm_filter_draft(window, cx);
             }))
             .when(self.ids.is_none(), |cards| {
                 cards

@@ -7732,7 +7732,7 @@ impl TypeTable {
 
     /// Tab: save the open edit, if any, and move to the next cell in the row.
     fn tab(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
-        if self.bar().draft.is_some() && self.bar().editor.focus_handle(cx).is_focused(window) {
+        if self.filter_draft_takes_keys(window, cx) {
             return;
         }
         if self.editing.is_some() {
@@ -10976,7 +10976,7 @@ impl Render for TypeTable {
         // Keys typed into a field are text, not the table's: the cell editor, the filter
         // value and the bulk value alike.
         let typing = self.editing.is_some()
-            || self.bar().editor.focus_handle(cx).is_focused(window)
+            || self.filter_draft_takes_keys(window, cx)
             || self.bulk_editor.focus_handle(cx).is_focused(window)
             || self.words_editor.focus_handle(cx).is_focused(window)
             || self.fill_editor.focus_handle(cx).is_focused(window);
@@ -18449,5 +18449,165 @@ mod tests {
         assert_eq!(values.len(), sent, "each section read once");
         // More sections came into view than may read at once, and every one of them read.
         assert!(sent > SECTION_READS_OUT, "{sent}");
+    }
+
+    /// A Person table with a Date column, its keys bound as the keymaps bind them, the cursor
+    /// on the date of the first row.
+    fn born_table(cx: &mut TestAppContext) -> (Entity<TypeTable>, &mut VisualTestContext) {
+        const BORN: &str = "node Person {\n  slug: String @key\n  name: String\n  born: Date?\n}\n";
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+            cx.bind_keys([
+                gpui::KeyBinding::new("down", MoveDown, Some("TypeTable && !editing")),
+                gpui::KeyBinding::new("j", MoveDown, Some("TypeTable && !editing")),
+                gpui::KeyBinding::new("enter", EditCell, Some("TypeTable && !editing")),
+                gpui::KeyBinding::new("enter", ConfirmEdit, Some("TypeTable && editing")),
+                gpui::KeyBinding::new("escape", Cancel, Some("TypeTable")),
+                gpui::KeyBinding::new("cmd-f", AddFilter, Some("TypeTable")),
+                gpui::KeyBinding::new("tab", menu::SelectNext, Some("TypeTable")),
+            ]);
+        });
+        let session = session(BORN, cx);
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session,
+                "Person".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        table.update_in(cx, |table, window, cx| {
+            let col = table.column_index("born").expect("the date's column");
+            table.cursor = Some(Cursor { row: 0, col });
+            window.focus(&table.focus_handle, cx);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        (table, cx)
+    }
+
+    /// The draft ⌘F opens on a date: "born is today", a test that takes no value, so no value
+    /// field is drawn, and the table has the keyboard, not a field nobody can see.
+    fn open_a_draft_with_no_value_field(table: &Entity<TypeTable>, cx: &mut VisualTestContext) {
+        cx.simulate_keystrokes("cmd-f");
+        cx.run_until_parked();
+        table.update_in(cx, |table, window, cx| {
+            let draft = table.bar().draft.as_ref().expect("⌘F opens a draft");
+            assert_eq!(
+                (draft.property.as_str(), draft.op),
+                ("born", FilterOp::Today)
+            );
+            assert!(
+                !table.bar().editor.focus_handle(cx).is_focused(window),
+                "a field that is not drawn has the keyboard"
+            );
+            assert!(table.focus_handle.is_focused(window), "the table has it");
+            assert!(table.filter_draft_takes_keys(window, cx));
+        });
+    }
+
+    /// A draft whose test takes no value takes ↵: opened on a date, it adds "is today". The
+    /// table's own keys wait meanwhile, as they do while a value field has the keyboard: ↓, J
+    /// and Tab move no cursor and ↵ edits no cell. Once it is added they are the table's again.
+    #[gpui::test]
+    async fn a_draft_with_no_value_field_takes_enter(cx: &mut TestAppContext) {
+        let (table, cx) = born_table(cx);
+        let cursor = table.read_with(cx, |table, _| table.cursor);
+        open_a_draft_with_no_value_field(&table, cx);
+        cx.simulate_keystrokes("down j tab");
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert_eq!(table.cursor, cursor, "the table's keys wait");
+            assert!(table.bar().draft.is_some());
+        });
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        table.update_in(cx, |table, window, _| {
+            assert_eq!(
+                table.filters,
+                [Filter {
+                    property: "born".into(),
+                    op: FilterOp::Today,
+                    value: Value::Null,
+                }],
+                "↵ added it"
+            );
+            assert!(table.bar().draft.is_none());
+            assert!(table.editing.is_none(), "↵ opened no cell");
+            assert!(table.focus_handle.is_focused(window));
+        });
+        // The cursor went with the rows read again; the keys are the table's.
+        cx.simulate_keystrokes("down down");
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert_eq!(table.cursor.map(|cursor| cursor.row), Some(1));
+        });
+    }
+
+    /// The same draft takes Esc: it closes, no filter is added, and the table's keys act.
+    #[gpui::test]
+    async fn a_draft_with_no_value_field_takes_esc(cx: &mut TestAppContext) {
+        let (table, cx) = born_table(cx);
+        open_a_draft_with_no_value_field(&table, cx);
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        table.update_in(cx, |table, window, _| {
+            assert!(table.bar().draft.is_none(), "Esc closed it");
+            assert!(table.filters.is_empty());
+            assert!(table.focus_handle.is_focused(window));
+            assert_eq!(table.cursor.map(|cursor| cursor.row), Some(0));
+        });
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert_eq!(table.cursor.map(|cursor| cursor.row), Some(1));
+        });
+    }
+
+    /// "Clear all" while a filter is being written closes the draft under its value field:
+    /// the table takes the keyboard back, and its keys act.
+    #[gpui::test]
+    async fn clear_all_with_a_draft_open_gives_the_table_its_keys(cx: &mut TestAppContext) {
+        let (table, cx) = born_table(cx);
+        table.update_in(cx, |table, window, cx| {
+            table.filters = vec![Filter {
+                property: "name".into(),
+                op: FilterOp::Contains,
+                value: serde_json::json!("a"),
+            }];
+            let col = table.column_index("name").expect("the name's column");
+            table.cursor = Some(Cursor { row: 0, col });
+            table.open_filter_draft(window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input("Ad");
+        table.update_in(cx, |table, window, cx| {
+            let draft = table.bar().draft.as_ref().expect("a draft is open");
+            assert!(draft.op.takes_value());
+            assert!(table.bar().editor.focus_handle(cx).is_focused(window));
+            assert!(table.filter_draft_takes_keys(window, cx));
+        });
+        // As the bar's "Clear all" and the toolbar chip's × call it.
+        table.update(cx, |table, cx| table.clear_filters(cx));
+        cx.run_until_parked();
+        table.update_in(cx, |table, window, cx| {
+            assert!(table.bar().draft.is_none() && table.filters.is_empty());
+            assert!(
+                !table.bar().editor.focus_handle(cx).is_focused(window),
+                "the field, no longer drawn, kept the keyboard"
+            );
+            assert!(table.focus_handle.is_focused(window), "the table has it");
+            assert!(!table.filter_draft_takes_keys(window, cx));
+            table.cursor = Some(Cursor { row: 0, col: 0 });
+        });
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert_eq!(table.cursor.map(|cursor| cursor.row), Some(1));
+        });
     }
 }
