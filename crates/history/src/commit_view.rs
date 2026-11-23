@@ -262,7 +262,9 @@ impl CommitView {
     /// Whether the commit is the graph's first, as far as it is known: one with no parent,
     /// which the server cannot compare with anything.
     fn is_first(&self) -> bool {
-        self.commit.as_ref().is_some_and(is_first_commit)
+        self.commit
+            .as_ref()
+            .is_some_and(crate::counts::is_first_commit)
     }
 
     /// Shows the graph's first commit as such, and drops a read of its changes still out, which
@@ -1136,12 +1138,6 @@ pub(crate) fn branch_fact(
         // A kind a later server sends: where it is, Studio cannot say.
         CommitKind::Other => return None,
     })
-}
-
-/// Whether `commit` is the graph's first: it has no parent, so it has no changes the server can
-/// tell (it refuses them with a 409, `parentless_commit`), and none are asked for.
-pub(crate) fn is_first_commit(commit: &CommitOutput) -> bool {
-    commit.parent_commit_id.is_none() && commit.merged_parent_commit_id.is_none()
 }
 
 /// The commit a branch can start at: a published one. A proposal or an unattached snapshot is

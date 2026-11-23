@@ -1499,7 +1499,7 @@ impl HistoryView {
             .get(range.start..range.end.min(self.commits.len()))
             .unwrap_or_default()
             .iter()
-            .filter(|commit| !crate::commit_view::is_first_commit(commit))
+            .filter(|commit| !crate::counts::is_first_commit(commit))
             .map(|commit| commit.graph_commit_id.clone())
             .collect();
         let session = self.session.clone();
@@ -1881,7 +1881,7 @@ fn commit_card(
 ) -> studio_ui::ds::TipContent {
     let who = commit.actor_id.clone().unwrap_or_else(|| "—".into());
     let when = relative_time(commit.created_at, now);
-    let what = if crate::commit_view::is_first_commit(commit) {
+    let what = if crate::counts::is_first_commit(commit) {
         "First commit".to_owned()
     } else if commit.merged_parent_commit_id.is_some() {
         format!(
@@ -2569,8 +2569,8 @@ mod tests {
             let counts = &view.counts.learnt;
             assert!(counts.contains_key("m1") && counts.contains_key("m2"));
             assert!(!counts.contains_key("m0"));
-            assert!(crate::commit_view::is_first_commit(&view.commits[2]));
-            assert!(!crate::commit_view::is_first_commit(&view.commits[1]));
+            assert!(crate::counts::is_first_commit(&view.commits[2]));
+            assert!(!crate::counts::is_first_commit(&view.commits[1]));
         });
     }
 
