@@ -237,8 +237,8 @@ impl Default for StudioOptions {
 }
 
 /// One graph's own values for the settings marked `x-per-graph`, over `studio` (spec 002),
-/// its saved table views (spec 004) and the property each type's nodes are named by. Each
-/// value is unset unless the person chose it for this graph.
+/// its saved table views (spec 004), the property each type's nodes are named by and what each
+/// type's cards show (spec 048). Each value is unset unless the person chose it for this graph.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct GraphOverrides {
@@ -254,6 +254,95 @@ pub struct GraphOverrides {
     /// types are named by their `name`, `title` or key (spec 002, "Node names").
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
+    /// What a type's cards show, by type, where the person changed it in a Cards tab; other
+    /// types show the default card (spec 048, "Format").
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub cards: BTreeMap<String, CardFormat>,
+}
+
+/// What a type's cards show (spec 048, "Format"): their fields in order, their cover and
+/// their size. A preference kept on this computer: Omnigraph has no notion of a card.
+///
+/// ```json
+/// { "fields": ["body", "written"], "cover": { "property": "attachment" }, "size": "large" }
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct CardFormat {
+    /// The properties a card shows under its title, by name, in card order; at most
+    /// [`CardFormat::MOST_FIELDS`]. Absent, the default rule chooses them: the type's first
+    /// three properties in schema order that are not its name, its key, a file or a vector.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fields: Option<Vec<String>>,
+    /// The file a card shows as its cover. Absent, the type's first file property.
+    #[serde(skip_serializing_if = "CardCover::is_first")]
+    pub cover: CardCover,
+    #[serde(skip_serializing_if = "CardSize::is_medium")]
+    pub size: CardSize,
+}
+
+impl CardFormat {
+    /// The most fields a card shows.
+    pub const MOST_FIELDS: usize = 8;
+
+    /// Whether this is the format a type has when none is kept for it.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// The file a card shows as its cover (spec 048): written `"none"`, or
+/// `{ "property": "<name>" }`; left out for the type's first file property.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CardCover {
+    /// The type's first file property; no cover for a type with none.
+    #[default]
+    First,
+    /// No cover: a card is its title and its fields.
+    None,
+    /// This file property.
+    Property(String),
+}
+
+impl CardCover {
+    fn is_first(&self) -> bool {
+        *self == CardCover::First
+    }
+}
+
+/// How large a Cards tab draws its cards (spec 048): the least its columns are wide.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CardSize {
+    Small,
+    #[default]
+    Medium,
+    Large,
+}
+
+impl CardSize {
+    pub const ALL: [CardSize; 3] = [CardSize::Small, CardSize::Medium, CardSize::Large];
+
+    fn is_medium(&self) -> bool {
+        *self == CardSize::Medium
+    }
+
+    /// The next size up; Large stays.
+    pub fn larger(self) -> Self {
+        match self {
+            CardSize::Small => CardSize::Medium,
+            _ => CardSize::Large,
+        }
+    }
+
+    /// The next size down; Small stays.
+    pub fn smaller(self) -> Self {
+        match self {
+            CardSize::Large => CardSize::Medium,
+            _ => CardSize::Small,
+        }
+    }
 }
 
 /// A named filter, order, grouping and set of columns for one type's table (spec 004), listed
@@ -1075,6 +1164,27 @@ impl StudioSettings {
             }
             None => {
                 labels.remove(type_name);
+            }
+        }
+        self.graphs.retain(|_, overrides| !overrides.is_empty());
+    }
+
+    /// What a type's cards show in a graph, where the person changed it (spec 048); `None`
+    /// for the default card.
+    pub fn card_format(&self, graph: &str, type_name: &str) -> Option<CardFormat> {
+        self.graphs.get(graph)?.cards.get(type_name).cloned()
+    }
+
+    /// Keeps what a type's cards show in a graph, or forgets it when `None` or the default:
+    /// the default card is no entry.
+    pub fn set_card_format(&mut self, graph: &str, type_name: &str, format: Option<CardFormat>) {
+        let cards = &mut self.graphs.entry(graph.to_owned()).or_default().cards;
+        match format.filter(|format| !format.is_default()) {
+            Some(format) => {
+                cards.insert(type_name.to_owned(), format);
+            }
+            None => {
+                cards.remove(type_name);
             }
         }
         self.graphs.retain(|_, overrides| !overrides.is_empty());
@@ -2023,6 +2133,148 @@ mod tests {
         assert_eq!(read_clean(&text), settings);
         settings.set_label("dev/knowledge", "Person", None);
         assert!(settings.graphs.is_empty(), "the default is no entry");
+    }
+
+    /// A type's card format is kept per graph and type, written as spec 048 writes it: each
+    /// cover form, the fields in order, the size. What is the default is left out, a format
+    /// that is the default is no entry, and a graph with nothing left is removed.
+    #[test]
+    fn card_formats_round_trip_and_the_default_is_no_entry() {
+        let mut settings = StudioSettings::default();
+        let chosen = CardFormat {
+            fields: Some(vec!["body".into(), "written".into()]),
+            cover: CardCover::Property("attachment".into()),
+            size: CardSize::Large,
+        };
+        settings.set_card_format("dev/notes", "Note", Some(chosen.clone()));
+        settings.set_card_format(
+            "dev/notes",
+            "Topic",
+            Some(CardFormat {
+                cover: CardCover::None,
+                ..CardFormat::default()
+            }),
+        );
+        settings.set_card_format(
+            "dev/notes",
+            "Draft",
+            Some(CardFormat {
+                fields: Some(Vec::new()),
+                size: CardSize::Small,
+                ..CardFormat::default()
+            }),
+        );
+        assert_eq!(settings.card_format("dev/notes", "Note"), Some(chosen));
+        assert_eq!(settings.card_format("dev/notes", "Person"), None);
+        assert_eq!(settings.card_format("prod/notes", "Note"), None);
+        let value = serde_json::to_value(&settings).unwrap();
+        assert_eq!(
+            value["graphs"]["dev/notes"]["cards"],
+            serde_json::json!({
+                "Note": {
+                    "fields": ["body", "written"],
+                    "cover": { "property": "attachment" },
+                    "size": "large",
+                },
+                "Topic": { "cover": "none" },
+                // No field shown is a choice, kept; the type's first file and Medium are not.
+                "Draft": { "fields": [], "size": "small" },
+            })
+        );
+        let text = serde_json::to_string(&settings).unwrap();
+        let reading = StudioSettings::read(&text).unwrap();
+        assert_eq!(
+            reading.problems,
+            Vec::<String>::new(),
+            "`cards` is a setting"
+        );
+        assert_eq!(reading.settings, settings);
+        // Written by hand: a cover left out is the type's first file, a size left out Medium.
+        let by_hand = StudioSettings::read(
+            r#"{"graphs":{"dev/notes":{"cards":{"Note":{"fields":["body"]}}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(by_hand.problems, Vec::<String>::new());
+        assert_eq!(
+            by_hand.settings.card_format("dev/notes", "Note"),
+            Some(CardFormat {
+                fields: Some(vec!["body".into()]),
+                cover: CardCover::First,
+                size: CardSize::Medium,
+            })
+        );
+        // A size that is none of the three is set aside, and the rest of the format applies.
+        let wrong = StudioSettings::read(
+            r#"{"graphs":{"dev/notes":{"cards":{"Note":{"cover":"none","size":"huge"}}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(wrong.problems.len(), 1, "{:?}", wrong.problems);
+        assert!(wrong.problems[0].contains("size"), "{:?}", wrong.problems);
+        assert_eq!(
+            wrong.settings.card_format("dev/notes", "Note"),
+            Some(CardFormat {
+                cover: CardCover::None,
+                ..CardFormat::default()
+            })
+        );
+
+        // The default card is no entry, whether it is set or the entry is cleared.
+        settings.set_card_format("dev/notes", "Note", Some(CardFormat::default()));
+        assert_eq!(settings.card_format("dev/notes", "Note"), None);
+        settings.set_card_format("dev/notes", "Topic", None);
+        assert!(settings.graphs.contains_key("dev/notes"), "Draft's is left");
+        settings.set_card_format("dev/notes", "Draft", None);
+        assert!(
+            settings.graphs.is_empty(),
+            "a graph with nothing left is removed"
+        );
+        // Beside a node name, the graph's entry stays for the name.
+        settings.set_label("dev/notes", "Note", Some("slug".into()));
+        settings.set_card_format(
+            "dev/notes",
+            "Note",
+            Some(CardFormat {
+                size: CardSize::Large,
+                ..CardFormat::default()
+            }),
+        );
+        settings.set_card_format("dev/notes", "Note", None);
+        assert_eq!(settings.labels_for("dev/notes")["Note"], "slug");
+
+        // Edited into the person's file as any setting is: beside what is there, comments
+        // kept; changed in place; and taken out again when the card is the default one.
+        let text = "{\n  // mine\n  \"graphs\": {\n    \"dev/notes\": {\n      \"labels\": { \"Note\": \"slug\" }\n    }\n  }\n}\n";
+        let before = read_clean(text);
+        let mut after = before.clone();
+        after.set_card_format(
+            "dev/notes",
+            "Note",
+            Some(CardFormat {
+                fields: Some(vec!["written".into()]),
+                cover: CardCover::None,
+                size: CardSize::Small,
+            }),
+        );
+        let written = document::edit(text, &before, &after).unwrap();
+        assert!(written.contains("// mine"), "{written}");
+        assert_eq!(read_clean(&written), after);
+        let mut moved = after.clone();
+        moved.set_card_format(
+            "dev/notes",
+            "Note",
+            Some(CardFormat {
+                fields: Some(vec!["written".into(), "body".into()]),
+                cover: CardCover::None,
+                size: CardSize::Small,
+            }),
+        );
+        let rewritten = document::edit(&written, &after, &moved).unwrap();
+        assert_eq!(read_clean(&rewritten), moved);
+        let mut reset = moved.clone();
+        reset.set_card_format("dev/notes", "Note", None);
+        let cleared = document::edit(&rewritten, &moved, &reset).unwrap();
+        assert_eq!(read_clean(&cleared), before, "{cleared}");
+        assert!(!cleared.contains("written"), "{cleared}");
     }
 
     #[test]

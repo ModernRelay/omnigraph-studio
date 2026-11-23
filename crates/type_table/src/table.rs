@@ -1103,19 +1103,16 @@ impl Item for TypeTable {
             None => ViewLink::disabled_because(ViewKind::Canvas, "Select a row to walk from it"),
         };
         let mut views = vec![ViewLink::current(ViewKind::Table), tree, canvas];
-        // A type with files also shows its rows as cards, a file their cover (spec 048; every
-        // node type from its slice 2).
-        if self.cards_cover().is_some() {
-            let shown = if self.selection.is_empty() {
-                "these rows".to_owned()
-            } else {
-                format!(
-                    "the {}",
-                    studio_ui::plural(self.selection.len(), "selected row", "selected rows")
-                )
-            };
-            views.push(ViewLink::to(ViewKind::Cards).saying(format!("Show {shown} as cards")));
-        }
+        // Every node type's rows are shown as cards too, last in the strip (spec 048).
+        let shown = if self.selection.is_empty() {
+            "these rows".to_owned()
+        } else {
+            format!(
+                "the {}",
+                studio_ui::plural(self.selection.len(), "selected row", "selected rows")
+            )
+        };
+        views.push(ViewLink::to(ViewKind::Cards).saying(format!("Show {shown} as cards")));
         views
     }
 
@@ -7957,30 +7954,14 @@ impl TypeTable {
         })
     }
 
-    /// The Blob property the cards of this table's rows show first as their cover (spec 048):
-    /// the one under the cursor, else the type's first; `None` for a type with no file, or an
-    /// edge type.
-    fn cards_cover(&self) -> Option<String> {
+    /// What Cards opens from this table (spec 048): the selected rows, listed, or the rows
+    /// under the filters and in the table's order, at the commit the table read, the cursor's
+    /// row under the cursor. What a card shows is the type's format, not the table's to say:
+    /// the file under the cursor is no longer handed over as the cover.
+    fn cards_action(&self) -> Option<Box<dyn gpui::Action>> {
         if self.kind != TableKind::Node {
             return None;
         }
-        let is_file = |column: &ColumnSpec| {
-            column
-                .property()
-                .filter(|property| property.kind == ScalarKind::Blob)
-                .map(|property| property.name.clone())
-        };
-        self.cursor
-            .and_then(|cursor| self.columns.get(cursor.col))
-            .and_then(is_file)
-            .or_else(|| self.all_columns.iter().find_map(is_file))
-    }
-
-    /// What Cards opens from this table (spec 048): the selected rows, listed, or the rows
-    /// under the filters and in the table's order, at the commit the table read, the cursor's
-    /// row under the cursor.
-    fn cards_action(&self) -> Option<Box<dyn gpui::Action>> {
-        let cover = self.cards_cover()?;
         let ids = (!self.selection.is_empty()).then(|| {
             self.rows
                 .iter()
@@ -8015,7 +7996,7 @@ impl TypeTable {
                 serde_json::json!({"property": sort.property, "descending": sort.descending})
             }),
             ids,
-            cover: Some(cover),
+            cover: None,
             at_commit: self.at_commit.clone(),
             snapshot: self.paging.pinned.clone().filter(|_| self.at_commit.is_none()),
             select: self.cursor_row().map(|row| row.id.clone()),
@@ -11744,7 +11725,8 @@ mod tests {
     /// the head without reading again; one that wrote its type offers Refresh (spec 015).
     /// A table's Tree holds what it shows: the selected rows, or its rows under the filters. Its
     /// Canvas holds one node, the row under the cursor, and without one says why it cannot open
-    /// (spec 020).
+    /// (spec 020). Its Cards, last in the strip of every node table, a type with no file among
+    /// them, hold the same set as its Tree and say nothing of what a card shows (spec 048).
     #[gpui::test]
     async fn tree_holds_the_tables_rows_and_canvas_the_row_under_the_cursor(
         cx: &mut TestAppContext,
@@ -11770,10 +11752,32 @@ mod tests {
             let views = Item::views(table, cx);
             assert_eq!(
                 views.iter().map(|link| link.kind).collect::<Vec<_>>(),
-                [ViewKind::Table, ViewKind::Tree, ViewKind::Canvas]
+                [
+                    ViewKind::Table,
+                    ViewKind::Tree,
+                    ViewKind::Canvas,
+                    ViewKind::Cards
+                ],
+                "Person has no file: Cards all the same"
             );
             assert_eq!(views[1].disabled, None);
             assert_eq!(views[2].disabled, Some("Select a row to walk from it"));
+            assert_eq!(views[3].disabled, None);
+            assert_eq!(views[3].says.as_deref(), Some("Show these rows as cards"));
+            let cards = Item::view_action(table, ViewKind::Cards, cx).expect("its cards");
+            assert!(cards.partial_eq(&studio_actions::graph::ShowSetInCards {
+                title: "Person".into(),
+                type_name: "Person".into(),
+                filters: None,
+                sort: None,
+                ids: None,
+                cover: None,
+                at_commit: None,
+                snapshot: table.paging.pinned.clone(),
+                select: None,
+                preview: true,
+            }));
+            assert!(table.paging.pinned.is_some(), "the commit the table read");
             assert!(Item::view_action(table, ViewKind::Canvas, cx).is_none());
             let all = Item::view_action(table, ViewKind::Tree, cx).expect("the rows");
             let all = all
@@ -11808,6 +11812,20 @@ mod tests {
             assert_eq!(nodes.len(), 1);
             assert_eq!(nodes[0].id, "p1");
             assert_eq!(nodes[0].label.as_deref(), Some("Ada"));
+            // And the Cards': listed, the cursor's row under the cursor.
+            assert_eq!(
+                Item::views(table, cx)[3].says.as_deref(),
+                Some("Show the 1 selected row as cards")
+            );
+            let cards = Item::view_action(table, ViewKind::Cards, cx).expect("the picked");
+            let cards = cards
+                .as_any()
+                .downcast_ref::<studio_actions::graph::ShowSetInCards>()
+                .expect("a set");
+            assert_eq!(cards.title, "Person, 1 selected row");
+            assert_eq!(cards.ids, Some(vec!["p1".to_owned()]));
+            assert_eq!(cards.select.as_deref(), Some("p2"));
+            assert_eq!(cards.cover, None, "the format says what a card shows");
             let walk = Item::view_action(table, ViewKind::Canvas, cx).expect("a walk");
             assert!(walk.partial_eq(&studio_actions::graph::ShowNodeOnCanvas {
                 type_name: "Person".into(),

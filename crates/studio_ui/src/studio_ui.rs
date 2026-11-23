@@ -26,7 +26,7 @@ pub use changes::{
     ChangeKind, PropertyRow, RelationshipLine, TextFolds, change_counts, changed_value,
     property_body, property_row,
 };
-pub use ds::cell_text::{CellText, cell_text, shown_part};
+pub use ds::cell_text::{CellText, cell_text, cell_text_width, shown_part};
 pub use grid_places::{GridPlace, columns_in_view, grid_places, scrolled_within};
 pub use overlay_slot::{OverlaySlot, OverlaySlotElement};
 pub use resize::{

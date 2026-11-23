@@ -1,11 +1,13 @@
 //! A type's nodes as cards (spec 048): a grid of columns of one width and cards of one size,
-//! each its cover (one of the node's files, fitted inside a box of one shape) and its title,
-//! placed in row order and never moved, one tab per set, read a page at a time at one commit.
-//! Each card's cover is read on its own through the Blob route once scrolling pauses, at most
-//! four at once, only for the cards a frame lays out, and drawn from a preview decoded and
-//! scaled off the main thread; the previews held are capped. It grew out of spec 035's gallery.
+//! each its cover (one of the node's files, fitted inside a box of one shape, when the format
+//! has one), its title and a line a field, placed in row order and never moved, one tab per
+//! set, read a page at a time at one commit. What a card shows is the tab's format
+//! (`card_format`): the tab saves it, and a change is kept as the type's in the settings. Each
+//! card's cover is read on its own through the Blob route once scrolling pauses, at most four
+//! at once, only for the cards a frame lays out, and drawn from a preview decoded and scaled
+//! off the main thread; the previews held are capped. It grew out of spec 035's gallery.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::rc::Rc;
@@ -18,7 +20,7 @@ use gpui::{
     KeyContext, Render, ScrollHandle, SharedString, StyleRefinement, Subscription, Task,
     WeakEntity, Window, point,
 };
-use gq_language::{BuiltQuery, Filter, ScalarKind, SchemaModel, Sort, builder};
+use gq_language::{BuiltQuery, Filter, Property, ScalarKind, SchemaModel, Sort, builder};
 use graph_client::api::ReadOutput;
 use graph_client::{BlobCell, BlobMeta, HistoricalGap, PropertyThen, ReadError};
 use graph_store::scope::ReadScope;
@@ -33,14 +35,16 @@ use studio_actions::graph::{
 };
 use studio_actions::workspace::ToggleInspector;
 use studio_actions::{ViewKind, ViewLink};
-use studio_ui::ds::menu::ContextMenu;
+use studio_settings::{CardFormat, CardSize, StudioSettings};
+use studio_ui::ds::menu::{ContextMenu, ContextMenuEntry};
 use studio_ui::ds::{Tipped, space};
 use studio_ui::{ChangeKind, plural};
 use studio_workspace::{Inspected, Item, ItemEvent, ItemStatus, KeyHint, SavedItem, Workspace};
-use ui::PopoverMenu;
 use ui::prelude::*;
+use ui::{PopoverMenu, PopoverMenuHandle};
 
 use crate::branch_diff::{BranchDiff, TARGET};
+use crate::card_format::{self, CardFace};
 use crate::card_grid::{COVER_RATIO, CardGrid, Step};
 use crate::model::{Paging, Row, field_rows, node_rows};
 use crate::peek::{NodePeek, PeekSubject};
@@ -60,55 +64,31 @@ pub(crate) const PREVIEWS_HELD: usize = 64 * 1024 * 1024;
 /// read, and one draw each would draw the grid dozens of times.
 pub(crate) const LANDING_DELAY: Duration = Duration::from_millis(30);
 
-/// How wide a Cards tab's columns are drawn at least; the columns grow from it to fill the
-/// width.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum CardSize {
-    Small,
-    #[default]
-    Medium,
-    Large,
-}
-
-impl CardSize {
-    const ALL: [CardSize; 3] = [CardSize::Small, CardSize::Medium, CardSize::Large];
-
-    pub(crate) fn edge(self) -> f32 {
-        match self {
-            CardSize::Small => studio_ui::ds::size::CARD_SMALL,
-            CardSize::Medium => studio_ui::ds::size::CARD,
-            CardSize::Large => studio_ui::ds::size::CARD_LARGE,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            CardSize::Small => "S",
-            CardSize::Medium => "M",
-            CardSize::Large => "L",
-        }
-    }
-
-    fn larger(self) -> Self {
-        match self {
-            CardSize::Small => CardSize::Medium,
-            _ => CardSize::Large,
-        }
-    }
-
-    fn smaller(self) -> Self {
-        match self {
-            CardSize::Large => CardSize::Medium,
-            _ => CardSize::Small,
-        }
+/// How wide a Cards tab's columns are drawn at least at `size`; the columns grow from it to
+/// fill the width.
+pub(crate) fn size_edge(size: CardSize) -> f32 {
+    match size {
+        CardSize::Small => studio_ui::ds::size::CARD_SMALL,
+        CardSize::Medium => studio_ui::ds::size::CARD,
+        CardSize::Large => studio_ui::ds::size::CARD_LARGE,
     }
 }
 
-/// The grid for a tab `width` wide and cards of at least `edge`: the tab's edges keep
-/// [`space::EDGE`], and columns and lines are [`space::LG`] apart.
-pub(crate) fn grid_for(width: f32, edge: f32) -> CardGrid {
-    CardGrid::fit(width - 2. * space::EDGE, edge, space::LG, card_height)
+fn size_label(size: CardSize) -> &'static str {
+    match size {
+        CardSize::Small => "S",
+        CardSize::Medium => "M",
+        CardSize::Large => "L",
+    }
+}
+
+/// The grid for a tab `width` wide and cards of at least `edge`, each with a cover's box when
+/// `cover` and `fields` lines under its title: the tab's edges keep [`space::EDGE`], and
+/// columns and lines are [`space::LG`] apart.
+pub(crate) fn grid_for(width: f32, edge: f32, cover: bool, fields: usize) -> CardGrid {
+    CardGrid::fit(width - 2. * space::EDGE, edge, space::LG, |width| {
+        card_height(width, cover, fields)
+    })
 }
 
 /// How far a card's cover sits inside its edge: the cursor's ring and [`space::XS`].
@@ -122,10 +102,72 @@ fn cover_height(width: f32) -> f32 {
     ((width - 2. * card_inset()) * COVER_RATIO).round()
 }
 
-/// How tall a card `width` wide is, whatever it holds: its cover and its title line, inside
-/// the ring.
-pub(crate) fn card_height(width: f32) -> f32 {
-    2. * card_inset() + cover_height(width) + studio_ui::ds::size::CARD_TITLE
+/// The space under a card's last field, so its lines sit as far from the card's foot as its
+/// title does from what is above it.
+fn fields_foot(fields: usize) -> f32 {
+    if fields > 0 { space::XS } else { 0. }
+}
+
+/// How tall a card `width` wide is, whatever its values hold: the cover's box when the format
+/// has a cover, its title line and a line a field, inside the ring.
+pub(crate) fn card_height(width: f32, cover: bool, fields: usize) -> f32 {
+    let cover = if cover { cover_height(width) } else { 0. };
+    2. * card_inset()
+        + cover
+        + studio_ui::ds::size::CARD_TITLE
+        + fields as f32 * studio_ui::ds::size::CARD_LINE
+        + fields_foot(fields)
+}
+
+/// What one field of a card shows of a row's value, as the table's cell shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum FieldShown {
+    /// No value: a dash.
+    Null,
+    /// An enum's member, in a chip.
+    Member(SharedString),
+    /// Any other value, on one line: text, a number, a date in the table's words, a list.
+    Text(SharedString),
+}
+
+/// What a row's fields show, made the first time its card is drawn and kept, so a frame does
+/// not format every value again. A date or a time reads relative to now, so a row with one is
+/// made again in a later minute than the one it was made in (`minute`).
+struct RowFields {
+    shown: Vec<FieldShown>,
+    minute: Option<i64>,
+}
+
+/// What `fields` show of `values`, and whether any of them is a date or a time.
+pub(crate) fn fields_shown(
+    fields: &[Property],
+    row: &Row,
+    now: chrono::DateTime<chrono::Local>,
+) -> (Vec<FieldShown>, bool) {
+    let mut temporal = false;
+    let shown = fields
+        .iter()
+        .map(|property| {
+            let value = row.value(&property.name);
+            temporal |=
+                !property.list && matches!(property.kind, ScalarKind::Date | ScalarKind::DateTime);
+            if value.is_null() {
+                return FieldShown::Null;
+            }
+            let text = match crate::model::relative_value(Some(property), value, now) {
+                Some((shown, _)) => shown,
+                None => crate::model::display_value(Some(property), value),
+            };
+            // No more than a line shows: a long text is not kept whole a second time.
+            let text = studio_ui::shown_part(text.into());
+            if property.enum_values.is_some() && !property.list {
+                FieldShown::Member(text)
+            } else {
+                FieldShown::Text(text)
+            }
+        })
+        .collect();
+    (shown, temporal)
 }
 
 /// What is known of one card's cover.
@@ -184,9 +226,21 @@ pub struct TypeCards {
     first_snapshot: Option<String>,
     /// The cursor's card is to be scrolled to once it is placed and the grid measured.
     scroll_owed: bool,
-    /// The Blob property the cards show as their cover, and the type's Blob properties.
+    /// What a card shows, as the tab keeps it (spec 048, "Format"): its fields, its cover and
+    /// its size. Saved with the tab; a change is also kept as the type's in the settings.
+    format: CardFormat,
+    /// The format read against the schema as it is now: the fields a card shows, in order, and
+    /// the Blob property that is its cover, if any; and the type's Blob properties.
+    fields: Vec<Property>,
     cover: Option<String>,
     files: Vec<String>,
+    /// What each row's fields show, by row id, made as its card is first drawn.
+    field_text: RefCell<HashMap<String, Rc<RowFields>>>,
+    /// Now, and its minute, as of the frame being drawn: what a date reads relative to.
+    frame_now: chrono::DateTime<chrono::Local>,
+    frame_minute: i64,
+    /// The Fields menu, so its chip says what it is only while the menu is closed.
+    fields_menu: PopoverMenuHandle<ContextMenu>,
     schema: Option<Arc<SchemaModel>>,
     rows: Vec<Row>,
     paging: Paging,
@@ -202,7 +256,6 @@ pub struct TypeCards {
     select_on_load: Option<String>,
     picks: IndexSet<String>,
     pick_anchor: Option<usize>,
-    size: CardSize,
     covers: HashMap<CoverKey, Cover>,
     cover_tasks: HashMap<CoverKey, Task<()>>,
     cover_queue: VecDeque<CoverKey>,
@@ -250,16 +303,30 @@ impl Focusable for TypeCards {
 }
 
 impl TypeCards {
+    /// A Cards tab of the set `opening` names. `format` is what a restored tab kept; a new tab
+    /// (`None`) starts from the type's format in the settings, else from the default card.
     pub(crate) fn new(
         workspace: WeakEntity<Workspace>,
         session: Entity<GraphSession>,
         opening: ShowSetInCards,
-        size: CardSize,
+        format: Option<CardFormat>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let grid = CardsGrid::new(cx);
         let branch = session.read(cx).branch.clone();
+        let format = format.unwrap_or_else(|| {
+            let graph = session.read(cx).overrides_key();
+            let mut format = cx
+                .try_global::<StudioSettings>()
+                .and_then(|settings| settings.card_format(&graph, &opening.type_name))
+                .unwrap_or_default();
+            // An action written for the gallery names the file to show (spec 035).
+            if let Some(cover) = &opening.cover {
+                format.cover = studio_settings::CardCover::Property(cover.clone());
+            }
+            format
+        });
         let filters: Vec<Filter> = opening
             .filters
             .clone()
@@ -302,8 +369,14 @@ impl TypeCards {
             absent: HashMap::new(),
             first_snapshot: None,
             scroll_owed: false,
-            cover: opening.cover,
+            format,
+            fields: Vec::new(),
+            cover: None,
             files: Vec::new(),
+            field_text: RefCell::default(),
+            frame_now: chrono::Local::now(),
+            frame_minute: 0,
+            fields_menu: PopoverMenuHandle::default(),
             schema: None,
             rows: Vec::new(),
             paging: Paging::default(),
@@ -318,7 +391,6 @@ impl TypeCards {
             select_on_load: opening.select,
             picks: IndexSet::default(),
             pick_anchor: None,
-            size,
             covers: HashMap::new(),
             cover_tasks: HashMap::new(),
             cover_queue: VecDeque::new(),
@@ -350,8 +422,8 @@ impl TypeCards {
         this
     }
 
-    /// What reopens these cards, as an action: the set they hold, where it is read, and the
-    /// file that is their cover.
+    /// What reopens these cards, as an action: the set they hold and where it is read. What a
+    /// card shows is the tab's format, saved beside it ([`Item::serialize`]).
     pub(crate) fn opening(&self) -> ShowSetInCards {
         ShowSetInCards {
             title: self.title.clone(),
@@ -363,7 +435,7 @@ impl TypeCards {
                 serde_json::json!({"property": sort.property, "descending": sort.descending})
             }),
             ids: self.ids.clone(),
-            cover: self.cover.clone(),
+            cover: None,
             at_commit: self.at_commit.clone(),
             snapshot: None,
             select: None,
@@ -402,25 +474,8 @@ impl TypeCards {
         self.span_read = None;
         self.scroll.set_offset(point(px(0.), px(0.)));
         self.schema = self.session.read(cx).schema_model();
-        self.files = self
-            .schema
-            .as_ref()
-            .and_then(|schema| schema.node(&self.type_name))
-            .map(|node| {
-                node.properties
-                    .iter()
-                    .filter(|p| p.kind == ScalarKind::Blob)
-                    .map(|p| p.name.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
-        if self
-            .cover
-            .as_ref()
-            .is_none_or(|property| !self.files.contains(property))
-        {
-            self.cover = self.files.first().cloned();
-        }
+        self.field_text.borrow_mut().clear();
+        self.read_format();
         if self.schema.is_none() {
             // The schema is read with the session; its event reads the set then.
             cx.notify();
@@ -933,7 +988,12 @@ impl TypeCards {
         } else {
             studio_ui::ds::size::WINDOW_WIDTH - studio_ui::ds::size::SIDEBAR_WIDTH
         };
-        grid_for(width, self.size.edge())
+        grid_for(
+            width,
+            size_edge(self.format.size),
+            self.cover.is_some(),
+            self.fields.len(),
+        )
     }
 
     /// How many rows are placed as cards: every row read, once the first page is in, and on a
@@ -1511,46 +1571,162 @@ impl TypeCards {
         }
     }
 
-    /// Shows another of the type's files as the cover. Every card keeps its place and its
-    /// size; the covers of the cards laid out are read.
-    fn show_cover(&mut self, property: String, cx: &mut Context<Self>) {
-        if self.cover.as_ref() == Some(&property) {
+    // ---- the format ----
+
+    /// The type as the schema has it now.
+    fn node_type(&self) -> Option<&gq_language::NodeType> {
+        self.schema.as_ref()?.node(&self.type_name)
+    }
+
+    /// Reads the tab's format against the schema as it is: the fields a card shows and its
+    /// cover, with what the type no longer has left out. The format is kept as it was written.
+    fn read_format(&mut self) {
+        let (face, files) = match self.node_type() {
+            Some(node) => (
+                card_format::face(&self.format, node),
+                card_format::files(node),
+            ),
+            None => (CardFace::default(), Vec::new()),
+        };
+        self.fields = face.fields;
+        self.cover = face.cover;
+        self.files = files;
+    }
+
+    /// Whether the tab shows another card than the default one: what the Fields chip's × and
+    /// "Reset to the default" undo.
+    fn format_changed(&self) -> bool {
+        self.node_type()
+            .is_some_and(|node| card_format::is_changed(&self.format, node))
+    }
+
+    /// Takes `format` as the tab's: every card is drawn again at its new height in its place,
+    /// the covers of the cards laid out are read when the cover changed, and the format is
+    /// kept as the type's in the settings, so the next Cards tab of the type opens the same
+    /// way (spec 048, "Where it is kept"). Other tabs open keep theirs.
+    fn set_format(&mut self, format: CardFormat, cx: &mut Context<Self>) {
+        if self.format == format {
             return;
         }
-        self.cover = Some(property);
+        let cover = self.cover.clone();
+        self.format = format;
+        self.read_format();
+        self.field_text.borrow_mut().clear();
+        // Other cards meet the same span at another height or size.
         self.span_read = None;
-        self.read_covers(cx);
+        if let Some(cursor) = self.cursor {
+            self.scroll_to_card(cursor);
+        }
+        if self.cover != cover {
+            self.read_covers(cx);
+        }
+        self.keep_format(cx);
         cx.emit(ItemEvent::UpdateTab);
         cx.notify();
     }
 
-    fn show_next_cover(&mut self, cx: &mut Context<Self>) {
-        let next = match &self.cover {
-            Some(shown) => self
-                .files
-                .iter()
-                .position(|file| file == shown)
-                .map(|ix| self.files[(ix + 1) % self.files.len()].clone()),
-            None => self.files.first().cloned(),
+    /// Writes the tab's format as the type's, for this graph. The default card is no entry.
+    fn keep_format(&self, cx: &mut Context<Self>) {
+        let Some(settings) = cx.try_global::<StudioSettings>() else {
+            return;
         };
-        if let Some(next) = next {
-            self.show_cover(next, cx);
+        let graph = self.session.read(cx).overrides_key();
+        let kept = Some(self.format.clone()).filter(|format| !format.is_default());
+        if settings.card_format(&graph, &self.type_name) == kept {
+            return;
         }
+        let type_name = self.type_name.clone();
+        studio_settings::update(cx, move |settings| {
+            settings.set_card_format(&graph, &type_name, kept)
+        });
+    }
+
+    /// Changes the format by `change`, which answers `None` when there is nothing to change
+    /// (a field shown already, a card that is full).
+    fn change_format(
+        &mut self,
+        change: impl FnOnce(&CardFormat, &gq_language::NodeType) -> Option<CardFormat>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(format) = self.node_type().and_then(|node| change(&self.format, node)) else {
+            return;
+        };
+        self.set_format(format, cx);
+    }
+
+    /// Shows the property `name` as a card's last field; nothing past eight.
+    pub(crate) fn show_field(&mut self, name: &str, cx: &mut Context<Self>) {
+        self.change_format(
+            |format, node| card_format::with_field_shown(format, node, name),
+            cx,
+        );
+    }
+
+    pub(crate) fn hide_field(&mut self, name: &str, cx: &mut Context<Self>) {
+        self.change_format(
+            |format, node| card_format::with_field_hidden(format, node, name),
+            cx,
+        );
+    }
+
+    /// Moves the field `name` up (`by` −1) or down (1) a card.
+    pub(crate) fn move_field(&mut self, name: &str, by: isize, cx: &mut Context<Self>) {
+        self.change_format(
+            |format, node| card_format::with_field_moved(format, node, name, by),
+            cx,
+        );
+    }
+
+    /// Shows the file `cover` as the cards' cover, or none.
+    pub(crate) fn show_cover(&mut self, cover: Option<&str>, cx: &mut Context<Self>) {
+        self.change_format(
+            |format, node| card_format::with_cover(format, node, cover),
+            cx,
+        );
+    }
+
+    /// F: the type's next file as the cover, then none, then the first again.
+    fn show_next_cover(&mut self, cx: &mut Context<Self>) {
+        self.change_format(card_format::with_next_cover, cx);
+    }
+
+    /// The default card, at the size the tab has.
+    pub(crate) fn reset_format(&mut self, cx: &mut Context<Self>) {
+        self.set_format(card_format::reset(&self.format), cx);
     }
 
     /// Another card size: the columns flow again, the previews held are kept, and the covers
     /// of the cards that now meet the view are asked for at the next draw.
     fn set_size(&mut self, size: CardSize, cx: &mut Context<Self>) {
-        if self.size == size {
-            return;
+        self.set_format(
+            CardFormat {
+                size,
+                ..self.format.clone()
+            },
+            cx,
+        );
+    }
+
+    /// What a row's fields show, made once and kept until the set is read again, the format
+    /// changes or, for a row with a date, the minute does.
+    fn row_fields(&self, row: &Row) -> Rc<RowFields> {
+        if let Some(made) = self
+            .field_text
+            .borrow()
+            .get(&row.id)
+            .filter(|made| made.minute.is_none_or(|minute| minute == self.frame_minute))
+        {
+            return made.clone();
         }
-        self.size = size;
-        self.span_read = None;
-        if let Some(cursor) = self.cursor {
-            self.scroll_to_card(cursor);
-        }
-        cx.emit(ItemEvent::UpdateTab);
-        cx.notify();
+        let (shown, temporal) = fields_shown(&self.fields, row, self.frame_now);
+        let made = Rc::new(RowFields {
+            shown,
+            minute: temporal.then_some(self.frame_minute),
+        });
+        self.field_text
+            .borrow_mut()
+            .insert(row.id.clone(), made.clone());
+        made
     }
 
     // ---- what it opens ----
@@ -1641,7 +1817,7 @@ impl TypeCards {
             .child(
                 studio_ui::ds::toolbar_actions()
                     .gap(px(space::SM))
-                    .child(self.render_cover_menu(cx))
+                    .child(self.render_fields_menu(cx))
                     .child(self.render_sizes(cx)),
             )
     }
@@ -1667,62 +1843,88 @@ impl TypeCards {
         )
     }
 
-    /// The Cover chip: which of the type's files the cards show as their cover.
-    fn render_cover_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// What the Fields menu lists: the fields shown, in card order; the properties that could
+    /// be shown, in schema order; the type's files and which is the cover; and whether the
+    /// card is other than the default one.
+    pub(crate) fn field_choices(&self) -> FieldChoices {
+        let shown: Vec<String> = self
+            .fields
+            .iter()
+            .map(|property| property.name.clone())
+            .collect();
+        let hidden = self
+            .node_type()
+            .map(|node| {
+                card_format::field_choices(node)
+                    .into_iter()
+                    .map(|property| property.name.clone())
+                    .filter(|name| !shown.contains(name))
+                    .collect()
+            })
+            .unwrap_or_default();
+        FieldChoices {
+            full: shown.len() >= CardFormat::MOST_FIELDS,
+            shown,
+            hidden,
+            files: self.files.clone(),
+            cover: self.cover.clone(),
+            changed: self.format_changed(),
+        }
+    }
+
+    /// The Fields chip (spec 048): what a card shows. Its menu stays open while it is used:
+    /// the fields shown, each with Move up, Move down and Hide; the ones that could be shown;
+    /// the cover, for a type with a file; and the way back to the default card, which the
+    /// chip's × is too.
+    fn render_fields_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let cards = cx.entity().downgrade();
-        let (files, shown) = (self.files.clone(), self.cover.clone());
-        let menu = PopoverMenu::new("cards-cover-menu")
+        let open = self.fields_menu.is_deployed();
+        let changed = self.format_changed();
+        let shown = self.fields.len();
+        let menu = PopoverMenu::new("cards-fields-menu")
             .anchor(gpui::Anchor::TopRight)
+            .with_handle(self.fields_menu.clone())
             .trigger(
                 studio_ui::ds::chip_button(
-                    "cards-cover",
-                    IconName::Image,
-                    "Cover",
-                    self.cover.clone().map(SharedString::from),
+                    "cards-fields",
+                    IconName::Eye,
+                    "Fields",
+                    changed.then(|| format!("{shown} shown").into()),
                 )
-                .disabled(self.files.len() < 2)
-                .tip(if self.files.len() < 2 {
-                    studio_ui::ds::tooltip(format!(
-                        "The cover is {}, the type's one file",
-                        self.cover.as_deref().unwrap_or("no file")
+                .when(!open, |button| {
+                    button.tip(studio_ui::ds::tooltip(
+                        "Choose what a card shows: its fields, their order and its cover",
                     ))
-                } else {
-                    studio_ui::ds::tooltip_for_action_in(
-                        "Which file is the cover",
-                        &ShowNextCover,
-                        &self.focus_handle,
-                    )
                 }),
             )
             .menu(move |window, cx| {
-                let (cards, files, shown) = (cards.clone(), files.clone(), shown.clone());
-                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                    for file in &files {
-                        let (cards, chosen) = (cards.clone(), file.clone());
-                        menu = menu.toggleable_entry(
-                            file.clone(),
-                            shown.as_ref() == Some(file),
-                            ui::IconPosition::Start,
-                            None,
-                            move |_, cx| {
-                                cards
-                                    .update(cx, |cards, cx| cards.show_cover(chosen.clone(), cx))
-                                    .ok();
-                            },
-                        );
-                    }
-                    menu
-                }))
+                let cards = cards.clone();
+                Some(ContextMenu::build_persistent(
+                    window,
+                    cx,
+                    move |menu, _, cx| {
+                        let menu = menu.keep_open_on_confirm(true);
+                        match cards.upgrade() {
+                            Some(entity) => {
+                                fields_menu(menu, entity.read(cx).field_choices(), cards.clone())
+                            }
+                            None => menu,
+                        }
+                    },
+                ))
             });
-        studio_ui::ds::control_chip("cards-cover-chip", menu)
+        let reset = cx.listener(|this, _, _, cx| this.reset_format(cx));
+        studio_ui::ds::control_chip("cards-fields-chip", menu).when(changed, |chip| {
+            chip.on_clear("Show the default card", reset)
+        })
     }
 
     /// The card size, as a segmented control; the keys that step it are in its tooltips.
     fn render_sizes(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let focus = self.focus_handle.clone();
         studio_ui::ds::segmented_track(cx).children(CardSize::ALL.into_iter().map(|size| {
-            let current = size == self.size;
-            studio_ui::ds::segment(("cards-size", size as usize), size.label(), current, cx)
+            let current = size == self.format.size;
+            studio_ui::ds::segment(("cards-size", size as usize), size_label(size), current, cx)
                 .tip(match size {
                     CardSize::Small => {
                         studio_ui::ds::tooltip_for_action_in("Small cards", &SmallerCards, &focus)
@@ -1759,13 +1961,6 @@ impl TypeCards {
                 .into_any_element();
             }
             Loadable::Loaded(()) => {}
-        }
-        if self.cover.is_none() {
-            return studio_ui::ds::empty_state(
-                IconName::Image,
-                format!("{} has no files now", self.type_name),
-            )
-            .into_any_element();
         }
         // Pages that showed no row read on: the set is empty only once read whole.
         if self.rows.is_empty() && !self.paging.exhausted {
@@ -1852,8 +2047,27 @@ impl TypeCards {
         {
             self.laid_out_last = drawn.len();
         }
+        // A date reads relative to now, as of this frame.
+        self.frame_now = chrono::Local::now();
+        self.frame_minute = self.frame_now.timestamp().div_euclid(60);
+        // The fields' names take one width, the widest of them and a third of the card at
+        // most, so every value starts on one edge.
+        let third = ((grid.width() - 2. * card_inset()) / 3.).floor();
+        let label_width = self
+            .fields
+            .iter()
+            .map(|property| {
+                f32::from(studio_ui::cell_text_width(
+                    property.name.clone(),
+                    window,
+                    cx,
+                ))
+                .ceil()
+            })
+            .fold(0., f32::max)
+            .min(third);
         let cards: Vec<AnyElement> = drawn
-            .filter_map(|row| self.render_card(row, &grid, cx))
+            .filter_map(|row| self.render_card(row, &grid, label_width, cx))
             .collect();
         div()
             .relative()
@@ -1870,22 +2084,28 @@ impl TypeCards {
             .into_any_element()
     }
 
-    /// One card: its cover, a box of one shape across it, then the node's name on one line.
-    /// The cursor's card is ringed in the focus colour, a picked one filled and checked, and a
-    /// branch's change marked as every change is (spec 033). One element id and one click
-    /// handler a card.
+    /// One card: its cover, a box of one shape across it, when the format has one; the node's
+    /// name on one line; then a line a field, its name and its value. The cursor's card is
+    /// ringed in the focus colour, a picked one filled and checked, and a branch's change
+    /// marked as every change is (spec 033). One element id and one click handler a card;
+    /// none a field.
     fn render_card(
         &self,
         ix: usize,
         grid: &CardGrid,
+        label_width: f32,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let row = self.rows.get(ix)?;
         let (left, top) = grid.place_of(ix);
         let width = grid.width();
         let radii = studio_ui::ds::radii(cx);
-        let property = self.cover.clone().unwrap_or_default();
-        let cover = self.covers.get(&(row.id.clone(), property.clone()));
+        let cover = self.cover.as_ref().map(|property| {
+            (
+                property,
+                self.covers.get(&(row.id.clone(), property.clone())),
+            )
+        });
         let cursor = self.cursor == Some(ix);
         let picked = self.picks.contains(&row.id);
         let change = self.change_of(&row.id);
@@ -1896,25 +2116,75 @@ impl TypeCards {
         let outer = radii.md;
         let well_radius = studio_ui::ds::radius::within(outer, card_inset());
         let inner = width - 2. * card_inset();
-        let cover_height = cover_height(width);
+        // With no cover's box to give it a body, a card is drawn on the fill the box has, so a
+        // title and its fields read as a card and not as lines of a list.
         let fill = if cursor {
             Some(studio_ui::ds::surface::selected_document(cx))
         } else if picked {
             Some(studio_ui::ds::surface::picked(cx))
+        } else if self.cover.is_none() {
+            Some(studio_ui::ds::surface::well(cx))
         } else {
             None
         };
-        let preview = self.render_cover(cover, inner, cover_height, well_radius, cx);
         let kind = change.map(|net| match net {
             NetChange::Added => ChangeKind::Added,
             NetChange::Changed => ChangeKind::Changed,
             NetChange::Removed => ChangeKind::Removed,
         });
-        let tip = match self.cover_line(&row.id, cover, &property) {
+        // A bar of the change's colour along the top: the cover's top edge, or the card's.
+        let bar = kind
+            .filter(|kind| *kind != ChangeKind::Removed)
+            .map(|kind| kind.color().color(cx));
+        let line = cover.and_then(|(property, cover)| self.cover_line(&row.id, cover, property));
+        let tip = match line {
             Some(line) => studio_ui::ds::tooltip(name.clone()).meta(line),
             None => studio_ui::ds::tooltip(name.clone()),
         };
         let title = studio_ui::cell_text(name, cx).weight(studio_ui::ds::text::weight::HEADING);
+        let well = cover.map(|(_, cover)| {
+            let cover_height = cover_height(width);
+            div()
+                .relative()
+                .flex_none()
+                .w(px(inner))
+                .h(px(cover_height))
+                .rounded(px(well_radius))
+                .overflow_hidden()
+                .bg(studio_ui::ds::surface::well(cx))
+                .child(self.render_cover(cover, inner, cover_height, well_radius, cx))
+                .when_some(bar, |well, color| {
+                    well.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .w_full()
+                            .h(px(studio_ui::ds::size::ACCENT_LINE))
+                            .bg(color),
+                    )
+                })
+                .when(picked, |well| {
+                    well.child(
+                        div()
+                            .absolute()
+                            .top(px(space::SM))
+                            .left(px(space::SM))
+                            .child(studio_ui::ds::picked_mark(cx)),
+                    )
+                })
+        });
+        let covered = well.is_some();
+        let lines: Vec<AnyElement> = if self.fields.is_empty() {
+            Vec::new()
+        } else {
+            let fields = self.row_fields(row);
+            self.fields
+                .iter()
+                .zip(&fields.shown)
+                .map(|(property, shown)| self.render_field(&property.name, shown, label_width, cx))
+                .collect()
+        };
         Some(
             v_flex()
                 .id(("card", ix))
@@ -1939,41 +2209,19 @@ impl TypeCards {
                 .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                     this.click_card(ix, event, window, cx)
                 }))
-                .child(
-                    div()
-                        .relative()
-                        .flex_none()
-                        .w(px(inner))
-                        .h(px(cover_height))
-                        .rounded(px(well_radius))
-                        .overflow_hidden()
-                        .bg(studio_ui::ds::surface::well(cx))
-                        .child(preview)
-                        // A bar of the change's colour along the cover's top edge.
-                        .when_some(
-                            kind.filter(|kind| *kind != ChangeKind::Removed),
-                            |well, kind| {
-                                well.child(
-                                    div()
-                                        .absolute()
-                                        .top_0()
-                                        .left_0()
-                                        .w_full()
-                                        .h(px(studio_ui::ds::size::ACCENT_LINE))
-                                        .bg(kind.color().color(cx)),
-                                )
-                            },
-                        )
-                        .when(picked, |well| {
-                            well.child(
-                                div()
-                                    .absolute()
-                                    .top(px(space::SM))
-                                    .left(px(space::SM))
-                                    .child(studio_ui::ds::picked_mark(cx)),
-                            )
-                        }),
-                )
+                .children(well)
+                // With no cover the bar runs along the card's own top, inside its corners.
+                .when_some(bar.filter(|_| !covered), |card, color| {
+                    card.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left(px(outer))
+                            .right(px(outer))
+                            .h(px(studio_ui::ds::size::ACCENT_LINE))
+                            .bg(color),
+                    )
+                })
                 .child(
                     h_flex()
                         .flex_none()
@@ -1988,10 +2236,54 @@ impl TypeCards {
                         .when_some(kind, |line, kind| {
                             line.child(studio_ui::ds::text::body(kind.symbol()).color(kind.color()))
                         })
-                        .child(if removed { title.struck() } else { title }),
+                        .child(if removed { title.struck() } else { title })
+                        // With no cover to carry it, the check is at the title's end.
+                        .when(picked && !covered, |line| {
+                            line.child(studio_ui::ds::picked_mark(cx))
+                        }),
                 )
+                .children(lines)
                 .into_any_element(),
         )
+    }
+
+    /// One field's line: its name in the muted colour, in the width every name of the card
+    /// takes, then its value as the table's cell shows it, cut where the card ends. No element
+    /// id and no handler: the card takes the click, and the inspector shows the whole value.
+    fn render_field(
+        &self,
+        name: &str,
+        shown: &FieldShown,
+        label_width: f32,
+        cx: &App,
+    ) -> AnyElement {
+        let value: AnyElement = match shown {
+            FieldShown::Null => studio_ui::cell_text("—", cx)
+                .color(Color::Disabled.color(cx))
+                .into_any_element(),
+            // A chip keeps its width: one wider than the card's room is cut at the card's edge.
+            FieldShown::Member(member) => h_flex()
+                .min_w_0()
+                .flex_1()
+                .overflow_hidden()
+                .child(studio_ui::ds::chip(member.clone(), cx))
+                .into_any_element(),
+            FieldShown::Text(text) => studio_ui::cell_text(text.clone(), cx).into_any_element(),
+        };
+        h_flex()
+            .flex_none()
+            .h(px(studio_ui::ds::size::CARD_LINE))
+            .px(px(space::XS))
+            .gap(px(space::MD))
+            .items_center()
+            .child(
+                h_flex()
+                    .flex_none()
+                    .w(px(label_width))
+                    .child(studio_ui::cell_text(name.to_owned(), cx).color(Color::Muted.color(cx))),
+            )
+            .child(value)
+            .into_any_element()
     }
 
     /// What a card's tooltip says of its cover, under the node's name: what the file is, why
@@ -2158,6 +2450,119 @@ async fn read_bytes(
         bytes.extend(chunk);
     }
     Ok(bytes)
+}
+
+/// What the Fields menu lists ([`TypeCards::field_choices`]).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FieldChoices {
+    /// The fields a card shows, in card order.
+    pub shown: Vec<String>,
+    /// The properties that could be shown and are not, in schema order.
+    pub hidden: Vec<String>,
+    /// A card shows as many fields as it may: none can be added.
+    pub full: bool,
+    /// The type's file properties, and the one that is the cover.
+    pub files: Vec<String>,
+    pub cover: Option<String>,
+    /// The card is other than the default one.
+    pub changed: bool,
+}
+
+/// What the Fields menu says in place of "Not shown" once a card is full.
+pub(crate) const CARD_FULL: &str = "A card shows at most 8 fields";
+
+/// The Fields menu's rows for `choices`, each acting on `cards`.
+fn fields_menu(
+    mut menu: ContextMenu,
+    choices: FieldChoices,
+    cards: WeakEntity<TypeCards>,
+) -> ContextMenu {
+    /// A row's handler: `change` made to the field `name` of `cards`.
+    fn act(
+        cards: &WeakEntity<TypeCards>,
+        change: fn(&mut TypeCards, &str, &mut Context<TypeCards>),
+        name: &str,
+    ) -> impl Fn(&mut Window, &mut App) + 'static {
+        let (cards, name) = (cards.clone(), name.to_owned());
+        move |_, cx| {
+            cards.update(cx, |cards, cx| change(cards, &name, cx)).ok();
+        }
+    }
+    if !choices.shown.is_empty() {
+        menu = menu.header("Fields");
+    }
+    let last = choices.shown.len().saturating_sub(1);
+    for (at, name) in choices.shown.iter().enumerate() {
+        let (cards, field) = (cards.clone(), name.clone());
+        menu = menu.submenu(name.clone(), move |menu, _, _| {
+            menu.item(
+                ContextMenuEntry::new("Move up")
+                    .disabled(at == 0)
+                    .handler(act(
+                        &cards,
+                        |cards, name, cx| cards.move_field(name, -1, cx),
+                        &field,
+                    )),
+            )
+            .item(
+                ContextMenuEntry::new("Move down")
+                    .disabled(at == last)
+                    .handler(act(
+                        &cards,
+                        |cards, name, cx| cards.move_field(name, 1, cx),
+                        &field,
+                    )),
+            )
+            .separator()
+            .entry("Hide", None, act(&cards, TypeCards::hide_field, &field))
+        });
+    }
+    if !choices.hidden.is_empty() {
+        menu = menu.header(if choices.full { CARD_FULL } else { "Not shown" });
+    }
+    for name in &choices.hidden {
+        menu = menu.item(
+            ContextMenuEntry::new(name.clone())
+                .disabled(choices.full)
+                .handler(act(&cards, TypeCards::show_field, name)),
+        );
+    }
+    if !choices.files.is_empty() {
+        menu = menu.header("Cover");
+        for file in &choices.files {
+            let (cards, chosen) = (cards.clone(), file.clone());
+            menu = menu.toggleable_entry(
+                file.clone(),
+                choices.cover.as_ref() == Some(file),
+                ui::IconPosition::Start,
+                None,
+                move |_, cx| {
+                    cards
+                        .update(cx, |cards, cx| cards.show_cover(Some(&chosen), cx))
+                        .ok();
+                },
+            );
+        }
+        let cards = cards.clone();
+        menu = menu.toggleable_entry(
+            "None",
+            choices.cover.is_none(),
+            ui::IconPosition::Start,
+            None,
+            move |_, cx| {
+                cards
+                    .update(cx, |cards, cx| cards.show_cover(None, cx))
+                    .ok();
+            },
+        );
+    }
+    menu.separator().item(
+        ContextMenuEntry::new("Reset to the default")
+            .disabled(!choices.changed)
+            .handler(move |_, cx| {
+                cards.update(cx, |cards, cx| cards.reset_format(cx)).ok();
+            }),
+    )
 }
 
 impl Item for TypeCards {
@@ -2331,15 +2736,18 @@ impl Item for TypeCards {
         Some(crate::cards_key(&self.opening()).into())
     }
 
-    /// Saved as kind `cards`: the set, the file that is the cover, and the card size. A tab
-    /// the gallery saved (kind `gallery`, its cover as `property`) is read the same way
-    /// ([`crate::saved_cards`]).
+    /// Saved as kind `cards`: the set, and the tab's format as `format`, which the tab keeps
+    /// when it comes back whatever the type's is by then. A tab saved before formats (its
+    /// cover and size beside the set) and one the gallery saved (kind `gallery`, its cover as
+    /// `property`) are read by [`crate::saved_cards`] too.
     fn serialize(&self, _cx: &App) -> Option<SavedItem> {
         let mut data = serde_json::to_value(self.opening()).ok()?;
         if let Some(map) = data.as_object_mut() {
+            // The format names the cover now.
+            map.remove("cover");
             map.insert(
-                "size".into(),
-                serde_json::to_value(self.size).unwrap_or(Value::Null),
+                "format".into(),
+                serde_json::to_value(&self.format).unwrap_or(Value::Null),
             );
         }
         Some(SavedItem {
@@ -2385,15 +2793,20 @@ impl Item for TypeCards {
             key("Move", &MoveRight),
             key("Inspector", &ToggleInspector),
             key("Open page", &OpenPage),
-            key("Open the cover", &OpenCover),
+        ];
+        // What a card with no cover has no file for.
+        if self.cover.is_some() {
+            keys.push(key("Open the cover", &OpenCover));
+        }
+        keys.extend([
             key("Canvas", &ShowOnCanvas),
             key("Pick", &TogglePick),
             key("Pick all", &PickAll),
             key("Clear picks", &Cancel),
             key("Copy ids", &CopyIds),
-        ];
-        // Bound only while the type has another file to show.
-        if self.files.len() > 1 {
+        ]);
+        // Registered only while the type has a file to show.
+        if !self.files.is_empty() {
             keys.push(key("Next cover", &ShowNextCover));
         }
         keys.extend([
@@ -2444,17 +2857,17 @@ impl Render for TypeCards {
             .on_action(cx.listener(|this, _: &PickAll, _, cx| this.pick_all(cx)))
             .on_action(cx.listener(|this, _: &Cancel, _, cx| this.cancel(cx)))
             .on_action(cx.listener(|this, _: &CopyIds, _, cx| this.copy_ids(cx)))
-            .when(self.files.len() > 1, |cards| {
+            .when(!self.files.is_empty(), |cards| {
                 cards.on_action(
                     cx.listener(|this, _: &ShowNextCover, _, cx| this.show_next_cover(cx)),
                 )
             })
             .on_action(cx.listener(|this, _: &LargerCards, _, cx| {
-                let size = this.size.larger();
+                let size = this.format.size.larger();
                 this.set_size(size, cx)
             }))
             .on_action(cx.listener(|this, _: &SmallerCards, _, cx| {
-                let size = this.size.smaller();
+                let size = this.format.size.smaller();
                 this.set_size(size, cx)
             }))
             .on_action(cx.listener(|this, _: &Refresh, _, cx| this.refresh(cx)))

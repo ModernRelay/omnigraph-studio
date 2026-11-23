@@ -1,8 +1,9 @@
 # 048: Cards, a view of a type's nodes
 
-Status: accepted 2026-11-23 · slice 1 built 2026-11-23 (Gallery is Cards: the names and their
-aliases, a saved `gallery` tab restored, the uniform grid, ↵, ⌥↵ and G; a card is its cover and
-its title, offered where Gallery was); slices 2 to 7 not built · supersedes
+Status: accepted 2026-11-23 · slices 1 and 2 built 2026-11-23 (1: Gallery is Cards: the names
+and their aliases, a saved `gallery` tab restored, the uniform grid, ↵, ⌥↵ and G. 2: a card
+shows fields under its title, the format with its Fields menu, kept by tab and by type; Cards
+for every node type and from a tree of a set); slices 3 to 7 not built · supersedes
 [035](../035-gallery/plan.md), whose Gallery left the app with slice 1 · Studio's claims checked
 against `7f3e7e92` on 2026-11-23; Omnigraph's are spec 035's, checked against `v0.15.0` on
 2026-11-18 and not rechecked
@@ -409,7 +410,7 @@ Each slice is a pull request that stands alone.
 | 2026-11-23 | A saved tab of an unregistered kind is dropped, and kinds have no aliases | Read `persistence.rs` and `Workspace::restore_saved` | Confirmed by reading |
 | 2026-11-23 | A saved view's shape is never read; a results canvas is not saved | Read `studio_settings.rs`, `type_table.rs` (`open_saved_view`), `graph_canvas.rs` (`serialize`) | Confirmed by reading |
 
-Slice 1 is built; slices 2 to 7 are not. Each slice adds its rows.
+Slices 1 and 2 are built; slices 3 to 7 are not. Each slice adds its rows.
 
 ### Slice 1 (2026-11-23)
 
@@ -444,9 +445,34 @@ grid's in place of the masonry's) and 3 replaced by their uniform-grid equivalen
 twice, where it read nothing) and `previews_past_the_cap_are_let_go_farthest_first` (no first bytes
 are held for rows measured ahead; a preview of a file that is no longer the cover goes first).
 
-What slice 1 leaves as Gallery had it, for the slices named: Cards is offered only for a type
-with a file (2); the toolbar's File chip stays, named Cover, and F goes round the type's files
-without None (2, the Fields menu); the set is fixed at opening (5).
+What slice 1 left as Gallery had it, for the slices named: Cards is offered only for a type
+with a file (2, built); the toolbar's File chip stays, named Cover, and F goes round the type's
+files without None (2, built: the Fields menu); the set is fixed at opening (5).
+
+### Slice 2 (2026-11-23)
+
+Built on `feat/cards-fields`, on `6f917dee`. The same machine and toolchain.
+
+| Date | Claim | Check | Result |
+|---|---|---|---|
+| 2026-11-23 | A format round-trips in the settings in each of its forms, and the default is no entry | `studio_settings` `card_formats_round_trip_and_the_default_is_no_entry`: three formats written and read as JSON (`{"property": …}`, `"none"`, the first file left out; `fields: []` kept; Medium left out), read from text written by hand, a size that is none of the three, the default set, the last entry of a graph cleared, and `document::edit` writing, changing and clearing one in a file with a comment and a node name | Pass. `cards` raises no "is not a setting" problem; a wrong `size` is set aside alone; a graph with nothing left is removed, and one with a node name stays; the comment and the name are kept |
+| 2026-11-23 | The default rule, and a format read against the schema | `type_table` `card_format::tests` (4): a type with two files, one with none, one whose first properties are the key and the name with a vector after them, one named by another property, one with only a key; a format naming a field and a cover the type lost, a file as a field, a field twice, twelve fields; show, hide, move, the ninth field, reset; the cover round the files and none | Pass. Three properties that are not the name, the key, a file or a vector; the first file, or no cover; what the schema lacks is left out and the format is not changed by being read |
+| 2026-11-23 | Every card is one height whatever its values hold | `cards::tests` `every_card_is_one_height_with_fields_whatever_they_hold`: twelve rows, half with a text of 1,000 characters on two lines, a list of five, an enum's member, a date and a number, half with none; the drawn bounds at three fields, at eight and with no cover | Pass: every card `card_height(width, cover, fields)`; five fields more are five `CARD_LINE` more; with no cover no file is read on a scroll to the end. A row's values are made once (`Rc::ptr_eq` across two keys) |
+| 2026-11-23 | The Fields menu shows, hides, moves and resets, within eight | `the_fields_menu_shows_hides_moves_and_resets`: the menu opened and its rows clicked (a property not shown, None, the file, a property past eight, Reset), the moves and Hide as its submenus call them | Pass: it stays open and lists the card as it is; the ninth is refused; reset keeps the size. `studio_ui` `menu::tests::a_persistent_menu_stays_open_after_a_choice_in_its_submenu` (a click and ↵ in a submenu) for the submenus themselves |
+| 2026-11-23 | A new tab takes the type's format, a restored tab keeps its own, and a change is written as the type's | `a_new_tab_takes_the_types_format_and_a_restored_tab_keeps_its_own`: five tabs of one type against settings held in memory | Pass: nothing is written by opening; a format naming a lost field and cover shows the rest and stays as written; a change in a tab is the type's at once and the next new tab's; tabs open keep theirs; the default card removes the entry and the graph's |
+| 2026-11-23 | The same, in the settings file | The offscreen snapshot tool on a data folder of its own: `=` in Person's cards, then the file read; then files written by hand for Person, Project and a scratch Ticket type | `settings.json` gained `graphs."environment@http://127.0.0.1:8790/knowledge".cards.Person.size = "large"`; new tabs drew the fields, order and size the files named |
+| 2026-11-23 | Old tabs restore | `a_saved_gallery_tab_comes_back_as_cards`, extended: two gallery tabs (`property`, `size`) and one saved by slice 1 (`cover`, `size`), through the workspace's opener | Pass: that cover, that size, the default fields; saved again with `format` and none of the three old keys |
+| 2026-11-23 | F goes round the files and none | `the_arrows_move_in_row_order_and_by_lines` (two files): F, F, F | scan, none (no card has the box, nothing is wanted read), the first file again, kept as the default |
+| 2026-11-23 | Every node table and a tree of a set list Cards | `type_table` `tree_holds_the_tables_rows_and_canvas_the_row_under_the_cursor` (Person, no file); `relationship_tree` `a_set_opens_closed_and_canvas_takes_the_selected_node` and `listed_nodes_are_the_set_and_a_set_is_known_by_what_it_holds`; `cards::tests` `a_type_with_no_file_has_cards_without_a_cover` | Pass: Table · Tree · Canvas · Cards with the two tooltips; the tree's action carries the set's filters or its listed ids, the commit it read and the selected row; a type with no file draws cards, reads no file and binds no F |
+| 2026-11-23 | A format change draws the cards once; an arrow key still does with fields | `a_format_change_draws_the_cards_once`: six keys with three fields shown, then a field shown, moved, hidden, another size, no cover, the default card, and two changes that change nothing | Pass: one draw each; none for nothing. In memory: see Corrections for the settings file |
+| 2026-11-23 | Cards with fields look right | Offscreen snapshots at 1440 × 900, read: Note at S, M and L; Topic and Person (no file); Person with its six properties; Project at Small; a scratch type `Ticket` (an enum, a second enum, a date, a time, a number, a list, a long nullable text, a file) with the default card and with eight fields; the Fields menu on both; the dark theme twice; a branch with a company added, changed and removed | Names in one column and values on one edge; long text cut with an ellipsis; chips, dashes, "Today", "3 h ago", "a, b, c +2"; cards of one height; no-cover cards on a faint fill. The first Topic picture showed titles with nothing around them, which the fill answers (Corrections) |
+| 2026-11-23 | The workspace's checks | The same seven commands | All pass. Tests: 1,754 passed, 0 failed, 9 ignored in the 54 harnessed binaries (`type_table` 316 and 1 ignored, `studio_settings` 50, `studio_ui` 65, `relationship_tree` 17), and the 7 checks of `keymaps`. `layers ok: 24 crates; 64 UI tools in their crate`, `design tokens ok`, `brand ok: 544 files`, 8 release-file tests OK |
+
+`cards::tests` holds 30 tests: slice 1's 25, of which `the_columns_fill_the_width`,
+`the_arrows_move_in_row_order_and_by_lines` and `a_saved_gallery_tab_comes_back_as_cards` now
+assert more (a card's height with fields and without a cover; F through none; the format a
+restored tab has and saves), and 5 new. The table's strip test changed what it asserts: a table
+of a type with no file listed three views and now lists four.
 
 ## Corrections
 
@@ -477,3 +503,37 @@ without None (2, the Fields menu); the set is fixed at opening (5).
 - 2026-11-23 · **The tab scrolls to the card it opened at once the grid is measured**, in the
   first frame that knows its width. The gallery scrolled when the tile was placed, from a
   width it guessed.
+
+Slice 2:
+
+- 2026-11-23 · **A menu that stays open closed on a choice in its submenu.** The Fields menu's
+  Move up, Move down and Hide are in submenus, and Zed's menu, which Studio's is a copy of,
+  dismisses the whole menu when a submenu's row is chosen. The copy (`studio_ui/src/menu.rs`)
+  now keeps a menu built with `build_persistent` open, builds it again and gives it the
+  keyboard back. No other menu of Studio's is both persistent and has a submenu.
+- 2026-11-23 · **The fields' names take one width**: the widest name's, and a third of the card
+  at most, so every value of a card starts on one edge. "A card" says each name is cut to a
+  third; alone, that leaves the values ragged.
+- 2026-11-23 · **A card with no cover is drawn on the fill the cover's box has.** Without it a
+  type with no file (Topic) drew as bare titles in a grid. Its check is at the title's end and
+  its change bar along the card's own top, since both sat on the cover.
+- 2026-11-23 · **Reset, and the chip's ×, leave the size.** They undo the fields and the cover;
+  the size has its own control beside them, and a chip named Fields that offered a reset
+  because the cards were Large would mislead. The size is still part of the format kept.
+- 2026-11-23 · **What can be a field** is every property but a file and a vector: the key and
+  the name can be chosen, and only the default rule leaves them out.
+- 2026-11-23 · **What equals the default is kept as the default.** Fields put back as the
+  default rule has them are kept as no list, and the type's first file chosen as the cover as
+  no cover, so a card that looks like the default one is the default one: the × goes and the
+  settings entry with it.
+- 2026-11-23 · **Writing the settings file draws every window again when the write lands**
+  (`studio_settings::update`, for every setting). In the app a format change, `=`, `−` and F
+  among them, so draws the cards once at once and once more some milliseconds later. The
+  guard holds for the change itself, with settings kept in memory.
+- 2026-11-23 · **The `knowledge` graph has no type with an enum, a date and a nullable text,
+  nor one with eight properties**: Person has six that can be fields, Project four. The
+  pictures of eight fields are of a type made for them in a scratch graph on the slice's own
+  development server; nothing of it is in the repository.
+- 2026-11-23 · **An action that names a cover** (`ShowSetInCards.cover`, as the gallery's
+  keymap entries could) still shows that file, for the tab it opens, over the type's format,
+  and writes nothing. Studio itself no longer sets it.
