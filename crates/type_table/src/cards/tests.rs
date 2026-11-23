@@ -3212,3 +3212,463 @@ async fn a_draft_with_no_value_field_takes_enter_and_esc(cx: &mut TestAppContext
     cx.run_until_parked();
     assert_eq!(heard.borrow().len(), 1);
 }
+
+// ---- relationships as fields (spec 048, slice 6) ----
+
+/// Notes filed under topics: Note has a file and one relationship, whose key a format names.
+const FILED: &str = "node Note {\n  slug: String @key\n  title: String\n  attachment: Blob?\n}\n\
+    node Topic {\n  slug: String @key\n  name: String\n}\n\
+    edge FiledUnder: Note -> Topic @card(0..)\n";
+const FILED_UNDER: &str = "out:FiledUnder";
+
+/// How many topics note `i` is filed under: none, one, two, three, and round again.
+fn topics_of(i: usize) -> usize {
+    i % 4
+}
+
+/// As [`notes_answering`], and the relationship reads of the notes a read names: how many
+/// topics each is filed under, and those topics, `t0` on, by name.
+fn filed_answering(total: usize) -> impl Fn(&Value) -> Value + Send + Sync + 'static {
+    let notes = notes_answering(total);
+    move |request: &Value| {
+        let named = || -> Vec<(String, usize)> {
+            request["params"]["ids"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .filter_map(|id| Some((id.to_owned(), id.trim_start_matches('n').parse().ok()?)))
+                .collect()
+        };
+        match request["name"].as_str().unwrap_or_default() {
+            "studio_page_degrees" => Value::from(
+                named()
+                    .into_iter()
+                    .map(|(id, i)| json!({ "id": id, "n": topics_of(i) }))
+                    .collect::<Vec<_>>(),
+            ),
+            "studio_page_neighbours" => Value::from(
+                named()
+                    .into_iter()
+                    .flat_map(|(id, i)| {
+                        (0..topics_of(i)).map(move |k| {
+                            json!({ "id": id, "other": format!("t{k}"), "label": format!("Topic {k}") })
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            _ => notes(request),
+        }
+    }
+}
+
+/// A card that shows the notes' topics, and no cover unless `cover`.
+fn filed_format(cover: bool) -> CardFormat {
+    CardFormat {
+        fields: Some(vec![FILED_UNDER.into()]),
+        cover: if cover {
+            CardCover::First
+        } else {
+            CardCover::None
+        },
+        ..CardFormat::default()
+    }
+}
+
+/// The notes a relationship read named, of every read of `name` sent so far, in order.
+fn rows_asked(served: &crate::test_support::Served, name: &str) -> Vec<Vec<String>> {
+    served
+        .sent(name)
+        .iter()
+        .map(|read| {
+            read["params"]["ids"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|id| id.as_str().map(str::to_owned))
+                .collect()
+        })
+        .collect()
+}
+
+/// A relationship field shows a row's neighbours by name, as the table's cell does: the first
+/// that fit as tags, "+N" for the rest, the count alone when no tag fits, a dash for none,
+/// nothing before they are read, and "?" when the count could not be.
+#[gpui::test]
+async fn a_card_shows_a_relationships_neighbours(cx: &mut TestAppContext) {
+    init(cx);
+    let (session, _, _) = session_served(FILED, filed_answering(12), cx);
+    let (cards, cx) = open_with(session, opening("Note"), Some(filed_format(true)), cx);
+    cards.read_with(cx, |cards, _| {
+        assert_eq!(field_names(cards), [FILED_UNDER]);
+        let field = &cards.fields[0];
+        assert_eq!(
+            field.title, "filedUnder →",
+            "as the table titles its column"
+        );
+        assert!(field.relationship().is_some());
+        let (shown, temporal) = fields_shown(&cards.fields, &cards.rows[1], chrono::Local::now());
+        assert_eq!((shown, temporal), (vec![FieldShown::Related], false));
+
+        let tags = |names: &[&str]| names.iter().map(|name| (*name).into()).collect::<Vec<_>>();
+        let shown = |row: usize, width: f32| {
+            related_shown(
+                cards.relations.get(&format!("n{row:03}"), FILED_UNDER),
+                width,
+            )
+        };
+        assert_eq!(shown(0, 300.), RelatedShown::None, "no topic: a dash");
+        assert_eq!(
+            shown(1, 300.),
+            RelatedShown::Chips(tags(&["Topic 0"]), None)
+        );
+        assert_eq!(
+            shown(2, 300.),
+            RelatedShown::Chips(tags(&["Topic 0", "Topic 1"]), None)
+        );
+        assert_eq!(
+            shown(3, 300.),
+            RelatedShown::Chips(tags(&["Topic 0", "Topic 1"]), Some("+1".into())),
+            "past what a line shows"
+        );
+        // A narrower line gives the tags up whole and keeps the count.
+        assert_eq!(
+            shown(3, 90.),
+            RelatedShown::Chips(tags(&["Topic 0"]), Some("+2".into()))
+        );
+        assert_eq!(
+            shown(3, 20.),
+            RelatedShown::Chips(Vec::new(), Some("3".into()))
+        );
+        assert_eq!(related_shown(None, 300.), RelatedShown::Unread);
+        let failed = Relation {
+            count: Err("refused".into()),
+            neighbours: Vec::new(),
+            whole: false,
+        };
+        assert_eq!(related_shown(Some(&failed), 300.), RelatedShown::Failed);
+    });
+    // The Fields menu offers it by the column's title, after the properties.
+    let (session, _, _) = session_served(FILED, filed_answering(12), cx);
+    let (plain, cx) = open(session, opening("Note"), cx);
+    plain.read_with(cx, |cards, _| {
+        assert!(field_names(cards).is_empty(), "no relationship by default");
+        let choices = cards.field_choices();
+        assert_eq!(choices.hidden, ["slug", "title", FILED_UNDER]);
+        assert_eq!(
+            cards
+                .relationship_titles()
+                .get(FILED_UNDER)
+                .map(String::as_str),
+            Some("filedUnder →")
+        );
+        assert!(!choices.changed);
+    });
+}
+
+/// A card with no relationship field sends no relationship read. With one, the cards laid out
+/// are read a hundred rows at a time, two reads a hundred: their counts and their neighbours.
+#[gpui::test]
+async fn relationship_fields_cost_two_reads_a_hundred_cards(cx: &mut TestAppContext) {
+    init(cx);
+    let (session, _, served) = session_served(FILED, filed_answering(400), cx);
+    let (cards, cx) = open(session, opening("Note"), cx);
+    scroll_to_end(&cards, cx);
+    assert!(served.sent("studio_page_degrees").is_empty());
+    assert!(served.sent("studio_page_neighbours").is_empty());
+
+    // Small cards with no cover: more than a hundred are laid out at once.
+    cards.update(cx, |cards, cx| {
+        cards.scroll.set_offset(point(px(0.), px(0.)));
+        cards.show_cover(None, cx);
+        cards.set_size(CardSize::Small, cx);
+    });
+    settle(cx);
+    assert!(served.sent("studio_page_degrees").is_empty(), "still none");
+    cards.update(cx, |cards, cx| cards.show_field(FILED_UNDER, cx));
+    settle(cx);
+    let laid_out: Vec<String> = cards.read_with(cx, |cards, _| {
+        cards.rows[cards.laid_out()]
+            .iter()
+            .map(|row| row.id.clone())
+            .collect()
+    });
+    assert!(laid_out.len() > 100, "{} cards laid out", laid_out.len());
+    let reads = laid_out.len().div_ceil(100);
+    for name in ["studio_page_degrees", "studio_page_neighbours"] {
+        let asked = rows_asked(&served, name);
+        assert_eq!(asked.len(), reads, "{name}: one read a hundred cards");
+        assert!(asked.iter().all(|rows| rows.len() <= 100), "{name}");
+        // The reads of a relationship go out together: the server logs them as they come.
+        let mut rows = asked.concat();
+        rows.sort();
+        assert_eq!(rows, laid_out, "{name}: the cards laid out, each once");
+    }
+    cards.read_with(cx, |cards, _| {
+        assert!(cards.relations.tasks.is_empty(), "every read landed");
+        assert!(cards.relations.get(&laid_out[3], FILED_UNDER).is_some());
+    });
+}
+
+/// Only the cards near the view read their relationships: the lines a frame lays out. A
+/// scroll reads those it brings near, and none twice.
+#[gpui::test]
+async fn only_the_cards_near_the_view_read_their_relationships(cx: &mut TestAppContext) {
+    init(cx);
+    let (session, _, served) = session_served(FILED, filed_answering(400), cx);
+    let (cards, cx) = open_with(session, opening("Note"), Some(filed_format(true)), cx);
+    let (rows, near) = cards.read_with(cx, |cards, _| {
+        let near: Vec<String> = cards.rows[cards.laid_out()]
+            .iter()
+            .map(|row| row.id.clone())
+            .collect();
+        (cards.rows.len(), near)
+    });
+    assert!(near.len() < rows, "{} of {rows} rows laid out", near.len());
+    assert_eq!(rows_asked(&served, "studio_page_degrees").concat(), near);
+    assert_eq!(rows_asked(&served, "studio_page_neighbours").concat(), near);
+    cards.read_with(cx, |cards, _| {
+        let far = &cards.rows[rows - 1].id;
+        assert!(cards.relations.get(far, FILED_UNDER).is_none(), "not read");
+        assert_eq!(
+            related_shown(cards.relations.get(far, FILED_UNDER), 300.),
+            RelatedShown::Unread
+        );
+    });
+
+    // To the end and back: the cards brought near are read, and no card a second time.
+    scroll_to_end(&cards, cx);
+    let asked = rows_asked(&served, "studio_page_degrees").concat();
+    assert!(asked.len() > near.len(), "the cards at the end were read");
+    cards.update(cx, |cards, cx| {
+        cards.scroll.set_offset(point(px(0.), px(0.)));
+        cx.notify();
+    });
+    settle(cx);
+    let again = rows_asked(&served, "studio_page_degrees").concat();
+    assert_eq!(again, asked, "back at the start, nothing is asked again");
+    let mut once = again.clone();
+    once.sort();
+    once.dedup();
+    assert_eq!(once.len(), again.len(), "no card asked twice");
+}
+
+/// A relationship shown from the Fields menu is read at the commit the tab shows, not at the
+/// head, and kept as the type's format. A filter, an order and the field hidden and shown
+/// again ask for nothing it holds at this commit; Refresh reads it again, at the head.
+#[gpui::test]
+async fn a_relationship_field_added_reads_at_the_pin(cx: &mut TestAppContext) {
+    init(cx);
+    let (session, writer, served) = session_served(FILED, filed_answering(12), cx);
+    let (cards, cx) = open(session.clone(), opening("Note"), cx);
+    head_moves_to("c2", &session, &writer, &cards, cx);
+    // As the menu's row for it calls.
+    cards.update(cx, |cards, cx| cards.show_field(FILED_UNDER, cx));
+    settle(cx);
+    for name in ["studio_page_degrees", "studio_page_neighbours"] {
+        let sent = served.sent(name);
+        assert_eq!(sent.len(), 1, "{name}");
+        assert_eq!(sent[0]["snapshot"], json!("c1"), "{name} asked at the pin");
+        assert_eq!(sent[0]["at"], json!("c1"), "{name} answered there");
+    }
+    cards.read_with(cx, |cards, cx| {
+        assert_eq!(field_names(cards), [FILED_UNDER]);
+        assert_eq!(cards.paging.pinned.as_deref(), Some("c1"));
+        assert_eq!(
+            related_shown(cards.relations.get("n002", FILED_UNDER), 300.),
+            RelatedShown::Chips(vec!["Topic 0".into(), "Topic 1".into()], None)
+        );
+        assert!(
+            Item::keeps_preview(cards, cx),
+            "the person changed the card"
+        );
+    });
+    assert_eq!(
+        kept_format(&session, "Note", cx).and_then(|format| format.fields),
+        Some(vec![FILED_UNDER.to_owned()]),
+        "kept as the type's"
+    );
+
+    // What it holds at this commit is not asked for again.
+    cards.update(cx, |cards, cx| {
+        cards.set_sort(
+            Some(Sort {
+                property: "title".into(),
+                descending: true,
+            }),
+            cx,
+        )
+    });
+    settle(cx);
+    write_filter(&cards, "title", FilterOp::Contains, "Note", cx);
+    cards.update(cx, |cards, cx| {
+        cards.hide_field(FILED_UNDER, cx);
+        cards.show_field(FILED_UNDER, cx);
+    });
+    settle(cx);
+    assert_eq!(
+        served.sent("studio_page_degrees").len(),
+        1,
+        "nothing read again"
+    );
+    assert_eq!(served.sent("studio_page_neighbours").len(), 1);
+    cards.read_with(cx, |cards, _| {
+        assert_eq!(cards.rows.len(), 12);
+        assert!(
+            cards.relations.get("n003", FILED_UNDER).is_some(),
+            "still held"
+        );
+    });
+
+    // Refresh lets it go with the rows, and reads it for the head's.
+    cx.simulate_keystrokes("cmd-r");
+    settle(cx);
+    let sent = served.sent("studio_page_degrees");
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[1]["at"], json!("c2"));
+    cards.read_with(cx, |cards, _| {
+        assert_eq!(cards.paging.pinned.as_deref(), Some("c2"));
+        assert!(cards.relations.get("n003", FILED_UNDER).is_some());
+    });
+}
+
+/// Every card is one height before a relationship field's answers land and after, in the same
+/// place: the line is there from the start, empty. A screen of answers landing draws the
+/// cards once, not once a read or a card, and an arrow key still draws them once
+/// (`docs/drawing.md`).
+#[gpui::test]
+async fn relationship_fields_land_in_place_and_draw_the_cards_once(cx: &mut TestAppContext) {
+    init(cx);
+    let (session, _, served) = session_served(FILED, filed_answering(60), cx);
+    let degrees = served.hold(|read| read["name"] == "studio_page_degrees");
+    let neighbours = served.hold(|read| read["name"] == "studio_page_neighbours");
+    let (cards, cx) = open_with(session, opening("Note"), Some(filed_format(false)), cx);
+    // The first key switches GPUI to keyboard input, which draws the window once.
+    cx.simulate_keystrokes("right");
+    settle(cx);
+    let (height, placed) = cards.read_with(cx, |cards, _| {
+        assert_eq!(cards.relations.tasks.len(), 1, "one read out, held");
+        assert!(cards.relations.get("n001", FILED_UNDER).is_none());
+        (cards.card_grid().card_height(), cards.laid_out().len())
+    });
+    assert!(placed > 8 && placed <= 100, "{placed} cards laid out");
+    let drawn = |cx: &mut VisualTestContext| -> Vec<Bounds<Pixels>> {
+        (0..8)
+            .map(|ix| card_bounds(ix, cx).expect("drawn"))
+            .collect()
+    };
+    let before = drawn(cx);
+    for bounds in &before {
+        assert_eq!(f32::from(bounds.size.height), height);
+    }
+
+    let renders = grid_renders(&cards, cx);
+    degrees.send(()).unwrap();
+    cx.run_until_parked();
+    neighbours.send(()).unwrap();
+    cx.run_until_parked();
+    cards.read_with(cx, |cards, _| {
+        assert!(cards.relations.tasks.is_empty(), "both landed");
+        assert_eq!(
+            cards.relations.get("n002", FILED_UNDER).unwrap().count,
+            Ok(2)
+        );
+    });
+    assert_eq!(grid_renders(&cards, cx), renders, "not drawn as they land");
+    cx.executor().advance_clock(LANDING_DELAY);
+    cx.run_until_parked();
+    assert_eq!(
+        grid_renders(&cards, cx),
+        renders + 1,
+        "one draw for {placed} cards' counts and neighbours"
+    );
+    assert_eq!(drawn(cx), before, "no card moved or changed its size");
+
+    for key in ["down", "up", "left", "right", "end", "home"] {
+        let renders = grid_renders(&cards, cx);
+        cx.simulate_keystrokes(key);
+        cx.run_until_parked();
+        assert_eq!(grid_renders(&cards, cx), renders + 1, "one draw for {key}");
+    }
+}
+
+/// A saved tab keeps a relationship among its fields, by its key, and comes back showing and
+/// reading it. One the schema no longer has is left out and read for nothing, and the format
+/// is kept as it was written.
+#[gpui::test]
+async fn a_saved_tab_keeps_its_relationship_fields(cx: &mut TestAppContext) {
+    init(cx);
+    cx.update(crate::init);
+    let (session, writer, served) = session_served(FILED, filed_answering(12), cx);
+    let format = CardFormat {
+        fields: Some(vec!["title".into(), "out:Gone".into(), FILED_UNDER.into()]),
+        ..CardFormat::default()
+    };
+    let (cards, cx) = open_with(session.clone(), opening("Note"), Some(format.clone()), cx);
+    let saved = cards.read_with(cx, |cards, cx| {
+        assert_eq!(field_names(cards), ["title", FILED_UNDER], "the one it has");
+        assert_eq!(cards.format, format, "kept as written");
+        Item::serialize(cards, cx).expect("saved")
+    });
+    assert_eq!(
+        saved.data["format"]["fields"],
+        json!(["title", "out:Gone", FILED_UNDER])
+    );
+    for read in served.sent("studio_page_degrees") {
+        assert!(
+            read["query"].as_str().unwrap().contains("filedUnder"),
+            "{read}"
+        );
+    }
+    assert_eq!(served.sent("studio_page_degrees").len(), 1);
+
+    // In another window, as the next launch restores it.
+    let (workspace, cx) = cx.add_window_view(Workspace::new);
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.set_session(session.clone(), window, cx)
+    });
+    cx.run_until_parked();
+    assert!(workspace.update_in(cx, |workspace, window, cx| {
+        workspace.reopen_saved(&saved, window, cx)
+    }));
+    settle(cx);
+    let back = workspace
+        .read_with(cx, |workspace, _| {
+            workspace
+                .active_item()
+                .and_then(|item| item.to_any().downcast::<TypeCards>().ok())
+        })
+        .expect("a Cards tab is open");
+    back.read_with(cx, |back, _| {
+        assert_eq!(back.format, format);
+        assert_eq!(field_names(back), ["title", FILED_UNDER]);
+        assert_eq!(
+            related_shown(back.relations.get("n001", FILED_UNDER), 300.),
+            RelatedShown::Chips(vec!["Topic 0".into()], None)
+        );
+    });
+
+    // Another writer drops the relationship: after a refresh the card has no such field, the
+    // menu no such choice, and nothing is read for it.
+    let unfiled = "node Note {\n  slug: String @key\n  title: String\n  attachment: Blob?\n}\n\
+        node Topic {\n  slug: String @key\n  name: String\n}\n";
+    writer.set_schema(unfiled);
+    writer.commit("c2", vec![changed("node", "Note", "n001", None)]);
+    session.update(cx, |session, cx| session.check_heads(cx));
+    cx.run_until_parked();
+    let read_before = served.sent("studio_page_degrees").len();
+    back.update(cx, |back, cx| back.refresh(cx));
+    settle(cx);
+    back.read_with(cx, |back, _| {
+        assert_eq!(field_names(back), ["title"], "the relationship is left out");
+        assert_eq!(back.format, format, "and the format kept as written");
+        assert!(
+            !back
+                .field_choices()
+                .hidden
+                .contains(&FILED_UNDER.to_owned())
+        );
+        assert!(back.relations.get("n001", FILED_UNDER).is_none());
+    });
+    assert_eq!(served.sent("studio_page_degrees").len(), read_before);
+}

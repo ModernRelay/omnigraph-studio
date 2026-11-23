@@ -20,6 +20,7 @@ mod node_page;
 mod offers;
 mod pdf;
 mod peek;
+mod relations;
 mod suggest;
 mod table;
 #[cfg(test)]

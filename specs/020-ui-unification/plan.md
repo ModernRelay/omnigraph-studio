@@ -772,7 +772,9 @@ The first four record changes to the draft before it was built.
   tree of a set of one type, with the set still fixed at opening. Slice 5 (2026-11-23) gave the tab
   the table's filter bar and a Sort chip: the table hands it its filters as it holds them, a date
   preset still a preset, the tab's title and key follow the filters it has now, and a preview tab
-  whose filters, order or format the person changed is kept.
+  whose filters, order or format the person changed is kept. Slice 6 (2026-11-23) made a
+  relationship a field a card can show, read as the table's relationship column is, by code the
+  two now share (`relations.rs`).
 
 ## What this branch leaves open
 

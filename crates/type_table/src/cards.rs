@@ -3,7 +3,9 @@
 //! has one), its title and a line a field, placed in row order and never moved, one tab per
 //! set, read a page at a time at one commit. The tab keeps filters and an order of its own
 //! after it opens, with the table's filter bar (`filter_bar`): a change reads the set again at
-//! the commit the tab shows. What a card shows is the tab's format
+//! the commit the tab shows. A field is a property of the row or one of its relationships,
+//! whose neighbours are read as a table's relationship column reads them (`relations`), for
+//! the cards near the view. What a card shows is the tab's format
 //! (`card_format`): the tab saves it, and a change is kept as the type's in the settings. Each
 //! card's cover is read on its own through the Blob route once scrolling pauses, at most four
 //! at once, only for the cards a frame lays out, and drawn from a preview decoded and scaled
@@ -22,7 +24,7 @@ use gpui::{
     KeyContext, Render, ScrollHandle, SharedString, StyleRefinement, Subscription, Task,
     WeakEntity, Window, point,
 };
-use gq_language::{BuiltQuery, Filter, Property, ScalarKind, SchemaModel, Sort, builder};
+use gq_language::{BuiltQuery, Filter, RelationshipGroup, ScalarKind, SchemaModel, Sort, builder};
 use graph_client::api::ReadOutput;
 use graph_client::{BlobCell, BlobMeta, HistoricalGap, PropertyThen, ReadError};
 use graph_store::scope::ReadScope;
@@ -49,11 +51,12 @@ use ui::prelude::*;
 use ui::{PopoverMenu, PopoverMenuHandle};
 
 use crate::branch_diff::{BranchDiff, TARGET};
-use crate::card_format::{self, CardFace};
+use crate::card_format::{self, CardFace, CardField, CardType, FieldOf};
 use crate::card_grid::{COVER_RATIO, CardGrid, Step};
 use crate::filter_bar::{FilterBar, FilterHost, filter_stands};
 use crate::model::{ColumnSpec, Paging, Row, TableKind, field_rows, node_columns, node_rows};
 use crate::peek::{NodePeek, PeekSubject};
+use crate::relations::{Relation, RelationHost, Relations};
 use crate::tile::{self, FIRST_READ, Facts, Look};
 
 /// How long scrolling rests before the covers of the cards laid out are read, as the table's
@@ -134,6 +137,39 @@ pub(crate) enum FieldShown {
     Member(SharedString),
     /// Any other value, on one line: text, a number, a date in the table's words, a list.
     Text(SharedString),
+    /// A relationship: the row's neighbours, read apart from the row and drawn from what is
+    /// held of them when the card is ([`related_shown`]).
+    Related,
+}
+
+/// What a relationship field shows of one row's neighbours.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum RelatedShown {
+    /// Not read yet: nothing, in a line that keeps its height.
+    Unread,
+    /// The count could not be read.
+    Failed,
+    /// No neighbour: a dash.
+    None,
+    /// The first neighbours that fit, by name, and "+N" for the rest, or the count alone when
+    /// none fits or the row's list was not read (a hub's).
+    Chips(Vec<SharedString>, Option<SharedString>),
+}
+
+/// What `available` pixels of a card's line show of `relation`, as the table's relationship
+/// cell shows it ([`Relation::chips`]).
+pub(crate) fn related_shown(relation: Option<&Relation>, available: f32) -> RelatedShown {
+    let Some(relation) = relation else {
+        return RelatedShown::Unread;
+    };
+    match relation.count {
+        Err(_) => RelatedShown::Failed,
+        Ok(0) => RelatedShown::None,
+        Ok(count) => {
+            let (chips, more) = relation.chips(count, available);
+            RelatedShown::Chips(chips, more)
+        }
+    }
 }
 
 /// What a row's fields show, made the first time its card is drawn and kept, so a frame does
@@ -146,14 +182,18 @@ struct RowFields {
 
 /// What `fields` show of `values`, and whether any of them is a date or a time.
 pub(crate) fn fields_shown(
-    fields: &[Property],
+    fields: &[CardField],
     row: &Row,
     now: chrono::DateTime<chrono::Local>,
 ) -> (Vec<FieldShown>, bool) {
     let mut temporal = false;
     let shown = fields
         .iter()
-        .map(|property| {
+        .map(|field| {
+            let property = match &field.of {
+                FieldOf::Property(property) => property,
+                FieldOf::Relationship(_) => return FieldShown::Related,
+            };
             let value = row.value(&property.name);
             temporal |=
                 !property.list && matches!(property.kind, ScalarKind::Date | ScalarKind::DateTime);
@@ -228,6 +268,9 @@ pub struct TypeCards {
     /// The filter bar's state (spec 048, "Filters and order"): the table's bar, from the same
     /// code ([`FilterHost`]).
     filter_bar: FilterBar,
+    /// The neighbours of the rows through the relationships the format shows as fields, read
+    /// for the cards near the view at the commit the rows were ([`RelationHost`]).
+    relations: Relations,
     /// Every column the schema gives the type: what a filter can test and an order can be by.
     all_columns: Vec<ColumnSpec>,
     /// The filters left out when the schema was last taken, in words: it no longer has what
@@ -254,7 +297,7 @@ pub struct TypeCards {
     format: CardFormat,
     /// The format read against the schema as it is now: the fields a card shows, in order, and
     /// the Blob property that is its cover, if any; and the type's Blob properties.
-    fields: Vec<Property>,
+    fields: Vec<CardField>,
     cover: Option<String>,
     files: Vec<String>,
     /// What each row's fields show, by row id, made as its card is first drawn.
@@ -388,6 +431,7 @@ impl TypeCards {
             filters,
             sort,
             filter_bar: FilterBar::new(window, cx),
+            relations: Relations::default(),
             all_columns: Vec::new(),
             lost: Vec::new(),
             changed: false,
@@ -1228,7 +1272,8 @@ impl TypeCards {
             span.end.round() as i32,
             self.width.get().round() as i32,
         );
-        if self.span_read == Some(key) || self.cover.is_none() {
+        // With no cover and no relationship field a screen of cards costs no read.
+        if self.span_read == Some(key) || (self.cover.is_none() && !self.shows_relationships()) {
             return;
         }
         self.span_read = Some(key);
@@ -1294,6 +1339,43 @@ impl TypeCards {
         }
         self.cover_queue = wanted.into_iter().collect();
         self.read_queued(cx);
+        self.read_relationship_fields(cx);
+    }
+
+    /// Whether the format shows a relationship as a field.
+    fn shows_relationships(&self) -> bool {
+        self.fields
+            .iter()
+            .any(|field| field.relationship().is_some())
+    }
+
+    /// Reads the relationship fields of the cards laid out, as the covers are: only for the
+    /// relationships the format shows, only for the cards near the view, a hundred rows a
+    /// read ([`RelationHost::read_relations_of`]), at the commit the rows were read at. A row
+    /// asked for at this commit is not asked for again, whatever the filters and the order
+    /// become. A row the branch removed is no row at this commit: its line stays empty.
+    fn read_relationship_fields(&mut self, cx: &mut Context<Self>) {
+        let groups: Vec<RelationshipGroup> = self
+            .fields
+            .iter()
+            .filter_map(CardField::relationship)
+            .cloned()
+            .collect();
+        if groups.is_empty() {
+            return;
+        }
+        let near = self.laid_out();
+        for group in groups {
+            let key = builder::relationship_key(&group);
+            let ids: Vec<String> = self.rows[near.clone()]
+                .iter()
+                .filter(|row| !self.is_removed(&row.id))
+                .map(|row| (row.id.clone(), key.clone()))
+                .filter(|asked| !self.relations.asked.contains(asked))
+                .map(|(id, _)| id)
+                .collect();
+            self.read_relations_of(&group, &ids, cx);
+        }
     }
 
     fn read_queued(&mut self, cx: &mut Context<Self>) {
@@ -1462,6 +1544,12 @@ impl TypeCards {
     fn cover_landed(&mut self, key: &CoverKey, cx: &mut Context<Self>) {
         self.cover_tasks.remove(key);
         self.read_queued(cx);
+        self.draw_what_landed(cx);
+    }
+
+    /// Draws the grid [`LANDING_DELAY`] from now, once, with everything that lands meanwhile:
+    /// covers, and the counts and neighbours of relationship fields.
+    fn draw_what_landed(&mut self, cx: &mut Context<Self>) {
         if self._landing.is_some() {
             return;
         }
@@ -1540,6 +1628,7 @@ impl TypeCards {
         self.cover_tasks.clear();
         self.cover_queue.clear();
         self.held = 0;
+        self.relations.clear();
     }
 
     // ---- the cursor and picks ----
@@ -1761,18 +1850,23 @@ impl TypeCards {
 
     // ---- the format ----
 
-    /// The type as the schema has it now.
-    fn node_type(&self) -> Option<&gq_language::NodeType> {
-        self.schema.as_ref()?.node(&self.type_name)
+    /// The type as a card sees it: its properties, and its relationships as a table has their
+    /// columns.
+    fn card_type(&self) -> Option<CardType<'_>> {
+        let schema = self.schema.as_ref()?;
+        Some(CardType {
+            node: schema.node(&self.type_name)?,
+            relationships: schema.relationships_of(&self.type_name),
+        })
     }
 
     /// Reads the tab's format against the schema as it is: the fields a card shows and its
     /// cover, with what the type no longer has left out. The format is kept as it was written.
     fn read_format(&mut self) {
-        let (face, files) = match self.node_type() {
-            Some(node) => (
-                card_format::face(&self.format, node),
-                card_format::files(node),
+        let (face, files) = match self.card_type() {
+            Some(of) => (
+                card_format::face(&self.format, of),
+                card_format::files(of.node),
             ),
             None => (CardFace::default(), Vec::new()),
         };
@@ -1784,8 +1878,8 @@ impl TypeCards {
     /// Whether the tab shows another card than the default one: what the Fields chip's × and
     /// "Reset to the default" undo.
     fn format_changed(&self) -> bool {
-        self.node_type()
-            .is_some_and(|node| card_format::is_changed(&self.format, node))
+        self.card_type()
+            .is_some_and(|of| card_format::is_changed(&self.format, of))
     }
 
     /// Takes `format` as the tab's: every card is drawn again at its new height in its place,
@@ -1805,8 +1899,12 @@ impl TypeCards {
         if let Some(cursor) = self.cursor {
             self.scroll_to_card(cursor);
         }
+        // What the new card needs read, at once: its covers, and with them or alone the
+        // relationships it now shows.
         if self.cover != cover {
             self.read_covers(cx);
+        } else {
+            self.read_relationship_fields(cx);
         }
         self.keep_format(cx);
         self.person_changed(cx);
@@ -1833,26 +1931,27 @@ impl TypeCards {
     /// (a field shown already, a card that is full).
     fn change_format(
         &mut self,
-        change: impl FnOnce(&CardFormat, &gq_language::NodeType) -> Option<CardFormat>,
+        change: impl FnOnce(&CardFormat, CardType<'_>) -> Option<CardFormat>,
         cx: &mut Context<Self>,
     ) {
-        let Some(format) = self.node_type().and_then(|node| change(&self.format, node)) else {
+        let Some(format) = self.card_type().and_then(|of| change(&self.format, of)) else {
             return;
         };
         self.set_format(format, cx);
     }
 
-    /// Shows the property `name` as a card's last field; nothing past eight.
+    /// Shows the property `name`, or the relationship whose key it is, as a card's last
+    /// field; nothing past eight.
     pub(crate) fn show_field(&mut self, name: &str, cx: &mut Context<Self>) {
         self.change_format(
-            |format, node| card_format::with_field_shown(format, node, name),
+            |format, of| card_format::with_field_shown(format, of, name),
             cx,
         );
     }
 
     pub(crate) fn hide_field(&mut self, name: &str, cx: &mut Context<Self>) {
         self.change_format(
-            |format, node| card_format::with_field_hidden(format, node, name),
+            |format, of| card_format::with_field_hidden(format, of, name),
             cx,
         );
     }
@@ -1860,7 +1959,7 @@ impl TypeCards {
     /// Moves the field `name` up (`by` −1) or down (1) a card.
     pub(crate) fn move_field(&mut self, name: &str, by: isize, cx: &mut Context<Self>) {
         self.change_format(
-            |format, node| card_format::with_field_moved(format, node, name, by),
+            |format, of| card_format::with_field_moved(format, of, name, by),
             cx,
         );
     }
@@ -1868,14 +1967,17 @@ impl TypeCards {
     /// Shows the file `cover` as the cards' cover, or none.
     pub(crate) fn show_cover(&mut self, cover: Option<&str>, cx: &mut Context<Self>) {
         self.change_format(
-            |format, node| card_format::with_cover(format, node, cover),
+            |format, of| card_format::with_cover(format, of.node, cover),
             cx,
         );
     }
 
     /// F: the type's next file as the cover, then none, then the first again.
     fn show_next_cover(&mut self, cx: &mut Context<Self>) {
-        self.change_format(card_format::with_next_cover, cx);
+        self.change_format(
+            |format, of| card_format::with_next_cover(format, of.node),
+            cx,
+        );
     }
 
     /// The default card, at the size the tab has.
@@ -2139,20 +2241,15 @@ impl TypeCards {
     }
 
     /// What the Fields menu lists: the fields shown, in card order; the properties that could
-    /// be shown, in schema order; the type's files and which is the cover; and whether the
-    /// card is other than the default one.
+    /// be shown, in schema order, and after them the relationships, by their keys; the type's
+    /// files and which is the cover; and whether the card is other than the default one.
     pub(crate) fn field_choices(&self) -> FieldChoices {
-        let shown: Vec<String> = self
-            .fields
-            .iter()
-            .map(|property| property.name.clone())
-            .collect();
+        let shown: Vec<String> = self.fields.iter().map(|field| field.name.clone()).collect();
         let hidden = self
-            .node_type()
-            .map(|node| {
-                card_format::field_choices(node)
+            .card_type()
+            .map(|of| {
+                card_format::field_choices(of)
                     .into_iter()
-                    .map(|property| property.name.clone())
                     .filter(|name| !shown.contains(name))
                     .collect()
             })
@@ -2165,6 +2262,16 @@ impl TypeCards {
             cover: self.cover.clone(),
             changed: self.format_changed(),
         }
+    }
+
+    /// How the Fields menu names the type's relationships, by key: as the table titles their
+    /// columns (`filedUnder →`).
+    fn relationship_titles(&self) -> HashMap<String, String> {
+        self.all_columns
+            .iter()
+            .filter(|column| column.relationship().is_some())
+            .map(|column| (column.key.clone(), column.title.clone()))
+            .collect()
     }
 
     /// The Fields chip (spec 048): what a card shows. Its menu stays open while it is used:
@@ -2200,9 +2307,12 @@ impl TypeCards {
                     move |menu, _, cx| {
                         let menu = menu.keep_open_on_confirm(true);
                         match cards.upgrade() {
-                            Some(entity) => {
-                                fields_menu(menu, entity.read(cx).field_choices(), cards.clone())
-                            }
+                            Some(entity) => fields_menu(
+                                menu,
+                                entity.read(cx).field_choices(),
+                                &entity.read(cx).relationship_titles(),
+                                cards.clone(),
+                            ),
                             None => menu,
                         }
                     },
@@ -2351,13 +2461,8 @@ impl TypeCards {
         let label_width = self
             .fields
             .iter()
-            .map(|property| {
-                f32::from(studio_ui::cell_text_width(
-                    property.name.clone(),
-                    window,
-                    cx,
-                ))
-                .ceil()
+            .map(|field| {
+                f32::from(studio_ui::cell_text_width(field.title.clone(), window, cx)).ceil()
             })
             .fold(0., f32::max)
             .min(third);
@@ -2474,10 +2579,19 @@ impl TypeCards {
             Vec::new()
         } else {
             let fields = self.row_fields(row);
+            // What is left of a line for its value: the card inside its ring, the line's own
+            // inset, the names' width and the gap after it.
+            let value_width =
+                (width - 2. * card_inset() - 2. * space::XS - label_width - space::MD).max(0.);
             self.fields
                 .iter()
                 .zip(&fields.shown)
-                .map(|(property, shown)| self.render_field(&property.name, shown, label_width, cx))
+                .map(|(field, shown)| {
+                    let related = matches!(shown, FieldShown::Related).then(|| {
+                        related_shown(self.relations.get(&row.id, &field.name), value_width)
+                    });
+                    self.render_field(&field.title, shown, related, label_width, cx)
+                })
                 .collect()
         };
         Some(
@@ -2543,19 +2657,39 @@ impl TypeCards {
     }
 
     /// One field's line: its name in the muted colour, in the width every name of the card
-    /// takes, then its value as the table's cell shows it, cut where the card ends. No element
-    /// id and no handler: the card takes the click, and the inspector shows the whole value.
+    /// takes, then its value as the table's cell shows it, cut where the card ends. A
+    /// relationship's value is `related`: its neighbours as tags and "+N", a dash for none,
+    /// and nothing until they are read, in a line of the same height. No element id and no
+    /// handler: the card takes the click, and the inspector shows the whole value.
     fn render_field(
         &self,
         name: &str,
         shown: &FieldShown,
+        related: Option<RelatedShown>,
         label_width: f32,
         cx: &App,
     ) -> AnyElement {
-        let value: AnyElement = match shown {
-            FieldShown::Null => studio_ui::cell_text("—", cx)
+        let dash = || {
+            studio_ui::cell_text("—", cx)
                 .color(Color::Disabled.color(cx))
-                .into_any_element(),
+                .into_any_element()
+        };
+        let value: AnyElement = match shown {
+            FieldShown::Related => match related.unwrap_or(RelatedShown::Unread) {
+                RelatedShown::Unread => gpui::Empty.into_any_element(),
+                RelatedShown::Failed => studio_ui::ds::text::body("?")
+                    .color(Color::Warning)
+                    .into_any_element(),
+                RelatedShown::None => dash(),
+                // The tags fill the rest of the line and centre themselves in its height.
+                RelatedShown::Chips(chips, more) => div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .child(studio_ui::tags(chips, more, cx))
+                    .into_any_element(),
+            },
+            FieldShown::Null => dash(),
             // A chip keeps its width: one wider than the card's room is cut at the card's edge.
             FieldShown::Member(member) => h_flex()
                 .min_w_0()
@@ -2747,6 +2881,42 @@ async fn read_bytes(
     Ok(bytes)
 }
 
+/// The relationship fields' reads are the table's relationship columns' ([`RelationHost`]):
+/// the tab says which rows to read ([`TypeCards::read_relationship_fields`]) and draws what
+/// lands with what else lands meanwhile.
+impl RelationHost for TypeCards {
+    fn relations(&self) -> &Relations {
+        &self.relations
+    }
+
+    fn relations_mut(&mut self) -> &mut Relations {
+        &mut self.relations
+    }
+
+    fn relation_rows(&self) -> Option<(Arc<SchemaModel>, &str)> {
+        Some((self.schema.clone()?, self.type_name.as_str()))
+    }
+
+    fn relation_pin(&self) -> Option<String> {
+        self.paging.pinned.clone()
+    }
+
+    fn read_relations(
+        &self,
+        query: &BuiltQuery,
+        snapshot: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<ReadOutput, ReadError>> {
+        self.read_shown(query, snapshot, cx)
+    }
+
+    /// A screen of counts and neighbours landing draws the grid once, with the covers that
+    /// land meanwhile.
+    fn relations_landed(&mut self, cx: &mut Context<Self>) {
+        self.draw_what_landed(cx);
+    }
+}
+
 /// The filter bar is the table's ([`FilterHost`]): the tab keeps its own filters, answers what
 /// the bar asks, and reads its rows again at its pin when they change.
 impl FilterHost for TypeCards {
@@ -2848,7 +3018,8 @@ impl FilterHost for TypeCards {
 pub(crate) struct FieldChoices {
     /// The fields a card shows, in card order.
     pub shown: Vec<String>,
-    /// The properties that could be shown and are not, in schema order.
+    /// The properties that could be shown and are not, in schema order, then the
+    /// relationships, by their keys.
     pub hidden: Vec<String>,
     /// A card shows as many fields as it may: none can be added.
     pub full: bool,
@@ -2862,12 +3033,15 @@ pub(crate) struct FieldChoices {
 /// What the Fields menu says in place of "Not shown" once a card is full.
 pub(crate) const CARD_FULL: &str = "A card shows at most 8 fields";
 
-/// The Fields menu's rows for `choices`, each acting on `cards`.
+/// The Fields menu's rows for `choices`, each acting on `cards`. A relationship reads by its
+/// title in `titles`; a property by its name.
 fn fields_menu(
     mut menu: ContextMenu,
     choices: FieldChoices,
+    titles: &HashMap<String, String>,
     cards: WeakEntity<TypeCards>,
 ) -> ContextMenu {
+    let title = |name: &String| titles.get(name).unwrap_or(name).clone();
     /// A row's handler: `change` made to the field `name` of `cards`.
     fn act(
         cards: &WeakEntity<TypeCards>,
@@ -2885,7 +3059,7 @@ fn fields_menu(
     let last = choices.shown.len().saturating_sub(1);
     for (at, name) in choices.shown.iter().enumerate() {
         let (cards, field) = (cards.clone(), name.clone());
-        menu = menu.submenu(name.clone(), move |menu, _, _| {
+        menu = menu.submenu(title(name), move |menu, _, _| {
             menu.item(
                 ContextMenuEntry::new("Move up")
                     .disabled(at == 0)
@@ -2913,7 +3087,7 @@ fn fields_menu(
     }
     for name in &choices.hidden {
         menu = menu.item(
-            ContextMenuEntry::new(name.clone())
+            ContextMenuEntry::new(title(name))
                 .disabled(choices.full)
                 .handler(act(&cards, TypeCards::show_field, name)),
         );

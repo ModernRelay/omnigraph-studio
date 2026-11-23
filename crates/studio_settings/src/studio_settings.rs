@@ -2135,6 +2135,31 @@ mod tests {
         assert!(settings.graphs.is_empty(), "the default is no entry");
     }
 
+    /// A card's field can be a relationship, which a format names by its key (spec 048, slice
+    /// 6): `out:FiledUnder`, `in:Wrote`. It is kept among the fields, in their order, as any
+    /// name is, in the settings and in their text.
+    #[test]
+    fn a_card_format_keeps_a_relationship_by_its_key() {
+        let mut settings = StudioSettings::default();
+        let chosen = CardFormat {
+            fields: Some(vec![
+                "body".into(),
+                "out:FiledUnder".into(),
+                "in:Wrote".into(),
+            ]),
+            ..CardFormat::default()
+        };
+        settings.set_card_format("dev/notes", "Note", Some(chosen.clone()));
+        let text = serde_json::to_string_pretty(&settings).unwrap();
+        assert!(text.contains("\"out:FiledUnder\""), "{text}");
+        let read: StudioSettings = serde_json::from_str(&text).unwrap();
+        assert_eq!(read.card_format("dev/notes", "Note"), Some(chosen));
+        assert_eq!(
+            serde_json::to_value(&read).unwrap()["graphs"]["dev/notes"]["cards"]["Note"],
+            serde_json::json!({ "fields": ["body", "out:FiledUnder", "in:Wrote"] })
+        );
+    }
+
     /// A type's card format is kept per graph and type, written as spec 048 writes it: each
     /// cover form, the fields in order, the size. What is the default is left out, a format
     /// that is the default is no entry, and a graph with nothing left is removed.
