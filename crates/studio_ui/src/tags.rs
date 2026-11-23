@@ -15,7 +15,7 @@ use gpui::{
 };
 use smallvec::SmallVec;
 
-use crate::cell_text::{cut_line, line_height, shape_line};
+use crate::ds::cell_text::{cut_line, line_height, shape_line};
 use crate::ds::{Anchor, TAG_MAX_WIDTH, size, space};
 
 /// See the module documentation.
@@ -43,7 +43,7 @@ pub fn tags(
         // As a cell's text: never more than a line shows, so a long name is not shaped whole.
         tags: tags
             .into_iter()
-            .map(|tag| crate::cell_text::one_line(crate::shown_part(tag)))
+            .map(|tag| crate::ds::cell_text::one_line(crate::shown_part(tag)))
             .collect(),
         count,
         tag_style: crate::cell_text("", cx).meta(cx).style,
@@ -787,7 +787,7 @@ mod tests {
         let element = cx.update(|cx| tags([long, "two\nlines".into()], None, cx));
         assert_eq!(
             element.tags[0].chars().count(),
-            crate::cell_text::SHOWN_CHARS
+            crate::ds::cell_text::SHOWN_CHARS
         );
         assert!(!element.tags[1].contains('\n'), "{}", element.tags[1]);
     }

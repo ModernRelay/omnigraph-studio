@@ -10,7 +10,7 @@ use crate::ds::Tipped;
 use gpui::{AnyElement, App, ClickEvent, Div, ElementId, SharedString, Window};
 use ui::prelude::*;
 
-use crate::button::{Button, Variant};
+use crate::ds::button::{Button, Variant};
 use crate::ds::{elevation, radii, radius, size, space, surface};
 
 /// A modal's card: the floating fill, its hairline, the floating shadow and the modal radius,

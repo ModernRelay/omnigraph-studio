@@ -19,12 +19,18 @@ use studio_settings::{StudioSettings, WindowStyle};
 use ui::prelude::*;
 use ui::rems_from_px;
 
-pub use crate::button::{Button, IconButton, Shape, Variant};
-pub use crate::menu::{MenuRow, menu_header, menu_separator, menu_surface};
-pub use crate::modal::{
+mod button;
+pub(crate) mod cell_text;
+pub mod menu;
+mod modal;
+mod tooltip;
+
+pub use button::{Button, IconButton, Shape, Variant};
+pub use menu::{MenuRow, menu_header, menu_separator, menu_surface};
+pub use modal::{
     ModalHeader, action_button, cancel_button, modal, modal_body, modal_footer, write_target,
 };
-pub use crate::tooltip::{
+pub use tooltip::{
     Anchor, TipContent, Tipped, tooltip, tooltip_for_action, tooltip_for_action_in,
     tooltip_for_action_in_view, tooltip_for_action_view, tooltip_view, tooltip_with_meta,
 };
@@ -1439,7 +1445,7 @@ impl SidebarRow {
     }
 }
 
-/// A sidebar row's tooltip: what it says, or a builder from state (`crate::tooltip`).
+/// A sidebar row's tooltip: what it says, or a builder from state (`tooltip`).
 enum RowTip {
     Content(TipContent),
     Builder(TooltipBuilder),
@@ -1755,7 +1761,7 @@ pub fn meta_code(icon: IconName, value: impl Into<SharedString>, cx: &App) -> Di
 
 /// A button with a label, in a toolbar, strip, panel or dialog: a pill of Zed's 22 px size
 /// (Tower's `xs`), its label small and 8 px in, the size of a [`bar_button`] and an
-/// [`icon_button`] beside it (`crate::button`). A button inside a row or a card is a
+/// [`icon_button`] beside it (`button`). A button inside a row or a card is a
 /// [`row_button`].
 pub fn button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
     Button::new(id, label)
@@ -2128,11 +2134,11 @@ pub type SetSort = std::rc::Rc<dyn Fn(Option<(String, bool)>, &mut App)>;
 /// order, each property by `choices`' `(name, title)`, then the direction, which a property
 /// chosen keeps. `set` gets the property and whether it runs descending, or none.
 pub fn sort_menu(
-    mut menu: crate::menu::ContextMenu,
+    mut menu: menu::ContextMenu,
     choices: &[(String, String)],
     current: Option<(String, bool)>,
     set: SetSort,
-) -> crate::menu::ContextMenu {
+) -> menu::ContextMenu {
     let entry = |sort: Option<(String, bool)>| {
         let set = set.clone();
         move |_: &mut Window, cx: &mut App| set(sort.clone(), cx)
@@ -2160,7 +2166,7 @@ pub fn sort_menu(
     for (label, down) in [("Ascending", false), ("Descending", true)] {
         let sort = current.clone().map(|(name, _)| (name, down));
         menu = menu.item(
-            crate::menu::ContextMenuEntry::new(label)
+            menu::ContextMenuEntry::new(label)
                 .toggleable(IconPosition::Start, current.is_some() && descending == down)
                 .disabled(current.is_none())
                 .handler(entry(sort)),
@@ -2203,7 +2209,7 @@ pub fn chip_button(
     button(id, label)
         .start_icon(Icon::new(icon))
         .value(value)
-        .shape(crate::button::Shape::Pill)
+        .shape(button::Shape::Pill)
 }
 
 /// A control in a toolbar, as the reference toolbar's chips (spec 002, "Control chips"): one
@@ -2338,14 +2344,17 @@ pub const TAG_MAX_WIDTH: f32 = 160.;
 /// A tag: a name in a quiet pill, as a table shows a row's neighbours. The UI font, unlike
 /// `ui::Chip`, which is for code-like values such as enum members.
 pub fn tag(label: impl Into<SharedString>, cx: &App) -> Div {
-    tag_box(crate::cell_text(label, cx).meta(cx).hug(), cx)
+    tag_box(cell_text::cell_text(label, cx).meta(cx).hug(), cx)
 }
 
 /// A code-like value in a quiet box, as a table shows an enum member: [`tag`] with the value
 /// in the buffer font. Zed's `Chip` keeps its own corner and hairline.
 pub fn chip(label: impl Into<SharedString>, cx: &App) -> Div {
     tag_box(
-        crate::cell_text(label, cx).meta(cx).buffer_font(cx).hug(),
+        cell_text::cell_text(label, cx)
+            .meta(cx)
+            .buffer_font(cx)
+            .hug(),
         cx,
     )
 }
@@ -3151,7 +3160,7 @@ pub fn value_list() -> Div {
 /// its end.
 pub fn value_select(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
     button(id, label)
-        .variant(crate::button::Variant::Outline)
+        .variant(button::Variant::Outline)
         .end_icon(Icon::new(IconName::ChevronDown))
 }
 
