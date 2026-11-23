@@ -10,8 +10,8 @@ use change_cards::{CardLines, CardRows, Row};
 use editor::{Editor, EditorEvent};
 use gpui::{
     AnyElement, AnyView, App, AsyncApp, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    ListAlignment, ListState, Render, SharedString, StyleRefinement, Subscription, Task,
-    WeakEntity, Window, list,
+    ListAlignment, ListState, Render, SharedString, StyleRefinement, Subscription, Task, Window,
+    list,
 };
 use gq_language::SchemaModel;
 use graph_client::api::{
@@ -50,7 +50,7 @@ use ui::prelude::*;
 use ui::{KeyBinding, PopoverMenu, Severity};
 
 use crate::conflicts::{conflict_wording, resolution_hint};
-use crate::scope_menu::ScopeMenu;
+use crate::scope_menu::{ReviewCommit, ScopeMenu};
 use crate::summary;
 
 /// How long typing in the search pauses before the cards are filtered.
@@ -364,15 +364,6 @@ fn mark_of(change: &FoldedChange) -> u64 {
     hasher.finish()
 }
 
-/// A commit under review: from the commit list, or the cause of its change-feed block.
-#[derive(Debug, Clone)]
-pub(crate) struct ReviewCommit {
-    pub(crate) id: String,
-    pub(crate) actor_id: Option<String>,
-    /// Unix microseconds.
-    pub(crate) created_at: i64,
-}
-
 /// What a review read of the branch and its target that a review of another scope at the same
 /// heads needs again: the merge base the server named for both heads and, once read, the
 /// branch's commits since its fork.
@@ -398,16 +389,6 @@ impl ForkRead {
 
     fn keep_since(&mut self, merged_in: bool, since: Since) {
         self.since[usize::from(merged_in)] = Some(since);
-    }
-}
-
-impl From<&CommitOutput> for ReviewCommit {
-    fn from(commit: &CommitOutput) -> Self {
-        Self {
-            id: commit.graph_commit_id.clone(),
-            actor_id: commit.actor_id.clone(),
-            created_at: commit.created_at,
-        }
     }
 }
 
@@ -785,7 +766,7 @@ impl ReviewView {
             summary: String::new(),
             made_by: String::new(),
             folded_large: false,
-            list_view: ReviewRows::new(cx),
+            list_view: Self::rows_view(cx),
             ai_summary: SummaryState::None,
             collapsed_runs: HashSet::new(),
             expanded: HashSet::new(),
@@ -1103,7 +1084,11 @@ impl ReviewView {
         let target = self.target.clone();
         let scope = self.scope.clone();
         self._load_task = Some(cx.spawn(async move |this, cx| {
-            let result = read_review(session, branch, target, scope, held, this.clone(), cx).await;
+            let folded = |folded, cx: &mut AsyncApp| {
+                this.update(cx, |this, cx| this.show_folded(folded, cx))
+                    .ok();
+            };
+            let result = read_review(session, branch, target, scope, held, &folded, cx).await;
             // The search's matches among the changes read, found off the main thread too.
             let searched = match &result {
                 Ok(data) => {
@@ -2038,12 +2023,17 @@ impl ReviewView {
         let key = change.key();
         let scope = self.session.read(cx).write_scope(&self.branch, cx);
         let view = cx.entity().downgrade();
+        // A review closed meanwhile has no edit to refuse: the form closes.
+        let save = move |changes, cx: &mut App| {
+            view.update(cx, |view, cx| view.save_edit(&key, changes, cx))
+                .unwrap_or(Ok(()))
+        };
         let Some(workspace) = workspace_for(window) else {
             return;
         };
         workspace.update(cx, |workspace, cx| {
             workspace.toggle_modal(window, cx, move |window, cx| {
-                crate::edit::EditModal::new(view, key, title, scope, values, window, cx)
+                crate::edit::EditModal::new(title, scope, values, save, window, cx)
             })
         });
     }
@@ -2052,7 +2042,7 @@ impl ReviewView {
     /// review showed for them, so a node with any of them changed since is left alone whole,
     /// sent bound to the head this review holds. Never retried. An edit that cannot be sent
     /// says why, for the form to show while it stays open.
-    pub(crate) fn save_edit(
+    fn save_edit(
         &mut self,
         key: &str,
         changes: Vec<(String, Value, Value)>,
@@ -2291,6 +2281,26 @@ impl ReviewView {
             }),
             cx,
         );
+    }
+
+    /// The list of changes as a view of its own, which draws [`Self::render_list`].
+    fn rows_view(cx: &mut Context<Self>) -> Entity<ReviewRows> {
+        let review = cx.entity();
+        let list = review.downgrade();
+        ReviewRows::new(
+            &review,
+            move |cx| {
+                list.update(cx, |review, cx| review.render_list(cx))
+                    .unwrap_or_else(|_| gpui::Empty.into_any_element())
+            },
+            cx,
+        )
+    }
+
+    /// A read under way has folded `folded` changes so far.
+    fn show_folded(&mut self, folded: usize, cx: &mut Context<Self>) {
+        self.load = LoadState::Loading { folded };
+        cx.notify();
     }
 
     /// The list of changes, as [`ReviewRows`] draws it.
@@ -2690,7 +2700,10 @@ impl ReviewView {
             .menu(move |_, cx| {
                 let (commits, scope) = view.upgrade()?.read(cx).scope_menu_input();
                 let view = view.clone();
-                Some(cx.new(|cx| ScopeMenu::new(view, commits, scope, cx)))
+                let choose = move |scope, cx: &mut App| {
+                    view.update(cx, |view, cx| view.set_scope(scope, cx)).ok();
+                };
+                Some(cx.new(|cx| ScopeMenu::new(commits, scope, choose, cx)))
             });
         // The search and the layout switch are pills too, so the row is one height and shape.
         let search = studio_ui::ds::pill_search("review-search", self.search.clone(), cx)
@@ -4195,7 +4208,7 @@ async fn read_review(
     target: String,
     scope: Option<String>,
     held: Option<ForkRead>,
-    this: WeakEntity<ReviewView>,
+    folded: &dyn Fn(usize, &mut AsyncApp),
     cx: &mut AsyncApp,
 ) -> Result<ReviewData, String> {
     let read = match held {
@@ -4238,7 +4251,7 @@ async fn read_review(
             });
         }
         let start = format!("after:{fork}");
-        return match fold_feed(&session, &branch, start, &head, &this, cx).await {
+        return match fold_feed(&session, &branch, start, &head, folded, cx).await {
             Ok(fed) => {
                 let mut data = fed
                     .into_review(&session, Some(fork), Some(head), false, cx)
@@ -4247,12 +4260,12 @@ async fn read_review(
                 Ok(data)
             }
             Err(FeedError::Refused) => {
-                read_review_since_merge(session, branch, target, read, this, cx).await
+                read_review_since_merge(session, branch, target, read, folded, cx).await
             }
             Err(FeedError::Failed(error)) => Err(error),
         };
     }
-    read_commit_review(session, branch, target, scope, read, this, cx).await
+    read_commit_review(session, branch, target, scope, read, folded, cx).await
 }
 
 /// What folding a branch's change feed gave.
@@ -4360,7 +4373,7 @@ async fn fold_feed(
     branch: &str,
     start: String,
     head: &str,
-    this: &WeakEntity<ReviewView>,
+    folded: &dyn Fn(usize, &mut AsyncApp),
     cx: &mut AsyncApp,
 ) -> Result<Fed, FeedError> {
     let mut fold = ChangeFold::new();
@@ -4402,8 +4415,8 @@ async fn fold_feed(
             reached_head |= id == head;
             blocks.push(block);
         }
-        let (folded, complete) = fold_blocks(fold, blocks, this, cx).await;
-        fold = folded;
+        let (fold_now, complete) = fold_blocks(fold, blocks, folded, cx).await;
+        fold = fold_now;
         let raw = fold.raw_changes();
         let more =
             page.next_page_token.is_some() || (!reached_head && page.caught_up == Some(false));
@@ -4437,11 +4450,11 @@ async fn fold_feed(
 }
 
 /// Folds `blocks` into `fold` off the main thread (constitution IX), up to the change cap, and
-/// shows how many changes are folded: the fold, and whether every change fit.
+/// tells `folded` how many changes are folded: the fold, and whether every change fit.
 async fn fold_blocks(
     mut fold: ChangeFold,
     blocks: Vec<ChangeBlockOutput>,
-    this: &WeakEntity<ReviewView>,
+    folded: &dyn Fn(usize, &mut AsyncApp),
     cx: &mut AsyncApp,
 ) -> (ChangeFold, bool) {
     let (fold, complete) = cx
@@ -4454,12 +4467,7 @@ async fn fold_blocks(
             (fold, complete)
         })
         .await;
-    let folded = fold.raw_changes();
-    this.update(cx, |this, cx| {
-        this.load = LoadState::Loading { folded };
-        cx.notify();
-    })
-    .ok();
+    folded(fold.raw_changes(), cx);
     (fold, complete)
 }
 
@@ -4467,7 +4475,7 @@ async fn fold_blocks(
 /// (the first for none), at most `limit` changes, as one block and the next page's token. The
 /// fold, and whether the cap left changes out.
 async fn fold_pages(
-    this: &WeakEntity<ReviewView>,
+    folded: &dyn Fn(usize, &mut AsyncApp),
     cx: &mut AsyncApp,
     mut read: impl AsyncFnMut(
         Option<String>,
@@ -4480,8 +4488,8 @@ async fn fold_pages(
     loop {
         let limit = FEED_PAGE.min(REVIEW_CHANGE_CAP - fold.raw_changes()).max(1) as u32;
         let (block, next) = read(token.take(), limit, cx).await?;
-        let (folded, complete) = fold_blocks(fold, vec![block], this, cx).await;
-        fold = folded;
+        let (fold_now, complete) = fold_blocks(fold, vec![block], folded, cx).await;
+        fold = fold_now;
         match next {
             Some(next) if complete && fold.raw_changes() < REVIEW_CHANGE_CAP => token = Some(next),
             Some(_) => return Ok((fold, true)),
@@ -4724,7 +4732,7 @@ async fn read_review_since_merge(
     branch: String,
     target: String,
     mut read: ForkRead,
-    this: WeakEntity<ReviewView>,
+    folded: &dyn Fn(usize, &mut AsyncApp),
     cx: &mut AsyncApp,
 ) -> Result<ReviewData, String> {
     let (base, head) = (read.base.clone(), read.head.clone());
@@ -4741,7 +4749,7 @@ async fn read_review_since_merge(
     let (since, folded) = futures::join!(
         since_of(&read, true, &session, &branch, &target, &mut since_cx),
         fold_pages(
-            &this,
+            folded,
             cx,
             async |token: Option<String>, limit: u32, cx: &mut AsyncApp| {
                 let page = session
@@ -4785,7 +4793,7 @@ async fn read_commit_review(
     target: String,
     scope: Option<String>,
     mut read: ForkRead,
-    this: WeakEntity<ReviewView>,
+    folded: &dyn Fn(usize, &mut AsyncApp),
     cx: &mut AsyncApp,
 ) -> Result<ReviewData, String> {
     let Some(commit) = scope else {
@@ -4795,7 +4803,7 @@ async fn read_commit_review(
     let (since, folded) = futures::join!(
         since_of(&read, false, &session, &branch, &target, &mut since_cx),
         fold_pages(
-            &this,
+            folded,
             cx,
             async |token: Option<String>, limit: u32, cx: &mut AsyncApp| {
                 let page = session
@@ -5055,7 +5063,8 @@ const SPLIT_LIST_WIDTH: f32 = 300.;
 /// notifies (it observes it), as History's rows are (`docs/drawing.md`): a key typed in the
 /// review's search draws the review around the field and leaves the list as it was.
 pub(crate) struct ReviewRows {
-    review: WeakEntity<ReviewView>,
+    /// Draws the list: the review's function for it, which is all the list knows of the review.
+    draw: Box<dyn Fn(&mut App) -> AnyElement>,
     _changed: Subscription,
     /// How often the list was drawn, for the test that typing leaves it.
     #[cfg(test)]
@@ -5063,12 +5072,16 @@ pub(crate) struct ReviewRows {
 }
 
 impl ReviewRows {
-    /// Made with the review, not on its first draw.
-    fn new(cx: &mut Context<ReviewView>) -> Entity<Self> {
-        let review = cx.entity();
+    /// Made with the review, not on its first draw: the list `draw` draws, drawn again when
+    /// `review` notifies.
+    fn new<V: 'static>(
+        review: &Entity<V>,
+        draw: impl Fn(&mut App) -> AnyElement + 'static,
+        cx: &mut App,
+    ) -> Entity<Self> {
         cx.new(|cx| ReviewRows {
-            review: review.downgrade(),
-            _changed: cx.observe(&review, |_, _, cx| cx.notify()),
+            draw: Box::new(draw),
+            _changed: cx.observe(review, |_, _, cx| cx.notify()),
             #[cfg(test)]
             renders: 0,
         })
@@ -5081,10 +5094,7 @@ impl Render for ReviewRows {
         {
             self.renders += 1;
         }
-        let list = self
-            .review
-            .update(cx, |review, cx| review.render_list(cx))
-            .unwrap_or_else(|_| gpui::Empty.into_any_element());
+        let list = (self.draw)(cx);
         v_flex().size_full().child(list)
     }
 }
@@ -5289,9 +5299,8 @@ pub(crate) mod tests {
             "kind": "node", "type": { "id": "Person", "name": "Person" }, "id": "p", "op": "update"
         }))
         .unwrap();
-        let this = WeakEntity::<ReviewView>::new_invalid();
         let (fold, partial) = fold_pages(
-            &this,
+            &|_, _| {},
             &mut acx,
             async |_: Option<String>, _: u32, _: &mut AsyncApp| {
                 let changes = (0..=REVIEW_CHANGE_CAP)
@@ -7604,7 +7613,7 @@ pub(crate) mod tests {
             "main".into(),
             None,
             None,
-            WeakEntity::new_invalid(),
+            &|_, _| {},
             &mut async_cx,
         )
         .await
@@ -7635,7 +7644,7 @@ pub(crate) mod tests {
             "main".into(),
             Some("f1".into()),
             None,
-            WeakEntity::new_invalid(),
+            &|_, _| {},
             &mut async_cx,
         )
         .await
@@ -7657,7 +7666,7 @@ pub(crate) mod tests {
             "main".into(),
             None,
             None,
-            WeakEntity::new_invalid(),
+            &|_, _| {},
             &mut async_cx,
         )
         .await
@@ -7847,7 +7856,7 @@ pub(crate) mod tests {
             "main".into(),
             Some("f10499".into()),
             None,
-            WeakEntity::new_invalid(),
+            &|_, _| {},
             &mut async_cx,
         )
         .await
@@ -7880,7 +7889,7 @@ pub(crate) mod tests {
             "main".into(),
             Some("f9899".into()),
             None,
-            WeakEntity::new_invalid(),
+            &|_, _| {},
             &mut async_cx,
         )
         .await
@@ -7911,7 +7920,7 @@ pub(crate) mod tests {
             "main".into(),
             Some("f1".into()),
             None,
-            WeakEntity::new_invalid(),
+            &|_, _| {},
             &mut async_cx,
         )
         .await

@@ -8,22 +8,43 @@ use std::sync::Arc;
 
 use gpui::{
     AnyElement, App, Context, DismissEvent, EventEmitter, FocusHandle, Focusable, MouseDownEvent,
-    Render, Role, ScrollStrategy, UniformListScrollHandle, WeakEntity, Window, uniform_list,
+    Render, Role, ScrollStrategy, UniformListScrollHandle, Window, uniform_list,
 };
+use graph_client::api::CommitOutput;
 use studio_ui::ds::{size, space};
 use studio_ui::menu::{MenuRow, menu_header, menu_separator, menu_surface};
 use studio_ui::{now_micros, relative_time, short_commit_id};
 use ui::prelude::*;
 
-use crate::view::{ReviewCommit, ReviewView};
-
 /// Commit rows the menu shows at once; the rest scroll.
 const SHOWN_ROWS: usize = 12;
+
+/// A commit under review: from the commit list, or the cause of its change-feed block.
+#[derive(Debug, Clone)]
+pub(crate) struct ReviewCommit {
+    pub(crate) id: String,
+    pub(crate) actor_id: Option<String>,
+    /// Unix microseconds.
+    pub(crate) created_at: i64,
+}
+
+impl From<&CommitOutput> for ReviewCommit {
+    fn from(commit: &CommitOutput) -> Self {
+        Self {
+            id: commit.graph_commit_id.clone(),
+            actor_id: commit.actor_id.clone(),
+            created_at: commit.created_at,
+        }
+    }
+}
+
+/// Reviews the scope chosen: `None` for everything since the fork, or one commit.
+type Choose = Box<dyn Fn(Option<String>, &mut App)>;
 
 /// "Since the fork", then the branch's commits since the fork, newest first: choosing one
 /// reviews it.
 pub(crate) struct ScopeMenu {
-    view: WeakEntity<ReviewView>,
+    choose: Choose,
     /// The review's own list, shared: nothing is copied or labelled as the menu opens.
     commits: Arc<[ReviewCommit]>,
     /// The highlighted row: 0 is "Since the fork", `n` the `n`th commit.
@@ -50,11 +71,11 @@ impl Focusable for ScopeMenu {
 
 impl ScopeMenu {
     /// The menu for `commits`, the review showing `scope` (`None` for everything since the
-    /// fork), which it highlights and scrolls to.
+    /// fork), which it highlights and scrolls to; `choose` reviews the scope chosen.
     pub(crate) fn new(
-        view: WeakEntity<ReviewView>,
         commits: Arc<[ReviewCommit]>,
         scope: Option<String>,
+        choose: impl Fn(Option<String>, &mut App) + 'static,
         cx: &mut Context<Self>,
     ) -> Self {
         let selected = scope
@@ -70,7 +91,7 @@ impl ScopeMenu {
             scroll.scroll_to_item(at, ScrollStrategy::Center);
         }
         Self {
-            view,
+            choose: Box::new(choose),
             commits,
             selected,
             now: now_micros(),
@@ -132,9 +153,7 @@ impl ScopeMenu {
             Some(at) => self.commits.get(at).map(|commit| Some(commit.id.clone())),
         };
         if let Some(scope) = scope {
-            self.view
-                .update(cx, |view, cx| view.set_scope(scope, cx))
-                .ok();
+            (self.choose)(scope, cx);
         }
         cx.emit(DismissEvent);
     }
@@ -225,6 +244,7 @@ mod tests {
     use gpui::Entity;
 
     use super::*;
+    use crate::view::ReviewView;
     use crate::view::tests::reviewed_server;
 
     fn commits(n: usize) -> Arc<[ReviewCommit]> {
@@ -245,12 +265,7 @@ mod tests {
     async fn the_scope_menu_builds_only_the_commits_in_view(cx: &mut gpui::TestAppContext) {
         cx.update(studio_theme::init_test);
         let (menu, cx) = cx.add_window_view(|_, cx| {
-            ScopeMenu::new(
-                WeakEntity::new_invalid(),
-                commits(10_000),
-                Some("c09990".into()),
-                cx,
-            )
+            ScopeMenu::new(commits(10_000), Some("c09990".into()), |_, _| {}, cx)
         });
         cx.run_until_parked();
         menu.update(cx, |menu, cx| {
@@ -298,7 +313,10 @@ mod tests {
         let open = |cx: &mut gpui::VisualTestContext| -> Entity<ScopeMenu> {
             let (commits, scope) = view.read_with(cx, |view, _| view.scope_menu_input());
             let weak = view.downgrade();
-            let menu = cx.new(|cx| ScopeMenu::new(weak, commits, scope, cx));
+            let choose = move |scope, cx: &mut App| {
+                weak.update(cx, |view, cx| view.set_scope(scope, cx)).ok();
+            };
+            let menu = cx.new(|cx| ScopeMenu::new(commits, scope, choose, cx));
             let seen = closed.clone();
             cx.update(|_, cx| {
                 cx.subscribe(&menu, move |_, _: &DismissEvent, _| {
