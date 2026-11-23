@@ -33,10 +33,10 @@ use graph_client::api::{ChangeImageOutput, EntityKind, QueryRequest};
 use graph_client::{BlobAt, BlobCell, BlobMeta, GraphClient, HistoricalGap, ReadError};
 use serde_json::{Map, Value};
 
-use crate::GraphSession;
 use crate::changes::{FoldedChange, NetChange};
 use crate::ledger::Asker;
 use crate::scope::ReadScope;
+use crate::{GraphSession, LastChange};
 
 /// First-parent commits an older window of a node's history covers ("Read the 200 commits
 /// before").
@@ -550,18 +550,6 @@ pub fn net_of(run: &[NodeHistoryEntry]) -> (Option<FoldedChange>, Vec<FoldedChan
         .filter_map(|key| fold(by_edge.remove(&key)?))
         .collect();
     (node, edges)
-}
-
-/// The node's last change, as the session keeps it once its history was read (spec 046): a
-/// node's page shows it in its meta line, and reads nothing for it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LastChange {
-    /// The head the history was read at: the page shows the line only when it shows that commit.
-    pub head: String,
-    pub commit: String,
-    pub actor: Option<String>,
-    /// Unix microseconds.
-    pub at: i64,
 }
 
 /// What the search past the windows found of the node's creation.

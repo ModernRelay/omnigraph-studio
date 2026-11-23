@@ -743,7 +743,7 @@ mod tests {
         let shown = view
             .read_with(cx, |view, _| view.snapshot.clone())
             .expect("read");
-        let last = |head: &str| graph_store::node_history::LastChange {
+        let last = |head: &str| graph_store::LastChange {
             head: head.to_owned(),
             commit: "c9".into(),
             actor: Some("act-dev".into()),
