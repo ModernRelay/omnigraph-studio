@@ -39,7 +39,7 @@ const PALETTE_ONLY: [&str; 33] = [
     "studio_graph::OpenAsCanvas",
     "studio_graph::OpenAsMap",
     "studio_graph::OpenAsSource",
-    "studio_graph::OpenAsGallery",
+    "studio_graph::OpenAsCards",
     "studio::About",
     "studio::RevealLog",
     "studio::OpenDesignSystem",
@@ -118,6 +118,10 @@ fn main() {
     println!("test every_destination_has_a_key ... ok");
     no_view_takes_the_keys_of_back_and_forward();
     println!("test no_view_takes_the_keys_of_back_and_forward ... ok");
+    the_cards_letter_keys_are_text_in_a_field(&mut cx);
+    println!("test the_cards_letter_keys_are_text_in_a_field ... ok");
+    a_keymap_naming_the_gallery_still_loads(&mut cx);
+    println!("test a_keymap_naming_the_gallery_still_loads ... ok");
     the_persons_keymap_wins_and_is_read_again(&mut cx, &keymap);
     println!("test the_persons_keymap_wins_and_is_read_again ... ok");
     std::fs::remove_dir_all(&data).ok();
@@ -211,6 +215,147 @@ fn every_keymap_binding_names_a_studio_action(cx: &mut HeadlessAppContext) {
             }
         }
     }
+}
+
+/// A Cards tab's keys that type a character (G, X, F, = and −, and Space) act while its cards
+/// have the keyboard and not while a field in the tab does (`editing`, the filter's field of
+/// spec 048's slice 5): there they are text. Its other keys act in both.
+fn the_cards_letter_keys_are_text_in_a_field(cx: &mut HeadlessAppContext) {
+    let context = |text: &str| KeyContext::parse(text).unwrap();
+    let on_cards = [context("Workspace"), context("Cards")];
+    let in_field = [
+        context("Workspace"),
+        context("Cards editing"),
+        context("Editor mode=single_line"),
+    ];
+    for (platform, content) in KEYMAPS {
+        let KeymapFileLoadResult::Success { key_bindings } =
+            cx.update(|cx| KeymapFile::load(content, cx))
+        else {
+            panic!("{platform}: the keymap did not load");
+        };
+        let mut letters = Vec::new();
+        let mut others = 0;
+        for binding in &key_bindings {
+            let [stroke] = binding.keystrokes() else {
+                continue;
+            };
+            // The Cards blocks' own bindings: those that need its context.
+            let Some(predicate) = binding.predicate() else {
+                continue;
+            };
+            if predicate.depth_of(&on_cards[..1]).is_some()
+                || predicate.depth_of(&on_cards).is_none()
+            {
+                continue;
+            }
+            let held = stroke.modifiers();
+            let types = !held.control
+                && !held.alt
+                && !held.platform
+                && !held.function
+                && (stroke.key().chars().count() == 1 || stroke.key() == "space");
+            if types {
+                assert!(
+                    predicate.depth_of(&in_field).is_none(),
+                    "{platform}: `{}` runs {} in a Cards tab's field instead of typing",
+                    stroke.key(),
+                    binding.action().name()
+                );
+                letters.push(stroke.key().to_owned());
+            } else {
+                assert!(
+                    predicate.depth_of(&in_field).is_some(),
+                    "{platform}: `{}` is lost while a Cards tab's field has the keyboard",
+                    stroke.key()
+                );
+                others += 1;
+            }
+        }
+        letters.sort();
+        assert_eq!(
+            letters,
+            ["-", "=", "f", "g", "space", "x"],
+            "{platform}: the Cards keys that type"
+        );
+        assert_eq!(others, 13, "{platform}: the Cards keys that do not type");
+    }
+}
+
+/// A person's keymap written for the gallery Cards replaced (spec 048) still loads, each old
+/// name bound to the action that took its place: `studio_gallery::…` to `studio_cards::…`,
+/// and the two `studio_graph` actions that opened a gallery to those that open cards.
+fn a_keymap_naming_the_gallery_still_loads(cx: &mut HeadlessAppContext) {
+    let renamed = [
+        ("studio_gallery::MoveLeft", "studio_cards::MoveLeft"),
+        ("studio_gallery::MoveRight", "studio_cards::MoveRight"),
+        ("studio_gallery::MoveUp", "studio_cards::MoveUp"),
+        ("studio_gallery::MoveDown", "studio_cards::MoveDown"),
+        ("studio_gallery::MoveToFirst", "studio_cards::MoveToFirst"),
+        ("studio_gallery::MoveToLast", "studio_cards::MoveToLast"),
+        ("studio_gallery::OpenFile", "studio_cards::OpenCover"),
+        ("studio_gallery::OpenRowPage", "studio_cards::OpenPage"),
+        ("studio_gallery::TogglePick", "studio_cards::TogglePick"),
+        ("studio_gallery::PickAll", "studio_cards::PickAll"),
+        ("studio_gallery::ClearPicks", "studio_cards::Cancel"),
+        ("studio_gallery::CopyIds", "studio_cards::CopyIds"),
+        (
+            "studio_gallery::ShowNextFile",
+            "studio_cards::ShowNextCover",
+        ),
+        ("studio_gallery::LargerTiles", "studio_cards::LargerCards"),
+        ("studio_gallery::SmallerTiles", "studio_cards::SmallerCards"),
+        ("studio_gallery::Refresh", "studio_cards::Refresh"),
+        ("studio_graph::OpenAsGallery", "studio_graph::OpenAsCards"),
+    ];
+    let bindings: Vec<String> = renamed
+        .iter()
+        .enumerate()
+        .map(|(index, (old, _))| format!(r#""ctrl-alt-shift-f{}": "{old}""#, index + 1))
+        .collect();
+    let keymap = format!(
+        r#"[
+  {{
+    "context": "Gallery",
+    "bindings": {{
+      {},
+      "ctrl-alt-shift-f19": [
+        "studio_graph::ShowSetInGallery",
+        {{ "title": "Note", "type_name": "Note", "property": "scan" }}
+      ]
+    }}
+  }}
+]"#,
+        bindings.join(",\n      ")
+    );
+    let key_bindings = match cx.update(|cx| KeymapFile::load(&keymap, cx)) {
+        KeymapFileLoadResult::Success { key_bindings } => key_bindings,
+        KeymapFileLoadResult::SomeFailedToLoad { error_message, .. } => {
+            panic!("a binding with an old name failed: {error_message:?}")
+        }
+        KeymapFileLoadResult::JsonParseFailure { error } => panic!("not valid JSON: {error}"),
+    };
+    assert_eq!(key_bindings.len(), renamed.len() + 1, "none dropped");
+    let mut names: Vec<&str> = key_bindings
+        .iter()
+        .map(|binding| binding.action().name())
+        .collect();
+    names.sort_unstable();
+    let mut expected: Vec<&str> = renamed.iter().map(|(_, new)| *new).collect();
+    expected.push("studio_graph::ShowSetInCards");
+    expected.sort_unstable();
+    assert_eq!(names, expected);
+    // The old `property` is the cover.
+    let opening = key_bindings
+        .iter()
+        .find_map(|binding| {
+            binding
+                .action()
+                .as_any()
+                .downcast_ref::<studio_actions::graph::ShowSetInCards>()
+        })
+        .expect("the action with arguments");
+    assert_eq!(opening.cover.as_deref(), Some("scan"));
 }
 
 /// An action Studio defines that takes no arguments is bound on every platform unless it is

@@ -82,7 +82,8 @@ the interaction and asserts the count:
 | `review` `typing_in_the_search_leaves_the_changes_as_they_were` | The review's list of changes is a cached view of its own (`ReviewRows`): keys in its search draw it no times, the search landing once |
 | `history` `the_rows_draw_once_a_key_and_only_for_what_they_show` | A node's history rows are a cached view of their own (`NodeHistoryRows`, spec 046): ↓ J K ↑ draw them once a key, another branch's commit draws them no times |
 | `history` `moving_through_a_commits_changes_draws_the_list_once_a_key` | A commit's list of changes is a cached view of its own (`CommitRows`): J and K draw it once a key |
-| `type_table` `a_key_draws_the_grid_once_and_previews_land_together` | A gallery's columns are a cached view of their own (`GalleryGrid`, spec 035), laying out only the tiles near the view: an arrow key draws them once, and the previews of a screen landing together draw them once (`gallery::LANDING_DELAY`), not once a tile |
+| `type_table` `a_key_draws_the_cards_once_and_covers_land_together` | A Cards tab's cards are a cached view of their own (`CardsGrid`, spec 048): an arrow key, Home and End draw them once a key, and the covers of a screen landing together draw them once (`cards::LANDING_DELAY`), not once a card |
+| `type_table` `a_frame_lays_out_only_the_lines_near_the_view` | With 5,000 rows read, a frame of `CardsGrid` builds the cards of the lines meeting the view and half a screen either side (under 200 in the test's window), at the end, in the middle and at the start; a card is one element id and one click handler |
 | `studio_workspace` `a_tab_that_caches_its_parts_keeps_them_while_a_field_changes` | A tab that caches its parts keeps them while a field changes; a cached tab draws them again, which is the GPUI behavior the opt-out exists for |
 
 Draw counts are exact, so they run in CI. Times are not: the machine's load moves them several

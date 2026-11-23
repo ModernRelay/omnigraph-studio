@@ -7,13 +7,13 @@ mod blob;
 mod blob_view;
 mod blob_write;
 mod branch_diff;
+mod card_grid;
+mod cards;
 mod cell_select;
 mod dialogs;
 mod fill;
 mod filter_bar;
-mod gallery;
 mod grouping;
-mod masonry;
 mod model;
 mod node_page;
 mod offers;
@@ -35,21 +35,21 @@ use graph_store::GraphSession;
 use serde_json::Value;
 use studio_actions::graph::{
     OpenBlob, OpenNode, OpenNodePage, OpenSavedView, OpenTextEditor, OpenType, RestoreSavedView,
-    ShowSetInGallery, UndoDelete,
+    ShowSetInCards, UndoDelete,
 };
 use studio_workspace::{PanelPosition, ToastKind, Workspace};
 use ui::IconName;
 
 use blob_view::BlobView;
-use gallery::{TileSize, TypeGallery};
+use cards::{CardSize, TypeCards};
 use node_page::NodePage;
 use peek::{NodePeek, PeekSubject};
 use table::{Opening, TypeTable};
 use text_editor::TextEditor;
 use types_list::TypesList;
 
-/// Registers this surface: the tabs it restores (a type's table, a node's page, a Blob, a long
-/// text), and with every new workspace the left dock's Graph panel and the actions that open what it shows (`OpenType`, `OpenNode`, `OpenNodePage`,
+/// Registers this surface: the tabs it restores (a type's table, its cards, a node's page, a
+/// Blob, a long text), and with every new workspace the left dock's Graph panel and the actions that open what it shows (`OpenType`, `OpenNode`, `OpenNodePage`,
 /// `OpenBlob`, `OpenTextEditor`, `UndoDelete`), and the inspector's view of a node another
 /// crate's tab has selected (`register_node_inspector`). Its keys are in `assets/keymaps/`
 /// (`TypeTable`, `TypeTable && editing`).
@@ -92,17 +92,12 @@ pub fn init(cx: &mut App) {
             open_text_editor(workspace, &action, window, cx);
         }
     });
-    // A gallery comes back holding its set, at the commit it held or at the head (spec 035).
-    studio_workspace::register_item_kind(cx, "gallery", |data, workspace, window, cx| {
-        if let Ok(opening) = serde_json::from_value::<ShowSetInGallery>(data.clone()) {
-            let size = data
-                .get("size")
-                .cloned()
-                .and_then(|size| serde_json::from_value(size).ok())
-                .unwrap_or_default();
-            open_gallery(workspace, opening, size, window, cx);
-        }
-    });
+    // A Cards tab comes back holding its set, at the commit it held or at the head (spec 048).
+    // A tab the gallery saved (spec 035) comes back as one: a kind nothing registers is dropped,
+    // and kinds have no aliases, so the old kind stays registered to the same opener.
+    for kind in [CARDS_KIND, GALLERY_KIND] {
+        studio_workspace::register_item_kind(cx, kind, restore_cards);
+    }
     studio_workspace::register_item_kind(cx, "type_table", |data, workspace, window, cx| {
         if let Some((type_name, at_commit, opening)) = saved_table(data) {
             open_type(workspace, &type_name, at_commit, opening, false, window, cx);
@@ -133,8 +128,8 @@ pub fn init(cx: &mut App) {
         workspace.register_action(|workspace, action: &RestoreSavedView, _window, cx| {
             restore_saved_view(workspace, action, cx);
         });
-        workspace.register_action(|workspace, action: &ShowSetInGallery, window, cx| {
-            open_gallery(workspace, action.clone(), TileSize::default(), window, cx);
+        workspace.register_action(|workspace, action: &ShowSetInCards, window, cx| {
+            open_cards(workspace, action.clone(), CardSize::default(), window, cx);
         });
         workspace.register_action(|workspace, action: &OpenBlob, window, cx| {
             open_blob(workspace, action, None, window, cx);
@@ -253,14 +248,44 @@ fn open_type(
     })
 }
 
-/// Opens a set's gallery (spec 035), or activates it when it is open.
-fn open_gallery(
+/// The kind a Cards tab is saved as, and the kind the gallery it replaced saved its tabs as
+/// (spec 035), which restores as Cards.
+pub(crate) const CARDS_KIND: &str = "cards";
+pub(crate) const GALLERY_KIND: &str = "gallery";
+
+/// A Cards tab as it was saved: the set it holds and the file that is its cover, and its card
+/// size. A gallery's saved tab is read the same: its `property` is the cover
+/// (`ShowSetInCards::cover`), and its `size` names the same three sizes.
+pub(crate) fn saved_cards(data: &Value) -> Option<(ShowSetInCards, CardSize)> {
+    let opening = serde_json::from_value::<ShowSetInCards>(data.clone()).ok()?;
+    let size = data
+        .get("size")
+        .cloned()
+        .and_then(|size| serde_json::from_value(size).ok())
+        .unwrap_or_default();
+    Some((opening, size))
+}
+
+/// Opens a saved Cards tab again ([`saved_cards`]).
+fn restore_cards(
+    data: &Value,
     workspace: &mut Workspace,
-    opening: ShowSetInGallery,
-    size: TileSize,
     window: &mut Window,
     cx: &mut Context<Workspace>,
-) -> Option<Entity<TypeGallery>> {
+) {
+    if let Some((opening, size)) = saved_cards(data) {
+        open_cards(workspace, opening, size, window, cx);
+    }
+}
+
+/// Opens a set's cards (spec 048), or activates their tab when it is open.
+fn open_cards(
+    workspace: &mut Workspace,
+    opening: ShowSetInCards,
+    size: CardSize,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Option<Entity<TypeCards>> {
     let session = workspace.session().cloned()?;
     if let Some(schema) = session.read(cx).schema_model()
         && schema.node(&opening.type_name).is_none()
@@ -273,23 +298,23 @@ fn open_gallery(
         return None;
     }
     let handle = cx.entity().downgrade();
-    let key = gallery_key(&opening);
+    let key = cards_key(&opening);
     let preview = opening.preview;
-    workspace.open_item_with::<TypeGallery>(key, preview, window, cx, move |window, cx| {
-        TypeGallery::new(handle, session, opening, size, window, cx)
+    workspace.open_item_with::<TypeCards>(key, preview, window, cx, move |window, cx| {
+        TypeCards::new(handle, session, opening, size, window, cx)
     })
 }
 
-/// A gallery's tab key: its type, the commit it holds, and the set it reads (spec 020, "Tab
-/// identity"); not the file it shows, which a person changes in the tab.
-pub(crate) fn gallery_key(opening: &ShowSetInGallery) -> String {
+/// A Cards tab's key: its type, the commit it holds, and the set it reads (spec 020, "Tab
+/// identity"); not its cover or its size, which a person changes in the tab.
+pub(crate) fn cards_key(opening: &ShowSetInCards) -> String {
     let set = serde_json::json!({
         "filters": opening.filters,
         "sort": opening.sort,
         "ids": opening.ids,
     });
     format!(
-        "gallery/{}@{}/{set}",
+        "cards/{}@{}/{set}",
         opening.type_name,
         opening.at_commit.as_deref().unwrap_or("head")
     )

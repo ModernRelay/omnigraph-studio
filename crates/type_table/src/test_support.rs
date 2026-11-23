@@ -477,7 +477,7 @@ pub(crate) fn session_with_blobs(
 
 /// A server with `schema`, each read answered with the rows `answer` gives for its request
 /// body, Blob cells it holds, and with `changes`, a branch's diff against main as
-/// [`session_with_branch_diff`] answers it: what a gallery reads (spec 035).
+/// [`session_with_branch_diff`] answers it: what a Cards tab reads (spec 048).
 pub(crate) fn session_with_files(
     schema: &str,
     answer: impl Fn(&Value) -> Value + Send + Sync + 'static,

@@ -32,8 +32,8 @@ pub enum ViewKind {
     Source,
     Review,
     History,
-    /// A type's rows as tiles of their files (spec 035).
-    Gallery,
+    /// A type's nodes as cards (spec 048).
+    Cards,
 }
 
 impl ViewKind {
@@ -47,7 +47,7 @@ impl ViewKind {
             Self::Source => "Source",
             Self::Review => "Review",
             Self::History => "History",
-            Self::Gallery => "Gallery",
+            Self::Cards => "Cards",
         }
     }
 }
@@ -361,14 +361,17 @@ pub mod graph {
             OpenAsReview,
             /// Show this branch's commits.
             OpenAsHistory,
-            /// Show what the active tab shows as tiles of its files.
-            OpenAsGallery,
             /// Create a branch from the current branch.
             CreateBranch,
             /// Delete the current branch.
             DeleteBranch,
         ]
     );
+
+    /// Show what the active tab shows as cards.
+    #[derive(Clone, Debug, Default, PartialEq, Action)]
+    #[action(namespace = studio_graph, deprecated_aliases = ["studio_graph::OpenAsGallery"])]
+    pub struct OpenAsCards;
 
     /// Open a node or edge type's table.
     #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
@@ -457,11 +460,11 @@ pub mod graph {
         pub preview: bool,
     }
 
-    /// Show a set of a node type's rows as tiles of one of its files (spec 035): the type's rows
-    /// under filters and an order, or the rows listed, fixed at opening.
+    /// Show a set of a node type's rows as cards (spec 048): the type's rows under filters and
+    /// an order, or the rows listed, as the tab opens.
     #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema, Action)]
-    #[action(namespace = studio_graph)]
-    pub struct ShowSetInGallery {
+    #[action(namespace = studio_graph, deprecated_aliases = ["studio_graph::ShowSetInGallery"])]
+    pub struct ShowSetInCards {
         /// The set in words, as its tab names it: "Note, design".
         pub title: String,
         pub type_name: String,
@@ -474,9 +477,10 @@ pub mod graph {
         /// The rows it holds, by id, when they are listed rather than read.
         #[serde(default)]
         pub ids: Option<Vec<String>>,
-        /// The Blob property its tiles show; the type's first when `None`.
-        #[serde(default)]
-        pub property: Option<String>,
+        /// The Blob property its cards show as their cover; the type's first when `None`. Read
+        /// from `property` too, as a gallery's saved tab and its action named it.
+        #[serde(default, alias = "property")]
+        pub cover: Option<String>,
         /// Read held at this commit, read-only; `None` follows the branch head.
         #[serde(default)]
         pub at_commit: Option<String>,
@@ -484,7 +488,7 @@ pub mod graph {
         /// table it came from read, so it shows the same rows.
         #[serde(default)]
         pub snapshot: Option<String>,
-        /// The row whose tile has the cursor at opening, by id.
+        /// The row whose card has the cursor at opening, by id.
         #[serde(default)]
         pub select: Option<String>,
         /// Open as the pane's preview tab, which the next preview replaces (spec 002).
@@ -785,46 +789,97 @@ pub mod table {
     );
 }
 
-pub mod gallery {
-    use gpui::actions;
+pub mod cards {
+    //! A Cards tab's keys (spec 048). Each keeps the name it had in the gallery Cards replaced
+    //! (`studio_gallery::…`, spec 035) as an alias, so a person's keymap that names one still
+    //! loads.
 
-    actions!(
-        studio_gallery,
-        [
-            /// Move the cursor to the tile before.
-            MoveLeft,
-            /// Move the cursor to the tile after.
-            MoveRight,
-            /// Move the cursor to the tile a line up.
-            MoveUp,
-            /// Move the cursor to the tile a line down.
-            MoveDown,
-            /// Move the cursor to the first tile.
-            MoveToFirst,
-            /// Move the cursor to the last tile read.
-            MoveToLast,
-            /// Open the file of the tile under the cursor in a tab of its own.
-            OpenFile,
-            /// Open the row of the tile under the cursor as a page.
-            OpenRowPage,
-            /// Pick the tile under the cursor, or take it out of the picks.
-            TogglePick,
-            /// Pick every tile read.
-            PickAll,
-            /// Take every tile out of the picks.
-            ClearPicks,
-            /// Copy the picked rows' ids, a line each, or the id of the row under the cursor.
-            CopyIds,
-            /// Show the next file property on the tiles.
-            ShowNextFile,
-            /// Make the tiles larger.
-            LargerTiles,
-            /// Make the tiles smaller.
-            SmallerTiles,
-            /// Read the gallery again: from the branch head, or at the commit it is held at.
-            Refresh,
-        ]
-    );
+    use gpui::Action;
+
+    /// Move the cursor to the card before, in row order.
+    #[derive(Clone, Debug, Default, PartialEq, Action)]
+    #[action(namespace = studio_cards, deprecated_aliases = ["studio_gallery::MoveLeft"])]
+    pub struct MoveLeft;
+
+    /// Move the cursor to the card after, in row order.
+    #[derive(Clone, Debug, Default, PartialEq, Action)]
+    #[action(namespace = studio_cards, deprecated_aliases = ["studio_gallery::MoveRight"])]
+    pub struct MoveRight;
+
+    /// Move the cursor to the card a line up.
+    #[derive(Clone, Debug, Default, PartialEq, Action)]
+    #[action(namespace = studio_cards, deprecated_aliases = ["studio_gallery::MoveUp"])]
+    pub struct MoveUp;
+
+    /// Move the cursor to the card a line down.
+    #[derive(Clone, Debug, Default, PartialEq, Action)]
+    #[action(namespace = studio_cards, deprecated_aliases = ["studio_gallery::MoveDown"])]
+    pub struct MoveDown;
+
+    /// Move the cursor to the first card.
+    #[derive(Clone, Debug, Default, PartialEq, Action)]
+    #[action(namespace = studio_cards, deprecated_aliases = ["studio_gallery::MoveToFirst"])]
+    pub struct MoveToFirst;
+
+    /// Move the cursor to the last card read.
+    #[derive(Clone, Debug, Default, PartialEq, Action)]
+    #[action(namespace = studio_cards, deprecated_aliases = ["studio_gallery::MoveToLast"])]
+    pub struct MoveToLast;
+
+    /// Open the node of the card under the cursor as a page.
+    #[derive(Clone, Debug, Default, PartialEq, Action)]
+    #[action(namespace = studio_cards, deprecated_aliases = ["studio_gallery::OpenRowPage"])]
+    pub struct OpenPage;
+
+    /// Open the cover's file of the card under the cursor in a tab of its own.
+    #[derive(Clone, Debug, Default, PartialEq, Action)]
+    #[action(namespace = studio_cards, deprecated_aliases = ["studio_gallery::OpenFile"])]
+    pub struct OpenCover;
+
+    /// Walk from the node of the card under the cursor, on a canvas of its own.
+    #[derive(Clone, Debug, Default, PartialEq, Action)]
+    #[action(namespace = studio_cards)]
+    pub struct ShowOnCanvas;
+
+    /// Pick the card under the cursor, or take it out of the picks.
+    #[derive(Clone, Debug, Default, PartialEq, Action)]
+    #[action(namespace = studio_cards, deprecated_aliases = ["studio_gallery::TogglePick"])]
+    pub struct TogglePick;
+
+    /// Pick every card read.
+    #[derive(Clone, Debug, Default, PartialEq, Action)]
+    #[action(namespace = studio_cards, deprecated_aliases = ["studio_gallery::PickAll"])]
+    pub struct PickAll;
+
+    /// Take every card out of the picks.
+    #[derive(Clone, Debug, Default, PartialEq, Action)]
+    #[action(namespace = studio_cards, deprecated_aliases = ["studio_gallery::ClearPicks"])]
+    pub struct Cancel;
+
+    /// Copy the picked nodes' ids, a line each, or the id of the node under the cursor.
+    #[derive(Clone, Debug, Default, PartialEq, Action)]
+    #[action(namespace = studio_cards, deprecated_aliases = ["studio_gallery::CopyIds"])]
+    pub struct CopyIds;
+
+    /// Show the type's next file property as the cards' cover.
+    #[derive(Clone, Debug, Default, PartialEq, Action)]
+    #[action(namespace = studio_cards, deprecated_aliases = ["studio_gallery::ShowNextFile"])]
+    pub struct ShowNextCover;
+
+    /// Make the cards larger.
+    #[derive(Clone, Debug, Default, PartialEq, Action)]
+    #[action(namespace = studio_cards, deprecated_aliases = ["studio_gallery::LargerTiles"])]
+    pub struct LargerCards;
+
+    /// Make the cards smaller.
+    #[derive(Clone, Debug, Default, PartialEq, Action)]
+    #[action(namespace = studio_cards, deprecated_aliases = ["studio_gallery::SmallerTiles"])]
+    pub struct SmallerCards;
+
+    /// Read the cards again: from the branch head, or at the commit they are held at.
+    #[derive(Clone, Debug, Default, PartialEq, Action)]
+    #[action(namespace = studio_cards, deprecated_aliases = ["studio_gallery::Refresh"])]
+    pub struct Refresh;
 }
 
 pub mod blob {

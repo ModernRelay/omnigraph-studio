@@ -33,7 +33,7 @@ use graph_store::{
     Loadable, OutcomeKind, SessionEvent,
 };
 use studio_actions::graph::{
-    OpenAsCanvas, OpenAsGallery, OpenAsHistory, OpenAsMap, OpenAsPage, OpenAsReview, OpenAsSource,
+    OpenAsCanvas, OpenAsCards, OpenAsHistory, OpenAsMap, OpenAsPage, OpenAsReview, OpenAsSource,
     OpenAsTable, OpenAsTree, OpenBranchHistory, OpenCommit,
 };
 use studio_actions::workspace::OpenViewAt;
@@ -827,7 +827,7 @@ impl Workspace {
         this.register_view_action::<OpenAsSource>(ViewKind::Source);
         this.register_view_action::<OpenAsReview>(ViewKind::Review);
         this.register_view_action::<OpenAsHistory>(ViewKind::History);
-        this.register_view_action::<OpenAsGallery>(ViewKind::Gallery);
+        this.register_view_action::<OpenAsCards>(ViewKind::Cards);
         this.register_action(|workspace, action: &OpenViewAt, window, cx| {
             let kind = workspace
                 .active_item()
@@ -3199,6 +3199,23 @@ impl Workspace {
             .iter()
             .map(|toast| toast.message.clone())
             .collect()
+    }
+
+    /// Opens a saved tab as a restart does, by the opener its kind registered
+    /// ([`register_item_kind`]); `false` when nothing registered the kind, and a restart drops
+    /// the tab. For the tests of crates that register kinds.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn reopen_saved(
+        &mut self,
+        item: &SavedItem,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(open) = ItemKinds::opener(cx, &item.kind) else {
+            return false;
+        };
+        open(&item.data, self, window, cx);
+        true
     }
 
     // ---- actions ----

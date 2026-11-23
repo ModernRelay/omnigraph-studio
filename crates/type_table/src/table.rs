@@ -468,7 +468,7 @@ async fn read_branch_diff(
 }
 
 /// [`read_branch_diff`], with the merge base it read from: where a removed row last was (a
-/// gallery reads a removed row's file there, spec 035).
+/// removed card's cover is read there, spec 048).
 pub(crate) async fn read_branch_diff_from(
     session: &Entity<GraphSession>,
     branch: &str,
@@ -1103,8 +1103,9 @@ impl Item for TypeTable {
             None => ViewLink::disabled_because(ViewKind::Canvas, "Select a row to walk from it"),
         };
         let mut views = vec![ViewLink::current(ViewKind::Table), tree, canvas];
-        // A type with files also shows them as tiles (spec 035).
-        if let Some(property) = self.gallery_property() {
+        // A type with files also shows its rows as cards, a file their cover (spec 048; every
+        // node type from its slice 2).
+        if self.cards_cover().is_some() {
             let shown = if self.selection.is_empty() {
                 "these rows".to_owned()
             } else {
@@ -1113,10 +1114,7 @@ impl Item for TypeTable {
                     studio_ui::plural(self.selection.len(), "selected row", "selected rows")
                 )
             };
-            views.push(
-                ViewLink::to(ViewKind::Gallery)
-                    .saying(format!("Show {shown} as tiles of their {property}")),
-            );
+            views.push(ViewLink::to(ViewKind::Cards).saying(format!("Show {shown} as cards")));
         }
         views
     }
@@ -1124,7 +1122,7 @@ impl Item for TypeTable {
     fn view_action(&self, kind: ViewKind, cx: &App) -> Option<Box<dyn gpui::Action>> {
         match kind {
             ViewKind::Tree => Some(self.tree_action(cx)),
-            ViewKind::Gallery => self.gallery_action(),
+            ViewKind::Cards => self.cards_action(),
             ViewKind::Canvas => {
                 let row = self.cursor_row()?;
                 Some(Box::new(studio_actions::graph::ShowNodeOnCanvas {
@@ -7959,9 +7957,10 @@ impl TypeTable {
         })
     }
 
-    /// The Blob property a gallery of this table's rows shows first (spec 035): the one under
-    /// the cursor, else the type's first; `None` for a type with no file, or an edge type.
-    fn gallery_property(&self) -> Option<String> {
+    /// The Blob property the cards of this table's rows show first as their cover (spec 048):
+    /// the one under the cursor, else the type's first; `None` for a type with no file, or an
+    /// edge type.
+    fn cards_cover(&self) -> Option<String> {
         if self.kind != TableKind::Node {
             return None;
         }
@@ -7977,11 +7976,11 @@ impl TypeTable {
             .or_else(|| self.all_columns.iter().find_map(is_file))
     }
 
-    /// What Gallery opens from this table (spec 035): the selected rows, listed, or the rows
+    /// What Cards opens from this table (spec 048): the selected rows, listed, or the rows
     /// under the filters and in the table's order, at the commit the table read, the cursor's
     /// row under the cursor.
-    fn gallery_action(&self) -> Option<Box<dyn gpui::Action>> {
-        let property = self.gallery_property()?;
+    fn cards_action(&self) -> Option<Box<dyn gpui::Action>> {
+        let cover = self.cards_cover()?;
         let ids = (!self.selection.is_empty()).then(|| {
             self.rows
                 .iter()
@@ -8006,7 +8005,7 @@ impl TypeTable {
         } else {
             format!("{}, {summary}", self.type_name)
         };
-        Some(Box::new(studio_actions::graph::ShowSetInGallery {
+        Some(Box::new(studio_actions::graph::ShowSetInCards {
             title,
             type_name: self.type_name.clone(),
             filters: (ids.is_none() && !filters.is_empty())
@@ -8016,7 +8015,7 @@ impl TypeTable {
                 serde_json::json!({"property": sort.property, "descending": sort.descending})
             }),
             ids,
-            property: Some(property),
+            cover: Some(cover),
             at_commit: self.at_commit.clone(),
             snapshot: self.paging.pinned.clone().filter(|_| self.at_commit.is_none()),
             select: self.cursor_row().map(|row| row.id.clone()),

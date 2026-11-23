@@ -1,8 +1,11 @@
 # 048: Cards, a view of a type's nodes
 
-Status: accepted 2026-11-23, not built · supersedes [035](../035-gallery/plan.md), whose Gallery
-stays in the app until slice 1 here lands · Studio's claims checked against `7f3e7e92` on
-2026-11-23; Omnigraph's are spec 035's, checked against `v0.15.0` on 2026-11-18 and not rechecked
+Status: accepted 2026-11-23 · slice 1 built 2026-11-23 (Gallery is Cards: the names and their
+aliases, a saved `gallery` tab restored, the uniform grid, ↵, ⌥↵ and G; a card is its cover and
+its title, offered where Gallery was); slices 2 to 7 not built · supersedes
+[035](../035-gallery/plan.md), whose Gallery left the app with slice 1 · Studio's claims checked
+against `7f3e7e92` on 2026-11-23; Omnigraph's are spec 035's, checked against `v0.15.0` on
+2026-11-18 and not rechecked
 
 ## Problem
 
@@ -51,7 +54,8 @@ card format among others.
 
 ## What exists today (checked)
 
-Studio at `7f3e7e92`. Read, not run, unless a row of the validation log says otherwise.
+Studio at `7f3e7e92`, before slice 1: what Gallery was. Read, not run, unless a row of the
+validation log says otherwise.
 
 - **Gallery** (spec 035, PR #144, merged 2026-11-20).
   - `crates/type_table/src/gallery.rs` (2,599 lines): `TypeGallery`, a tab of a node type's
@@ -173,9 +177,9 @@ configuration describes a view, a layout or a card.
 ### The grid
 
 - Columns of one width: at least Small, Medium (default) or Large (`ds::size::CARD_SMALL`,
-  `CARD`, `CARD_LARGE`; first values 200, 260 and 340 pixels, settled by snapshot in slice 1
-  and recorded in the validation log), as many as fit the tab less `space::EDGE` either side
-  and `space::LG` between, grown to fill it.
+  `CARD`, `CARD_LARGE`: 180, 240 and 340 pixels, settled by snapshot in slice 1; Corrections),
+  as many as fit the tab less `space::EDGE` either side and `space::LG` between, grown to fill
+  it.
 - Cards are placed in row order, left to right, then down. Card *i* of *c* columns is in line
   *i ÷ c*, column *i mod c*. Nothing is measured before a card is placed.
 - One scroll area as tall as its lines. A frame lays out only the cards of the lines that meet
@@ -405,8 +409,71 @@ Each slice is a pull request that stands alone.
 | 2026-11-23 | A saved tab of an unregistered kind is dropped, and kinds have no aliases | Read `persistence.rs` and `Workspace::restore_saved` | Confirmed by reading |
 | 2026-11-23 | A saved view's shape is never read; a results canvas is not saved | Read `studio_settings.rs`, `type_table.rs` (`open_saved_view`), `graph_canvas.rs` (`serialize`) | Confirmed by reading |
 
-Nothing of the design is built. Each slice adds its rows.
+Slice 1 is built; slices 2 to 7 are not. Each slice adds its rows.
+
+### Slice 1 (2026-11-23)
+
+Built on `feat/cards-view`, on `028574f4`. Apple M5 Max, macOS 27.0.1, Rust 1.98.1, debug builds.
+
+| Date | Claim | Check | Result |
+|---|---|---|---|
+| 2026-11-23 | The gallery's tests passed before the change | `cargo test -p type_table gallery` on `028574f4` | 20 passed |
+| 2026-11-23 | Card `i` of `c` columns is at line `i ÷ c`, column `i mod c`; the arrows move as the table of keys says | `type_table` `card_grid::tests` (4): `a_card_is_placed_by_its_index_alone`, `the_columns_fill_the_width`, `the_cards_of_the_lines_meeting_a_span_are_found`, `the_arrows_move_in_row_order_and_by_lines` | Pass. They take the place of `masonry.rs`'s four |
+| 2026-11-23 | Every card is one size and is placed before its cover is read; a cover landing moves none | `cards::tests` `every_card_is_one_size_whatever_its_cover`, `a_card_is_placed_before_its_cover_and_stays_there` (drawn bounds, one file's bytes held) | Pass |
+| 2026-11-23 | Covers are read for the cards a frame lays out and no others, four at once; a read for a card scrolled away is dropped | `covers_are_read_for_the_cards_laid_out_and_no_others` (400 rows, 120 files over 64 KiB, the fake server's log of reads) | Pass: 36 cards laid out and read in the test's 1920 × 1080 window, none after them; four reads out at once; after a jump to the end no read for a card near the start was sent |
+| 2026-11-23 | A frame lays out only the lines near the view | `a_frame_lays_out_only_the_lines_near_the_view`: 5,000 rows read, the cards built at the end, the middle and the start | Pass: the lines meeting the view and half a screen either side, under 200 cards of 5,000 |
+| 2026-11-23 | A window widened at the cards' end still shows cards | `a_widened_window_at_the_end_still_draws_the_last_cards`: 150 rows, scrolled to the end, the window made twice as wide | Failed first: the frame chose its cards from the old offset, past the end, and drew none until the next event, as the gallery did. Pass with the offset held within the new range (`studio_ui::scrolled_within`, as the table's columns) |
+| 2026-11-23 | An arrow key draws the grid once; a screen of covers landing draws it once | `a_key_draws_the_cards_once_and_covers_land_together` (↓ ↑ ← → End Home; every cover of the cards laid out read again) | Pass: one draw a key, no draw as the covers land, one draw `LANDING_DELAY` after |
+| 2026-11-23 | ↵ and ⌘↵ open the page, ⌥↵ the cover's file, G the canvas the strip opens; a second click opens the page | `enter_opens_the_page_alt_enter_the_cover_and_g_the_canvas`, `a_click_selects_and_a_second_opens_the_page` (the actions dispatched) | Pass |
+| 2026-11-23 | A saved `gallery` tab comes back as Cards | `a_saved_gallery_tab_comes_back_as_cards`: two tabs as 0.4.12 wrote them (`property`, `size`; one filtered and sorted, one of listed rows held at a commit), reopened through the workspace's opener for their kind | Pass: the same set, that file the cover, that size; saved again as kind `cards` with `cover`; a kind nothing registers opens nothing |
+| 2026-11-23 | The old names load from a person's keymap | `studio` `keymaps` `a_keymap_naming_the_gallery_still_loads`: the sixteen `studio_gallery::…` names, `studio_graph::OpenAsGallery` and `ShowSetInGallery` with `property`, in a `Gallery` context | Pass: each bound to the action that took its place; the view keeps the `Gallery` key context beside `Cards`, so such bindings act (`the_arrows_move_in_row_order_and_by_lines`) |
+| 2026-11-23 | Letters typed in a field are text | `keymaps` `the_cards_letter_keys_are_text_in_a_field`: G, X, F, =, − and Space are bound in `Cards && !editing` on every platform, the other thirteen keys in `Cards` | Pass. No field is in the tab until slice 5, which sets `editing` |
+| 2026-11-23 | The card widths | Offscreen snapshots of the `notes` graph's Note cards at 1440 × 900, against `script/dev-server` on a port of its own (`omnigraph` 0.15.0) | 180, 240 and 340 drew 4, 3 and 2 columns between the sidebar and the inspector (a tab of 836 px), and 240 drew 4 with the inspector closed (1,176 px), where 180 and 340 give 6 and 3 by the grid's arithmetic, not drawn. 260 drew 3 in the 836 px tab, and 200 gives 3 there by the same arithmetic (Corrections) |
+| 2026-11-23 | Cards look right at each size, with picks and with the inspector | The same snapshots, read: Small, Medium, Large; the cursor moved and two cards picked; the inspector closed and open again with Space; a branch `fix` with a note added, one retitled and one deleted | Cards of one height in straight lines; covers fitted and centered in boxes of one shape (pictures, an SVG, a PDF's page, text, bytes, an empty value, a null); titles on one line; nothing overlaps or is cut. On the branch the deleted note's card is first, dimmed, its title struck; the added and the changed card carry their bar and mark; the toolbar counts +1 ~1 −1 |
+| 2026-11-23 | The workspace's checks | `cargo fmt --all --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace --no-fail-fast`; `script/check-layers.py`, `check-design-tokens.py`, `check-brand.py`, `test_release_files.py` | All pass. Tests: 1,742 passed, 0 failed, 9 ignored in the 54 harnessed test binaries (`type_table` 307, 1 ignored), and the 7 checks of `studio`'s `keymaps`, which has no harness; `PALETTE_ONLY` is still 33 names. `layers ok: 24 crates; 64 UI tools in their crate`, `design tokens ok`, `brand ok: 543 files`, 8 release-file tests OK |
+
+`cards::tests` holds 25 tests: the gallery's 20 and 5 new (the frame's lines, the keys that open,
+the clicks, the saved tab, the widened window). Of the gallery's 20, 15 were adapted (names and the
+grid's in place of the masonry's) and 3 replaced by their uniform-grid equivalents:
+`a_tile_is_as_tall_as_its_files_shape` by `every_card_is_one_size_whatever_its_cover`,
+`a_placed_tile_keeps_its_place_when_later_shapes_arrive` by
+`a_card_is_placed_before_its_cover_and_stays_there`, and
+`the_tiles_shown_are_drawn_and_the_rows_below_measured` by
+`covers_are_read_for_the_cards_laid_out_and_no_others`. Two were adapted in what they assert:
+`the_arrows_move_within_and_across_columns` (now row order and lines; a size change reads no cover
+twice, where it read nothing) and `previews_past_the_cap_are_let_go_farthest_first` (no first bytes
+are held for rows measured ahead; a preview of a file that is no longer the cover goes first).
+
+What slice 1 leaves as Gallery had it, for the slices named: Cards is offered only for a type
+with a file (2); the toolbar's File chip stays, named Cover, and F goes round the type's files
+without None (2, the Fields menu); the set is fixed at opening (5).
 
 ## Corrections
 
-None yet.
+- 2026-11-23 · **The card widths are 180, 240 and 340**, not 200, 260 and 340. Columns grow to
+  fill the tab, so a size is seen only as a column count: in a 1440 px window with the sidebar
+  and the inspector open the tab is 836 px, where 200 and 260 both give three columns of 260
+  (and 260 sits exactly on the edge of two).
+- 2026-11-23 · **A later page that failed is retried from the status bar**, as in the table. The
+  gallery said "Not read · Retry" in the band under its shortest column, and the bands are
+  gone; States names only ⌘R, which reads the set again from its first page. With no row
+  shown the tab's body still says the error and offers the same Retry.
+- 2026-11-23 · **Covers are read for the cards a frame lays out**: the lines meeting the view,
+  first, then half a screen below and above. Reading says "the cards meeting the view"; read
+  only for those, a scroll of less than half a screen would show cards drawn with empty covers.
+- 2026-11-23 · **A preview of at most 480 px is soft on a Large card.** 480 was twice the
+  gallery's large tile (240 px). A Large card's cover is 330 to 400 px wide, so on a 2x display
+  it is drawn from 480 px over as many as 800. Left at 480: at 680 a preview holds twice the
+  bytes, and a screen of Small cards already holds about what `PREVIEWS_HELD` allows. A choice
+  for the person who owns this plan.
+- 2026-11-23 · **A card keeps one tooltip**: the node's name, which its title may cut, and under
+  it what the cover's file is, why there is none, or that the branch changed it, which the
+  gallery's meta line said. A field still has none.
+- 2026-11-23 · **Home, End and the arrows show the cursor's card** even when the cursor does not
+  move (Home on the first card, scrolled away): the gallery left the view where it was.
+- 2026-11-23 · **The view keeps the key context `Gallery` beside `Cards`.** Names says the old
+  action names are kept working by their aliases; a binding a person wrote in a `Gallery`
+  context would still load and never act, since a context has no alias. The tab answers both.
+- 2026-11-23 · **The tab scrolls to the card it opened at once the grid is measured**, in the
+  first frame that knows its width. The gallery scrolled when the tile was placed, from a
+  width it guessed.
