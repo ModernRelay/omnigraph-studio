@@ -24,6 +24,8 @@ use crate::first_run::{self, Choice};
 use crate::organizations;
 use ui::prelude::*;
 
+mod planes;
+
 /// Where the keyboard is in the dialog: a server, one of the chosen server's graphs, or a field.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Place {
@@ -98,7 +100,7 @@ pub struct OpenGraphModal {
     selected: Option<Entity<Connection>>,
     /// The control plane, and its organization, the pane shows in place of the selected
     /// server's graphs.
-    plane_shown: Option<organizations::Shown>,
+    plane_shown: Option<planes::Shown>,
     /// The row or field ↑, ↓ and Tab moved to, which ↵ runs.
     cursor: Option<Place>,
     graph_id: Entity<Editor>,
@@ -424,7 +426,7 @@ impl OpenGraphModal {
             .iter()
             .map(|connection| Place::Server(connection.entity_id()))
             .collect();
-        places.extend(organizations::nav_places(&self.planes, cx));
+        places.extend(planes::nav_places(&self.planes, cx));
         match self.start {
             Some(Start::Choices) => {
                 let no_cli = self.no_cli(cx);
@@ -442,7 +444,7 @@ impl OpenGraphModal {
             None => {}
         }
         match self.shown_plane() {
-            Some((plane, Some(organization))) => places.extend(organizations::pane_places(
+            Some((plane, Some(organization))) => places.extend(planes::pane_places(
                 &plane,
                 &organization,
                 &self.managed,
@@ -659,7 +661,7 @@ impl OpenGraphModal {
                             .iter()
                             .find(|p| p.entity_id() == id)
                             .and_then(|plane| {
-                                organizations::pane_places(plane, &organization, &self.managed, cx)
+                                planes::pane_places(plane, &organization, &self.managed, cx)
                                     .into_iter()
                                     .next()
                             });
@@ -1272,11 +1274,7 @@ impl OpenGraphModal {
                         this.show_start(Start::Choices, window, cx)
                     })),
             )
-            .children(organizations::nav(
-                &self.planes,
-                self.plane_shown.as_ref(),
-                cx,
-            ))
+            .children(self.render_planes(cx))
     }
 
     /// While Studio finds no Omnigraph CLI it can drive, a band over the pane says so, with the
@@ -2169,7 +2167,7 @@ fn source_label(source: &ServerSource, profile: Option<&str>) -> String {
 
 /// A pane's head: what it shows, named, a line under the name, and its actions on the right;
 /// on its rows' text's edge.
-pub(crate) fn pane_head(
+fn pane_head(
     title: impl Into<SharedString>,
     detail: Option<AnyElement>,
     actions: Vec<AnyElement>,
@@ -2190,7 +2188,7 @@ pub(crate) fn pane_head(
 }
 
 /// A pane's name, over its rows and on their text's edge.
-pub(crate) fn pane_label(title: &'static str) -> Div {
+fn pane_label(title: &'static str) -> Div {
     div()
         .px(px(space::MD))
         .pb(px(space::XS))
@@ -2214,13 +2212,9 @@ impl Render for OpenGraphModal {
             (true, _) => self.render_add(cx).into_any_element(),
             (false, _) if self.start == Some(Start::Choices) => self.render_start(cx),
             (false, _) if self.start == Some(Start::Local) => self.render_local(cx),
-            (false, Some((plane, organization))) => organizations::pane(
-                &plane,
-                organization.as_deref(),
-                &self.managed,
-                self.cursor.as_ref(),
-                cx,
-            ),
+            (false, Some((plane, organization))) => {
+                self.render_plane(&plane, organization.as_deref(), cx)
+            }
             (false, None) => self.render_graphs(cx).into_any_element(),
         };
         ds::modal(cx)
