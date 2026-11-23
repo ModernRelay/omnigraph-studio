@@ -55,7 +55,7 @@ type Digester =
     dyn Fn(&[PathBuf], &str) -> BoxFuture<'static, Result<TargetDigests, String>> + Send + Sync;
 
 /// Lists the targets of an operator home with the first CLI Studio can drive of the places
-/// given, as they land on the platform given ([`cli_config::read_targets`]); run off the main
+/// given, as they land on the platform given ([`cli_tokens::read_targets`]); run off the main
 /// thread.
 type Lister = Arc<
     dyn Fn(Option<PathBuf>, Vec<PathBuf>, Platform) -> BoxFuture<'static, CliTargets> + Send + Sync,
@@ -315,7 +315,7 @@ fn list_with_the_cli(
     places: Vec<PathBuf>,
     platform: Platform,
 ) -> BoxFuture<'static, CliTargets> {
-    async move { cli_config::read_targets(dir.as_deref(), &places, platform).await }.boxed()
+    async move { cli_tokens::read_targets(dir.as_deref(), &places, platform).await }.boxed()
 }
 
 fn add_with_the_cli(
