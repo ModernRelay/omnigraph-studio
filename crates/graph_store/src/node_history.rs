@@ -869,10 +869,44 @@ pub fn read_window(
     window: NodeHistoryWindow,
     cx: &mut Context<GraphSession>,
 ) -> Task<Result<NodeHistoryPage, ReadError>> {
-    let Some(mut reader) = Reader::new(session, scope, branch, node, cx) else {
+    let Some(reader) = Reader::new(session, scope, branch, node, cx) else {
         return Task::ready(Err(ReadError::Decode("the schema is not read yet".into())));
     };
-    cx.spawn(async move |_, cx| {
+    cx.spawn(async move |_, cx| reader.window(window, cx).await)
+}
+
+/// Searches past the windows read (spec 046), asked for through `scope`: when node `node`
+/// was created, it being there at `base` (the oldest commit read). It lists the commits from
+/// `base` back, from `page_token` for the head the windows answer for, in pages of 1,000,
+/// then binary-searches them with point reads of the node. Only for its creation: a list of
+/// changes is never searched, since a search misses a value that changed and changed back.
+pub fn search_creation(
+    session: &GraphSession,
+    scope: &ReadScope,
+    branch: &str,
+    node: NodeScope,
+    page_token: String,
+    base: (String, NodeState),
+    cx: &mut Context<GraphSession>,
+) -> Task<Result<SearchFound, ReadError>> {
+    let Some(reader) = Reader::new(session, scope, branch, node, cx) else {
+        return Task::ready(Err(ReadError::Decode("the schema is not read yet".into())));
+    };
+    if !base.1.exists {
+        return Task::ready(Err(ReadError::Decode(
+            "the node is not there at the oldest commit read".into(),
+        )));
+    }
+    cx.spawn(async move |_, cx| reader.search(page_token, base, cx).await)
+}
+
+impl Reader {
+    /// Reads `window` ([`read_window`]).
+    async fn window(
+        mut self,
+        window: NodeHistoryWindow,
+        cx: &mut AsyncApp,
+    ) -> Result<NodeHistoryPage, ReadError> {
         let newest = matches!(window, NodeHistoryWindow::Newest);
         let limit = if newest {
             NODE_HISTORY_FIRST_COMMITS
@@ -892,12 +926,9 @@ pub fn read_window(
                 nothing_newer,
             ),
         };
-        let (client, graph, branch) = (
-            reader.client.clone(),
-            reader.graph.clone(),
-            reader.branch.clone(),
-        );
-        let listing = reader
+        let (client, graph, branch) =
+            (self.client.clone(), self.graph.clone(), self.branch.clone());
+        let listing = self
             .start(
                 "node_history_commits",
                 async move {
@@ -925,7 +956,7 @@ pub fn read_window(
         };
         let Some(oldest) = commits.last().cloned() else {
             page.coverage.reach = Reach::GraphStart;
-            page.requests = reader.requests;
+            page.requests = self.requests;
             return Ok(page);
         };
         // The commits read: the window's, then the oldest one's parent, which the window's
@@ -939,15 +970,15 @@ pub fn read_window(
             states[0] = state;
         }
         let last = ids.len() - 1;
-        let groups = reader.node.groups.len();
-        let blobs = reader.node.blobs.len();
+        let groups = self.node.groups.len();
+        let blobs = self.node.blobs.len();
 
         // The node at every commit; then, at each commit that holds it, its edges through
         // every relationship group and its Blobs. No group is left out: a group read only at
         // the window's ends would miss an edge added and removed between them, and with it
         // who changed the node last.
         let jobs: Vec<(usize, Read)> = (first..ids.len()).map(|at| (at, Read::Node)).collect();
-        let mut failed = reader.run(&ids, jobs, &mut states, cx).await;
+        let mut failed = self.run(&ids, jobs, &mut states, cx).await;
         let mut jobs = Vec::new();
         for (at, _) in states
             .iter()
@@ -958,7 +989,7 @@ pub fn read_window(
             jobs.extend((0..groups).map(|ix| (at, Read::Edges(ix))));
             jobs.extend((0..blobs).map(|ix| (at, Read::Blob(ix))));
         }
-        failed.extend(reader.run(&ids, jobs, &mut states, cx).await);
+        failed.extend(self.run(&ids, jobs, &mut states, cx).await);
         // A failed read ends what is known at the newest commit it failed at: a schema change
         // between it and the commit above it (E52), or a read that stopped short.
         failed.sort_by_key(|(at, _)| *at);
@@ -997,9 +1028,9 @@ pub fn read_window(
             .collect();
         page.coverage.too_large = full
             .into_iter()
-            .map(|ix| reader.node.groups[ix].clone())
+            .map(|ix| self.node.groups[ix].clone())
             .collect();
-        page.entries = entries_of(&reader.node, &commits, &states);
+        page.entries = entries_of(&self.node, &commits, &states);
         if page.entries.iter().any(NodeHistoryEntry::created) {
             page.coverage.creation = Creation::InEntries;
         }
@@ -1021,8 +1052,8 @@ pub fn read_window(
                 let Some((ix, merged)) = merges.next() else {
                     break;
                 };
-                let (client, graph) = (reader.client.clone(), reader.graph.clone());
-                let read = reader.start(
+                let (client, graph) = (self.client.clone(), self.graph.clone());
+                let read = self.start(
                     "node_history_merge",
                     async move { client.commit(&graph, &merged).await },
                     cx,
@@ -1039,7 +1070,7 @@ pub fn read_window(
         }
 
         page.commits = commits;
-        page.requests = reader.requests;
+        page.requests = self.requests;
         // The node's last change is this window's newest entry when no window above it
         // changed anything. A group too large to follow may hide a newer change: the page then
         // says nothing.
@@ -1053,41 +1084,24 @@ pub fn read_window(
                 actor: last.actor.clone(),
                 at: last.at,
             };
-            let (type_name, id) = (reader.node.type_name.clone(), reader.node.id.clone());
-            reader
-                .session
+            let (type_name, id) = (self.node.type_name.clone(), self.node.id.clone());
+            self.session
                 .update(cx, |session, cx| {
                     session.note_last_change(&type_name, &id, last, cx)
                 })
                 .ok();
         }
         Ok(page)
-    })
-}
-
-/// Searches past the windows read (spec 046), asked for through `scope`: when node `node`
-/// was created, it being there at `base` (the oldest commit read). It lists the commits from
-/// `base` back, from `page_token` for the head the windows answer for, in pages of 1,000,
-/// then binary-searches them with point reads of the node. Only for its creation: a list of
-/// changes is never searched, since a search misses a value that changed and changed back.
-pub fn search_creation(
-    session: &GraphSession,
-    scope: &ReadScope,
-    branch: &str,
-    node: NodeScope,
-    page_token: String,
-    base: (String, NodeState),
-    cx: &mut Context<GraphSession>,
-) -> Task<Result<SearchFound, ReadError>> {
-    let Some(mut reader) = Reader::new(session, scope, branch, node, cx) else {
-        return Task::ready(Err(ReadError::Decode("the schema is not read yet".into())));
-    };
-    if !base.1.exists {
-        return Task::ready(Err(ReadError::Decode(
-            "the node is not there at the oldest commit read".into(),
-        )));
     }
-    cx.spawn(async move |_, cx| {
+
+    /// Searches for the node's creation from `base` back, from `page_token`
+    /// ([`search_creation`]).
+    async fn search(
+        mut self,
+        page_token: String,
+        base: (String, NodeState),
+        cx: &mut AsyncApp,
+    ) -> Result<SearchFound, ReadError> {
         let mut found = SearchFound::default();
         let mut capped = false;
         // The commits from `base` back towards the graph's first.
@@ -1098,12 +1112,9 @@ pub fn search_creation(
                 capped = true;
                 break;
             }
-            let (client, graph, branch) = (
-                reader.client.clone(),
-                reader.graph.clone(),
-                reader.branch.clone(),
-            );
-            let listing = reader
+            let (client, graph, branch) =
+                (self.client.clone(), self.graph.clone(), self.branch.clone());
+            let listing = self
                 .start(
                     "node_history_search_commits",
                     async move { client.commit_page(&graph, &branch, 1000, Some(&at)).await },
@@ -1122,7 +1133,7 @@ pub fn search_creation(
         // Binary search for the oldest commit the node is still there at.
         let (mut lo, mut hi) = (0usize, older.len());
         while let Some(mid) = search_step(lo, hi) {
-            match reader.node_at(&older[mid].id, cx).await {
+            match self.node_at(&older[mid].id, cx).await {
                 Ok(state) if state.exists => lo = mid,
                 Ok(_) => hi = mid,
                 // A read that failed answers nothing: the search fails, and is offered again.
@@ -1134,9 +1145,9 @@ pub fn search_creation(
             (None, Some(oldest)) => Creation::Before(oldest.clone()),
             (None, None) => Creation::NotSearched,
         };
-        found.requests = reader.requests;
+        found.requests = self.requests;
         Ok(found)
-    })
+    }
 }
 
 #[cfg(test)]
