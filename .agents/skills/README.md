@@ -30,8 +30,10 @@ Their examples are CSS, Tailwind and React, and some render on a web page. Studi
 - Express each fix in GPUI and Studio's design tokens, never in a second styling system.
 - Where Studio already has a rule, Studio's rule wins: nested corners through
   `ds::radius::around`/`within` and Zed's buttons at `radius::BUTTON` (spec 002, Visual language),
-  colours and sizes as tokens only (`script/check-design-tokens.py`), and what a keystroke may
-  draw (`docs/drawing.md`).
+  colours and sizes as tokens only (`script/check-design-tokens.py`), what a keystroke may
+  draw (`docs/drawing.md`), and a destructive action confirmed with ↵ or its button, never by
+  typing a name (constitution IV; `better-writing`'s "Type 'acme-web' to confirm" does not
+  apply).
 - Advice that only applies to a browser (`will-change`, `text-wrap`, `-webkit-font-smoothing`,
   the browser's Animations panel, ARIA) has no GPUI counterpart; skip it, or use its GPUI
   equivalent where one exists.

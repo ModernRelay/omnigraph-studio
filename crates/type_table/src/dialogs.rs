@@ -1,7 +1,7 @@
 //! Insert-row and delete-row dialogs (spec 004), for nodes and edges. Each names the branch it
-//! writes to; a delete lists everything it removes, is confirmed with ↵ and offers Undo, and is
-//! bound to the commit the table was read at (constitution IV). None retries; a refused or
-//! unknown outcome keeps the form.
+//! writes to; a delete lists everything it removes, is confirmed with ↵ and offers Undo, or says
+//! plainly that it cannot be undone (constitution IV). None retries; a refused or unknown outcome
+//! keeps the form.
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -1198,8 +1198,8 @@ const DEPENDENTS_NAMED: usize = 6;
 /// a node that needs one of them (`@card(n..)`) goes too, listed here, all in one commit. The
 /// plan reads at the branch's newest commit the session holds, and the delete is not bound to a
 /// commit: other writers' commits do not refuse it, and the server refuses one that would leave
-/// a node without a relationship it needs (spec 004, 2026-11-13). ↵ deletes, and the toast offers Undo; typing the key
-/// is asked for only when Undo could not bring it all back.
+/// a node without a relationship it needs (spec 004, 2026-11-13). ↵ deletes. The toast offers
+/// Undo when Undo can bring it all back; when it cannot, the dialog says so before it is sent.
 pub struct DeleteRowModal<T: DialogTable> {
     table: WeakEntity<T>,
     session: Entity<GraphSession>,
@@ -1213,9 +1213,9 @@ pub struct DeleteRowModal<T: DialogTable> {
     plan_at: Option<String>,
     /// What a node delete removes, read before it is offered.
     plan: Loadable<DeletePlan>,
-    /// Why Undo could not restore this delete, once known; typing is then asked for.
+    /// Why Undo could not restore this delete, once known; the dialog then says it cannot be
+    /// undone.
     undo_unavailable: Option<String>,
-    confirm: Entity<Editor>,
     notice: Option<Notice>,
     focus_handle: FocusHandle,
     _plan: Option<Task<()>>,
@@ -1223,7 +1223,6 @@ pub struct DeleteRowModal<T: DialogTable> {
     progress: deletes::PlanProgress,
     /// Draws the progress again while the plan reads.
     _progress: Option<Task<()>>,
-    _subscription: Subscription,
 }
 
 impl<T: DialogTable> EventEmitter<DismissEvent> for DeleteRowModal<T> {}
@@ -1233,12 +1232,8 @@ impl<T: DialogTable> EventEmitter<DismissEvent> for DeleteRowModal<T> {}
 impl<T: DialogTable> ModalView for DeleteRowModal<T> {}
 
 impl<T: DialogTable> Focusable for DeleteRowModal<T> {
-    fn focus_handle(&self, cx: &App) -> FocusHandle {
-        if self.undo_unavailable.is_some() {
-            self.confirm.focus_handle(cx)
-        } else {
-            self.focus_handle.clone()
-        }
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
     }
 }
 
@@ -1267,24 +1262,6 @@ impl<T: DialogTable> DeleteRowModal<T> {
         // The table's kind, not the schema's first match: a node type and an edge type may
         // share a name, and the table shows the one it was opened on.
         let edges = kind == TableKind::Edge;
-        let phrase = Self::phrase_for(&targets);
-        let confirm = cx.new(|cx| {
-            let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text(&phrase, window, cx);
-            editor
-        });
-        let subscription = cx.subscribe(&confirm, |this: &mut Self, _, event: &EditorEvent, cx| {
-            if let EditorEvent::BufferEdited = event {
-                if this
-                    .notice
-                    .as_ref()
-                    .is_some_and(|n| n.tone == Tone::Invalid)
-                {
-                    this.notice = None;
-                }
-                cx.notify();
-            }
-        });
         let mut this = Self {
             table,
             session,
@@ -1296,13 +1273,11 @@ impl<T: DialogTable> DeleteRowModal<T> {
             plan_at,
             plan: Loadable::NotLoaded,
             undo_unavailable: None,
-            confirm,
             notice: None,
             focus_handle: cx.focus_handle(),
             _plan: None,
             progress: deletes::PlanProgress::default(),
             _progress: None,
-            _subscription: subscription,
         };
         if edges {
             // A relationship delete removes the relationships picked and nothing else, so what
@@ -1364,14 +1339,11 @@ impl<T: DialogTable> DeleteRowModal<T> {
         }));
         self._plan = Some(cx.spawn_in(window, async move |this, cx| {
             let plan = plan.await;
-            this.update_in(cx, |this, window, cx| {
+            this.update(cx, |this, cx| {
                 match plan {
                     Ok(plan) => {
                         this.undo_unavailable = plan.undo_unavailable.clone();
                         this.plan = Loadable::Loaded(plan);
-                        if this.undo_unavailable.is_some() {
-                            window.focus(&this.confirm.focus_handle(cx), cx);
-                        }
                     }
                     Err(error) => this.plan = Loadable::Failed(error.to_string()),
                 }
@@ -1381,22 +1353,8 @@ impl<T: DialogTable> DeleteRowModal<T> {
         }));
     }
 
-    /// What is typed to confirm a delete Undo could not restore: the key of one row, or
-    /// `delete N` for several.
-    fn phrase_for(targets: &[DeleteTarget]) -> String {
-        match targets {
-            [one] => one.id.clone(),
-            many => format!("delete {}", many.len()),
-        }
-    }
-
     fn ready(&self) -> bool {
         self.edges || matches!(self.plan, Loadable::Loaded(_))
-    }
-
-    fn confirmed(&self, cx: &App) -> bool {
-        self.undo_unavailable.is_none()
-            || self.confirm.read(cx).text(cx).trim() == Self::phrase_for(&self.targets)
     }
 
     /// The deleted rows in a few words: "Acme", "3 Company rows".
@@ -1410,14 +1368,6 @@ impl<T: DialogTable> DeleteRowModal<T> {
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.ready() {
-            return;
-        }
-        if !self.confirmed(cx) {
-            self.notice = Some(Notice::new(
-                Tone::Invalid,
-                format!("Type {} to confirm.", Self::phrase_for(&self.targets)),
-            ));
-            cx.notify();
             return;
         }
         let ids: Vec<String> = self.targets.iter().map(|t| t.id.clone()).collect();
@@ -1601,7 +1551,7 @@ impl<T: DialogTable> DeleteRowModal<T> {
     }
 
     /// The dialog's one paragraph: what goes, what else goes with it, and whether Undo can
-    /// bring it back. The body holds only what it names (the dependents, the confirm field).
+    /// bring it back. The body holds only what it names (the dependents).
     fn description(&self) -> String {
         let them = self.targets.len() > 1;
         let mut text = match (self.edges, them) {
@@ -1629,10 +1579,7 @@ impl<T: DialogTable> DeleteRowModal<T> {
             ));
         }
         match &self.undo_unavailable {
-            Some(reason) => text.push_str(&format!(
-                " Undo cannot restore this: {reason} Type {} to confirm.",
-                Self::phrase_for(&self.targets)
-            )),
+            Some(reason) => text.push_str(&format!(" This cannot be undone. {reason}")),
             None if self.ready() => text.push_str(" You can undo this right after."),
             None => {}
         }
@@ -1643,11 +1590,9 @@ impl<T: DialogTable> DeleteRowModal<T> {
 impl<T: DialogTable> Render for DeleteRowModal<T> {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ready = self.ready();
-        let confirmed = self.confirmed(cx);
         let headline = format!("Delete {}", self.what());
         let description = self.description();
         let plan = self.render_plan(cx);
-        let typing = self.undo_unavailable.is_some();
         let notice = self.notice.clone();
         modal(cx)
             .key_context("DeleteRowModal")
@@ -1663,19 +1608,12 @@ impl<T: DialogTable> Render for DeleteRowModal<T> {
                     ))
                     .on_close(cx.listener(|this, _, _, cx| this.cancel(cx))),
             )
-            // The body only when it has something: the dependents, the confirm field, or why
-            // the delete could not be built.
-            .when(plan.is_some() || typing || notice.is_some(), |dialog| {
-                dialog.child(
-                    modal_body()
-                        .children(plan)
-                        .when(typing, |body| {
-                            body.child(field_box(&self.confirm, false, cx))
-                        })
-                        .children(notice.map(|notice| {
-                            studio_ui::ds::text::body(notice.message).color(notice.tone.color())
-                        })),
-                )
+            // The body only when it has something: the dependents, or why the delete could not
+            // be built.
+            .when(plan.is_some() || notice.is_some(), |dialog| {
+                dialog.child(modal_body().children(plan).children(notice.map(|notice| {
+                    studio_ui::ds::text::body(notice.message).color(notice.tone.color())
+                })))
             })
             .child(
                 modal_footer(cx)
@@ -1686,7 +1624,7 @@ impl<T: DialogTable> Render for DeleteRowModal<T> {
                     .child(
                         action_button("delete", "Delete")
                             .variant(Variant::Destructive)
-                            .disabled(!ready || !confirmed)
+                            .disabled(!ready)
                             .key_binding(ui::KeyBinding::for_action(&menu::Confirm, cx))
                             .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
                     ),
@@ -2081,23 +2019,22 @@ mod tests {
         );
     }
 
-    /// More relationships picked than Undo puts back in one commit are deleted only once typed
-    /// for, and the toast offers no Undo; as many as it puts back are confirmed with ↵.
+    /// More relationships picked than Undo puts back in one commit are deleted with ↵ as any
+    /// delete is, and the dialog says first what goes and that it cannot be undone; the toast
+    /// offers no Undo. As many as Undo puts back say it can be undone. Nothing is typed.
     #[gpui::test]
-    async fn an_edge_delete_past_what_undo_puts_back_is_confirmed_by_typing(
+    async fn an_edge_delete_past_what_undo_puts_back_says_so_and_goes_with_enter(
         cx: &mut TestAppContext,
     ) {
         cx.update(|cx| {
             studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
             editor::init(cx);
+            cx.bind_keys([KeyBinding::new("enter", menu::Confirm, None)]);
         });
-        let schema = Arc::new(
-            SchemaModel::parse(
-                "node Person {\n  slug: String @key\n}\nedge Knows: Person -> Person\n",
-            )
-            .unwrap(),
-        );
-        for (picked, typed) in [(UNDO_CAP, false), (UNDO_CAP + 1, true)] {
+        const KNOWS: &str = "node Person {\n  slug: String @key\n}\nedge Knows: Person -> Person\n";
+        let schema = Arc::new(SchemaModel::parse(KNOWS).unwrap());
+        for (picked, unrestorable) in [(UNDO_CAP, false), (UNDO_CAP + 1, true)] {
             let targets: Vec<DeleteTarget> = (0..picked)
                 .map(|i| DeleteTarget {
                     id: format!("e{i}"),
@@ -2105,7 +2042,8 @@ mod tests {
                     endpoints: Some(("a".into(), "b".into())),
                 })
                 .collect();
-            let (session, schema) = (session(cx), schema.clone());
+            let (session, writes) = crate::test_support::session_recording_writes(KNOWS, cx);
+            let schema = schema.clone();
             let (modal, cx) = cx.add_window_view(|window, cx| {
                 DeleteRowModal::new(
                     WeakEntity::<TypeTable>::new_invalid(),
@@ -2119,22 +2057,40 @@ mod tests {
                     cx,
                 )
             });
-            modal.read_with(cx, |modal, cx| {
-                assert_eq!(modal.undo_unavailable.is_some(), typed, "{picked}");
-                assert_eq!(!modal.confirmed(cx), typed, "{picked}");
-                if typed {
-                    let reason = modal.undo_unavailable.as_deref().unwrap();
+            modal.read_with(cx, |modal, _| {
+                assert_eq!(modal.undo_unavailable.is_some(), unrestorable, "{picked}");
+                let description = modal.description();
+                assert!(
+                    description.starts_with("Removes them from main. Their nodes stay."),
+                    "{description}"
+                );
+                if unrestorable {
                     assert!(
-                        reason.contains("20,001") && reason.contains("20,000"),
-                        "{reason}"
+                        description.contains(
+                            " This cannot be undone. It removes 20,001 relationships, more than \
+                             the 20,000 Undo puts back in one commit."
+                        ),
+                        "{description}"
                     );
+                } else {
                     assert!(
-                        modal
-                            .description()
-                            .contains("Type delete 20001 to confirm.")
+                        description.ends_with("You can undo this right after."),
+                        "{description}"
                     );
                 }
             });
+            let dismissed = Rc::new(Cell::new(false));
+            let _subscription = cx.update({
+                let dismissed = dismissed.clone();
+                |_, cx| cx.subscribe(&modal, move |_, _: &DismissEvent, _| dismissed.set(true))
+            });
+            modal.update_in(cx, |modal, window, cx| {
+                window.focus(&modal.focus_handle(cx), cx)
+            });
+            cx.simulate_keystrokes("enter");
+            assert!(dismissed.get(), "{picked}: ↵ deletes");
+            cx.run_until_parked();
+            assert_eq!(writes.lock().unwrap().len(), 1, "{picked}: sent once");
         }
     }
 

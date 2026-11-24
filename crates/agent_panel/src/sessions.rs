@@ -297,7 +297,7 @@ impl AgentSessions {
     }
 
     /// The agent's title, which replaces any earlier one: one line, cut ([`title_of`]), so it
-    /// fits a row and can be typed into the delete confirmation. One without text is not taken.
+    /// fits a row and the delete confirmation's headline. One without text is not taken.
     pub fn set_title(&mut self, session: &str, title: String, cx: &mut Context<Self>) {
         let Some(title) = title_of(&title) else {
             return;

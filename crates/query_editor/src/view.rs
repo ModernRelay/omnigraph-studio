@@ -85,7 +85,7 @@ struct Prepared {
     sent: Option<MultiBufferSnapshot>,
     /// The stored query to invoke by name instead of sending `text` (spec 007).
     stored: Option<String>,
-    /// What the write destroys that Studio cannot put back: it is confirmed by typing.
+    /// What the write destroys that Studio cannot put back, which the confirm bar says.
     destroys: Option<Destroys>,
     /// Where the write's result goes: the branch, or held off it (`as commit`, `as unattached
     /// branch`), which the confirm bar says. A stored query's text is the server's, so it is
@@ -156,22 +156,13 @@ struct FileView {
     run: bool,
 }
 
-/// A write waiting for the person to confirm it (constitution III, VII).
+/// A write waiting for the person to confirm it (constitution III, IV, VII).
 struct PendingWrite {
     prepared: Prepared,
     branch: String,
-    /// A write Studio cannot put back is confirmed by typing what it destroys (IV).
-    typed: Option<TypedConfirm>,
-}
-
-/// The words a destructive write is confirmed with, and the field they are typed in.
-struct TypedConfirm {
-    /// What goes, in a sentence.
-    what: String,
-    phrase: String,
-    field: Entity<Editor>,
-    /// A confirmation was asked for with other words in the field.
-    refused: bool,
+    /// What a write Studio cannot put back destroys, in full, and that it cannot be undone
+    /// (IV); it is confirmed with ↵ as any write is.
+    destroys: Option<String>,
 }
 
 enum Output {
@@ -3105,7 +3096,7 @@ impl QueryEditor {
         let (columns, destroys, publication) = match info {
             Some(info) => (Some(info.columns), info.destroys, info.publication),
             // Unchecked (no schema yet): where it publishes and what it destroys are in its
-            // parse alone, so a destructive write still waits for its name typed.
+            // parse alone, so a destructive write still says what it destroys.
             None => {
                 let declared = gq_language::check::declared_write(&text, &declaration.name);
                 (None, declared.destroys, declared.publication)
@@ -3178,24 +3169,18 @@ impl QueryEditor {
                 if matches!(self.output, Output::Running { .. }) {
                     self.replace_output(Output::Empty, cx);
                 }
-                // Never on ⌘↵ alone: the person confirms the branch first, and what it
-                // destroys by typing its name when Studio cannot put it back.
+                // Never on ⌘↵ alone: the person confirms the branch first, with what it
+                // destroys said in full when Studio cannot put it back.
                 let branch = self.branch(cx);
-                let typed = prepared
+                let destroys = prepared
                     .destroys
                     .as_ref()
-                    .map(|destroys| self.typed_confirm(destroys, &prepared, &branch, window, cx));
-                match &typed {
-                    Some(typed) => {
-                        let focus = typed.field.focus_handle(cx);
-                        window.focus(&focus, cx);
-                    }
-                    None => window.focus(&self.confirm_focus, cx),
-                }
+                    .map(|destroys| self.destroys_words(destroys, &branch, cx));
+                window.focus(&self.confirm_focus, cx);
                 self.pending_write = Some(PendingWrite {
                     prepared,
                     branch,
-                    typed,
+                    destroys,
                 });
             }
             Ok(prepared) => {
@@ -3208,41 +3193,26 @@ impl QueryEditor {
         cx.notify();
     }
 
-    /// What a destructive write destroys, said in full, and the words typed to confirm it: the
-    /// name or key of what goes (constitution IV, as a delete Undo cannot restore is confirmed
-    /// in a table).
-    fn typed_confirm(
-        &self,
-        destroys: &Destroys,
-        prepared: &Prepared,
-        branch: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> TypedConfirm {
+    /// What a destructive write destroys, said in full, and that it cannot be undone
+    /// (constitution IV, as a delete Undo cannot restore says in a table).
+    fn destroys_words(&self, destroys: &Destroys, branch: &str, cx: &App) -> String {
         let schema = self.schema(cx);
         let is_node = |type_name: &str| {
             schema
                 .as_ref()
                 .is_none_or(|schema| schema.node(type_name).is_some())
         };
-        let (what, phrase) = match destroys {
-            Destroys::Branch(name) => (
-                format!("Deletes branch {name}, with its commits no other branch holds."),
-                name.clone(),
+        let what = match destroys {
+            Destroys::Branch(name) => {
+                format!("Deletes branch {name}, with its commits no other branch holds.")
+            }
+            Destroys::Commit(id) => format!(
+                "Drops the unpublished commit {}, which was never on a branch.",
+                short_commit_id(id)
             ),
-            Destroys::Commit(id) => (
-                format!(
-                    "Drops the unpublished commit {}, which was never on a branch.",
-                    short_commit_id(id)
-                ),
-                short_commit_id(id).to_string(),
-            ),
-            Destroys::Overwrite { type_name, edge } => (
-                format!(
-                    "Replaces every {type_name} {} on {branch} with the file's.",
-                    if *edge { "relationship" } else { "node" }
-                ),
-                type_name.clone(),
+            Destroys::Overwrite { type_name, edge } => format!(
+                "Replaces every {type_name} {} on {branch} with the file's.",
+                if *edge { "relationship" } else { "node" }
             ),
             Destroys::Rows(types) => {
                 let names = match types.split_last() {
@@ -3255,30 +3225,10 @@ impl QueryEditor {
                 } else {
                     ""
                 };
-                let phrase = match types.as_slice() {
-                    [one] => one.clone(),
-                    _ => prepared.label.clone(),
-                };
-                (
-                    format!(
-                        "Deletes what its `where` matches of {names} from {branch}{relationships}."
-                    ),
-                    phrase,
-                )
+                format!("Deletes what its `where` matches of {names} from {branch}{relationships}.")
             }
         };
-        let field = cx.new(|cx| {
-            let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text(&phrase, window, cx);
-            editor.set_text_style_refinement(studio_ui::ds::field_text(cx));
-            editor
-        });
-        TypedConfirm {
-            what: format!("{what} Studio cannot put it back. Type {phrase} to confirm."),
-            phrase,
-            field,
-            refused: false,
-        }
+        format!("{what} This cannot be undone.")
     }
 
     fn explain(&mut self, _: &Explain, _window: &mut Window, cx: &mut Context<Self>) {
@@ -3596,18 +3546,6 @@ impl QueryEditor {
     }
 
     fn confirm_write(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
-        // A write Studio cannot put back goes only with its name typed: anything else keeps it
-        // waiting, and says what to type.
-        if let Some(typed) = self
-            .pending_write
-            .as_mut()
-            .and_then(|pending| pending.typed.as_mut())
-            && typed.field.read(cx).text(cx).trim() != typed.phrase
-        {
-            typed.refused = true;
-            cx.notify();
-            return;
-        }
         let Some(PendingWrite {
             prepared, branch, ..
         }) = self.pending_write.take()
@@ -4594,28 +4532,21 @@ impl QueryEditor {
     }
 
     fn render_confirm(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        use studio_ui::ds::{self, size, space};
+        use studio_ui::ds::{self, space};
         let pending = self.pending_write.as_ref()?;
         let (said, button) = confirm_words(&pending.prepared, &pending.branch);
-        let what = match &pending.typed {
-            Some(typed) => typed.what.clone(),
-            None => said,
-        };
+        let what = pending.destroys.clone().unwrap_or(said);
         // Two windows can both be on the same branch name: the bar names where this lands.
         let what = format!(
             "{} · {what}",
             self.session.read(cx).write_scope(&pending.branch, cx)
         );
-        // A write Studio cannot put back takes its name typed, in a field before the buttons.
-        let typed = pending.typed.as_ref().map(|typed| {
-            ds::field_frame(typed.refused, cx)
-                .flex_none()
-                .w(px(size::FIELD_LABEL_WIDE))
-                .child(ds::field_input(typed.field.clone()))
-        });
-        let confirm_focus = match &pending.typed {
-            Some(typed) => typed.field.focus_handle(cx),
-            None => self.confirm_focus.clone(),
+        let confirm_focus = self.confirm_focus.clone();
+        // A write Studio cannot put back is marked as one that destroys.
+        let variant = if pending.destroys.is_some() {
+            ds::Variant::Destructive
+        } else {
+            ds::Variant::Primary
         };
         Some(
             warning_bar(what, cx)
@@ -4623,7 +4554,6 @@ impl QueryEditor {
                 .track_focus(&self.confirm_focus)
                 .on_action(cx.listener(Self::confirm_write))
                 .on_action(cx.listener(Self::cancel_write))
-                .children(typed)
                 .child(
                     h_flex()
                         .gap(px(space::XS))
@@ -4640,7 +4570,7 @@ impl QueryEditor {
                         )
                         .child(
                             ds::button("confirm-write", button)
-                                .style(ButtonStyle::Filled)
+                                .variant(variant)
                                 .key_binding(KeyBinding::for_action_in(
                                     &menu::Confirm,
                                     &confirm_focus,
@@ -6340,7 +6270,7 @@ mod tests {
                     ..Default::default()
                 },
                 branch: "main".into(),
-                typed: None,
+                destroys: None,
             };
             let (a, b) = (
                 "query w() { insert Person { slug: \"a\" } }",
@@ -6694,13 +6624,15 @@ mod tests {
             });
         }
 
-        /// A destructive statement names what it destroys and goes only with that name typed:
-        /// ↵ with other words in the field sends nothing. A `delete` written in the tab waits
-        /// for its type's name too, also before the schema is read (this server serves none):
-        /// what it destroys is in its parse alone.
+        /// A destructive statement says what it destroys and that it cannot be undone, and goes
+        /// with ↵, nothing typed. A `delete` written in the tab says so too, also before the
+        /// schema is read (this server serves none): what it destroys is in its parse alone.
         #[gpui::test]
-        async fn a_destructive_write_waits_for_its_name(cx: &mut TestAppContext) {
+        async fn a_destructive_write_says_what_it_destroys_and_goes_with_enter(
+            cx: &mut TestAppContext,
+        ) {
             init(cx);
+            cx.update(|cx| cx.bind_keys([gpui::KeyBinding::new("enter", menu::Confirm, None)]));
             let (session, asked) = served(cx, Vec::new());
             cx.run_until_parked();
             let (editor, cx) =
@@ -6713,39 +6645,31 @@ mod tests {
                     .filter(|line| line.ends_with("/mutate"))
                     .count()
             };
+            // The text's own edit settles before Run, as a person's typing does.
             editor.update_in(cx, |editor, window, cx| {
-                editor.set_text("branch delete feature", window, cx);
-                editor.run(&Run, window, cx);
-                let typed = editor
-                    .pending_write
-                    .as_ref()
-                    .and_then(|pending| pending.typed.as_ref())
-                    .expect("typed to confirm");
-                assert_eq!(typed.phrase, "feature");
-                assert!(
-                    typed.what.starts_with("Deletes branch feature"),
-                    "{}",
-                    typed.what
-                );
-                let field = typed.field.clone();
-                editor.confirm_write(&menu::Confirm, window, cx);
-                assert!(!editor.writing, "nothing was sent");
-                assert!(
-                    editor
-                        .pending_write
-                        .as_ref()
-                        .and_then(|pending| pending.typed.as_ref())
-                        .is_some_and(|typed| typed.refused),
-                    "it still waits, and says what to type"
-                );
-                field.update(cx, |field, cx| field.set_text("feature", window, cx));
-                editor.confirm_write(&menu::Confirm, window, cx);
-                assert!(editor.writing, "sent with its name typed");
+                editor.set_text("branch delete feature", window, cx)
             });
             cx.run_until_parked();
-            assert_eq!(mutations(), 1);
+            editor.update_in(cx, |editor, window, cx| {
+                editor.run(&Run, window, cx);
+                let destroys = editor
+                    .pending_write
+                    .as_ref()
+                    .and_then(|pending| pending.destroys.clone())
+                    .expect("says what it destroys");
+                assert_eq!(
+                    destroys,
+                    "Deletes branch feature, with its commits no other branch holds. This cannot \
+                     be undone."
+                );
+            });
+            // The bar drawn, so ↵ reaches it as the person's would.
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.simulate_keystrokes("enter");
+            cx.run_until_parked();
+            assert_eq!(mutations(), 1, "sent with ↵, nothing typed");
 
-            // A declaration that deletes, checked against no schema: its type's name is typed.
+            // A declaration that deletes, checked against no schema.
             editor.update_in(cx, |editor, window, cx| {
                 assert!(editor.schema(cx).is_none(), "no schema was read");
                 editor.set_text(
@@ -6753,28 +6677,29 @@ mod tests {
                     window,
                     cx,
                 );
-                editor.cursor = 0;
-                editor.run(&Run, window, cx);
-                let typed = editor
-                    .pending_write
-                    .as_ref()
-                    .and_then(|pending| pending.typed.as_ref())
-                    .expect("typed to confirm");
-                assert_eq!(typed.phrase, "Person");
-                assert!(
-                    typed
-                        .what
-                        .starts_with("Deletes what its `where` matches of Person"),
-                    "{}",
-                    typed.what
-                );
-                editor.confirm_write(&menu::Confirm, window, cx);
-                assert!(!editor.writing, "nothing was sent");
             });
             cx.run_until_parked();
-            assert_eq!(mutations(), 1);
+            editor.update_in(cx, |editor, window, cx| {
+                editor.cursor = 0;
+                editor.run(&Run, window, cx);
+                let destroys = editor
+                    .pending_write
+                    .as_ref()
+                    .and_then(|pending| pending.destroys.clone())
+                    .expect("says what it destroys");
+                assert!(
+                    destroys.starts_with("Deletes what its `where` matches of Person")
+                        && destroys.ends_with("This cannot be undone."),
+                    "{destroys}"
+                );
+            });
+            // The bar drawn, so ↵ reaches it as the person's would.
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.simulate_keystrokes("enter");
+            cx.run_until_parked();
+            assert_eq!(mutations(), 2, "sent with ↵");
 
-            // A write that destroys nothing Studio cannot put back is confirmed with ↵ alone.
+            // A write that destroys nothing Studio cannot put back says nothing of the kind.
             editor.update_in(cx, |editor, window, cx| {
                 editor.set_text("branch create feature", window, cx);
                 editor.run(&Run, window, cx);
@@ -6782,7 +6707,7 @@ mod tests {
                     editor
                         .pending_write
                         .as_ref()
-                        .is_some_and(|pending| pending.typed.is_none())
+                        .is_some_and(|pending| pending.destroys.is_none())
                 );
             });
         }
@@ -7817,10 +7742,7 @@ mod tests {
                 editor.run(&Run, window, cx);
                 let pending = editor.pending_write.as_ref().expect("a write asks first");
                 assert!(pending.prepared.write);
-                assert!(
-                    pending.typed.is_some(),
-                    "a delete waits for its type's name"
-                );
+                assert!(pending.destroys.is_some(), "a delete says what it destroys");
             });
             cx.run_until_parked();
             assert_eq!(reads(), before, "nothing was read");

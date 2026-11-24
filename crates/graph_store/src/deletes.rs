@@ -7,7 +7,7 @@
 //! dependents follow, round by round, until a round finds none. Every read is held at the
 //! commit the rows were shown at, and the delete is bound to that commit, so what the dialog
 //! lists is exactly what goes. What it removes is counted there too, so a delete larger than
-//! Undo puts back is confirmed by typing before it is sent, not found too large by Undo after.
+//! Undo puts back says it cannot be undone before it is sent, not found too large by Undo after.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -36,7 +36,7 @@ const MAX_ROUNDS: usize = 32;
 const UNDO_PAGE: u32 = 8_192;
 /// The most changes Undo reads and puts back in one commit, as many as a review folds
 /// (constitution IX): a delete that removed more is refused before it is all held, and a delete
-/// that would remove more is confirmed by typing.
+/// that would remove more says, before it is sent, that it cannot be undone.
 pub const UNDO_CAP: usize = REVIEW_CHANGE_CAP;
 /// Relationship types counted at once for Undo: as many reads as a connection sends together,
 /// so a batch is answered before the next one decides whether it is needed.

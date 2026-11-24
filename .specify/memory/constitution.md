@@ -1,8 +1,8 @@
 # Omnigraph Studio constitution
 
-Version 1.5.2 · ratified 2026-10-11 · amended 2026-10-17 (IV: ↵ and Undo for what Studio can
+Version 1.6.0 · ratified 2026-10-11 · amended 2026-10-17 (IV: ↵ and Undo for what Studio can
 put back) · amended 2026-10-18 (IV: ↵ for what loses no data) · amended 2026-10-22 (I: the
-updater's requests) · amended 2026-10-24 (X: Omnigraph `v0.14.0` and later) · amended 2026-10-30 (I: model calls) · amended 2026-11-01 (XIII: one rule for what a pick does) · amended 2026-11-05 (I: control-plane calls) · amended 2026-11-10 (II, V: a view in front may take new data itself) · amended 2026-11-11 (I: telemetry's uploads) · amended 2026-11-14 (I: telemetry removed)
+updater's requests) · amended 2026-10-24 (X: Omnigraph `v0.14.0` and later) · amended 2026-10-30 (I: model calls) · amended 2026-11-01 (XIII: one rule for what a pick does) · amended 2026-11-05 (I: control-plane calls) · amended 2026-11-10 (II, V: a view in front may take new data itself) · amended 2026-11-11 (I: telemetry's uploads) · amended 2026-11-14 (I: telemetry removed) · amended 2026-11-24 (IV: nothing is confirmed by typing)
 
 Omnigraph Studio is a native desktop app for exploring and changing Omnigraph graphs: type
 tables, a relationship tree, a graph canvas, a `.gq` query editor, branches, review, merge and
@@ -42,12 +42,11 @@ known.
 ## IV. Every write names its branch; Cedar decides
 
 Every surface that writes shows the branch it writes to. A destructive action says exactly what
-it destroys, including what goes with it, before it runs. When Studio can put it all back, it
-is confirmed with ↵ and its outcome offers Undo; when it cannot, it is confirmed by typing the
-name or key of what is destroyed. An action that destroys no data, such as deleting a branch
-whose every commit is already in its target, is confirmed with ↵. Studio reflects the server's policy and never
-enforces its own: a hidden button is a courtesy, a 403 is shown as a denial, and the draft
-stays.
+it destroys, including what goes with it, before it runs. When Studio can put it all back, its
+outcome offers Undo; when it cannot, it says plainly that it cannot be undone. Either way it is
+confirmed with ↵ or its button, never by typing a name or key. Studio reflects the server's
+policy and never enforces its own: a hidden button is a courtesy, a 403 is shown as a denial,
+and the draft stays.
 
 ## V. Nothing moves under you
 
