@@ -200,10 +200,11 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
   commit to publish or drop later ("Hold for main"), one `as unattached branch` writes a
   snapshot that never publishes ("Write snapshot"), and a merge `as commit` holds the merge
   ("Hold as commit"). A
-  write Studio cannot put back says what goes and waits for its name typed (constitution IV):
-  `branch delete x` the branch and its commits no other branch holds (type `x`), `commit drop`
-  the proposal (its short id), `load … mode overwrite` every row of the type (the type), and a
-  `delete` that publishes what its `where` matches (the type; the query's name for several).
+  write Studio cannot put back says what goes and that it cannot be undone, and its button is
+  marked destructive; ↵ confirms it as any write (constitution IV; until 2026-11-24 its name was
+  typed): `branch delete x` the branch and its commits no other branch holds, `commit drop` the
+  proposal, `load … mode overwrite` every row of the type, and a `delete` that publishes what
+  its `where` matches.
   What a declaration destroys and where it publishes are read from its parse alone, so they
   hold before the schema is read too (`gq_language::check::declared_write`, since 2026-10-21).
   The write is sent once, never retried, and its outcome is shown as what the server says it
@@ -332,10 +333,14 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
 | 2026-10-20 | Saved queries follow the graph's key, not its server's name | `graph_store` `named_keys` tests `saved_queries_move_to_the_graphs_key_without_writing_over_one` (neither folder, the name's only, both), `a_graph_opening_takes_its_saved_queries_along` (a `GraphSession` made for `dev` at `http://127.0.0.1:8787`), `a_name_resolves_only_to_a_known_server`; `studio_settings` `query_folders_are_safe_names_per_graph`; every caller of the removed `GraphSession::settings_key` (Queries panel, ⌘S, ⌘⇧S, the palette's Queries scope) now on `overrides_key` | With neither folder nothing is made; the name's alone is renamed whole; with both, `a.gq` moved, `b.gq` kept the key's text ("new b") and stayed in the old folder with `notes.txt`. Opening the graph moved `people.gq` to `queries/http_~~127.0.0.1_8787~moved-queries`. Not yet seen in the running app on a renamed CLI target |
 | 2026-10-20 | The Queries panel's rows are reached by keys | `query_editor` test `queries_panel::tests::the_rows_are_selected_and_opened_by_keys` (a saved file and two stored queries served with the contract header: ↓ to the file, ↵, ↓ past the Stored header, ↓↓ stopping at the last, ↑ ↵; a file saved above keeps the selection on its query); `studio` `keymaps` test (each new action bound on macOS, Linux and Windows) | Pass: ↵ dispatched `OpenQueryFile` with the file's path, then `OpenStoredQuery` for `people_titled`; the pattern is the relationship tree's (actions in `studio_actions`, bindings in the keymaps, the panel's focus given by `set_panel_focus`) |
 | 2026-10-20 | Run reuses the check | `query_editor` `a_run_reuses_the_check_of_the_same_text` | A held check of the same text and schema answers Run and Confirm; text changed since is checked again |
+| 2026-11-24 | A destructive write says what it destroys and goes with ↵ (constitution 1.6.0) | `query_editor` `a_destructive_write_says_what_it_destroys_and_goes_with_enter` (↵ simulated on the drawn bar), `a_write_named_like_a_read_asks_before_it_writes` | `branch delete feature` says "Deletes branch feature, with its commits no other branch holds. This cannot be undone." and ↵ sent one `/mutate`; an unchecked `delete Person` says what its `where` matches and the same, and ↵ sent it; `branch create` says nothing of the kind. The bar has no field, and its confirm button is destructive when the write destroys |
 
 
 ## Corrections
 
+- 2026-11-24 · A destructive write waited for its name typed in the confirm bar. Constitution
+  1.6.0 confirms every destructive action with ↵ or its button: the bar says what goes and
+  "This cannot be undone.", and has no field.
 - 2026-10-22 · "Files" gave the queries folder as the graph's key `<server url>/<graph id>` made
   safe; the key is `<target>/<graph id>` since `1b5a110`, so the folder is `<target>~<graph>`,
   which a folder from before 2026-10-20 matches again where its server's name is the target's.

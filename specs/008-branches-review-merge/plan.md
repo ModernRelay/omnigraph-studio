@@ -11,7 +11,7 @@ conflicts explained.
 
 ## Principles
 
-III (merge outcomes), IV (branch named; typed confirmation for delete), V (review items stay in
+III (merge outcomes), IV (branch named; delete says what it loses, confirmed with ↵), V (review items stay in
 place), X (designed on 0.13; the better routes are deferred).
 
 ## What exists today (checked)
@@ -62,10 +62,13 @@ place), X (designed on 0.13; the better routes are deferred).
   (409); a reason this build does not know reads as the server's message. The notice is the
   commit's, so it stays while the name changes and Create stays off; nothing is sent again.
 - Delete asks once, saying what goes with the branch, read from its merge base with `main` as
-  the dialog opens: a branch whose head is in `main` loses nothing and is deleted with ↵; one
-  with commits only it holds, or one the check could not read, is deleted by typing its name
-  (constitution IV). The dialog holds that one sentence, the name field when it is needed,
-  and Cancel and Delete; the CLI command is the Delete button's tooltip.
+  the dialog opens: a branch whose head is in `main` loses nothing; one with commits only it
+  holds, or one the check could not read, loses them, and the dialog says this cannot be
+  undone. Either is deleted with ↵ or Delete (constitution IV; until 2026-11-24 an unmerged
+  branch's name was typed). A branch merged when the dialog opened is asked about again on ↵;
+  one with a commit of its own since is not deleted then, and the dialog says what deleting it
+  now loses. The dialog holds that one sentence, and Cancel and Delete with its ↵ hint; the CLI
+  command is the Delete button's tooltip.
 
 ### Review (`review` crate)
 
@@ -345,9 +348,14 @@ place), X (designed on 0.13; the better routes are deferred).
 | 2026-10-20 | No history is read whole: the fork, the commits since it and a merge's confirmation come from bounded pages | `review` tests `a_review_reads_the_merge_base_and_the_feed_after_it` (a branch main was merged into reads one page of each history, `limit=500`), `a_fork_past_the_history_read_is_said_and_no_history_is_read_whole` (a review of one commit on a branch of 10,500 commits since the fork; a branch main was merged into whose fork is past main's newest 10,000), `a_merge_past_the_history_read_is_not_confirmed` (main of 10,501 commits without the merge), `a_merge_is_confirmed_after_more_of_the_source_was_merged`; `graph_store` `ForkSearch` tests (`the_fork_is_the_newest_branch_commit_in_the_target`, `a_held_merge_base_is_the_fork_the_chain_reaches`, `a_branch_the_target_was_merged_into_forks_where_it_began`, `a_branch_merged_into_the_target_forks_at_its_merged_head`, `a_merged_branch_forks_at_its_own_head`), each history read in pages of 1, 2, 3 and 10; against fakes that page `GET /commits` by `limit` and `page_token` as `edge-20261020-7fd9cc9` does (`limit` 1 to 1,000, `crates/graph_client/openapi/omnigraph-0.14.0-edge.json`) and send the contract header | Pass: every listing names a `limit`; past the bound exactly 20 pages of a history are read, none of main's for a fork on the branch's own chain; the note shows and the summary reads "1 entity changed"; the merge reads `NotReached`, "Not confirmed: …" when committed and "The merge outcome is unknown (…): the newest 10,000 commits of main's history do not show it, and Studio read no further. Studio did not retry; open History before merging again." when lost. `GraphSession::commits` and `GraphClient::commits`, the whole-list reads, are gone: nothing else read them |
 | 2026-10-20 | A branch starts at a commit with the commit alone, and each refusal reads in words | `graph_store` test `a_branch_starts_at_a_head_or_at_a_commit_never_both`; `review` test `a_branch_at_a_commit_says_why_it_was_refused_and_is_not_sent_again`, against fakes answering with the contract header as Omnigraph `edge-20261020-7fd9cc9` does (`BranchCreateRequest`, `BranchCreateOutput`, `BranchStartRefusalOutput` in `crates/graph_client/openapi/omnigraph-0.14.0-edge.json`) | Pass: the body names `from_commit` and no `from`; the receipt's commit is the head; every reason's notice shows, an unknown one as the server's message, and each start is sent once |
 | 2026-11-03 | Open tabs keep their names across a branch switch, and Review branch has a key | `graph_store` test `the_root_keeps_its_name_across_a_branch_switch` (fails without the fix: the root's label read `None`); the `studio` keymap test with `studio_graph::ReviewBranch` off the palette-only list; offscreen snapshot on the dev server: Shafi Wirth's page, canvas and tree open, a query tab, ⌘⇧B to `q4-hires`, then ⌘⇧R | Pass: the tabs read Shafi Wirth, Canvas: Shafi Wirth and Tree: Shafi Wirth, where they read `person-000009` before; ⌘⇧R (Ctrl+Shift+R on Linux and Windows) opened Review q4-hires → main |
+| 2026-11-24 | Every branch deletes with ↵ once the dialog says what goes (constitution 1.6.0) | `review` `every_branch_deletes_with_enter_once_the_dialog_says_what_goes` (↵ simulated in the dialog); offscreen snapshots of deleting `feature`, with a commit only it holds, on the dev `knowledge` graph, before and after | Merged `feature`: "…loses nothing.", ↵ deleted it. Unmerged `spike`: "…Deleting it loses them, and this cannot be undone.", ↵ deleted it with nothing typed. `late`, merged at open with a commit since: the first ↵ sent nothing and said why, the description turned to what it loses, and ↵ again deleted it and cleared the error |
 
 ## Corrections
 
+- 2026-11-24 · Deleting a branch with commits only it holds waited for its name typed.
+  Constitution 1.6.0 confirms every destructive action with ↵ or its button: the dialog says
+  the commits go and this cannot be undone, and has no field. Delete now shows its ↵ hint,
+  which it lacked.
 - 2026-10-12: a target's `GET /commits` holds only its own first-parent chain, and a fast-forward
   publishes a new target commit whose merged parent is the branch head. The fork point is the
   newest branch commit that is in the target's list *or* is a merged parent there
