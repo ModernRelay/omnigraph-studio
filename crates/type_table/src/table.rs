@@ -60,7 +60,7 @@ use crate::blob_write::{self, Binding, BlobChange, BlobEdit, BlobWritten};
 use crate::branch_diff::{BranchDiff, TARGET};
 use crate::cell_select::{self, CellSelect};
 use crate::dialogs::{
-    DeleteRowModal, DeleteTarget, DialogTable, InsertEdgeModal, InsertRowModal, SaveViewModal,
+    DeleteRowModal, DeleteTarget, InsertEdgeModal, InsertRowModal, SaveViewModal, TableLink, Told,
 };
 use crate::fill;
 use crate::grouping::{GROUP_LIMIT, Grouping, Line, Lines, SECTION_FIRST_PAGE};
@@ -2258,7 +2258,7 @@ impl TypeTable {
             .map(|view| view.name)
             .collect();
         // A view's tab saved as a new view becomes that view; the one it was stays as saved.
-        let table = self.view_id.is_some().then(|| cx.entity().downgrade());
+        let table = self.view_id.is_some().then(|| self.dialog_link(cx));
         workspace.update(cx, |workspace, cx| {
             workspace.toggle_modal(window, cx, |window, cx| {
                 SaveViewModal::new(graph, view, taken, table, window, cx)
@@ -2280,6 +2280,60 @@ impl TypeTable {
     pub(crate) fn view_changed(&self, cx: &App) -> bool {
         self.saved_self(cx)
             .is_some_and(|saved| !saved.shows_as(&self.current_view()))
+    }
+
+    /// The table as its dialogs know it (spec 004): what they tell it goes to the method that
+    /// takes it, while the table is open.
+    pub(crate) fn dialog_link(&self, cx: &mut Context<Self>) -> TableLink {
+        let (shown, told) = (cx.entity().downgrade(), cx.entity().downgrade());
+        TableLink::new(
+            move |cx| {
+                shown
+                    .upgrade()
+                    .map(|table| table.read(cx).workspace())
+                    .unwrap_or_else(WeakEntity::new_invalid)
+            },
+            move |said, cx| {
+                told.update(cx, |table, cx| table.told(said, cx)).ok();
+            },
+        )
+    }
+
+    /// What one of its dialogs tells the table.
+    fn told(&mut self, told: Told<'_>, cx: &mut Context<Self>) {
+        match told {
+            Told::SaveStarted => self.save_started(),
+            Told::SaveFinished => self.save_finished(cx),
+            Told::BranchMoved => self.branch_moved(cx),
+            Told::RowInserted {
+                branch,
+                key,
+                values,
+                commit,
+                parent,
+            } => self.row_inserted(branch, key, values, commit, parent, cx),
+            Told::RowsDeleting { branch, ids } => self.rows_deleting(branch, ids, cx),
+            Told::RowsDeleted {
+                branch,
+                ids,
+                commit,
+                parent,
+            } => self.rows_deleted(branch, ids, commit, parent, cx),
+            Told::DeleteNotMade { ids, unknown } => self.delete_not_made(ids, unknown, cx),
+            Told::DeleteFoundNothing { ids, several } => {
+                self.delete_found_nothing(ids, several, cx)
+            }
+            Told::BecameView(id) => self.become_view(id, cx),
+        }
+    }
+
+    /// Makes this tab the saved view `id`: one saved from it as a new view.
+    pub(crate) fn become_view(&mut self, id: String, cx: &mut Context<Self>) {
+        self.view_id = Some(id);
+        // A filtered table saved as a view is that view's tab, found by the view's key.
+        self.own_key = None;
+        cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
     }
 
     /// Saves what this view's tab shows into the view.
@@ -5693,10 +5747,30 @@ impl TypeTable {
         cx.notify();
     }
 
+    /// A write on the table's behalf is going out (a dialog's insert or delete).
+    pub fn save_started(&mut self) {
+        self.saves_in_flight += 1;
+    }
+
+    /// A write on the table's behalf came back and its outcome is applied.
+    pub fn save_finished(&mut self, cx: &mut Context<Self>) {
+        self.saves_in_flight = self.saves_in_flight.saturating_sub(1);
+        self.saves_settled(cx);
+    }
+
     /// Once every write is back, a head the session saw while they were out is compared.
     fn saves_settled(&mut self, cx: &mut Context<Self>) {
         if self.saves_in_flight == 0 && std::mem::take(&mut self.head_moved_while_saving) {
             self.compare_head(cx);
+        }
+    }
+
+    /// A write bound to the pin was refused because the branch moved: offer Refresh.
+    pub fn branch_moved(&mut self, cx: &mut Context<Self>) {
+        if !self.newer {
+            self.newer = true;
+            cx.emit(ItemEvent::UpdateTab);
+            cx.notify();
         }
     }
 
@@ -5727,6 +5801,96 @@ impl TypeTable {
     }
 
     // ---- own writes from the dialogs ----
+
+    /// A row this table inserted committed. It is shown where it sorts when that place is
+    /// loaded; the pin follows when nothing else committed in between, and the counts follow
+    /// it ([`Self::recount`]).
+    pub fn row_inserted(
+        &mut self,
+        branch: &str,
+        key: Option<String>,
+        mut values: serde_json::Map<String, Value>,
+        commit: &str,
+        parent: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        // Inserted on the branch the table left: not one it shows.
+        if branch != self.branch {
+            return;
+        }
+        let behind = self.follow_own_commit(parent, commit);
+        if behind {
+            self.newer = true;
+            cx.emit(ItemEvent::UpdateTab);
+        }
+        // A row added, with no relationship: nothing the peek shows changed.
+        self.tell_peek_wrote(Vec::new(), None, commit, parent, cx);
+        let filters = self.resolved_filters();
+        let matching = i64::from(row_matches(&filters, &values));
+        match key {
+            Some(id) => {
+                values.insert(crate::model::ID_COLUMN.into(), Value::String(id.clone()));
+                // Grouped, a new row goes first in its open section; sorted, first in the list,
+                // where it is seen. The next read places it.
+                let section = self.grouping.as_ref().map(|grouping| {
+                    let value = grouping.value_of_new_row(&values)?;
+                    grouping.section_with(&value).filter(|ix| {
+                        grouping
+                            .sections()
+                            .get(*ix)
+                            .is_some_and(|section| section.expanded)
+                    })
+                });
+                let position = match section {
+                    Some(Some(ix)) => self
+                        .grouping
+                        .as_ref()
+                        .and_then(|g| g.sections().get(ix))
+                        .map(|section| section.range.start),
+                    // A value with no open section, or not known yet, shows after a read.
+                    Some(None) => {
+                        self.newer = true;
+                        cx.emit(ItemEvent::UpdateTab);
+                        None
+                    }
+                    None if self.sort.is_some() => Some(0),
+                    None => self.read_order_position(&id),
+                };
+                if let (Some(Some(ix)), Some(grouping)) = (section, self.grouping.as_mut()) {
+                    grouping.inserted(ix, 1);
+                    if let Some(section) = grouping.section_mut(ix) {
+                        section.count += 1;
+                    }
+                }
+                if let Some(position) = position {
+                    // Out of read order, sorted or in a section: a later page brings it again.
+                    if self.sort.is_some() || section.is_some() {
+                        self.placed_here.insert(id.clone());
+                    }
+                    let dimmed = !row_matches(&filters, &values);
+                    self.rows.insert(position, Row { id, values, dimmed });
+                    // The row a range starts from moves with the rows below it; the cursor goes
+                    // to the new row.
+                    self.rows_inserted(position, 1);
+                    self.cursor = Some(Cursor {
+                        row: position,
+                        col: self.cursor.map_or(0, |c| c.col),
+                    });
+                    self.table_state
+                        .read(cx)
+                        .scroll_handle
+                        .scroll_to_item(position, ScrollStrategy::Nearest);
+                }
+            }
+            // Without a key the engine assigns the id; only a fresh read shows the row.
+            None => {
+                self.newer = true;
+                cx.emit(ItemEvent::UpdateTab);
+            }
+        }
+        self.recount(behind, 1, matching, cx);
+        cx.notify();
+    }
 
     /// Brings the counts up to the table's own insert or delete of `rows` rows, `matching` of
     /// them through its filters (negative for a delete). With the pin moved to the commit, they
@@ -5771,12 +5935,110 @@ impl TypeTable {
         self.count_shift = Some(shift);
     }
 
+    /// The table's own delete was sent (spec 004): its rows leave the list now, as if it had
+    /// committed, and come back where they were if it is refused or its outcome is unknown
+    /// ([`Self::delete_not_made`]). Their drafts stay until the commit (constitution III).
+    pub fn rows_deleting(&mut self, branch: &str, ids: &[String], cx: &mut Context<Self>) {
+        if branch != self.branch {
+            return;
+        }
+        let going: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        let filters = self.resolved_filters();
+        let mut counted = HashSet::new();
+        let counts = self
+            .rows
+            .iter()
+            .filter(|row| going.contains(row.id.as_str()) && counted.insert(row.id.as_str()))
+            .fold((0, 0), |(rows, matching), row| {
+                let shown = row_matches(&filters, &row.values);
+                (rows + 1, matching + i64::from(shown))
+            });
+        let rows: Vec<(usize, Row)> = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| going.contains(row.id.as_str()))
+            .map(|(index, row)| (index, row.clone()))
+            .collect();
+        let picked: Vec<String> = self
+            .selection
+            .iter()
+            .filter(|id| going.contains(id.as_str()))
+            .cloned()
+            .collect();
+        self.selection.retain(|id| !going.contains(id.as_str()));
+        let gone: Vec<usize> = rows.iter().rev().map(|(index, _)| *index).collect();
+        self.take_out(&gone, &going);
+        self.deleting.push(PendingDelete {
+            ids: ids.to_vec(),
+            rows,
+            picked,
+            counts,
+            generation: self.generation,
+        });
+        cx.notify();
+    }
+
+    /// The workspace the table is in, for a dialog's outcome that comes after it closed.
+    pub(crate) fn workspace(&self) -> WeakEntity<Workspace> {
+        self.workspace.clone()
+    }
+
     fn take_pending_delete(&mut self, ids: &[String]) -> Option<PendingDelete> {
         let at = self
             .deleting
             .iter()
             .position(|pending| pending.ids == ids)?;
         Some(self.deleting.remove(at))
+    }
+
+    /// The table's own delete was not made, or may not have been: its rows come back where
+    /// they were, picked as they were. Grouped, the rows are read again at the pin instead.
+    /// With the outcome `unknown`, the head may hold the delete: the table is behind its
+    /// branch, and offers Refresh or follows it (spec 028).
+    pub fn delete_not_made(&mut self, ids: &[String], unknown: bool, cx: &mut Context<Self>) {
+        if let Some(pending) = self
+            .take_pending_delete(ids)
+            .filter(|pending| pending.generation == self.generation)
+        {
+            if self.grouping.is_some() {
+                self.reload(true, cx);
+            } else {
+                let shown: HashSet<String> = self.rows.iter().map(|row| row.id.clone()).collect();
+                for (index, row) in pending.rows {
+                    if shown.contains(&row.id) {
+                        continue;
+                    }
+                    let index = index.min(self.rows.len());
+                    self.row_put_back(index);
+                    self.rows.insert(index, row);
+                }
+                self.selection.extend(pending.picked);
+                self.lines_moved();
+            }
+        }
+        if unknown && !self.newer {
+            self.newer = true;
+            cx.emit(ItemEvent::UpdateTab);
+        }
+        cx.notify();
+    }
+
+    /// The table's own delete found none of its rows at the head of the branch: someone
+    /// deleted them first. They stay out, and the table, behind its branch, says so.
+    pub fn delete_found_nothing(&mut self, ids: &[String], several: bool, cx: &mut Context<Self>) {
+        self.take_pending_delete(ids);
+        if !self.newer {
+            self.newer = true;
+            cx.emit(ItemEvent::UpdateTab);
+        }
+        let reason = if several {
+            "Nothing was deleted: they no longer exist at the head of the branch."
+        } else {
+            "Nothing was deleted: it no longer exists at the head of the branch."
+        };
+        self.toast(ToastKind::Info, reason, cx);
+        cx.notify();
     }
 
     /// Keeps the cursor and the selection anchor on their rows as a row comes back at `index`.
@@ -5791,6 +6053,64 @@ impl TypeTable {
         {
             cursor.row += 1;
         }
+    }
+
+    /// Rows the table's own delete removed in `commit`: they leave the list, with their drafts
+    /// and the pick. The table follows the commit, which moves its pin once, and its counts
+    /// follow it ([`Self::recount`]).
+    pub fn rows_deleted(
+        &mut self,
+        branch: &str,
+        ids: &[String],
+        commit: &str,
+        parent: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        // Deleted on the branch the table left: the rows it shows are still there.
+        if branch != self.branch {
+            return;
+        }
+        let behind = self.follow_own_commit(parent, commit);
+        if behind {
+            self.newer = true;
+            cx.emit(ItemEvent::UpdateTab);
+        }
+        // Taken out when the delete was sent: counted then, and their drafts go now.
+        let pending = self
+            .take_pending_delete(ids)
+            .filter(|pending| pending.generation == self.generation);
+        if pending.is_some() {
+            let going: HashSet<&str> = ids.iter().map(String::as_str).collect();
+            self.cells
+                .retain(|(row_id, _), _| !going.contains(row_id.as_str()));
+            self.drop_rows_drafts(&going, cx);
+        }
+        // Counted before they go, for counts adjusted here: each row once, however many places
+        // it shows in.
+        let (rows, matching) = if let Some(pending) = pending {
+            pending.counts
+        } else {
+            let going: HashSet<&str> = ids.iter().map(String::as_str).collect();
+            let mut counted = HashSet::new();
+            let filters = self.resolved_filters();
+            self.rows
+                .iter()
+                .filter(|row| going.contains(row.id.as_str()) && counted.insert(row.id.as_str()))
+                .fold((0, 0), |(rows, matching), row| {
+                    let shown = row_matches(&filters, &row.values);
+                    (rows + 1, matching + i64::from(shown))
+                })
+        };
+        self.remove_rows(ids, cx);
+        // A deleted node took its relationships with it: the rows still shown read their
+        // relationship chips again at the new commit, rather than listing it.
+        self.relations.clear();
+        self.relation_tasks.clear();
+        self.relations_asked.clear();
+        self.relation_lines = None;
+        self.load_shown_relations(cx);
+        self.recount(behind, -rows, -matching, cx);
+        cx.notify();
     }
 
     /// Takes rows out of the table with every copy of each (grouped by a relationship, a row
@@ -8053,7 +8373,7 @@ impl TypeTable {
         else {
             return;
         };
-        let table = cx.entity().downgrade();
+        let table = self.dialog_link(cx);
         let session = self.session.clone();
         let type_name = self.type_name.clone();
         let snapshot = self.paging.pinned.clone();
@@ -8123,7 +8443,7 @@ impl TypeTable {
                 }
             })
             .collect();
-        let table = cx.entity().downgrade();
+        let table = self.dialog_link(cx);
         let session = self.session.clone();
         let (type_name, kind) = (self.type_name.clone(), self.kind);
         let if_commit = self.paging.pinned.clone();
@@ -12238,285 +12558,6 @@ impl TypeTable {
             end: Vec::new(),
             keys,
         }
-    }
-}
-
-/// What the table's dialogs tell it (spec 004): it opens them, and they tell it as their writes
-/// go out and come back, and when its tab is saved as a view.
-impl DialogTable for TypeTable {
-    /// The workspace the table is in, for a dialog's outcome that comes after it closed.
-    fn workspace(&self) -> WeakEntity<Workspace> {
-        self.workspace.clone()
-    }
-
-    /// A write on the table's behalf is going out (a dialog's insert or delete).
-    fn save_started(&mut self) {
-        self.saves_in_flight += 1;
-    }
-
-    /// A write on the table's behalf came back and its outcome is applied.
-    fn save_finished(&mut self, cx: &mut Context<Self>) {
-        self.saves_in_flight = self.saves_in_flight.saturating_sub(1);
-        self.saves_settled(cx);
-    }
-
-    /// A write bound to the pin was refused because the branch moved: offer Refresh.
-    fn branch_moved(&mut self, cx: &mut Context<Self>) {
-        if !self.newer {
-            self.newer = true;
-            cx.emit(ItemEvent::UpdateTab);
-            cx.notify();
-        }
-    }
-
-    /// A row this table inserted committed. It is shown where it sorts when that place is
-    /// loaded; the pin follows when nothing else committed in between, and the counts follow
-    /// it ([`Self::recount`]).
-    fn row_inserted(
-        &mut self,
-        branch: &str,
-        key: Option<String>,
-        mut values: serde_json::Map<String, Value>,
-        commit: &str,
-        parent: Option<&str>,
-        cx: &mut Context<Self>,
-    ) {
-        // Inserted on the branch the table left: not one it shows.
-        if branch != self.branch {
-            return;
-        }
-        let behind = self.follow_own_commit(parent, commit);
-        if behind {
-            self.newer = true;
-            cx.emit(ItemEvent::UpdateTab);
-        }
-        // A row added, with no relationship: nothing the peek shows changed.
-        self.tell_peek_wrote(Vec::new(), None, commit, parent, cx);
-        let filters = self.resolved_filters();
-        let matching = i64::from(row_matches(&filters, &values));
-        match key {
-            Some(id) => {
-                values.insert(crate::model::ID_COLUMN.into(), Value::String(id.clone()));
-                // Grouped, a new row goes first in its open section; sorted, first in the list,
-                // where it is seen. The next read places it.
-                let section = self.grouping.as_ref().map(|grouping| {
-                    let value = grouping.value_of_new_row(&values)?;
-                    grouping.section_with(&value).filter(|ix| {
-                        grouping
-                            .sections()
-                            .get(*ix)
-                            .is_some_and(|section| section.expanded)
-                    })
-                });
-                let position = match section {
-                    Some(Some(ix)) => self
-                        .grouping
-                        .as_ref()
-                        .and_then(|g| g.sections().get(ix))
-                        .map(|section| section.range.start),
-                    // A value with no open section, or not known yet, shows after a read.
-                    Some(None) => {
-                        self.newer = true;
-                        cx.emit(ItemEvent::UpdateTab);
-                        None
-                    }
-                    None if self.sort.is_some() => Some(0),
-                    None => self.read_order_position(&id),
-                };
-                if let (Some(Some(ix)), Some(grouping)) = (section, self.grouping.as_mut()) {
-                    grouping.inserted(ix, 1);
-                    if let Some(section) = grouping.section_mut(ix) {
-                        section.count += 1;
-                    }
-                }
-                if let Some(position) = position {
-                    // Out of read order, sorted or in a section: a later page brings it again.
-                    if self.sort.is_some() || section.is_some() {
-                        self.placed_here.insert(id.clone());
-                    }
-                    let dimmed = !row_matches(&filters, &values);
-                    self.rows.insert(position, Row { id, values, dimmed });
-                    // The row a range starts from moves with the rows below it; the cursor goes
-                    // to the new row.
-                    self.rows_inserted(position, 1);
-                    self.cursor = Some(Cursor {
-                        row: position,
-                        col: self.cursor.map_or(0, |c| c.col),
-                    });
-                    self.table_state
-                        .read(cx)
-                        .scroll_handle
-                        .scroll_to_item(position, ScrollStrategy::Nearest);
-                }
-            }
-            // Without a key the engine assigns the id; only a fresh read shows the row.
-            None => {
-                self.newer = true;
-                cx.emit(ItemEvent::UpdateTab);
-            }
-        }
-        self.recount(behind, 1, matching, cx);
-        cx.notify();
-    }
-
-    /// The table's own delete was sent (spec 004): its rows leave the list now, as if it had
-    /// committed, and come back where they were if it is refused or its outcome is unknown
-    /// ([`Self::delete_not_made`]). Their drafts stay until the commit (constitution III).
-    fn rows_deleting(&mut self, branch: &str, ids: &[String], cx: &mut Context<Self>) {
-        if branch != self.branch {
-            return;
-        }
-        let going: HashSet<&str> = ids.iter().map(String::as_str).collect();
-        let filters = self.resolved_filters();
-        let mut counted = HashSet::new();
-        let counts = self
-            .rows
-            .iter()
-            .filter(|row| going.contains(row.id.as_str()) && counted.insert(row.id.as_str()))
-            .fold((0, 0), |(rows, matching), row| {
-                let shown = row_matches(&filters, &row.values);
-                (rows + 1, matching + i64::from(shown))
-            });
-        let rows: Vec<(usize, Row)> = self
-            .rows
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| going.contains(row.id.as_str()))
-            .map(|(index, row)| (index, row.clone()))
-            .collect();
-        let picked: Vec<String> = self
-            .selection
-            .iter()
-            .filter(|id| going.contains(id.as_str()))
-            .cloned()
-            .collect();
-        self.selection.retain(|id| !going.contains(id.as_str()));
-        let gone: Vec<usize> = rows.iter().rev().map(|(index, _)| *index).collect();
-        self.take_out(&gone, &going);
-        self.deleting.push(PendingDelete {
-            ids: ids.to_vec(),
-            rows,
-            picked,
-            counts,
-            generation: self.generation,
-        });
-        cx.notify();
-    }
-
-    /// Rows the table's own delete removed in `commit`: they leave the list, with their drafts
-    /// and the pick. The table follows the commit, which moves its pin once, and its counts
-    /// follow it ([`Self::recount`]).
-    fn rows_deleted(
-        &mut self,
-        branch: &str,
-        ids: &[String],
-        commit: &str,
-        parent: Option<&str>,
-        cx: &mut Context<Self>,
-    ) {
-        // Deleted on the branch the table left: the rows it shows are still there.
-        if branch != self.branch {
-            return;
-        }
-        let behind = self.follow_own_commit(parent, commit);
-        if behind {
-            self.newer = true;
-            cx.emit(ItemEvent::UpdateTab);
-        }
-        // Taken out when the delete was sent: counted then, and their drafts go now.
-        let pending = self
-            .take_pending_delete(ids)
-            .filter(|pending| pending.generation == self.generation);
-        if pending.is_some() {
-            let going: HashSet<&str> = ids.iter().map(String::as_str).collect();
-            self.cells
-                .retain(|(row_id, _), _| !going.contains(row_id.as_str()));
-            self.drop_rows_drafts(&going, cx);
-        }
-        // Counted before they go, for counts adjusted here: each row once, however many places
-        // it shows in.
-        let (rows, matching) = if let Some(pending) = pending {
-            pending.counts
-        } else {
-            let going: HashSet<&str> = ids.iter().map(String::as_str).collect();
-            let mut counted = HashSet::new();
-            let filters = self.resolved_filters();
-            self.rows
-                .iter()
-                .filter(|row| going.contains(row.id.as_str()) && counted.insert(row.id.as_str()))
-                .fold((0, 0), |(rows, matching), row| {
-                    let shown = row_matches(&filters, &row.values);
-                    (rows + 1, matching + i64::from(shown))
-                })
-        };
-        self.remove_rows(ids, cx);
-        // A deleted node took its relationships with it: the rows still shown read their
-        // relationship chips again at the new commit, rather than listing it.
-        self.relations.clear();
-        self.relation_tasks.clear();
-        self.relations_asked.clear();
-        self.relation_lines = None;
-        self.load_shown_relations(cx);
-        self.recount(behind, -rows, -matching, cx);
-        cx.notify();
-    }
-
-    /// The table's own delete was not made, or may not have been: its rows come back where
-    /// they were, picked as they were. Grouped, the rows are read again at the pin instead.
-    /// With the outcome `unknown`, the head may hold the delete: the table is behind its
-    /// branch, and offers Refresh or follows it (spec 028).
-    fn delete_not_made(&mut self, ids: &[String], unknown: bool, cx: &mut Context<Self>) {
-        if let Some(pending) = self
-            .take_pending_delete(ids)
-            .filter(|pending| pending.generation == self.generation)
-        {
-            if self.grouping.is_some() {
-                self.reload(true, cx);
-            } else {
-                let shown: HashSet<String> = self.rows.iter().map(|row| row.id.clone()).collect();
-                for (index, row) in pending.rows {
-                    if shown.contains(&row.id) {
-                        continue;
-                    }
-                    let index = index.min(self.rows.len());
-                    self.row_put_back(index);
-                    self.rows.insert(index, row);
-                }
-                self.selection.extend(pending.picked);
-                self.lines_moved();
-            }
-        }
-        if unknown && !self.newer {
-            self.newer = true;
-            cx.emit(ItemEvent::UpdateTab);
-        }
-        cx.notify();
-    }
-
-    /// The table's own delete found none of its rows at the head of the branch: someone
-    /// deleted them first. They stay out, and the table, behind its branch, says so.
-    fn delete_found_nothing(&mut self, ids: &[String], several: bool, cx: &mut Context<Self>) {
-        self.take_pending_delete(ids);
-        if !self.newer {
-            self.newer = true;
-            cx.emit(ItemEvent::UpdateTab);
-        }
-        let reason = if several {
-            "Nothing was deleted: they no longer exist at the head of the branch."
-        } else {
-            "Nothing was deleted: it no longer exists at the head of the branch."
-        };
-        self.toast(ToastKind::Info, reason, cx);
-        cx.notify();
-    }
-
-    /// Makes this tab the saved view `id`: one saved from it as a new view.
-    fn become_view(&mut self, id: String, cx: &mut Context<Self>) {
-        self.view_id = Some(id);
-        // A filtered table saved as a view is that view's tab, found by the view's key.
-        self.own_key = None;
-        cx.emit(ItemEvent::UpdateTab);
-        cx.notify();
     }
 }
 
