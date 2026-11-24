@@ -6,7 +6,7 @@
 //! Omnigraph has no read of one entity's commits (E62) and keeps no operation or message with a
 //! commit (E60): the first window covers the branch's newest
 //! [`NODE_HISTORY_FIRST_COMMITS`](graph_store::node_history::NODE_HISTORY_FIRST_COMMITS) commits, read as point reads of the node at each
-//! ([`GraphSession::node_history_in`]), with an honest exit to the [`NODE_HISTORY_COMMITS`]
+//! ([`node_history::read_window`](graph_store::node_history::read_window)), with an honest exit to the [`NODE_HISTORY_COMMITS`]
 //! before them. It reads only once its tab is shown.
 //!
 //! Forked in part from the closed #146 (spec 040, `feat/ux-p5-node-history`).
@@ -396,7 +396,7 @@ impl NodeHistoryView {
         let older = matches!(window, NodeHistoryWindow::Older { .. });
         let (branch, scope) = (self.branch.clone(), self.scope.clone());
         let read = self.session.update(cx, |session, cx| {
-            session.node_history_in(&scope, &branch, node, window, cx)
+            graph_store::node_history::read_window(session, &scope, &branch, node, window, cx)
         });
         self._task = Some(cx.spawn(async move |this, cx| {
             let answer = read.await;
@@ -566,7 +566,15 @@ impl NodeHistoryView {
         };
         let (branch, scope) = (self.branch.clone(), self.scope.clone());
         let read = self.session.update(cx, |session, cx| {
-            session.node_history_search(&scope, &branch, node, window.page_token, base, cx)
+            graph_store::node_history::search_creation(
+                session,
+                &scope,
+                &branch,
+                node,
+                window.page_token,
+                base,
+                cx,
+            )
         });
         self.search = Search::Running;
         self._search_task = Some(cx.spawn(async move |this, cx| {
