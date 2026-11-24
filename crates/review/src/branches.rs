@@ -815,20 +815,19 @@ enum Holds {
     Unknown(String),
 }
 
-/// "Delete branch" (constitution IV). A branch whose every commit is already in `main` loses
-/// nothing with it, so ↵ deletes it; one with commits only it holds, or one the check could not
-/// read, is deleted by typing its name. `main` cannot be deleted.
+/// "Delete branch" (constitution IV). The dialog says first what deleting loses: nothing, for a
+/// branch whose every commit is already in `main`; for one with commits only it holds, or one
+/// the check could not read, those commits, which Studio cannot bring back. Either way ↵ or
+/// Delete deletes it. `main` cannot be deleted.
 pub struct DeleteBranchModal {
     session: Entity<GraphSession>,
     branch: String,
     holds: Holds,
-    confirm: Entity<Editor>,
     error: Option<SharedString>,
     running: bool,
     focus_handle: FocusHandle,
     _check: Task<()>,
     _task: Option<Task<()>>,
-    _subscription: Subscription,
 }
 
 impl EventEmitter<DismissEvent> for DeleteBranchModal {}
@@ -853,17 +852,6 @@ impl DeleteBranchModal {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let confirm = cx.new(|cx| {
-            let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text(&format!("Type {branch} to delete it"), window, cx);
-            editor
-        });
-        let subscription = cx.subscribe(&confirm, |this, _, event: &EditorEvent, cx| {
-            if let EditorEvent::BufferEdited = event {
-                this.error = None;
-                cx.notify();
-            }
-        });
         let read = session.update(cx, |session, cx| session.merge_base(&branch, TARGET, cx));
         let check = cx.spawn_in(window, async move |this, cx| {
             let holds = match read.await {
@@ -873,10 +861,7 @@ impl DeleteBranchModal {
                 Ok(_) => Holds::Unmerged,
                 Err(error) => Holds::Unknown(error.to_string()),
             };
-            this.update_in(cx, |this, window, cx| {
-                if holds != Holds::Merged {
-                    window.focus(&this.confirm.focus_handle(cx), cx);
-                }
+            this.update(cx, |this, cx| {
                 this.holds = holds;
                 cx.notify();
             })
@@ -886,36 +871,29 @@ impl DeleteBranchModal {
             session,
             branch,
             holds: Holds::Reading,
-            confirm,
             error: None,
             running: false,
             focus_handle: cx.focus_handle(),
             _check: check,
             _task: None,
-            _subscription: subscription,
         }
     }
 
-    /// Whether Delete may run: a merged branch at once, any other once its name is typed.
-    fn confirmed(&self, cx: &App) -> bool {
-        self.branch != TARGET
-            && match self.holds {
-                Holds::Reading => false,
-                Holds::Merged => true,
-                Holds::Unmerged | Holds::Unknown(_) => {
-                    self.confirm.read(cx).text(cx).trim() == self.branch
-                }
-            }
+    /// Whether Delete may run: once the dialog has said what deleting loses, and never `main`.
+    fn ready(&self) -> bool {
+        self.branch != TARGET && self.holds != Holds::Reading
     }
 
     fn delete(&mut self, cx: &mut Context<Self>) {
-        if self.running || !self.confirmed(cx) {
+        if self.running || !self.ready() {
             return;
         }
         self.running = true;
+        self.error = None;
         let branch = self.branch.clone();
         // Merged when the dialog opened, and asked again now: a commit landed on the branch
-        // meanwhile is the branch's alone, and then the branch waits for its name.
+        // meanwhile is the branch's alone, so nothing is sent and the dialog says what deleting
+        // now loses; ↵ again deletes it.
         let recheck = matches!(self.holds, Holds::Merged).then(|| {
             self.session
                 .update(cx, |session, cx| session.merge_base(&branch, TARGET, cx))
@@ -936,14 +914,13 @@ impl DeleteBranchModal {
                             this.error = Some(
                                 match &holds {
                                     Holds::Unknown(error) => format!(
-                                        "Studio could not check {} again: {}. Type its name to \
-                                         delete it.",
+                                        "Not deleted: Studio could not check {} again ({}).",
                                         this.branch,
                                         studio_ui::clause(&error.to_string())
                                     ),
                                     _ => format!(
-                                        "{} has a commit {TARGET} does not since this opened; \
-                                         type its name to delete it.",
+                                        "Not deleted: {} has a commit {TARGET} does not since \
+                                         this opened.",
                                         this.branch
                                     ),
                                 }
@@ -985,34 +962,33 @@ impl DeleteBranchModal {
     }
 }
 
+impl DeleteBranchModal {
+    /// What deleting the branch loses, and, when that is commits, that they cannot be brought
+    /// back (constitution IV).
+    fn description(&self) -> String {
+        let branch = &self.branch;
+        match &self.holds {
+            Holds::Reading => format!("Checking whether {branch} is merged into {TARGET}…"),
+            Holds::Merged => {
+                format!("Everything on {branch} is in {TARGET}, so deleting it loses nothing.")
+            }
+            Holds::Unmerged => format!(
+                "{branch} has commits that are not in {TARGET}. Deleting it loses them, and \
+                 this cannot be undone."
+            ),
+            Holds::Unknown(error) => format!(
+                "Studio could not tell whether {branch} is merged into {TARGET} ({error}). \
+                 Deleting it may lose commits, and this cannot be undone."
+            ),
+        }
+    }
+}
+
 impl Render for DeleteBranchModal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let confirmed = self.confirmed(cx);
+        let ready = self.ready();
+        let what = self.description();
         let branch = &self.branch;
-        let (what, typing) = match &self.holds {
-            Holds::Reading => (
-                format!("Checking whether {branch} is merged into {TARGET}…"),
-                false,
-            ),
-            Holds::Merged => (
-                format!("Everything on {branch} is in {TARGET}, so deleting it loses nothing."),
-                false,
-            ),
-            Holds::Unmerged => (
-                format!(
-                    "{branch} has commits that are not in {TARGET}. Deleting it loses them, and \
-                     Studio cannot bring them back."
-                ),
-                true,
-            ),
-            Holds::Unknown(error) => (
-                format!(
-                    "Studio could not tell whether {branch} is merged into {TARGET} ({error}). \
-                     Deleting it may lose commits."
-                ),
-                true,
-            ),
-        };
         let cli = format!("omnigraph branch delete {branch}");
         let running = self.running;
         ds::modal(cx)
@@ -1020,8 +996,7 @@ impl Render for DeleteBranchModal {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
             .on_action(cx.listener(|this, _: &menu::Confirm, _, cx| this.delete(cx)))
-            // What it loses is the description; the body holds only the field that asks for
-            // the branch's name when it may lose commits.
+            // What it loses is the description; the body holds only why it was not deleted.
             .child(
                 ds::ModalHeader::new(format!("Delete {branch}?"))
                     .description(SharedString::from(what))
@@ -1032,12 +1007,8 @@ impl Render for DeleteBranchModal {
                     .close_disabled(running)
                     .on_close(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
             )
-            .when(typing || self.error.is_some(), |dialog| {
-                dialog.child(
-                    ds::modal_body()
-                        .when(typing, |body| body.child(field(&self.confirm, cx)))
-                        .children(self.error.clone().map(studio_ui::ds::text::error)),
-                )
+            .when_some(self.error.clone(), |dialog, error| {
+                dialog.child(ds::modal_body().child(studio_ui::ds::text::error(error)))
             })
             .child(
                 ds::modal_footer(cx)
@@ -1056,7 +1027,8 @@ impl Render for DeleteBranchModal {
                             },
                         )
                         .variant(ds::Variant::Destructive)
-                        .disabled(!confirmed || self.running)
+                        .disabled(!ready || self.running)
+                        .key_binding(ui::KeyBinding::for_action(&menu::Confirm, cx))
                         .tip_fn(move |_, cx| {
                             studio_ui::ds::tooltip_with_meta(
                                 "Delete the branch",
@@ -1396,14 +1368,18 @@ mod tests {
         });
     }
 
-    /// A merged branch is deleted with ↵; one with commits only it holds waits for its name.
+    /// Every branch is deleted with ↵, nothing typed. The dialog says first what goes: nothing
+    /// for a merged branch; for one with commits only it holds, those commits and that this
+    /// cannot be undone. A merged branch that took a commit of its own after the dialog opened
+    /// is not deleted on that ↵: the dialog says what deleting now loses, and ↵ again deletes it.
     #[gpui::test]
-    async fn a_merged_branch_deletes_at_once_and_an_unmerged_one_by_its_name(
+    async fn every_branch_deletes_with_enter_once_the_dialog_says_what_goes(
         cx: &mut gpui::TestAppContext,
     ) {
         cx.update(|cx| {
             studio_theme::init_test(cx);
             editor::init(cx);
+            cx.bind_keys([gpui::KeyBinding::new("enter", menu::Confirm, None)]);
         });
         let commit = |id: &str| json!({ "graph_commit_id": id, "graph_manifest_version": 1, "kind": "published", "created_at": 0 });
         let late_reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1448,16 +1424,27 @@ mod tests {
                 })
                 .count()
         };
+        // ↵ in the dialog, as the person presses it.
+        let enter = |modal: &Entity<DeleteBranchModal>, cx: &mut gpui::VisualTestContext| {
+            modal.update_in(cx, |modal, window, cx| {
+                window.focus(&modal.focus_handle(cx), cx)
+            });
+            cx.simulate_keystrokes("enter");
+            cx.run_until_parked();
+        };
         let (merged, cx) = cx.add_window_view(|window, cx| {
             DeleteBranchModal::new(session.clone(), "feature".into(), window, cx)
         });
         cx.run_until_parked();
-        merged.update(cx, |modal, cx| {
+        merged.read_with(cx, |modal, _| {
             assert_eq!(modal.holds, Holds::Merged);
-            modal.delete(cx);
+            assert_eq!(
+                modal.description(),
+                "Everything on feature is in main, so deleting it loses nothing."
+            );
         });
-        cx.run_until_parked();
-        assert_eq!(deletes(), 1, "deleted with no name typed");
+        enter(&merged, cx);
+        assert_eq!(deletes(), 1, "deleted with ↵");
         merged.read_with(cx, |modal, _| {
             assert_eq!(modal.error, None, "the receipt settles the delete")
         });
@@ -1466,39 +1453,40 @@ mod tests {
             DeleteBranchModal::new(session.clone(), "spike".into(), window, cx)
         });
         cx.run_until_parked();
-        unmerged.update(cx, |modal, cx| {
+        unmerged.read_with(cx, |modal, _| {
             assert_eq!(modal.holds, Holds::Unmerged);
-            modal.delete(cx);
+            assert_eq!(
+                modal.description(),
+                "spike has commits that are not in main. Deleting it loses them, and this \
+                 cannot be undone."
+            );
         });
-        cx.run_until_parked();
-        assert_eq!(deletes(), 1, "not without its name");
-        unmerged.update_in(cx, |modal, window, cx| {
-            modal
-                .confirm
-                .update(cx, |editor, cx| editor.set_text("spike", window, cx));
-            modal.delete(cx);
-        });
-        cx.run_until_parked();
-        assert_eq!(deletes(), 2);
+        enter(&unmerged, cx);
+        assert_eq!(deletes(), 2, "deleted with ↵, nothing typed");
 
         let (late, cx) = cx.add_window_view(|window, cx| {
             DeleteBranchModal::new(session.clone(), "late".into(), window, cx)
         });
         cx.run_until_parked();
-        late.update(cx, |modal, cx| {
-            assert_eq!(modal.holds, Holds::Merged);
-            modal.delete(cx);
-        });
-        cx.run_until_parked();
+        late.read_with(cx, |modal, _| assert_eq!(modal.holds, Holds::Merged));
+        enter(&late, cx);
         assert_eq!(
             deletes(),
             2,
-            "a commit landed meanwhile: not without its name"
+            "a commit landed meanwhile: not on the ↵ that said it loses nothing"
         );
         late.read_with(cx, |modal, _| {
             assert_eq!(modal.holds, Holds::Unmerged);
             assert!(modal.error.is_some());
+            assert!(
+                modal.description().contains("this cannot be undone"),
+                "{}",
+                modal.description()
+            );
         });
+        enter(&late, cx);
+        assert_eq!(deletes(), 3, "↵ again, once it says what goes");
+        late.read_with(cx, |modal, _| assert_eq!(modal.error, None));
     }
 
     /// A branch at a commit is asked for with the commit alone, never a branch too, and the

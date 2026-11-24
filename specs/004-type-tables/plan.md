@@ -505,13 +505,14 @@ its open section.
   2026-10-21: before, such a delete offered an Undo that restored nothing; since 2026-11-12 a
   type whose total the session's counts hold for that commit is counted only when it could
   pass the cap, largest first, so most deletes send no count; one past the cap is counted
-  whole), the dialog says why
-  and asks for the key, or `delete N` for several rows, to be typed (constitution IV). An edge
+  whole), the dialog says that it cannot be undone and why, and ↵ deletes it as any delete
+  (constitution IV; until 2026-11-24 the key, or `delete N` for several rows, was typed). An edge
   delete takes no dependents; deleting a relationship its source needs is refused by the
   server, which the dialog shows. The dialog deletes the kind its table shows, as a node type
   and an edge type may share a name (since 2026-10-21; before, it took the edge). More than
-  20,000 picked relationships, past what Undo puts back in one commit, are confirmed by typing
-  `delete N`, with no Undo (since 2026-10-21).
+  20,000 picked relationships, past what Undo puts back in one commit, say that they cannot be
+  undone and are confirmed with ↵, with no Undo (since 2026-10-21; typed as `delete N` until
+  2026-11-24).
 - An edit open when the table moves to another branch (a link, a toast's follow-up), or when its
   tab closes, is kept as the cell's draft on the branch it was typed on, as leaving the cell keeps it; a tab holding such an edit asks before
   it closes (since 2026-10-21; before, the text was lost).
@@ -555,7 +556,7 @@ kept answers.
 
 | Decision | Rejected alternatives | Why |
 |---|---|---|
-| ↵ and Undo for a delete Studio can put back; typing only when it cannot | Typing the key every time (constitution 1.0.0); no dialog, Undo only | Ragnor, 2026-10-17: typing was annoying. The dialog still lists everything a delete removes, and Undo puts it back from the change feed in one commit |
+| ↵ and Undo for a delete Studio can put back; ↵ and "This cannot be undone." when it cannot | Typing the key every time (constitution 1.0.0); typing only when Undo cannot (until 2026-11-24); no dialog, Undo only | Ragnor, 2026-10-17 and again 2026-11-24 (constitution 1.6.0): typing was annoying. The dialog still lists everything a delete removes and says whether it can be undone, and Undo puts it back from the change feed in one commit |
 | Dependents found by Studio and deleted in the same commit, listed | A checkbox per delete; only a schema-declared cascade (an engine change) | Ragnor, 2026-10-17. The server already refuses a delete that leaves a node below its `@card` minimum, so without them the delete cannot happen; the list says exactly what goes. Since 2026-11-13 the list is read at the branch's newest commit the session holds and the delete is bound to no commit: on a branch another writer commits to every minute or two, a delete bound to the table's commit was refused (412) nearly every time, and its plan, read behind the session's totals, counted every relationship type. The delete names its nodes and relationships by id, and the server still refuses one that leaves a node below its `@card` minimum, so a dependent added since the plan read refuses it rather than being left behind |
 | Value-bound cell saves | `if-graph-commit` on every cell | Any unrelated commit would refuse the save |
 | Engine-side filter, sort and count | Filtering loaded rows | Correct at any size; grouping and filtering loaded rows is wrong once a type outgrows a page |
@@ -702,9 +703,13 @@ kept answers.
 | 2026-10-20 | A Blob write is bound to the value read and has three outcomes | `graph_client` `a_blob_put_sends_raw_bytes_bound_to_the_etag_read`, `a_blob_clear_of_a_null_cell_commits_nothing`, `a_changed_blob_refuses_the_write_with_its_current_etag`, `a_blob_put_without_the_servers_answer_is_unknown`; `type_table` `blob_write` tests, the peek's `a_file_stored_in_a_slot_is_bound_to_the_value_read`, `a_value_changed_elsewhere_is_offered_again_over_the_new_one`, `uploads_the_view_cannot_send_say_why_and_send_nothing`, `a_page_held_at_a_commit_stores_no_file`, the table's `a_file_dropped_on_a_blob_cell_is_stored_bound_to_the_value_read`, the tab's `a_file_stored_from_the_tab_shows_at_its_own_commit` and `a_tab_at_a_commit_writes_nothing`, against the fake server's Blob cells | One `PUT` with one content type, the bytes and the ETag read; the view, the table and the tab move to the write's commit and show its value; a value changed elsewhere sends one write, keeps the other writer's bytes and offers "Replace anyway" bound to the new ETag, which lands; a 32 MiB + 1 file and a held view send nothing; a lost answer is unknown and not sent again. The native picker and a drop from Finder were not driven: no test reaches the system's open panel or its file drags, so the paths after them (`upload_blob`, `upload`) are what the tests call |
 | 2026-11-10 | A delete's rows leave at once and come back where they were, picked, the cursor on its row, when it is refused or its outcome is unknown (which also offers Refresh); committed, they stay out and the table follows the commit | `type_table` `a_deletes_rows_leave_at_once_and_come_back_if_it_is_not_made`; the `type_table` suite | Pass. Not yet checked in the running app |
 | 2026-11-10 | ↵ in the insert dialog closes it as the insert goes; refused, the same dialog comes back with what was typed and why, after a dialog opened meanwhile closes | `type_table` `dialogs::tests::a_refused_insert_brings_its_dialog_back_with_what_was_typed`; the `type_table` and `studio_workspace` suites | Pass. Not yet checked in the running app |
+| 2026-11-24 | A delete Undo cannot restore goes with ↵ and says so (constitution 1.6.0) | `type_table` `an_edge_delete_past_what_undo_puts_back_says_so_and_goes_with_enter` (20,000 and 20,001 `Knows` picked, ↵ simulated in the dialog), `a_delete_behind_its_branch_plans_at_the_head_and_is_not_bound`; offscreen snapshots of a `Note` delete on the dev `notes` graph (its Blob), before and after | 20,001 says "This cannot be undone. It removes 20,001 relationships, more than the 20,000 Undo puts back in one commit." and 20,000 "You can undo this right after."; ↵ closed the dialog and sent one write in both. The dialog has no field; `phrase_for` and its editor are gone |
 
 ## Corrections
 
+- 2026-11-24 · A delete Undo could not restore was confirmed by typing the row's key, or
+  `delete N`. Constitution 1.6.0 confirms every destructive action with ↵ or its button: the
+  dialog now says "This cannot be undone." with the reason, and has no field.
 - 2026-10-22 · "Reading" still gave what `dab901f` and the snapshot's commit changed. Its sketch
   put the `$after` cursor on every page; the first page has none. It said the next page was read
   once the view passed 80% of the rows read; it is read a page ahead. It said a page's

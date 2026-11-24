@@ -18,8 +18,9 @@ gives the CLI command for each (constitution VI). This plan makes those changes 
   operation; refused is a 4xx, and nothing changed; unknown is a lost answer. An unknown outcome is
   settled by reading the operation or the cluster list, never by sending the write again, and
   Studio never retries a write by itself.
-- IV: a destructive action says what it destroys before it runs. Delete is confirmed by typing
-  the cluster's name, and says that its graphs go with it, and how long Undo stays possible. A
+- IV: a destructive action says what it destroys before it runs. Delete says that the cluster's
+  graphs go with it, and how long Undo stays possible, or that it cannot be undone when
+  retention is 0; it is confirmed with ↵ or its button, never by typing a name. A
   403 is shown as a denial in the organization's words (`scope_missing`); nothing is hidden
   ahead of time.
 - V: a cluster deleted or created stays where it was in the list, its state changing, until the
@@ -76,8 +77,8 @@ Check again, which reads, never resends.
 ### Delete and Undo
 
 Delete says: "Delete <name>? Its graphs and their history go with it. You can undo this for 24
-hours." Retention is one of 0, 1, 7 or 30 days, 24 hours by default. It is confirmed by typing
-the cluster's name. `POST …:delete` names the exact `incarnation` shown, so a cluster that was
+hours." Retention is one of 0, 1, 7 or 30 days, 24 hours by default; with 0 it says "This cannot
+be undone." instead. It is confirmed with ↵ or Delete. `POST …:delete` names the exact `incarnation` shown, so a cluster that was
 replaced meanwhile is refused (`409`) rather than deleted. While the deletion is retained, the
 cluster's row says "Deleted · Undo until <time>" and offers Undo, which is confirmed with ↵ and
 sends `POST …:undo` with the deletion's ID.
@@ -105,7 +106,7 @@ the list again"). A `422` shows the problem's `detail` next to the field it name
 
 | Chosen | Rejected | Why |
 |---|---|---|
-| Typing the name confirms Delete | ↵ | Studio cannot put a purged cluster back; within retention Undo can, but the default may be 0 |
+| ↵ or Delete confirms Delete, after a description that says what goes and how long Undo lasts, or that it cannot be undone | Typing the name | Constitution 1.6.0, IV: nothing is confirmed by typing (Ragnor, 2026-11-24: typing was annoying). Was "typing the name" before it |
 | An unknown outcome is read, not resent | Resending with the same `Idempotency-Key` | Constitution III; a replay is the control plane's guarantee, not a reason for Studio to send twice |
 | Members read-only | Invitations and roles | They are the organization's, not the cluster's; the web console owns them |
 | Actions in Settings' Manage section | A cluster window of its own | It is where the clusters are listed; a cluster page can follow if people manage many |

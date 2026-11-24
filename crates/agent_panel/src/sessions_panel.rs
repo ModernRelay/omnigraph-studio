@@ -266,8 +266,8 @@ impl SessionsPanel {
         };
         let panel = cx.entity().downgrade();
         workspace.update(cx, |workspace, cx| {
-            workspace.toggle_modal(window, cx, move |window, cx| {
-                DeleteConversation::new(record, panel, window, cx)
+            workspace.toggle_modal(window, cx, move |_, cx| {
+                DeleteConversation::new(record, panel, cx)
             });
         });
     }
@@ -929,64 +929,40 @@ impl Render for SessionsActions {
 }
 
 /// Asks before a conversation is deleted: Studio forgets it, and the agent deletes it when it
-/// can. Nothing on the graph changes. Neither can be put back, so it is confirmed by typing the
-/// conversation's title (constitution IV).
+/// can. Nothing on the graph changes. Neither can be put back, so the dialog says so; ↵ or
+/// Delete deletes it (constitution IV).
 struct DeleteConversation {
     record: SessionRecord,
     panel: WeakEntity<SessionsPanel>,
-    /// Where the title is typed.
-    confirm: Entity<Editor>,
-    /// Delete was asked for with other words in the field.
-    refused: bool,
-    _subscription: Subscription,
-}
-
-/// Whether `typed` names the conversation to delete: its title as the list shows it, typed
-/// whole.
-fn title_typed(typed: &str, record: &SessionRecord) -> bool {
-    typed.trim() == record.shown_title().trim()
+    focus_handle: FocusHandle,
 }
 
 impl DeleteConversation {
     fn new(
         record: SessionRecord,
         panel: WeakEntity<SessionsPanel>,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let title = record.shown_title().trim().to_owned();
-        let confirm = cx.new(|cx| {
-            let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text(&format!("Type {title} to delete it"), window, cx);
-            editor.set_text_style_refinement(ds::field_text(cx));
-            editor
-        });
-        let subscription = cx.subscribe(&confirm, |this: &mut Self, _, event: &EditorEvent, cx| {
-            if let EditorEvent::BufferEdited = event {
-                this.refused = false;
-                cx.notify();
-            }
-        });
         Self {
             record,
             panel,
-            confirm,
-            refused: false,
-            _subscription: subscription,
+            focus_handle: cx.focus_handle(),
         }
     }
 
-    fn confirmed(&self, cx: &App) -> bool {
-        title_typed(&self.confirm.read(cx).text(cx), &self.record)
+    /// The title as the list shows it.
+    fn title(&self) -> String {
+        self.record.shown_title().trim().to_owned()
     }
 
-    /// Deletes once the title is typed; otherwise the field says what to type.
+    /// What goes, what stays, and that it cannot be undone.
+    fn description(&self) -> String {
+        "Studio forgets this conversation and its open tab closes; the agent deletes it too when \
+         it can. This cannot be undone. The graph and the agent's branch are not touched."
+            .to_owned()
+    }
+
     fn delete(&mut self, cx: &mut Context<Self>) {
-        if !self.confirmed(cx) {
-            self.refused = true;
-            cx.notify();
-            return;
-        }
         let record = self.record.clone();
         self.panel
             .update(cx, |panel, cx| panel.delete(&record, cx))
@@ -1000,33 +976,23 @@ impl EventEmitter<DismissEvent> for DeleteConversation {}
 impl ModalView for DeleteConversation {}
 
 impl Focusable for DeleteConversation {
-    /// The field the title is typed in.
-    fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.confirm.focus_handle(cx)
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
     }
 }
 
 impl Render for DeleteConversation {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let title = self.record.shown_title().trim().to_owned();
-        let confirmed = self.confirmed(cx);
         ds::modal(cx)
             .key_context("DeleteConversation")
+            .track_focus(&self.focus_handle)
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
             .on_action(cx.listener(|this, _: &menu::Confirm, _, cx| this.delete(cx)))
             .child(
-                ds::ModalHeader::new(format!("Delete “{title}”"))
-                    .description(SharedString::from(format!(
-                        "Studio forgets this conversation and its open tab closes; the agent \
-                         deletes it too when it can. This cannot be undone. The graph and the \
-                         agent's branch are not touched. Type {title} to confirm."
-                    )))
+                ds::ModalHeader::new(format!("Delete “{}”", self.title()))
+                    .description(SharedString::from(self.description()))
                     .on_close(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
             )
-            // The body holds only the field the title is typed in.
-            .child(ds::modal_body().child(
-                ds::field_frame(self.refused, cx).child(ds::field_input(self.confirm.clone())),
-            ))
             .child(
                 ds::modal_footer(cx)
                     .child(
@@ -1036,7 +1002,7 @@ impl Render for DeleteConversation {
                     .child(
                         ds::action_button("delete", "Delete")
                             .variant(ds::Variant::Destructive)
-                            .disabled(!confirmed)
+                            .key_binding(ui::KeyBinding::for_action(&menu::Confirm, cx))
                             .on_click(cx.listener(|this, _, _, cx| this.delete(cx))),
                     ),
             )
@@ -1122,10 +1088,17 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// A conversation is deleted only with its title typed whole, as the list shows it: the
-    /// person's name for it over the agent's, and "New conversation" before either.
-    #[test]
-    fn a_conversation_is_deleted_only_with_its_title_typed() {
+    /// A conversation is deleted with ↵, nothing typed. The dialog names it by its title as
+    /// the list shows it (the person's name for it over the agent's, and "New conversation"
+    /// before either) and says that it cannot be undone.
+    #[gpui::test]
+    async fn a_conversation_is_deleted_with_enter_once_the_dialog_says_what_goes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            cx.bind_keys([gpui::KeyBinding::new("enter", menu::Confirm, None)]);
+        });
         let at = Utc::now();
         let record = |title: Option<&str>, title_override: Option<&str>| SessionRecord {
             session: "s1".into(),
@@ -1141,16 +1114,36 @@ mod tests {
             archived: false,
             cwd: std::path::PathBuf::from("/tmp/agent"),
         };
-        let titled = record(Some("Count people"), None);
-        assert!(title_typed("Count people", &titled));
-        assert!(title_typed("  Count people ", &titled));
-        for typed in ["", "count people", "Count", "Count people!", "\n"] {
-            assert!(!title_typed(typed, &titled), "{typed:?}");
+        for (record, title) in [
+            (record(Some(" Count people "), None), "Count people"),
+            (
+                record(Some("Count people"), Some("People count")),
+                "People count",
+            ),
+            (record(None, None), "New conversation"),
+        ] {
+            let (modal, cx) = cx.add_window_view(|_, cx| {
+                DeleteConversation::new(record, WeakEntity::new_invalid(), cx)
+            });
+            modal.read_with(cx, |modal, _| {
+                assert_eq!(modal.title(), title);
+                assert!(
+                    modal.description().contains("This cannot be undone."),
+                    "{}",
+                    modal.description()
+                );
+            });
+            let dismissed = Rc::new(std::cell::Cell::new(false));
+            let _subscription = cx.update({
+                let dismissed = dismissed.clone();
+                |_, cx| cx.subscribe(&modal, move |_, _: &DismissEvent, _| dismissed.set(true))
+            });
+            modal.update_in(cx, |modal, window, cx| {
+                window.focus(&modal.focus_handle(cx), cx)
+            });
+            cx.simulate_keystrokes("enter");
+            assert!(dismissed.get(), "{title}: ↵ deletes it");
         }
-        let renamed = record(Some("Count people"), Some("People count"));
-        assert!(title_typed("People count", &renamed));
-        assert!(!title_typed("Count people", &renamed));
-        assert!(title_typed("New conversation", &record(None, None)));
     }
 
     #[test]

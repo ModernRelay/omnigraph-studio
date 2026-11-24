@@ -332,9 +332,9 @@ and Delta's sidebar.
 - A right click on a row offers Rename, Pin or Unpin, Archive or Restore, and Delete…. Rename
   edits the title in place (↩ or leaving the field keeps it, ⎋ drops it); the person's title
   wins over the agent's, and an empty one gives the agent's back. Delete… asks first, in a
-  dialog confirmed by typing the conversation's title as the list shows it, since neither Studio
-  nor the agent can bring it back (constitution IV; since 2026-10-21, before which ↵ confirmed
-  it): Studio forgets the conversation and its open tab closes, and the agent deletes it with
+  dialog named by the conversation's title as the list shows it that says this cannot be undone,
+  since neither Studio nor the agent can bring it back; ↵ or Delete confirms it (constitution
+  IV; from 2026-10-21 to 2026-11-24 the title was typed): Studio forgets the conversation and its open tab closes, and the agent deletes it with
   `session/delete` when it can (otherwise the note says why); the graph and the agent's branch
   are not touched. Filter in the title line opens a field on the rows' edge (⎋ closes it); it
   matches titles and agent names and looks through the archive too. "Import from the agent"
@@ -459,6 +459,7 @@ Effort, Fast mode and Agent; the test agent offers the same five.
 | 2026-10-20 | On Windows agents work in the local application folder | `agent_panel` `agents_work_in_the_local_folder_of_studios_roaming_data` (run on macOS) | A data folder under `%APPDATA%`, local or on a `\\server\share`, maps to the same name under `%LOCALAPPDATA%`; a data folder set elsewhere keeps its agents |
 | 2026-10-20 | Conversations follow the graph's key, and an old one resumes where it ran | `agent_panel` `conversations_filed_by_server_name_move_to_the_graphs_key` (records written as a build before wrote them, loaded with the server list `dev` → `http://127.0.0.1:8787`); `graph_store` `a_name_resolves_only_to_a_known_server`; the panel's working directory now `sessions::working_dir` (`panel.rs`, `start`), the record's own `cwd` when resuming | `dev/crm` became `http://127.0.0.1:8787/crm`, its `cwd` still `graph_cwd("dev/crm")`, and `latest` found it under the key; a new conversation gets `graph_cwd` of the key, another directory; `gone/crm`, a name no server has, stayed; the next load read the record under the key. Import lists only the key's directory, so a conversation the agent has in the old directory and the list lacks is not offered. Not yet seen in the running app |
 | 2026-10-31 | Import finds conversations in their own folders, and Restart cleans up | `agent_panel` `sessions_panel::tests::import_asks_every_conversation_folder_and_keeps_each_ones_own` (new) and `panel::tests::starting_an_unsent_conversation_again_removes_its_folder` (new). Each fails without its fix (checked) | Taken: since conversations started in folders of their own, Import still asked the agent for the graph's folder alone and kept exact matches, so it found none of them and said the list had them all; and it recorded the graph's folder, where the agent could not load the conversation. Restart of a conversation nothing was sent in claimed a new folder and left the old one, with its `AGENTS.md` and skill, on disk, where choosing another agent removed it |
+| 2026-11-24 | A conversation is deleted with ↵ (constitution 1.6.0) | `agent_panel` `a_conversation_is_deleted_with_enter_once_the_dialog_says_what_goes` (three titles; ↵ simulated in the dialog) | The headline names the title as the list shows it ("Count people" trimmed, the person's "People count" over the agent's, "New conversation"); the description says "This cannot be undone."; ↵ dismissed the dialog. `title_typed` and the field are gone |
 
 ## Corrections
 
@@ -496,4 +497,5 @@ Effort, Fast mode and Agent; the test agent offers the same five.
   Review. The card now hears the outcome, the branch is saved, and Review shows once the branch
   exists.
 - 2026-10-21 · Deleting a conversation, which cannot be undone, was confirmed with ↵. It is now
-  confirmed by typing its title.
+  confirmed by typing its title. (Reversed 2026-11-24, constitution 1.6.0: ↵ again, the dialog
+  saying it cannot be undone.)
