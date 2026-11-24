@@ -2288,11 +2288,11 @@ impl ReviewView {
         let review = cx.entity();
         let list = review.downgrade();
         ReviewRows::new(
-            &review,
             move |cx| {
                 list.update(cx, |review, cx| review.render_list(cx))
                     .unwrap_or_else(|_| gpui::Empty.into_any_element())
             },
+            move |cx| cx.observe(&review, |_, _, cx| cx.notify()),
             cx,
         )
     }
@@ -5073,15 +5073,15 @@ pub(crate) struct ReviewRows {
 
 impl ReviewRows {
     /// Made with the review, not on its first draw: the list `draw` draws, drawn again when
-    /// `review` notifies.
-    fn new<V: 'static>(
-        review: &Entity<V>,
+    /// what `follow` subscribes it to (the review's notifies) says it changed.
+    fn new(
         draw: impl Fn(&mut App) -> AnyElement + 'static,
+        follow: impl FnOnce(&mut Context<Self>) -> Subscription,
         cx: &mut App,
     ) -> Entity<Self> {
         cx.new(|cx| ReviewRows {
             draw: Box::new(draw),
-            _changed: cx.observe(review, |_, _, cx| cx.notify()),
+            _changed: follow(cx),
             #[cfg(test)]
             renders: 0,
         })
