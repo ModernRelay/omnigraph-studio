@@ -24,6 +24,8 @@ use crate::first_run::{self, Choice};
 use crate::organizations;
 use ui::prelude::*;
 
+mod planes;
+
 /// Where the keyboard is in the dialog: a server, one of the chosen server's graphs, or a field.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Place {
@@ -70,6 +72,10 @@ pub(crate) const CLOUD_OFF_LINE: &str = "Turned off in Settings.";
 /// What choosing that row says, beside the link to the setting.
 pub(crate) const CLOUD_OFF: &str = "Omnigraph Cloud is off: its address is empty.";
 
+/// Opens Settings at Omnigraph Cloud in the dialog's window: what the link beside [`CLOUD_OFF`]
+/// does. The app hands it to the dialog, which knows nothing of Settings.
+pub(crate) type OpenCloudSettings = fn(&mut Workspace, &mut Window, &mut Context<Workspace>);
+
 /// Where a line the dialog says is shown: beside what it is about (constitution VII).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Said {
@@ -89,6 +95,8 @@ pub(crate) enum Said {
 
 pub struct OpenGraphModal {
     workspace: WeakEntity<Workspace>,
+    /// What the link to Omnigraph Cloud's setting does ([`OpenCloudSettings`]).
+    open_cloud_settings: OpenCloudSettings,
     focus_handle: FocusHandle,
     /// The servers listed, as the registry last held them.
     connections: Vec<Entity<Connection>>,
@@ -98,7 +106,7 @@ pub struct OpenGraphModal {
     selected: Option<Entity<Connection>>,
     /// The control plane, and its organization, the pane shows in place of the selected
     /// server's graphs.
-    plane_shown: Option<organizations::Shown>,
+    plane_shown: Option<planes::Shown>,
     /// The row or field ↑, ↓ and Tab moved to, which ↵ runs.
     cursor: Option<Place>,
     graph_id: Entity<Editor>,
@@ -145,11 +153,7 @@ impl Focusable for OpenGraphModal {
     }
 }
 
-fn input(
-    placeholder: &str,
-    window: &mut Window,
-    cx: &mut Context<OpenGraphModal>,
-) -> Entity<Editor> {
+fn input(placeholder: &str, window: &mut Window, cx: &mut App) -> Entity<Editor> {
     cx.new(|cx| {
         let mut editor = Editor::single_line(window, cx);
         editor.set_placeholder_text(placeholder, window, cx);
@@ -160,6 +164,7 @@ fn input(
 impl OpenGraphModal {
     pub fn new(
         workspace: WeakEntity<Workspace>,
+        open_cloud_settings: OpenCloudSettings,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -186,7 +191,15 @@ impl OpenGraphModal {
                 registry.managed_targets.clone(),
             )
         };
-        let mut this = Self::build(workspace, connections, vec![observe], platform, window, cx);
+        let mut this = Self::build(
+            workspace,
+            open_cloud_settings,
+            connections,
+            vec![observe],
+            platform,
+            window,
+            cx,
+        );
         this.follow_planes(planes, managed, cx);
         this
     }
@@ -194,6 +207,7 @@ impl OpenGraphModal {
     /// A managed link with no graph opens the picker on its authenticated connection alone.
     pub(crate) fn for_connection(
         workspace: WeakEntity<Workspace>,
+        open_cloud_settings: OpenCloudSettings,
         connection: Entity<Connection>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -201,6 +215,7 @@ impl OpenGraphModal {
         let platform = ConnectionRegistry::global(cx).read(cx).platform();
         Self::build(
             workspace,
+            open_cloud_settings,
             vec![connection],
             Vec::new(),
             platform,
@@ -213,6 +228,7 @@ impl OpenGraphModal {
     /// `platform`.
     fn build(
         workspace: WeakEntity<Workspace>,
+        open_cloud_settings: OpenCloudSettings,
         connections: Vec<Entity<Connection>>,
         mut subscriptions: Vec<Subscription>,
         platform: Platform,
@@ -270,6 +286,7 @@ impl OpenGraphModal {
         let start = connections.is_empty().then_some(Start::Choices);
         let mut this = Self {
             workspace,
+            open_cloud_settings,
             focus_handle: cx.focus_handle(),
             connections: Vec::new(),
             followed: Vec::new(),
@@ -424,7 +441,7 @@ impl OpenGraphModal {
             .iter()
             .map(|connection| Place::Server(connection.entity_id()))
             .collect();
-        places.extend(organizations::nav_places(&self.planes, cx));
+        places.extend(planes::nav_places(&self.planes, cx));
         match self.start {
             Some(Start::Choices) => {
                 let no_cli = self.no_cli(cx);
@@ -442,7 +459,7 @@ impl OpenGraphModal {
             None => {}
         }
         match self.shown_plane() {
-            Some((plane, Some(organization))) => places.extend(organizations::pane_places(
+            Some((plane, Some(organization))) => places.extend(planes::pane_places(
                 &plane,
                 &organization,
                 &self.managed,
@@ -659,7 +676,7 @@ impl OpenGraphModal {
                             .iter()
                             .find(|p| p.entity_id() == id)
                             .and_then(|plane| {
-                                organizations::pane_places(plane, &organization, &self.managed, cx)
+                                planes::pane_places(plane, &organization, &self.managed, cx)
                                     .into_iter()
                                     .next()
                             });
@@ -718,15 +735,11 @@ impl OpenGraphModal {
                             .variant(ds::Variant::Ghost)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 let workspace = this.workspace.clone();
+                                let open_cloud_settings = this.open_cloud_settings;
                                 cx.emit(DismissEvent);
                                 workspace
                                     .update(cx, |workspace, cx| {
-                                        crate::open_settings_at(
-                                            workspace,
-                                            crate::settings_view::CLOUD,
-                                            window,
-                                            cx,
-                                        )
+                                        open_cloud_settings(workspace, window, cx)
                                     })
                                     .ok();
                             })),
@@ -1272,11 +1285,7 @@ impl OpenGraphModal {
                         this.show_start(Start::Choices, window, cx)
                     })),
             )
-            .children(organizations::nav(
-                &self.planes,
-                self.plane_shown.as_ref(),
-                cx,
-            ))
+            .children(self.render_planes(cx))
     }
 
     /// While Studio finds no Omnigraph CLI it can drive, a band over the pane says so, with the
@@ -1503,7 +1512,7 @@ impl OpenGraphModal {
             Some(ds::text::meta(address).truncate().into_any_element()),
             actions
                 .into_iter()
-                .map(|action| line_button(action, &selected, cx).into_any_element())
+                .map(|action| line_button(action, &selected).into_any_element())
                 .collect(),
         );
         v_flex()
@@ -1680,7 +1689,7 @@ fn cli_band(
     no_cli: &NoCli,
     checking: bool,
     registry: Entity<ConnectionRegistry>,
-    cx: &mut Context<OpenGraphModal>,
+    cx: &App,
 ) -> AnyElement {
     let title = if no_cli.unfit {
         "Studio needs a newer Omnigraph CLI"
@@ -1693,9 +1702,7 @@ fn cli_band(
         .tip(studio_ui::ds::tooltip(
             "Looks for the Omnigraph CLI again and lists its targets",
         ))
-        .on_click(cx.listener(move |_, _, _, cx| {
-            registry.update(cx, |registry, cx| registry.check_cli_again(cx))
-        }));
+        .on_click(move |_, _, cx| registry.update(cx, |registry, cx| registry.check_cli_again(cx)));
     studio_ui::ds::callout(ui::Severity::Warning, title)
         .description_slot(
             v_flex()
@@ -1834,61 +1841,55 @@ fn actions_for(
 }
 
 /// The button for `action` on the chosen server's line.
-fn line_button(
-    action: LineAction,
-    selected: &Entity<Connection>,
-    cx: &mut Context<OpenGraphModal>,
-) -> ds::Button {
+fn line_button(action: LineAction, selected: &Entity<Connection>) -> ds::Button {
     let selected = selected.clone();
     match action {
         LineAction::CancelSignIn => studio_ui::ds::button("cancel-sign-in", "Cancel")
             .style(ButtonStyle::Subtle)
-            .on_click(cx.listener(move |_, _, _, cx| {
+            .on_click(move |_, _, cx| {
                 selected.update(cx, |c, cx| c.cancel_sign_in(cx));
-            })),
+            }),
         LineAction::SignIn { service } => studio_ui::ds::button("sign-in", "Sign in")
             .style(ButtonStyle::Filled)
             .tip(studio_ui::ds::tooltip(format!(
                 "Opens {service} in your browser to sign in to this server."
             )))
-            .on_click(cx.listener(move |_, _, _, cx| selected.update(cx, |c, cx| c.sign_in(cx)))),
+            .on_click(move |_, _, cx| selected.update(cx, |c, cx| c.sign_in(cx))),
         LineAction::SignInAsSomeoneElse => {
             studio_ui::ds::button("sign-in-again", "Sign in as someone else")
                 .style(ButtonStyle::Subtle)
-                .on_click(
-                    cx.listener(move |_, _, _, cx| selected.update(cx, |c, cx| c.sign_in(cx))),
-                )
+                .on_click(move |_, _, cx| selected.update(cx, |c, cx| c.sign_in(cx)))
         }
-        LineAction::SignOut => sign_out_button(&selected, cx),
-        LineAction::Cancel => cancel_button(&selected, cx),
-        LineAction::Retry => retry_button(&selected, cx),
+        LineAction::SignOut => sign_out_button(&selected),
+        LineAction::Cancel => cancel_button(&selected),
+        LineAction::Retry => retry_button(&selected),
     }
 }
 
 /// Signs out of the chosen server (spec 016).
-fn sign_out_button(selected: &Entity<Connection>, cx: &mut Context<OpenGraphModal>) -> ds::Button {
+fn sign_out_button(selected: &Entity<Connection>) -> ds::Button {
     let selected = selected.clone();
     studio_ui::ds::button("sign-out", "Sign out")
         .style(ButtonStyle::Subtle)
         .tip(studio_ui::ds::tooltip(
             "Forgets this sign-in, and asks the sign-in service to end it where it can.",
         ))
-        .on_click(cx.listener(move |_, _, _, cx| selected.update(cx, |c, cx| c.sign_out(cx))))
+        .on_click(move |_, _, cx| selected.update(cx, |c, cx| c.sign_out(cx)))
 }
 
-fn cancel_button(selected: &Entity<Connection>, cx: &mut Context<OpenGraphModal>) -> ds::Button {
+fn cancel_button(selected: &Entity<Connection>) -> ds::Button {
     let selected = selected.clone();
     studio_ui::ds::button("cancel-connect", "Cancel")
         .style(ButtonStyle::Subtle)
-        .on_click(cx.listener(move |_, _, _, cx| selected.update(cx, |c, cx| c.cancel(cx))))
+        .on_click(move |_, _, cx| selected.update(cx, |c, cx| c.cancel(cx)))
 }
 
-fn retry_button(selected: &Entity<Connection>, cx: &mut Context<OpenGraphModal>) -> ds::Button {
+fn retry_button(selected: &Entity<Connection>) -> ds::Button {
     let selected = selected.clone();
     studio_ui::ds::button("retry-connect", "Retry")
         .style(ButtonStyle::Subtle)
         .start_icon(Icon::new(IconName::RotateCw))
-        .on_click(cx.listener(move |_, _, _, cx| selected.update(cx, |c, cx| c.connect(cx))))
+        .on_click(move |_, _, cx| selected.update(cx, |c, cx| c.connect(cx)))
 }
 
 /// What the chosen server's line says of its state. A 401 says what it was an answer to: no
@@ -2169,7 +2170,7 @@ fn source_label(source: &ServerSource, profile: Option<&str>) -> String {
 
 /// A pane's head: what it shows, named, a line under the name, and its actions on the right;
 /// on its rows' text's edge.
-pub(crate) fn pane_head(
+fn pane_head(
     title: impl Into<SharedString>,
     detail: Option<AnyElement>,
     actions: Vec<AnyElement>,
@@ -2190,7 +2191,7 @@ pub(crate) fn pane_head(
 }
 
 /// A pane's name, over its rows and on their text's edge.
-pub(crate) fn pane_label(title: &'static str) -> Div {
+fn pane_label(title: &'static str) -> Div {
     div()
         .px(px(space::MD))
         .pb(px(space::XS))
@@ -2214,13 +2215,9 @@ impl Render for OpenGraphModal {
             (true, _) => self.render_add(cx).into_any_element(),
             (false, _) if self.start == Some(Start::Choices) => self.render_start(cx),
             (false, _) if self.start == Some(Start::Local) => self.render_local(cx),
-            (false, Some((plane, organization))) => organizations::pane(
-                &plane,
-                organization.as_deref(),
-                &self.managed,
-                self.cursor.as_ref(),
-                cx,
-            ),
+            (false, Some((plane, organization))) => {
+                self.render_plane(&plane, organization.as_deref(), cx)
+            }
             (false, None) => self.render_graphs(cx).into_any_element(),
         };
         ds::modal(cx)
@@ -2349,6 +2346,7 @@ mod tests {
         let (modal, cx) = cx.add_window_view(|window, cx| {
             OpenGraphModal::build(
                 WeakEntity::new_invalid(),
+                |_, _, _| {},
                 connections,
                 Vec::new(),
                 platform,

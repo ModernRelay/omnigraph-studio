@@ -9,13 +9,9 @@ use ui::prelude::*;
 
 pub use studio_theme::TypeTints;
 
-mod button;
-mod cell_text;
 mod changes;
 pub mod ds;
 mod grid_places;
-pub mod menu;
-mod modal;
 pub mod motion;
 pub mod node_names;
 mod overlay_slot;
@@ -23,15 +19,15 @@ mod resize;
 pub mod rows;
 mod tags;
 pub mod text;
-mod tooltip;
 mod values;
 pub mod window_buttons;
 
-pub use cell_text::{CellText, cell_text, shown_part};
 pub use changes::{
     ChangeKind, PropertyRow, RelationshipLine, TextFolds, change_counts, changed_value,
     property_body, property_row,
 };
+pub use ds::cell_text::{CellText, cell_text, shown_part};
+pub use ds::menu;
 pub use grid_places::{GridPlace, columns_in_view, grid_places, scrolled_within};
 pub use overlay_slot::{OverlaySlot, OverlaySlotElement};
 pub use resize::{

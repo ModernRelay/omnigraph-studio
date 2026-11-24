@@ -11,7 +11,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use gpui::SharedString;
+use gpui::{Context, SharedString, Task};
+use graph_client::ReadError;
 
 /// How many events the ledger keeps while keeping them; the oldest go first.
 pub const EVENTS: usize = 4096;
@@ -231,6 +232,19 @@ impl Sending {
             took: now.saturating_duration_since(self.started),
         }
     }
+}
+
+/// What sends a read, counted while it runs and recorded in the ledger as `asker` asked for it:
+/// the session. A read plan that goes on after the session method that started it returned, as
+/// a node's history reads its window (spec 046), sends its reads through this.
+pub(crate) trait SendsReads: Sized + 'static {
+    fn counted_read_by<T: Send + 'static>(
+        &mut self,
+        what: &'static str,
+        asker: Asker,
+        request: impl Future<Output = Result<T, ReadError>> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<T, ReadError>>;
 }
 
 #[cfg(test)]

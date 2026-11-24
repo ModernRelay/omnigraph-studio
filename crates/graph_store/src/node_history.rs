@@ -33,10 +33,10 @@ use graph_client::api::{ChangeImageOutput, EntityKind, QueryRequest};
 use graph_client::{BlobAt, BlobCell, BlobMeta, GraphClient, HistoricalGap, ReadError};
 use serde_json::{Map, Value};
 
-use crate::GraphSession;
 use crate::changes::{FoldedChange, NetChange};
-use crate::ledger::Asker;
+use crate::ledger::{Asker, SendsReads};
 use crate::scope::ReadScope;
+use crate::{GraphSession, LastChange};
 
 /// First-parent commits an older window of a node's history covers ("Read the 200 commits
 /// before").
@@ -552,18 +552,6 @@ pub fn net_of(run: &[NodeHistoryEntry]) -> (Option<FoldedChange>, Vec<FoldedChan
     (node, edges)
 }
 
-/// The node's last change, as the session keeps it once its history was read (spec 046): a
-/// node's page shows it in its meta line, and reads nothing for it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LastChange {
-    /// The head the history was read at: the page shows the line only when it shows that commit.
-    pub head: String,
-    pub commit: String,
-    pub actor: Option<String>,
-    /// Unix microseconds.
-    pub at: i64,
-}
-
 /// What the search past the windows found of the node's creation.
 #[derive(Debug, Clone, Default)]
 pub struct SearchFound {
@@ -587,8 +575,8 @@ pub fn settled(lo: usize, len: usize, reached_first: bool) -> Option<usize> {
 }
 
 /// Who asks, through which client, of which graph and branch: what each read of a window needs.
-struct Reader {
-    session: WeakEntity<GraphSession>,
+struct Reader<S: SendsReads> {
+    session: WeakEntity<S>,
     asker: Asker,
     client: GraphClient,
     graph: String,
@@ -613,7 +601,7 @@ enum Answer {
     Blob(usize, BlobState),
 }
 
-impl Reader {
+impl<S: SendsReads> Reader<S> {
     /// Starts `request` through the session, counted and named in its ledger as `what`.
     fn start<T: Send + 'static>(
         &mut self,
@@ -849,7 +837,7 @@ impl GraphSession {
         branch: &str,
         node: NodeScope,
         cx: &mut Context<Self>,
-    ) -> Option<Reader> {
+    ) -> Option<Reader<Self>> {
         Some(Reader {
             session: cx.entity().downgrade(),
             asker: self.asker_of(scope),

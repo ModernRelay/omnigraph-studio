@@ -23,6 +23,12 @@ pub(crate) const COUNTS_AFTER: Duration = Duration::from_millis(120);
 #[cfg(test)]
 pub(crate) type Counts = (usize, usize, usize);
 
+/// Whether `commit` is the graph's first: it has no parent, so it has no changes the server can
+/// tell (it refuses them with a 409, `parentless_commit`), and none are asked for.
+pub(crate) fn is_first_commit(commit: &CommitOutput) -> bool {
+    commit.parent_commit_id.is_none() && commit.merged_parent_commit_id.is_none()
+}
+
 /// What a view has learnt of a listed commit's changes (spec 033): its counts as every list of
 /// commits says them, and the same by type, node types first, for the inspector.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,7 +170,7 @@ impl RowCounts {
     /// the server refused for good says why; one counted says its counts. None while it is
     /// not read.
     pub(crate) fn learnt(&self, commit: &CommitOutput) -> Option<Learnt> {
-        if crate::commit_view::is_first_commit(commit) {
+        if is_first_commit(commit) {
             return Some(Learnt::said(CommitCounts::First));
         }
         self.learnt.get(&commit.graph_commit_id).cloned()
@@ -197,7 +203,7 @@ impl RowCounts {
         // asked for.
         let wanted: Vec<String> = drawn
             .into_iter()
-            .filter(|commit| !crate::commit_view::is_first_commit(commit))
+            .filter(|commit| !is_first_commit(commit))
             .map(|commit| commit.graph_commit_id.clone())
             .collect();
         let session = session.clone();

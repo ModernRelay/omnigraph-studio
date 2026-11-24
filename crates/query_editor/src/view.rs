@@ -662,7 +662,7 @@ pub struct QueryEditor {
     /// the cursor moves into another one's place, not at every key.
     fix_shown: Option<usize>,
     /// The problems list as a view of its own, drawn again only when what it shows changes.
-    problems: Entity<QueryProblems>,
+    problems: Entity<Part>,
     /// Where the server's diagnostic shown points in the text, followed through later edits.
     diagnostic_at: Option<Anchor>,
     /// The server's suggested edits for that diagnostic, anchored in the text as it was run,
@@ -730,80 +730,47 @@ pub struct QueryEditor {
     view_values: Map<String, Value>,
     /// The result area as a view of its own, drawn again only when what it shows changes
     /// ([`Self::redraw_results`]).
-    results: Entity<QueryResults>,
+    results: Entity<Part>,
     _subscriptions: Vec<Subscription>,
 }
 
-/// The tab's result area, drawn as a view of its own, so a keystroke in the query or a check
-/// of it draws the toolbar and the text again but leaves the rows as they were
-/// (`docs/drawing.md`). The tab tells it when what it shows changed; it does not follow every
-/// notify of the tab.
-struct QueryResults {
-    query: WeakEntity<QueryEditor>,
-    /// How often the results were drawn, for the test that typing leaves them alone.
+/// What draws a [`Part`]: the tab's function for it.
+type Draw = Box<dyn Fn(&mut Window, &mut App) -> AnyElement>;
+
+/// A part of the tab drawn as a view of its own, so a keystroke in the query or a check of it
+/// draws the toolbar and the text again but leaves the part as it was (`docs/drawing.md`). The
+/// tab tells it when what it shows changed; it does not follow every notify of the tab. It draws
+/// what the tab's function for it returns and knows nothing else of the tab: the result area
+/// ([`QueryEditor::render_results`]) and the problems list
+/// ([`QueryEditor::render_problems`]), whose rows are a virtualized list.
+struct Part {
+    draw: Draw,
+    /// How often the part was drawn, for the tests that typing leaves it alone.
     #[cfg(test)]
     renders: usize,
 }
 
-impl QueryResults {
+impl Part {
     /// Made with the tab, not on its first draw (`docs/drawing.md`).
-    fn new(cx: &mut Context<QueryEditor>) -> Entity<Self> {
-        let query = cx.entity().downgrade();
-        cx.new(|_| QueryResults {
-            query,
+    fn new(
+        cx: &mut App,
+        draw: impl Fn(&mut Window, &mut App) -> AnyElement + 'static,
+    ) -> Entity<Self> {
+        cx.new(|_| Part {
+            draw: Box::new(draw),
             #[cfg(test)]
             renders: 0,
         })
     }
 }
 
-impl Render for QueryResults {
+impl Render for Part {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         #[cfg(test)]
         {
             self.renders += 1;
         }
-        let results = self
-            .query
-            .update(cx, |query, cx| query.render_results(window, cx))
-            .unwrap_or_else(|_| gpui::Empty.into_any_element());
-        v_flex().size_full().child(results)
-    }
-}
-
-/// The problems list under the query, drawn as a view of its own, as the result area is: the
-/// tab draws again at every key, the list only when its problems, the one gone to or the one
-/// ⌘. fixes change ([`QueryEditor::redraw_problems`]). Its rows are a virtualized list.
-struct QueryProblems {
-    query: WeakEntity<QueryEditor>,
-    /// How often the list was drawn, for the test that typing leaves it alone.
-    #[cfg(test)]
-    renders: usize,
-}
-
-impl QueryProblems {
-    /// Made with the tab, not on its first draw (`docs/drawing.md`).
-    fn new(cx: &mut Context<QueryEditor>) -> Entity<Self> {
-        let query = cx.entity().downgrade();
-        cx.new(|_| QueryProblems {
-            query,
-            #[cfg(test)]
-            renders: 0,
-        })
-    }
-}
-
-impl Render for QueryProblems {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        #[cfg(test)]
-        {
-            self.renders += 1;
-        }
-        self.query
-            .update(cx, |query, cx| query.render_problems(cx))
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| gpui::Empty.into_any_element())
+        (self.draw)(window, cx)
     }
 }
 
@@ -819,7 +786,7 @@ impl Focusable for QueryEditor {
 }
 
 impl Item for QueryEditor {
-    /// The result area is drawn cached on its own (`QueryResults`).
+    /// The result area is drawn cached on its own (`Part`).
     fn caches_its_parts(&self) -> bool {
         true
     }
@@ -1162,6 +1129,7 @@ impl QueryEditor {
                 }
             }),
         ];
+        let (problems_of, results_of) = (cx.entity().downgrade(), cx.entity().downgrade());
         let mut this = Self {
             number,
             session,
@@ -1190,7 +1158,13 @@ impl QueryEditor {
             selected_problem: None,
             problems_scroll: UniformListScrollHandle::new(),
             fix_shown: None,
-            problems: QueryProblems::new(cx),
+            problems: Part::new(cx, move |_, cx| {
+                problems_of
+                    .update(cx, |query, cx| query.render_problems(cx))
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| gpui::Empty.into_any_element())
+            }),
             diagnostic_at: None,
             diagnostic_edits: Vec::new(),
             server_fix_holds: false,
@@ -1221,7 +1195,12 @@ impl QueryEditor {
             stored,
             file_view: None,
             view_values: Map::new(),
-            results: QueryResults::new(cx),
+            results: Part::new(cx, move |window, cx| {
+                let results = results_of
+                    .update(cx, |query, cx| query.render_results(window, cx))
+                    .unwrap_or_else(|_| gpui::Empty.into_any_element());
+                v_flex().size_full().child(results).into_any_element()
+            }),
             _subscriptions: subscriptions,
         };
         this.parse_as_gq(cx);
@@ -2045,7 +2024,7 @@ impl QueryEditor {
     }
 
     /// Draws the result area again: what it shows changed. A notify of the tab alone leaves it
-    /// as it was (`QueryResults`).
+    /// as it was (`Part`).
     fn redraw_results(&self, cx: &mut Context<Self>) {
         self.results.update(cx, |_, cx| cx.notify());
     }
@@ -2241,7 +2220,17 @@ impl QueryEditor {
                         style: BlockStyle::Flex,
                         priority: 0,
                         render: std::sync::Arc::new(move |block: &mut BlockContext| {
-                            run_line(&this, &name, index, block)
+                            let note = this.upgrade().and_then(|editor| {
+                                editor.read(block.app).last_runs.get(&name).cloned()
+                            });
+                            let editor = this.clone();
+                            run_line(note, index, block, move |window, cx| {
+                                editor
+                                    .update(cx, |editor, cx| {
+                                        editor.run_declaration(index, window, cx)
+                                    })
+                                    .ok();
+                            })
                         }),
                     }
                 })
@@ -2453,8 +2442,18 @@ impl QueryEditor {
         }
     }
 
+    /// What a view saved from this tab does: the tab becomes it.
+    fn becoming_view(&self, cx: &mut Context<Self>) -> impl Fn(String, &mut App) + 'static {
+        let editor = cx.entity().downgrade();
+        move |id, cx| {
+            editor
+                .update(cx, |editor, cx| editor.become_view(id, cx))
+                .ok();
+        }
+    }
+
     /// The tab becomes the saved view `id`: one just saved from it.
-    pub(crate) fn become_view(&mut self, id: String, cx: &mut Context<Self>) {
+    fn become_view(&mut self, id: String, cx: &mut Context<Self>) {
         if let Some(stored) = &mut self.stored {
             stored.view = Some(id);
             stored.view_changed = false;
@@ -2537,10 +2536,10 @@ impl QueryEditor {
             return;
         };
         let graph = self.session.read(cx).overrides_key();
-        let editor = cx.entity().downgrade();
+        let become_view = self.becoming_view(cx);
         workspace.update(cx, |workspace, cx| {
             workspace.toggle_modal(window, cx, |window, cx| {
-                crate::name_view::NameViewModal::new(graph, query, editor, window, cx)
+                crate::name_view::NameViewModal::new(graph, query, become_view, window, cx)
             });
         });
     }
@@ -2570,10 +2569,10 @@ impl QueryEditor {
         };
         let query = self.file_query(&name, cx);
         let graph = self.session.read(cx).overrides_key();
-        let editor = cx.entity().downgrade();
+        let become_view = self.becoming_view(cx);
         workspace.update(cx, |workspace, cx| {
             workspace.toggle_modal(window, cx, |window, cx| {
-                crate::name_view::NameViewModal::new(graph, query, editor, window, cx)
+                crate::name_view::NameViewModal::new(graph, query, become_view, window, cx)
             });
         });
     }
@@ -4307,7 +4306,7 @@ impl QueryEditor {
         })
     }
 
-    /// The problems list, drawn by its own view ([`QueryProblems`]). It reads only what the tab
+    /// The problems list, drawn by its own view ([`Part`]). It reads only what the tab
     /// holds (the check, the problem gone to, the one ⌘. fixes), never the editor, so a key in
     /// the query leaves it as it was.
     fn render_problems(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -5562,7 +5561,7 @@ fn param_input(
     placeholder: &str,
     text: Option<String>,
     window: &mut Window,
-    cx: &mut Context<QueryEditor>,
+    cx: &mut App,
 ) -> Entity<Editor> {
     cx.new(|cx| {
         let mut editor = Editor::single_line(window, cx);
@@ -5674,17 +5673,13 @@ struct RunNote {
     failed: bool,
 }
 
-/// The line above a declaration: Run, and how its last run went.
+/// The line above a declaration: Run, which calls `run`, and how its last run went.
 fn run_line(
-    editor: &gpui::WeakEntity<QueryEditor>,
-    name: &str,
+    note: Option<RunNote>,
     index: usize,
     block: &mut BlockContext,
+    run: impl Fn(&mut Window, &mut App) + 'static,
 ) -> AnyElement {
-    let note = editor
-        .upgrade()
-        .and_then(|editor| editor.read(block.app).last_runs.get(name).cloned());
-    let editor = editor.clone();
     h_flex()
         .id(("run-line", index))
         .w_full()
@@ -5696,11 +5691,7 @@ fn run_line(
                 .style(ButtonStyle::Transparent)
                 .color(Color::Muted)
                 .start_icon(Icon::new(IconName::PlayFilled))
-                .on_click(move |_, window, cx| {
-                    editor
-                        .update(cx, |editor, cx| editor.run_declaration(index, window, cx))
-                        .ok();
-                }),
+                .on_click(move |_, window, cx| run(window, cx)),
         )
         .children(note.map(|note| {
             studio_ui::ds::text::meta(note.text).color(if note.failed {

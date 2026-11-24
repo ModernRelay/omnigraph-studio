@@ -62,10 +62,10 @@ ROOT = Path(__file__).resolve().parent.parent
 # The design system, where tokens are defined from the theme and from numbers.
 SYSTEM = {
     "crates/studio_ui/src/ds.rs",
-    "crates/studio_ui/src/button.rs",
-    "crates/studio_ui/src/tooltip.rs",
-    "crates/studio_ui/src/modal.rs",
-    "crates/studio_ui/src/menu.rs",
+    "crates/studio_ui/src/ds/button.rs",
+    "crates/studio_ui/src/ds/tooltip.rs",
+    "crates/studio_ui/src/ds/modal.rs",
+    "crates/studio_ui/src/ds/menu.rs",
     "crates/studio_ui/src/window_buttons.rs",
 }
 # Crates that are not views: the theme itself, and those that draw nothing.

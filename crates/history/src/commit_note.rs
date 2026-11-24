@@ -11,8 +11,8 @@ use studio_ui::ds::{self, Tipped as _, size, space};
 use studio_ui::{now_micros, relative_time, short_commit_id, utc_date_time};
 use ui::prelude::*;
 
-use crate::commit_view::{branch_fact, is_first_commit};
-use crate::counts::Learnt;
+use crate::commit_view::branch_fact;
+use crate::counts::{Learnt, is_first_commit};
 
 /// A fact this short sits in a value box as a property's value does; a longer one (a held
 /// commit's place) is read as text.

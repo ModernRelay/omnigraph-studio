@@ -53,6 +53,7 @@ use studio_ui::window_buttons::{self, WindowButtons};
 use ui::prelude::*;
 use ui::{ButtonLike, PopoverMenu, right_click_menu};
 
+use confirm::{Closing, ConfirmClose};
 pub use confirm::{Confirm, confirm, confirm_expand};
 pub use item::{
     Inspected, InspectedNode, Item, ItemEvent, ItemHandle, ItemStatus, KeyHint, NodeInspector,
@@ -65,7 +66,7 @@ pub use panels::PanelPosition;
 use panels::{Dock, PanelEntry};
 pub use persistence::{
     SavedGraph, SavedItem, SavedPane, SavedSession, SavedWindow, SavedWorkspace,
-    keep_saved_windows, load_windows, register_item_kind, saved_window_bounds,
+    keep_saved_windows, load_windows, saved_window_bounds,
 };
 pub use sign_in_prompt::sign_in_prompt;
 
@@ -293,6 +294,32 @@ type ActionCondition = Rc<dyn Fn(&Workspace, &App) -> bool>;
 
 /// Puts a registered action's handler on the window's root.
 type ActionHandler = Rc<dyn Fn(Div, &mut Window, &mut Context<Workspace>) -> Div>;
+
+/// Opens a remembered tab of one kind.
+pub type OpenSavedItem =
+    fn(&serde_json::Value, &mut Workspace, &mut Window, &mut Context<Workspace>);
+
+/// The kinds of tab that come back after a restart, each with how to open it, as feature
+/// crates registered them.
+#[derive(Default)]
+struct ItemKinds(HashMap<String, OpenSavedItem>);
+
+impl gpui::Global for ItemKinds {}
+
+impl ItemKinds {
+    /// How to open a remembered tab of `kind`, if a feature registered it.
+    fn opener(cx: &App, kind: &str) -> Option<OpenSavedItem> {
+        cx.try_global::<ItemKinds>()
+            .and_then(|kinds| kinds.0.get(kind).copied())
+    }
+}
+
+/// Lets tabs of `kind` come back after a restart.
+pub fn register_item_kind(cx: &mut App, kind: &str, open: OpenSavedItem) {
+    cx.default_global::<ItemKinds>()
+        .0
+        .insert(kind.to_owned(), open);
+}
 
 /// A graph open in this window but not shown (spec 002: several graph sessions as tabs): its
 /// tabs, splits and back/forward trail wait here until it is shown again.
@@ -1090,7 +1117,7 @@ impl Workspace {
                 // pane holds, which makes that pane the active one.
                 self.active_pane = id;
                 let before = self.pane(id).map_or(0, |pane| pane.items.len());
-                if let Some(open) = persistence::opener(cx, &item.kind) {
+                if let Some(open) = ItemKinds::opener(cx, &item.kind) {
                     open(&item.data, self, window, cx);
                 }
                 let now = self.pane(id).map_or(0, |pane| pane.items.len());
@@ -1442,14 +1469,16 @@ impl Workspace {
             .collect()
     }
 
-    /// Asks before `closing` drops the unsaved work of the tabs named. A close asked while
-    /// another waits for its answer asks the wider of the two (Quit over the window, the
-    /// window over the graph, the graph over a tab): ⌘Q over a tab's question asks about
-    /// quitting, where ⌘W over the window's question leaves it.
+    /// Asks before `closing` drops the unsaved work of the tabs named, and runs `close` on
+    /// this workspace if the person closes anyway. A close asked while another waits for its
+    /// answer asks the wider of the two (Quit over the window, the window over the graph, the
+    /// graph over a tab): ⌘Q over a tab's question asks about quitting, where ⌘W over the
+    /// window's question leaves it.
     fn confirm_close(
         &mut self,
         closing: Closing,
         unsaved: Vec<SharedString>,
+        close: impl Fn(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1457,17 +1486,27 @@ impl Workspace {
             .modal
             .as_ref()
             .and_then(|modal| modal.view.clone().downcast::<ConfirmClose>().ok())
-            .map(|dialog| dialog.read(cx).closing);
+            .map(|dialog| dialog.read(cx).closing());
         if asked.is_some_and(|asked| asked.reach() > closing.reach()) {
             return;
         }
         let workspace = cx.entity().downgrade();
-        self.show_modal(window, cx, move |_, cx| ConfirmClose {
-            workspace,
-            closing,
-            unsaved,
-            focus_handle: cx.focus_handle(),
+        let on_close = Box::new(move |window: &mut Window, cx: &mut App| {
+            workspace
+                .update(cx, |workspace, cx| close(workspace, window, cx))
+                .ok();
         });
+        self.show_modal(window, cx, move |_, cx| {
+            ConfirmClose::new(closing, unsaved, on_close, cx)
+        });
+    }
+
+    /// The focus had been the closed tab's or graph's: the tab shown next takes it, not a
+    /// handle of the closed one the modal would hand it back to.
+    fn forget_modal_focus(&mut self) {
+        if let Some(modal) = &mut self.modal {
+            modal.previous_focus = None;
+        }
     }
 
     /// A graph of this window, shown or parked, with a write still running: closing the window
@@ -1508,7 +1547,11 @@ impl Workspace {
             .map(|item| item.tab_title(cx))
             .collect();
         if ask && !unsaved.is_empty() {
-            self.confirm_close(Closing::Graph, unsaved, window, cx);
+            let close = |workspace: &mut Workspace, window: &mut Window, cx: &mut Context<_>| {
+                workspace.forget_modal_focus();
+                workspace.close_graph_asking(false, window, cx);
+            };
+            self.confirm_close(Closing::Graph, unsaved, close, window, cx);
             return;
         }
         let id = session.entity_id();
@@ -2043,9 +2086,15 @@ impl Workspace {
             self.force_close(pane, index, window, cx);
             return;
         }
-        let closing = Closing::Tab(item.item_id());
+        let item_id = item.item_id();
         let title = item.tab_title(cx);
-        self.confirm_close(closing, vec![title], window, cx);
+        let close = move |workspace: &mut Workspace, window: &mut Window, cx: &mut Context<_>| {
+            if let Some((pane, index)) = workspace.find_item(item_id) {
+                workspace.forget_modal_focus();
+                workspace.force_close(pane, index, window, cx);
+            }
+        };
+        self.confirm_close(Closing::Tab, vec![title], close, window, cx);
     }
 
     /// Closes the tabs with these ids that have nothing unsaved; the others stay open, with
@@ -2151,7 +2200,7 @@ impl Workspace {
         let copy = self.active_item().and_then(|item| item.serialize(cx));
         self.active_pane = new;
         if let Some(copy) = copy
-            && let Some(open) = persistence::opener(cx, &copy.kind)
+            && let Some(open) = ItemKinds::opener(cx, &copy.kind)
         {
             self.dedupe_across_panes = false;
             open(&copy.data, self, window, cx);
@@ -3201,7 +3250,25 @@ impl Workspace {
             None => {
                 let unsaved = self.unsaved_tabs(cx);
                 if !unsaved.is_empty() {
-                    self.confirm_close(Closing::Window, unsaved, window, cx);
+                    let close = |workspace: &mut Workspace,
+                                 window: &mut Window,
+                                 cx: &mut Context<_>| {
+                        match workspace.running_write(cx) {
+                        // Asked again for a write started since; the unsaved tabs were.
+                        Some(graph) => workspace.show_toast(
+                            ToastKind::Error,
+                            format!(
+                                "A write to {graph} is still running. Close the window when it finishes."
+                            ),
+                            cx,
+                        ),
+                        None => {
+                            workspace.flush_saves(cx);
+                            window.remove_window();
+                        }
+                    }
+                    };
+                    self.confirm_close(Closing::Window, unsaved, close, window, cx);
                     return false;
                 }
                 // Closing drops the save waiting for its delay: written now, in turn on the
@@ -4292,7 +4359,7 @@ impl Workspace {
                     .menu(move |window, cx| {
                         let (workspace, focus) = (workspace.clone(), focus.clone());
                         ContextMenu::build(window, cx, move |menu, _, cx| {
-                            tab_menu(menu.context(focus), workspace, item_id, cx)
+                            Workspace::tab_menu(menu.context(focus), workspace, item_id, cx)
                         })
                     })
             }))
@@ -6120,110 +6187,112 @@ fn resized(flexes: &[f32], boundary: usize, fraction: f32) -> Option<Vec<f32>> {
     Some(next)
 }
 
-/// A tab's right-click menu, after Zed's: close variants, pin, then splits. Each entry names the
-/// action its key runs, for the hint, and acts on the clicked tab; a close variant with nothing
-/// to close is disabled.
-fn tab_menu(
-    menu: ContextMenu,
-    workspace: WeakEntity<Workspace>,
-    item: EntityId,
-    cx: &App,
-) -> ContextMenu {
-    let targets = workspace
-        .upgrade()
-        .and_then(|workspace| {
-            let workspace = workspace.read(cx);
-            let (pane, index) = workspace.find_item(item)?;
-            let pane = workspace.pane(pane)?;
-            Some(TabTargets {
-                pinned: pane.is_pinned(index),
-                others: !pane.others(index).is_empty(),
-                right: !pane.to_the_right(index).is_empty(),
-                all: !pane.all_unpinned().is_empty(),
-            })
-        })
-        .unwrap_or_default();
-    let on = |f: fn(&mut Workspace, PaneId, usize, &mut Window, &mut Context<Workspace>)| {
-        let workspace = workspace.clone();
-        move |window: &mut Window, cx: &mut App| {
-            workspace
-                .update(cx, |workspace, cx| {
-                    if let Some((pane, index)) = workspace.find_item(item) {
-                        f(workspace, pane, index, window, cx);
-                    }
+impl Workspace {
+    /// A tab's right-click menu, after Zed's: close variants, pin, then splits. Each entry names the
+    /// action its key runs, for the hint, and acts on the clicked tab; a close variant with nothing
+    /// to close is disabled.
+    fn tab_menu(
+        menu: ContextMenu,
+        workspace: WeakEntity<Workspace>,
+        item: EntityId,
+        cx: &App,
+    ) -> ContextMenu {
+        let targets = workspace
+            .upgrade()
+            .and_then(|workspace| {
+                let workspace = workspace.read(cx);
+                let (pane, index) = workspace.find_item(item)?;
+                let pane = workspace.pane(pane)?;
+                Some(TabTargets {
+                    pinned: pane.is_pinned(index),
+                    others: !pane.others(index).is_empty(),
+                    right: !pane.to_the_right(index).is_empty(),
+                    all: !pane.all_unpinned().is_empty(),
                 })
-                .ok();
-        }
-    };
-    let entry = |label: &'static str, action: Option<Box<dyn Action>>, enabled: bool| {
-        let entry = ContextMenuEntry::new(label).disabled(!enabled);
-        match action {
-            Some(action) => entry.action(action),
-            None => entry,
-        }
-    };
-    menu.item(ContextMenuItem::Entry(
-        entry("Close", Some(Box::new(CloseActiveItem)), true).handler(on(
-            |w, pane, index, window, cx| w.close_in(pane, index, window, cx),
-        )),
-    ))
-    .item(ContextMenuItem::Entry(
-        entry(
-            "Close Others",
-            Some(Box::new(CloseOtherItems)),
-            targets.others,
+            })
+            .unwrap_or_default();
+        let on = |f: fn(&mut Workspace, PaneId, usize, &mut Window, &mut Context<Workspace>)| {
+            let workspace = workspace.clone();
+            move |window: &mut Window, cx: &mut App| {
+                workspace
+                    .update(cx, |workspace, cx| {
+                        if let Some((pane, index)) = workspace.find_item(item) {
+                            f(workspace, pane, index, window, cx);
+                        }
+                    })
+                    .ok();
+            }
+        };
+        let entry = |label: &'static str, action: Option<Box<dyn Action>>, enabled: bool| {
+            let entry = ContextMenuEntry::new(label).disabled(!enabled);
+            match action {
+                Some(action) => entry.action(action),
+                None => entry,
+            }
+        };
+        menu.item(ContextMenuItem::Entry(
+            entry("Close", Some(Box::new(CloseActiveItem)), true).handler(on(
+                |w, pane, index, window, cx| w.close_in(pane, index, window, cx),
+            )),
+        ))
+        .item(ContextMenuItem::Entry(
+            entry(
+                "Close Others",
+                Some(Box::new(CloseOtherItems)),
+                targets.others,
+            )
+            .handler(on(|w, pane, index, window, cx| {
+                let ids = w.pane(pane).map(|p| p.others(index)).unwrap_or_default();
+                w.close_clean(ids, window, cx);
+            })),
+        ))
+        .item(ContextMenuItem::Entry(
+            entry("Close to the Right", None, targets.right).handler(on(
+                |w, pane, index, window, cx| {
+                    let ids = w
+                        .pane(pane)
+                        .map(|p| p.to_the_right(index))
+                        .unwrap_or_default();
+                    w.close_clean(ids, window, cx);
+                },
+            )),
+        ))
+        .item(ContextMenuItem::Entry(
+            entry("Close All", Some(Box::new(CloseAllItems)), targets.all).handler(on(
+                |w, pane, _, window, cx| {
+                    let ids = w.pane(pane).map(|p| p.all_unpinned()).unwrap_or_default();
+                    w.close_clean(ids, window, cx);
+                },
+            )),
+        ))
+        .separator()
+        .entry(
+            if targets.pinned {
+                "Unpin Tab"
+            } else {
+                "Pin Tab"
+            },
+            Some(Box::new(TogglePinTab)),
+            on(|w, pane, index, _, cx| w.toggle_pin(pane, index, cx)),
         )
-        .handler(on(|w, pane, index, window, cx| {
-            let ids = w.pane(pane).map(|p| p.others(index)).unwrap_or_default();
-            w.close_clean(ids, window, cx);
-        })),
-    ))
-    .item(ContextMenuItem::Entry(
-        entry("Close to the Right", None, targets.right).handler(on(
-            |w, pane, index, window, cx| {
-                let ids = w
-                    .pane(pane)
-                    .map(|p| p.to_the_right(index))
-                    .unwrap_or_default();
-                w.close_clean(ids, window, cx);
-            },
-        )),
-    ))
-    .item(ContextMenuItem::Entry(
-        entry("Close All", Some(Box::new(CloseAllItems)), targets.all).handler(on(
-            |w, pane, _, window, cx| {
-                let ids = w.pane(pane).map(|p| p.all_unpinned()).unwrap_or_default();
-                w.close_clean(ids, window, cx);
-            },
-        )),
-    ))
-    .separator()
-    .entry(
-        if targets.pinned {
-            "Unpin Tab"
-        } else {
-            "Pin Tab"
-        },
-        Some(Box::new(TogglePinTab)),
-        on(|w, pane, index, _, cx| w.toggle_pin(pane, index, cx)),
-    )
-    .separator()
-    .entry(
-        "Split Right",
-        Some(Box::new(SplitRight)),
-        on(|w, pane, index, window, cx| {
-            w.activate_in(pane, index, true, window, cx);
-            w.split(SplitDirection::Right, window, cx)
-        }),
-    )
-    .entry(
-        "Split Down",
-        Some(Box::new(SplitDown)),
-        on(|w, pane, index, window, cx| {
-            w.activate_in(pane, index, true, window, cx);
-            w.split(SplitDirection::Down, window, cx)
-        }),
-    )
+        .separator()
+        .entry(
+            "Split Right",
+            Some(Box::new(SplitRight)),
+            on(|w, pane, index, window, cx| {
+                w.activate_in(pane, index, true, window, cx);
+                w.split(SplitDirection::Right, window, cx)
+            }),
+        )
+        .entry(
+            "Split Down",
+            Some(Box::new(SplitDown)),
+            on(|w, pane, index, window, cx| {
+                w.activate_in(pane, index, true, window, cx);
+                w.split(SplitDirection::Down, window, cx)
+            }),
+        )
+    }
 }
 
 /// What a tab's menu can act on: whether the tab is pinned, and whether each close variant has
@@ -6270,129 +6339,6 @@ fn resize_handle(position: PanelPosition) -> impl IntoElement {
         cx.stop_propagation();
         cx.new(|_| *dock)
     })
-}
-
-/// What a close asked about closes: a tab, the shown graph, the window, or Studio, quitting
-/// or restarting into an update.
-#[derive(Debug, Clone, Copy)]
-enum Closing {
-    Tab(EntityId),
-    Graph,
-    Window,
-    Quit,
-    Restart,
-}
-
-impl Closing {
-    /// The confirm button's label: what pressing it does.
-    fn confirm(self) -> &'static str {
-        match self {
-            Closing::Quit => "Quit",
-            Closing::Restart => "Restart",
-            Closing::Tab(_) | Closing::Graph | Closing::Window => "Close",
-        }
-    }
-
-    /// How much it closes: each holds the ones before it.
-    fn reach(self) -> u8 {
-        match self {
-            Closing::Tab(_) => 0,
-            Closing::Graph => 1,
-            Closing::Window => 2,
-            Closing::Quit | Closing::Restart => 3,
-        }
-    }
-}
-
-/// Asks before a close drops unsaved work (constitution IV), naming the tabs that hold it.
-struct ConfirmClose {
-    workspace: WeakEntity<Workspace>,
-    closing: Closing,
-    /// The tabs with unsaved work: a tab's own close names the tab.
-    unsaved: Vec<SharedString>,
-    focus_handle: FocusHandle,
-}
-
-/// Tabs a close dialog names before "and N more".
-const UNSAVED_NAMED: usize = 8;
-
-impl EventEmitter<DismissEvent> for ConfirmClose {}
-
-impl ModalView for ConfirmClose {
-    /// A tab's or the graph's question is about the graph shown; the window's and Quit's are
-    /// about every graph.
-    fn goes_with_graph(&self) -> bool {
-        matches!(self.closing, Closing::Tab(_) | Closing::Graph)
-    }
-}
-
-impl Focusable for ConfirmClose {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus_handle.clone()
-    }
-}
-
-impl ConfirmClose {
-    fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let closing = self.closing;
-        cx.emit(DismissEvent);
-        self.workspace
-            .update(cx, |workspace, cx| match closing {
-                Closing::Tab(item_id) => {
-                    if let Some((pane, index)) = workspace.find_item(item_id) {
-                        // The focus had been the closed tab's: the tab shown next takes it, not
-                        // a handle of the closed one the modal would hand it back to.
-                        if let Some(modal) = &mut workspace.modal {
-                            modal.previous_focus = None;
-                        }
-                        workspace.force_close(pane, index, window, cx);
-                    }
-                }
-                Closing::Graph => {
-                    if let Some(modal) = &mut workspace.modal {
-                        modal.previous_focus = None;
-                    }
-                    workspace.close_graph_asking(false, window, cx);
-                }
-                // Asked again for a write started since; the unsaved tabs were.
-                Closing::Window => match workspace.running_write(cx) {
-                    Some(graph) => workspace.show_toast(
-                        ToastKind::Error,
-                        format!(
-                            "A write to {graph} is still running. Close the window when it finishes."
-                        ),
-                        cx,
-                    ),
-                    None => {
-                        workspace.flush_saves(cx);
-                        window.remove_window();
-                    }
-                },
-                Closing::Quit => cx.defer(|cx| quit(true, cx)),
-                Closing::Restart => cx.defer(|cx| restart(true, cx)),
-            })
-            .ok();
-    }
-
-    fn header(&self) -> (SharedString, &'static str) {
-        let lost = "Their unsaved changes are lost. A write in flight still finishes; the \
-                    activity log keeps its outcome.";
-        match self.closing {
-            Closing::Tab(_) => (
-                format!(
-                    "Close {}?",
-                    self.unsaved.first().cloned().unwrap_or_default()
-                )
-                .into(),
-                "It has unsaved changes or a write still running. A write in flight still \
-                 finishes; the activity log keeps its outcome.",
-            ),
-            Closing::Graph => ("Close the graph?".into(), lost),
-            Closing::Window => ("Close this window?".into(), lost),
-            Closing::Quit => ("Quit Omnigraph Studio?".into(), lost),
-            Closing::Restart => ("Restart to update Omnigraph Studio?".into(), lost),
-        }
-    }
 }
 
 /// Quits Studio, unless a window holds a write still running: quitting would lose its outcome
@@ -6451,7 +6397,10 @@ fn leave(closing: Closing, confirmed: bool, cx: &mut App) {
         {
             handle
                 .update(cx, |workspace, window, cx| {
-                    workspace.confirm_close(closing, unsaved, window, cx);
+                    let close = move |_: &mut Workspace, _: &mut Window, cx: &mut Context<_>| {
+                        cx.defer(move |cx| leave(closing, true, cx));
+                    };
+                    workspace.confirm_close(closing, unsaved, close, window, cx);
                     window.activate_window();
                 })
                 .ok();
@@ -6461,52 +6410,6 @@ fn leave(closing: Closing, confirmed: bool, cx: &mut App) {
     match closing {
         Closing::Restart => cx.restart(),
         _ => cx.quit(),
-    }
-}
-
-impl Render for ConfirmClose {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let focus = self.focus_handle.clone();
-        studio_ui::ds::modal(cx)
-            .key_context("ConfirmClose")
-            .track_focus(&self.focus_handle)
-            .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| this.close(window, cx)))
-            .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
-            .child({
-                let (title, description) = self.header();
-                studio_ui::ds::ModalHeader::new(title)
-                    .description(SharedString::from(description))
-                    .on_close(cx.listener(|_, _, _, cx| cx.emit(DismissEvent)))
-            })
-            .when(!matches!(self.closing, Closing::Tab(_)), |modal| {
-                let more = self.unsaved.len().saturating_sub(UNSAVED_NAMED);
-                modal.child(
-                    studio_ui::ds::modal_body()
-                        .children(
-                            self.unsaved
-                                .iter()
-                                .take(UNSAVED_NAMED)
-                                .map(|title| studio_ui::ds::text::body(title.clone())),
-                        )
-                        .when(more > 0, |body| {
-                            body.child(studio_ui::ds::text::muted(format!("and {more} more")))
-                        }),
-                )
-            })
-            .child(
-                studio_ui::ds::modal_footer(cx)
-                    .child(
-                        studio_ui::ds::Button::new("keep-open", "Keep open")
-                            .variant(studio_ui::ds::Variant::Outline)
-                            .key_binding(ui::KeyBinding::for_action_in(&menu::Cancel, &focus, cx))
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
-                    )
-                    .child(
-                        studio_ui::ds::action_button("close-anyway", self.closing.confirm())
-                            .key_binding(ui::KeyBinding::for_action_in(&menu::Confirm, &focus, cx))
-                            .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
-                    ),
-            )
     }
 }
 
@@ -6799,7 +6702,7 @@ mod tests {
                 .modal
                 .as_ref()
                 .and_then(|modal| modal.view.clone().downcast::<ConfirmClose>().ok())
-                .map(|dialog| dialog.read(cx).closing)
+                .map(|dialog| dialog.read(cx).closing())
         };
         workspace.update_in(cx, |workspace, window, cx| {
             workspace.graph_order.push(session.entity_id());
@@ -6810,7 +6713,7 @@ mod tests {
             assert_eq!(workspace.unsaved_tabs(cx), [SharedString::from("Draft")]);
             // The tab's own close asks about the tab; Close Graph then asks about the graph.
             workspace.close_item(0, window, cx);
-            assert!(matches!(asked(workspace, cx), Some(Closing::Tab(_))));
+            assert!(matches!(asked(workspace, cx), Some(Closing::Tab)));
             workspace.close_graph(window, cx);
             assert!(
                 matches!(asked(workspace, cx), Some(Closing::Graph)),
@@ -6946,7 +6849,7 @@ mod tests {
                 .expect("the window asks about its unsaved tab")
         });
         assert!(matches!(
-            dialog.read_with(cx, |dialog, _| dialog.closing),
+            dialog.read_with(cx, |dialog, _| dialog.closing()),
             Closing::Window
         ));
         assert_eq!(cx.windows().len(), 1, "still open");
@@ -7147,13 +7050,13 @@ mod tests {
                 .expect("the restart dialog")
         });
         dialog.read_with(cx, |dialog, _| {
-            assert!(matches!(dialog.closing, Closing::Restart));
+            assert!(matches!(dialog.closing(), Closing::Restart));
             assert_eq!(
                 dialog.header().0,
                 SharedString::from("Restart to update Omnigraph Studio?")
             );
-            assert_eq!(dialog.unsaved, [SharedString::from("Draft")]);
-            assert_eq!(dialog.closing.confirm(), "Restart");
+            assert_eq!(dialog.unsaved(), [SharedString::from("Draft")]);
+            assert_eq!(dialog.closing().confirm(), "Restart");
         });
     }
 
@@ -8540,7 +8443,7 @@ mod tests {
         cx.update(|cx| {
             studio_theme::init_test(cx);
             studio_settings::init_test(cx);
-            persistence::register_item_kind(cx, "split", |data, workspace, window, cx| {
+            register_item_kind(cx, "split", |data, workspace, window, cx| {
                 open_tab(workspace, data.as_str().unwrap_or_default(), window, cx);
             });
         });
@@ -8644,14 +8547,14 @@ mod tests {
         cx.update(|cx| {
             studio_theme::init_test(cx);
             studio_settings::init_test(cx);
-            persistence::register_item_kind(cx, "maybe", |data, workspace, window, cx| {
+            register_item_kind(cx, "maybe", |data, workspace, window, cx| {
                 let key = data.as_str().unwrap_or_default();
                 if key != "gone" {
                     open_tab(workspace, key, window, cx);
                 }
             });
             // As a conversation another pane holds: shown there, opening nothing here.
-            persistence::register_item_kind(cx, "elsewhere", |_, workspace, window, cx| {
+            register_item_kind(cx, "elsewhere", |_, workspace, window, cx| {
                 let shown = workspace.all_items().next().map(|item| item.item_id());
                 if let Some(id) = shown {
                     workspace.activate_item_by_id(id, window, cx);

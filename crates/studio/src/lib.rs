@@ -253,7 +253,7 @@ pub fn init(cx: &mut App) {
                 .session()
                 .map(|session| session.read(cx).connection.clone());
             workspace.toggle_modal(window, cx, |window, cx| {
-                let mut modal = OpenGraphModal::new(handle, window, cx);
+                let mut modal = OpenGraphModal::new(handle, open_cloud_settings, window, cx);
                 if let Some(connection) = shown.filter(|c| modal.lists(c)) {
                     modal.select(connection, window, cx);
                 }
@@ -345,20 +345,24 @@ fn copied_link_note(
     })
 }
 
-/// Opens the settings tab, offering the workspace's graph as a scope.
-/// Opens Settings at `section`, as `OpenAgentSettings` opens it at Agent: what a link to a
-/// setting does in place of naming where it is (spec 047).
-pub(crate) fn open_settings_at(
+/// Opens Settings at Omnigraph Cloud, as `OpenAgentSettings` opens it at Agent: what the Open
+/// dialog's link to the setting does in place of naming where it is (spec 047). The dialog is
+/// handed it ([`open_graph::OpenCloudSettings`]): the app opens Settings, and the dialog knows
+/// nothing of it.
+fn open_cloud_settings(
     workspace: &mut Workspace,
-    section: &'static str,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
     if let Some(view) = open_settings(workspace, window, cx) {
-        view.update(cx, |view, cx| view.show_section(section, window, cx));
+        view.update(cx, |view, cx| {
+            view.show_section(settings_view::CLOUD, window, cx)
+        });
     }
 }
 
+/// Opens the settings tab, offering the workspace's graph as a scope. The tab says a file it
+/// could not write as Studio says what did not happen ([`tell`]).
 fn open_settings(
     workspace: &mut Workspace,
     window: &mut Window,
@@ -370,7 +374,7 @@ fn open_settings(
         .map(|session| settings_view::graph_scope(session, cx));
     let made = graph.clone();
     let view = workspace.open_item("settings", window, cx, move |window, cx| {
-        settings_view::SettingsView::new(made, window, cx)
+        settings_view::SettingsView::new(made, tell, window, cx)
     });
     // A tab open from before offers the graph shown now, and its types for "Node names"; and
     // it follows the window's graph from now on.
@@ -793,7 +797,7 @@ fn show_open_dialog(workspace: &Entity<Workspace>, window: &mut Window, cx: &mut
     let handle = workspace.downgrade();
     workspace.update(cx, |workspace, cx| {
         workspace.toggle_modal(window, cx, |window, cx| {
-            OpenGraphModal::new(handle, window, cx)
+            OpenGraphModal::new(handle, open_cloud_settings, window, cx)
         });
     });
 }
@@ -1013,7 +1017,7 @@ fn open_cluster_graph(
         workspace.update(cx, |workspace, cx| {
             workspace.hide_modal(window, cx);
             workspace.toggle_modal(window, cx, |window, cx| {
-                OpenGraphModal::for_connection(handle, connection, window, cx)
+                OpenGraphModal::for_connection(handle, open_cloud_settings, connection, window, cx)
             });
         });
         window.activate_window();

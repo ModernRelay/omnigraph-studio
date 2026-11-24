@@ -44,7 +44,10 @@ use futures::{AsyncReadExt as _, FutureExt as _};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::cli_config::{CliCredential, CliServer, FileStamp};
+use crate::cli_config::{
+    CliAuth, CliCredential, CliServer, CliTargets, FileStamp, NoCli, Platform, ProfileOwner,
+    config_path, servers_from, stamp_of, unlisted,
+};
 
 /// The program's name.
 const CLI_NAME: &str = if cfg!(windows) {
@@ -606,6 +609,164 @@ pub(crate) async fn profile_owner(
     };
     Ok((route, organization))
 }
+
+/// Lists the targets of the operator home in `dir` with the first CLI of `programs` Studio can
+/// drive, in one turn at the CLI, as they land on `platform` ([`servers_from`]). No directory is
+/// no servers.
+pub async fn read_targets(
+    dir: Option<&Path>,
+    programs: &[PathBuf],
+    platform: Platform,
+) -> CliTargets {
+    let Some(dir) = dir else {
+        return CliTargets {
+            servers: Some(Vec::new()),
+            ..CliTargets::default()
+        };
+    };
+    let config = config_path(dir);
+    // A failure that may pass (the CLI busy, or slow to start or to answer) lists the targets
+    // again at the next check; one that lasts waits for the operator file, as `stamp` saw it, to
+    // change.
+    let failed = |passing: bool, error: String, stamp: Option<FileStamp>| {
+        if passing {
+            return unlisted(&config, error);
+        }
+        CliTargets {
+            servers: None,
+            errors: vec![error],
+            watched: vec![(config.clone(), stamp)],
+            managed: Vec::new(),
+            profiles: Vec::new(),
+            no_cli: None,
+        }
+    };
+    let asked = "`omnigraph target list --json`";
+    let turn = match take_turn(&Arc::default(), READ_TIMEOUT, asked).await {
+        Ok(turn) => turn,
+        Err(busy) => {
+            return failed(
+                true,
+                format!("Studio could not list the CLI's targets: {busy}"),
+                None,
+            );
+        }
+    };
+    let cli = match found_cli(programs, &turn).await {
+        Ok(cli) => cli,
+        // One that may pass (a CLI just replaced, slow to start) is tried again; one that stands
+        // is said in the Open dialog, with how to install one, until a CLI is found.
+        Err(why) if why.passing => {
+            return failed(
+                true,
+                format!(
+                    "Studio lists the CLI's targets with the Omnigraph CLI, and {}",
+                    why.why
+                ),
+                None,
+            );
+        }
+        Err(why) => {
+            return CliTargets {
+                servers: None,
+                errors: Vec::new(),
+                watched: vec![(config.clone(), stamp_of(&config))],
+                managed: Vec::new(),
+                profiles: Vec::new(),
+                no_cli: Some(NoCli {
+                    unfit: !installed(programs).is_empty(),
+                    why: why.why,
+                }),
+            };
+        }
+    };
+    // Taken before the CLI reads the file: a write while it lists changes the next stamp.
+    let config_stamp = stamp_of(&config);
+    match list_targets(&cli, &turn).await {
+        Ok(targets) => {
+            let mut read = servers_from(&targets, platform);
+            name_organizations(&mut read, &cli, &turn).await;
+            read.watched.insert(0, (config, config_stamp));
+            read
+        }
+        Err(refusal) => failed(
+            refusal.passing,
+            format!(
+                "The Omnigraph CLI ({}, {}) could not list its targets: {}",
+                cli.path.display(),
+                cli.version,
+                refusal.why
+            ),
+            config_stamp,
+        ),
+    }
+}
+
+/// Names on each managed server of `read` the organization its profile names, as the CLI
+/// reports it (`credentials status --profile NAME --json`, once per profile, in the listing's
+/// turn): a sign-in to the cluster must be in it (spec 016). A profile whose organization the
+/// CLI would not say is a notice and marked `unread`: a connection holding its organization
+/// from before keeps it, and one holding none leaves a sign-in to the server to check.
+async fn name_organizations(read: &mut CliTargets, cli: &FoundCli, turn: &Held) {
+    let Some(servers) = read.servers.as_mut() else {
+        return;
+    };
+    // Each profile's control plane and organization, or `Err` when the CLI would not say them
+    // this time.
+    let mut named: Vec<(String, Result<Owner, ()>)> = Vec::new();
+    for server in servers.iter_mut() {
+        let CliAuth::Token(CliCredential::Managed {
+            profile,
+            organization,
+            unread,
+        }) = &mut server.auth
+        else {
+            continue;
+        };
+        let found = match named.iter().find(|(read, _)| read == profile) {
+            Some((_, known)) => known.clone(),
+            None => {
+                let found = profile_owner(cli, turn, profile).await.map_err(|why| {
+                    read.errors.push(format!(
+                        "Studio could not read which organization CLI profile '{profile}' \
+                             is in ({why}), so a sign-in to its clusters is checked against the \
+                             one read before, else by the server alone"
+                    ));
+                });
+                named.push((profile.clone(), found.clone()));
+                found
+            }
+        };
+        *unread = found.is_err();
+        *organization = found
+            .map(|(_, organization)| organization)
+            .unwrap_or_default();
+    }
+    // A control-only target's profile names a control plane too, whose clusters Studio lists.
+    for target in &read.managed {
+        if named.iter().any(|(read, _)| *read == target.profile) {
+            continue;
+        }
+        let found = profile_owner(cli, turn, &target.profile)
+            .await
+            .map_err(|_| ());
+        named.push((target.profile.clone(), found));
+    }
+    read.profiles = named
+        .into_iter()
+        .filter_map(|(profile, found)| {
+            let (route, organization) = found.ok()?;
+            Some(ProfileOwner {
+                profile,
+                route,
+                organization,
+            })
+        })
+        .collect();
+}
+
+/// A profile's control plane and organization, as `credentials status` says them.
+type Owner = (Option<String>, Option<String>);
 
 /// What `target inspect NAME --json` says of one target, without a server or a secret.
 async fn inspect_target(cli: &FoundCli, turn: &Held, name: &str) -> Result<Value, NoToken> {
@@ -1538,7 +1699,7 @@ mod tests {
     use http_client::{AsyncBody, FakeHttpClient, Response};
 
     use super::*;
-    use crate::cli_config::{CliAuth, Platform, read_targets};
+    use crate::cli_config::{CliAuth, Platform};
     use crate::connection::{Connection, ConnectionState, ServerEntry, ServerSource};
 
     /// What `version --json` reports in the Omnigraph 0.14.0 release.
@@ -3483,7 +3644,8 @@ mod every_system_tests {
 #[cfg(all(test, unix))]
 mod live_tests {
     use super::*;
-    use crate::cli_config::{CliAuth, Platform, operator_dir, read_targets};
+    use crate::cli_config::{CliAuth, Platform, operator_dir};
+    use crate::cli_tokens::read_targets;
 
     /// Every server target that takes a token is given one when all are asked at once, each
     /// from a thread of its own, as the Open dialog asks them. Only the tokens' lengths are

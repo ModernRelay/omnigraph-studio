@@ -4,7 +4,7 @@
 use studio_settings::TypeNaming;
 use ui::prelude::*;
 
-use crate::menu::ContextMenu;
+use crate::ds::menu::ContextMenu;
 
 /// What the choice reads when none is made: the automatic property, named.
 pub fn automatic(names: &TypeNaming) -> String {

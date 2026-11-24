@@ -23,10 +23,14 @@ use studio_ui::ds::Tipped;
 use studio_ui::ds::{self, Dotted as _, space};
 use studio_ui::menu::ContextMenu;
 use studio_workspace::models::{KeyState, Models};
-use studio_workspace::{Item, ItemEvent, SavedItem, Workspace, WorkspaceEvent};
+use studio_workspace::{Item, ItemEvent, SavedItem, ToastKind, Workspace, WorkspaceEvent};
 use theme::ThemeRegistry;
 use ui::prelude::*;
 use ui::{PopoverMenu, Severity};
+
+/// Says what did not happen, in a window if there is one. The app hands the tab its own way of
+/// saying so, as a link that does not open is said: the tab knows no window but its own.
+pub(crate) type Tell = fn(&mut App, ToastKind, String);
 
 pub struct SettingsView {
     search: Entity<Editor>,
@@ -55,6 +59,8 @@ pub struct SettingsView {
     cloud_shown: Option<crate::cloud_settings::Part>,
     /// The window's graph changing, which the tab follows.
     _workspace_subscription: Option<Subscription>,
+    /// How a file the tab could not write is said ([`Tell`]).
+    tell: Tell,
     /// The session's schema changing, which "Node names" lists the types of.
     _session_subscription: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
@@ -131,9 +137,11 @@ impl Item for SettingsView {
 }
 
 impl SettingsView {
-    /// `graph` is the open graph's settings key and name, offered as a scope.
+    /// `graph` is the open graph's settings key and name, offered as a scope; `tell` says a file
+    /// the tab could not write.
     pub fn new(
         graph: Option<(String, String)>,
+        tell: Tell,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -218,6 +226,7 @@ impl SettingsView {
             cloud: cx.new(crate::cloud_settings::CloudPage::new),
             cloud_shown: None,
             _workspace_subscription: None,
+            tell,
             _session_subscription: None,
             _subscriptions: subscriptions,
         };
@@ -981,6 +990,7 @@ impl Render for SettingsView {
         let path = studio_settings::settings_path();
         let settings_problems = studio_settings::settings_problems(cx);
         let keymap_problems = studio_settings::keymap_problems(cx).to_vec();
+        let tell = self.tell;
         let rule = ds::surface::rule(cx);
         let changed_word = if scope == Scope::All {
             "changed"
@@ -1193,7 +1203,7 @@ impl Render for SettingsView {
                                         "Show keymap.json, your shortcuts · {}",
                                         studio_settings::keymap_path().display()
                                     )))
-                                    .on_click(|_, _, cx| show_keymap_file(cx)),
+                                    .on_click(move |_, _, cx| show_keymap_file(tell, cx)),
                             ),
                     )
                     .children(file_problems(
@@ -1205,7 +1215,7 @@ impl Render for SettingsView {
                     .children(file_problems(
                         "keymap.json",
                         keymap_problems,
-                        show_keymap_file,
+                        move |cx| show_keymap_file(tell, cx),
                         cx,
                     ))
                     .child(body),
@@ -1236,8 +1246,8 @@ fn scope_applies(section: &str, searching: bool, scope: &Scope) -> bool {
 
 /// Shows `keymap.json`, written first with a starting point when the person has none, off the
 /// main thread (the write is synced to disk). One that cannot be written is said in a toast
-/// with its path and why, as the button would otherwise do nothing.
-fn show_keymap_file(cx: &mut App) {
+/// with its path and why ([`Tell`]), as the button would otherwise do nothing.
+fn show_keymap_file(tell: Tell, cx: &mut App) {
     let written = cx.background_spawn(async { crate::keymaps::user_keymap_file() });
     cx.spawn(async move |cx| {
         let written = written.await;
@@ -1249,7 +1259,7 @@ fn show_keymap_file(cx: &mut App) {
                     studio_settings::keymap_path().display()
                 );
                 log::error!("{message}");
-                crate::tell(cx, studio_workspace::ToastKind::Error, message);
+                tell(cx, ToastKind::Error, message);
             }
         });
     })
@@ -1261,7 +1271,7 @@ fn show_keymap_file(cx: &mut App) {
 fn file_problems(
     file: &'static str,
     problems: Vec<String>,
-    show: fn(&mut App),
+    show: impl Fn(&mut App) + 'static,
     cx: &App,
 ) -> Option<impl IntoElement> {
     let title = match problems.len() {
@@ -1355,7 +1365,7 @@ mod tests {
             studio_settings::init_test(cx);
         });
         let (view, cx): (_, &mut VisualTestContext) = cx.add_window_view(|window, cx| {
-            SettingsView::new(Some(("k".into(), "Graph".into())), window, cx)
+            SettingsView::new(Some(("k".into(), "Graph".into())), crate::tell, window, cx)
         });
         let index = view.read_with(cx, |view, _| cli_field(view));
         let editor = view.read_with(cx, |view, _| view.text_inputs[index].editor.clone());
@@ -1415,7 +1425,7 @@ mod tests {
         let http = http_client::FakeHttpClient::create(|_| std::future::pending());
         cx.update(|cx| Models::init_for_tests(http, Some("old-key"), cx));
         let (view, cx): (_, &mut VisualTestContext) = cx.add_window_view(|window, cx| {
-            SettingsView::new(Some(("k".into(), "Graph".into())), window, cx)
+            SettingsView::new(Some(("k".into(), "Graph".into())), crate::tell, window, cx)
         });
         view.update(cx, |view, cx| {
             view.test_key(cx);
@@ -1466,7 +1476,7 @@ mod tests {
             studio_settings::init_test(cx);
         });
         let (view, cx): (_, &mut VisualTestContext) =
-            cx.add_window_view(|window, cx| SettingsView::new(None, window, cx));
+            cx.add_window_view(|window, cx| SettingsView::new(None, crate::tell, window, cx));
         // This test's settings refuse a write by setting their values again, which counts it.
         let writes = Rc::new(std::cell::Cell::new(0));
         let _counted = cx.update(|_, cx| {

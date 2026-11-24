@@ -201,7 +201,7 @@ type ClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 type TooltipBuilder = Box<dyn Fn(&mut Window, &mut App) -> AnyView + 'static>;
 
 /// A button's tooltip: what it says, or a builder from state; anchored under the button either
-/// way (`crate::tooltip`).
+/// way (`crate::ds::tooltip`).
 enum Tip {
     Content(ds::TipContent),
     Builder(TooltipBuilder),

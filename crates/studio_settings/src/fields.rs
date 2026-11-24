@@ -299,18 +299,22 @@ fn sentence(key: &str) -> String {
 }
 
 /// The settings in their JSON form, serialized once: for reading many settings at a time, as
-/// the settings tab does for every row it draws.
-pub struct SettingsValues(Value);
+/// the settings tab does for every row it draws. It holds the defaults in the same form, to say
+/// which settings are at theirs.
+pub struct SettingsValues {
+    values: Value,
+    defaults: &'static Value,
+}
 
 impl SettingsValues {
     /// The value at `path`; `Null` where there is none.
     pub fn at(&self, path: &[String]) -> &Value {
-        at(&self.0, path)
+        at(&self.values, path)
     }
 
     /// Whether the setting at `path` has its default value.
     fn is_default_at(&self, path: &[String]) -> bool {
-        self.at(path) == at(defaults(), path)
+        self.at(path) == at(self.defaults, path)
     }
 
     /// The value `field` has in `scope`: a graph's override, else the shared value.
@@ -337,17 +341,13 @@ fn at<'a>(document: &'a Value, path: &[String]) -> &'a Value {
         .unwrap_or(&NULL)
 }
 
-/// The default settings in their JSON form, serialized once.
-fn defaults() -> &'static Value {
-    static DEFAULTS: LazyLock<Value> =
-        LazyLock::new(|| serde_json::to_value(StudioSettings::default()).unwrap_or_default());
-    &DEFAULTS
-}
-
 impl StudioSettings {
     /// The document's values, to read by path.
     pub fn values(&self) -> SettingsValues {
-        SettingsValues(serde_json::to_value(self).unwrap_or_default())
+        SettingsValues {
+            values: serde_json::to_value(self).unwrap_or_default(),
+            defaults: Self::default_values(),
+        }
     }
 
     /// The document with `value` at `path`, or why it does not fit there.
@@ -369,7 +369,7 @@ impl StudioSettings {
 
     /// The document with the setting at `path` back at its default.
     fn reset_at(&self, path: &[String]) -> Self {
-        self.with_value(path, at(defaults(), path).clone())
+        self.with_value(path, at(Self::default_values(), path).clone())
             .unwrap_or_else(|_| self.clone())
     }
 

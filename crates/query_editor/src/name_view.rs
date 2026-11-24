@@ -4,19 +4,20 @@
 use editor::{Editor, EditorEvent};
 use gpui::{
     App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Render, Subscription,
-    WeakEntity, Window,
+    Window,
 };
 use studio_settings::{StudioSettings, ViewQuery};
 use studio_ui::ds::{ModalHeader, action_button, cancel_button, modal, modal_body, modal_footer};
 use studio_workspace::ModalView;
 use ui::prelude::*;
 
-use crate::view::QueryEditor;
+/// What the view saved does next, given its id: the tab it was saved from becomes it.
+type Saved = Box<dyn Fn(String, &mut App)>;
 
 pub struct NameViewModal {
     graph: String,
     query: ViewQuery,
-    editor: WeakEntity<QueryEditor>,
+    saved: Saved,
     name: Entity<Editor>,
     _subscription: Subscription,
 }
@@ -35,7 +36,7 @@ impl NameViewModal {
     pub fn new(
         graph: String,
         query: ViewQuery,
-        editor: WeakEntity<QueryEditor>,
+        saved: impl Fn(String, &mut App) + 'static,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -52,7 +53,7 @@ impl NameViewModal {
         Self {
             graph,
             query,
-            editor,
+            saved: Box::new(saved),
             name,
             _subscription: subscription,
         }
@@ -82,9 +83,7 @@ impl NameViewModal {
         // no view to become.
         let saved = saved.filter(|id| StudioSettings::get(cx).view(&self.graph, id).is_some());
         if let Some(id) = saved {
-            self.editor
-                .update(cx, |editor, cx| editor.become_view(id, cx))
-                .ok();
+            (self.saved)(id, cx);
         }
         cx.emit(DismissEvent);
     }

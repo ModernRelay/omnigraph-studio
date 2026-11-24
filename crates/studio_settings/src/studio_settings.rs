@@ -671,6 +671,16 @@ pub struct ServerOverrides {
     pub environment: ServerEnvironment,
 }
 
+impl StudioSettings {
+    /// The default settings in their JSON form, serialized once.
+    pub(crate) fn default_values() -> &'static serde_json::Value {
+        static DEFAULTS: std::sync::LazyLock<serde_json::Value> = std::sync::LazyLock::new(|| {
+            serde_json::to_value(StudioSettings::default()).unwrap_or_default()
+        });
+        &DEFAULTS
+    }
+}
+
 impl Default for StudioSettings {
     fn default() -> Self {
         Self {

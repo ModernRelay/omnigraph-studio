@@ -5,18 +5,15 @@
 
 use editor::Editor;
 use gpui::{
-    App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Render, WeakEntity,
-    Window,
+    App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Render, Window,
 };
 use gq_language::Property;
 use gq_language::input::{edit_text, same_value, typed};
 use serde_json::Value;
 use studio_ui::ds;
 use studio_ui::ds::Tipped;
-use ui::prelude::*;
-
-use crate::view::ReviewView;
 use studio_workspace::ModalView;
+use ui::prelude::*;
 
 struct Field {
     property: Property,
@@ -26,10 +23,12 @@ struct Field {
     error: Option<String>,
 }
 
+/// Sends the fields typed in, as `(property, value shown, value typed)`, or says why they were
+/// not sent: the review saves them on the change the form edits.
+type Save = Box<dyn Fn(Vec<(String, Value, Value)>, &mut App) -> Result<(), String>>;
+
 pub(crate) struct EditModal {
-    view: WeakEntity<ReviewView>,
-    /// The change the form edits, by its key.
-    key: String,
+    save: Save,
     title: SharedString,
     /// Where the edit writes, named whole: the server, the graph and the branch, as every write
     /// confirmation names it, since two windows can both be on `main`.
@@ -55,11 +54,10 @@ impl Focusable for EditModal {
 
 impl EditModal {
     pub(crate) fn new(
-        view: WeakEntity<ReviewView>,
-        key: String,
         title: String,
         scope: String,
         values: Vec<(Property, Value)>,
+        save: impl Fn(Vec<(String, Value, Value)>, &mut App) -> Result<(), String> + 'static,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -81,8 +79,7 @@ impl EditModal {
             })
             .collect();
         Self {
-            view,
-            key,
+            save: Box::new(save),
             title: title.into(),
             scope,
             fields,
@@ -118,16 +115,12 @@ impl EditModal {
             cx.emit(DismissEvent);
             return;
         }
-        let key = self.key.clone();
-        match self
-            .view
-            .update(cx, |view, cx| view.save_edit(&key, changes, cx))
-        {
-            Ok(Err(reason)) => {
+        match (self.save)(changes, cx) {
+            Err(reason) => {
                 self.refused = Some(reason);
                 cx.notify();
             }
-            _ => cx.emit(DismissEvent),
+            Ok(()) => cx.emit(DismissEvent),
         }
     }
 }

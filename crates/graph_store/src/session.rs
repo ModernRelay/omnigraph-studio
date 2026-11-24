@@ -10,10 +10,10 @@ use std::time::{Duration, SystemTime};
 use futures::FutureExt as _;
 use futures::channel::oneshot;
 use futures::future::{Either, Shared, WeakShared, select};
-use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Subscription, Task};
+use gpui::{App, AppContext as _, Context, Entity, EventEmitter, SharedString, Subscription, Task};
 use gq_language::builder::{Depends, Seeds};
 use gq_language::input::same_value;
-use gq_language::{BuiltQuery, RelationshipGroup, SchemaModel, builder};
+use gq_language::{BuiltQuery, NodeType, RelationshipGroup, SchemaModel, builder};
 use graph_client::api::{
     AccessAction, BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchDetailOutput,
     BranchListOutput, BranchMergeOutput, BranchMergeRequest, ChangeFeedOutput, ChangeOutput,
@@ -28,13 +28,17 @@ use graph_client::{
 use serde_json::Value;
 
 use crate::access::{Access, AccessScope, Allowed};
-use crate::carry::{ChangeLog, ChangesSince, FeedFold, Since, answer_unchanged};
+use crate::carry::{ChangeLog, ChangesSince, FeedFold, Since, TypeRef, answer_unchanged};
 use crate::connection::{Connection, ConnectionEvent, ConnectionState, ConnectionWatch};
 use crate::degrees::{DEGREE_BATCH, DegreeBatchKey, DegreeBatches, page_counts};
 use crate::ledger::{
-    Answered, Asker, Origin, ReadEvent, ReadLedger, ReadView, Sending, Status, Target,
+    Answered, Asker, Origin, ReadEvent, ReadLedger, ReadView, Sending, SendsReads, Status, Target,
 };
 use crate::memo::{Held, Memo};
+use crate::node_search::{
+    INDEX_MAX_NODES, Loaded, NodeIndex, NodeIndexes, SERVER_MIN_CHARS, SERVER_ROWS,
+    TEXT_SEARCHES_HELD, TEXT_SEARCHES_SERVER, TypeHits, merge_full_text,
+};
 use crate::scope::{ReadScope, Scope, ScopeSince};
 use crate::server_features::{ServerFeature, ServerFeatures};
 
@@ -718,6 +722,18 @@ impl<V: Clone + 'static> crate::memo::Pend for Pending<V> {
     }
 }
 
+/// The node's last change, as the session keeps it once its history was read (spec 046): a
+/// node's page shows it in its meta line, and reads nothing for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastChange {
+    /// The head the history was read at: the page shows the line only when it shows that commit.
+    pub head: String,
+    pub commit: String,
+    pub actor: Option<String>,
+    /// Unix microseconds.
+    pub at: i64,
+}
+
 pub struct GraphSession {
     pub connection: Entity<Connection>,
     pub graph_id: String,
@@ -801,7 +817,7 @@ pub struct GraphSession {
     /// every answer kept is kept under its epoch, and nothing crosses one.
     schema_epoch: u64,
     /// The name indexes node searches match in memory, by type and commit (spec 031).
-    pub(crate) node_indexes: crate::node_search::NodeIndexes,
+    pub(crate) node_indexes: NodeIndexes,
     schema_text: Option<Arc<str>>,
     /// Branches' newest commits, for a list of branches: from one detailed branch list where the
     /// server serves one ([`ServerFeature::DetailedBranchList`]), else read alone; kept until a
@@ -866,7 +882,7 @@ pub struct GraphSession {
     scope_views: HashMap<u64, ReadView>,
     /// Each node's last change, by type and id, as its history last read it (spec 046): a page
     /// shows it, and reads nothing for it. Forgotten with a new token, as the read memo is.
-    last_changes: HashMap<(String, String), crate::node_history::LastChange>,
+    last_changes: HashMap<(String, String), LastChange>,
     /// How each read was answered (spec 030).
     ledger: ReadLedger,
     /// Who is asking for the read being started: set by the scoped reads around their call.
@@ -2364,11 +2380,7 @@ impl GraphSession {
     }
 
     /// Node `type_name` `id`'s last change, as its history last read it (spec 046).
-    pub fn last_change(
-        &self,
-        type_name: &str,
-        id: &str,
-    ) -> Option<&crate::node_history::LastChange> {
+    pub fn last_change(&self, type_name: &str, id: &str) -> Option<&LastChange> {
         self.last_changes
             .get(&(type_name.to_owned(), id.to_owned()))
     }
@@ -2378,7 +2390,7 @@ impl GraphSession {
         &mut self,
         type_name: &str,
         id: &str,
-        change: crate::node_history::LastChange,
+        change: LastChange,
         cx: &mut Context<Self>,
     ) {
         let key = (type_name.to_owned(), id.to_owned());
@@ -2399,7 +2411,7 @@ impl GraphSession {
         &mut self,
         type_name: &str,
         id: &str,
-        change: crate::node_history::LastChange,
+        change: LastChange,
         cx: &mut Context<Self>,
     ) {
         self.note_last_change(type_name, id, change, cx);
@@ -3835,24 +3847,6 @@ impl GraphSession {
         self.counted_read_as(Some(sending), request, cx)
     }
 
-    /// [`Self::counted_read`] asked for by `asker`, for a read a session method sends after it
-    /// returned, as a node's history sends each of its pages (spec 046).
-    pub(crate) fn counted_read_by<T: Send + 'static>(
-        &mut self,
-        what: &'static str,
-        asker: Asker,
-        request: impl Future<Output = Result<T, ReadError>> + Send + 'static,
-        cx: &mut Context<Self>,
-    ) -> Task<Result<T, ReadError>> {
-        let sending = Sending {
-            what: what.into(),
-            asker,
-            target: Target::Route,
-            started: cx.background_executor().now(),
-        };
-        self.counted_read_as(Some(sending), request, cx)
-    }
-
     /// [`Self::counted_read`], recorded in the ledger as `sending` says when it ends or is
     /// dropped.
     fn counted_read_as<T: Send + 'static>(
@@ -5156,6 +5150,359 @@ fn read_status<T>(result: &Result<T, ReadError>) -> Status {
         Err(ReadError::Refused(refusal)) => Status::Refused(refusal.status),
         Err(_) => Status::Failed,
     }
+}
+
+/// [`GraphSession::counted_read`] asked for by `asker`, for a read a session method sends after
+/// it returned, as a node's history sends each of its pages (spec 046).
+impl SendsReads for GraphSession {
+    fn counted_read_by<T: Send + 'static>(
+        &mut self,
+        what: &'static str,
+        asker: Asker,
+        request: impl Future<Output = Result<T, ReadError>> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<T, ReadError>> {
+        let sending = Sending {
+            what: what.into(),
+            asker,
+            target: Target::Route,
+            started: cx.background_executor().now(),
+        };
+        self.counted_read_as(Some(sending), request, cx)
+    }
+}
+
+// Finding a node by what people call it (spec 031), through the name indexes the session
+// holds (`crate::node_search`).
+
+/// Where a search's reads go: the commit (the branch's head when `None`), and the scope they
+/// are read through, when the caller holds one.
+#[derive(Clone)]
+struct ReadAt {
+    commit: Option<String>,
+    scope: Option<ReadScope>,
+}
+
+fn message(error: impl std::fmt::Display) -> SharedString {
+    error.to_string().into()
+}
+
+impl GraphSession {
+    /// The nodes of `type_name` that `text` names, best first, at most `limit` (spec 031): from
+    /// the type's name index when it holds at most [`INDEX_MAX_NODES`] nodes, else from the
+    /// server; with what full-text search finds merged in. Read at `snapshot`, or the branch's
+    /// head. Fails only when the type cannot be searched at all: its index or the server's
+    /// search refused or unanswered.
+    ///
+    /// Read through `scope` when one is given (a [`crate::ledger::ReadView::Search`] scope the
+    /// caller holds while it searches): the change feed is then asked about the types searched,
+    /// so a commit that changed none of a type's nodes carries its index.
+    pub fn find_nodes(
+        &mut self,
+        type_name: &str,
+        text: &str,
+        snapshot: Option<String>,
+        scope: Option<&ReadScope>,
+        limit: usize,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<TypeHits, SharedString>> {
+        let Some(schema) = self.schema_model() else {
+            return Task::ready(Err("The graph's schema is not read yet.".into()));
+        };
+        let Some(node) = schema.node(type_name).cloned() else {
+            return Task::ready(Err(
+                format!("The graph has no node type {type_name}.").into()
+            ));
+        };
+        let text = text.trim().to_owned();
+        let at = ReadAt {
+            commit: snapshot.or_else(|| self.head(&self.branch).map(str::to_owned)),
+            scope: scope.cloned(),
+        };
+        // The type's count, at the branch's newest commit, says whether to hold it; an index read
+        // that finds more nodes than the limit says so too.
+        let counted_large = self
+            .count_of(EntityKind::Node, type_name)
+            .is_some_and(|count| count > INDEX_MAX_NODES as i64);
+        if counted_large {
+            return self.server_find(&schema, node, text, at, limit, cx);
+        }
+        let index = self.node_index(&schema, &node, &at, cx);
+        // What the index does not hold, searched by the engine meanwhile.
+        let held: Vec<&str> = builder::searched_properties(&node);
+        let properties: Vec<String> = node
+            .properties
+            .iter()
+            .filter(|p| p.full_text && !p.is_key && !held.contains(&p.name.as_str()))
+            .take(TEXT_SEARCHES_HELD)
+            .map(|p| p.name.clone())
+            .collect();
+        let texts = self.full_text_reads(&schema, &node, &properties, &text, &at, cx);
+        let schema_held = schema.clone();
+        cx.spawn(async move |this, cx| {
+            let (commit, loaded) = index.await?;
+            match loaded {
+                Loaded::Index(index) => {
+                    let find_text = text.clone();
+                    let mut hits = cx
+                        .background_spawn(async move { index.find(&find_text, limit) })
+                        .await;
+                    let answers = full_text_answers(texts).await;
+                    merge_full_text(&node, &mut hits, &answers, limit);
+                    Ok(hits)
+                }
+                Loaded::TooLarge => {
+                    drop(texts);
+                    let find = this
+                        .update(cx, |this, cx| {
+                            let at = ReadAt { commit, ..at };
+                            this.server_find(&schema_held, node, text, at, limit, cx)
+                        })
+                        .map_err(|_| SharedString::from("The graph was closed."))?;
+                    find.await
+                }
+            }
+        })
+    }
+
+    /// `node`'s name index at `commit` (the branch's head when `None`), held or read, and the
+    /// commit it is of. An index held at another commit stands for this one when the branch's
+    /// change log says no node of the type changed between them. With no head known, the
+    /// commit a head read last answered at stands for [`HEAD_UNKNOWN_HOLD`]. The rows are read
+    /// fresh, kept nowhere but in the index made of them.
+    fn node_index(
+        &mut self,
+        schema: &Arc<SchemaModel>,
+        node: &NodeType,
+        at: &ReadAt,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(Option<String>, Loaded), SharedString>> {
+        let now = cx.background_executor().now();
+        let commit = at
+            .commit
+            .clone()
+            .or_else(|| self.node_indexes.at_head(&node.name, now));
+        if let Some(commit) = &commit {
+            if let Some(loaded) = self.node_indexes.get(&node.name, commit, node) {
+                return Task::ready(Ok((Some(commit.clone()), loaded)));
+            }
+            if let Some(index) = self.carried_index(node, commit) {
+                let loaded = Loaded::Index(index);
+                self.node_indexes
+                    .insert(&node.name, commit.clone(), loaded.clone());
+                return Task::ready(Ok((Some(commit.clone()), loaded)));
+            }
+        }
+        let key = (node.name.clone(), commit.clone());
+        if let Some(loading) = self.node_indexes.loading.get(&key) {
+            let loading = loading.clone();
+            return cx.background_spawn(loading);
+        }
+        let query = match builder::node_index(schema, &node.name, INDEX_MAX_NODES as u32 + 1) {
+            Ok(query) => query,
+            Err(error) => return Task::ready(Err(message(error))),
+        };
+        let read = self.read_fresh(at.scope.as_ref(), &query, commit.clone(), cx);
+        let (node, type_name) = (node.clone(), node.name.clone());
+        let (generation, budget) = (self.node_indexes.generation, self.node_indexes.budget);
+        let asked_head = commit.is_none();
+        let task = cx.spawn(async move |this, cx| {
+            let result = read.await;
+            let finished = match result {
+                Ok(output) => {
+                    let at = output.graph_commit_id.clone().or(commit.clone());
+                    // The answer's rows go once the index is made of them.
+                    let rows = output.rows;
+                    let loaded = cx
+                        .background_spawn(async move {
+                            if rows.as_array().map_or(0, Vec::len) > INDEX_MAX_NODES {
+                                return Loaded::TooLarge;
+                            }
+                            let index = NodeIndex::from_rows(&node, &rows);
+                            match index.bytes > budget {
+                                true => Loaded::TooLarge,
+                                false => Loaded::Index(Arc::new(index)),
+                            }
+                        })
+                        .await;
+                    Ok((at, loaded))
+                }
+                Err(error) => Err(message(error)),
+            };
+            let now = cx.background_executor().now();
+            this.update(cx, |this, _| {
+                // Forgotten while it was out (a new token, a new schema): it lands nowhere.
+                if this.node_indexes.generation != generation {
+                    return;
+                }
+                this.node_indexes
+                    .loading
+                    .remove(&(type_name.clone(), commit));
+                if let Ok((Some(at), loaded)) = &finished {
+                    this.node_indexes
+                        .insert(&type_name, at.clone(), loaded.clone());
+                    if asked_head {
+                        this.node_indexes
+                            .at_head
+                            .insert(type_name.clone(), (at.clone(), now));
+                    }
+                }
+            })
+            .ok();
+            finished
+        });
+        let shared = task.shared();
+        self.node_indexes.loading.insert(key, shared.clone());
+        cx.background_spawn(shared)
+    }
+
+    /// An index of `node` held at another commit that stands at `commit`: the branch's change
+    /// log says no node of the type changed between them.
+    fn carried_index(&self, node: &NodeType, commit: &str) -> Option<Arc<NodeIndex>> {
+        let ty = TypeRef::Node(node.name.clone());
+        self.node_indexes
+            .held_at(&node.name, node)
+            .into_iter()
+            .find(|(held, _)| {
+                matches!(
+                    self.changes_since(&self.branch, held, commit),
+                    crate::carry::Since::Known(since) if !since.type_changed(&ty)
+                )
+            })
+            .map(|(_, index)| index)
+    }
+
+    /// [`GraphSession::read_in`] `scope` when there is one, else [`GraphSession::read`].
+    fn read_through(
+        &mut self,
+        at: &ReadAt,
+        query: &builder::BuiltQuery,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<graph_client::api::ReadOutput, graph_client::ReadError>> {
+        match &at.scope {
+            Some(scope) => self.read_in(scope, query, at.commit.clone(), cx),
+            None => self.read(query, at.commit.clone(), cx),
+        }
+    }
+
+    /// The engine's full-text search of each of `properties` for `text`, at `commit`.
+    fn full_text_reads(
+        &mut self,
+        schema: &SchemaModel,
+        node: &NodeType,
+        properties: &[String],
+        text: &str,
+        at: &ReadAt,
+        cx: &mut Context<Self>,
+    ) -> Vec<(
+        String,
+        Task<Result<graph_client::api::ReadOutput, graph_client::ReadError>>,
+    )> {
+        if text.chars().count() < SERVER_MIN_CHARS {
+            return Vec::new();
+        }
+        properties
+            .iter()
+            .filter_map(|property| {
+                let query =
+                    builder::node_text_search(schema, &node.name, property, text, SERVER_ROWS)
+                        .ok()?;
+                Some((property.clone(), self.read_through(at, &query, cx)))
+            })
+            .collect()
+    }
+
+    /// The server's search of a type too large to hold (`builder::node_search`), ranked as an
+    /// index ranks, with full-text search of its indexed name and contact properties, else its
+    /// key.
+    fn server_find(
+        &mut self,
+        schema: &Arc<SchemaModel>,
+        node: NodeType,
+        text: String,
+        at: ReadAt,
+        limit: usize,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<TypeHits, SharedString>> {
+        let query = match builder::node_search(schema, &node.name, &text, SERVER_ROWS) {
+            Ok(query) => query,
+            Err(error) => return Task::ready(Err(message(error))),
+        };
+        let typed = text.chars().count() >= SERVER_MIN_CHARS || text.is_empty();
+        let read = typed.then(|| self.read_through(&at, &query, cx));
+        // Words on their own match many more nodes than the phrase they make: a name typed in
+        // full is asked for whole too, so it is among the rows read whatever its id.
+        let phrase = (typed && text.split_whitespace().nth(1).is_some())
+            .then(|| builder::node_phrase_search(schema, &node.name, &text, SERVER_ROWS).ok())
+            .flatten()
+            .map(|query| self.read_through(&at, &query, cx));
+        let searched = builder::searched_properties(&node);
+        let mut properties: Vec<String> = node
+            .properties
+            .iter()
+            .filter(|p| p.full_text && searched.contains(&p.name.as_str()))
+            .map(|p| p.name.clone())
+            .collect();
+        properties.extend(
+            node.key
+                .clone()
+                .filter(|key| node.property(key).is_some_and(|p| p.full_text)),
+        );
+        properties.truncate(TEXT_SEARCHES_SERVER);
+        let texts = self.full_text_reads(schema, &node, &properties, &text, &at, cx);
+        cx.spawn(async move |_, cx| {
+            let Some(read) = read else {
+                return Ok(TypeHits::default());
+            };
+            let output = read.await.map_err(message)?;
+            // The phrase's rows first: the words' rows hold them too, unless their limit cut
+            // them off.
+            let mut rows: Vec<Value> = match phrase {
+                Some(phrase) => phrase
+                    .await
+                    .ok()
+                    .and_then(|output| output.rows.as_array().cloned())
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            };
+            let asked = output.rows.as_array().map_or(0, Vec::len);
+            for row in output.rows.as_array().into_iter().flatten() {
+                if !rows.iter().any(|held| held.get("id") == row.get("id")) {
+                    rows.push(row.clone());
+                }
+            }
+            let rows = Value::Array(rows);
+            let answers = full_text_answers(texts).await;
+            let hits = cx
+                .background_spawn(async move {
+                    let mut hits =
+                        NodeIndex::from_rows(&node, &rows).find_listing_all(&text, limit);
+                    hits.more |= asked >= SERVER_ROWS as usize;
+                    hits.held = false;
+                    merge_full_text(&node, &mut hits, &answers, limit);
+                    hits
+                })
+                .await;
+            Ok(hits)
+        })
+    }
+}
+
+/// What each full-text read found, by property; a read that failed is left out (the property
+/// has no index yet, the engine refused it), since the type's own search still answers.
+async fn full_text_answers(
+    reads: Vec<(
+        String,
+        Task<Result<graph_client::api::ReadOutput, graph_client::ReadError>>,
+    )>,
+) -> Vec<(String, Arc<Value>)> {
+    let mut answers = Vec::new();
+    for (property, read) in reads {
+        if let Ok(output) = read.await {
+            answers.push((property, output.rows));
+        }
+    }
+    answers
 }
 
 #[cfg(test)]
