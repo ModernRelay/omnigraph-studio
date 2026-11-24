@@ -19,10 +19,13 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use futures::FutureExt as _;
 use futures::future::Shared;
-use gpui::{SharedString, Task};
+use gpui::{AppContext as _, Context, SharedString, Task};
 use gq_language::NodeType;
 use gq_language::builder;
+use graph_client::ReadError;
+use graph_client::api::ReadOutput;
 use serde_json::Value;
 use unicode_normalization::UnicodeNormalization as _;
 use unicode_normalization::char::is_combining_mark;
@@ -190,7 +193,7 @@ pub(crate) struct NodeIndex {
     label: Option<usize>,
     entries: Vec<Entry>,
     /// What it holds, counted as [`INDEX_BUDGET_BYTES`] counts.
-    pub(crate) bytes: usize,
+    bytes: usize,
 }
 
 impl NodeIndex {
@@ -467,21 +470,26 @@ const MARKER_BYTES: usize = 256;
 /// session knows no head: one head poll, as long as any view goes without asking (spec 031).
 pub const HEAD_UNKNOWN_HOLD: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// What a failed read says, as a search shows it.
+pub(crate) fn message(error: impl std::fmt::Display) -> SharedString {
+    error.to_string().into()
+}
+
 pub(crate) type Loading = Shared<Task<Result<(Option<String>, Loaded), SharedString>>>;
 
 /// The name indexes a session holds, by type and commit, within [`INDEX_BUDGET_BYTES`].
 pub(crate) struct NodeIndexes {
     held: HashMap<(String, String), (Loaded, u64)>,
     /// Indexes being read, by type and the commit asked for (`None`: the branch's head).
-    pub(crate) loading: HashMap<(String, Option<String>), Loading>,
+    loading: HashMap<(String, Option<String>), Loading>,
     /// While no head is known: the commit each type's index was last read at as the head's,
     /// and when.
-    pub(crate) at_head: HashMap<String, (String, std::time::Instant)>,
+    at_head: HashMap<String, (String, std::time::Instant)>,
     used: u64,
     /// Moves when the indexes are forgotten (a new token, a new schema), so a read still out
     /// from before lands nowhere.
-    pub(crate) generation: u64,
-    pub(crate) budget: usize,
+    generation: u64,
+    budget: usize,
 }
 
 impl Default for NodeIndexes {
@@ -573,7 +581,7 @@ impl NodeIndexes {
 
     /// Holds `loaded` for `type_name` at `commit`, then lets the least recently used go until
     /// the indexes are within the budget. An index is never larger than the budget alone
-    /// ([`GraphSession::node_index`] makes such a type `TooLarge`).
+    /// ([`Self::load`] makes such a type `TooLarge`).
     pub(crate) fn insert(&mut self, type_name: &str, commit: String, loaded: Loaded) {
         self.used += 1;
         let key = (type_name.to_owned(), commit);
@@ -590,6 +598,83 @@ impl NodeIndexes {
             };
             self.held.remove(&oldest);
         }
+    }
+
+    /// `node`'s index at `commit` (the branch's head when `None`), as `read` answers it, and the
+    /// commit it is of: joined to a read of it still out, else read once and made into an index
+    /// off the main thread, which is held when it lands unless the indexes were forgotten
+    /// meanwhile. A type of more than [`INDEX_MAX_NODES`] nodes, or whose index is larger than
+    /// the budget, is `TooLarge`. `of` finds the indexes in `holder`, which `read` reads through;
+    /// a read `read` refuses to send fails with what it says.
+    pub(crate) fn load<T: 'static>(
+        holder: &mut T,
+        of: fn(&mut T) -> &mut NodeIndexes,
+        node: &NodeType,
+        commit: Option<String>,
+        read: impl FnOnce(
+            &mut T,
+            Option<String>,
+            &mut Context<T>,
+        ) -> Result<Task<Result<ReadOutput, ReadError>>, SharedString>,
+        cx: &mut Context<T>,
+    ) -> Task<Result<(Option<String>, Loaded), SharedString>> {
+        let key = (node.name.clone(), commit.clone());
+        if let Some(loading) = of(holder).loading.get(&key) {
+            let loading = loading.clone();
+            return cx.background_spawn(loading);
+        }
+        let read = match read(holder, commit.clone(), cx) {
+            Ok(read) => read,
+            Err(error) => return Task::ready(Err(error)),
+        };
+        let (node, type_name) = (node.clone(), node.name.clone());
+        let indexes = of(holder);
+        let (generation, budget) = (indexes.generation, indexes.budget);
+        let asked_head = commit.is_none();
+        let task = cx.spawn(async move |this, cx| {
+            let result = read.await;
+            let finished = match result {
+                Ok(output) => {
+                    let at = output.graph_commit_id.clone().or(commit.clone());
+                    // The answer's rows go once the index is made of them.
+                    let rows = output.rows;
+                    let loaded = cx
+                        .background_spawn(async move {
+                            if rows.as_array().map_or(0, Vec::len) > INDEX_MAX_NODES {
+                                return Loaded::TooLarge;
+                            }
+                            let index = NodeIndex::from_rows(&node, &rows);
+                            match index.bytes > budget {
+                                true => Loaded::TooLarge,
+                                false => Loaded::Index(Arc::new(index)),
+                            }
+                        })
+                        .await;
+                    Ok((at, loaded))
+                }
+                Err(error) => Err(message(error)),
+            };
+            let now = cx.background_executor().now();
+            this.update(cx, |holder, _| {
+                let indexes = of(holder);
+                // Forgotten while it was out (a new token, a new schema): it lands nowhere.
+                if indexes.generation != generation {
+                    return;
+                }
+                indexes.loading.remove(&(type_name.clone(), commit));
+                if let Ok((Some(at), loaded)) = &finished {
+                    indexes.insert(&type_name, at.clone(), loaded.clone());
+                    if asked_head {
+                        indexes.at_head.insert(type_name.clone(), (at.clone(), now));
+                    }
+                }
+            })
+            .ok();
+            finished
+        });
+        let shared = task.shared();
+        of(holder).loading.insert(key, shared.clone());
+        cx.background_spawn(shared)
     }
 
     /// The commit `type_name`'s index was read at as the head's, while that stands.

@@ -37,7 +37,7 @@ use crate::ledger::{
 use crate::memo::{Held, Memo};
 use crate::node_search::{
     INDEX_MAX_NODES, Loaded, NodeIndex, NodeIndexes, SERVER_MIN_CHARS, SERVER_ROWS,
-    TEXT_SEARCHES_HELD, TEXT_SEARCHES_SERVER, TypeHits, merge_full_text,
+    TEXT_SEARCHES_HELD, TEXT_SEARCHES_SERVER, TypeHits, merge_full_text, message,
 };
 use crate::scope::{ReadScope, Scope, ScopeSince};
 use crate::server_features::{ServerFeature, ServerFeatures};
@@ -5183,10 +5183,6 @@ struct ReadAt {
     scope: Option<ReadScope>,
 }
 
-fn message(error: impl std::fmt::Display) -> SharedString {
-    error.to_string().into()
-}
-
 impl GraphSession {
     /// The nodes of `type_name` that `text` names, best first, at most `limit` (spec 031): from
     /// the type's name index when it holds at most [`INDEX_MAX_NODES`] nodes, else from the
@@ -5293,67 +5289,19 @@ impl GraphSession {
                 return Task::ready(Ok((Some(commit.clone()), loaded)));
             }
         }
-        let key = (node.name.clone(), commit.clone());
-        if let Some(loading) = self.node_indexes.loading.get(&key) {
-            let loading = loading.clone();
-            return cx.background_spawn(loading);
-        }
-        let query = match builder::node_index(schema, &node.name, INDEX_MAX_NODES as u32 + 1) {
-            Ok(query) => query,
-            Err(error) => return Task::ready(Err(message(error))),
-        };
-        let read = self.read_fresh(at.scope.as_ref(), &query, commit.clone(), cx);
-        let (node, type_name) = (node.clone(), node.name.clone());
-        let (generation, budget) = (self.node_indexes.generation, self.node_indexes.budget);
-        let asked_head = commit.is_none();
-        let task = cx.spawn(async move |this, cx| {
-            let result = read.await;
-            let finished = match result {
-                Ok(output) => {
-                    let at = output.graph_commit_id.clone().or(commit.clone());
-                    // The answer's rows go once the index is made of them.
-                    let rows = output.rows;
-                    let loaded = cx
-                        .background_spawn(async move {
-                            if rows.as_array().map_or(0, Vec::len) > INDEX_MAX_NODES {
-                                return Loaded::TooLarge;
-                            }
-                            let index = NodeIndex::from_rows(&node, &rows);
-                            match index.bytes > budget {
-                                true => Loaded::TooLarge,
-                                false => Loaded::Index(Arc::new(index)),
-                            }
-                        })
-                        .await;
-                    Ok((at, loaded))
-                }
-                Err(error) => Err(message(error)),
-            };
-            let now = cx.background_executor().now();
-            this.update(cx, |this, _| {
-                // Forgotten while it was out (a new token, a new schema): it lands nowhere.
-                if this.node_indexes.generation != generation {
-                    return;
-                }
-                this.node_indexes
-                    .loading
-                    .remove(&(type_name.clone(), commit));
-                if let Ok((Some(at), loaded)) = &finished {
-                    this.node_indexes
-                        .insert(&type_name, at.clone(), loaded.clone());
-                    if asked_head {
-                        this.node_indexes
-                            .at_head
-                            .insert(type_name.clone(), (at.clone(), now));
-                    }
-                }
-            })
-            .ok();
-            finished
-        });
-        let shared = task.shared();
-        self.node_indexes.loading.insert(key, shared.clone());
-        cx.background_spawn(shared)
+        let scope = at.scope.clone();
+        NodeIndexes::load(
+            self,
+            |session| &mut session.node_indexes,
+            node,
+            commit,
+            |session, commit, cx| {
+                let query = builder::node_index(schema, &node.name, INDEX_MAX_NODES as u32 + 1)
+                    .map_err(message)?;
+                Ok(session.read_fresh(scope.as_ref(), &query, commit, cx))
+            },
+            cx,
+        )
     }
 
     /// An index of `node` held at another commit that stands at `commit`: the branch's change
