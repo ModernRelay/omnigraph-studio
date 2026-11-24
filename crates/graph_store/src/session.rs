@@ -32,7 +32,7 @@ use crate::carry::{ChangeLog, ChangesSince, FeedFold, Since, TypeRef, answer_unc
 use crate::connection::{Connection, ConnectionEvent, ConnectionState, ConnectionWatch};
 use crate::degrees::{DEGREE_BATCH, DegreeBatchKey, DegreeBatches, page_counts};
 use crate::ledger::{
-    Answered, Asker, Origin, ReadEvent, ReadLedger, ReadView, Sending, SendsReads, Status, Target,
+    Answered, Asker, Origin, ReadEvent, ReadLedger, ReadView, Sending, Status, Target,
 };
 use crate::memo::{Held, Memo};
 use crate::node_search::{
@@ -5152,10 +5152,10 @@ fn read_status<T>(result: &Result<T, ReadError>) -> Status {
     }
 }
 
-/// [`GraphSession::counted_read`] asked for by `asker`, for a read a session method sends after
-/// it returned, as a node's history sends each of its pages (spec 046).
-impl SendsReads for GraphSession {
-    fn counted_read_by<T: Send + 'static>(
+impl GraphSession {
+    /// [`Self::counted_read`] asked for by `asker`, for a read sent after the call that asked
+    /// for it returned, as a node's history sends each of its pages (spec 046).
+    pub(crate) fn counted_read_by<T: Send + 'static>(
         &mut self,
         what: &'static str,
         asker: Asker,
