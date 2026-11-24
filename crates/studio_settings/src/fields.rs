@@ -299,22 +299,23 @@ fn sentence(key: &str) -> String {
 }
 
 /// The settings in their JSON form, serialized once: for reading many settings at a time, as
-/// the settings tab does for every row it draws. It holds the defaults in the same form, to say
-/// which settings are at theirs.
-pub struct SettingsValues {
-    values: Value,
-    defaults: &'static Value,
-}
+/// the settings tab does for every row it draws.
+pub struct SettingsValues(Value);
 
 impl SettingsValues {
+    /// `settings`' values, to read by path.
+    pub fn of(settings: &StudioSettings) -> Self {
+        SettingsValues(serde_json::to_value(settings).unwrap_or_default())
+    }
+
     /// The value at `path`; `Null` where there is none.
     pub fn at(&self, path: &[String]) -> &Value {
-        at(&self.values, path)
+        at(&self.0, path)
     }
 
     /// Whether the setting at `path` has its default value.
     fn is_default_at(&self, path: &[String]) -> bool {
-        self.at(path) == at(self.defaults, path)
+        self.at(path) == at(StudioSettings::default_values(), path)
     }
 
     /// The value `field` has in `scope`: a graph's override, else the shared value.
@@ -342,14 +343,6 @@ fn at<'a>(document: &'a Value, path: &[String]) -> &'a Value {
 }
 
 impl StudioSettings {
-    /// The document's values, to read by path.
-    pub fn values(&self) -> SettingsValues {
-        SettingsValues {
-            values: serde_json::to_value(self).unwrap_or_default(),
-            defaults: Self::default_values(),
-        }
-    }
-
     /// The document with `value` at `path`, or why it does not fit there.
     pub fn with_value(&self, path: &[String], value: Value) -> Result<Self, String> {
         let mut document = serde_json::to_value(self).map_err(|e| e.to_string())?;
@@ -524,7 +517,10 @@ mod tests {
     fn values_are_read_written_and_reset_by_path() {
         let path = |p: &str| p.split('.').map(str::to_owned).collect::<Vec<_>>();
         let settings = StudioSettings::default();
-        assert_eq!(settings.values().at(&path("studio.tree_page_size")), 50);
+        assert_eq!(
+            SettingsValues::of(&settings).at(&path("studio.tree_page_size")),
+            50
+        );
         let changed = settings
             .with_value(&path("studio.window_style"), "glass".into())
             .unwrap()
@@ -534,8 +530,8 @@ mod tests {
             .unwrap();
         assert_eq!(changed.studio.window_style, WindowStyle::Glass);
         assert_eq!(changed.ui_density, Density::Compact);
-        assert!(!changed.values().is_default_at(&path("ui_font_family")));
-        assert!(changed.values().is_default_at(&path("theme.mode")));
+        assert!(!SettingsValues::of(&changed).is_default_at(&path("ui_font_family")));
+        assert!(SettingsValues::of(&changed).is_default_at(&path("theme.mode")));
         let reset = changed.reset_at(&path("ui_font_family"));
         assert_eq!(reset.ui_font_family, None);
         assert_eq!(reset.ui_density, Density::Compact, "only that setting");
@@ -554,19 +550,19 @@ mod tests {
         let scope = Scope::Graph(crate::overrides_key("dev", "knowledge"));
         let settings = StudioSettings::default();
         assert_eq!(
-            *settings.values().value_in(&scope, page),
+            *SettingsValues::of(&settings).value_in(&scope, page),
             50,
             "the shared value shows through"
         );
-        assert!(settings.values().is_default_in(&scope, page));
+        assert!(SettingsValues::of(&settings).is_default_in(&scope, page));
         let changed = settings.with_value_in(&scope, page, 20.into()).unwrap();
-        assert_eq!(*changed.values().value_in(&scope, page), 20);
+        assert_eq!(*SettingsValues::of(&changed).value_in(&scope, page), 20);
         assert_eq!(
             changed.studio.tree_page_size, 50,
             "the shared value is untouched"
         );
-        assert!(!changed.values().is_default_in(&scope, page));
-        assert!(changed.values().is_default_in(&Scope::All, page));
+        assert!(!SettingsValues::of(&changed).is_default_in(&scope, page));
+        assert!(SettingsValues::of(&changed).is_default_in(&Scope::All, page));
         assert_eq!(changed.for_graph("dev", "knowledge").tree_page_size, 20);
         let cleared = changed.reset_in(&scope, page);
         assert!(
