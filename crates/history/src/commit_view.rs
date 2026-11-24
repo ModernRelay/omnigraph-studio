@@ -19,7 +19,7 @@ use studio_actions::changes::{OpenChanged, ToggleChange};
 use studio_actions::graph::{CreateBranchAt, OpenCommit, OpenNodePage, OpenQueryAt, OpenType};
 use studio_actions::history::{LoadMoreChanges, NewBranchHere};
 use studio_ui::ds::Tipped;
-use studio_ui::menu::ContextMenu;
+use studio_ui::ds::menu::ContextMenu;
 use studio_ui::{now_micros, relative_time, short_commit_id, utc_date_time};
 use studio_workspace::{Inspected, InspectedNode, Item, ItemEvent, SavedItem, Workspace};
 use ui::prelude::*;

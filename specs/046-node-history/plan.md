@@ -25,8 +25,8 @@ says who set it.
 
 ## Principles
 
-- **I.** Every read goes through the session and `graph_client` (`GraphSession::node_history_in`,
-  `node_history_search`). Studio keeps no history of its own: the session holds only the node's
+- **I.** Every read goes through the session and `graph_client` (`graph_store::node_history`'s
+  `read_window` and `search_creation`, counted by the session). Studio keeps no history of its own: the session holds only the node's
   last change as its history read last found it, for the page, and forgets it with a new token.
 - **II.** Every window answers for the head the first listing resolved; each read is pinned to
   its commit's snapshot. Any move of the branch's head past it offers Refresh.
@@ -120,7 +120,7 @@ Read back to YSJP572K, 32 min ago, the graph's first commit. 29 commits read.
 
 ### Reading
 
-Per window (`GraphSession::node_history_in`, `graph_store::node_history`):
+Per window (`graph_store::node_history::read_window`):
 
 1. `node_history_commits`: `GET /commits?branch=&limit=50` for the first window, `limit=200` and
    `page_token` for an older one.

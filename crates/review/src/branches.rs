@@ -19,7 +19,7 @@ use studio_actions::graph::{
     CreateBranch, CreateBranchAt, DeleteBranch, OpenBranch, OpenBranchHistory, ReviewBranch,
 };
 use studio_ui::ds::Tipped;
-use studio_ui::menu::{ContextMenu, ContextMenuEntry};
+use studio_ui::ds::menu::{ContextMenu, ContextMenuEntry};
 use studio_ui::{ds, now_micros, relative_time, short_commit_id};
 use studio_workspace::{Workspace, WorkspaceEvent};
 use ui::prelude::*;

@@ -48,7 +48,7 @@ use studio_actions::{ViewKind, ViewLink};
 use studio_settings::{BottomDockLayout, ServerEnvironment, StudioSettings};
 use studio_ui::ds::IconButton;
 use studio_ui::ds::Tipped;
-use studio_ui::menu::{ContextMenu, ContextMenuEntry, ContextMenuItem};
+use studio_ui::ds::menu::{ContextMenu, ContextMenuEntry, ContextMenuItem};
 use studio_ui::window_buttons::{self, WindowButtons};
 use ui::prelude::*;
 use ui::{ButtonLike, PopoverMenu, right_click_menu};
@@ -3254,19 +3254,18 @@ impl Workspace {
                                  window: &mut Window,
                                  cx: &mut Context<_>| {
                         match workspace.running_write(cx) {
-                        // Asked again for a write started since; the unsaved tabs were.
-                        Some(graph) => workspace.show_toast(
-                            ToastKind::Error,
-                            format!(
-                                "A write to {graph} is still running. Close the window when it finishes."
-                            ),
-                            cx,
-                        ),
-                        None => {
-                            workspace.flush_saves(cx);
-                            window.remove_window();
+                            // Asked again for a write started since; the unsaved tabs were.
+                            Some(graph) => {
+                                let message = format!(
+                                    "A write to {graph} is still running. Close the window when it finishes."
+                                );
+                                workspace.show_toast(ToastKind::Error, message, cx)
+                            }
+                            None => {
+                                workspace.flush_saves(cx);
+                                window.remove_window();
+                            }
                         }
-                    }
                     };
                     self.confirm_close(Closing::Window, unsaved, close, window, cx);
                     return false;

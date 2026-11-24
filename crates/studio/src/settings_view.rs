@@ -20,8 +20,8 @@ use graph_store::{GraphSession, SessionEvent};
 use serde_json::Value;
 use studio_settings::{FieldKind, Scope, SettingField, SettingsValues, StudioSettings, TypeNaming};
 use studio_ui::ds::Tipped;
+use studio_ui::ds::menu::ContextMenu;
 use studio_ui::ds::{self, Dotted as _, space};
-use studio_ui::menu::ContextMenu;
 use studio_workspace::models::{KeyState, Models};
 use studio_workspace::{Item, ItemEvent, SavedItem, ToastKind, Workspace, WorkspaceEvent};
 use theme::ThemeRegistry;
@@ -157,7 +157,7 @@ impl SettingsView {
                 }
             }),
             cx.observe_global_in::<StudioSettings>(window, |this, window, cx| {
-                this.values = StudioSettings::get(cx).values();
+                this.values = SettingsValues::of(StudioSettings::get(cx));
                 this.show_text_values(window, cx)
             }),
             // Typing a field holds when the tab closes, or Studio quits, is written: the field
@@ -222,7 +222,7 @@ impl SettingsView {
             key_editor,
             key_notice: None,
             key_test: None,
-            values: StudioSettings::get(cx).values(),
+            values: SettingsValues::of(StudioSettings::get(cx)),
             cloud: cx.new(crate::cloud_settings::CloudPage::new),
             cloud_shown: None,
             _workspace_subscription: None,
@@ -424,9 +424,7 @@ impl SettingsView {
             scope: self.scope.clone(),
             field: input.field,
         };
-        if *StudioSettings::get(cx)
-            .values()
-            .value_in(&target.scope, target.field)
+        if *SettingsValues::of(StudioSettings::get(cx)).value_in(&target.scope, target.field)
             != value
         {
             target.set(value, cx);

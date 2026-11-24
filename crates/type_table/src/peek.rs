@@ -32,8 +32,8 @@ use studio_actions::node::{CancelField, EditNodeName, ExpandField, SaveField, Sa
 use studio_actions::table::{SelectNextSuggestion, SelectPreviousSuggestion};
 use studio_actions::workspace::Refresh;
 use studio_ui::ds::Tipped;
+use studio_ui::ds::menu::ContextMenu;
 use studio_ui::ds::space;
-use studio_ui::menu::ContextMenu;
 use ui::prelude::*;
 use ui::{PopoverMenu, ToggleState};
 

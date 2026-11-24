@@ -37,8 +37,8 @@ use studio_actions::query::{
 use studio_actions::table::RevertView;
 use studio_actions::workspace::Refresh;
 use studio_ui::ds::Tipped;
+use studio_ui::ds::menu::{ContextMenu, ContextMenuEntry};
 use studio_ui::ds::{Dotted as _, space};
-use studio_ui::menu::{ContextMenu, ContextMenuEntry};
 use studio_ui::{
     ColumnDrag, ColumnResize, GridColumn, GridPlace, ROW_HEIGHT, columns_in_view, format_elapsed,
     format_value, grid_cell, grid_header, grid_places, is_numeric, resizable_grid_header,

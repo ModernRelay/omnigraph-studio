@@ -53,7 +53,7 @@ use ui::prelude::*;
 
 use layout::{LayoutKind, LayoutNode, Vec2};
 use model::{HUB_STEP, Scene, SceneId, SceneKind, SceneNode};
-use studio_ui::menu::ContextMenu;
+use studio_ui::ds::menu::ContextMenu;
 use studio_ui::motion::{self, Glide, Glides};
 
 /// The closest the view zooms in.
