@@ -43,8 +43,8 @@ use studio_actions::table::{
 use studio_actions::workspace::ToggleInspector;
 use studio_actions::{ViewKind, ViewLink};
 use studio_ui::ds::Tipped;
+use studio_ui::ds::menu::{ContextMenu, ContextMenuEntry};
 use studio_ui::ds::space;
-use studio_ui::menu::{ContextMenu, ContextMenuEntry};
 use studio_ui::plural;
 use studio_ui::{ColumnDrag, ColumnResize, GridPlace, ROW_HEIGHT, columns_in_view, grid_places};
 use studio_workspace::models::{self, Error as ModelError, Models, Request as ModelRequest};

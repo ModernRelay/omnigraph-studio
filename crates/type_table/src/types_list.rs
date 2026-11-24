@@ -17,7 +17,7 @@ use studio_actions::graph::{OpenMap, OpenSavedView, OpenType};
 use studio_settings::StudioSettings;
 use studio_ui::ds::Prose as _;
 use studio_ui::ds::Tipped;
-use studio_ui::menu::ContextMenu;
+use studio_ui::ds::menu::ContextMenu;
 use studio_workspace::{ToastKind, Workspace, WorkspaceEvent};
 use ui::prelude::*;
 use ui::right_click_menu;

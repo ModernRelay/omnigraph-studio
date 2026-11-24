@@ -880,7 +880,7 @@ than styling one-off elements.
   each a pill of its own, sit `space::SM` apart there. Zed's `ButtonLike` keeps its corners at 4 px and
   its colours private, so Studio draws its own and keeps Zed's builder traits; no view
   constructs Zed's `Button` or `IconButton`.
-- **Menus** (`studio_ui::menu`, a fork of Zed's `ContextMenu` at v1.23.2, GPL-3.0-or-later,
+- **Menus** (`studio_ui::ds::menu`, a fork of Zed's `ContextMenu` at v1.23.2, GPL-3.0-or-later,
   credited in the file). Zed's behaviour (keys, submenus, asides, actions, accessibility) with
   Tower's drawing: the modal's fill, hairline and shadow at the scale's `md` corner (`Radii::menu`), a 4 px
   inset, 26 px rows (`ds::MenuRow`, `size::MENU_ROW`) rounded within it, the hovered or

@@ -14,7 +14,7 @@ use graph_store::{GraphSession, Loadable, SessionEvent};
 use studio_actions::graph::{NewQuery, OpenQueryFile, OpenStoredQuery};
 use studio_actions::queries::{OpenSelected, SelectNext, SelectPrevious};
 use studio_ui::ds::Tipped;
-use studio_ui::menu::{ContextMenu, ContextMenuEntry};
+use studio_ui::ds::menu::{ContextMenu, ContextMenuEntry};
 use studio_workspace::{ToastKind, Workspace, WorkspaceEvent};
 use ui::prelude::*;
 use ui::right_click_menu;
