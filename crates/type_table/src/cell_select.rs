@@ -18,8 +18,8 @@ use gq_language::input::{parse_input, same_value};
 use gq_language::{Property, ScalarKind};
 use studio_actions::table::{SelectNextSuggestion, SelectPreviousSuggestion};
 use studio_ui::ROW_HEIGHT;
+use studio_ui::ds::menu::{MenuRow, menu_separator, menu_surface};
 use studio_ui::ds::{size, space};
-use studio_ui::menu::{MenuRow, menu_separator, menu_surface};
 use ui::prelude::*;
 
 use crate::model::{Notice, Tone};

@@ -11,8 +11,8 @@ use gpui::{
     Render, Role, ScrollStrategy, UniformListScrollHandle, Window, uniform_list,
 };
 use graph_client::api::CommitOutput;
+use studio_ui::ds::menu::{MenuRow, menu_header, menu_separator, menu_surface};
 use studio_ui::ds::{size, space};
-use studio_ui::menu::{MenuRow, menu_header, menu_separator, menu_surface};
 use studio_ui::{now_micros, relative_time, short_commit_id};
 use ui::prelude::*;
 

@@ -34,8 +34,8 @@ use studio_actions::graph::{
 };
 use studio_actions::workspace::ToggleInspector;
 use studio_actions::{ViewKind, ViewLink};
+use studio_ui::ds::menu::ContextMenu;
 use studio_ui::ds::{Tipped, space};
-use studio_ui::menu::ContextMenu;
 use studio_ui::{ChangeKind, plural};
 use studio_workspace::{Inspected, Item, ItemEvent, ItemStatus, KeyHint, SavedItem, Workspace};
 use ui::PopoverMenu;

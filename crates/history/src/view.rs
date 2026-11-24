@@ -20,7 +20,7 @@ use studio_actions::history::{NewBranchHere, NextMatch, PreviousMatch};
 use studio_actions::workspace::Refresh;
 use studio_actions::{ViewKind, ViewLink};
 use studio_ui::ds::Tipped;
-use studio_ui::menu::ContextMenu;
+use studio_ui::ds::menu::ContextMenu;
 use studio_ui::{group_digits, now_micros, relative_time, short_commit_id};
 use studio_workspace::{Inspected, Item, ItemEvent, SavedItem};
 use ui::prelude::*;

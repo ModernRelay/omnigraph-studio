@@ -48,7 +48,7 @@ use studio_actions::{ViewKind, ViewLink};
 use studio_settings::{BottomDockLayout, ServerEnvironment, StudioSettings};
 use studio_ui::ds::IconButton;
 use studio_ui::ds::Tipped;
-use studio_ui::menu::{ContextMenu, ContextMenuEntry, ContextMenuItem};
+use studio_ui::ds::menu::{ContextMenu, ContextMenuEntry, ContextMenuItem};
 use studio_ui::window_buttons::{self, WindowButtons};
 use ui::prelude::*;
 use ui::{ButtonLike, PopoverMenu, right_click_menu};
