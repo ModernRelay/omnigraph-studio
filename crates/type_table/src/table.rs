@@ -1134,6 +1134,8 @@ pub struct TypeTable {
     /// Where the grid's lines are scrolled, cut or wrapped (spec 049); told how many there are
     /// each frame.
     lines: GridRows,
+    /// The wrap the lines were last drawn with, so a change of it moves the scroll across.
+    lines_wrap: CellWrap,
     /// The lines the rows of this frame have drawn so far, first to last, and whether this
     /// frame's per-frame work is done: the list draws a row at a time.
     frame_lines_drawn: Option<Range<usize>>,
@@ -1246,6 +1248,10 @@ pub struct TypeTable {
     /// value is read as markdown to show its first line, too slow to do for every cell every
     /// frame. A cell set, or rows read again, are made again.
     cell_text: RefCell<HashMap<String, HashMap<String, CellText>>>,
+    /// How many lines each row takes wrapped, by row id (spec 049): worked out from every
+    /// column's text when the row is first drawn wrapped, so a row keeps its height while the
+    /// grid scrolls sideways, and forgotten with the row's cell text or a width or wrap change.
+    wrapped_lines: RefCell<HashMap<String, usize>>,
     /// The inspector's view of a row, by the row's id: made when the workspace asks what is
     /// selected ([`Item::inspected`]), and told of the table's writes while it is that row's.
     peek: Option<(String, Entity<NodePeek>)>,
@@ -1616,6 +1622,7 @@ impl TypeTable {
         let table_state = cx.new(|cx| TableInteractionState::new(cx));
         let scope = at_commit.is_none().then(|| new_scope(&session, cx));
         let sizing = type_sizing(&session, &type_name, opening.saved_widths, cx);
+        let lines_wrap = sizing.wrap();
         let mut this = Self {
             workspace,
             session,
@@ -1662,6 +1669,7 @@ impl TypeTable {
             resizing: None,
             sizing,
             lines: GridRows::new(table_state.read(cx).scroll_handle.clone()),
+            lines_wrap,
             frame_lines_drawn: None,
             blob_lines: None,
             _blob_wait: None,
@@ -1708,6 +1716,7 @@ impl TypeTable {
             absent: HashMap::new(),
             menu_choices: Default::default(),
             cell_text: RefCell::new(HashMap::new()),
+            wrapped_lines: RefCell::default(),
             peek: None,
             inspected_row: None,
             newer: false,
@@ -1881,6 +1890,7 @@ impl TypeTable {
             let renamed = schema.renamed_since(&was);
             self.schema = Some(schema);
             self.cell_text.borrow_mut().clear();
+            self.wrapped_lines.borrow_mut().clear();
             let by_neighbours = self.grouping.as_ref().is_some_and(|grouping| {
                 matches!(
                     builder::parse_group_key(&grouping.property),
@@ -1918,6 +1928,7 @@ impl TypeTable {
             self.rows.clear();
             self.placed_here.clear();
             self.cell_text.borrow_mut().clear();
+            self.wrapped_lines.borrow_mut().clear();
             cx.notify();
             return;
         };
@@ -2190,7 +2201,15 @@ impl TypeTable {
     /// The type's widths or wrap changed: the lines are measured again, and, when `keep`, the
     /// change is kept for the type, which its other tabs follow.
     fn sizing_changed(&mut self, keep: bool, cx: &mut Context<Self>) {
+        self.wrapped_lines.borrow_mut().clear();
         self.lines.measured.remeasure();
+        if self.lines_wrap != self.sizing.wrap() {
+            // The first line in view stays first; the cursor's stays in view.
+            self.lines.sync(self.line_count());
+            self.lines.switch(self.lines_wrap);
+            self.lines_wrap = self.sizing.wrap();
+            self.reveal_cursor();
+        }
         if keep {
             self.keep_sizing(cx);
         }
@@ -2253,6 +2272,17 @@ impl TypeTable {
     fn scrolled_down(&self) -> Pixels {
         let (line, offset) = self.lines.first(self.sizing.wrap());
         -(self.lines.cut_row_height() * line as f32 + offset)
+    }
+
+    /// Scrolls as little as shows the cursor's line.
+    fn reveal_cursor(&self) {
+        let line = self.cursor.and_then(|cursor| match &self.grouping {
+            Some(grouping) => grouping.line_of_row(cursor.row),
+            None => Some(cursor.row),
+        });
+        if let Some(line) = line {
+            self.reveal_line(line);
+        }
     }
 
     /// Scrolls as little as shows all of `line`.
@@ -4135,6 +4165,7 @@ impl TypeTable {
         self.rows.clear();
         self.placed_here.clear();
         self.cell_text.borrow_mut().clear();
+        self.wrapped_lines.borrow_mut().clear();
         // At the same commit a row's relationships and Blob cells cannot have changed: a new
         // order or filter keeps what was read and reads only rows not seen yet.
         if !keep_pin {
@@ -4169,6 +4200,9 @@ impl TypeTable {
         self.owed_sections.clear();
         self.count_task = None;
         self.total_task = None;
+        // Other rows: no height the wrapped list measured for these is kept. Taking the head
+        // (`swap`) puts the first row back where it was itself.
+        self.lines.reset(0);
         if !swap {
             self.scroll_to_line(0, Pixels::ZERO);
         }
@@ -5058,6 +5092,7 @@ impl TypeTable {
         if let Some(row) = self.cell_text.borrow_mut().get_mut(&self.rows[first].id) {
             row.remove(column);
         }
+        self.wrapped_lines.borrow_mut().remove(&self.rows[first].id);
     }
 
     /// Puts back what a row showed (`shown`) before a save that did not land put `new` in its
@@ -6295,9 +6330,11 @@ impl TypeTable {
         let going: HashSet<&str> = ids.iter().map(String::as_str).collect();
         {
             // A row put back (an undone delete) shows its values afresh.
-            let mut shown = self.cell_text.borrow_mut();
+            let (mut shown, mut lines) =
+                (self.cell_text.borrow_mut(), self.wrapped_lines.borrow_mut());
             for id in &going {
                 shown.remove(*id);
+                lines.remove(*id);
             }
         }
         // From the last row up, so each index is the row's place once the rows after it went.
@@ -6401,13 +6438,7 @@ impl TypeTable {
 
     fn set_cursor(&mut self, cursor: Cursor, cx: &mut Context<Self>) {
         self.cursor = Some(cursor);
-        let line = match &self.grouping {
-            Some(grouping) => grouping.line_of_row(cursor.row),
-            None => Some(cursor.row),
-        };
-        if let Some(line) = line {
-            self.reveal_line(line);
-        }
+        self.reveal_cursor();
         self.scroll_column_into_view(cursor.col, cx);
         if self
             .paging
@@ -12104,25 +12135,33 @@ impl TypeTable {
             .collect()
     }
 
-    /// How tall `row` is wrapped: as its text cell with the most lines among the columns its
-    /// rows draw, each line `line` high ([`studio_ui::wrapped_row_height`]).
+    /// How tall `row` is wrapped: as its text cell with the most lines among all its columns,
+    /// drawn or not, each line `line` high ([`studio_ui::wrapped_row_height`]); worked out once
+    /// a row until its text, a width or the wrap changes.
     fn wrapped_row_height(&self, row: &Row, line: Pixels, window: &Window, cx: &App) -> Pixels {
-        let lines = self
-            .frame_places
-            .iter()
-            .filter_map(|place| match *place {
-                GridPlace::Column(col) if self.frame_rows_drawn.get(col) != Some(&false) => {
-                    let column = self.columns.get(col)?;
-                    self.wraps(column).then(|| {
+        let known = self.wrapped_lines.borrow().get(&row.id).copied();
+        let lines = known.unwrap_or_else(|| {
+            let lines = studio_ui::row_lines(
+                self.columns
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, column)| self.wraps(column))
+                    .map(|(col, column)| {
                         let value = row.value(&column.key);
-                        studio_ui::cell_text(self.cell_text_of(row, column, value).shown, cx)
-                            .wrapped_lines(px(self.text_room(col, column)), window, cx)
-                    })
-                }
-                _ => None,
-            })
-            .max()
-            .unwrap_or(1);
+                        let shown = self.cell_text_of(row, column, value).shown;
+                        (
+                            studio_ui::cell_text(shown, cx),
+                            px(self.text_room(col, column)),
+                        )
+                    }),
+                window,
+                cx,
+            );
+            self.wrapped_lines
+                .borrow_mut()
+                .insert(row.id.clone(), lines);
+            lines
+        });
         studio_ui::wrapped_row_height(lines, line, px(ROW_HEIGHT))
     }
 
@@ -16466,6 +16505,35 @@ mod tests {
         assert!(kept(cx).is_default());
         let cut = table.read_with(cx, |table, _| table.lines.cut_row_height());
         assert_eq!(cut, row, "cut again, every line is a row");
+    }
+
+    /// Wrapped, a row is as tall as its text with the most lines in any column, drawn or not:
+    /// a type's long text far out of view still makes its row tall, so the row keeps its
+    /// height while the grid scrolls sideways (review of #180).
+    #[gpui::test]
+    async fn a_wrapped_row_is_as_tall_as_its_text_out_of_view(cx: &mut TestAppContext) {
+        let properties: String = (0..30).map(|i| format!("  p{i:02}: String?\n")).collect();
+        let schema = format!("node Person {{\n  slug: String @key\n{properties}}}\n");
+        let long = "a long value that wraps onto several lines ".repeat(10);
+        let session = crate::test_support::session_reading(
+            &schema,
+            serde_json::json!([{"n": {"@id": "p1", "slug": "p1", "p29": long}}]),
+            cx,
+        );
+        let (table, cx) = people_table(&session, cx);
+        table.update_in(cx, |table, window, cx| {
+            table.change_columns(ColumnChange::ToggleWrap, None, window, cx)
+        });
+        cx.run_until_parked();
+        let (drawn, height) = table.read_with(cx, |table, _| {
+            let p29 = table.column_index("p29").unwrap();
+            let drawn = table.frame_rows_drawn.get(p29).copied().unwrap_or(false);
+            let bounds = table.lines.measured.bounds_for_item(0).expect("drawn");
+            (drawn, bounds.size.height)
+        });
+        assert!(!drawn, "p29 is out of view");
+        let line = cx.update(|window, cx| studio_ui::cell_line_height(window, cx));
+        assert!(height >= px(ROW_HEIGHT) + line, "{height:?}");
     }
 
     /// A restored tab sets its order and grouping before the schema is read: they wait for it,
