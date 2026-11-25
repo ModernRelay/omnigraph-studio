@@ -1,0 +1,9 @@
+thread 'table::tests::a_column_edge_is_the_resize_handles_and_no_control_reaches_it' (14065) panicked at crates/type_table/src/table.rs:15753:17:
+assertion `left == right` failed: -0.5 px from slug's rule
+  left: (None, false, false)
+ right: (Some("slug"), false, false)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+--
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 300 filtered out; finished in 0.16s
+
+error: test failed, to rerun pass `-p type_table --lib`
