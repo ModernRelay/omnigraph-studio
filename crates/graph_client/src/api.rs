@@ -29,8 +29,9 @@ pub struct GraphListResponse {
     pub graphs: Vec<GraphInfo>,
 }
 
-/// `GET /graphs/discovery`: the graphs an identity credential (managed or OIDC) may know of,
-/// with no storage or serving metadata. A static token is refused it.
+/// `GET /graphs/discovery`: graph ids and names, with no storage or serving metadata. From
+/// Omnigraph #1544 it answers every credential with the graphs it can read on some branch;
+/// earlier servers answer identity credentials (managed or OIDC) only, with every graph.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GraphDiscoveryResponse {
     pub graphs: Vec<GraphDiscoveryEntry>,

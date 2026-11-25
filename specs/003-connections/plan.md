@@ -53,8 +53,10 @@ dialog by keyboard), X (capabilities from the served document).
 - Public routes: `GET`/`HEAD /healthz`, `GET /readyz`, `GET /openapi.json`. The CLI checks the
   contract with `HEAD /healthz` before a data request.
 - `GET /graphs` needs the `graph_list` action, which is denied without a cluster policy, even to
-  a valid token. `GET /graphs/discovery` returns ids and names but accepts only identity
-  credentials, not static tokens.
+  a valid token. `GET /graphs/discovery` returns ids and names. Before Omnigraph #1544 it
+  accepts only identity credentials and names every graph; from #1544 it answers every
+  credential with the graphs it can read on some branch, and a graph that grants the
+  credential nothing answers 404 on every route, as a missing one does.
 - The CLI's operator home is `$OMNIGRAPH_HOME`, else `~/.omnigraph`, its file `config.yaml`
   there. Since Omnigraph main `f7db38da` (#1115) and `ff542202` (#1126) the file is the version-1
   operator configuration (`version: 1` with `profiles`, `targets`, `aliases` and `defaults`); a
@@ -295,8 +297,9 @@ dialog by keyboard), X (capabilities from the served document).
    same rule applies to addresses from the CLI's targets and the environment.
    `GraphClient::new` refuses an unusable root rather than building URLs on it.
 3. Graph ids for a server come from, in order: `GET /graphs` when allowed; else
-   `GET /graphs/discovery`, which names the graphs an identity credential (managed or OIDC)
-   may know of, with no state; its target's `default_graph`; graph ids the person typed
+   `GET /graphs/discovery`, which names graphs with no state (before Omnigraph #1544, every
+   graph, to identity credentials only; from #1544, the graphs the credential can read, to any
+   credential); its target's `default_graph`; graph ids the person typed
    before. A 403 on both is not an error state; Studio says "This token may not list graphs.
    Enter a graph id." A discovery that fails otherwise says the list could not be read.
 
