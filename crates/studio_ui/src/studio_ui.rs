@@ -29,8 +29,9 @@ pub use changes::{
 };
 pub use ds::cell_text::{CellText, cell_text, shown_part};
 pub use grid_columns::{
-    COLUMN_STEP, CellWrap, ColumnChange, FIT_ROWS, GridColumns, GridLayout, WRAP_LINES,
-    cell_line_height, fitted_width, widest_text, wrapped_row_height, wrapping_cell,
+    COLUMN_STEP, CellWrap, ColumnChange, FIT_ROWS, GridColumns, GridLayout, GridRows, WRAP_LINES,
+    WRAPPED_DRAW_AHEAD, cell_line_height, fitted_width, widest_text, wrapped_row_height,
+    wrapping_cell,
 };
 pub use grid_places::{GridPlace, columns_in_view, grid_places, scrolled_within};
 pub use overlay_slot::{OverlaySlot, OverlaySlotElement};

@@ -157,7 +157,7 @@ impl GridColumns {
     }
 
     /// A column's menu's entries for its width and the grid's wrap, after what the grid puts
-    /// first: Fit width, Reset width, then Wrap text and Reset columns. `key` is the column the
+    /// first: Fit width, Reset width, then Wrap text and Reset widths and wrap. `key` is the column the
     /// menu is for; `action` names the action whose key an entry shows, if it has one; `apply`
     /// makes a change.
     pub fn menu_entries(
@@ -194,7 +194,162 @@ impl GridColumns {
                 action(ColumnChange::ToggleWrap),
                 move |window, cx| toggle(ColumnChange::ToggleWrap, window, cx),
             )
-            .item(entry("Reset columns", ColumnChange::Reset).disabled(self.layout.is_default()))
+            .item(
+                entry("Reset widths and wrap", ColumnChange::Reset)
+                    .disabled(self.layout.is_default()),
+            )
+    }
+}
+
+/// How far past the view a wrapped grid lays its rows out, above and below: GPUI's `list`
+/// learns a row's height only by drawing it, so this is how far a frame's scroll can reach
+/// past the rows measured so far.
+pub const WRAPPED_DRAW_AHEAD: f32 = 600.;
+
+/// Where a grid's rows are scrolled, whichever way they are drawn (spec 049). Cut, every row
+/// is one height and GPUI's `uniform_list` draws them, its scroll range exact. Wrapped, GPUI's
+/// `list` measures each row as it draws it: it forgets every height when its width changes and
+/// counts a row it has not drawn as none, so a cut grid, which has one height, does not use it.
+/// A grid asks this for the line under the pointer, the first line in view, and to scroll, and
+/// never divides by a row's height itself.
+#[derive(Clone)]
+pub struct GridRows {
+    /// The cut rows' scroll.
+    pub uniform: gpui::UniformListScrollHandle,
+    /// The wrapped rows, as GPUI's `list` laid them out.
+    pub measured: gpui::ListState,
+    /// How many lines the grid holds, as last told ([`GridRows::sync`]).
+    count: Rc<std::cell::Cell<usize>>,
+}
+
+impl GridRows {
+    /// The rows of a grid whose cut rows scroll by `uniform`.
+    pub fn new(uniform: gpui::UniformListScrollHandle) -> Self {
+        Self {
+            uniform,
+            measured: gpui::ListState::new(0, gpui::ListAlignment::Top, px(WRAPPED_DRAW_AHEAD)),
+            count: Rc::default(),
+        }
+    }
+
+    /// The grid holds `count` lines. Lines added or taken are at the end; nothing in view
+    /// moves.
+    pub fn sync(&self, count: usize) {
+        self.count.set(count);
+        let old = self.measured.item_count();
+        if count > old {
+            // GPUI moves a scroll held at the old end past what is added.
+            let top = self.measured.logical_scroll_top();
+            self.measured.splice(old..old, count - old);
+            if top.item_ix >= old {
+                self.measured.scroll_to(top);
+            }
+        } else if count < old {
+            self.measured.splice(count..old, 0);
+        }
+    }
+
+    /// A cut line's height, as the list last laid its lines out: GPUI's `last_item_size` holds
+    /// the list's own size as `item` and its lines' as `contents`.
+    fn cut_line(&self) -> Pixels {
+        let count = self.count.get();
+        self.uniform
+            .0
+            .borrow()
+            .last_item_size
+            .filter(|_| count > 0)
+            .map(|size| size.contents.height / count as f32)
+            .filter(|height| *height > Pixels::ZERO)
+            .unwrap_or(px(crate::ROW_HEIGHT))
+    }
+
+    /// The first line in view, and how far into it the view starts.
+    pub fn first(&self, wrap: CellWrap) -> (usize, Pixels) {
+        match wrap {
+            CellWrap::Wrap => {
+                let top = self.measured.logical_scroll_top();
+                (top.item_ix, top.offset_in_item)
+            }
+            CellWrap::Truncate => {
+                let line = self.cut_line();
+                let down = (-self.uniform.0.borrow().base_handle.offset().y).max(Pixels::ZERO);
+                let first = (down / line).floor();
+                (first as usize, down - line * first)
+            }
+        }
+    }
+
+    /// Scrolls so `line` is first in view, `offset` into it.
+    pub fn scroll_to(&self, wrap: CellWrap, line: usize, offset: Pixels) {
+        match wrap {
+            CellWrap::Wrap => {
+                self.sync(self.count.get());
+                self.measured.scroll_to(gpui::ListOffset {
+                    item_ix: line,
+                    offset_in_item: offset,
+                });
+            }
+            CellWrap::Truncate => {
+                let y = self.cut_line() * line as f32 + offset;
+                let state = self.uniform.0.borrow();
+                let x = state.base_handle.offset().x;
+                state.base_handle.set_offset(gpui::point(x, -y));
+            }
+        }
+    }
+
+    /// Scrolls as little as shows all of `line`.
+    pub fn reveal(&self, wrap: CellWrap, line: usize) {
+        match wrap {
+            CellWrap::Wrap => self.measured.scroll_to_reveal_item(line),
+            CellWrap::Truncate => self
+                .uniform
+                .scroll_to_item(line, gpui::ScrollStrategy::Nearest),
+        }
+    }
+
+    /// Keeps the first line in view first when the grid turns from `from` to the other way of
+    /// drawing its rows (constitution V).
+    pub fn switch(&self, from: CellWrap) {
+        let (line, offset) = self.first(from);
+        let to = from.toggled();
+        // A line's height differs between the two; its start stays.
+        let offset = if to == CellWrap::Wrap {
+            Pixels::ZERO
+        } else {
+            offset.min(self.cut_line())
+        };
+        self.scroll_to(to, line, offset);
+    }
+
+    /// The line under `position`, as the rows were last laid out and are scrolled now; `None`
+    /// off the rows.
+    pub fn line_at(&self, wrap: CellWrap, position: gpui::Point<Pixels>) -> Option<usize> {
+        match wrap {
+            CellWrap::Wrap => {
+                let view = self.measured.viewport_bounds();
+                if !view.contains(&position) {
+                    return None;
+                }
+                let top = self.measured.logical_scroll_top().item_ix;
+                (top..self.measured.item_count())
+                    .map_while(|line| Some((line, self.measured.bounds_for_item(line)?)))
+                    .take_while(|(_, bounds)| bounds.top() < view.bottom())
+                    .find(|(_, bounds)| bounds.top() <= position.y && position.y < bounds.bottom())
+                    .map(|(line, _)| line)
+            }
+            CellWrap::Truncate => {
+                let (rows, offset) = {
+                    let state = self.uniform.0.borrow();
+                    (state.base_handle.bounds(), state.base_handle.offset())
+                };
+                if !rows.contains(&position) {
+                    return None;
+                }
+                let line = (position.y - rows.origin.y - offset.y) / self.cut_line();
+                (line >= 0.).then_some(line as usize)
+            }
+        }
     }
 }
 
@@ -214,13 +369,13 @@ pub fn widest_text(texts: impl IntoIterator<Item = CellText>, window: &gpui::Win
         .fold(Pixels::ZERO, Pixels::max)
 }
 
-/// How tall a row is whose tallest cell takes `lines` lines of `line_height`: a row of one
-/// line ([`crate::ROW_HEIGHT`]) and a line more for each line more, up to [`WRAP_LINES`]. Its
-/// first line sits where a cut row's one line does, so turning the wrap on moves no row of one
-/// line.
-pub fn wrapped_row_height(lines: usize, line_height: Pixels) -> Pixels {
+/// How tall a row is whose tallest cell takes `lines` lines of `line_height`, in a grid whose
+/// cut rows are `row` tall: a cut row, and a line more for each line more, up to
+/// [`WRAP_LINES`]. Its first line sits where a cut row's one line does, so turning the wrap on
+/// moves no row of one line.
+pub fn wrapped_row_height(lines: usize, line_height: Pixels, row: Pixels) -> Pixels {
     let more = lines.clamp(1, WRAP_LINES) - 1;
-    px(crate::ROW_HEIGHT) + line_height * more as f32
+    row + line_height * more as f32
 }
 
 /// The height of a line of a cell's text ([`crate::cell_text`]) where it is drawn.
@@ -233,12 +388,11 @@ pub fn cell_line_height(window: &Window, cx: &App) -> Pixels {
     crate::ds::cell_text::line_height(&text_style, font_size, window)
 }
 
-/// `cell` (a [`crate::grid_cell`]) made to hold wrapped text: as tall as its lines, the first
-/// where a cut cell's one line is, stretched to its row's height so a fill covers it. A grid's
-/// row has a hairline rule below its cells, so a row of wrapped cells is
-/// [`wrapped_row_height`] tall, a row of one line as tall as a cut one.
-pub fn wrapping_cell(cell: Div, line_height: Pixels) -> Div {
-    let room = px(crate::ROW_HEIGHT - crate::ds::size::HAIRLINE);
+/// `cell` made to hold wrapped text: as tall as its lines, the first where a cut cell's one
+/// line is, stretched to its row's height so a fill covers it. `cut` is how tall the grid's cut
+/// cells are, so a row of one line is as tall wrapped as cut ([`wrapped_row_height`]).
+pub fn wrapping_cell(cell: Div, line_height: Pixels, cut: Pixels) -> Div {
+    let room = cut;
     let inset = ((room - line_height) / 2.).max(Pixels::ZERO);
     cell.h_auto()
         .min_h(room)
@@ -385,12 +539,12 @@ mod tests {
     fn a_wrapped_row_grows_by_its_lines_up_to_the_most() {
         let line = px(18.);
         let row = px(crate::ROW_HEIGHT);
-        assert_eq!(wrapped_row_height(0, line), row);
-        assert_eq!(wrapped_row_height(1, line), row);
-        assert_eq!(wrapped_row_height(2, line), row + line);
-        assert_eq!(wrapped_row_height(3, line), row + line * 2.);
+        assert_eq!(wrapped_row_height(0, line, row), row);
+        assert_eq!(wrapped_row_height(1, line, row), row);
+        assert_eq!(wrapped_row_height(2, line, row), row + line);
+        assert_eq!(wrapped_row_height(3, line, row), row + line * 2.);
         assert_eq!(
-            wrapped_row_height(WRAP_LINES + 10, line),
+            wrapped_row_height(WRAP_LINES + 10, line, row),
             row + line * (WRAP_LINES - 1) as f32
         );
     }
@@ -417,8 +571,12 @@ mod tests {
                     // In a row with the rule a grid's rows have below them.
                     let cell = crate::grid_cell(width, false);
                     let cell = match wrap {
-                        CellWrap::Wrap => wrapping_cell(cell, line)
-                            .child(crate::cell_text(text, cx).wrap(crate::cell_room(width))),
+                        CellWrap::Wrap => wrapping_cell(
+                            cell,
+                            line,
+                            px(crate::ROW_HEIGHT - crate::ds::size::HAIRLINE),
+                        )
+                        .child(crate::cell_text(text, cx).wrap(crate::cell_room(width))),
                         CellWrap::Truncate => cell.child(crate::cell_text(text, cx)),
                     };
                     div()
@@ -444,9 +602,12 @@ mod tests {
         let (_, cx) = cx.add_window_view(|_, _| Probe);
         let line = cx.update(|window, cx| cell_line_height(window, cx));
         let mut height = |name: &'static str| cx.debug_bounds(name).expect("drawn").size.height;
-        // Layout puts edges on whole pixels, so a height is the formula's within one.
-        let near =
-            |drawn: Pixels, lines: usize| (drawn - wrapped_row_height(lines, line)).abs() < px(1.);
+        // Layout puts edges on whole pixels, so a height is the formula's within one. The
+        // probe's rows are the query results' kind: a row high, its rule within it.
+        let row = px(crate::ROW_HEIGHT);
+        let near = |drawn: Pixels, lines: usize| {
+            (drawn - wrapped_row_height(lines, line, row)).abs() < px(1.)
+        };
         assert!(line > px(0.));
         assert!(near(height("short"), 1), "{:?}", height("short"));
         let sentence = height("sentence");

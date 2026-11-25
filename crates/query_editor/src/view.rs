@@ -17,9 +17,9 @@ use editor::{
 };
 use gpui::{
     AnyView, App, ClickEvent, ClipboardItem, Context, DragMoveEvent, Entity, EventEmitter,
-    FocusHandle, Focusable, HighlightStyle, ListAlignment, ListState, MouseButton, MouseDownEvent,
-    Pixels, Render, ScrollHandle, ScrollStrategy, SharedString, StyleRefinement, Subscription,
-    Task, UnderlineStyle, UniformListScrollHandle, WeakEntity, Window, list, uniform_list,
+    FocusHandle, Focusable, HighlightStyle, MouseButton, MouseDownEvent, Pixels, Render,
+    ScrollHandle, ScrollStrategy, SharedString, StyleRefinement, Subscription, Task,
+    UnderlineStyle, UniformListScrollHandle, WeakEntity, Window, list, uniform_list,
 };
 use gq_language::check::{Destroys, Publication};
 use gq_language::{QueryInfo, ResultColumn, SchemaModel};
@@ -43,7 +43,7 @@ use studio_ui::ds::menu::{ContextMenu, ContextMenuEntry};
 use studio_ui::ds::{Dotted as _, space};
 use studio_ui::{
     CellWrap, ColumnChange, ColumnDrag, ColumnEdge, ColumnResize, GridColumn, GridColumns,
-    GridLayout, GridPlace, ROW_HEIGHT, cell_line_height, cell_room, columns_in_view,
+    GridLayout, GridPlace, GridRows, ROW_HEIGHT, cell_line_height, cell_room, columns_in_view,
     format_elapsed, format_value, grid_cell, grid_header, grid_places, is_numeric,
     resizable_grid_header, short_commit_id, value_text, widest_text, wrapping_cell,
 };
@@ -63,9 +63,6 @@ use crate::row_note::RowNote;
 const CHECK_DELAY: Duration = Duration::from_millis(150);
 /// The width of the row-number column in the result grid.
 const ROW_NUMBER_WIDTH: f32 = 48.;
-/// How far past the view the result rows are laid out, above and below, so a scroll shows no
-/// empty space.
-const RESULTS_DRAW_AHEAD: f32 = 600.;
 
 /// Each result column's width as drawn: the one the person gave its name, else its own.
 fn drawn_widths(columns: &GridColumns, names: &[String], own: &[f32]) -> Vec<f32> {
@@ -751,8 +748,8 @@ pub struct QueryEditor {
     header_menu: Option<(Entity<ContextMenu>, gpui::Point<Pixels>, Subscription)>,
     /// The tab was filled with an example read once; emptied, it stays empty.
     filled_example: bool,
-    /// The result rows, laid out as they are drawn: a wrapped row is as tall as its lines.
-    results_list: ListState,
+    /// Where the result rows are scrolled, cut or wrapped (spec 049).
+    results_rows: GridRows,
     /// How far the results are scrolled sideways, for the columns a frame draws.
     results_hscroll: ScrollHandle,
     results_focus: FocusHandle,
@@ -1227,8 +1224,7 @@ impl QueryEditor {
             resizing: None,
             header_menu: None,
             filled_example: false,
-            results_list: ListState::new(0, ListAlignment::Top, px(RESULTS_DRAW_AHEAD))
-                .with_uniform_item_height(px(ROW_HEIGHT)),
+            results_rows: GridRows::new(UniformListScrollHandle::new()),
             results_hscroll: ScrollHandle::new(),
             results_focus: cx.focus_handle(),
             confirm_focus: cx.focus_handle(),
@@ -3486,8 +3482,9 @@ impl QueryEditor {
             Output::Rows(rows) => rows.table.rows.len(),
             _ => 0,
         };
-        self.results_list
-            .reset_with_uniform_height(rows, px(ROW_HEIGHT));
+        self.results_rows.sync(rows);
+        self.results_rows.scroll_to(CellWrap::Truncate, 0, px(0.));
+        self.results_rows.scroll_to(CellWrap::Wrap, 0, px(0.));
     }
 
     /// The rows just shown against the head of their branch: a head the session learned while
@@ -3829,7 +3826,7 @@ impl QueryEditor {
             ),
         };
         self.selected = Some((row, column));
-        self.results_list.scroll_to_reveal_item(row);
+        self.results_rows.reveal(self.columns.wrap(), row);
         self.scroll_column_into_view(column);
         if first {
             // The status bar offers copying once a cell is selected.
@@ -4891,13 +4888,29 @@ impl QueryEditor {
                 .track_scroll(&self.results_hscroll)
                 .child(
                     v_flex().h_full().w(px(total)).child(header()).child(
-                        list(
-                            self.results_list.clone(),
-                            cx.processor(move |this, ix, _window, cx| {
-                                this.render_grid_row(ix, &places, line, cx)
-                            }),
-                        )
-                        .flex_1(),
+                        match self.columns.wrap() {
+                            // Wrapped, each row measured as it is drawn.
+                            CellWrap::Wrap => list(
+                                self.results_rows.measured.clone(),
+                                cx.processor(move |this, ix, _window, cx| {
+                                    this.render_grid_row(ix, &places, line, cx)
+                                }),
+                            )
+                            .flex_1()
+                            .into_any_element(),
+                            CellWrap::Truncate => uniform_list(
+                                "query-results",
+                                table.rows.len(),
+                                cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                                    range
+                                        .map(|ix| this.render_grid_row(ix, &places, line, cx))
+                                        .collect()
+                                }),
+                            )
+                            .track_scroll(&self.results_rows.uniform)
+                            .flex_1()
+                            .into_any_element(),
+                        },
                     ),
                 )
                 .into_any_element()
@@ -5083,6 +5096,7 @@ impl QueryEditor {
             return;
         };
         let column = column.or(self.selected.map(|(_, column)| column));
+        let wrap = self.columns.wrap();
         let named = column.and_then(|column| {
             let name = rows.table.columns.get(column)?;
             Some((column, name.as_str(), rows.own_widths[column]))
@@ -5103,6 +5117,9 @@ impl QueryEditor {
             .columns
             .change(change, named.map(|(_, name, own)| (name, own)), widest)
         {
+            if self.columns.wrap() != wrap {
+                self.results_rows.switch(wrap);
+            }
             self.columns_changed(cx);
         }
     }
@@ -5111,7 +5128,7 @@ impl QueryEditor {
     /// measured again, and the tab saves them.
     fn columns_changed(&mut self, cx: &mut Context<Self>) {
         self.sync_widths();
-        self.results_list.remeasure();
+        self.results_rows.measured.remeasure();
         cx.emit(ItemEvent::UpdateTab);
         self.redraw_results(cx);
         cx.notify();
@@ -5170,7 +5187,9 @@ impl QueryEditor {
         let shown = rows.shown[ix].get_or_init(|| cells_of(values));
         let row_selected = self.selected.is_some_and(|(row, _)| row == ix);
         let wrapping = |cell: Div| match wrap {
-            CellWrap::Wrap => wrapping_cell(cell, line),
+            CellWrap::Wrap => {
+                wrapping_cell(cell, line, px(ROW_HEIGHT - studio_ui::ds::size::HAIRLINE))
+            }
             CellWrap::Truncate => cell,
         };
         let row = h_flex()
@@ -6717,14 +6736,24 @@ mod tests {
                 editor.redraw_results(cx);
             });
             cx.run_until_parked();
+            // Wrapped, a row is as tall as the list measured it; cut, every row is the
+            // uniform list's one height.
             let height = |cx: &mut gpui::VisualTestContext, row: usize| {
-                editor.read_with(cx, |editor, _| {
-                    editor
-                        .results_list
-                        .bounds_for_item(row)
-                        .expect("drawn")
-                        .size
-                        .height
+                editor.read_with(cx, |editor, _| match editor.columns.wrap() {
+                    CellWrap::Wrap => {
+                        editor
+                            .results_rows
+                            .measured
+                            .bounds_for_item(row)
+                            .expect("drawn")
+                            .size
+                            .height
+                    }
+                    CellWrap::Truncate => {
+                        let state = editor.results_rows.uniform.0.borrow();
+                        let size = state.last_item_size.expect("drawn");
+                        size.contents.height / 2.
+                    }
                 })
             };
             let row = px(ROW_HEIGHT);
@@ -6737,7 +6766,7 @@ mod tests {
             let line = cx.update(|window, cx| cell_line_height(window, cx));
             // Layout puts a row's edges on whole pixels.
             let near = |drawn: Pixels, lines: usize| {
-                (drawn - studio_ui::wrapped_row_height(lines, line)).abs() < px(1.)
+                (drawn - studio_ui::wrapped_row_height(lines, line, px(ROW_HEIGHT))).abs() < px(1.)
             };
             assert!(near(height(cx, 0), 1), "{:?}", height(cx, 0));
             let grown = height(cx, 1);
