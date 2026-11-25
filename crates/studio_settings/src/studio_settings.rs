@@ -250,6 +250,10 @@ pub struct GraphOverrides {
     pub canvas_max_nodes: Option<u32>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub views: Vec<SavedView>,
+    /// What the person chose for each type's table's columns, by type: widths and the wrap
+    /// (spec 049). Every tab and view of the type shares it.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub columns: BTreeMap<String, GridLayout>,
     /// The property that names each type's nodes, by type, where the person chose one; other
     /// types are named by their `name`, `title` or key (spec 002, "Node names").
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -1101,6 +1105,28 @@ impl StudioSettings {
             .views
             .iter_mut()
             .find(|view| view.key() == id)
+    }
+
+    /// What the person chose for a type's table's columns in a graph (spec 049): the table's
+    /// own layout when nothing.
+    pub fn grid_layout(&self, graph: &str, type_name: &str) -> GridLayout {
+        self.graphs
+            .get(graph)
+            .and_then(|overrides| overrides.columns.get(type_name))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Keeps what the person chose for a type's table's columns in a graph; the table's own
+    /// layout is no entry, and a graph left with nothing is removed (spec 049).
+    pub fn set_grid_layout(&mut self, graph: &str, type_name: &str, layout: GridLayout) {
+        let columns = &mut self.graphs.entry(graph.to_owned()).or_default().columns;
+        if layout.is_default() {
+            columns.remove(type_name);
+        } else {
+            columns.insert(type_name.to_owned(), layout);
+        }
+        self.graphs.retain(|_, overrides| !overrides.is_empty());
     }
 
     /// The property chosen to name each type's nodes in a graph, by type.
@@ -2078,6 +2104,41 @@ mod tests {
             "{dir:?}"
         );
         assert!(queries_dir("http://a b/g").ends_with("queries/http_~~a_b~g"));
+    }
+
+    /// A type's columns are kept per graph and type as spec 049 writes them; the table's own
+    /// layout is no entry, and a graph with nothing left is removed.
+    #[test]
+    fn a_types_columns_round_trip_and_the_default_is_no_entry() {
+        let mut settings = StudioSettings::default();
+        let chosen = GridLayout {
+            widths: [("title".to_owned(), 320)].into(),
+            wrap: Some(CellWrap::Wrap),
+        };
+        settings.set_grid_layout("dev/notes", "Note", chosen.clone());
+        assert_eq!(settings.grid_layout("dev/notes", "Note"), chosen);
+        assert_eq!(
+            settings.grid_layout("dev/notes", "Topic"),
+            GridLayout::default()
+        );
+        assert_eq!(
+            settings.grid_layout("prod/notes", "Note"),
+            GridLayout::default()
+        );
+        let value = serde_json::to_value(&settings).unwrap();
+        assert_eq!(
+            value["graphs"]["dev/notes"]["columns"],
+            serde_json::json!({ "Note": { "widths": { "title": 320 }, "wrap": "wrap" } })
+        );
+        let reading = StudioSettings::read(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(
+            reading.problems,
+            Vec::<String>::new(),
+            "`columns` is a setting"
+        );
+        assert_eq!(reading.settings, settings);
+        settings.set_grid_layout("dev/notes", "Note", GridLayout::default());
+        assert!(settings.graphs.is_empty(), "the default is no entry");
     }
 
     #[test]
