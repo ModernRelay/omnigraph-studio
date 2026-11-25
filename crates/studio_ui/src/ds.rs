@@ -250,6 +250,9 @@ pub mod size {
     pub const SHEET_GAP: f32 = 8.;
     /// The hit area of a divider that resizes a dock or a split, centred on its line.
     pub const RESIZE_HANDLE: f32 = 6.;
+    /// How far either side of a grid column's rule the edge is its resize handle's
+    /// (`studio_ui::column_resize_handle`): no control's hit area comes nearer.
+    pub const COLUMN_EDGE: f32 = 4.;
     /// The column of an empty state's actions.
     pub const STATE_ACTIONS: f32 = 240.;
     /// The widest a tooltip grows before its text wraps: Zed's `max_w_72`.
@@ -3795,6 +3798,14 @@ pub fn cell_action(id: impl Into<ElementId>, glyph: IconName) -> IconButton {
 /// frame's prepaint and its paint.
 pub fn hover_slot(group: impl Into<SharedString>, fill: Hsla, action: impl IntoElement) -> Div {
     end_slot(fill, action).visible_on_hover(group)
+}
+
+/// A [`hover_slot`] at the end of a grid's header cell, kept clear of the column's edge: the
+/// edge is the resize handle's ([`size::COLUMN_EDGE`] either side of the rule), and the slot's
+/// fill and its button stop [`space::XS`] short of it, so no press near the edge reaches the
+/// button and the handle's line is never under the slot's fill.
+pub fn header_slot(group: impl Into<SharedString>, fill: Hsla, action: impl IntoElement) -> Div {
+    hover_slot(group, fill, action).right(px(size::COLUMN_EDGE + space::XS))
 }
 
 /// A [`cell_action`] over the end of a cell on the cell's opaque fill (`fill`), shown: a

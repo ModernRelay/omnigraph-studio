@@ -30,7 +30,8 @@ pub use ds::cell_text::{CellText, cell_text, shown_part};
 pub use grid_places::{GridPlace, columns_in_view, grid_places, scrolled_within};
 pub use overlay_slot::{OverlaySlot, OverlaySlotElement};
 pub use resize::{
-    COLUMN_MAX_WIDTH, COLUMN_MIN_WIDTH, ColumnDrag, ColumnResize, clamp_width, column_resize_handle,
+    COLUMN_MAX_WIDTH, COLUMN_MIN_WIDTH, ColumnDrag, ColumnEdge, ColumnResize, clamp_width,
+    column_resize_handle,
 };
 pub use tags::{Tags, tags};
 pub use values::{
@@ -82,16 +83,18 @@ pub const HEADER_HEIGHT: f32 = ds::size::HEADER;
 /// The header row of a grid: one line per column, the name then its type, muted, with a
 /// hairline below (spec 002, "Visual language").
 pub fn grid_header(columns: &[GridColumn], leading: Pixels, cx: &App) -> Div {
-    resizable_grid_header(columns, None, leading, |_| None, cx)
+    resizable_grid_header(columns, None, leading, |_, _| None, cx)
 }
 
 /// [`grid_header`] at a frame's `places` (every column when `None`; see [`grid_places`]),
-/// with what `handle` gives for a column at its right edge: a [`column_resize_handle`].
+/// with what `handle` gives for a column's edge, last in each cell: a [`column_resize_handle`]
+/// for column `index`'s end in its own cell, and for the column before's edge at the start of
+/// the next, where that column is drawn against it.
 pub fn resizable_grid_header(
     columns: &[GridColumn],
     places: Option<&[GridPlace]>,
     leading: Pixels,
-    mut handle: impl FnMut(usize) -> Option<AnyElement>,
+    mut handle: impl FnMut(usize, ColumnEdge) -> Option<AnyElement>,
     cx: &App,
 ) -> Div {
     let every: Vec<GridPlace>;
@@ -108,11 +111,14 @@ pub fn resizable_grid_header(
         .border_b_1()
         .border_color(ds::surface::rule(cx))
         .child(div().w(leading).flex_none())
-        .children(places.iter().map(|place| {
+        .children(places.iter().enumerate().map(|(at, place)| {
             let index = match *place {
                 GridPlace::Column(index) => index,
                 GridPlace::Gap(width) => return div().w(width).flex_none().into_any_element(),
             };
+            let after = index
+                .checked_sub(1)
+                .filter(|before| at > 0 && places[at - 1] == GridPlace::Column(*before));
             let column = &columns[index];
             h_flex()
                 .relative()
@@ -128,7 +134,8 @@ pub fn resizable_grid_header(
                         .color(Color::Disabled)
                         .single_line()
                 }))
-                .children(handle(index))
+                .children(handle(index, ColumnEdge::End { ruled: false }))
+                .children(after.and_then(|before| handle(before, ColumnEdge::Start)))
                 .into_any_element()
         }))
 }

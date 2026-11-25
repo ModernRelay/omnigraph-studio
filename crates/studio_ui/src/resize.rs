@@ -70,35 +70,79 @@ pub fn clamp_width(width: f32) -> f32 {
     width.clamp(COLUMN_MIN_WIDTH, COLUMN_MAX_WIDTH).round()
 }
 
-/// The handle at a column header's right edge, of the grid `owner` draws. Place it in a header
-/// cell that is `relative()`. `on_start` runs when the pointer goes down on it, `on_reset` on a
-/// double click; neither reaches the header behind it. `active` keeps the line shown while this
-/// column is dragged.
+/// Which side of a column's rule a handle is on: the column's own end, in its header cell, or
+/// the start of the column after it, in that header cell. A grid gives every column it lets a
+/// person resize both, the start one only where that column is drawn against it (not where a
+/// scrolled strip has moved another column there).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColumnEdge {
+    /// The column's end. `ruled` when the grid draws a rule between its columns: the handle
+    /// draws it, at the cell's last pixel, in place of a border. GPUI clips a cell's children
+    /// inside its border (`Style::overflow_mask`), so a rule drawn as the cell's border could
+    /// never be the handle's.
+    End {
+        ruled: bool,
+    },
+    Start,
+}
+
+/// A handle on column `index`'s rule, of the grid `owner` draws: the rule is the edge between a
+/// column and the next, and the edge belongs to the handle. Every grid follows one rule for who
+/// owns a pointer there (spec 049):
+///
+/// - The edge is [`crate::ds::size::COLUMN_EDGE`] either side of the rule: the end of column
+///   `index` ([`ColumnEdge::End`], over its rule) and the start of the column after it
+///   ([`ColumnEdge::Start`]). Each half is placed in its own header cell, which is
+///   `relative()`, as the cell's **last** child: drawn over what the cell holds, so its line
+///   shows over a hover slot's fill, and its hit area blocks what is under it, so a press there
+///   reaches no button and no header click (sort) under it.
+/// - Controls stay out: a header cell's end control is a [`crate::ds::header_slot`], which
+///   stops short of the edge, so no control's hit area meets the handle's.
+/// - A press on the handle starts a resize and goes no further; a click on a control never
+///   starts one, since the control is not on the edge. A drag that starts on the handle is the
+///   handle's to its end: the button under the pointer when it is released was not pressed.
+///
+/// `on_start` runs when the pointer goes down on it, `on_reset` on a double click. `active`
+/// keeps the line shown while this column is dragged.
 pub fn column_resize_handle(
     owner: EntityId,
     index: usize,
+    edge: ColumnEdge,
     active: bool,
     on_start: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
     on_reset: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     cx: &App,
 ) -> Stateful<Div> {
+    use crate::ds::size::{COLUMN_EDGE, DRAG_LINE, HAIRLINE};
+    let rule = crate::ds::surface::rule(cx);
     let line = crate::ds::surface::focus(cx);
-    let group = SharedString::from(format!("column-resize-{index}"));
-    div()
-        .id(("column-resize", index))
+    let slot = index * 2 + usize::from(edge == ColumnEdge::Start);
+    let ruled = matches!(edge, ColumnEdge::End { ruled: true });
+    let group = SharedString::from(format!("column-resize-{slot}"));
+    let handle = div()
+        .id(("column-resize", slot))
         .group(group.clone())
         .absolute()
         .top_0()
-        .bottom_0()
-        .right_0()
-        .w(px(crate::ds::size::RESIZE_HANDLE))
+        .bottom_0();
+    let handle = match edge {
+        ColumnEdge::End { .. } => handle.right_0().w(px(COLUMN_EDGE)).flex().justify_end(),
+        ColumnEdge::Start => handle.left_0().w(px(COLUMN_EDGE)).flex().justify_start(),
+    };
+    handle
+        .debug_selector(move || format!("column-edge-{slot}"))
         .cursor_col_resize()
-        .flex()
-        .justify_end()
+        .block_mouse_except_scroll()
         .child(
             div()
-                .w(px(crate::ds::size::DRAG_LINE))
+                .w(px(DRAG_LINE))
                 .h_full()
+                .flex()
+                .justify_end()
+                // At rest, the rule between the columns, where a border would be.
+                .when(ruled && !active, |d| {
+                    d.child(div().w(px(HAIRLINE)).h_full().bg(rule))
+                })
                 .when(active, |d| d.bg(line))
                 .group_hover(group, |d| d.bg(line)),
         )
@@ -118,6 +162,69 @@ pub fn column_resize_handle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A grid header's edges follow the rule (`column_resize_handle`): a press within
+    /// `COLUMN_EDGE` either side of a rule resizes the column on its left, the last column's
+    /// own half too; further in, it resizes nothing.
+    #[gpui::test]
+    fn a_press_at_a_rule_resizes_the_column_on_its_left(cx: &mut gpui::TestAppContext) {
+        use crate::ds::size::COLUMN_EDGE;
+        use std::{cell::RefCell, rc::Rc};
+
+        struct Header(Rc<RefCell<Vec<usize>>>);
+        impl Render for Header {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let columns: Vec<crate::GridColumn> = ["a", "b", "c"]
+                    .map(|key| crate::GridColumn::new(key, key).width(px(100.)))
+                    .to_vec();
+                let owner = cx.entity_id();
+                let pressed = self.0.clone();
+                crate::resizable_grid_header(
+                    &columns,
+                    None,
+                    px(0.),
+                    |index, edge| {
+                        let pressed = pressed.clone();
+                        Some(
+                            column_resize_handle(
+                                owner,
+                                index,
+                                edge,
+                                false,
+                                move |_, _, _| pressed.borrow_mut().push(index),
+                                |_, _, _| {},
+                                cx,
+                            )
+                            .into_any_element(),
+                        )
+                    },
+                    cx,
+                )
+            }
+        }
+        cx.update(studio_theme::init_test);
+        let pressed: Rc<RefCell<Vec<usize>>> = Rc::default();
+        let (_, cx) = cx.add_window_view({
+            let pressed = pressed.clone();
+            |_, _| Header(pressed)
+        });
+        let mut press = |x: f32| {
+            pressed.borrow_mut().clear();
+            let at = gpui::point(px(x), px(crate::HEADER_HEIGHT / 2.));
+            cx.simulate_mouse_down(at, MouseButton::Left, Default::default());
+            cx.simulate_mouse_up(at, MouseButton::Left, Default::default());
+            pressed.borrow().first().copied()
+        };
+        // Rules at 100, 200 and the last column's end at 300.
+        for (rule, column) in [(100., 0), (200., 1)] {
+            for dx in [-COLUMN_EDGE + 0.5, -0.5, 0.5, COLUMN_EDGE - 0.5] {
+                assert_eq!(press(rule + dx), Some(column), "{dx} from {rule}");
+            }
+            assert_eq!(press(rule - COLUMN_EDGE - 1.), None);
+            assert_eq!(press(rule + COLUMN_EDGE + 1.), None);
+        }
+        assert_eq!(press(300. - 0.5), Some(2), "the last column's own half");
+    }
 
     #[test]
     fn a_drag_follows_the_pointer_within_bounds() {
