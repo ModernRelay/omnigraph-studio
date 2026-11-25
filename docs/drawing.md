@@ -46,6 +46,10 @@ Measured against Zed v1.23.2 (`crates/gpui/src/window.rs`, `view.rs`):
   drew several columns past its edge in every row.
 - The type table and the query results pick their columns with `studio_ui::columns_in_view` and
   `studio_ui::grid_places`.
+- Wrapped (spec 049), a grid's rows are drawn through GPUI's `list`, which lays out only the rows
+  near the view and keeps each one's height until a width or the wrap changes
+  (`ListState::remeasure`). A wrapped cell is `CellText::wrap` at its column's width: shaped
+  once a frame at a width known before layout, at most `WRAP_LINES` lines, never measured.
 - A grid cell's plain value is `studio_ui::CellText`, not a `Label`: the cell's box is fixed by
   its column, so the text asks for no measurement and is cut only when it does not fit. A
   truncated label is measured on every layout pass of every frame, with a line wrapper taken

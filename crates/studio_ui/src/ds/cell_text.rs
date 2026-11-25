@@ -11,11 +11,15 @@
 //!
 //! It looks as a small `Label` does: the UI font at the small size and weight, in the colour
 //! given, or the buffer font.
+//!
+//! Wrapped ([`CellText::wrap`], spec 049), it runs onto as many lines as the width it is given
+//! needs, at most [`crate::WRAP_LINES`], the last cut with "…", and asks for their height. The
+//! width is the column's, known before layout, so it is still never measured.
 
 use gpui::{
     App, Bounds, DefiniteLength, Element, ElementId, FontWeight, GlobalElementId, Hsla,
     InspectorElementId, IntoElement, LayoutId, Length, Pixels, ShapedLine, SharedString, Style,
-    TextAlign, TextStyle, TextStyleRefinement, TruncateFrom, Window, px,
+    TextAlign, TextStyle, TextStyleRefinement, TruncateFrom, Window, WrappedLine, px,
 };
 
 /// See the module documentation.
@@ -23,6 +27,8 @@ pub struct CellText {
     text: SharedString,
     align: TextAlign,
     hug: bool,
+    /// The width its lines wrap at, when it wraps ([`CellText::wrap`]).
+    wrap: Option<Pixels>,
     pub(crate) style: TextStyleRefinement,
 }
 
@@ -37,6 +43,7 @@ pub fn cell_text(text: impl Into<SharedString>, cx: &App) -> CellText {
         text: one_line(shown_part(text.into())),
         align: TextAlign::Left,
         hug: false,
+        wrap: None,
         style: TextStyleRefinement {
             color: Some(ui::Color::Default.color(cx)),
             font_size: Some(crate::ds::text::body_size(cx).into()),
@@ -94,6 +101,25 @@ impl CellText {
         self.hug = true;
         self
     }
+
+    /// Wrapped at `width` (its room's, which a grid knows from the column) onto at most
+    /// [`crate::WRAP_LINES`] lines, the last cut with "…", as tall as the lines it takes.
+    pub fn wrap(mut self, width: Pixels) -> Self {
+        self.wrap = Some(width.max(px(1.)));
+        self
+    }
+
+    /// How wide its line is when it has the room: what fitting a column to its values
+    /// measures (spec 049). Shaped as the cell shapes it, so a frame that draws the cell after
+    /// takes the line from GPUI's cache.
+    pub fn line_width(&self, window: &Window) -> Pixels {
+        use gpui::Refineable as _;
+
+        let mut text_style = window.text_style();
+        text_style.refine(&self.style);
+        let font_size = text_style.font_size.to_pixels(window.rem_size());
+        self.shape(&text_style, font_size, window).width
+    }
 }
 
 impl IntoElement for CellText {
@@ -117,8 +143,16 @@ pub struct Fitted {
 /// also its width), and the height it is drawn in. Shaped as it is laid out, so a frame works
 /// out the text style once, not again to shape it and again for its height.
 pub struct Shaped {
-    whole: Option<Box<ShapedLine>>,
+    whole: Option<Box<Shape>>,
     line_height: Pixels,
+}
+
+/// The text as laid out: one line, cut later if it does not fit, or wrapped, already within
+/// its lines. Always boxed ([`Shaped`]), so the line's size is the box's to carry.
+#[expect(clippy::large_enum_variant)]
+enum Shape {
+    Line(ShapedLine),
+    Wrapped(WrappedLine),
 }
 
 impl Element for CellText {
@@ -147,15 +181,28 @@ impl Element for CellText {
             let font_size = text_style.font_size.to_pixels(window.rem_size());
             // A hugging line asks for its width, even an empty one's; an empty line in a cell
             // draws nothing.
-            let whole = (self.hug || !self.text.is_empty())
-                .then(|| Box::new(self.shape(&text_style, font_size, window)));
+            let whole = match self.wrap {
+                Some(width) if !self.text.is_empty() => self
+                    .shape_wrapped(&text_style, font_size, width, window, cx)
+                    .map(|wrapped| Box::new(Shape::Wrapped(wrapped))),
+                _ => (self.hug || !self.text.is_empty())
+                    .then(|| Box::new(Shape::Line(self.shape(&text_style, font_size, window)))),
+            };
             Shaped {
                 whole,
                 line_height: line_height(&text_style, font_size, window),
             }
         });
+        let lines = match shaped.whole.as_deref() {
+            Some(Shape::Wrapped(wrapped)) => wrapped_lines(wrapped),
+            _ => 1,
+        };
         let none = Length::Definite(DefiniteLength::Absolute(px(0.).into()));
-        let mut style = match shaped.whole.as_ref().filter(|_| self.hug) {
+        let hugged = match shaped.whole.as_deref() {
+            Some(Shape::Line(whole)) if self.hug => Some(whole),
+            _ => None,
+        };
+        let mut style = match hugged {
             Some(whole) => {
                 let mut style = Style {
                     flex_shrink: 1.,
@@ -176,7 +223,9 @@ impl Element for CellText {
             },
         };
         style.min_size.width = none;
-        style.size.height = Length::Definite(DefiniteLength::Absolute(shaped.line_height.into()));
+        style.size.height = Length::Definite(DefiniteLength::Absolute(
+            (shaped.line_height * lines as f32).into(),
+        ));
         (window.request_layout(style, [], cx), shaped)
     }
 
@@ -192,7 +241,14 @@ impl Element for CellText {
         if self.text.is_empty() {
             return None;
         }
-        let whole = shaped.whole.take()?;
+        // Wrapped lines are within their width already, and painted from the layout's state.
+        if matches!(shaped.whole.as_deref(), Some(Shape::Wrapped(_))) {
+            return None;
+        }
+        let Shape::Line(whole) = *shaped.whole.take()? else {
+            return None;
+        };
+        let whole = Box::new(whole);
         let line = if whole.width <= bounds.size.width {
             whole
         } else {
@@ -213,11 +269,24 @@ impl Element for CellText {
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
-        _shaped: &mut Shaped,
+        shaped: &mut Shaped,
         fitted: &mut Option<Fitted>,
         window: &mut Window,
         cx: &mut App,
     ) {
+        if let Some(Shape::Wrapped(wrapped)) = shaped.whole.as_deref() {
+            wrapped
+                .paint(
+                    bounds.origin,
+                    shaped.line_height,
+                    self.align,
+                    Some(bounds),
+                    window,
+                    cx,
+                )
+                .ok();
+            return;
+        }
         if let Some(fitted) = fitted {
             fitted
                 .line
@@ -238,6 +307,47 @@ impl CellText {
     /// The whole line, shaped in `text_style`.
     fn shape(&self, text_style: &TextStyle, font_size: Pixels, window: &Window) -> ShapedLine {
         shape_line(&self.text, text_style, font_size, window)
+    }
+
+    /// The text wrapped at `width` onto at most [`crate::WRAP_LINES`] lines, the last cut with
+    /// "…" when there is more. The text is one line ([`one_line`]), so it shapes as one
+    /// wrapped line.
+    fn shape_wrapped(
+        &self,
+        text_style: &TextStyle,
+        font_size: Pixels,
+        width: Pixels,
+        window: &Window,
+        cx: &App,
+    ) -> Option<WrappedLine> {
+        let most = crate::WRAP_LINES;
+        let runs = [text_style.to_run(self.text.len())];
+        let shape = |text: SharedString, runs: &[gpui::TextRun], clamp: Option<usize>| {
+            window
+                .text_system()
+                .shape_text(text, font_size, runs, Some(width), clamp)
+                .ok()?
+                .into_iter()
+                .next()
+        };
+        let wrapped = shape(self.text.clone(), &runs, None)?;
+        if wrapped.wrap_boundaries().len() < most {
+            return Some(wrapped);
+        }
+        let (text, runs) = cx
+            .text_system()
+            .line_wrapper(text_style.font(), font_size)
+            .truncate_wrapped_line(
+                self.text.clone(),
+                width,
+                most,
+                "…",
+                &runs,
+                TruncateFrom::End,
+            );
+        // The cut is measured by advances, which may still leave a line over: never more
+        // lines than the most.
+        shape(text, &runs, Some(most))
     }
 
     /// The line cut to `width` at its end, in the text style in effect.
@@ -296,6 +406,11 @@ pub(crate) fn one_line(text: SharedString) -> SharedString {
         std::borrow::Cow::Owned(replaced) => replaced.into(),
         std::borrow::Cow::Borrowed(_) => text,
     }
+}
+
+/// How many lines a wrapped text is drawn on: never more than [`crate::WRAP_LINES`].
+fn wrapped_lines(wrapped: &WrappedLine) -> usize {
+    (wrapped.wrap_boundaries().len() + 1).min(crate::WRAP_LINES)
 }
 
 /// The height of a line of `text_style`, on whole pixels as GPUI's text is.

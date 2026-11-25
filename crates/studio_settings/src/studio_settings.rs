@@ -405,6 +405,51 @@ pub struct SavedSort {
     pub descending: bool,
 }
 
+/// What a person chose for one grid's columns (spec 049): widths by column key, and whether
+/// its cells wrap. What they did not choose is the grid's own; a layout that is the grid's own
+/// is the default, and kept as no entry.
+///
+/// ```json
+/// { "widths": { "title": 320, "email": 180 }, "wrap": "wrap" }
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct GridLayout {
+    /// Widths the person gave columns, in whole pixels, by column key.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub widths: BTreeMap<String, u32>,
+    /// Whether cells wrap or are cut; absent, the grid's own choice.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wrap: Option<CellWrap>,
+}
+
+impl GridLayout {
+    /// Whether this is the grid's own layout: nothing chosen.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// How a grid lays out a cell's text that is wider than its column (spec 049): cut on one line
+/// with "…", or wrapped onto more lines, the row growing to hold them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CellWrap {
+    #[default]
+    Truncate,
+    Wrap,
+}
+
+impl CellWrap {
+    /// The other one.
+    pub fn toggled(self) -> Self {
+        match self {
+            CellWrap::Truncate => CellWrap::Wrap,
+            CellWrap::Wrap => CellWrap::Truncate,
+        }
+    }
+}
+
 impl GraphOverrides {
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
