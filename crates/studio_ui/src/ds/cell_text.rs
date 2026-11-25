@@ -109,6 +109,22 @@ impl CellText {
         self
     }
 
+    /// How many lines it takes wrapped at `width` ([`CellText::wrap`]), at most
+    /// [`crate::WRAP_LINES`]: what a grid sizes a wrapped row by when its cells cannot stretch
+    /// to it. Shaped as the cell shapes it, so the cell drawn after takes it from GPUI's cache.
+    pub fn wrapped_lines(&self, width: Pixels, window: &Window, cx: &App) -> usize {
+        use gpui::Refineable as _;
+
+        if self.text.is_empty() {
+            return 1;
+        }
+        let mut text_style = window.text_style();
+        text_style.refine(&self.style);
+        let font_size = text_style.font_size.to_pixels(window.rem_size());
+        self.shape_wrapped(&text_style, font_size, width.max(px(1.)), window, cx)
+            .map_or(1, |wrapped| wrapped_lines(&wrapped))
+    }
+
     /// How wide its line is when it has the room: what fitting a column to its values
     /// measures (spec 049). Shaped as the cell shapes it, so a frame that draws the cell after
     /// takes the line from GPUI's cache.

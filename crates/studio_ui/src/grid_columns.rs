@@ -251,7 +251,7 @@ impl GridRows {
 
     /// A cut line's height, as the list last laid its lines out: GPUI's `last_item_size` holds
     /// the list's own size as `item` and its lines' as `contents`.
-    fn cut_line(&self) -> Pixels {
+    pub fn cut_row_height(&self) -> Pixels {
         let count = self.count.get();
         self.uniform
             .0
@@ -271,7 +271,7 @@ impl GridRows {
                 (top.item_ix, top.offset_in_item)
             }
             CellWrap::Truncate => {
-                let line = self.cut_line();
+                let line = self.cut_row_height();
                 let down = (-self.uniform.0.borrow().base_handle.offset().y).max(Pixels::ZERO);
                 let first = (down / line).floor();
                 (first as usize, down - line * first)
@@ -290,7 +290,7 @@ impl GridRows {
                 });
             }
             CellWrap::Truncate => {
-                let y = self.cut_line() * line as f32 + offset;
+                let y = self.cut_row_height() * line as f32 + offset;
                 let state = self.uniform.0.borrow();
                 let x = state.base_handle.offset().x;
                 state.base_handle.set_offset(gpui::point(x, -y));
@@ -317,7 +317,7 @@ impl GridRows {
         let offset = if to == CellWrap::Wrap {
             Pixels::ZERO
         } else {
-            offset.min(self.cut_line())
+            offset.min(self.cut_row_height())
         };
         self.scroll_to(to, line, offset);
     }
@@ -346,7 +346,7 @@ impl GridRows {
                 if !rows.contains(&position) {
                     return None;
                 }
-                let line = (position.y - rows.origin.y - offset.y) / self.cut_line();
+                let line = (position.y - rows.origin.y - offset.y) / self.cut_row_height();
                 (line >= 0.).then_some(line as usize)
             }
         }
