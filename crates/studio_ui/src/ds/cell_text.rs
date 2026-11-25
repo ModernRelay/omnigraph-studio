@@ -408,10 +408,11 @@ pub(crate) fn cut_line(
 }
 
 /// The start of `text` one line can show ([`SHOWN_CHARS`]), found without reading the rest: what
-/// a view that keeps a cell's text keeps of it.
+/// a view that keeps a cell's text keeps of it. A text cut here ends in "…", so a wrapped cell
+/// with room for all of it still says there is more (spec 049).
 pub fn shown_part(text: SharedString) -> SharedString {
     match text.char_indices().nth(SHOWN_CHARS) {
-        Some((end, _)) => text[..end].to_owned().into(),
+        Some((end, _)) => format!("{}…", &text[..end]).into(),
         None => text,
     }
 }
@@ -446,7 +447,8 @@ mod tests {
     fn a_long_value_is_kept_to_what_a_line_shows() {
         let long: String = "é".repeat(SHOWN_CHARS * 4);
         let shown = shown_part(long.into());
-        assert_eq!(shown.chars().count(), SHOWN_CHARS);
+        assert_eq!(shown.chars().count(), SHOWN_CHARS + 1);
+        assert!(shown.ends_with('…'), "a cut text says so");
         let short = SharedString::from("Ada");
         assert_eq!(shown_part(short.clone()), short);
     }

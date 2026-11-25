@@ -229,6 +229,9 @@ struct RowsOutput {
     /// What each row's cells show, made the first time the row is drawn rather than every
     /// frame it is.
     shown: Vec<std::cell::OnceCell<Box<[SharedString]>>>,
+    /// How many lines each row takes wrapped, worked out when it is first drawn wrapped and
+    /// forgotten when a width or the wrap changes; 0 is not worked out yet.
+    wrapped_lines: Box<[std::cell::Cell<usize>]>,
     row_count: i64,
     elapsed: Duration,
     read_at: ReadAt,
@@ -3424,6 +3427,7 @@ impl QueryEditor {
                 } = built;
                 // A width the person gave a column wins over the one from its content.
                 let widths = drawn_widths(&self.columns, &table.columns, &own_widths);
+                let table_len = table.rows.len();
                 let to_branch = matches!(sent, ReadAt::Branch(_));
                 // A statement's answer names no branch or snapshot of the tab's; a read's names
                 // where it read, else it read where it was sent.
@@ -3459,6 +3463,7 @@ impl QueryEditor {
                     widths,
                     own_widths,
                     right_aligned,
+                    wrapped_lines: (0..table_len).map(|_| Default::default()).collect(),
                     shown,
                     row_count: output.row_count,
                     elapsed,
@@ -3482,9 +3487,9 @@ impl QueryEditor {
             Output::Rows(rows) => rows.table.rows.len(),
             _ => 0,
         };
-        self.results_rows.sync(rows);
+        // Other rows, from the first: no height of the last result's is kept.
+        self.results_rows.reset(rows);
         self.results_rows.scroll_to(CellWrap::Truncate, 0, px(0.));
-        self.results_rows.scroll_to(CellWrap::Wrap, 0, px(0.));
     }
 
     /// The rows just shown against the head of their branch: a head the session learned while
@@ -4892,8 +4897,8 @@ impl QueryEditor {
                             // Wrapped, each row measured as it is drawn.
                             CellWrap::Wrap => list(
                                 self.results_rows.measured.clone(),
-                                cx.processor(move |this, ix, _window, cx| {
-                                    this.render_grid_row(ix, &places, line, cx)
+                                cx.processor(move |this, ix, window, cx| {
+                                    this.render_grid_row(ix, &places, line, window, cx)
                                 }),
                             )
                             .flex_1()
@@ -4901,11 +4906,15 @@ impl QueryEditor {
                             CellWrap::Truncate => uniform_list(
                                 "query-results",
                                 table.rows.len(),
-                                cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
-                                    range
-                                        .map(|ix| this.render_grid_row(ix, &places, line, cx))
-                                        .collect()
-                                }),
+                                cx.processor(
+                                    move |this, range: std::ops::Range<usize>, window, cx| {
+                                        range
+                                            .map(|ix| {
+                                                this.render_grid_row(ix, &places, line, window, cx)
+                                            })
+                                            .collect()
+                                    },
+                                ),
                             )
                             .track_scroll(&self.results_rows.uniform)
                             .flex_1()
@@ -5119,6 +5128,10 @@ impl QueryEditor {
         {
             if self.columns.wrap() != wrap {
                 self.results_rows.switch(wrap);
+                // The selected cell stays in view as the rows above it change height.
+                if let Some((row, _)) = self.selected {
+                    self.results_rows.reveal(self.columns.wrap(), row);
+                }
             }
             self.columns_changed(cx);
         }
@@ -5138,6 +5151,9 @@ impl QueryEditor {
     fn sync_widths(&mut self) {
         if let Output::Rows(rows) = &mut self.output {
             rows.widths = drawn_widths(&self.columns, &rows.table.columns, &rows.own_widths);
+            for lines in &rows.wrapped_lines {
+                lines.set(0);
+            }
         }
     }
 
@@ -5166,6 +5182,7 @@ impl QueryEditor {
         ix: usize,
         places: &[GridPlace],
         line: Pixels,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let Output::Rows(rows) = &self.output else {
@@ -5198,7 +5215,29 @@ impl QueryEditor {
             .when(row_selected, |d| d.bg(row_selected_bg));
         let row = match wrap {
             CellWrap::Truncate => row.h(px(ROW_HEIGHT)),
-            CellWrap::Wrap => row.min_h(px(ROW_HEIGHT)).items_stretch(),
+            // As tall as its text cell with the most lines, drawn or not: a row keeps its
+            // height while it is scrolled sideways.
+            CellWrap::Wrap => {
+                let lines = match rows.wrapped_lines[ix].get() {
+                    0 => {
+                        let lines = studio_ui::row_lines(
+                            shown.iter().zip(&rows.widths).map(|(text, width)| {
+                                (
+                                    studio_ui::cell_text(text.clone(), cx),
+                                    cell_room(px(*width)),
+                                )
+                            }),
+                            window,
+                            cx,
+                        );
+                        rows.wrapped_lines[ix].set(lines);
+                        lines
+                    }
+                    lines => lines,
+                };
+                row.h(studio_ui::wrapped_row_height(lines, line, px(ROW_HEIGHT)))
+                    .items_stretch()
+            }
         };
         row.child(
             wrapping(
@@ -6073,12 +6112,13 @@ mod tests {
     }
 
     /// A row keeps the start of a long text that a cell shows, not the whole, which the table
-    /// holds already; other values as they read.
+    /// holds already, ending in "…" so a wrapped cell says there is more; other values as they
+    /// read.
     #[test]
     fn a_rows_cells_keep_what_a_cell_shows() {
         let long = "word ".repeat(2_000);
         let cells = cells_of(&[json!(long), json!(12), json!("Ada")]);
-        assert_eq!(&*cells[0], &long[..512]);
+        assert_eq!(&*cells[0], format!("{}…", &long[..512]));
         assert_eq!(&*cells[1], "12");
         assert_eq!(&*cells[2], "Ada");
     }
@@ -6822,6 +6862,86 @@ mod tests {
                     (&json!({}), &Value::Null)
                 );
             });
+        }
+
+        /// Wrapped, a row is as tall as its text with the most lines whether or not that column
+        /// is drawn, so a row keeps its height while the results scroll sideways; and a run's
+        /// new rows keep no height of the last result's.
+        #[gpui::test]
+        async fn wrapped_rows_keep_their_height_out_of_view_and_across_runs(
+            cx: &mut TestAppContext,
+        ) {
+            cx.update(|cx| {
+                studio_theme::init_test(cx);
+                editor::init(cx);
+            });
+            let session = session(cx);
+            let (editor, cx) =
+                cx.add_window_view(|window, cx| QueryEditor::new(1, session, window, cx));
+            // 40 columns; the last holds a long text, far out of view at the start.
+            let names: Vec<String> = (0..40).map(|i| format!("column_{i:02}")).collect();
+            let long = "a long value that wraps onto several lines ".repeat(10);
+            let read = |last: &str| -> ReadOutput {
+                let row: Map<String, Value> = names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| {
+                        let value = if i == 39 {
+                            last.to_owned()
+                        } else {
+                            "x".to_owned()
+                        };
+                        (name.clone(), json!(value))
+                    })
+                    .collect();
+                serde_json::from_value(json!({
+                    "query_name": "people",
+                    "target": {"branch": "main"},
+                    "row_count": 1,
+                    "columns": names,
+                    "rows": [row],
+                }))
+                .unwrap()
+            };
+            editor.update_in(cx, |editor, window, cx| {
+                let at = ReadAt::Branch("main".into());
+                editor.finish_read(people(), at, Ok(read(&long)), Duration::ZERO, None);
+                editor.change_columns(ColumnChange::ToggleWrap, None, window, cx);
+                let Output::Rows(rows) = &editor.output else {
+                    panic!("rows")
+                };
+                let places = editor.result_places(rows, window);
+                assert!(
+                    !places.contains(&GridPlace::Column(39)),
+                    "the long column is out of view: {places:?}"
+                );
+            });
+            cx.run_until_parked();
+            let height = |cx: &mut gpui::VisualTestContext| {
+                editor.read_with(cx, |editor, _| {
+                    editor
+                        .results_rows
+                        .measured
+                        .bounds_for_item(0)
+                        .expect("drawn")
+                        .size
+                        .height
+                })
+            };
+            let line = cx.update(|window, cx| cell_line_height(window, cx));
+            assert!(
+                height(cx) >= px(ROW_HEIGHT) + line,
+                "as tall as the value out of view: {:?}",
+                height(cx)
+            );
+            // Run again: one short row, one row high.
+            editor.update(cx, |editor, cx| {
+                let at = ReadAt::Branch("main".into());
+                editor.finish_read(people(), at, Ok(read("short")), Duration::ZERO, None);
+                editor.redraw_results(cx);
+            });
+            cx.run_until_parked();
+            assert_eq!(height(cx), px(ROW_HEIGHT), "no height of the last result's");
         }
 
         /// A result wider than its view draws the columns in view and one gap for the rest, as

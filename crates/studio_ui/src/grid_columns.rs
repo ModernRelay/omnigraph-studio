@@ -173,7 +173,9 @@ impl GridColumns {
             let entry = ContextMenuEntry::new(label)
                 .toggleable(IconPosition::Start, false)
                 .handler(move |window, cx| apply(change, window, cx));
-            match action(change) {
+            // A column's own entries show no key: the key acts on the selected cell's column,
+            // which may be another than the menu's.
+            match action(change).filter(|_| !change.is_to_a_column()) {
                 Some(action) => entry.action(action),
                 None => entry,
             }
@@ -230,6 +232,13 @@ impl GridRows {
             measured: gpui::ListState::new(0, gpui::ListAlignment::Top, px(WRAPPED_DRAW_AHEAD)),
             count: Rc::default(),
         }
+    }
+
+    /// The grid holds other lines now, `count` of them, from the first: every height the
+    /// wrapped list measured is forgotten.
+    pub fn reset(&self, count: usize) {
+        self.count.set(count);
+        self.measured.reset(count);
     }
 
     /// The grid holds `count` lines. Lines added or taken are at the end; nothing in view
@@ -367,6 +376,21 @@ pub fn widest_text(texts: impl IntoIterator<Item = CellText>, window: &gpui::Win
         .take(FIT_ROWS)
         .map(|text| text.line_width(window))
         .fold(Pixels::ZERO, Pixels::max)
+}
+
+/// How many lines a wrapped row takes: as many as its text cell that takes the most, each
+/// wrapped at its room. A grid counts every column's, drawn or not, so a row keeps its height
+/// while it is scrolled sideways, and keeps the count until a width or the wrap changes.
+pub fn row_lines(
+    cells: impl IntoIterator<Item = (CellText, Pixels)>,
+    window: &Window,
+    cx: &App,
+) -> usize {
+    cells
+        .into_iter()
+        .map(|(text, room)| text.wrapped_lines(room, window, cx))
+        .max()
+        .unwrap_or(1)
 }
 
 /// How tall a row is whose tallest cell takes `lines` lines of `line_height`, in a grid whose

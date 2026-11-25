@@ -787,7 +787,8 @@ mod tests {
         let element = cx.update(|cx| tags([long, "two\nlines".into()], None, cx));
         assert_eq!(
             element.tags[0].chars().count(),
-            crate::ds::cell_text::SHOWN_CHARS
+            crate::ds::cell_text::SHOWN_CHARS + 1,
+            "the start a line shows, and the ellipsis that says it was cut"
         );
         assert!(!element.tags[1].contains('\n'), "{}", element.tags[1]);
     }
