@@ -83,17 +83,20 @@ pub const HEADER_HEIGHT: f32 = ds::size::HEADER;
 /// The header row of a grid: one line per column, the name then its type, muted, with a
 /// hairline below (spec 002, "Visual language").
 pub fn grid_header(columns: &[GridColumn], leading: Pixels, cx: &App) -> Div {
-    resizable_grid_header(columns, None, leading, |_, _| None, cx)
+    resizable_grid_header(columns, None, leading, Pixels::ZERO, |_, _| None, cx)
 }
 
 /// [`grid_header`] at a frame's `places` (every column when `None`; see [`grid_places`]),
 /// with what `handle` gives for a column's edge, last in each cell: a [`column_resize_handle`]
 /// for column `index`'s end in its own cell, and for the column before's edge at the start of
-/// the next, where that column is drawn against it.
+/// the next, where that column is drawn against it and its start is in view: the header is
+/// `scrolled` that far sideways, and a start at or left of the view's edge has the column
+/// before it out of view.
 pub fn resizable_grid_header(
     columns: &[GridColumn],
     places: Option<&[GridPlace]>,
     leading: Pixels,
+    scrolled: Pixels,
     mut handle: impl FnMut(usize, ColumnEdge) -> Option<AnyElement>,
     cx: &App,
 ) -> Div {
@@ -116,9 +119,13 @@ pub fn resizable_grid_header(
                 GridPlace::Column(index) => index,
                 GridPlace::Gap(width) => return div().w(width).flex_none().into_any_element(),
             };
-            let after = index
-                .checked_sub(1)
-                .filter(|before| at > 0 && places[at - 1] == GridPlace::Column(*before));
+            let start = leading
+                + columns[..index]
+                    .iter()
+                    .fold(Pixels::ZERO, |x, c| x + c.width);
+            let after = index.checked_sub(1).filter(|before| {
+                at > 0 && places[at - 1] == GridPlace::Column(*before) && start > scrolled
+            });
             let column = &columns[index];
             h_flex()
                 .relative()

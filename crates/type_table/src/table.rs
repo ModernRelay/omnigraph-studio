@@ -10474,15 +10474,15 @@ impl TypeTable {
         // A rule on every header's right but the last column's: the grid's edge is its own.
         // The column's edge handle draws it (`ColumnEdge::End`), so the rule is the handle's.
         let last = self.columns.len().saturating_sub(1);
-        // The strip of unpinned columns at its start: only then is the key column drawn
-        // against the first of them.
-        let unscrolled = self
+        // How far the strip of unpinned columns is scrolled: a column's start half is drawn
+        // only where the column before it is in view against it, the key column against the
+        // first of them only at the strip's start.
+        let scrolled = -self
             .table_state
             .read(cx)
             .horizontal_scroll_handle
             .offset()
-            .x
-            >= Pixels::ZERO;
+            .x;
         let headers: Vec<AnyElement> = places
             .iter()
             .enumerate()
@@ -10510,10 +10510,15 @@ impl TypeTable {
                     },
                     cx,
                 );
+                let start = column_widths
+                    .get(1..index)
+                    .unwrap_or_default()
+                    .iter()
+                    .fold(Pixels::ZERO, |x, width| x + *width);
                 let before = index.checked_sub(1).filter(|&before| {
                     at > 0
                         && places[at - 1] == GridPlace::Column(before)
-                        && (before > 0 || unscrolled)
+                        && (start > scrolled || (before == 0 && scrolled <= Pixels::ZERO))
                 });
                 let start =
                     before.map(|before| self.render_resize_handle(before, ColumnEdge::Start, cx));
@@ -15813,6 +15818,76 @@ mod tests {
             assert!(table.header_menu.is_none(), "the drag opened the menu");
             assert!(table.layout.widths.contains_key("name"), "the drag resized");
         });
+    }
+
+    /// A column dragged by its header onto another header's edge still drops there and moves:
+    /// the edge takes presses, not what is dropped on the header under it (spec 049).
+    #[gpui::test]
+    async fn a_column_dropped_on_an_edge_moves(cx: &mut TestAppContext) {
+        let schema = "node Person {\n  slug: String @key\n  name: String\n  title: String\n  email: String\n}\n";
+        let session = session(schema, cx);
+        let (table, cx) = people_table(&session, cx);
+        let name = cx.debug_bounds("cell-0-1").expect("drawn");
+        let email = cx.debug_bounds("cell-0-3").expect("drawn");
+        let y = name.top() - px(studio_ui::HEADER_HEIGHT / 2.) - px(1.);
+        let none = gpui::Modifiers::default();
+        // email's header, by its middle, onto name's end and title's start.
+        let from = point(email.center().x, y);
+        let to = point(name.right() + px(1.), y);
+        cx.simulate_mouse_move(from, None, none);
+        cx.simulate_mouse_down(from, MouseButton::Left, none);
+        for step in 1..=10 {
+            let x = from.x + (to.x - from.x) * (step as f32 / 10.);
+            cx.simulate_mouse_move(point(x, y), MouseButton::Left, none);
+        }
+        cx.simulate_mouse_up(to, MouseButton::Left, none);
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            let keys: Vec<&str> = table.columns.iter().map(|c| c.key.as_str()).collect();
+            assert_eq!(keys, ["slug", "name", "email", "title"], "moved onto title");
+            assert!(table.layout.widths.is_empty(), "and nothing resized");
+        });
+    }
+
+    /// A column's start half is drawn only where the column before it is in view against it:
+    /// with the strip scrolled so `name` is out of view, the column after it has none, and the
+    /// key column's end is the only edge by the strip's start (spec 049).
+    #[gpui::test]
+    async fn a_scrolled_strip_gives_no_edge_to_a_column_out_of_view(cx: &mut TestAppContext) {
+        let edges: String = (1..=20)
+            .map(|i| format!("edge R{i:02}: Person -> Person\n"))
+            .collect();
+        let session = session(&format!("{PEOPLE}{edges}"), cx);
+        let (table, cx) = people_table(&session, cx);
+        // name's end is slot 2, the next column's start for it slot 3.
+        assert!(
+            cx.debug_bounds("column-edge-3").is_some(),
+            "in view, both halves"
+        );
+        let name = table.read_with(cx, |table, _| px(table.layout.width(&table.columns[1])));
+        table.update(cx, |table, cx| {
+            let handle = table.table_state.read(cx).horizontal_scroll_handle.clone();
+            handle.set_offset(point(-name, px(0.)));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let scrolled = table.read_with(cx, |table, cx| {
+            table
+                .table_state
+                .read(cx)
+                .horizontal_scroll_handle
+                .offset()
+                .x
+        });
+        assert_eq!(scrolled, -name, "the strip scrolled past name");
+        assert!(
+            cx.debug_bounds("column-edge-3").is_none(),
+            "no edge for name out of view"
+        );
+        assert!(
+            cx.debug_bounds("column-edge-0").is_some(),
+            "the key column's end stays"
+        );
     }
 
     /// A restored tab sets its order and grouping before the schema is read: they wait for it,

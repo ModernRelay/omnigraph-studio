@@ -94,8 +94,11 @@ pub enum ColumnEdge {
 ///   `index` ([`ColumnEdge::End`], over its rule) and the start of the column after it
 ///   ([`ColumnEdge::Start`]). Each half is placed in its own header cell, which is
 ///   `relative()`, as the cell's **last** child: drawn over what the cell holds, so its line
-///   shows over a hover slot's fill, and its hit area blocks what is under it, so a press there
-///   reaches no button and no header click (sort) under it.
+///   shows over a hover slot's fill. A press on it stops there, before the header cell around
+///   it hears it, so no header click (sort) or reorder drag starts; it blocks nothing else, so
+///   a column dragged onto the header to move it still drops there.
+/// - Each half lights the line on its side of the rule, half of [`crate::ds::size::DRAG_LINE`]:
+///   hovering either half lights one, a drag lights both, the whole line centred on the rule.
 /// - Controls stay out: a header cell's end control is a [`crate::ds::header_slot`], which
 ///   stops short of the edge, so no control's hit area meets the handle's.
 /// - A press on the handle starts a resize and goes no further; a click on a control never
@@ -132,10 +135,9 @@ pub fn column_resize_handle(
     handle
         .debug_selector(move || format!("column-edge-{slot}"))
         .cursor_col_resize()
-        .block_mouse_except_scroll()
         .child(
             div()
-                .w(px(DRAG_LINE))
+                .w(px(DRAG_LINE / 2.))
                 .h_full()
                 .flex()
                 .justify_end()
@@ -171,7 +173,7 @@ mod tests {
         use crate::ds::size::COLUMN_EDGE;
         use std::{cell::RefCell, rc::Rc};
 
-        struct Header(Rc<RefCell<Vec<usize>>>);
+        struct Header(Rc<RefCell<Vec<usize>>>, Pixels);
         impl Render for Header {
             fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
                 let columns: Vec<crate::GridColumn> = ["a", "b", "c"]
@@ -183,6 +185,7 @@ mod tests {
                     &columns,
                     None,
                     px(0.),
+                    self.1,
                     |index, edge| {
                         let pressed = pressed.clone();
                         Some(
@@ -204,9 +207,9 @@ mod tests {
         }
         cx.update(studio_theme::init_test);
         let pressed: Rc<RefCell<Vec<usize>>> = Rc::default();
-        let (_, cx) = cx.add_window_view({
+        let (header, cx) = cx.add_window_view({
             let pressed = pressed.clone();
-            |_, _| Header(pressed)
+            |_, _| Header(pressed, px(0.))
         });
         let mut press = |x: f32| {
             pressed.borrow_mut().clear();
@@ -224,6 +227,22 @@ mod tests {
             assert_eq!(press(rule + COLUMN_EDGE + 1.), None);
         }
         assert_eq!(press(300. - 0.5), Some(2), "the last column's own half");
+        // Scrolled so the view starts at b's start, a is out of view: b's start resizes
+        // nothing, and its end still resizes b.
+        header.update(cx, |header, cx| {
+            header.1 = px(100.);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let mut press = |x: f32| {
+            pressed.borrow_mut().clear();
+            let at = gpui::point(px(x), px(crate::HEADER_HEIGHT / 2.));
+            cx.simulate_mouse_down(at, MouseButton::Left, Default::default());
+            cx.simulate_mouse_up(at, MouseButton::Left, Default::default());
+            pressed.borrow().first().copied()
+        };
+        assert_eq!(press(100.5), None, "a's edge with a out of view");
+        assert_eq!(press(199.5), Some(1));
     }
 
     #[test]

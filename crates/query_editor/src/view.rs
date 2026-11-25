@@ -4781,6 +4781,7 @@ impl QueryEditor {
                 &columns,
                 Some(&places),
                 px(ROW_NUMBER_WIDTH),
+                -self.results_hscroll.offset().x,
                 |index, edge| Some(self.render_resize_handle(index, edge, rows.widths[index], cx)),
                 cx,
             )

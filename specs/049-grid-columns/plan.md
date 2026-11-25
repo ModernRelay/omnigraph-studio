@@ -57,11 +57,13 @@ type table's header edges (`edge-trace-main.txt` in the PR):
 
 - The edge is `size::COLUMN_EDGE` (4 px) either side of the rule, in two halves: the column's
   end in its own header cell (`ColumnEdge::End`) and the next column's start in its cell
-  (`ColumnEdge::Start`), given only where that column is drawn against it (not the key column's
-  neighbour while the strip is scrolled).
-- Each half is its cell's **last** child, so its line draws over any slot, and it blocks the
-  mouse beneath it (`block_mouse_except_scroll`), so no button or header click under it hears a
-  press. A ruled cell's rule is drawn by its `End` half, not a border, so the rule is the edge.
+  (`ColumnEdge::Start`), given only where the column before is in view against it (not at a
+  scrolled strip's or header's left edge).
+- Each half is its cell's **last** child, so its line draws over any slot. A press on it stops
+  there, before the header cell around it hears it (no sort, no reorder drag); it blocks nothing
+  else, so a column dragged onto the header to move it still drops there. Each half lights half
+  of the drag line on its side of the rule; a drag lights both. A ruled cell's rule is drawn by
+  its `End` half, not a border, so the rule is the edge.
 - Controls keep out: a header's end control is a `ds::header_slot`, which stops `space::XS`
   short of the edge.
 - `resizable_grid_header` (query results) and the type table's header both place the two halves.
@@ -107,7 +109,7 @@ page). No engine change.
 | Date | Claim | Check | Result |
 |---|---|---|---|
 | 2026-11-25 | The edge bug, as above | Probe on `main`: a click and a 40 px drag at every pixel from 30 px left to 4 px right of each header rule of `Person` (two columns), and sub-pixel presses | Handle −6 to −1 px, menu button −24 to −7, sort left of that; on the key column the rule pixel did nothing and +0.5 px sorted the next column; drags from the handle never opened the menu |
-| 2026-11-25 | The rule holds | `type_table` `a_column_edge_is_the_resize_handles_and_no_control_reaches_it`; `studio_ui` `a_press_at_a_rule_resizes_the_column_on_its_left` | Pass; the first fails on `main` at −0.5 px from the key column's rule |
+| 2026-11-25 | The rule holds | `type_table` `a_column_edge_is_the_resize_handles_and_no_control_reaches_it`, `a_column_dropped_on_an_edge_moves`, `a_scrolled_strip_gives_no_edge_to_a_column_out_of_view`; `studio_ui` `a_press_at_a_rule_resizes_the_column_on_its_left` | Pass; the first fails on `main` at −0.5 px from the key column's rule. With the edge blocking the mouse (the first version of this fix), a column dropped on an edge did not move (review of #181) |
 | 2026-11-25 | The edge shows its line | Offscreen snapshots of `Note`, the pointer 2 px left of slug's rule | `main`: the menu's button and no line; now: the line, no button |
 
 ## Corrections
