@@ -324,14 +324,15 @@ pub(crate) fn saved_table(data: &Value) -> Option<(String, Option<String>, Openi
             })
             .unwrap_or_default()
     };
-    let mut layout = model::ColumnLayout::new(keys("hidden"), keys("order"));
-    if let Some(widths) = data.get("widths").and_then(Value::as_object) {
-        for (key, width) in widths {
-            if let Some(width) = width.as_f64() {
-                layout.set_width(key, Some(width as f32));
-            }
-        }
-    }
+    let layout = model::ColumnLayout::new(keys("hidden"), keys("order"));
+    // Before spec 049 a tab kept its columns' widths; they are the type's now.
+    let saved_widths = data
+        .get("widths")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter_map(|(key, width)| Some((key.clone(), width.as_f64()?.round() as u32)))
+        .collect();
     let filters = data
         .get("filters")
         .cloned()
@@ -354,6 +355,7 @@ pub(crate) fn saved_table(data: &Value) -> Option<(String, Option<String>, Openi
         sort,
         group_by,
         layout,
+        saved_widths,
         view: data.get("view").and_then(Value::as_str).map(str::to_owned),
         own_key: data
             .get("own_key")
@@ -384,6 +386,7 @@ pub(crate) fn view_opening(view: &studio_settings::SavedView) -> Opening {
         }),
         group_by: view.group_by.clone(),
         layout: model::ColumnLayout::new(view.hidden.clone(), view.order.clone()),
+        saved_widths: Default::default(),
         view: Some(view.key()),
         own_key: None,
     }

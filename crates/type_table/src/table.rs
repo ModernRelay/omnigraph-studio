@@ -17,8 +17,8 @@ use editor::{Editor, EditorEvent};
 use gpui::{
     Anchor, AnyView, App, ClickEvent, ClipboardItem, Context, DragMoveEvent, ElementId, Entity,
     EventEmitter, ExternalPaths, FocusHandle, Focusable, KeyContext, MouseButton, MouseDownEvent,
-    MouseMoveEvent, Pixels, Point, Render, ScrollStrategy, SharedString, StyleRefinement,
-    Subscription, Task, WeakEntity, Window, anchored, deferred, point,
+    MouseMoveEvent, Pixels, Point, Render, SharedString, StyleRefinement, Subscription, Task,
+    WeakEntity, Window, anchored, deferred, point,
 };
 use gq_language::builder::{Group, Quantifier};
 use gq_language::input::same_value;
@@ -34,6 +34,7 @@ use graph_store::{
 };
 use serde_json::Value;
 use studio_actions::blob::{ChooseFile, ClearValue};
+use studio_actions::grid;
 use studio_actions::table::{
     AddFilter, Cancel, ClearFilters, ConfirmEdit, CopyAsStoredQuery, CopyCell, DeleteRow, EditCell,
     ExpandCell, FillColumn, FilterBySelection, FilterInWords, InsertRow, MoveDown, MoveLeft,
@@ -47,7 +48,8 @@ use studio_ui::ds::menu::{ContextMenu, ContextMenuEntry};
 use studio_ui::ds::space;
 use studio_ui::plural;
 use studio_ui::{
-    ColumnDrag, ColumnEdge, ColumnResize, GridPlace, ROW_HEIGHT, columns_in_view, grid_places,
+    CellWrap, ColumnChange, ColumnDrag, ColumnEdge, ColumnResize, GridColumns, GridPlace, GridRows,
+    ROW_HEIGHT, columns_in_view, grid_places,
 };
 use studio_workspace::models::{self, Error as ModelError, Models, Request as ModelRequest};
 use studio_workspace::{
@@ -84,6 +86,46 @@ use crate::write::{self, Bound};
 /// Rows per neighbour read when a relationship column comes into view: a page's worth, as the
 /// page reads do.
 const RELATION_READ_CHUNK: usize = 100;
+
+/// A type's column sizing in the session's graph, from settings (spec 049). A tab saved
+/// before spec 049 kept its own widths: the type takes them, once, when it has none.
+fn type_sizing(
+    session: &Entity<GraphSession>,
+    type_name: &str,
+    saved_widths: std::collections::BTreeMap<String, u32>,
+    cx: &mut App,
+) -> GridColumns {
+    let Some(settings) = cx.try_global::<studio_settings::StudioSettings>() else {
+        return GridColumns::new(Default::default(), CellWrap::Truncate);
+    };
+    let graph = session.read(cx).overrides_key();
+    let mut layout = settings.grid_layout(&graph, type_name);
+    let adopt = layout.widths.is_empty() && !saved_widths.is_empty();
+    if adopt {
+        layout.widths = saved_widths;
+    }
+    let sizing = GridColumns::new(layout, CellWrap::Truncate);
+    if adopt {
+        let (kept, type_name) = (sizing.layout().clone(), type_name.to_owned());
+        studio_settings::update(cx, move |settings| {
+            settings.set_grid_layout(&graph, &type_name, kept)
+        });
+    }
+    sizing
+}
+
+/// The action whose key a column menu's entry shows (spec 049); Reset width has none.
+fn grid_action(change: ColumnChange) -> Option<Box<dyn gpui::Action>> {
+    use studio_actions::grid::{FitColumn, NarrowColumn, ResetColumns, ToggleWrap, WidenColumn};
+    Some(match change {
+        ColumnChange::Widen => Box::new(WidenColumn),
+        ColumnChange::Narrow => Box::new(NarrowColumn),
+        ColumnChange::Fit => Box::new(FitColumn),
+        ColumnChange::ResetWidth => return None,
+        ColumnChange::Reset => Box::new(ResetColumns),
+        ColumnChange::ToggleWrap => Box::new(ToggleWrap),
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cursor {
@@ -1002,6 +1044,9 @@ pub struct Opening {
     /// The grouping's key: a property, a relationship or a property of a neighbour.
     pub group_by: Option<String>,
     pub layout: ColumnLayout,
+    /// The widths a tab saved before spec 049, when the tab kept them: the type takes them once,
+    /// if it has none of its own.
+    pub saved_widths: std::collections::BTreeMap<String, u32>,
     /// The saved view the tab is (spec 024), by id: what it saves to and is named by.
     pub view: Option<String>,
     /// The tab's own key, for a filtered table opened beside the type's own (spec 032): it is
@@ -1058,9 +1103,8 @@ pub struct TypeTable {
     grouping: Option<Grouping>,
     /// The grouped grid's lines as this frame drew them.
     frame_lines: Option<Rc<Lines>>,
-    /// How many lines the last frame's list held, which [`Self::line_height`] divides its
-    /// height by.
-    frame_line_count: usize,
+    /// A line's height when the cells wrap this frame (spec 049); `None` when they are cut.
+    frame_wrap: Option<Pixels>,
     /// How the lines drawn this frame look, filled by the row callback for the row styling.
     frame_looks: Rc<RefCell<HashMap<usize, RowLook>>>,
     /// The places this frame's lines draw.
@@ -1084,6 +1128,15 @@ pub struct TypeTable {
     /// A column being dragged wider or narrower: its key, and where the pointer and the column's
     /// width were when the drag began.
     resizing: Option<ColumnResize<String>>,
+    /// The widths the person gave the type's columns, and whether its cells wrap (spec 049):
+    /// the type's in this graph, in settings, which every tab of the type shares.
+    sizing: GridColumns,
+    /// Where the grid's lines are scrolled, cut or wrapped (spec 049); told how many there are
+    /// each frame.
+    lines: GridRows,
+    /// The lines the rows of this frame have drawn so far, first to last, and whether this
+    /// frame's per-frame work is done: the list draws a row at a time.
+    frame_lines_drawn: Option<Range<usize>>,
     /// The time relative dates are read against, taken once a frame rather than once a cell
     /// (reading the local time zone is not free), and its minute since the epoch.
     frame_now: chrono::DateTime<chrono::Local>,
@@ -1421,7 +1474,6 @@ impl Item for TypeTable {
                 "group_by": self.grouping.as_ref().map(|g| &g.property),
                 "hidden": self.layout.hidden,
                 "order": self.layout.order,
-                "widths": self.layout.widths,
                 "view": self.view_id,
                 "own_key": self.own_key,
             }),
@@ -1521,11 +1573,13 @@ impl TypeTable {
             // when that is another row, however the cursor or the rows came to change.
             cx.observe_self(|this, cx| this.report_selection(cx)),
             // A view renamed, saved or deleted elsewhere: the tab's name and dot follow it.
+            // The type's columns sized or wrapped in another tab of it: this one follows.
             cx.observe_global::<studio_settings::StudioSettings>(|this, cx| {
                 if this.view_id.is_some() {
                     cx.emit(ItemEvent::UpdateTab);
                     cx.notify();
                 }
+                this.follow_type_sizing(cx);
             }),
             cx.subscribe_in(&session, window, Self::on_session_event),
             // A table behind its branch in a window that was not active follows it once the
@@ -1561,6 +1615,7 @@ impl TypeTable {
         let branch = session.read(cx).branch.clone();
         let table_state = cx.new(|cx| TableInteractionState::new(cx));
         let scope = at_commit.is_none().then(|| new_scope(&session, cx));
+        let sizing = type_sizing(&session, &type_name, opening.saved_widths, cx);
         let mut this = Self {
             workspace,
             session,
@@ -1589,7 +1644,7 @@ impl TypeTable {
             sort: opening.sort,
             grouping: opening.group_by.map(Grouping::new),
             frame_lines: None,
-            frame_line_count: 0,
+            frame_wrap: None,
             frame_looks: Rc::default(),
             frame_places: Rc::from([]),
             frame_rows_drawn: Vec::new(),
@@ -1605,6 +1660,9 @@ impl TypeTable {
             edit_slot: Default::default(),
             wheel_gesture: Default::default(),
             resizing: None,
+            sizing,
+            lines: GridRows::new(table_state.read(cx).scroll_handle.clone()),
+            frame_lines_drawn: None,
             blob_lines: None,
             _blob_wait: None,
             blob_columns: Vec::new(),
@@ -2024,7 +2082,7 @@ impl TypeTable {
     }
 
     /// Column `index`'s edge, on `edge`'s side of its rule (`studio_ui::column_resize_handle`):
-    /// drag to make the column wider or narrower, click twice to fit it to its type again.
+    /// drag to make the column wider or narrower, click twice to fit it to its values (spec 049).
     fn render_resize_handle(
         &self,
         index: usize,
@@ -2033,7 +2091,7 @@ impl TypeTable {
     ) -> AnyElement {
         let column = &self.columns[index];
         let key = column.key.clone();
-        let width = self.layout.width(column);
+        let width = self.width(column);
         let active = self
             .resizing
             .as_ref()
@@ -2045,16 +2103,16 @@ impl TypeTable {
                 cx.notify();
             }
         });
-        let on_reset = cx.listener(move |this, _: &ClickEvent, _, cx| {
+        let on_fit = cx.listener(move |this, _: &ClickEvent, window, cx| {
             this.resizing = None;
-            this.resize_column(&key, None, cx);
+            this.change_columns(ColumnChange::Fit, Some(index), window, cx);
         });
-        studio_ui::column_resize_handle(cx.entity_id(), index, edge, active, on_start, on_reset, cx)
+        studio_ui::column_resize_handle(cx.entity_id(), index, edge, active, on_start, on_fit, cx)
             .into_any_element()
     }
 
     /// Follows a column drag: the column's new width is where the pointer is now, relative to
-    /// where the drag began.
+    /// where the drag began. The width is kept for the type when the drag ends.
     fn drag_column(&mut self, event: &DragMoveEvent<ColumnDrag>, cx: &mut Context<Self>) {
         let Some(resizing) = &self.resizing else {
             return;
@@ -2063,30 +2121,144 @@ impl TypeTable {
             return;
         }
         let (key, width) = (resizing.column.clone(), resizing.width(event));
-        self.resize_column(&key, Some(width), cx);
+        if self.sizing.set_width(&key, Some(width)) {
+            self.sizing_changed(false, cx);
+        }
     }
 
     fn end_resize(&mut self, cx: &mut Context<Self>) {
         if self.resizing.take().is_some() {
+            self.keep_sizing(cx);
             cx.notify();
         }
     }
 
-    fn resize_column(&mut self, key: &str, width: Option<f32>, cx: &mut Context<Self>) {
-        let before = self.layout.widths.get(key).copied();
-        self.layout.set_width(key, width);
-        if self.layout.widths.get(key).copied() == before {
+    /// A column's width as drawn: the one the person gave it for the type, else the one
+    /// fitted to its type.
+    pub(crate) fn width(&self, column: &ColumnSpec) -> f32 {
+        self.sizing.width(&column.key, column.width)
+    }
+
+    /// Makes `change` to column `col`, or to the cursor's column when `None` (spec 049), and
+    /// keeps it for the type. A fit measures the column's header and the rows read, as their
+    /// cells show them.
+    fn change_columns(
+        &mut self,
+        change: ColumnChange,
+        col: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let col = col.or(self.cursor.map(|cursor| cursor.col));
+        let Some(column) = col.and_then(|col| self.columns.get(col)).cloned() else {
+            if !change.is_to_a_column() && self.sizing.change(change, None, || Pixels::ZERO) {
+                self.sizing_changed(true, cx);
+            }
+            return;
+        };
+        // Measured only for a fit, before the model is changed.
+        let widest = match change {
+            ColumnChange::Fit => self.widest_text(&column, window, cx),
+            _ => Pixels::ZERO,
+        };
+        if self
+            .sizing
+            .change(change, Some((&column.key, column.width)), || widest)
+        {
+            self.sizing_changed(true, cx);
+        }
+    }
+
+    /// The widest text of `column` as drawn: its header (its kind's icon, its title and its
+    /// type, and the menu's button) and the values of the first rows read.
+    fn widest_text(&self, column: &ColumnSpec, window: &Window, cx: &App) -> Pixels {
+        let detail = match self.absent.get(&column.key) {
+            Some(then) => crate::peek::absence_text(then, false),
+            None => column.detail.clone(),
+        };
+        let header =
+            px(studio_ui::ds::size::ROW_ICON + 2. * space::SM + studio_ui::ds::size::ROW_BUTTON)
+                + studio_ui::cell_text(column.title.clone(), cx).line_width(window)
+                + studio_ui::cell_text(detail, cx).meta(cx).line_width(window);
+        let values = self.rows.iter().map(|row| {
+            let value = row.value(&column.key);
+            studio_ui::cell_text(self.cell_text_of(row, column, value).shown, cx)
+        });
+        header.max(studio_ui::widest_text(values, window))
+    }
+
+    /// The type's widths or wrap changed: the lines are measured again, and, when `keep`, the
+    /// change is kept for the type, which its other tabs follow.
+    fn sizing_changed(&mut self, keep: bool, cx: &mut Context<Self>) {
+        self.lines.measured.remeasure();
+        if keep {
+            self.keep_sizing(cx);
+        }
+        cx.notify();
+    }
+
+    /// Keeps the type's sizing in settings, for this graph (spec 049).
+    fn keep_sizing(&self, cx: &mut Context<Self>) {
+        if cx.try_global::<studio_settings::StudioSettings>().is_none() {
             return;
         }
-        // Saved with the tab, like the columns' order.
-        cx.emit(ItemEvent::UpdateTab);
-        cx.notify();
+        let graph = self.session.read(cx).overrides_key();
+        let (type_name, layout) = (self.type_name.clone(), self.sizing.layout().clone());
+        studio_settings::update(cx, move |settings| {
+            if settings.grid_layout(&graph, &type_name) != layout {
+                settings.set_grid_layout(&graph, &type_name, layout)
+            }
+        });
+    }
+
+    /// Takes the type's sizing from settings when another tab of the type changed it.
+    fn follow_type_sizing(&mut self, cx: &mut Context<Self>) {
+        if self.resizing.is_some() {
+            return;
+        }
+        let Some(settings) = cx.try_global::<studio_settings::StudioSettings>() else {
+            return;
+        };
+        let graph = self.session.read(cx).overrides_key();
+        let layout = settings.grid_layout(&graph, &self.type_name);
+        if layout != *self.sizing.layout() {
+            self.sizing = GridColumns::new(layout, CellWrap::Truncate);
+            self.sizing_changed(false, cx);
+        }
     }
 
     /// How wide the columns from `from` on are, as drawn.
     fn width_from(&self, from: usize) -> Pixels {
         let columns = self.columns.get(from..).unwrap_or_default();
-        px(columns.iter().map(|c| self.layout.width(c)).sum())
+        px(columns.iter().map(|c| self.width(c)).sum())
+    }
+
+    /// How many lines the grid draws: a row each, or grouped, its sections' lines.
+    fn line_count(&self) -> usize {
+        match &self.grouping {
+            Some(grouping) => grouping.line_map().len(),
+            None => self.rows.len(),
+        }
+    }
+
+    /// Scrolls the lines so `line` is first in view, `offset` into it.
+    fn scroll_to_line(&self, line: usize, offset: Pixels) {
+        self.lines.sync(self.line_count());
+        self.lines.scroll_to(self.sizing.wrap(), line, offset);
+    }
+
+    /// How far down the lines are scrolled, in pixels, as a cut grid's lines are a row each:
+    /// what a test of scrolling reads.
+    #[cfg(test)]
+    fn scrolled_down(&self) -> Pixels {
+        let (line, offset) = self.lines.first(self.sizing.wrap());
+        -(self.lines.cut_row_height() * line as f32 + offset)
+    }
+
+    /// Scrolls as little as shows all of `line`.
+    fn reveal_line(&self, line: usize) {
+        self.lines.sync(self.line_count());
+        self.lines.reveal(self.sizing.wrap(), line);
     }
 
     // ---- reading ----
@@ -2234,10 +2406,8 @@ impl TypeTable {
             .as_ref()
             .filter(|key| self.can_group_by(key))
             .map(Grouping::new);
-        // The view's columns and their order; the widths are the tab's own, and stay.
-        let widths = std::mem::take(&mut self.layout.widths);
+        // The view's columns and their order; the widths are the type's, and stay.
         self.layout = ColumnLayout::new(view.hidden.clone(), view.order.clone());
-        self.layout.widths = widths;
         self.show_columns(cx);
         self.filter_draft = None;
         self.reload(true, cx);
@@ -3251,6 +3421,7 @@ impl TypeTable {
         let sort = self.sort.clone();
         let grouped = self.grouping.as_ref().map(|g| g.property.clone());
         let arranged = self.layout != ColumnLayout::default();
+        let sizing = self.sizing.clone();
         // Entries line up with the checked ones when the menu has any.
         let checks = sortable.is_some() || groupable.is_some();
         let plain = move |label: &'static str| {
@@ -3336,7 +3507,15 @@ impl TypeTable {
                         }))),
                     );
             }
-            menu
+            // The column's width and the type's wrap (spec 049), as every grid's menu has them.
+            let table = table.clone();
+            sizing.menu_entries(menu, &key, grid_action, move |change, window, cx| {
+                table
+                    .update(cx, |table, cx| {
+                        table.change_columns(change, Some(col), window, cx)
+                    })
+                    .ok();
+            })
         });
         let subscription = cx.subscribe_in(
             &menu,
@@ -3391,11 +3570,13 @@ impl TypeTable {
                         let Some(entity) = table.upgrade() else {
                             return menu;
                         };
-                        let (choices, arranged) = {
+                        let (choices, arranged, wrapped, sized) = {
                             let table = entity.read(cx);
                             (
                                 table.column_choices(),
                                 table.layout != ColumnLayout::default(),
+                                table.sizing.wrap() == CellWrap::Wrap,
+                                !table.sizing.layout().is_default(),
                             )
                         };
                         for (key, title, shown) in choices {
@@ -3416,19 +3597,47 @@ impl TypeTable {
                                 },
                             );
                         }
-                        let table = table.clone();
-                        menu.separator().item(
-                            ContextMenuEntry::new("Show all columns")
-                                .toggleable(IconPosition::Start, false)
-                                .disabled(!arranged)
-                                .handler(move |_, cx| {
-                                    table
-                                        .update(cx, |table, cx| {
-                                            table.arrange_columns(cx, |layout, _| layout.reset())
-                                        })
-                                        .ok();
-                                }),
-                        )
+                        let show_all = table.clone();
+                        // The type's wrap and widths (spec 049), with the keys that change them.
+                        let change = |change: ColumnChange| {
+                            let table = table.clone();
+                            move |window: &mut Window, cx: &mut App| {
+                                table
+                                    .update(cx, |table, cx| {
+                                        table.change_columns(change, None, window, cx)
+                                    })
+                                    .ok();
+                            }
+                        };
+                        menu.separator()
+                            .item(
+                                ContextMenuEntry::new("Show all columns")
+                                    .toggleable(IconPosition::Start, false)
+                                    .disabled(!arranged)
+                                    .handler(move |_, cx| {
+                                        show_all
+                                            .update(cx, |table, cx| {
+                                                table
+                                                    .arrange_columns(cx, |layout, _| layout.reset())
+                                            })
+                                            .ok();
+                                    }),
+                            )
+                            .separator()
+                            .toggleable_entry(
+                                "Wrap text",
+                                wrapped,
+                                IconPosition::Start,
+                                grid_action(ColumnChange::ToggleWrap),
+                                change(ColumnChange::ToggleWrap),
+                            )
+                            .item(
+                                ContextMenuEntry::new("Reset widths and wrap")
+                                    .toggleable(IconPosition::Start, false)
+                                    .disabled(!sized)
+                                    .action(Box::new(grid::ResetColumns))
+                                    .handler(change(ColumnChange::Reset)),
+                            )
                     },
                 ))
             });
@@ -3961,10 +4170,7 @@ impl TypeTable {
         self.count_task = None;
         self.total_task = None;
         if !swap {
-            self.table_state
-                .read(cx)
-                .scroll_handle
-                .scroll_to_item(0, ScrollStrategy::Top);
+            self.scroll_to_line(0, Pixels::ZERO);
         }
         true
     }
@@ -4685,26 +4891,11 @@ impl TypeTable {
     }
 
     /// The first line in view, grouped: what it shows, and how many lines there are.
-    fn first_line_in_view(&self, cx: &App) -> Option<(Line, usize)> {
+    fn first_line_in_view(&self, _cx: &App) -> Option<(Line, usize)> {
         let grouping = self.grouping.as_ref()?;
         let lines = grouping.line_map();
-        let height = self.line_height(cx);
-        let state = self.table_state.read(cx).scroll_handle.0.borrow();
-        let first = (-state.base_handle.offset().y / height).floor().max(0.) as usize;
+        let (first, _) = self.lines.first(self.sizing.wrap());
         Some((lines.get(first)?, lines.len()))
-    }
-
-    /// How tall a grid line is, as the list last laid them out. GPUI's `last_item_size` holds
-    /// the list's own size as `item` (`uniform_list.rs`, `ItemSize`) and its lines' as
-    /// `contents`, so a line is the contents' height over the lines it held.
-    fn line_height(&self, cx: &App) -> Pixels {
-        let state = self.table_state.read(cx).scroll_handle.0.borrow();
-        state
-            .last_item_size
-            .filter(|_| self.frame_line_count > 0)
-            .map(|size| size.contents.height / self.frame_line_count as f32)
-            .filter(|height| *height > px(0.))
-            .unwrap_or(px(ROW_HEIGHT))
     }
 
     /// Keeps the lines in view where they were after a section's rows went in at row `at`, in
@@ -4712,7 +4903,7 @@ impl TypeTable {
     /// showed and how many lines there were), the scroll moves by the lines added, so nothing
     /// in view moves (constitution V). Every line the read added or ended (the section's read
     /// line, once it has no more) is at the section's end.
-    fn hold_lines_in_view(&self, before: (Line, usize), at: usize, index: usize, cx: &App) {
+    fn hold_lines_in_view(&self, before: (Line, usize), at: usize, index: usize, _cx: &App) {
         let (first, len) = before;
         let below = match first {
             Line::Row(row) => row >= at,
@@ -4723,15 +4914,12 @@ impl TypeTable {
         let Some(grouping) = self.grouping.as_ref().filter(|_| below) else {
             return;
         };
-        let added = grouping.line_map().len() as f32 - len as f32;
-        if added == 0. {
+        let now = grouping.line_map().len();
+        if now == len {
             return;
         }
-        let height = self.line_height(cx);
-        let state = self.table_state.read(cx).scroll_handle.0.borrow();
-        let offset = state.base_handle.offset();
-        let y = (offset.y - height * added).min(Pixels::ZERO);
-        state.base_handle.set_offset(point(offset.x, y));
+        let (top, offset) = self.lines.first(self.sizing.wrap());
+        self.scroll_to_line((top + now).saturating_sub(len), offset);
     }
 
     /// `page` without the rows the table shows already, once its pin moved to one of its own
@@ -5707,16 +5895,8 @@ impl TypeTable {
         let on = self
             .cursor
             .and_then(|cursor| Some((self.rows.get(cursor.row)?.id.clone(), cursor)));
-        let scroll = self.table_state.read(cx).scroll_handle.clone();
-        let (offset, row_height) = {
-            let state = scroll.0.borrow();
-            let height = state.last_item_size.map(|size| size.item.height);
-            (state.base_handle.offset(), height)
-        };
-        let first_shown = row_height
-            .filter(|height| *height > px(0.))
-            .map(|height| ((-offset.y) / height).floor().max(0.) as usize);
-        let first = first_shown.and_then(|ix| Some((ix, self.rows.get(ix)?.id.clone())));
+        let (top, offset) = self.lines.first(self.sizing.wrap());
+        let first = self.rows.get(top).map(|row| (offset, row.id.clone()));
         if !self.clear_rows(false, true, cx) {
             return;
         }
@@ -5735,15 +5915,10 @@ impl TypeTable {
                 col: cursor.col,
             });
         }
-        if let (Some((was, id)), Some(height)) = (first, row_height)
+        if let Some((offset, id)) = first
             && let Some(now) = self.rows.iter().position(|row| row.id == id)
         {
-            let moved = now as f32 - was as f32;
-            scroll
-                .0
-                .borrow()
-                .base_handle
-                .set_offset(point(offset.x, offset.y - height * moved));
+            self.scroll_to_line(now, offset);
         }
         // The head may have moved again while the rows were read.
         self.compare_head(cx);
@@ -5879,10 +6054,7 @@ impl TypeTable {
                         row: position,
                         col: self.cursor.map_or(0, |c| c.col),
                     });
-                    self.table_state
-                        .read(cx)
-                        .scroll_handle
-                        .scroll_to_item(position, ScrollStrategy::Nearest);
+                    self.reveal_line(position);
                 }
             }
             // Without a key the engine assigns the id; only a fresh read shows the row.
@@ -6234,10 +6406,7 @@ impl TypeTable {
             None => Some(cursor.row),
         };
         if let Some(line) = line {
-            self.table_state
-                .read(cx)
-                .scroll_handle
-                .scroll_to_item(line, ScrollStrategy::Nearest);
+            self.reveal_line(line);
         }
         self.scroll_column_into_view(cursor.col, cx);
         if self
@@ -6656,7 +6825,7 @@ impl TypeTable {
             _ => (edit_text(&old), None),
         };
         // An enum's values and a boolean's are chosen, not typed.
-        let width = self.layout.width(column);
+        let width = self.width(column);
         let select = column.property().cloned().and_then(|property| {
             let choices = cell_select::choices(&property)?;
             Some(self.open_select(&property, choices, &text, width, notice.clone(), window, cx))
@@ -9132,9 +9301,7 @@ impl TypeTable {
                 .into_iter()
                 .filter(|key| Some(key) != pinned.as_ref())
                 .collect();
-            let widths = std::mem::take(&mut self.layout.widths);
             self.layout = ColumnLayout::new(hidden, order);
-            self.layout.widths = widths;
             self.show_columns(cx);
         }
     }
@@ -10458,11 +10625,7 @@ impl TypeTable {
         let drawn = Rc::new(self.drawn_columns(window, cx));
         #[cfg(test)]
         self.frames_rows_drawn.push(Vec::new());
-        let column_widths: Vec<Pixels> = self
-            .columns
-            .iter()
-            .map(|c| px(self.layout.width(c)))
-            .collect();
+        let column_widths: Vec<Pixels> = self.columns.iter().map(|c| px(self.width(c))).collect();
         let places: Rc<[GridPlace]> = grid_places(&drawn, &column_widths).into();
         self.frame_places = places.clone();
         self.frame_writable = self.at_commit.is_none() && self.change_refusal(cx).is_none();
@@ -10676,7 +10839,13 @@ impl TypeTable {
         let picked_bg = studio_ui::ds::surface::picked(cx);
         let header_bg = studio_ui::ds::surface::well(cx);
         let line_count = lines.as_ref().map_or(self.rows.len(), |lines| lines.len());
-        self.frame_line_count = line_count;
+        self.lines.sync(line_count);
+        // The lines this frame draws are noted as the list draws them, a line at a time.
+        self.frame_lines_drawn = None;
+        self.frame_wrap = match self.sizing.wrap() {
+            CellWrap::Wrap => Some(studio_ui::cell_line_height(window, cx)),
+            CellWrap::Truncate => None,
+        };
         // Widths fitted to each column's type unless dragged. Not Zed's resizable columns: they
         // draw a full-height rule between every column, which the visual language leaves out
         // (spec 002); the header's edges resize instead.
@@ -10716,60 +10885,30 @@ impl TypeTable {
                         row.opacity(studio_ui::ds::opacity::DIMMED)
                     })
                     .into_any_element()
-            })
-            .uniform_list(
+            });
+        // Cut, every line is a row high and drawn by a uniform list, its scroll exact; wrapped,
+        // each is measured as it is drawn (spec 049).
+        let table = match self.sizing.wrap() {
+            CellWrap::Truncate => table.uniform_list(
                 "type-table-rows",
                 line_count,
                 cx.processor(move |this, range: Range<usize>, window, cx| {
-                    this.note_looks(range.clone());
-                    this.want_relations(&drawn, window, cx);
-                    this.note_blob_columns(&drawn);
-                    // Their rows' relationship and Blob cells are asked for once the frame is
-                    // out, for the rows these lines show, not every row between their first
-                    // and last: grouped, a folded section's rows are on no line.
-                    this.frame_line_range = Some(range.clone());
-                    this.frame_rows_drawn = this.rows_drawn(&drawn, window, cx);
-                    this.drawn(window, cx);
-                    #[cfg(test)]
-                    {
-                        this.frame_drawn = drawn.to_vec();
-                        if let Some(frame) = this.frames_rows_drawn.last_mut() {
-                            *frame = this.frame_rows_drawn.clone();
-                        }
-                    }
-                    let Some(lines) = this.frame_lines.clone() else {
-                        if this.more_error.is_none()
-                            && this
-                                .paging
-                                .wants_more(this.rows.len(), range.end, this.loading_more)
-                        {
-                            cx.defer_in(window, |this, _, cx| this.load_more(cx));
-                        }
-                        return range.map(|ix| this.render_row(ix, window, cx)).collect();
-                    };
-                    let shown: Vec<Line> = lines.slice(range).collect();
-                    // An open section reads its first rows when its read line comes into view,
-                    // and a read owed while the section reads were full goes once one is back.
-                    for line in &shown {
-                        if let Line::More(index) = *line
-                            && let Some(rows) = this.section_read_owed(index)
-                        {
-                            cx.defer_in(window, move |this, _, cx| {
-                                this.load_section(index, rows, cx)
-                            });
-                        }
-                    }
-                    shown
-                        .iter()
-                        .map(|line| match *line {
-                            Line::Row(row) => this.render_row(row, window, cx),
-                            Line::Header(index) => this.render_section_header(index, cx),
-                            Line::More(index) => this.render_section_more(index, cx),
-                            Line::OtherValues => this.render_other_values(),
-                        })
+                    // The list lays one line out alone to measure it, then the lines in view:
+                    // each call's lines are the frame's, the last call's standing.
+                    this.frame_lines_drawn = None;
+                    range
+                        .map(|ix| this.render_line(ix, &drawn, window, cx))
                         .collect()
                 }),
-            );
+            ),
+            CellWrap::Wrap => table.variable_row_height_list(
+                line_count,
+                self.lines.measured.clone(),
+                cx.processor(move |this, ix: usize, window, cx| {
+                    this.render_line(ix, &drawn, window, cx)
+                }),
+            ),
+        };
         let state = self.table_state.read(cx);
         let wheel = sideways_scroll(
             state.horizontal_scroll_handle.clone(),
@@ -11058,6 +11197,77 @@ impl TypeTable {
         std::iter::once(first)
             .chain((1..self.frame_places.len()).map(|_| div().h(px(ROW_HEIGHT)).into_any_element()))
             .collect()
+    }
+
+    /// Line `ix` of this frame, whichever list draws it: a row, a section's header or read
+    /// line, or the other values' line.
+    fn render_line(
+        &mut self,
+        ix: usize,
+        drawn: &[bool],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        self.line_drawn(ix, drawn, window, cx);
+        let Some(lines) = self.frame_lines.clone() else {
+            return self.render_row(ix, window, cx);
+        };
+        match lines.get(ix) {
+            Some(Line::Row(row)) => self.render_row(row, window, cx),
+            Some(Line::Header(index)) => self.render_section_header(index, cx),
+            Some(Line::More(index)) => {
+                // An open section reads its first rows when its read line comes into view,
+                // and a read owed while the section reads were full goes once one is back.
+                if let Some(rows) = self.section_read_owed(index) {
+                    cx.defer_in(window, move |this, _, cx| {
+                        this.load_section(index, rows, cx)
+                    });
+                }
+                self.render_section_more(index, cx)
+            }
+            Some(Line::OtherValues) | None => self.render_other_values(),
+        }
+    }
+
+    /// The list draws line `ix` of this frame (`drawn`, the columns it draws): how it looks is
+    /// worked out, and the lines drawn so far noted, whose relationships and Blob cells are
+    /// asked for once the frame is out ([`Self::drawn`]). The first line of a frame does the
+    /// frame's own work; a line near the end of the rows read asks for the next page.
+    fn line_drawn(
+        &mut self,
+        ix: usize,
+        drawn: &[bool],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.note_looks(ix..ix + 1);
+        let lines = match self.frame_lines_drawn.take() {
+            Some(lines) => lines.start.min(ix)..lines.end.max(ix + 1),
+            None => {
+                self.want_relations(drawn, window, cx);
+                self.note_blob_columns(drawn);
+                self.frame_rows_drawn = self.rows_drawn(drawn, window, cx);
+                #[cfg(test)]
+                {
+                    self.frame_drawn = drawn.to_vec();
+                    if let Some(frame) = self.frames_rows_drawn.last_mut() {
+                        *frame = self.frame_rows_drawn.clone();
+                    }
+                }
+                ix..ix + 1
+            }
+        };
+        self.frame_lines_drawn = Some(lines.clone());
+        self.frame_line_range = Some(lines);
+        self.drawn(window, cx);
+        if self.frame_lines.is_none()
+            && self.more_error.is_none()
+            && self
+                .paging
+                .wants_more(self.rows.len(), ix + 1, self.loading_more)
+        {
+            cx.defer_in(window, |this, _, cx| this.load_more(cx));
+        }
     }
 
     /// Works out how the lines `range` look, for the row styling of the lines being drawn.
@@ -11762,17 +11972,7 @@ impl TypeTable {
     /// is now; `None` off the rows.
     fn cell_at(&self, position: Point<Pixels>, cx: &App) -> Option<(usize, usize)> {
         let state = self.table_state.read(cx);
-        let (rows, offset) = {
-            let list = state.scroll_handle.0.borrow();
-            (list.base_handle.bounds(), list.base_handle.offset())
-        };
-        if !rows.contains(&position) {
-            return None;
-        }
-        let line = (position.y - rows.origin.y - offset.y) / self.line_height(cx);
-        if line < 0. {
-            return None;
-        }
+        let line = self.lines.line_at(self.sizing.wrap(), position)?;
         // The pinned key column, then a strip of the others that scrolls sideways.
         let strip = &state.horizontal_scroll_handle;
         let col = if strip.bounds().size.width <= px(0.) || position.x < strip.bounds().left() {
@@ -11784,7 +11984,7 @@ impl TypeTable {
                 .enumerate()
                 .skip(1)
                 .find_map(|(col, column)| {
-                    let width = px(self.layout.width(column));
+                    let width = px(self.width(column));
                     if x < width {
                         Some(col)
                     } else {
@@ -11793,7 +11993,7 @@ impl TypeTable {
                     }
                 })?
         };
-        Some((line as usize, col))
+        Some((line, col))
     }
 
     /// The row and column under `position` ([`Self::cell_at`]), a grouped grid's line taken to
@@ -11865,6 +12065,11 @@ impl TypeTable {
         let Some(row) = self.rows.get(ix) else {
             return Vec::new();
         };
+        // Wrapped, every cell is as tall as the row: Zed's cell around each does not stretch
+        // to its row, so the row's height is worked out here, from its drawn text cells' lines.
+        let height = self
+            .frame_wrap
+            .map(|line| self.wrapped_row_height(row, line, window, cx));
         self.frame_places
             .clone()
             .iter()
@@ -11873,7 +12078,7 @@ impl TypeTable {
                 GridPlace::Column(0) => div()
                     .relative()
                     .w_full()
-                    .child(self.render_cell(ix, 0, row, window, cx))
+                    .child(self.render_cell(ix, 0, row, height, window, cx))
                     .when_some(self.row_change(&row.id), |cell, net| {
                         // The gutter's bar says the kind, as a diff's does.
                         cell.child(
@@ -11893,10 +12098,47 @@ impl TypeTable {
                 GridPlace::Column(col) if self.frame_rows_drawn.get(col) == Some(&false) => {
                     div().into_any_element()
                 }
-                GridPlace::Column(col) => self.render_cell(ix, col, row, window, cx),
+                GridPlace::Column(col) => self.render_cell(ix, col, row, height, window, cx),
                 GridPlace::Gap(_) => div().into_any_element(),
             })
             .collect()
+    }
+
+    /// How tall `row` is wrapped: as its text cell with the most lines among the columns its
+    /// rows draw, each line `line` high ([`studio_ui::wrapped_row_height`]).
+    fn wrapped_row_height(&self, row: &Row, line: Pixels, window: &Window, cx: &App) -> Pixels {
+        let lines = self
+            .frame_places
+            .iter()
+            .filter_map(|place| match *place {
+                GridPlace::Column(col) if self.frame_rows_drawn.get(col) != Some(&false) => {
+                    let column = self.columns.get(col)?;
+                    self.wraps(column).then(|| {
+                        let value = row.value(&column.key);
+                        studio_ui::cell_text(self.cell_text_of(row, column, value).shown, cx)
+                            .wrapped_lines(px(self.text_room(col, column)), window, cx)
+                    })
+                }
+                _ => None,
+            })
+            .max()
+            .unwrap_or(1);
+        studio_ui::wrapped_row_height(lines, line, px(ROW_HEIGHT))
+    }
+
+    /// Whether `column`'s cells are text that wraps (spec 049): not a relationship, a file or
+    /// an enum's chip, which stay one line.
+    fn wraps(&self, column: &ColumnSpec) -> bool {
+        column.relationship().is_none()
+            && column.property().is_none_or(|property| {
+                property.kind != ScalarKind::Blob && property.enum_values.is_none()
+            })
+    }
+
+    /// The room column `col`'s text has: its width less the cell's inset on both sides.
+    fn text_room(&self, col: usize, column: &ColumnSpec) -> f32 {
+        let inset = if col == 0 { KEY_TEXT_INSET } else { space::LG };
+        self.width(column) - inset - space::LG
     }
 
     /// Whether row `ix` builds its checkbox: every row the branch keeps while any row is checked,
@@ -12053,7 +12295,7 @@ impl TypeTable {
             .columns
             .iter()
             .skip(1)
-            .map(|column| px(self.layout.width(column)))
+            .map(|column| px(self.width(column)))
             .collect();
         let content = scrolled.iter().fold(Pixels::ZERO, |sum, w| sum + *w);
         let shown_left = studio_ui::scrolled_within(-handle.offset().x, content, width);
@@ -12115,6 +12357,7 @@ impl TypeTable {
         ix: usize,
         col: usize,
         row: &Row,
+        height: Option<Pixels>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -12150,6 +12393,13 @@ impl TypeTable {
             .when(col == 0, |d| d.pl(px(KEY_TEXT_INSET)))
             .flex()
             .items_center()
+            // Wrapped (spec 049), as tall as its lines and its row, its first line where a cut
+            // cell's one line is.
+            // Wrapped (spec 049), as tall as its row, its first line where a cut cell's one line
+            // is, so the rule on its right and the cursor's ring run the row's height.
+            .when_some(self.frame_wrap.zip(height), |cell, (line, height)| {
+                studio_ui::wrapping_cell(cell, line, px(ROW_HEIGHT)).h(height)
+            })
             .gap(px(space::XS))
             .overflow_hidden()
             // A rule on every cell's right but the last column's: the grid's edge is its own.
@@ -12204,7 +12454,7 @@ impl TypeTable {
         let numeric = column.align_right;
         if column.relationship().is_some() {
             // The cell's padding on both sides.
-            let available = self.layout.width(column) - 2. * space::LG;
+            let available = self.width(column) - 2. * space::LG;
             return cell
                 .debug_selector(move || format!("cell-{ix}-{col}"))
                 .child(self.render_relation_cell(ix, col, row, available, cx))
@@ -12279,8 +12529,12 @@ impl TypeTable {
                 studio_ui::ds::chip(shown, cx).into_any_element()
             }
             _ => {
-                // One line in the cell's room, never measured: most cells are this.
+                // One line in the cell's room, never measured: most cells are this. Wrapped,
+                // as many lines as the column's width needs.
                 let mut text = studio_ui::cell_text(shown, cx).color(text_color.color(cx));
+                if self.frame_wrap.is_some() {
+                    text = text.wrap(px(self.text_room(col, column)));
+                }
                 if removed {
                     text = text.struck();
                 }
@@ -12709,6 +12963,22 @@ impl Render for TypeTable {
             .on_action(cx.listener(|this, _: &MoveDown, _, cx| this.move_cursor(1, 0, cx)))
             .on_action(cx.listener(|this, _: &MoveLeft, _, cx| this.move_cursor(0, -1, cx)))
             .on_action(cx.listener(|this, _: &MoveRight, _, cx| this.move_cursor(0, 1, cx)))
+            // The cursor's column's width and the type's wrap (spec 049).
+            .on_action(cx.listener(|this, _: &grid::WidenColumn, window, cx| {
+                this.change_columns(ColumnChange::Widen, None, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &grid::NarrowColumn, window, cx| {
+                this.change_columns(ColumnChange::Narrow, None, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &grid::FitColumn, window, cx| {
+                this.change_columns(ColumnChange::Fit, None, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &grid::ResetColumns, window, cx| {
+                this.change_columns(ColumnChange::Reset, None, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &grid::ToggleWrap, window, cx| {
+                this.change_columns(ColumnChange::ToggleWrap, None, window, cx)
+            }))
             .on_action(
                 cx.listener(|this, _: &menu::SelectNext, window, cx| this.tab(1, window, cx)),
             )
@@ -15724,10 +15994,10 @@ mod tests {
         });
     }
 
-    /// A saved view brings its filters, order and columns; the widths the tab's columns were
-    /// dragged to stay, being the tab's own.
+    /// A saved view brings its filters, order and columns; the widths the columns were dragged
+    /// to stay, being the type's (spec 049).
     #[gpui::test]
-    async fn a_saved_view_keeps_the_tabs_column_widths(cx: &mut TestAppContext) {
+    async fn a_saved_view_keeps_the_types_column_widths(cx: &mut TestAppContext) {
         cx.update(|cx| {
             studio_theme::init_test(cx);
             editor::init(cx);
@@ -15745,7 +16015,7 @@ mod tests {
         });
         cx.run_until_parked();
         table.update(cx, |table, cx| {
-            table.layout.set_width("name", Some(300.));
+            table.sizing.set_width("name", Some(300.));
             let view = studio_settings::SavedView {
                 name: "v".into(),
                 type_name: "Person".into(),
@@ -15754,7 +16024,7 @@ mod tests {
             };
             table.apply_view(&view, cx);
             assert_eq!(table.layout.hidden, ["slug"]);
-            assert_eq!(table.layout.widths.get("name"), Some(&300));
+            assert_eq!(table.sizing.chosen_width("name"), Some(300.));
         });
     }
 
@@ -15847,7 +16117,10 @@ mod tests {
         cx.run_until_parked();
         table.read_with(cx, |table, _| {
             assert!(table.header_menu.is_none(), "the drag opened the menu");
-            assert!(table.layout.widths.contains_key("name"), "the drag resized");
+            assert!(
+                table.sizing.chosen_width("name").is_some(),
+                "the drag resized"
+            );
         });
     }
 
@@ -16034,7 +16307,10 @@ mod tests {
         table.read_with(cx, |table, _| {
             let keys: Vec<&str> = table.columns.iter().map(|c| c.key.as_str()).collect();
             assert_eq!(keys, ["slug", "name", "email", "title"], "moved onto title");
-            assert!(table.layout.widths.is_empty(), "and nothing resized");
+            assert!(
+                table.sizing.layout().widths.is_empty(),
+                "and nothing resized"
+            );
         });
     }
 
@@ -16053,7 +16329,7 @@ mod tests {
             cx.debug_bounds("column-edge-3").is_some(),
             "in view, both halves"
         );
-        let name = table.read_with(cx, |table, _| px(table.layout.width(&table.columns[1])));
+        let name = table.read_with(cx, |table, _| px(table.width(&table.columns[1])));
         table.update(cx, |table, cx| {
             let handle = table.table_state.read(cx).horizontal_scroll_handle.clone();
             handle.set_offset(point(-name, px(0.)));
@@ -16077,6 +16353,119 @@ mod tests {
             cx.debug_bounds("column-edge-0").is_some(),
             "the key column's end stays"
         );
+    }
+
+    /// A type's columns are the type's (spec 049): widths and the wrap a tab changes are kept
+    /// in settings for the graph and type, a second tab of the type follows them, and a tab
+    /// saved before spec 049 hands its widths to a type that has none. Wrapped, a long value's
+    /// row grows by its lines, the others stay a row, and a click on a wrapped row's lower
+    /// lines lands on that row; cut again, every line is a row.
+    #[gpui::test]
+    async fn a_types_columns_are_kept_for_the_type_and_wrapped_rows_grow(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+            studio_settings::init_test(cx);
+            studio_settings::keep_changes_in_memory(cx);
+        });
+        let long = "a name long enough to need several lines in a narrow column ".repeat(6);
+        let session = crate::test_support::session_reading(
+            PEOPLE,
+            serde_json::json!([
+                {"n": {"@id": "p1", "slug": "p1", "name": "Ada"}},
+                {"n": {"@id": "p2", "slug": "p2", "name": long}},
+                {"n": {"@id": "p3", "slug": "p3", "name": "Grace"}},
+            ]),
+            cx,
+        );
+        let graph = session.read_with(cx, |session, _| session.overrides_key());
+        let opened = |session: Entity<GraphSession>, opening: Opening| {
+            move |window: &mut Window, cx: &mut Context<TypeTable>| {
+                TypeTable::opening(
+                    WeakEntity::new_invalid(),
+                    session,
+                    "Person".into(),
+                    None,
+                    opening,
+                    window,
+                    cx,
+                )
+            }
+        };
+        // A tab saved before spec 049 brings its widths to the type.
+        let (table, cx) = cx.add_window_view(opened(
+            session.clone(),
+            Opening {
+                saved_widths: [("name".to_owned(), 200)].into(),
+                ..Opening::default()
+            },
+        ));
+        cx.run_until_parked();
+        let kept = |cx: &mut VisualTestContext| {
+            let graph = graph.clone();
+            cx.update(|_, cx| {
+                studio_settings::StudioSettings::get(cx).grid_layout(&graph, "Person")
+            })
+        };
+        assert_eq!(kept(cx).widths.get("name"), Some(&200));
+        assert!(
+            table
+                .read_with(cx, |table, cx| table.serialize(cx))
+                .is_some_and(|saved| saved.data.get("widths").is_none()),
+            "the tab keeps no widths of its own"
+        );
+
+        // Wrapped, the long name's row grows; the others stay one row.
+        let row = table.read_with(cx, |table, _| table.lines.cut_row_height());
+        table.update_in(cx, |table, window, cx| {
+            table.change_columns(ColumnChange::ToggleWrap, None, window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(kept(cx).wrap, Some(CellWrap::Wrap));
+        let height = |cx: &mut VisualTestContext, line: usize| {
+            table.read_with(cx, |table, _| {
+                table.lines.measured.bounds_for_item(line).expect("drawn")
+            })
+        };
+        let line = cx.update(|window, cx| studio_ui::cell_line_height(window, cx));
+        assert_eq!(height(cx, 0).size.height, row, "a short name stays a row");
+        let grown = height(cx, 1);
+        assert!(
+            grown.size.height >= row + line * 2.,
+            "{grown:?} at a line of {line:?}"
+        );
+        assert_eq!(height(cx, 2).size.height, row);
+        // A click on the long name's last line is on its row.
+        let below = point(px(30.), grown.bottom() - px(4.));
+        let hit = table.read_with(cx, |table, cx| table.row_cell_at(below, cx));
+        assert_eq!(hit.map(|(row, _)| row), Some(1));
+
+        // A second tab of the type draws what the first kept, and follows its next change.
+        let make = opened(session.clone(), Opening::default());
+        let second = cx.update(|window, cx| cx.new(|cx| make(window, cx)));
+        cx.run_until_parked();
+        let sizing = |table: &Entity<TypeTable>, cx: &mut VisualTestContext| {
+            table.read_with(cx, |table, _| table.sizing.layout().clone())
+        };
+        assert_eq!(sizing(&second, cx), kept(cx));
+        table.update_in(cx, |table, window, cx| {
+            let name = table.column_index("name").unwrap();
+            table.cursor = Some(Cursor { row: 0, col: name });
+            table.change_columns(ColumnChange::Widen, None, window, cx);
+        });
+        cx.run_until_parked();
+        let widened = 200 + studio_ui::COLUMN_STEP as u32;
+        assert_eq!(kept(cx).widths.get("name"), Some(&widened));
+        assert_eq!(sizing(&second, cx).widths.get("name"), Some(&widened));
+
+        // Reset: the type's own widths and the cut rows, and nothing kept.
+        table.update_in(cx, |table, window, cx| {
+            table.change_columns(ColumnChange::Reset, None, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(kept(cx).is_default());
+        let cut = table.read_with(cx, |table, _| table.lines.cut_row_height());
+        assert_eq!(cut, row, "cut again, every line is a row");
     }
 
     /// A restored tab sets its order and grouping before the schema is read: they wait for it,
@@ -16358,7 +16747,7 @@ mod tests {
                 let state = table.table_state.read(cx);
                 (
                     state.horizontal_scroll_handle.offset().x,
-                    state.scroll_handle.0.borrow().base_handle.offset().y,
+                    table.scrolled_down(),
                 )
             })
         };
@@ -16427,12 +16816,7 @@ mod tests {
             state
                 .horizontal_scroll_handle
                 .set_offset(point(px(0.), px(0.)));
-            state
-                .scroll_handle
-                .0
-                .borrow()
-                .base_handle
-                .set_offset(point(px(0.), px(0.)));
+            table.scroll_to_line(0, px(0.));
             let col = table.columns.iter().position(|c| c.key == "name").unwrap();
             table.start_edit(Cursor { row: 0, col }, window, cx);
         });
@@ -17255,11 +17639,11 @@ mod tests {
                 "{places:?}"
             );
             let width = |place: &GridPlace| match *place {
-                GridPlace::Column(col) => table.layout.width(&table.columns[col]),
+                GridPlace::Column(col) => table.width(&table.columns[col]),
                 GridPlace::Gap(width) => f32::from(width),
             };
             let drawn: f32 = places.iter().map(width).sum();
-            let all: f32 = table.columns.iter().map(|c| table.layout.width(c)).sum();
+            let all: f32 = table.columns.iter().map(|c| table.width(c)).sum();
             assert!((drawn - all).abs() < 0.5, "{drawn} of {all}");
         });
         cx.simulate_resize(gpui::size(px(6000.), px(800.)));
@@ -17854,11 +18238,7 @@ mod tests {
         // Scrolled to within a page of the rows read, the next is asked for, twice as large.
         let third = served.hold(|read| read["params"]["after"] == "p199");
         table.update(cx, |table, cx| {
-            let height = table.line_height(cx);
-            {
-                let state = table.table_state.read(cx).scroll_handle.0.borrow();
-                state.base_handle.set_offset(point(px(0.), height * -110.));
-            }
+            table.scroll_to_line(110, px(0.));
             cx.notify();
         });
         cx.run_until_parked();
@@ -20002,7 +20382,7 @@ mod tests {
         let second = cx.debug_bounds("cell-1-1").expect("row 1 is drawn");
         let drawn = second.top() - first.top();
         assert!(drawn > px(0.));
-        let height = table.read_with(cx, |table, cx| table.line_height(cx));
+        let height = table.read_with(cx, |table, _| table.lines.cut_row_height());
         assert_eq!(height, drawn);
     }
 
@@ -20041,11 +20421,7 @@ mod tests {
             grouping.accept_counts(&counts, GROUP_LIMIT);
             table.grouping = Some(grouping);
             // Each section is a header and its read line: line 40 is section 20's header.
-            let height = table.line_height(cx);
-            {
-                let state = table.table_state.read(cx).scroll_handle.0.borrow();
-                state.base_handle.set_offset(point(px(0.), height * -40.));
-            }
+            table.scroll_to_line(40, px(0.));
             assert_eq!(
                 table.first_line_in_view(cx).map(|(line, _)| line),
                 Some(Line::Header(20))
@@ -20348,11 +20724,7 @@ mod tests {
         cx.run_until_parked();
         pages.lock().unwrap().clear();
         let scroll = |line: f32, table: &mut TypeTable, cx: &mut Context<TypeTable>| {
-            let height = table.line_height(cx);
-            {
-                let state = table.table_state.read(cx).scroll_handle.0.borrow();
-                state.base_handle.set_offset(point(px(0.), height * -line));
-            }
+            table.scroll_to_line(line as usize, px(0.));
             cx.notify();
         };
 
