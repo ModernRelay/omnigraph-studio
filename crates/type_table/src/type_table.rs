@@ -10,6 +10,7 @@ mod branch_diff;
 mod cell_select;
 mod dialogs;
 mod fill;
+mod filter_bar;
 mod gallery;
 mod grouping;
 mod masonry;

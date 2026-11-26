@@ -15,12 +15,11 @@ use std::time::Duration;
 use collections::IndexSet;
 use editor::{Editor, EditorEvent};
 use gpui::{
-    Anchor, AnyView, App, ClickEvent, ClipboardItem, Context, DragMoveEvent, ElementId, Entity,
+    AnyView, App, ClickEvent, ClipboardItem, Context, DragMoveEvent, ElementId, Entity,
     EventEmitter, ExternalPaths, FocusHandle, Focusable, KeyContext, MouseButton, MouseDownEvent,
     MouseMoveEvent, Pixels, Point, Render, ScrollStrategy, SharedString, StyleRefinement,
-    Subscription, Task, WeakEntity, Window, anchored, deferred, point,
+    Subscription, Task, WeakEntity, Window, point,
 };
-use gq_language::builder::{Group, Quantifier};
 use gq_language::input::same_value;
 use gq_language::{
     BuildError, BuiltQuery, Filter, FilterOp, PageStart, Property, RelationshipGroup, ScalarKind,
@@ -38,7 +37,7 @@ use studio_actions::table::{
     AddFilter, Cancel, ClearFilters, ConfirmEdit, CopyAsStoredQuery, CopyCell, DeleteRow, EditCell,
     ExpandCell, FillColumn, FilterBySelection, FilterInWords, InsertRow, MoveDown, MoveLeft,
     MoveRight, MoveUp, OpenRowPage, RefreshTable, RevertView, SaveDrafts, SaveView, SaveViewAsNew,
-    SelectNextSuggestion, SelectPreviousSuggestion, ShowRowOnCanvas, StageEdit,
+    ShowRowOnCanvas, StageEdit,
 };
 use studio_actions::workspace::ToggleInspector;
 use studio_actions::{ViewKind, ViewLink};
@@ -63,15 +62,17 @@ use crate::dialogs::{
     DeleteRowModal, DeleteTarget, InsertEdgeModal, InsertRowModal, SaveViewModal, TableLink, Told,
 };
 use crate::fill;
+use crate::filter_bar::{
+    FilterBar, FilterHost, direction_icon, filter_placeholder, floating_under,
+};
 use crate::grouping::{GROUP_LIMIT, Grouping, Line, Lines, SECTION_FIRST_PAGE};
 use crate::model::{
     ColumnLayout, ColumnRole, ColumnSpec, Notice, Paging, RELATION_CHIPS_SHOWN,
     RELATION_SAMPLE_BUDGET, Row, SaveResult, TableKind, Tone, changed_elsewhere, chips_that_fit,
     display_value, edge_columns, edge_rows, edit_text, edited, field_rows, filter_parts,
-    insert_position, node_columns, node_rows, parse_filter_list, parse_filter_value, parse_input,
-    preset_range, published, reads_as_markdown, relation_sample, row_matches,
+    insert_position, node_columns, node_rows, parse_input, published, reads_as_markdown,
+    relation_sample, row_matches,
 };
-use crate::offers::Offers;
 use crate::peek::{
     KnownRelation, NEIGHBOUR_LIMIT, Neighbour, NodePeek, PeekSubject, TableBlobs, TableWrote,
 };
@@ -79,11 +80,12 @@ use crate::suggest;
 use crate::words;
 use crate::write::{self, Bound};
 
-mod filters;
-
 #[cfg(test)]
-use filters::DraftTarget;
-use filters::{FilterDraft, FilterMenuEntry, filter_menu, filter_placeholder};
+use crate::filter_bar::{DraftTarget, FilterMenuEntry, filter_menu};
+#[cfg(test)]
+use gq_language::builder::Quantifier;
+#[cfg(test)]
+use studio_actions::table::{SelectNextSuggestion, SelectPreviousSuggestion};
 
 /// Rows per neighbour read when a relationship column comes into view: a page's worth, as the
 /// page reads do.
@@ -673,19 +675,16 @@ fn relation_samples(rows: &Value) -> Vec<(String, String, Option<String>)> {
         .collect()
 }
 
-/// What the Group and Filter menus offer for a table's columns, built once with them
-/// ([`TypeTable::build_menu_choices`]): the toolbar draws both on every render, and a type with
-/// dozens of relationships offers thousands of choices through its neighbours' properties.
+/// What the Group menu offers for a table's columns, built once with them
+/// ([`TypeTable::build_menu_choices`]) as the Filter menu's choices are ([`FilterBar`]): the
+/// toolbar draws both on every render, and a type with dozens of relationships offers thousands
+/// of choices through its neighbours' properties.
 #[derive(Default)]
 struct MenuChoices {
     /// The Group menu's submenus.
     group_menus: Rc<Vec<GroupMenu>>,
     /// Every grouping by key and how it reads.
     groups: Rc<Vec<(String, String)>>,
-    /// Every filter key, how it reads and its icon ([`TypeTable::filter_choices`]).
-    filters: Rc<Vec<(String, String, IconName)>>,
-    /// The Filter menu's entries over [`Self::filters`].
-    filter_menu: Rc<Vec<FilterMenuEntry>>,
 }
 
 /// A submenu of the Group menu (see [`TypeTable::group_menus`]).
@@ -720,14 +719,6 @@ pub struct Opening {
     pub own_key: Option<String>,
 }
 
-/// A relationship's direction, as filters and the Group menu show it.
-fn direction_icon(direction: gq_language::Direction) -> IconName {
-    match direction {
-        gq_language::Direction::Outgoing => IconName::ArrowRight,
-        gq_language::Direction::Incoming => IconName::ArrowLeft,
-    }
-}
-
 pub struct TypeTable {
     workspace: WeakEntity<Workspace>,
     session: Entity<GraphSession>,
@@ -750,8 +741,6 @@ pub struct TypeTable {
     columns: Vec<ColumnSpec>,
     /// A column header's right-click menu, where it was opened.
     header_menu: Option<(Entity<ContextMenu>, gpui::Point<Pixels>, Subscription)>,
-    /// A group pill's menu (spec 025), where it was opened.
-    group_menu: Option<(Entity<ContextMenu>, gpui::Point<Pixels>, Subscription)>,
     rows: Vec<Row>,
     /// Rows made here and shown out of their read order (first in a sorted table, or in their
     /// section), by id: the page that reaches one leaves it out, so it shows once.
@@ -812,11 +801,6 @@ pub struct TypeTable {
     /// The Blob properties of the columns the last frame drew: only these cells are read, so a
     /// Blob column scrolled off sideways reads nothing.
     blob_columns: Vec<String>,
-    /// Labels of nodes picked for "related to" filters, so their pills read by name.
-    node_labels: HashMap<String, String>,
-    /// The filter being written's property and operator menus; the offered values hide while
-    /// either is open.
-    filter_menus: [PopoverMenuHandle<ContextMenu>; 2],
     /// The toolbar's Views, Columns and Group menus, whose buttons keep their tooltips quiet
     /// while open.
     /// Views, Columns, Group and Sort, in that order.
@@ -824,8 +808,8 @@ pub struct TypeTable {
     /// The toolbar's width as last laid out, 0 before its first frame: in a narrow tab its
     /// chips are their icons alone ([`Self::compact_toolbar`]). A change draws the table again.
     toolbar_width: Rc<Cell<f32>>,
-    filter_draft: Option<FilterDraft>,
-    filter_editor: Entity<Editor>,
+    /// The filter bar's own state: the filter being written, its value field and its menus.
+    filter_bar: FilterBar,
     /// Filter in words (spec 019): the toolbar's sentence field, what its call is doing, and
     /// the filters its last answer made, which the next answer replaces.
     words_editor: Entity<Editor>,
@@ -980,6 +964,76 @@ impl EventEmitter<ItemEvent> for TypeTable {}
 impl Focusable for TypeTable {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+impl FilterHost for TypeTable {
+    fn bar(&self) -> &FilterBar {
+        &self.filter_bar
+    }
+
+    fn bar_mut(&mut self) -> &mut FilterBar {
+        &mut self.filter_bar
+    }
+
+    fn filters(&self) -> &[Filter] {
+        &self.filters
+    }
+
+    fn filters_mut(&mut self) -> &mut Vec<Filter> {
+        &mut self.filters
+    }
+
+    fn schema(&self) -> Option<&Arc<SchemaModel>> {
+        self.schema.as_ref()
+    }
+
+    fn type_name(&self) -> &str {
+        &self.type_name
+    }
+
+    fn kind(&self) -> TableKind {
+        self.kind
+    }
+
+    fn all_columns(&self) -> &[ColumnSpec] {
+        &self.all_columns
+    }
+
+    fn session(&self) -> &Entity<GraphSession> {
+        &self.session
+    }
+
+    fn pinned(&self) -> Option<String> {
+        self.paging.pinned.clone()
+    }
+
+    fn host_focus(&self) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+
+    fn filters_changed(&mut self, cx: &mut Context<Self>) {
+        self.reload(true, cx);
+    }
+
+    /// The column the cursor is on.
+    fn draft_starts_on(&self) -> Option<&Property> {
+        self.cursor
+            .and_then(|c| self.columns.get(c.col))
+            .and_then(|c| c.property())
+    }
+
+    /// What "Filter in words" could not use, or why its call failed (spec 019).
+    fn bar_note(&self) -> Option<Label> {
+        match &self.words {
+            WordsState::Typing(Some(note)) => Some(studio_ui::ds::text::muted(note.clone())),
+            WordsState::Failed(why) => Some(studio_ui::ds::text::error(why.clone())),
+            _ => None,
+        }
+    }
+
+    fn nothing_to_filter(&self, cx: &mut Context<Self>) {
+        self.toast(ToastKind::Info, "This table has no filterable columns.", cx);
     }
 }
 
@@ -1197,12 +1251,7 @@ impl TypeTable {
     ) -> Self {
         let cell_editor = cx.new(|cx| Editor::single_line(window, cx));
         let cell_editor_events = cx.subscribe_in(&cell_editor, window, Self::on_cell_editor_event);
-        let filter_editor = cx.new(|cx| {
-            let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text("Value", window, cx);
-            editor.set_text_style_refinement(studio_ui::ds::field_text(cx));
-            editor
-        });
+        let filter_bar = FilterBar::new(window, cx);
         let needs_key = Models::needs_key(cx);
         let words_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
@@ -1246,22 +1295,6 @@ impl TypeTable {
                     cx.notify();
                 }
             }),
-            cx.subscribe(
-                &filter_editor,
-                |this, _, event: &EditorEvent, cx| match event {
-                    // No `notify`: the table draws again because the field it holds changed,
-                    // and the grid, which does not show the field, keeps its last frame.
-                    EditorEvent::BufferEdited => {
-                        if let Some(draft) = &mut this.filter_draft {
-                            draft.error = None;
-                        }
-                        this.refresh_suggestions(cx);
-                    }
-                    // The offered values show only while the field has focus.
-                    EditorEvent::Focused | EditorEvent::Blurred => this.redraw_offers(cx),
-                    _ => {}
-                },
-            ),
         ];
         // The sentence field says whether a key is stored, and follows the key.
         if let Some(models) = Models::try_global(cx) {
@@ -1286,7 +1319,6 @@ impl TypeTable {
             layout: opening.layout,
             columns: Vec::new(),
             header_menu: None,
-            group_menu: None,
             rows: Vec::new(),
             placed_here: HashSet::new(),
             paging: Paging::default(),
@@ -1319,12 +1351,9 @@ impl TypeTable {
             blob_lines: None,
             _blob_wait: None,
             blob_columns: Vec::new(),
-            node_labels: HashMap::new(),
-            filter_menus: Default::default(),
             toolbar_menus: Default::default(),
             toolbar_width: Rc::default(),
-            filter_draft: None,
-            filter_editor,
+            filter_bar,
             words_editor,
             words: WordsState::Typing(None),
             needs_key,
@@ -1567,6 +1596,7 @@ impl TypeTable {
             self.schema = Some(schema);
             self.all_columns.clear();
             self.menu_choices = Default::default();
+            self.bar_mut().clear_choices();
             self.columns.clear();
             self.rows.clear();
             self.placed_here.clear();
@@ -1949,7 +1979,7 @@ impl TypeTable {
         self.layout = ColumnLayout::new(view.hidden.clone(), view.order.clone());
         self.layout.widths = widths;
         self.show_columns(cx);
-        self.filter_draft = None;
+        self.bar_mut().draft = None;
         self.reload(true, cx);
     }
 
@@ -3909,14 +3939,11 @@ impl TypeTable {
     fn build_menu_choices(&mut self) {
         let group_menus = self.build_group_menus();
         let groups = self.build_group_choices(&group_menus);
-        let filters = self.build_filter_choices();
-        let filter_menu = filter_menu(&filters, |key| self.related_type(key));
         self.menu_choices = MenuChoices {
             group_menus: Rc::new(group_menus),
             groups: Rc::new(groups),
-            filters: Rc::new(filters),
-            filter_menu: Rc::new(filter_menu),
         };
+        self.rebuild_filter_choices();
     }
 
     fn build_group_choices(&self, menus: &[GroupMenu]) -> Vec<(String, String)> {
@@ -6584,28 +6611,7 @@ impl TypeTable {
             self.run_fill(cx);
             return;
         }
-        if self.filter_draft.is_some() && self.filter_editor.focus_handle(cx).is_focused(window) {
-            // ↵ picks the highlighted offer, unless it is just what is typed. While the nodes
-            // for what is typed are being read it waits: the ones offered were found for
-            // earlier text.
-            let text = self.filter_editor.read(cx).text(cx);
-            if self
-                .filter_draft
-                .as_ref()
-                .is_some_and(|draft| draft.answers.as_deref() != Some(text.as_str()))
-            {
-                return;
-            }
-            let pick = self.filter_draft.as_ref().and_then(|draft| {
-                let index = draft.offers.highlighted()?;
-                let suggestion = draft.offers.get(index)?;
-                let list = draft.op == FilterOp::In;
-                (!suggest::already_typed(&text, &suggestion.value, list)).then_some(index)
-            });
-            match pick {
-                Some(index) => self.pick_suggestion(index, window, cx),
-                None => self.apply_filter_draft(window, cx),
-            }
+        if self.confirm_filter_draft(window, cx) {
             return;
         }
         // An edit open when the access route refused the branch (its save's 403 reopened it):
@@ -7726,7 +7732,7 @@ impl TypeTable {
         let key = (row_id.clone(), column.clone());
         let position = self.row_index(&row_id).zip(self.column_index(&column));
         let free = self.editing.is_none()
-            && self.filter_draft.is_none()
+            && self.bar().draft.is_none()
             && self.focus_handle.contains_focused(window, cx);
         self.cells.remove(&key);
         let keep = (DraftEntry { old, text }, Some(notice));
@@ -7768,7 +7774,7 @@ impl TypeTable {
             window.focus(&self.focus_handle, cx);
             return;
         }
-        if self.filter_draft.is_some() {
+        if self.bar().draft.is_some() {
             self.cancel_filter_draft(window, cx);
             return;
         }
@@ -7784,7 +7790,7 @@ impl TypeTable {
 
     /// Tab: save the open edit, if any, and move to the next cell in the row.
     fn tab(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
-        if self.filter_draft.is_some() && self.filter_editor.focus_handle(cx).is_focused(window) {
+        if self.bar().draft.is_some() && self.bar().editor.focus_handle(cx).is_focused(window) {
             return;
         }
         if self.editing.is_some() {
@@ -8188,10 +8194,10 @@ impl TypeTable {
     /// relationship tree).
     pub fn show_only(&mut self, filter: Filter, cx: &mut Context<Self>) {
         // Opened with it just now (`TypeTable::opening`): its rows are being read already.
-        if self.filter_draft.is_none() && self.filters == [filter.clone()] {
+        if self.bar().draft.is_none() && self.filters == [filter.clone()] {
             return;
         }
-        self.filter_draft = None;
+        self.bar_mut().draft = None;
         self.filters = vec![filter];
         if self.schema.is_some() {
             self.reload(true, cx);
@@ -8279,17 +8285,6 @@ impl TypeTable {
                 label,
             })
             .collect()
-    }
-
-    /// The type at the other end of a relationship key.
-    fn related_type(&self, key: &str) -> Option<String> {
-        let (direction, edge) = builder::parse_relationship_key(key)?;
-        self.schema
-            .as_ref()?
-            .relationships_of(&self.type_name)
-            .iter()
-            .find(|group| group.direction == direction && group.edge == edge)
-            .map(|group| group.other_type.clone())
     }
 
     /// ↵ in the sentence field: the sentence goes to the model, once the task is allowed.
@@ -8434,7 +8429,7 @@ impl TypeTable {
             }
             let filters = judged;
             this.update_in(cx, |this, window, cx| {
-                this.node_labels.extend(labels);
+                this.bar_mut().node_labels.extend(labels);
                 // The last sentence's filters go; ones added by hand stay.
                 let made = std::mem::take(&mut this.words_made);
                 this.filters.retain(|filter| !made.contains(filter));
@@ -8483,17 +8478,18 @@ impl TypeTable {
         }
         self.set_draft_property(key.clone(), window, cx);
         if self
-            .filter_draft
+            .bar()
+            .draft
             .as_ref()
             .is_none_or(|draft| draft.property != key)
         {
             return false;
         }
-        self.filter_editor.update(cx, |editor, cx| {
+        self.bar().editor.update(cx, |editor, cx| {
             editor.set_text(name.clone(), window, cx);
             editor.set_placeholder_text(filter_placeholder(FilterOp::RelatedTo), window, cx);
         });
-        if let Some(draft) = &mut self.filter_draft {
+        if let Some(draft) = &mut self.bar_mut().draft {
             draft.op = FilterOp::RelatedTo;
             draft.offers.set(offers, true);
             draft.answers = Some(name);
@@ -11074,7 +11070,7 @@ impl Render for TypeTable {
         // Keys typed into a field are text, not the table's: the cell editor, the filter
         // value and the bulk value alike.
         let typing = self.editing.is_some()
-            || self.filter_editor.focus_handle(cx).is_focused(window)
+            || self.bar().editor.focus_handle(cx).is_focused(window)
             || self.bulk_editor.focus_handle(cx).is_focused(window)
             || self.words_editor.focus_handle(cx).is_focused(window)
             || self.fill_editor.focus_handle(cx).is_focused(window);
@@ -11214,7 +11210,8 @@ impl Render for TypeTable {
                     .map(|(menu, position, _)| studio_ui::ds::menu_at(menu.clone(), *position)),
             )
             .children(
-                self.group_menu
+                self.bar()
+                    .group_menu
                     .as_ref()
                     .map(|(menu, position, _)| studio_ui::ds::menu_at(menu.clone(), *position)),
             )
@@ -11341,31 +11338,6 @@ fn sideways_scroll(
     .top_0()
     .left_0()
     .size_full()
-}
-
-/// `content` floating under the element this is placed in, `offset` from its top-left corner:
-/// drawn over the rest of the window, `priority` among other overlays, and kept inside it by a
-/// margin.
-fn floating_under(
-    offset: gpui::Point<Pixels>,
-    priority: usize,
-    content: impl IntoElement,
-) -> AnyElement {
-    div()
-        .absolute()
-        .top_0()
-        .left_0()
-        .child(
-            deferred(
-                anchored()
-                    .anchor(Anchor::TopLeft)
-                    .offset(offset)
-                    .snap_to_window_with_margin(px(space::MD))
-                    .child(content),
-            )
-            .with_priority(priority),
-        )
-        .into_any_element()
 }
 
 #[cfg(test)]
@@ -12265,11 +12237,11 @@ mod tests {
         });
         assert!(opened);
         table.read_with(cx, |table, cx| {
-            let draft = table.filter_draft.as_ref().expect("the filter is a draft");
+            let draft = table.bar().draft.as_ref().expect("the filter is a draft");
             assert_eq!(draft.property, key);
             assert_eq!(draft.op, FilterOp::RelatedTo);
             assert_eq!(draft.offers.len(), 2);
-            assert_eq!(table.filter_editor.read(cx).text(cx), "Acme");
+            assert_eq!(table.bar().editor.read(cx).text(cx), "Acme");
             assert!(table.filters.is_empty(), "nothing filtered until a pick");
         });
 
@@ -12278,7 +12250,7 @@ mod tests {
         table.update_in(cx, |table, window, cx| {
             table.cancel_filter_draft(window, cx);
             assert!(!table.ask_to_pick("name".into(), "Acme".into(), offers.clone(), window, cx));
-            assert!(table.filter_draft.is_none());
+            assert!(table.bar().draft.is_none());
         });
     }
 
@@ -12597,7 +12569,7 @@ mod tests {
         cx.simulate_input("d");
         cx.run_until_parked();
         table.read_with(cx, |table, cx| {
-            assert_eq!(table.filter_editor.read(cx).text(cx), "Ad")
+            assert_eq!(table.bar().editor.read(cx).text(cx), "Ad")
         });
         assert_eq!(
             grid_renders(&table, cx),
@@ -12617,7 +12589,7 @@ mod tests {
         table.update(cx, |table, cx| table.move_suggestion(1, cx));
         cx.run_until_parked();
         table.read_with(cx, |table, _| {
-            let offers = &table.filter_draft.as_ref().unwrap().offers;
+            let offers = &table.bar().draft.as_ref().unwrap().offers;
             assert_eq!(offers.len(), 2);
             assert_eq!(offers.highlighted(), Some(0));
             assert!(table.renders > drew, "the offers were drawn again");
@@ -12625,7 +12597,7 @@ mod tests {
         assert_eq!(grid_renders(&table, cx), before, "the offers drew the grid");
 
         table.update_in(cx, |table, window, cx| {
-            table.filter_draft = None;
+            table.bar_mut().draft = None;
             let col = table.columns.iter().position(|c| c.key == "name").unwrap();
             table.start_edit(Cursor { row: 0, col }, window, cx);
         });
@@ -12692,11 +12664,12 @@ mod tests {
 
             table.edit_filter(0, window, cx);
             table
-                .filter_editor
+                .bar()
+                .editor
                 .update(cx, |editor, cx| editor.set_text("Grace", window, cx));
             table.apply_filter_draft(window, cx);
             assert_eq!(table.filters, [named("Grace")], "replaced where it stood");
-            assert!(table.filter_draft.is_none());
+            assert!(table.bar().draft.is_none());
 
             // Its key changed from the draft's own key menu, it still replaces the filter it
             // was opened from rather than adding another.
@@ -12704,7 +12677,7 @@ mod tests {
         });
         cx.run_until_parked();
         table.update_in(cx, |table, window, cx| {
-            table.filter_menus[0].show(window, cx)
+            table.bar().menus[0].show(window, cx)
         });
         cx.run_until_parked();
         // The menu takes the keyboard two frames after it opens, as Zed's popover menus do.
@@ -12719,12 +12692,14 @@ mod tests {
         cx.run_until_parked();
         table.update_in(cx, |table, window, cx| {
             let key = table
-                .filter_draft
+                .bar()
+                .draft
                 .as_ref()
                 .map(|draft| draft.property.as_str());
             assert_eq!(key, Some("city"));
             table
-                .filter_editor
+                .bar()
+                .editor
                 .update(cx, |editor, cx| editor.set_text("London", window, cx));
             table.apply_filter_draft(window, cx);
             assert_eq!(
@@ -12758,13 +12733,14 @@ mod tests {
                          window: &mut Window,
                          cx: &mut Context<TypeTable>| {
             table
-                .filter_editor
+                .bar()
+                .editor
                 .update(cx, |editor, cx| editor.set_text(text, window, cx));
         };
         table.update_in(cx, |table, window, cx| {
             // The edge's own property.
             table.set_draft_property("out:WorksAt.@role".into(), window, cx);
-            assert!(table.filter_draft.is_some(), "the edge's role is a key");
+            assert!(table.bar().draft.is_some(), "the edge's role is a key");
             type_text(table, "CTO", window, cx);
             table.apply_filter_draft(window, cx);
             let (key, group) = builder::as_group(&table.filters[0]).unwrap();
@@ -12801,7 +12777,7 @@ mod tests {
                 window,
                 cx,
             );
-            let ops = table.draft_ops(table.filter_draft.as_ref().unwrap());
+            let ops = table.draft_ops(table.bar().draft.as_ref().unwrap());
             assert!(!ops.contains(&FilterOp::In), "{ops:?}");
             table.set_draft_op(FilterOp::Gt, window, cx);
             type_text(table, "10", window, cx);
@@ -12841,7 +12817,7 @@ mod tests {
         // A group's pill opens its menu.
         table.update_in(cx, |table, window, cx| {
             table.open_group_menu(0, gpui::point(px(10.), px(10.)), window, cx);
-            assert!(table.group_menu.is_some());
+            assert!(table.bar().group_menu.is_some());
             let group = table.filters[0].clone();
             table.replace_filter(&group, None, cx);
             assert_eq!(table.filters.len(), 2);
