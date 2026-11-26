@@ -1,0 +1,37 @@
+test table::tests::old_tabs_hand_their_widths_to_a_type_once ... FAILED
+test table::tests::hiding_a_column_measures_the_rows_again ... FAILED
+test table::tests::toggling_the_wrap_never_jumps_to_the_cursor ... FAILED
+test table::tests::a_row_deleted_above_moves_the_measured_heights_with_their_rows ... FAILED
+test table::tests::grouped_changes_move_the_measured_heights_with_their_lines ... FAILED
+
+failures:
+
+--
+thread 'table::tests::old_tabs_hand_their_widths_to_a_type_once' (38246) panicked at crates/type_table/src/table.rs:16564:9:
+the person's choice stands
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+--
+thread 'table::tests::hiding_a_column_measures_the_rows_again' (38245) panicked at crates/type_table/src/table.rs:16351:9:
+assertion `left == right` failed: name hidden
+  left: Some(126.5px)
+ right: Some(29px)
+--
+thread 'table::tests::toggling_the_wrap_never_jumps_to_the_cursor' (38247) panicked at crates/type_table/src/table.rs:16504:13:
+assertion `left == right` failed: the first line stays; the cursor is on row 0
+  left: 0
+ right: 40
+--
+thread 'table::tests::a_row_deleted_above_moves_the_measured_heights_with_their_rows' (38243) panicked at crates/type_table/src/table.rs:16381:9:
+assertion `left == right` failed: the long row's height moved up with it
+  left: Some(29px)
+ right: Some(126.5px)
+--
+thread 'table::tests::grouped_changes_move_the_measured_heights_with_their_lines' (38244) panicked at crates/type_table/src/table.rs:16476:9:
+assertion `left == right` failed: its height moved with it
+  left: Some(29px)
+ right: Some(126.5px)
+--
+test result: FAILED. 0 passed; 5 failed; 0 ignored; 0 measured; 306 filtered out; finished in 0.59s
+
+error: test failed, to rerun pass `-p type_table --lib`
