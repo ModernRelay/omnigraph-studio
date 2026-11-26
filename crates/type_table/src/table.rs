@@ -87,8 +87,17 @@ use crate::write::{self, Bound};
 /// page reads do.
 const RELATION_READ_CHUNK: usize = 100;
 
+/// The types whose tabs saved before spec 049 have been heard this run, by graph and type: the
+/// first such tab of a type speaks for it, and no later one does, so a Reset is not undone by
+/// another old tab restored after it.
+#[derive(Default)]
+struct OldTabWidthsHeard(HashSet<(String, String)>);
+
+impl gpui::Global for OldTabWidthsHeard {}
+
 /// A type's column sizing in the session's graph, from settings (spec 049). A tab saved
-/// before spec 049 kept its own widths: the type takes them, once, when it has none.
+/// before spec 049 kept its own widths: the first such tab of a type hands them to the type,
+/// if the person has chosen nothing for it (no widths and no wrap); no later one does.
 fn type_sizing(
     session: &Entity<GraphSession>,
     type_name: &str,
@@ -100,7 +109,12 @@ fn type_sizing(
     };
     let graph = session.read(cx).overrides_key();
     let mut layout = settings.grid_layout(&graph, type_name);
-    let adopt = layout.widths.is_empty() && !saved_widths.is_empty();
+    let first = !saved_widths.is_empty()
+        && cx
+            .default_global::<OldTabWidthsHeard>()
+            .0
+            .insert((graph.clone(), type_name.to_owned()));
+    let adopt = first && layout.is_default();
     if adopt {
         layout.widths = saved_widths;
     }
@@ -112,19 +126,6 @@ fn type_sizing(
         });
     }
     sizing
-}
-
-/// The action whose key a column menu's entry shows (spec 049); Reset width has none.
-fn grid_action(change: ColumnChange) -> Option<Box<dyn gpui::Action>> {
-    use studio_actions::grid::{FitColumn, NarrowColumn, ResetColumns, ToggleWrap, WidenColumn};
-    Some(match change {
-        ColumnChange::Widen => Box::new(WidenColumn),
-        ColumnChange::Narrow => Box::new(NarrowColumn),
-        ColumnChange::Fit => Box::new(FitColumn),
-        ColumnChange::ResetWidth => return None,
-        ColumnChange::Reset => Box::new(ResetColumns),
-        ColumnChange::ToggleWrap => Box::new(ToggleWrap),
-    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1251,7 +1252,10 @@ pub struct TypeTable {
     /// How many lines each row takes wrapped, by row id (spec 049): worked out from every
     /// column's text when the row is first drawn wrapped, so a row keeps its height while the
     /// grid scrolls sideways, and forgotten with the row's cell text or a width or wrap change.
-    wrapped_lines: RefCell<HashMap<String, usize>>,
+    wrap_lines: studio_ui::WrapLines<String>,
+    /// Lines went in, out or moved since the wrapped list last took them
+    /// ([`Self::lines_moved`]): the next frame splices them by identity.
+    lines_due: Cell<bool>,
     /// The inspector's view of a row, by the row's id: made when the workspace asks what is
     /// selected ([`Item::inspected`]), and told of the table's writes while it is that row's.
     peek: Option<(String, Entity<NodePeek>)>,
@@ -1720,7 +1724,8 @@ impl TypeTable {
             absent: HashMap::new(),
             menu_choices: Default::default(),
             cell_text: RefCell::new(HashMap::new()),
-            wrapped_lines: RefCell::default(),
+            wrap_lines: Default::default(),
+            lines_due: Cell::new(false),
             peek: None,
             inspected_row: None,
             newer: false,
@@ -1894,7 +1899,7 @@ impl TypeTable {
             let renamed = schema.renamed_since(&was);
             self.schema = Some(schema);
             self.cell_text.borrow_mut().clear();
-            self.wrapped_lines.borrow_mut().clear();
+            self.wrap_lines.forget_all();
             let by_neighbours = self.grouping.as_ref().is_some_and(|grouping| {
                 matches!(
                     builder::parse_group_key(&grouping.property),
@@ -1932,7 +1937,7 @@ impl TypeTable {
             self.rows.clear();
             self.placed_here.clear();
             self.cell_text.borrow_mut().clear();
-            self.wrapped_lines.borrow_mut().clear();
+            self.wrap_lines.forget_all();
             cx.notify();
             return;
         };
@@ -2205,14 +2210,13 @@ impl TypeTable {
     /// The type's widths or wrap changed: the lines are measured again, and, when `keep`, the
     /// change is kept for the type, which its other tabs follow.
     fn sizing_changed(&mut self, keep: bool, cx: &mut Context<Self>) {
-        self.wrapped_lines.borrow_mut().clear();
-        self.lines.measured.remeasure();
+        // What the wrapped rows measured is forgotten by the frame that draws the new widths,
+        // when its measure differs (`studio_ui::WrapLines`).
         if self.lines_wrap != self.sizing.wrap() {
-            // The first line in view stays first; the cursor's stays in view.
+            // The first line in view stays first; the view never moves to the cursor.
             self.lines.sync(self.line_count());
             self.lines.switch(self.lines_wrap);
             self.lines_wrap = self.sizing.wrap();
-            self.reveal_cursor();
         }
         if keep {
             self.keep_sizing(cx);
@@ -2264,9 +2268,32 @@ impl TypeTable {
         }
     }
 
+    /// Tells the lines' list what the grid's lines are now (`lines`, grouped): cut, how many;
+    /// wrapped, what each shows, so the lines that went in, out or moved anywhere are spliced
+    /// where they are and every other line keeps its measured height (spec 049). Every frame,
+    /// scroll and reveal tells it this way.
+    fn sync_lines(&self, lines: Option<&Lines>) {
+        let count = lines.map_or(self.rows.len(), |lines| lines.len());
+        match self.sizing.wrap() {
+            CellWrap::Truncate => self.lines.sync(count),
+            CellWrap::Wrap => {
+                if self.lines_due.take() || count != self.lines.count() || !self.lines.knows_lines()
+                {
+                    self.lines.splice_by(self.line_identities(lines));
+                }
+            }
+        }
+    }
+
+    /// [`Self::sync_lines`] with the lines as the grouping makes them now.
+    fn sync_lines_now(&self) {
+        let lines = self.grouping.as_ref().map(|grouping| grouping.line_map());
+        self.sync_lines(lines.as_ref());
+    }
+
     /// Scrolls the lines so `line` is first in view, `offset` into it.
     fn scroll_to_line(&self, line: usize, offset: Pixels) {
-        self.lines.sync(self.line_count());
+        self.sync_lines_now();
         self.lines.scroll_to(self.sizing.wrap(), line, offset);
     }
 
@@ -2291,7 +2318,7 @@ impl TypeTable {
 
     /// Scrolls as little as shows all of `line`.
     fn reveal_line(&self, line: usize) {
-        self.lines.sync(self.line_count());
+        self.sync_lines_now();
         self.lines.reveal(self.sizing.wrap(), line);
     }
 
@@ -3543,7 +3570,7 @@ impl TypeTable {
             }
             // The column's width and the type's wrap (spec 049), as every grid's menu has them.
             let table = table.clone();
-            sizing.menu_entries(menu, &key, grid_action, move |change, window, cx| {
+            sizing.menu_entries(menu, &key, move |change, window, cx| {
                 table
                     .update(cx, |table, cx| {
                         table.change_columns(change, Some(col), window, cx)
@@ -3662,7 +3689,7 @@ impl TypeTable {
                                 "Wrap text",
                                 wrapped,
                                 IconPosition::Start,
-                                grid_action(ColumnChange::ToggleWrap),
+                                ColumnChange::ToggleWrap.action(),
                                 change(ColumnChange::ToggleWrap),
                             )
                             .item(
@@ -4169,7 +4196,7 @@ impl TypeTable {
         self.rows.clear();
         self.placed_here.clear();
         self.cell_text.borrow_mut().clear();
-        self.wrapped_lines.borrow_mut().clear();
+        self.wrap_lines.forget_all();
         // At the same commit a row's relationships and Blob cells cannot have changed: a new
         // order or filter keeps what was read and reads only rows not seen yet.
         if !keep_pin {
@@ -5021,6 +5048,7 @@ impl TypeTable {
     fn lines_moved(&mut self) {
         self.relation_lines = None;
         self.blob_lines = None;
+        self.lines_due.set(true);
     }
 
     fn toggle_section(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -5096,7 +5124,7 @@ impl TypeTable {
         if let Some(row) = self.cell_text.borrow_mut().get_mut(&self.rows[first].id) {
             row.remove(column);
         }
-        self.wrapped_lines.borrow_mut().remove(&self.rows[first].id);
+        self.wrap_lines.forget(&self.rows[first].id);
     }
 
     /// Puts back what a row showed (`shown`) before a save that did not land put `new` in its
@@ -6334,11 +6362,10 @@ impl TypeTable {
         let going: HashSet<&str> = ids.iter().map(String::as_str).collect();
         {
             // A row put back (an undone delete) shows its values afresh.
-            let (mut shown, mut lines) =
-                (self.cell_text.borrow_mut(), self.wrapped_lines.borrow_mut());
+            let mut shown = self.cell_text.borrow_mut();
             for id in &going {
                 shown.remove(*id);
-                lines.remove(*id);
+                self.wrap_lines.forget(&(*id).to_owned());
             }
         }
         // From the last row up, so each index is the row's place once the rows after it went.
@@ -10797,7 +10824,7 @@ impl TypeTable {
                                         )
                                     },
                                 )),
-                            px(self.layout.width(column)),
+                            px(self.width(column)),
                             // The key column's select-all check at its start.
                             if index == 0 {
                                 px(KEY_INSET + studio_ui::ds::size::CHECK)
@@ -10874,7 +10901,26 @@ impl TypeTable {
         let picked_bg = studio_ui::ds::surface::picked(cx);
         let header_bg = studio_ui::ds::surface::well(cx);
         let line_count = lines.as_ref().map_or(self.rows.len(), |lines| lines.len());
-        self.lines.sync(line_count);
+        self.sync_lines(lines.as_deref());
+        match self.sizing.wrap() {
+            CellWrap::Truncate => {}
+            CellWrap::Wrap => {
+                let measure = studio_ui::wrap_key(
+                    self.columns
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, column)| self.wraps(column))
+                        .map(|(col, column)| {
+                            (column.key.as_str(), px(self.text_room(col, column)))
+                        }),
+                    window,
+                    cx,
+                );
+                if self.wrap_lines.measure_with(measure) {
+                    self.lines.measured.remeasure();
+                }
+            }
+        }
         // The lines this frame draws are noted as the list draws them, a line at a time.
         self.frame_lines_drawn = None;
         self.frame_wrap = match self.sizing.wrap() {
@@ -12143,30 +12189,70 @@ impl TypeTable {
     /// drawn or not, each line `line` high ([`studio_ui::wrapped_row_height`]); worked out once
     /// a row until its text, a width or the wrap changes.
     fn wrapped_row_height(&self, row: &Row, line: Pixels, window: &Window, cx: &App) -> Pixels {
-        let known = self.wrapped_lines.borrow().get(&row.id).copied();
-        let lines = known.unwrap_or_else(|| {
-            let lines = studio_ui::row_lines(
+        let lines = self.wrap_lines.lines(row.id.clone(), || {
+            studio_ui::row_lines(
                 self.columns
                     .iter()
                     .enumerate()
                     .filter(|(_, column)| self.wraps(column))
                     .map(|(col, column)| {
-                        let value = row.value(&column.key);
-                        let shown = self.cell_text_of(row, column, value).shown;
                         (
-                            studio_ui::cell_text(shown, cx),
+                            self.styled_text(row, column, cx),
                             px(self.text_room(col, column)),
                         )
                     }),
                 window,
                 cx,
-            );
-            self.wrapped_lines
-                .borrow_mut()
-                .insert(row.id.clone(), lines);
-            lines
+            )
         });
         studio_ui::wrapped_row_height(lines, line, px(ROW_HEIGHT))
+    }
+
+    /// A text cell's text as it is drawn, but for its colour: the font and weight a row's
+    /// wrapped lines are counted in are the cell's own.
+    fn styled_text(&self, row: &Row, column: &ColumnSpec, cx: &App) -> studio_ui::CellText {
+        let value = row.value(&column.key);
+        let mut text = studio_ui::cell_text(self.cell_text_of(row, column, value).shown, cx);
+        if self.is_removed(&row.id) {
+            text = text.struck();
+        }
+        if column.align_right {
+            text = text.buffer_font(cx).align_end();
+        }
+        // A key is read like any value; its column header says it is the key.
+        if matches!(column.role, ColumnRole::Key) {
+            text = text.weight(studio_ui::ds::text::weight::BODY);
+        }
+        text
+    }
+
+    /// What each line shows, as a hash: a row's id, a section's value, for the wrapped list to
+    /// splice the lines that changed ([`GridRows::splice_by`]).
+    fn line_identities(&self, lines: Option<&Lines>) -> Vec<u64> {
+        use std::hash::{Hash, Hasher};
+        let hash = |kind: u8, what: &str| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            (kind, what).hash(&mut hasher);
+            hasher.finish()
+        };
+        let row = |ix: usize| self.rows.get(ix).map_or(0, |row| hash(0, &row.id));
+        let Some(lines) = lines else {
+            return (0..self.rows.len()).map(row).collect();
+        };
+        let section = |index: usize| {
+            self.grouping
+                .as_ref()
+                .and_then(|grouping| grouping.sections().get(index))
+                .map_or_else(String::new, |section| section.value.to_string())
+        };
+        (0..lines.len())
+            .map(|line| match lines.get(line) {
+                Some(Line::Row(ix)) => row(ix),
+                Some(Line::Header(index)) => hash(1, &section(index)),
+                Some(Line::More(index)) => hash(2, &section(index)),
+                Some(Line::OtherValues) | None => hash(3, ""),
+            })
+            .collect()
     }
 
     /// Whether `column`'s cells are text that wraps (spec 049): not a relationship, a file or
@@ -12494,7 +12580,6 @@ impl TypeTable {
         } else {
             Color::Default
         };
-        let numeric = column.align_right;
         if column.relationship().is_some() {
             // The cell's padding on both sides.
             let available = self.width(column) - 2. * space::LG;
@@ -12573,20 +12658,12 @@ impl TypeTable {
             }
             _ => {
                 // One line in the cell's room, never measured: most cells are this. Wrapped,
-                // as many lines as the column's width needs.
-                let mut text = studio_ui::cell_text(shown, cx).color(text_color.color(cx));
+                // as many lines as the column's width needs, counted in the same text.
+                let mut text = self
+                    .styled_text(row, column, cx)
+                    .color(text_color.color(cx));
                 if self.frame_wrap.is_some() {
                     text = text.wrap(px(self.text_room(col, column)));
-                }
-                if removed {
-                    text = text.struck();
-                }
-                if numeric {
-                    text = text.buffer_font(cx).align_end();
-                }
-                // A key is read like any value; its column header says it is the key.
-                if matches!(column.role, ColumnRole::Key) {
-                    text = text.weight(studio_ui::ds::text::weight::BODY);
                 }
                 text.into_any_element()
             }
@@ -16221,7 +16298,7 @@ mod tests {
         let (table, cx) = people_table(&session, cx);
         table.update(cx, |table, cx| {
             table
-                .layout
+                .sizing
                 .set_width("slug", Some(studio_ui::COLUMN_MIN_WIDTH));
             cx.notify();
         });
@@ -16396,6 +16473,289 @@ mod tests {
             cx.debug_bounds("column-edge-0").is_some(),
             "the key column's end stays"
         );
+    }
+
+    /// A wrapped table of `count` people, the person at `long_at` with a long name, the rest
+    /// short; settings in memory.
+    fn wrapped_people(
+        count: usize,
+        long_at: usize,
+        cx: &mut TestAppContext,
+    ) -> (Entity<TypeTable>, &mut VisualTestContext) {
+        cx.update(|cx| {
+            studio_settings::init_test(cx);
+            studio_settings::keep_changes_in_memory(cx);
+        });
+        let long = "a name long enough to need several lines in a narrow column ".repeat(6);
+        let rows: Vec<Value> = (0..count)
+            .map(|i| {
+                let name = if i == long_at { long.clone() } else { format!("Person {i}") };
+                serde_json::json!({"n": {"@id": format!("p{i:03}"), "slug": format!("p{i:03}"), "name": name}})
+            })
+            .collect();
+        let session = crate::test_support::session_reading(PEOPLE, Value::Array(rows), cx);
+        let (table, cx) = people_table(&session, cx);
+        table.update_in(cx, |table, window, cx| {
+            table.change_columns(ColumnChange::ToggleWrap, None, window, cx)
+        });
+        cx.run_until_parked();
+        (table, cx)
+    }
+
+    /// How tall the wrapped list measured line `line`, if it has.
+    fn measured_line(
+        table: &Entity<TypeTable>,
+        line: usize,
+        cx: &mut VisualTestContext,
+    ) -> Option<Pixels> {
+        table.read_with(cx, |table, _| {
+            table
+                .lines
+                .measured
+                .bounds_for_item(line)
+                .map(|bounds| bounds.size.height)
+        })
+    }
+
+    /// What the wrapped rows measured holds for the columns shown: hiding the long text's
+    /// column makes its row a row high, showing it again makes it tall. Before, the counts and
+    /// heights of the columns shown before stayed (Codex and Bugbot reviews of #182).
+    #[gpui::test]
+    async fn hiding_a_column_measures_the_rows_again(cx: &mut TestAppContext) {
+        let (table, cx) = wrapped_people(3, 1, cx);
+        let row = px(ROW_HEIGHT + studio_ui::ds::size::HAIRLINE);
+        let tall = measured_line(&table, 1, cx).expect("drawn");
+        assert!(tall > row, "{tall:?}");
+        let toggle = |table: &Entity<TypeTable>, cx: &mut VisualTestContext| {
+            table.update(cx, |table, cx| {
+                table.arrange_columns(cx, |layout, all| layout.toggle(all, "name"))
+            });
+            cx.run_until_parked();
+        };
+        toggle(&table, cx);
+        assert_eq!(measured_line(&table, 1, cx), Some(row), "name hidden");
+        toggle(&table, cx);
+        assert_eq!(measured_line(&table, 1, cx), Some(tall), "name shown again");
+    }
+
+    /// Rows that go in or out in the middle of the list take their place in the wrapped list
+    /// there: a row deleted near the top moves the long row's measured height up with it, off
+    /// screen too, and a press on that row lands on it. Before, the list kept its heights by
+    /// place, so the long row's place held the short row's height (reviews of #182).
+    #[gpui::test]
+    async fn a_row_deleted_above_moves_the_measured_heights_with_their_rows(
+        cx: &mut TestAppContext,
+    ) {
+        let (table, cx) = wrapped_people(120, 80, cx);
+        let scroll = |line: usize, cx: &mut VisualTestContext| {
+            table.update(cx, |table, cx| {
+                table.scroll_to_line(line, px(0.));
+                cx.notify();
+            });
+            cx.run_until_parked();
+        };
+        scroll(78, cx);
+        let tall = measured_line(&table, 80, cx).expect("drawn");
+        assert!(tall > px(ROW_HEIGHT + 1.), "{tall:?}");
+        scroll(0, cx);
+        table.update(cx, |table, cx| {
+            table.remove_rows(&["p001".to_owned()], cx);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            measured_line(&table, 79, cx),
+            Some(tall),
+            "the long row's height moved up with it"
+        );
+        scroll(79, cx);
+        let bounds = table.read_with(cx, |table, _| table.lines.measured.bounds_for_item(79));
+        let bounds = bounds.expect("drawn");
+        let low = point(bounds.left() + px(40.), bounds.bottom() - px(3.));
+        let hit = table.read_with(cx, |table, cx| table.row_cell_at(low, cx));
+        assert_eq!(hit.map(|(row, _)| row), Some(79));
+        table.read_with(cx, |table, _| assert_eq!(table.rows[79].id, "p080"));
+    }
+
+    /// Grouped, the lines a section's read puts in and a section folded above take their place
+    /// in the wrapped list where they are: the long row read into section 30 keeps its measured
+    /// height when section 0 folds above it and its line moves up (reviews of #182).
+    #[gpui::test]
+    async fn grouped_changes_move_the_measured_heights_with_their_lines(cx: &mut TestAppContext) {
+        let (table, cx) = wrapped_people(2, 9, cx);
+        let long = "a name long enough to need several lines in a narrow column ".repeat(6);
+        let page = |rows: Value| -> Result<ReadOutput, ReadError> {
+            Ok(serde_json::from_value(serde_json::json!({
+                "query_name": "studio_page",
+                "target": {"branch": "main"},
+                "row_count": 2,
+                "columns": ["n"],
+                "rows": rows,
+                "graph_commit_id": "c1",
+            }))
+            .unwrap())
+        };
+        let generation = table.update(cx, |table, cx| {
+            table.rows.clear();
+            let mut grouping = Grouping::new("name");
+            let generation = grouping.restart();
+            let values: Vec<Value> = (0..40)
+                .map(|i| serde_json::json!({"value": format!("v{i:02}"), "n": 2}))
+                .collect();
+            let counts: ReadOutput = serde_json::from_value(serde_json::json!({
+                "query_name": "studio_value_counts",
+                "target": {"branch": "main"},
+                "row_count": 40,
+                "columns": ["value", "n"],
+                "rows": values,
+            }))
+            .unwrap();
+            grouping.accept_counts(&counts, GROUP_LIMIT);
+            table.grouping = Some(grouping);
+            table.lines_moved();
+            cx.notify();
+            generation
+        });
+        cx.run_until_parked();
+        // Section 30's rows, the long one first.
+        let line_of_long = |table: &Entity<TypeTable>, cx: &mut VisualTestContext| {
+            table.read_with(cx, |table, _| {
+                let lines = table.grouping.as_ref().unwrap().line_map();
+                (0..lines.len())
+                    .find(|&line| {
+                        matches!(lines.get(line), Some(Line::Row(row)) if table.rows[row].id == "q1")
+                    })
+                    .unwrap()
+            })
+        };
+        table.update(cx, |table, cx| {
+            let rows = serde_json::json!([
+                {"n": {"@id": "q1", "slug": "q1", "name": long}},
+                {"n": {"@id": "q2", "slug": "q2", "name": "v30"}},
+            ]);
+            table.apply_section_page(generation, 30, page(rows), 10, cx);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let line = line_of_long(&table, cx);
+        table.update(cx, |table, cx| {
+            table.scroll_to_line(line - 2, px(0.));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        // Sections in view read their rows as they come into it: the long row's line is where
+        // it is once they are in.
+        let line = line_of_long(&table, cx);
+        let tall = measured_line(&table, line, cx).expect("drawn");
+        assert!(tall > px(ROW_HEIGHT + 1.), "{tall:?}");
+        table.update(cx, |table, cx| {
+            table.scroll_to_line(0, px(0.));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        // Section 0 folds: its read line goes, and every line after it moves up one.
+        table.update(cx, |table, cx| table.toggle_section(0, cx));
+        cx.run_until_parked();
+        let moved = line_of_long(&table, cx);
+        assert!(moved < line, "section 0 folded above it: {moved} {line}");
+        assert_eq!(
+            measured_line(&table, moved, cx),
+            Some(tall),
+            "its height moved with it"
+        );
+    }
+
+    /// Turning the wrap on or off keeps the first line in view first and never moves the view
+    /// to the cursor. Before, the toggle revealed the cursor's row (Codex review of #180).
+    #[gpui::test]
+    async fn toggling_the_wrap_never_jumps_to_the_cursor(cx: &mut TestAppContext) {
+        let (table, cx) = wrapped_people(200, 300, cx);
+        table.update_in(cx, |table, window, cx| {
+            table.change_columns(ColumnChange::ToggleWrap, None, window, cx);
+            table.cursor = Some(Cursor { row: 0, col: 1 });
+            table.scroll_to_line(40, px(0.));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let first = |cx: &mut VisualTestContext| {
+            table.read_with(cx, |table, _| table.lines.first(table.sizing.wrap()).0)
+        };
+        assert_eq!(first(cx), 40);
+        for _ in 0..2 {
+            table.update_in(cx, |table, window, cx| {
+                table.change_columns(ColumnChange::ToggleWrap, None, window, cx)
+            });
+            cx.run_until_parked();
+            assert_eq!(
+                first(cx),
+                40,
+                "the first line stays; the cursor is on row 0"
+            );
+        }
+    }
+
+    /// A tab saved before spec 049 hands its widths to a type once: not over a wrap the person
+    /// chose for the type, and not again after a Reset, from another old tab. Before, the type
+    /// took them whenever it had no widths (Codex review of #182).
+    #[gpui::test]
+    async fn old_tabs_hand_their_widths_to_a_type_once(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+            studio_settings::init_test(cx);
+            studio_settings::keep_changes_in_memory(cx);
+        });
+        let session = session(PEOPLE, cx);
+        let graph = session.read_with(cx, |session, _| session.overrides_key());
+        let old_tab = |session: &Entity<GraphSession>| {
+            let session = session.clone();
+            move |window: &mut Window, cx: &mut Context<TypeTable>| {
+                TypeTable::opening(
+                    WeakEntity::new_invalid(),
+                    session,
+                    "Person".into(),
+                    None,
+                    Opening {
+                        saved_widths: [("name".to_owned(), 260)].into(),
+                        ..Opening::default()
+                    },
+                    window,
+                    cx,
+                )
+            }
+        };
+        let kept = |cx: &mut VisualTestContext| {
+            let graph = graph.clone();
+            cx.update(|_, cx| {
+                studio_settings::StudioSettings::get(cx).grid_layout(&graph, "Person")
+            })
+        };
+        // The person chose a wrap for Person: an old tab's widths do not join it.
+        cx.update(|cx| {
+            let graph = graph.clone();
+            studio_settings::update(cx, move |settings| {
+                settings.set_grid_layout(
+                    &graph,
+                    "Person",
+                    studio_ui::GridLayout {
+                        wrap: Some(CellWrap::Wrap),
+                        ..Default::default()
+                    },
+                )
+            })
+        });
+        let (first, cx) = cx.add_window_view(old_tab(&session));
+        cx.run_until_parked();
+        assert!(kept(cx).widths.is_empty(), "the person's choice stands");
+        // Reset, then another old tab of Person: its widths are not taken either.
+        first.update_in(cx, |table, window, cx| {
+            table.change_columns(ColumnChange::Reset, None, window, cx)
+        });
+        cx.run_until_parked();
+        let make = old_tab(&session);
+        let _second = cx.update(|window, cx| cx.new(|cx| make(window, cx)));
+        cx.run_until_parked();
+        assert!(kept(cx).is_default(), "Reset is not undone by an old tab");
     }
 
     /// A type's columns are the type's (spec 049): widths and the wrap a tab changes are kept

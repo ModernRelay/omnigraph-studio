@@ -100,7 +100,16 @@ type table's header edges (`edge-trace-main.txt` in the PR):
 ### Step 3: the type table on the model
 
 - Widths and wrap are the type's, per graph, in settings (`graphs.<graph>.columns.<Type>`); every
-  tab of the type follows a change. A tab saved with widths hands them to the type once.
+  tab of the type follows a change. The first tab of a type saved with widths before this step
+  hands them to the type, and only if the person chose nothing for it (no widths, no wrap); no
+  later old tab does, so a Reset stays.
+- Wrapped, the lines the list holds are told by what each shows (a row's id, a section's value):
+  whatever changed in the middle (a group opened or folded, a section read, a row put in or
+  deleted, all of which pass through `lines_moved`) is spliced where it is
+  (`GridRows::splice_by`), so every other line keeps its measured height and the first line in
+  view stays first. Every frame, scroll and reveal tells the list this one way.
+- A row's lines are counted in the text its cells draw (`styled_text`: the key's weight, a
+  number's font), under the frame's measure, which includes the columns shown.
 - Zed's cell around a type table cell does not stretch to its row, so a wrapped row's height is
   worked out from its drawn text cells' line counts and given to every cell.
 
@@ -131,6 +140,7 @@ page). No engine change.
 | 2026-11-25 | A wrapped row's cells run its height | Offscreen snapshot of `Note` wrapped, the cursor on "gpui-panes" | With each cell only as tall as its lines, the rules between short cells and the cursor's ring stopped after the first line; each cell now takes the row's height from its text cells' line counts |
 | 2026-11-26 | Every button at an edge is the edge's; no end control over a start control | `type_table` `every_button_at_an_edge_is_the_edges`, `the_select_all_check_is_not_under_the_menu_at_the_narrowest_key_column`, both failing on `11942b0` | At `11942b0` a right press 3.5 px left of the key column's rule opened a menu, and at a 48 px key column the menu's button (16 to 34 px) covered the select-all check (16 to 30 px), so a click on the check opened the menu (Codex review of #181) |
 | 2026-11-26 | Toggling the wrap keeps the view; a font change counts lines again; a new result closes a column menu | `query_editor` `toggling_the_wrap_never_jumps_to_the_selection`, `a_font_change_counts_wrapped_lines_again`, `a_new_result_closes_a_column_menu`, all failing on `1ef16d0`; `the_keys_menu_and_edge_work_as_a_person_uses_them` | At `1ef16d0` the toggle moved the view from row 40 to the selected row 0; at a 24 px rem a 6-line row was drawn 115 px tall instead of 173 px; a menu outlived its result (Codex and Bugbot reviews of #180). ⌥Z from the query does nothing, from the results wraps; a right press on a header opens its menu; a double click on an edge fits |
+| 2026-11-26 | The type table's wrap measurements follow the columns shown and its lines; the toggle keeps the view; old widths come once | `type_table` `hiding_a_column_measures_the_rows_again`, `a_row_deleted_above_moves_the_measured_heights_with_their_rows`, `grouped_changes_move_the_measured_heights_with_their_lines`, `toggling_the_wrap_never_jumps_to_the_cursor`, `old_tabs_hand_their_widths_to_a_type_once`, all failing on `8b9bae9`; `studio_ui` `a_change_in_the_middle_splices_its_own_lines` | At `8b9bae9`: name hidden, the long row stayed 126.5 px tall; a row deleted above or section 0 folded left the long row's place 29 px; the toggle moved the view from line 40 to the cursor's 0; an old tab's widths joined a wrap-only choice and came back after Reset (Codex and Bugbot reviews of #182) |
 | 2026-11-25 | The edge shows its line | Offscreen snapshots of `Note`, the pointer 2 px left of slug's rule | `main`: the menu's button and no line, the slot's fill over it; now: the line, drawn over everything, and the button, which stops short of the edge |
 
 ## Corrections

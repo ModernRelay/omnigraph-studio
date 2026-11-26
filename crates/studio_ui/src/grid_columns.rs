@@ -337,6 +337,9 @@ pub struct GridRows {
     /// How tall a cut line is, its rule included: the grid's own, given, never worked out from
     /// a layout that may be a frame old.
     cut_row: Pixels,
+    /// Each line's identity as the wrapped list last held them ([`GridRows::splice_by`]);
+    /// `None` until told, and after the list starts fresh.
+    identities: Rc<std::cell::RefCell<Option<Vec<u64>>>>,
 }
 
 impl GridRows {
@@ -347,7 +350,40 @@ impl GridRows {
             measured: gpui::ListState::new(0, gpui::ListAlignment::Top, px(WRAPPED_DRAW_AHEAD)),
             count: Rc::default(),
             cut_row,
+            identities: Rc::default(),
         }
+    }
+
+    /// The grid holds the lines `identities` names, in order (a hash of what each line shows: a
+    /// row's id, a section's value). The wrapped list's lines that changed between the ones it
+    /// held and these are the ones between their common start and their common end, and only
+    /// those are put in or taken out there, wherever in the list they are: a group opened, a
+    /// section read, a row put in or deleted. Every other line keeps the height measured for it,
+    /// and the first line in view stays first unless it is one that changed.
+    pub fn splice_by(&self, identities: Vec<u64>) {
+        let held = self.identities.borrow_mut().take();
+        match held.as_deref() {
+            None => self.sync(identities.len()),
+            Some(old) => {
+                let start = old
+                    .iter()
+                    .zip(&identities)
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                let end = old[start..]
+                    .iter()
+                    .rev()
+                    .zip(identities[start..].iter().rev())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                if start + end < old.len() || start + end < identities.len() {
+                    self.measured
+                        .splice(start..old.len() - end, identities.len() - start - end);
+                }
+                self.count.set(identities.len());
+            }
+        }
+        *self.identities.borrow_mut() = Some(identities);
     }
 
     /// The grid holds other lines now, `count` of them, from the first: every height the
@@ -355,12 +391,33 @@ impl GridRows {
     pub fn reset(&self, count: usize) {
         self.count.set(count);
         self.measured.reset(count);
+        self.identities.borrow_mut().take();
+    }
+
+    /// How many lines the grid holds, as last told.
+    pub fn count(&self) -> usize {
+        self.count.get()
+    }
+
+    /// Whether the wrapped list knows what its lines show ([`GridRows::splice_by`]): not when
+    /// it starts fresh, when the grid tells it again.
+    pub fn knows_lines(&self) -> bool {
+        self.identities.borrow().is_some()
     }
 
     /// The grid holds `count` lines. Lines added or taken are at the end; nothing in view
     /// moves.
     pub fn sync(&self, count: usize) {
         self.count.set(count);
+        // Lines told by count alone are lines whose identities are not known.
+        if self
+            .identities
+            .borrow()
+            .as_ref()
+            .is_some_and(|known| known.len() != count)
+        {
+            self.identities.borrow_mut().take();
+        }
         let old = self.measured.item_count();
         if count > old {
             // GPUI moves a scroll held at the old end past what is added.
@@ -432,7 +489,7 @@ impl GridRows {
         let to = from.toggled();
         if to == CellWrap::Wrap {
             // No height the list measured before is known to hold now.
-            self.measured.reset(self.count.get());
+            self.reset(self.count.get());
         }
         self.scroll_to(to, line, Pixels::ZERO);
     }
@@ -684,6 +741,28 @@ mod tests {
         rows.sync(400);
         rows.scroll_to(CellWrap::Truncate, 12, Pixels::ZERO);
         assert_eq!(rows.first(CellWrap::Truncate), (12, Pixels::ZERO));
+    }
+
+    /// The lines that changed in the middle of the list are spliced there: the lines after them
+    /// keep their place, so the first line in view after them stays first.
+    #[test]
+    fn a_change_in_the_middle_splices_its_own_lines() {
+        let rows = GridRows::new(gpui::UniformListScrollHandle::new(), px(29.));
+        let ids = |list: &[u64]| list.to_vec();
+        rows.splice_by(ids(&[1, 2, 3, 4, 5, 6, 7, 8]));
+        rows.scroll_to(CellWrap::Wrap, 6, Pixels::ZERO);
+        // 3 goes, two lines go in after 4: the line first in view (7) is now at 7.
+        rows.splice_by(ids(&[1, 2, 4, 40, 41, 5, 6, 7, 8]));
+        assert_eq!(rows.measured.item_count(), 9);
+        assert_eq!(
+            rows.first(CellWrap::Wrap),
+            (7, Pixels::ZERO),
+            "7 is still first"
+        );
+        // Lines at the end only.
+        rows.splice_by(ids(&[1, 2, 4, 40, 41, 5, 6, 7, 8, 9, 10]));
+        assert_eq!(rows.measured.item_count(), 11);
+        assert_eq!(rows.first(CellWrap::Wrap), (7, Pixels::ZERO));
     }
 
     /// A row of one line is a row's height; more lines grow it by a line each, up to the most
