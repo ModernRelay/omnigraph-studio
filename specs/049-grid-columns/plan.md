@@ -110,6 +110,6 @@ page). No engine change.
 |---|---|---|---|
 | 2026-11-25 | The edge bug, as above | Probe on `main`: a click and a 40 px drag at every pixel from 30 px left to 4 px right of each header rule of `Person` (two columns), and sub-pixel presses | Handle −6 to −1 px, menu button −24 to −7, sort left of that; on the key column the rule pixel did nothing and +0.5 px sorted the next column; drags from the handle never opened the menu |
 | 2026-11-25 | The rule holds | `type_table` `a_column_edge_is_the_resize_handles_and_no_control_reaches_it`, `a_column_dropped_on_an_edge_moves`, `a_scrolled_strip_gives_no_edge_to_a_column_out_of_view`; `studio_ui` `a_press_at_a_rule_resizes_the_column_on_its_left` | Pass; the first fails on `main` at −0.5 px from the key column's rule. With the edge blocking the mouse (the first version of this fix), a column dropped on an edge did not move (review of #181) |
-| 2026-11-25 | The edge shows its line | Offscreen snapshots of `Note`, the pointer 2 px left of slug's rule | `main`: the menu's button and no line; now: the line, no button |
+| 2026-11-25 | The edge shows its line | Offscreen snapshots of `Note`, the pointer 2 px left of slug's rule | `main`: the menu's button and no line, the slot's fill over it; now: the line, drawn over everything, and the button, which stops short of the edge |
 
 ## Corrections
