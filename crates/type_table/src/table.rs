@@ -2147,10 +2147,35 @@ impl TypeTable {
     }
 
     fn end_resize(&mut self, cx: &mut Context<Self>) {
-        if self.resizing.take().is_some() {
-            self.keep_sizing(cx);
+        if let Some(resizing) = self.resizing.take() {
+            self.keep_width(&resizing.column, cx);
             cx.notify();
         }
+    }
+
+    /// Keeps the width a drag gave column `key` in the type's settings, over what they hold
+    /// now: another tab of the type may have changed the rest while this one was dragging, and
+    /// this tab did not follow it then ([`Self::follow_type_sizing`]). This tab follows the
+    /// result.
+    fn keep_width(&self, key: &str, cx: &mut Context<Self>) {
+        if cx.try_global::<studio_settings::StudioSettings>().is_none() {
+            return;
+        }
+        let graph = self.session.read(cx).overrides_key();
+        let (type_name, key) = (self.type_name.clone(), key.to_owned());
+        let width = self.sizing.chosen_width(&key);
+        studio_settings::update(cx, move |settings| {
+            let mut layout = settings.grid_layout(&graph, &type_name);
+            match width {
+                Some(width) => {
+                    layout.widths.insert(key, width as u32);
+                }
+                None => {
+                    layout.widths.remove(&key);
+                }
+            }
+            settings.set_grid_layout(&graph, &type_name, layout);
+        });
     }
 
     /// A column's width as drawn: the one the person gave it for the type, else the one
@@ -2178,7 +2203,7 @@ impl TypeTable {
         };
         // Measured only for a fit, before the model is changed.
         let widest = match change {
-            ColumnChange::Fit => self.widest_text(&column, window, cx),
+            ColumnChange::Fit => self.widest_text(col.unwrap_or_default(), &column, window, cx),
             _ => Pixels::ZERO,
         };
         if self
@@ -2189,9 +2214,11 @@ impl TypeTable {
         }
     }
 
-    /// The widest text of `column` as drawn: its header (its kind's icon, its title and its
-    /// type, and the menu's button) and the values of the first rows read.
-    fn widest_text(&self, column: &ColumnSpec, window: &Window, cx: &App) -> Pixels {
+    /// The widest text of column `col` as drawn: its header (its kind's icon, its title and its
+    /// type, and the menu's button) and the values of the first rows read, with what the key
+    /// column's inset takes beyond a cell's ([`fitted_width`](studio_ui::fitted_width) adds
+    /// a cell's own).
+    fn widest_text(&self, col: usize, column: &ColumnSpec, window: &Window, cx: &App) -> Pixels {
         let detail = match self.absent.get(&column.key) {
             Some(then) => crate::peek::absence_text(then, false),
             None => column.detail.clone(),
@@ -2200,11 +2227,16 @@ impl TypeTable {
             px(studio_ui::ds::size::ROW_ICON + 2. * space::SM + studio_ui::ds::size::ROW_BUTTON)
                 + studio_ui::cell_text(column.title.clone(), cx).line_width(window)
                 + studio_ui::cell_text(detail, cx).meta(cx).line_width(window);
-        let values = self.rows.iter().map(|row| {
-            let value = row.value(&column.key);
-            studio_ui::cell_text(self.cell_text_of(row, column, value).shown, cx)
-        });
-        header.max(studio_ui::widest_text(values, window))
+        let values = self
+            .rows
+            .iter()
+            .map(|row| self.styled_text(row, column, cx));
+        let key_inset = if col == 0 {
+            KEY_TEXT_INSET - space::LG
+        } else {
+            0.
+        };
+        header.max(studio_ui::widest_text(values, window)) + px(key_inset)
     }
 
     /// The type's widths or wrap changed: the lines are measured again, and, when `keep`, the
@@ -10909,7 +10941,7 @@ impl TypeTable {
                     self.columns
                         .iter()
                         .enumerate()
-                        .filter(|(_, column)| self.wraps(column))
+                        .filter(|(col, column)| self.wraps_in(*col, column))
                         .map(|(col, column)| {
                             (column.key.as_str(), px(self.text_room(col, column)))
                         }),
@@ -12194,7 +12226,7 @@ impl TypeTable {
                 self.columns
                     .iter()
                     .enumerate()
-                    .filter(|(_, column)| self.wraps(column))
+                    .filter(|(col, column)| self.wraps_in(*col, column))
                     .map(|(col, column)| {
                         (
                             self.styled_text(row, column, cx),
@@ -12264,10 +12296,17 @@ impl TypeTable {
             })
     }
 
-    /// The room column `col`'s text has: its width less the cell's inset on both sides.
+    /// The room column `col`'s text has: its width less the cell's inset on both sides, and
+    /// none when the column is narrower than its insets (a 48 px key column). A column with no
+    /// room does not wrap ([`Self::wraps_in`]).
     fn text_room(&self, col: usize, column: &ColumnSpec) -> f32 {
         let inset = if col == 0 { KEY_TEXT_INSET } else { space::LG };
-        self.width(column) - inset - space::LG
+        (self.width(column) - inset - space::LG).max(0.)
+    }
+
+    /// Whether column `col`'s cells wrap: text, with room for it.
+    fn wraps_in(&self, col: usize, column: &ColumnSpec) -> bool {
+        self.wraps(column) && self.text_room(col, column) > 0.
     }
 
     /// Whether row `ix` builds its checkbox: every row the branch keeps while any row is checked,
@@ -12662,7 +12701,7 @@ impl TypeTable {
                 let mut text = self
                     .styled_text(row, column, cx)
                     .color(text_color.color(cx));
-                if self.frame_wrap.is_some() {
+                if self.frame_wrap.is_some() && self.wraps_in(col, column) {
                     text = text.wrap(px(self.text_room(col, column)));
                 }
                 text.into_any_element()
@@ -16368,7 +16407,7 @@ mod tests {
                 .columns
                 .iter()
                 .skip(1)
-                .map(|c| px(table.layout.width(c)))
+                .map(|c| px(table.width(c)))
                 .collect();
             let content = widths.iter().fold(Pixels::ZERO, |sum, w| sum + *w);
             let strip = table
@@ -16663,6 +16702,116 @@ mod tests {
             Some(tall),
             "its height moved with it"
         );
+    }
+
+    /// A drag's end keeps the dragged column's width over what the type's settings hold then:
+    /// another tab of the type that wrapped meanwhile keeps its wrap. Before, the dragging tab
+    /// wrote its whole layout, from before the other's change (Bugbot review of #182).
+    #[gpui::test]
+    async fn a_drags_end_keeps_what_another_tab_changed_meanwhile(cx: &mut TestAppContext) {
+        let (table, cx) = wrapped_people(3, 99, cx);
+        // Cut again, so the other tab's wrap is a change.
+        table.update_in(cx, |table, window, cx| {
+            table.change_columns(ColumnChange::ToggleWrap, None, window, cx)
+        });
+        cx.run_until_parked();
+        let session = table.read_with(cx, |table, _| table.session.clone());
+        let other = cx.update(|window, cx| {
+            cx.new(|cx| {
+                TypeTable::new(
+                    WeakEntity::new_invalid(),
+                    session,
+                    "Person".into(),
+                    None,
+                    window,
+                    cx,
+                )
+            })
+        });
+        // A drag on name begins in the first tab.
+        let down = gpui::MouseDownEvent {
+            button: MouseButton::Left,
+            position: point(px(300.), px(10.)),
+            modifiers: Default::default(),
+            click_count: 1,
+            first_mouse: false,
+        };
+        table.update(cx, |table, cx| {
+            table.resizing = Some(ColumnResize::new("name".to_owned(), &down, 200.));
+            table.sizing.set_width("name", Some(300.));
+            table.sizing_changed(false, cx);
+        });
+        // The other tab wraps meanwhile.
+        other.update_in(cx, |other, window, cx| {
+            other.change_columns(ColumnChange::ToggleWrap, None, window, cx)
+        });
+        cx.run_until_parked();
+        table.update(cx, |table, cx| table.end_resize(cx));
+        cx.run_until_parked();
+        let graph = table.read_with(cx, |table, cx| table.session.read(cx).overrides_key());
+        let kept = cx
+            .update(|_, cx| studio_settings::StudioSettings::get(cx).grid_layout(&graph, "Person"));
+        assert_eq!(
+            kept.wrap,
+            Some(CellWrap::Wrap),
+            "the other tab's wrap stays"
+        );
+        assert_eq!(
+            kept.widths.get("name"),
+            Some(&300),
+            "the drag's width is kept"
+        );
+        let followed = table.read_with(cx, |table, _| table.sizing.layout().clone());
+        assert_eq!(followed, kept, "the dragging tab follows the result");
+    }
+
+    /// A column narrower than its insets has no room for text and does not wrap: at the
+    /// narrowest key column (48 px) every short row stays a row high. Before, its room went
+    /// below zero and each character took a line (Bugbot review of #182).
+    #[gpui::test]
+    async fn a_column_with_no_room_does_not_wrap(cx: &mut TestAppContext) {
+        let (table, cx) = wrapped_people(3, 99, cx);
+        table.update(cx, |table, cx| {
+            table
+                .sizing
+                .set_width("slug", Some(studio_ui::COLUMN_MIN_WIDTH));
+            table.sizing_changed(false, cx);
+        });
+        cx.run_until_parked();
+        let row = px(ROW_HEIGHT + studio_ui::ds::size::HAIRLINE);
+        for line in 0..3 {
+            assert_eq!(measured_line(&table, line, cx), Some(row), "line {line}");
+        }
+    }
+
+    /// A fit of the key column leaves its widest value room beyond the key's wider inset (the
+    /// select-all's place), not a cell's: no slug is cut after a fit. Before, the fit added a
+    /// cell's inset and the slug lost the key's extra 34 px (Bugbot review of #182).
+    #[gpui::test]
+    async fn a_fit_of_the_key_column_cuts_no_key(cx: &mut TestAppContext) {
+        // A slug wider than the key column's header, so the value decides the fit.
+        let session = crate::test_support::session_reading(
+            PEOPLE,
+            serde_json::json!([
+                {"n": {"@id": "p1", "slug": "a-slug-much-wider-than-its-header-0001", "name": "Ada"}},
+            ]),
+            cx,
+        );
+        let (table, cx) = people_table(&session, cx);
+        table.update_in(cx, |table, window, cx| {
+            table.change_columns(ColumnChange::Fit, Some(0), window, cx)
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let table = table.read(cx);
+            let room = px(table.text_room(0, &table.columns[0]));
+            for row in &table.rows {
+                let width = table
+                    .styled_text(row, &table.columns[0], cx)
+                    .line_width(window);
+                assert!(width <= room, "{} is {width:?} in {room:?}", row.id);
+            }
+        });
     }
 
     /// Turning the wrap on or off keeps the first line in view first and never moves the view
