@@ -1668,7 +1668,11 @@ impl TypeTable {
             wheel_gesture: Default::default(),
             resizing: None,
             sizing,
-            lines: GridRows::new(table_state.read(cx).scroll_handle.clone()),
+            // A cut line is a row and the rule under it, as Zed's table draws it.
+            lines: GridRows::new(
+                table_state.read(cx).scroll_handle.clone(),
+                px(ROW_HEIGHT + studio_ui::ds::size::HAIRLINE),
+            ),
             lines_wrap,
             frame_lines_drawn: None,
             blob_lines: None,
