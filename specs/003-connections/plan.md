@@ -54,9 +54,14 @@ dialog by keyboard), X (capabilities from the served document).
   contract with `HEAD /healthz` before a data request.
 - `GET /graphs` needs the `graph_list` action, which is denied without a cluster policy, even to
   a valid token. `GET /graphs/discovery` returns ids and names. Before Omnigraph #1544 it
-  accepts only identity credentials and names every graph; from #1544 it answers every
-  credential with the graphs it can read on some branch, and a graph that grants the
-  credential nothing answers 404 on every route, as a missing one does.
+  accepts only identity credentials and names every graph. From #1544 (main `d3a354e7`) it
+  answers every credential with `visibility: "granted"`, the caller's `actor_id` (and
+  `client_id` for an OAuth client), and the registered graphs the credential holds any
+  permission on: any graph action on some branch, so a change-only grant lists a graph too,
+  or every registered graph for a holder of `graph_list`. A registered graph it does not list
+  answers that graph's routes (`/graphs/{graph_id}/…`) with the 404 `graph not found` a
+  missing graph gets; the built-in `og_catalog` is never listed and keeps its own
+  authorization. Studio decodes the ids and names only.
 - The CLI's operator home is `$OMNIGRAPH_HOME`, else `~/.omnigraph`, its file `config.yaml`
   there. Since Omnigraph main `f7db38da` (#1115) and `ff542202` (#1126) the file is the version-1
   operator configuration (`version: 1` with `profiles`, `targets`, `aliases` and `defaults`); a
@@ -298,8 +303,9 @@ dialog by keyboard), X (capabilities from the served document).
    `GraphClient::new` refuses an unusable root rather than building URLs on it.
 3. Graph ids for a server come from, in order: `GET /graphs` when allowed; else
    `GET /graphs/discovery`, which names graphs with no state (before Omnigraph #1544, every
-   graph, to identity credentials only; from #1544, the graphs the credential can read, to any
-   credential); its target's `default_graph`; graph ids the person typed
+   graph, to identity credentials only; from #1544, to any credential, the registered graphs
+   it holds any permission on, or every one for a `graph_list` holder); its target's
+   `default_graph`; graph ids the person typed
    before. A 403 on both is not an error state; Studio says "This token may not list graphs.
    Enter a graph id." A discovery that fails otherwise says the list could not be read.
 
@@ -480,6 +486,7 @@ for* or how it *saves* is used only where the server serves it (spec 034):
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-11-26 | Discovery is read as Omnigraph #1544 answers it, and the docs state its rule (Codex's review of #179) | `crates/omnigraph-server/src/handlers.rs` at Omnigraph main `d3a354e7` (`server_graphs_discovery`, `VisibleGraphs`, `resolve_registered_graph`); `graph_store` `a_token_that_may_not_list_graphs_discovers_them` (an earlier server's body, a #1544 body with `visibility`, `actor_id` and `client_id`, a #1544 body listing nothing, 403, 401) | A graph is listed for any graph action on some branch, a change-only grant included, or for every registered graph to a `graph_list` holder; an unlisted registered graph answers its graph routes 404 `graph not found`, and `og_catalog` is never listed. Studio decodes the ids alone: both bodies give the same listing, and the empty one says the server lists no graphs. Before, the docs called discovery a read-access check |
 | 2026-11-18 | Refresh of a server that did not answer asks the CLI over a typed token (Devin's review of #142) | `graph_store` `connecting_again_asks_the_source_over_a_typed_token` (a source-backed connection given a typed token, then unreachable, then `connect_again`), checked to fail without the change | Before, Refresh connected again with the typed token still standing, so a token that lapsed while the server was away was sent and refused although the CLI held a good one. Now `Connection::connect_again` drops a typed token as `refresh_token` does, and the connect asks the source: the probe carries the CLI's token |
 | 2026-11-18 | The Open dialog says what to do about a server that did not answer | `studio` `an_unreachable_server_says_what_to_do_next`; offscreen snapshots, light and dark, of the dialog on a port nothing serves | "Could not reach the server: the connection was refused. Is omnigraph-server running at http://127.0.0.1:8799? Start it, then Retry."; a remote server's says to check the address and the network. Before, the line ended at the error, where the page of a graph that did not open already said what to do |
 | 2026-11-18 | Refresh connects again to a server that did not answer, at once, and the chip's tooltip says why it did not | `graph_store` `refresh_connects_again_to_a_server_that_did_not_answer` (a server refusing connections, then answering: Refresh makes it Connected with no clock moved; fails with the reconnect taken out); offscreen snapshots, light and dark, of Studio started on a port nothing serves: the tooltip reads "Unreachable: the connection was refused" and the menu offers Connect Again with Ctrl-R; a server then started on that port and Connect Again chosen, Person opens | Before, the chip said only "Unreachable", its menu offered no retry, and Refresh read the views again but left the connection to its next check, two minutes after the failure. Usage reports from 0.4.5 (13 to 18 November) had 59 connections go unreachable, the most common state after ready |

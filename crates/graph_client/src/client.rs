@@ -1773,8 +1773,10 @@ impl GraphClient {
         self.read(Method::GET, &["graphs"], &[], None).await
     }
 
-    /// The graphs this credential may know of, for one that may not list the server's
-    /// (`graph_list` is a server policy): an identity credential's, by id only.
+    /// The graphs this credential may know of, by id only, for one that may not list the
+    /// server's (`graph_list` is a server policy). From Omnigraph #1544 any credential may ask
+    /// and is answered with the graphs it holds a permission on; an earlier server answers an
+    /// identity credential alone, with every graph.
     pub async fn discover_graphs(&self) -> Result<crate::api::GraphDiscoveryResponse, ReadError> {
         self.read(Method::GET, &["graphs", "discovery"], &[], None)
             .await
