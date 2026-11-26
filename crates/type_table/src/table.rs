@@ -1899,7 +1899,7 @@ impl TypeTable {
             let renamed = schema.renamed_since(&was);
             self.schema = Some(schema);
             self.cell_text.borrow_mut().clear();
-            self.wrap_lines.forget_all();
+            self.forget_wrapped(None);
             let by_neighbours = self.grouping.as_ref().is_some_and(|grouping| {
                 matches!(
                     builder::parse_group_key(&grouping.property),
@@ -1937,7 +1937,7 @@ impl TypeTable {
             self.rows.clear();
             self.placed_here.clear();
             self.cell_text.borrow_mut().clear();
-            self.wrap_lines.forget_all();
+            self.forget_wrapped(None);
             cx.notify();
             return;
         };
@@ -4228,7 +4228,7 @@ impl TypeTable {
         self.rows.clear();
         self.placed_here.clear();
         self.cell_text.borrow_mut().clear();
-        self.wrap_lines.forget_all();
+        self.forget_wrapped(None);
         // At the same commit a row's relationships and Blob cells cannot have changed: a new
         // order or filter keeps what was read and reads only rows not seen yet.
         if !keep_pin {
@@ -5156,7 +5156,7 @@ impl TypeTable {
         if let Some(row) = self.cell_text.borrow_mut().get_mut(&self.rows[first].id) {
             row.remove(column);
         }
-        self.wrap_lines.forget(&self.rows[first].id);
+        self.forget_wrapped(Some(places));
     }
 
     /// Puts back what a row showed (`shown`) before a save that did not land put `new` in its
@@ -12287,6 +12287,32 @@ impl TypeTable {
             .collect()
     }
 
+    /// The text of rows `rows` changed (every row's when `None`): their wrapped line counts are
+    /// forgotten, and so are the heights the wrapped list measured for their lines, which it
+    /// measures again when it next lays them out, in view or not (spec 049). A row deleted or
+    /// put in is the list's splice's, not this.
+    fn forget_wrapped(&self, rows: Option<&[usize]>) {
+        let Some(rows) = rows else {
+            self.wrap_lines.forget_all();
+            self.lines.measured.remeasure();
+            return;
+        };
+        let count = self.lines.measured.item_count();
+        for &ix in rows {
+            let Some(row) = self.rows.get(ix) else {
+                continue;
+            };
+            self.wrap_lines.forget(&row.id);
+            let line = match &self.grouping {
+                Some(grouping) => grouping.line_of_row(ix),
+                None => Some(ix),
+            };
+            if let Some(line) = line.filter(|line| *line < count) {
+                self.lines.measured.remeasure_items(line..line + 1);
+            }
+        }
+    }
+
     /// Whether `column`'s cells are text that wraps (spec 049): not a relationship, a file or
     /// an enum's chip, which stay one line.
     fn wraps(&self, column: &ColumnSpec) -> bool {
@@ -16812,6 +16838,40 @@ mod tests {
                 assert!(width <= room, "{} is {width:?} in {room:?}", row.id);
             }
         });
+    }
+
+    /// A row whose text changes out of view has its measured height forgotten with its line
+    /// count: the wrapped list measures it again when it lays it out, and scrolled there it is
+    /// as tall as its new text. Before, the list kept the one-line height it measured (Bugbot
+    /// review of #182).
+    #[gpui::test]
+    async fn a_value_changed_out_of_view_is_measured_again(cx: &mut TestAppContext) {
+        let (table, cx) = wrapped_people(120, 999, cx);
+        let scroll = |line: usize, cx: &mut VisualTestContext| {
+            table.update(cx, |table, cx| {
+                table.scroll_to_line(line, px(0.));
+                cx.notify();
+            });
+            cx.run_until_parked();
+        };
+        let row = px(ROW_HEIGHT + studio_ui::ds::size::HAIRLINE);
+        scroll(78, cx);
+        assert_eq!(measured_line(&table, 80, cx), Some(row));
+        scroll(0, cx);
+        let long = "a name long enough to need several lines in a narrow column ".repeat(6);
+        table.update(cx, |table, cx| {
+            table.set_cell_at(&[80], "name", Value::String(long));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_ne!(
+            measured_line(&table, 80, cx),
+            Some(row),
+            "the one-line height is not kept"
+        );
+        scroll(78, cx);
+        let grown = measured_line(&table, 80, cx).expect("drawn");
+        assert!(grown > row, "{grown:?}");
     }
 
     /// Turning the wrap on or off keeps the first line in view first and never moves the view
