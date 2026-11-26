@@ -97,12 +97,14 @@ impl ConnectionState {
 pub enum GraphListing {
     Unknown,
     Listed(Vec<GraphInfo>),
-    /// The token may not list graphs, but may discover them: an identity credential, which the
-    /// server answers with the ids of the graphs it may know of and nothing about their state.
+    /// The token may not list graphs, but may discover them: the server answers with the ids of
+    /// the graphs it may know of and nothing about their state. From Omnigraph #1544 that is any
+    /// credential, and the graphs it holds a permission on (none, for one granted nothing); an
+    /// earlier server answers an identity credential alone, with every graph.
     Discovered(Vec<String>),
-    /// The token may neither list nor discover graphs (`graph_list` needs a cluster policy,
-    /// and a static token is refused discovery); graph ids come from the CLI's targets or are
-    /// typed in.
+    /// The token may neither list nor discover graphs (`graph_list` needs a cluster policy, and
+    /// a server before Omnigraph #1544 refuses a static token discovery); graph ids come from
+    /// the CLI's targets or are typed in.
     NotAllowed,
     Failed(String),
 }
@@ -2450,7 +2452,8 @@ async fn list_graphs(client: &GraphClient) -> Result<GraphListing, Failed> {
         Err(ReadError::Refused(summary)) if not_admitted(&summary) => {
             return Err(not_admitted_failure());
         }
-        // A credential that may not list the server's graphs may still discover its own.
+        // A credential that may not list the server's graphs may still discover the ones it may
+        // use (from Omnigraph #1544, any credential; before, an identity credential alone).
         Err(ReadError::Refused(summary)) if summary.status == 403 => {
             match client.discover_graphs().await {
                 Err(ReadError::Refused(summary)) if not_admitted(&summary) => {
@@ -2459,9 +2462,10 @@ async fn list_graphs(client: &GraphClient) -> Result<GraphListing, Failed> {
                 Ok(found) => {
                     GraphListing::Discovered(found.graphs.into_iter().map(|g| g.graph_id).collect())
                 }
-                // A static token is refused discovery too, and a request with no token (a server
-                // run `--unauthenticated`) is asked for an identity credential it does not have:
-                // neither lists (spec 029). Any other failure is a failed read.
+                // A server before Omnigraph #1544 refuses a static token discovery too, and asks a
+                // request with no token (a server run `--unauthenticated`) for an identity
+                // credential it does not have: neither lists (spec 029). Any other failure is a
+                // failed read.
                 Err(ReadError::Refused(summary)) if matches!(summary.status, 401 | 403) => {
                     GraphListing::NotAllowed
                 }
@@ -2563,13 +2567,42 @@ mod tests {
         connection.read_with(cx, |connection, _| connection.state.clone())
     }
 
-    /// A token that may not list the server's graphs discovers the ones it may know of; one
-    /// refused discovery too (a static token, 403, or no token on a server run
-    /// `--unauthenticated`, 401) has graph ids typed in.
+    /// A token that may not list the server's graphs discovers the ones it may know of, from
+    /// an earlier server's answer or one from Omnigraph #1544, which also states its rule and
+    /// the caller, and lists nothing for a credential granted nothing; one refused discovery
+    /// (a static token before #1544, 403, or no token on a server run `--unauthenticated`,
+    /// 401) has graph ids typed in.
     #[gpui::test]
     async fn a_token_that_may_not_list_graphs_discovers_them(cx: &mut TestAppContext) {
-        for discovery in [200u16, 403, 401] {
-            let discovers = discovery == 200;
+        const BEFORE_1544: &str =
+            r#"{"graphs":[{"graph_id":"knowledge","display_name":"knowledge"}]}"#;
+        const FROM_1544: &str = r#"{"visibility":"granted","actor_id":"principal:p1","client_id":"client_1","graphs":[{"graph_id":"knowledge","display_name":"knowledge"}]}"#;
+        const GRANTED_NOTHING: &str =
+            r#"{"visibility":"granted","actor_id":"principal:p2","graphs":[]}"#;
+        let cases: [(u16, &'static str, GraphListing); 5] = [
+            (
+                200,
+                BEFORE_1544,
+                GraphListing::Discovered(vec!["knowledge".into()]),
+            ),
+            (
+                200,
+                FROM_1544,
+                GraphListing::Discovered(vec!["knowledge".into()]),
+            ),
+            (200, GRANTED_NOTHING, GraphListing::Discovered(Vec::new())),
+            (
+                403,
+                r#"{"error":"forbidden","code":"forbidden"}"#,
+                GraphListing::NotAllowed,
+            ),
+            (
+                401,
+                r#"{"error":"missing bearer token","code":"unauthorized"}"#,
+                GraphListing::NotAllowed,
+            ),
+        ];
+        for (discovery, answer, expected) in cases {
             let http = FakeHttpClient::create(move |request| {
                 let path = request.uri().path().to_owned();
                 async move {
@@ -2578,16 +2611,8 @@ mod tests {
                             200,
                             r#"{"status":"ok","version":"0.14.0","internal_schema_version":16}"#,
                         )
-                    } else if path.ends_with("/graphs/discovery") && discovers {
-                        (
-                            200,
-                            r#"{"graphs":[{"graph_id":"knowledge","display_name":"knowledge"}]}"#,
-                        )
-                    } else if path.ends_with("/graphs/discovery") && discovery == 401 {
-                        (
-                            401,
-                            r#"{"error":"missing bearer token","code":"unauthorized"}"#,
-                        )
+                    } else if path.ends_with("/graphs/discovery") {
+                        (discovery, answer)
                     } else {
                         (403, r#"{"error":"forbidden","code":"forbidden"}"#)
                     };
@@ -2608,17 +2633,13 @@ mod tests {
             connection.update(cx, |connection, cx| connection.connect(cx));
             cx.run_until_parked();
             connection.read_with(cx, |connection, _| {
-                assert_eq!(connection.state, ConnectionState::Ready);
-                if discovers {
-                    assert_eq!(
-                        connection.graphs,
-                        GraphListing::Discovered(vec!["knowledge".into()])
-                    );
-                    assert_eq!(connection.graph_ids(), ["knowledge"]);
-                } else {
-                    assert_eq!(connection.graphs, GraphListing::NotAllowed);
-                    assert!(connection.graph_ids().is_empty());
-                }
+                assert_eq!(connection.state, ConnectionState::Ready, "{answer}");
+                assert_eq!(connection.graphs, expected, "{answer}");
+                let ids: Vec<String> = match &expected {
+                    GraphListing::Discovered(ids) => ids.clone(),
+                    _ => Vec::new(),
+                };
+                assert_eq!(connection.graph_ids(), ids, "{answer}");
             });
         }
     }

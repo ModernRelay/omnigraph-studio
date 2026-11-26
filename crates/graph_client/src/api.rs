@@ -29,8 +29,14 @@ pub struct GraphListResponse {
     pub graphs: Vec<GraphInfo>,
 }
 
-/// `GET /graphs/discovery`: the graphs an identity credential (managed or OIDC) may know of,
-/// with no storage or serving metadata. A static token is refused it.
+/// `GET /graphs/discovery`, the part of its answer Studio decodes: graph ids and names, with no
+/// storage or serving metadata. From Omnigraph #1544 it answers every credential, stating its
+/// rule (`visibility: "granted"`) and the caller (`actor_id`, and `client_id` for an OAuth
+/// client), with the registered graphs the credential holds any permission on, for any graph
+/// action on some branch (a change-only grant lists a graph too), or every registered graph
+/// for a holder of the server-level `graph_list`. Earlier servers answer identity credentials
+/// (managed or OIDC) only, with every graph, and refuse a static token. Studio reads `graphs`
+/// alone and takes both answers the same way.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GraphDiscoveryResponse {
     pub graphs: Vec<GraphDiscoveryEntry>,
