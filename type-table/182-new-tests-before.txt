@@ -35,3 +35,31 @@ assertion `left == right` failed: its height moved with it
 test result: FAILED. 0 passed; 5 failed; 0 ignored; 0 measured; 306 filtered out; finished in 0.59s
 
 error: test failed, to rerun pass `-p type_table --lib`
+test table::tests::a_fit_of_the_key_column_cuts_no_key ... ok
+test table::tests::a_column_with_no_room_does_not_wrap ... FAILED
+test table::tests::a_drags_end_keeps_what_another_tab_changed_meanwhile ... FAILED
+
+failures:
+
+--
+thread 'table::tests::a_column_with_no_room_does_not_wrap' (9104) panicked at crates/type_table/src/table.rs:16744:13:
+assertion `left == right` failed: line 0
+  left: Some(87.5px)
+ right: Some(29px)
+--
+thread 'table::tests::a_drags_end_keeps_what_another_tab_changed_meanwhile' (9105) panicked at crates/type_table/src/table.rs:16715:9:
+assertion `left == right` failed: the other tab's wrap stays
+  left: None
+ right: Some(Wrap)
+--
+test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 312 filtered out; finished in 0.15s
+
+error: test failed, to rerun pass `-p type_table --lib`
+test table::tests::a_fit_of_the_key_column_cuts_no_key ... FAILED
+
+failures:
+
+--
+thread 'table::tests::a_fit_of_the_key_column_cuts_no_key' (10280) panicked at crates/type_table/src/table.rs:16693:17:
+p1 is 273.59995px in 240px
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
