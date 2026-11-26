@@ -1,7 +1,7 @@
 # 049: Column edges, widths and wrapped text
 
-Status: in progress · 2026-11-25 · step 1 (who owns a column's edge) in review; steps 2 and 3
-stacked on it.
+Status: in progress · 2026-11-25 · step 1 (who owns a column's edge, #181), step 2 (#180) and
+step 3 (#182) in review.
 
 ## Problem
 
@@ -100,7 +100,21 @@ type table's header edges (`edge-trace-main.txt` in the PR):
 ### Step 3: the type table on the model
 
 - Widths and wrap are the type's, per graph, in settings (`graphs.<graph>.columns.<Type>`); every
-  tab of the type follows a change. A tab saved with widths hands them to the type once.
+  tab of the type follows a change. The first tab of a type saved with widths before this step
+  hands them to the type, and only if the person chose nothing for it (no widths, no wrap); no
+  later old tab does, so a Reset stays.
+- Wrapped, the lines the list holds are told by what each shows (a row's id, a section's value):
+  whatever changed in the middle (a group opened or folded, a section read, a row put in or
+  deleted, all of which pass through `lines_moved`) is spliced where it is
+  (`GridRows::splice_by`), so every other line keeps its measured height and the first line in
+  view stays first. Every frame, scroll and reveal tells the list this one way.
+- A row's lines are counted in the text its cells draw (`styled_text`: the key's weight, a
+  number's font), under the frame's measure, which includes the columns shown.
+  A row whose text changes forgets its count and its line's measured height together
+  (`forget_wrapped`), in view or not.
+  A column narrower than its insets (a 48 px key column) has no room and does not wrap. A fit of
+  the key column counts its wider inset. A drag's end keeps only the dragged width over what the
+  type's settings hold then, so another tab's change made meanwhile stays.
 - Zed's cell around a type table cell does not stretch to its row, so a wrapped row's height is
   worked out from its drawn text cells' line counts and given to every cell.
 
@@ -125,8 +139,15 @@ page). No engine change.
 |---|---|---|---|
 | 2026-11-25 | The edge bug, as above | Probe on `main`: a click and a 40 px drag at every pixel from 30 px left to 4 px right of each header rule of `Person` (two columns), and sub-pixel presses | Handle −6 to −1 px, menu button −24 to −7, sort left of that; on the key column the rule pixel did nothing and +0.5 px sorted the next column; drags from the handle never opened the menu |
 | 2026-11-25 | The rule holds | `type_table` `a_column_edge_is_the_resize_handles_and_no_control_reaches_it`, `a_column_dropped_on_an_edge_moves`, `a_scrolled_strip_gives_no_edge_to_a_column_out_of_view`; `studio_ui` `a_press_at_a_rule_resizes_the_column_on_its_left` | Pass; the first fails on `main` at −0.5 px from the key column's rule. With the edge blocking the mouse (the first version of this fix), a column dropped on an edge did not move (review of #181) |
+| 2026-11-25 | Query results wrap and size by key; cut rows keep `uniform_list` | `query_editor` `wrapped_results_grow_and_the_keys_size_the_selected_column`; with GPUI's `list` for cut rows too, `type_table` `a_sideways_wheel_scrolls_the_columns_not_the_rows` failed | Wrapped, a long note 6 lines and short rows a row; keys on the selected column; the tab keeps `"widths"` and `"wrap"`. With `list`, a cut table of 60 rows had a 13 px scroll range after its first frame |
+| 2026-11-25 | A wrapped row keeps its height while scrolled sideways, and a run keeps no old heights | `query_editor` `wrapped_rows_keep_their_height_out_of_view_and_across_runs` (40 columns, the long one out of view) | Counted from the drawn cells only, the row was a row high until its tall cell scrolled in (review of #180); counted from every column, cached per row, it is tall from the start; a rerun's short row is a row |
+| 2026-11-25 | The type table keeps its columns for the type, and wrapped rows grow without breaking selection | `type_table` `a_types_columns_are_kept_for_the_type_and_wrapped_rows_grow` | A saved tab's widths became the type's; wrapped, the long name's row grew and a press near its bottom is on it; a second tab of the type followed a change; Reset left no entry |
+| 2026-11-25 | A wrapped row's cells run its height | Offscreen snapshot of `Note` wrapped, the cursor on "gpui-panes" | With each cell only as tall as its lines, the rules between short cells and the cursor's ring stopped after the first line; each cell now takes the row's height from its text cells' line counts |
 | 2026-11-26 | Every button at an edge is the edge's; no end control over a start control | `type_table` `every_button_at_an_edge_is_the_edges`, `the_select_all_check_is_not_under_the_menu_at_the_narrowest_key_column`, both failing on `11942b0` | At `11942b0` a right press 3.5 px left of the key column's rule opened a menu, and at a 48 px key column the menu's button (16 to 34 px) covered the select-all check (16 to 30 px), so a click on the check opened the menu (Codex review of #181) |
 | 2026-11-26 | Toggling the wrap keeps the view; a font change counts lines again; a new result closes a column menu | `query_editor` `toggling_the_wrap_never_jumps_to_the_selection`, `a_font_change_counts_wrapped_lines_again`, `a_new_result_closes_a_column_menu`, all failing on `1ef16d0`; `the_keys_menu_and_edge_work_as_a_person_uses_them` | At `1ef16d0` the toggle moved the view from row 40 to the selected row 0; at a 24 px rem a 6-line row was drawn 115 px tall instead of 173 px; a menu outlived its result (Codex and Bugbot reviews of #180). ⌥Z from the query does nothing, from the results wraps; a right press on a header opens its menu; a double click on an edge fits |
+| 2026-11-26 | The type table's wrap measurements follow the columns shown and its lines; the toggle keeps the view; old widths come once | `type_table` `hiding_a_column_measures_the_rows_again`, `a_row_deleted_above_moves_the_measured_heights_with_their_rows`, `grouped_changes_move_the_measured_heights_with_their_lines`, `toggling_the_wrap_never_jumps_to_the_cursor`, `old_tabs_hand_their_widths_to_a_type_once`, all failing on `8b9bae9`; `studio_ui` `a_change_in_the_middle_splices_its_own_lines` | At `8b9bae9`: name hidden, the long row stayed 126.5 px tall; a row deleted above or section 0 folded left the long row's place 29 px; the toggle moved the view from line 40 to the cursor's 0; an old tab's widths joined a wrap-only choice and came back after Reset (Codex and Bugbot reviews of #182) |
+| 2026-11-26 | A drag's end keeps another tab's change; a column with no room does not wrap; a fit of the key column cuts no key | `type_table` `a_drags_end_keeps_what_another_tab_changed_meanwhile`, `a_column_with_no_room_does_not_wrap`, `a_fit_of_the_key_column_cuts_no_key`, all failing on `d53c0c4` | Before: the drag's end wrote its whole layout and dropped the other tab's wrap; a 48 px key column's room went below 0 and short rows were 87.5 px; a fitted key column left a 274 px slug 240 px (Bugbot review of #182) |
+| 2026-11-26 | A value changed out of view is measured again | `type_table` `a_value_changed_out_of_view_is_measured_again`, failing on `e250404` | Before, the long text set on row 80 off screen kept the 29 px the list had measured for it (Bugbot review of #182) |
 | 2026-11-25 | The edge shows its line | Offscreen snapshots of `Note`, the pointer 2 px left of slug's rule | `main`: the menu's button and no line, the slot's fill over it; now: the line, drawn over everything, and the button, which stops short of the edge |
 
 ## Corrections
