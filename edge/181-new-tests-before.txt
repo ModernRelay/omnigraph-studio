@@ -1,0 +1,14 @@
+test table::tests::the_select_all_check_is_not_under_the_menu_at_the_narrowest_key_column ... FAILED
+test table::tests::every_button_at_an_edge_is_the_edges ... FAILED
+
+failures:
+
+--
+thread 'table::tests::the_select_all_check_is_not_under_the_menu_at_the_narrowest_key_column' (10299) panicked at crates/type_table/src/table.rs:15894:13:
+the click opened the column menu
+
+---- table::tests::every_button_at_an_edge_is_the_edges stdout ----
+--
+thread 'table::tests::every_button_at_an_edge_is_the_edges' (10298) panicked at crates/type_table/src/table.rs:15860:17:
+assertion `left == right` failed: Right -3.5 px from slug's rule
+  left: (true, false)
