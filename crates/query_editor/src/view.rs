@@ -4789,7 +4789,10 @@ impl QueryEditor {
                     studio_ui::scrolled_within(
                         -self.results_hscroll.offset().x,
                         px(total),
-                        window.viewport_size().width,
+                        // The scroller's own width as last laid out, else the window's.
+                        Some(self.results_hscroll.bounds().size.width)
+                            .filter(|width| *width > Pixels::ZERO)
+                            .unwrap_or(window.viewport_size().width),
                     )
                 },
                 |index, edge| Some(self.render_resize_handle(index, edge, rows.widths[index], cx)),

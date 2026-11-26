@@ -10490,7 +10490,22 @@ impl TypeTable {
                 .horizontal_scroll_handle
                 .offset()
                 .x;
-            studio_ui::scrolled_within(raw, strip, window.viewport_size().width)
+            // The strip's own width as last laid out, which beside a sidebar or inspector is
+            // less than the window's: held within the window's, a scroll near the end would be
+            // understated and a hidden column given an edge.
+            let view = self
+                .table_state
+                .read(cx)
+                .horizontal_scroll_handle
+                .bounds()
+                .size
+                .width;
+            let view = if view > Pixels::ZERO {
+                view
+            } else {
+                window.viewport_size().width
+            };
+            studio_ui::scrolled_within(raw, strip, view)
         };
         let headers: Vec<AnyElement> = places
             .iter()
@@ -15912,6 +15927,86 @@ mod tests {
                 "every row selected"
             );
         });
+    }
+
+    /// Beside a sidebar the strip is narrower than the window, and scrolled near its end the
+    /// window's width would understate the scroll: the column at the strip's start still gets no
+    /// start half for the column hidden before it (Bugbot review of #181).
+    #[gpui::test]
+    async fn beside_a_sidebar_a_column_at_the_strips_start_has_no_start_half(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let edges: String = (1..=20)
+            .map(|i| format!("edge R{i:02}: Person -> Person\n"))
+            .collect();
+        let session = session(&format!("{PEOPLE}{edges}"), cx);
+        struct Beside(Entity<TypeTable>);
+        impl Render for Beside {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                h_flex()
+                    .size_full()
+                    .child(div().w(px(800.)).h_full().flex_none())
+                    .child(div().flex_1().min_w_0().h_full().child(self.0.clone()))
+            }
+        }
+        let (beside, cx) = cx.add_window_view(|window, cx| {
+            let table = cx.new(|cx| {
+                TypeTable::new(
+                    WeakEntity::new_invalid(),
+                    session.clone(),
+                    "Person".into(),
+                    None,
+                    window,
+                    cx,
+                )
+            });
+            Beside(table)
+        });
+        cx.run_until_parked();
+        let table = beside.read_with(cx, |beside, _| beside.0.clone());
+        // A column whose start the window's width could not scroll to, but the strip's can.
+        let (k, offset) = cx.update(|window, cx| {
+            let table = table.read(cx);
+            let widths: Vec<Pixels> = table
+                .columns
+                .iter()
+                .skip(1)
+                .map(|c| px(table.layout.width(c)))
+                .collect();
+            let content = widths.iter().fold(Pixels::ZERO, |sum, w| sum + *w);
+            let strip = table
+                .table_state
+                .read(cx)
+                .horizontal_scroll_handle
+                .bounds()
+                .size
+                .width;
+            let window_end = content - window.viewport_size().width;
+            let mut left = Pixels::ZERO;
+            for (i, width) in widths.iter().enumerate() {
+                if left > window_end && left <= content - strip {
+                    return (i + 1, left);
+                }
+                left += *width;
+            }
+            panic!("no column between {window_end:?} and {:?}", content - strip);
+        });
+        table.update(cx, |table, cx| {
+            let handle = table.table_state.read(cx).horizontal_scroll_handle.clone();
+            handle.set_offset(point(-offset, px(0.)));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let start_half: &'static str = format!("column-edge-{}", (k - 1) * 2 + 1).leak();
+        assert!(
+            cx.debug_bounds(start_half).is_none(),
+            "column {k} at the strip's start has no edge for the hidden column {}",
+            k - 1
+        );
     }
 
     /// A column dragged by its header onto another header's edge still drops there and moves:

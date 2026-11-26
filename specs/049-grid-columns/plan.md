@@ -63,7 +63,8 @@ type table's header edges (`edge-trace-main.txt` in the PR):
   button** on it stops there, before the header cell around it hears it (no sort, no reorder
   drag, no column menu); it blocks nothing else, so a column dragged onto the header to move it
   still drops there. Which columns have a start half is decided from the scroll as GPUI will
-  hold it this frame (`scrolled_within`), as the columns drawn are. Each half lights half
+  hold it this frame (`scrolled_within`, within the strip's own width, which beside a sidebar is
+  less than the window's). Each half lights half
   of the drag line on its side of the rule; a drag lights both. A ruled cell's rule is drawn by
   its `End` half, not a border, so the rule is the edge.
 - Controls keep out: a header's end control is a `ds::header_slot`, which stops `space::XS`
