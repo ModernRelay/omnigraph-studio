@@ -3507,7 +3507,9 @@ impl QueryEditor {
             Output::Rows(rows) => rows.table.rows.len(),
             _ => 0,
         };
-        // Other rows, from the first: no height of the last result's is kept.
+        // Other rows, from the first: no height of the last result's is kept. The wrapped list's
+        // reset drops its scroll (`ListState::reset`), so it starts at the first row; the cut
+        // list is put there.
         self.results_rows.reset(rows);
         self.results_rows.scroll_to(CellWrap::Truncate, 0, px(0.));
         // A column menu names a column of the last result: it goes with it.
@@ -6927,6 +6929,36 @@ mod tests {
                 cx.run_until_parked();
                 assert_eq!(first(cx), 40, "the first row stays, the selection is row 0");
             }
+        }
+
+        /// A run's rows start at the first, wrapped as cut: the wrapped list is not left where
+        /// the last result was scrolled (Bugbot review of #180).
+        #[gpui::test]
+        async fn a_rerun_starts_wrapped_rows_at_the_first(cx: &mut TestAppContext) {
+            cx.update(|cx| {
+                studio_theme::init_test(cx);
+                editor::init(cx);
+            });
+            let session = session(cx);
+            let (editor, cx) =
+                cx.add_window_view(|window, cx| QueryEditor::new(1, session, window, cx));
+            editor.update_in(cx, |editor, window, cx| {
+                finish_rows(editor, 200, "short");
+                editor.change_columns(ColumnChange::ToggleWrap, None, window, cx);
+                editor.results_rows.scroll_to(CellWrap::Wrap, 120, px(0.));
+                editor.redraw_results(cx);
+            });
+            cx.run_until_parked();
+            let first = |cx: &mut gpui::VisualTestContext| {
+                editor.read_with(cx, |editor, _| editor.results_rows.first(CellWrap::Wrap).0)
+            };
+            assert_eq!(first(cx), 120);
+            editor.update(cx, |editor, cx| {
+                finish_rows(editor, 200, "short");
+                editor.redraw_results(cx);
+            });
+            cx.run_until_parked();
+            assert_eq!(first(cx), 0, "the new result from its first row");
         }
 
         /// What the wrapped rows counted holds for one measure: a larger font counts the lines
