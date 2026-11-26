@@ -734,6 +734,10 @@ kept answers.
   (`studio_ui::OverlaySlot`); and the filter's suggestions no longer notify on every key.
   The rules and their guards are in `docs/drawing.md`.
 
+- 2026-11-25 · Spec 049: a column's edge is 4 px either side of its rule, the resize handle's
+  alone; it draws the rule and the column menu's button stops short of it. Before, the menu's
+  slot hid the resize line and a press a pixel off opened the menu or sorted the next column.
+
 - 2026-10-13 · Columns can be resized, which was deferred. Each header's right edge is a 6 px
   handle: drag it to set the width (48 to 1,200 px), click it twice to fit the column to its
   type again. Dragged widths are kept per column key in the table's layout and saved with the

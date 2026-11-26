@@ -40,9 +40,9 @@ use studio_ui::ds::Tipped;
 use studio_ui::ds::menu::{ContextMenu, ContextMenuEntry};
 use studio_ui::ds::{Dotted as _, space};
 use studio_ui::{
-    ColumnDrag, ColumnResize, GridColumn, GridPlace, ROW_HEIGHT, columns_in_view, format_elapsed,
-    format_value, grid_cell, grid_header, grid_places, is_numeric, resizable_grid_header,
-    short_commit_id, value_text,
+    ColumnDrag, ColumnEdge, ColumnResize, GridColumn, GridPlace, ROW_HEIGHT, columns_in_view,
+    format_elapsed, format_value, grid_cell, grid_header, grid_places, is_numeric,
+    resizable_grid_header, short_commit_id, value_text,
 };
 use studio_workspace::{Inspected, InspectedNode, Item, ItemEvent, ItemStatus, KeyHint, SavedItem};
 use ui::prelude::*;
@@ -4781,7 +4781,21 @@ impl QueryEditor {
                 &columns,
                 Some(&places),
                 px(ROW_NUMBER_WIDTH),
-                |index| Some(self.render_resize_handle(index, rows.widths[index], cx)),
+                // With no rows the header is not in the sideways scroller: it starts at 0. With
+                // rows, as far as the columns drawn are picked from ([`Self::result_places`]).
+                if table.rows.is_empty() {
+                    Pixels::ZERO
+                } else {
+                    studio_ui::scrolled_within(
+                        -self.results_hscroll.offset().x,
+                        px(total),
+                        // The scroller's own width as last laid out, else the window's.
+                        Some(self.results_hscroll.bounds().size.width)
+                            .filter(|width| *width > Pixels::ZERO)
+                            .unwrap_or(window.viewport_size().width),
+                    )
+                },
+                |index, edge| Some(self.render_resize_handle(index, edge, rows.widths[index], cx)),
                 cx,
             )
         };
@@ -4859,7 +4873,13 @@ impl QueryEditor {
 
     /// The right edge of result column `index`'s header: drag to make the column wider or
     /// narrower, click twice to fit it to its values again.
-    fn render_resize_handle(&self, index: usize, width: f32, cx: &Context<Self>) -> AnyElement {
+    fn render_resize_handle(
+        &self,
+        index: usize,
+        edge: ColumnEdge,
+        width: f32,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         let active = self
             .resizing
             .as_ref()
@@ -4872,7 +4892,7 @@ impl QueryEditor {
             this.resizing = None;
             this.resize_column(index, None, cx);
         });
-        studio_ui::column_resize_handle(cx.entity_id(), index, active, on_start, on_reset, cx)
+        studio_ui::column_resize_handle(cx.entity_id(), index, edge, active, on_start, on_reset, cx)
             .into_any_element()
     }
 

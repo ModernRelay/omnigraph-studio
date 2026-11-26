@@ -46,7 +46,9 @@ use studio_ui::ds::Tipped;
 use studio_ui::ds::menu::{ContextMenu, ContextMenuEntry};
 use studio_ui::ds::space;
 use studio_ui::plural;
-use studio_ui::{ColumnDrag, ColumnResize, GridPlace, ROW_HEIGHT, columns_in_view, grid_places};
+use studio_ui::{
+    ColumnDrag, ColumnEdge, ColumnResize, GridPlace, ROW_HEIGHT, columns_in_view, grid_places,
+};
 use studio_workspace::models::{self, Error as ModelError, Models, Request as ModelRequest};
 use studio_workspace::{
     Inspected, Item, ItemEvent, ItemStatus, KeyHint, SavedItem, ToastKind, Workspace,
@@ -1734,14 +1736,15 @@ impl TypeTable {
         }
     }
 
-    /// The right edge of a column's header: drag to make the column wider or narrower, click
-    /// twice to fit it to its type again.
+    /// Column `index`'s edge, on `edge`'s side of its rule (`studio_ui::column_resize_handle`):
+    /// drag to make the column wider or narrower, click twice to fit it to its type again.
     fn render_resize_handle(
         &self,
         index: usize,
-        column: &ColumnSpec,
+        edge: ColumnEdge,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let column = &self.columns[index];
         let key = column.key.clone();
         let width = self.layout.width(column);
         let active = self
@@ -1759,7 +1762,7 @@ impl TypeTable {
             this.resizing = None;
             this.resize_column(&key, None, cx);
         });
-        studio_ui::column_resize_handle(cx.entity_id(), index, active, on_start, on_reset, cx)
+        studio_ui::column_resize_handle(cx.entity_id(), index, edge, active, on_start, on_reset, cx)
             .into_any_element()
     }
 
@@ -8934,18 +8937,46 @@ impl TypeTable {
         let content_width = column_widths
             .iter()
             .fold(Pixels::ZERO, |sum, width| sum + *width);
-        let last = self.columns.len().saturating_sub(1);
         // A rule on every header's right but the last column's: the grid's edge is its own.
-        let ruled = move |header: Div, index: usize, cx: &App| {
-            if index < last {
-                studio_ui::ds::cell_rule(header, cx)
+        // The column's edge handle draws it (`ColumnEdge::End`), so the rule is the handle's.
+        let last = self.columns.len().saturating_sub(1);
+        // How far the strip of unpinned columns is scrolled, as the columns drawn are picked
+        // (held within what it can scroll, as GPUI will hold it this frame): a column's start
+        // half is drawn only where the column before it is in view against it, the key column
+        // against the first of them only at the strip's start.
+        let scrolled = {
+            let strip = column_widths
+                .get(1..)
+                .unwrap_or_default()
+                .iter()
+                .fold(Pixels::ZERO, |sum, width| sum + *width);
+            let raw = -self
+                .table_state
+                .read(cx)
+                .horizontal_scroll_handle
+                .offset()
+                .x;
+            // The strip's own width as last laid out, which beside a sidebar or inspector is
+            // less than the window's: held within the window's, a scroll near the end would be
+            // understated and a hidden column given an edge.
+            let view = self
+                .table_state
+                .read(cx)
+                .horizontal_scroll_handle
+                .bounds()
+                .size
+                .width;
+            let view = if view > Pixels::ZERO {
+                view
             } else {
-                header
-            }
+                window.viewport_size().width
+            };
+            studio_ui::scrolled_within(raw, strip, view)
         };
         let headers: Vec<AnyElement> = places
             .iter()
-            .map(|place| {
+            .enumerate()
+            .map(|(at, place)| {
                 let index = match *place {
                     GridPlace::Column(index) => index,
                     GridPlace::Gap(_) => return div().into_any_element(),
@@ -8958,58 +8989,92 @@ impl TypeTable {
                     .filter(|sort| sortable.is_some_and(|p| p.name == sort.property));
                 let key = column.key.clone();
                 let menu_key = column.key.clone();
-                let resize = self.render_resize_handle(index, column, cx);
+                // The edge's two halves, last in the cell (`studio_ui::column_resize_handle`):
+                // this column's end, and the start of this one for the column drawn before it.
+                // The pinned key column is drawn against the first other column only while the
+                // strip is not scrolled.
+                let end = self.render_resize_handle(
+                    index,
+                    ColumnEdge::End {
+                        ruled: index < last,
+                    },
+                    cx,
+                );
+                let start = column_widths
+                    .get(1..index)
+                    .unwrap_or_default()
+                    .iter()
+                    .fold(Pixels::ZERO, |x, width| x + *width);
+                let before = index.checked_sub(1).filter(|&before| {
+                    at > 0
+                        && places[at - 1] == GridPlace::Column(before)
+                        && (start > scrolled || (before == 0 && scrolled <= Pixels::ZERO))
+                });
+                let start =
+                    before.map(|before| self.render_resize_handle(before, ColumnEdge::Start, cx));
                 let group = SharedString::from(format!("column-header-{index}"));
                 let kind = Some(self.column_icon(column));
                 // The key's header starts at the page's gutter, as its cells do.
-                let header = ruled(
+                let header =
                     studio_ui::ds::header_cell(kind, column.title.clone(), sorted.is_some())
-                        .when(index == 0, |header| header.pl(px(KEY_TEXT_INSET))),
-                    index,
-                    cx,
-                )
-                .id(("column-header", index))
-                .group(group.clone())
-                .relative()
-                .w_full()
-                .child(resize)
-                .when(index == 0, |header| header.child(self.render_all_check(cx)))
-                .on_mouse_down(
-                    MouseButton::Right,
-                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                        this.open_header_menu(key.clone(), event.position, window, cx)
-                    }),
-                )
-                .child(
-                    div().min_w_0().flex_shrink(1000.).child(
-                        studio_ui::ds::text::meta(match self.absent.get(&column.key) {
-                            Some(then) => crate::peek::absence_text(then, false),
-                            None => column.detail.clone(),
-                        })
-                        .color(Color::Disabled)
-                        .single_line()
-                        .truncate(),
-                    ),
-                )
-                .children(sorted.map(|sort| {
-                    studio_ui::ds::icon::meta(if sort.descending {
-                        IconName::ArrowDown
-                    } else {
-                        IconName::ArrowUp
-                    })
-                    .color(Color::Accent)
-                }))
-                // A number's header sits at the cells' end, as its values do.
-                .when(column.align_right, |header| header.justify_end())
-                .child(studio_ui::ds::hover_slot(
-                    group,
-                    studio_ui::ds::header_fill_opaque(sortable.is_some(), cx),
-                    studio_ui::ds::cell_action(("column-menu", index), IconName::Ellipsis)
-                        .tip(studio_ui::ds::tooltip("Column menu"))
-                        .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                            this.open_header_menu(menu_key.clone(), event.position(), window, cx)
-                        })),
-                ));
+                        .when(index == 0, |header| header.pl(px(KEY_TEXT_INSET)))
+                        .id(("column-header", index))
+                        .group(group.clone())
+                        .relative()
+                        .w_full()
+                        .when(index == 0, |header| header.child(self.render_all_check(cx)))
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                this.open_header_menu(key.clone(), event.position, window, cx)
+                            }),
+                        )
+                        .child(
+                            div().min_w_0().flex_shrink(1000.).child(
+                                studio_ui::ds::text::meta(match self.absent.get(&column.key) {
+                                    Some(then) => crate::peek::absence_text(then, false),
+                                    None => column.detail.clone(),
+                                })
+                                .color(Color::Disabled)
+                                .single_line()
+                                .truncate(),
+                            ),
+                        )
+                        .children(sorted.map(|sort| {
+                            studio_ui::ds::icon::meta(if sort.descending {
+                                IconName::ArrowDown
+                            } else {
+                                IconName::ArrowUp
+                            })
+                            .color(Color::Accent)
+                        }))
+                        // A number's header sits at the cells' end, as its values do.
+                        .when(column.align_right, |header| header.justify_end())
+                        .children(studio_ui::ds::header_slot(
+                            group,
+                            studio_ui::ds::header_fill_opaque(sortable.is_some(), cx),
+                            studio_ui::ds::cell_action(("column-menu", index), IconName::Ellipsis)
+                                .tip(studio_ui::ds::tooltip("Column menu"))
+                                .on_click(cx.listener(
+                                    move |this, event: &ClickEvent, window, cx| {
+                                        this.open_header_menu(
+                                            menu_key.clone(),
+                                            event.position(),
+                                            window,
+                                            cx,
+                                        )
+                                    },
+                                )),
+                            px(self.layout.width(column)),
+                            // The key column's select-all check at its start.
+                            if index == 0 {
+                                px(KEY_INSET + studio_ui::ds::size::CHECK)
+                            } else {
+                                Pixels::ZERO
+                            },
+                        ))
+                        .child(end)
+                        .children(start);
                 // An unpinned header drags onto another to move its column there.
                 let header = if index == 0 {
                     header
@@ -14146,6 +14211,327 @@ mod tests {
             assert_eq!(table.layout.hidden, ["slug"]);
             assert_eq!(table.layout.widths.get("name"), Some(&300));
         });
+    }
+
+    /// Who owns the pointer at a column's edge (spec 049, `studio_ui::column_resize_handle`):
+    /// every press within `COLUMN_EDGE` either side of a rule starts a resize of the column on
+    /// its left, and a click there opens no menu and sorts nothing; the column menu's button
+    /// stops `XS` short of the edge; a click on the button starts no resize; a drag from the
+    /// edge that ends over the button opens nothing. Before, the edge was 6 px inside the
+    /// column, the button's hit area met it, the key column's own rule did nothing and a press
+    /// just right of a rule sorted the next column.
+    #[gpui::test]
+    async fn a_column_edge_is_the_resize_handles_and_no_control_reaches_it(
+        cx: &mut TestAppContext,
+    ) {
+        use studio_ui::ds::{size::COLUMN_EDGE, space::XS};
+        let session = session(PEOPLE, cx);
+        let (table, cx) = people_table(&session, cx);
+        let key_rule = cx.debug_bounds("cell-0-0").expect("drawn").right();
+        let last = cx.debug_bounds("cell-0-1").expect("drawn");
+        let y = last.top() - px(studio_ui::HEADER_HEIGHT / 2.) - px(1.);
+        let none = gpui::Modifiers::default();
+        // What a press, and a click, at `x` did: the column a resize began on, whether a
+        // column menu opened, and the order.
+        let press = |x: Pixels, cx: &mut VisualTestContext| {
+            table.update(cx, |table, cx| {
+                table.header_menu = None;
+                table.sort = None;
+                table.resizing = None;
+                cx.notify();
+            });
+            let at = point(x, y);
+            cx.simulate_mouse_move(at, None, none);
+            cx.run_until_parked();
+            cx.simulate_mouse_down(at, MouseButton::Left, none);
+            cx.run_until_parked();
+            let resized = table.read_with(cx, |table, _| {
+                table
+                    .resizing
+                    .as_ref()
+                    .map(|resizing| resizing.column.clone())
+            });
+            cx.simulate_mouse_up(at, MouseButton::Left, none);
+            cx.run_until_parked();
+            table.read_with(cx, |table, _| {
+                (resized, table.header_menu.is_some(), table.sort.is_some())
+            })
+        };
+        let edge = |rule: Pixels, right_half: bool| {
+            let to = if right_half { COLUMN_EDGE } else { 0. };
+            let mut x = -COLUMN_EDGE + 0.5;
+            std::iter::from_fn(move || {
+                let at = x;
+                x += 1.;
+                (at < to).then(|| rule + px(at))
+            })
+        };
+        // The key column's edge, both halves; the last column's, its own half.
+        for (rule, key, right_half) in [(key_rule, "slug", true), (last.right(), "name", false)] {
+            for x in edge(rule, right_half) {
+                assert_eq!(
+                    press(x, cx),
+                    (Some(key.to_owned()), false, false),
+                    "{} px from {key}'s rule",
+                    f32::from(x - rule)
+                );
+            }
+        }
+        // Short of the edge by less than the gap, no press reaches the menu's button.
+        for rule in [key_rule, last.right()] {
+            for dx in 0..XS as i32 {
+                let x = rule - px(COLUMN_EDGE + 0.5 + dx as f32);
+                let (resized, menu, _) = press(x, cx);
+                assert!(resized.is_none() && !menu, "{x:?} by {rule:?}");
+            }
+        }
+        // The button itself opens its menu and starts no resize.
+        let button =
+            last.right() - px(COLUMN_EDGE + XS + studio_ui::ds::size::ROW_BUTTON / 2. + 2.);
+        assert_eq!(press(button, cx), (None, true, false), "the button");
+        // A drag from the edge that ends over the button resizes and opens nothing.
+        table.update(cx, |table, _| table.header_menu = None);
+        let from = point(last.right() - px(1.), y);
+        cx.simulate_mouse_move(from, None, none);
+        cx.simulate_mouse_down(from, MouseButton::Left, none);
+        for step in 1..=8 {
+            let x = from.x + (button - from.x) * (step as f32 / 8.);
+            cx.simulate_mouse_move(point(x, y), MouseButton::Left, none);
+        }
+        cx.simulate_mouse_up(point(button, y), MouseButton::Left, none);
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert!(table.header_menu.is_none(), "the drag opened the menu");
+            assert!(table.layout.widths.contains_key("name"), "the drag resized");
+        });
+    }
+
+    /// Every button's press at a column's edge is the edge's: a right or middle press either
+    /// side of a rule opens no column menu and sorts nothing, while a right press on a header's
+    /// body still opens its menu. Before, only a left press was the edge's, so a right press
+    /// just right of a rule opened the next column's menu (review of #181).
+    #[gpui::test]
+    async fn every_button_at_an_edge_is_the_edges(cx: &mut TestAppContext) {
+        use studio_ui::ds::size::COLUMN_EDGE;
+        let session = session(PEOPLE, cx);
+        let (table, cx) = people_table(&session, cx);
+        let key = cx.debug_bounds("cell-0-0").expect("drawn");
+        let y = key.top() - px(studio_ui::HEADER_HEIGHT / 2.) - px(1.);
+        let none = gpui::Modifiers::default();
+        let press = |x: Pixels, button: MouseButton, cx: &mut VisualTestContext| {
+            table.update(cx, |table, cx| {
+                table.header_menu = None;
+                table.sort = None;
+                cx.notify();
+            });
+            cx.run_until_parked();
+            let at = point(x, y);
+            cx.simulate_mouse_move(at, None, none);
+            cx.simulate_mouse_down(at, button, none);
+            cx.simulate_mouse_up(at, button, none);
+            cx.run_until_parked();
+            table.read_with(cx, |table, _| {
+                (table.header_menu.is_some(), table.sort.is_some())
+            })
+        };
+        for dx in [-COLUMN_EDGE + 0.5, -0.5, 0.5, COLUMN_EDGE - 0.5] {
+            for button in [MouseButton::Right, MouseButton::Middle] {
+                assert_eq!(
+                    press(key.right() + px(dx), button, cx),
+                    (false, false),
+                    "{button:?} {dx} px from slug's rule"
+                );
+            }
+        }
+        // The name header's body, past the edge: its menu.
+        let body = key.right() + px(COLUMN_EDGE + 20.);
+        assert_eq!(press(body, MouseButton::Right, cx), (true, false));
+    }
+
+    /// A header's end control is drawn only where it fits between the cell's start controls and
+    /// its edge: at the narrowest key column (48 px) the column menu's button is left out and a
+    /// click on the select-all check selects every row. Before, the button covered the check
+    /// (review of #181).
+    #[gpui::test]
+    async fn the_select_all_check_is_not_under_the_menu_at_the_narrowest_key_column(
+        cx: &mut TestAppContext,
+    ) {
+        let session = session(PEOPLE, cx);
+        let (table, cx) = people_table(&session, cx);
+        table.update(cx, |table, cx| {
+            table
+                .layout
+                .set_width("slug", Some(studio_ui::COLUMN_MIN_WIDTH));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let check = cx.debug_bounds("all-rows-check").expect("drawn");
+        let none = gpui::Modifiers::default();
+        cx.simulate_mouse_move(check.center(), None, none);
+        cx.run_until_parked();
+        cx.simulate_click(check.center(), none);
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert!(
+                table.header_menu.is_none(),
+                "the click opened the column menu"
+            );
+            assert_eq!(
+                table.selection.len(),
+                table.rows.len(),
+                "every row selected"
+            );
+        });
+    }
+
+    /// Beside a sidebar the strip is narrower than the window, and scrolled near its end the
+    /// window's width would understate the scroll: the column at the strip's start still gets no
+    /// start half for the column hidden before it (Bugbot review of #181).
+    #[gpui::test]
+    async fn beside_a_sidebar_a_column_at_the_strips_start_has_no_start_half(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let edges: String = (1..=20)
+            .map(|i| format!("edge R{i:02}: Person -> Person\n"))
+            .collect();
+        let session = session(&format!("{PEOPLE}{edges}"), cx);
+        struct Beside(Entity<TypeTable>);
+        impl Render for Beside {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                h_flex()
+                    .size_full()
+                    .child(div().w(px(800.)).h_full().flex_none())
+                    .child(div().flex_1().min_w_0().h_full().child(self.0.clone()))
+            }
+        }
+        let (beside, cx) = cx.add_window_view(|window, cx| {
+            let table = cx.new(|cx| {
+                TypeTable::new(
+                    WeakEntity::new_invalid(),
+                    session.clone(),
+                    "Person".into(),
+                    None,
+                    window,
+                    cx,
+                )
+            });
+            Beside(table)
+        });
+        cx.run_until_parked();
+        let table = beside.read_with(cx, |beside, _| beside.0.clone());
+        // A column whose start the window's width could not scroll to, but the strip's can.
+        let (k, offset) = cx.update(|window, cx| {
+            let table = table.read(cx);
+            let widths: Vec<Pixels> = table
+                .columns
+                .iter()
+                .skip(1)
+                .map(|c| px(table.layout.width(c)))
+                .collect();
+            let content = widths.iter().fold(Pixels::ZERO, |sum, w| sum + *w);
+            let strip = table
+                .table_state
+                .read(cx)
+                .horizontal_scroll_handle
+                .bounds()
+                .size
+                .width;
+            let window_end = content - window.viewport_size().width;
+            let mut left = Pixels::ZERO;
+            for (i, width) in widths.iter().enumerate() {
+                if left > window_end && left <= content - strip {
+                    return (i + 1, left);
+                }
+                left += *width;
+            }
+            panic!("no column between {window_end:?} and {:?}", content - strip);
+        });
+        table.update(cx, |table, cx| {
+            let handle = table.table_state.read(cx).horizontal_scroll_handle.clone();
+            handle.set_offset(point(-offset, px(0.)));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let start_half: &'static str = format!("column-edge-{}", (k - 1) * 2 + 1).leak();
+        assert!(
+            cx.debug_bounds(start_half).is_none(),
+            "column {k} at the strip's start has no edge for the hidden column {}",
+            k - 1
+        );
+    }
+
+    /// A column dragged by its header onto another header's edge still drops there and moves:
+    /// the edge takes presses, not what is dropped on the header under it (spec 049).
+    #[gpui::test]
+    async fn a_column_dropped_on_an_edge_moves(cx: &mut TestAppContext) {
+        let schema = "node Person {\n  slug: String @key\n  name: String\n  title: String\n  email: String\n}\n";
+        let session = session(schema, cx);
+        let (table, cx) = people_table(&session, cx);
+        let name = cx.debug_bounds("cell-0-1").expect("drawn");
+        let email = cx.debug_bounds("cell-0-3").expect("drawn");
+        let y = name.top() - px(studio_ui::HEADER_HEIGHT / 2.) - px(1.);
+        let none = gpui::Modifiers::default();
+        // email's header, by its middle, onto name's end and title's start.
+        let from = point(email.center().x, y);
+        let to = point(name.right() + px(1.), y);
+        cx.simulate_mouse_move(from, None, none);
+        cx.simulate_mouse_down(from, MouseButton::Left, none);
+        for step in 1..=10 {
+            let x = from.x + (to.x - from.x) * (step as f32 / 10.);
+            cx.simulate_mouse_move(point(x, y), MouseButton::Left, none);
+        }
+        cx.simulate_mouse_up(to, MouseButton::Left, none);
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            let keys: Vec<&str> = table.columns.iter().map(|c| c.key.as_str()).collect();
+            assert_eq!(keys, ["slug", "name", "email", "title"], "moved onto title");
+            assert!(table.layout.widths.is_empty(), "and nothing resized");
+        });
+    }
+
+    /// A column's start half is drawn only where the column before it is in view against it:
+    /// with the strip scrolled so `name` is out of view, the column after it has none, and the
+    /// key column's end is the only edge by the strip's start (spec 049).
+    #[gpui::test]
+    async fn a_scrolled_strip_gives_no_edge_to_a_column_out_of_view(cx: &mut TestAppContext) {
+        let edges: String = (1..=20)
+            .map(|i| format!("edge R{i:02}: Person -> Person\n"))
+            .collect();
+        let session = session(&format!("{PEOPLE}{edges}"), cx);
+        let (table, cx) = people_table(&session, cx);
+        // name's end is slot 2, the next column's start for it slot 3.
+        assert!(
+            cx.debug_bounds("column-edge-3").is_some(),
+            "in view, both halves"
+        );
+        let name = table.read_with(cx, |table, _| px(table.layout.width(&table.columns[1])));
+        table.update(cx, |table, cx| {
+            let handle = table.table_state.read(cx).horizontal_scroll_handle.clone();
+            handle.set_offset(point(-name, px(0.)));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let scrolled = table.read_with(cx, |table, cx| {
+            table
+                .table_state
+                .read(cx)
+                .horizontal_scroll_handle
+                .offset()
+                .x
+        });
+        assert_eq!(scrolled, -name, "the strip scrolled past name");
+        assert!(
+            cx.debug_bounds("column-edge-3").is_none(),
+            "no edge for name out of view"
+        );
+        assert!(
+            cx.debug_bounds("column-edge-0").is_some(),
+            "the key column's end stays"
+        );
     }
 
     /// A restored tab sets its order and grouping before the schema is read: they wait for it,
