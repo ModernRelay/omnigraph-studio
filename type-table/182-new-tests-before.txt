@@ -63,3 +63,9 @@ failures:
 thread 'table::tests::a_fit_of_the_key_column_cuts_no_key' (10280) panicked at crates/type_table/src/table.rs:16693:17:
 p1 is 273.59995px in 240px
 note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test table::tests::a_value_changed_out_of_view_is_measured_again ... FAILED
+
+failures:
+
+--
+thread 'table::tests::a_value_changed_out_of_view_is_measured_again' (18339) panicked at crates/type_table/src/table.rs:16841:9:
