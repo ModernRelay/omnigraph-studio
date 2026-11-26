@@ -59,13 +59,17 @@ type table's header edges (`edge-trace-main.txt` in the PR):
   end in its own header cell (`ColumnEdge::End`) and the next column's start in its cell
   (`ColumnEdge::Start`), given only where the column before is in view against it (not at a
   scrolled strip's or header's left edge).
-- Each half is its cell's **last** child, so its line draws over any slot. A press on it stops
-  there, before the header cell around it hears it (no sort, no reorder drag); it blocks nothing
-  else, so a column dragged onto the header to move it still drops there. Each half lights half
+- Each half is its cell's **last** child, so its line draws over any slot. A press of **any
+  button** on it stops there, before the header cell around it hears it (no sort, no reorder
+  drag, no column menu); it blocks nothing else, so a column dragged onto the header to move it
+  still drops there. Which columns have a start half is decided from the scroll as GPUI will
+  hold it this frame (`scrolled_within`), as the columns drawn are. Each half lights half
   of the drag line on its side of the rule; a drag lights both. A ruled cell's rule is drawn by
   its `End` half, not a border, so the rule is the edge.
 - Controls keep out: a header's end control is a `ds::header_slot`, which stops `space::XS`
-  short of the edge.
+  short of the edge, and is left out where it would come within `space::XS` of the cell's start
+  controls (the key column's select-all check, below 70 px); the header's right click still
+  opens its menu.
 - `resizable_grid_header` (query results) and the type table's header both place the two halves.
 
 ### Step 2: the column model, and query results on it
@@ -110,6 +114,7 @@ page). No engine change.
 |---|---|---|---|
 | 2026-11-25 | The edge bug, as above | Probe on `main`: a click and a 40 px drag at every pixel from 30 px left to 4 px right of each header rule of `Person` (two columns), and sub-pixel presses | Handle −6 to −1 px, menu button −24 to −7, sort left of that; on the key column the rule pixel did nothing and +0.5 px sorted the next column; drags from the handle never opened the menu |
 | 2026-11-25 | The rule holds | `type_table` `a_column_edge_is_the_resize_handles_and_no_control_reaches_it`, `a_column_dropped_on_an_edge_moves`, `a_scrolled_strip_gives_no_edge_to_a_column_out_of_view`; `studio_ui` `a_press_at_a_rule_resizes_the_column_on_its_left` | Pass; the first fails on `main` at −0.5 px from the key column's rule. With the edge blocking the mouse (the first version of this fix), a column dropped on an edge did not move (review of #181) |
+| 2026-11-26 | Every button at an edge is the edge's; no end control over a start control | `type_table` `every_button_at_an_edge_is_the_edges`, `the_select_all_check_is_not_under_the_menu_at_the_narrowest_key_column`, both failing on `11942b0` | At `11942b0` a right press 3.5 px left of the key column's rule opened a menu, and at a 48 px key column the menu's button (16 to 34 px) covered the select-all check (16 to 30 px), so a click on the check opened the menu (Codex review of #181) |
 | 2026-11-25 | The edge shows its line | Offscreen snapshots of `Note`, the pointer 2 px left of slug's rule | `main`: the menu's button and no line, the slot's fill over it; now: the line, drawn over everything, and the button, which stops short of the edge |
 
 ## Corrections

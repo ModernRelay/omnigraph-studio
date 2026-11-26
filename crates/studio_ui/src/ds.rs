@@ -3800,12 +3800,25 @@ pub fn hover_slot(group: impl Into<SharedString>, fill: Hsla, action: impl IntoE
     end_slot(fill, action).visible_on_hover(group)
 }
 
-/// A [`hover_slot`] at the end of a grid's header cell, kept clear of the column's edge: the
-/// edge is the resize handle's ([`size::COLUMN_EDGE`] either side of the rule), and the slot's
-/// fill and its button stop [`space::XS`] short of it, so no press near the edge reaches the
-/// button and the handle's line is never under the slot's fill.
-pub fn header_slot(group: impl Into<SharedString>, fill: Hsla, action: impl IntoElement) -> Div {
-    hover_slot(group, fill, action).right(px(size::COLUMN_EDGE + space::XS))
+/// How wide a [`header_slot`] is: its padding and a row button.
+const HEADER_SLOT: f32 = space::XS + size::ROW_BUTTON + space::SM;
+
+/// A [`hover_slot`] at the end of a grid's header cell `width` wide, kept clear of the column's
+/// edge and of the controls at the cell's start, which reach `start` into it (a select-all
+/// check): the edge is the resize handle's ([`size::COLUMN_EDGE`] either side of the rule), so
+/// the slot's fill and button stop [`space::XS`] short of it, and the slot is left out (`None`)
+/// where it would come within [`space::XS`] of the start controls. A header leaves its menu to
+/// a right click on its body then.
+pub fn header_slot(
+    group: impl Into<SharedString>,
+    fill: Hsla,
+    action: impl IntoElement,
+    width: Pixels,
+    start: Pixels,
+) -> Option<Div> {
+    let inset = size::COLUMN_EDGE + space::XS;
+    let left = width - px(inset + HEADER_SLOT);
+    (left >= start + px(space::XS)).then(|| hover_slot(group, fill, action).right(px(inset)))
 }
 
 /// A [`cell_action`] over the end of a cell on the cell's opaque fill (`fill`), shown: a

@@ -4781,11 +4781,16 @@ impl QueryEditor {
                 &columns,
                 Some(&places),
                 px(ROW_NUMBER_WIDTH),
-                // With no rows the header is not in the sideways scroller: it starts at 0.
+                // With no rows the header is not in the sideways scroller: it starts at 0. With
+                // rows, as far as the columns drawn are picked from ([`Self::result_places`]).
                 if table.rows.is_empty() {
                     Pixels::ZERO
                 } else {
-                    -self.results_hscroll.offset().x
+                    studio_ui::scrolled_within(
+                        -self.results_hscroll.offset().x,
+                        px(total),
+                        window.viewport_size().width,
+                    )
                 },
                 |index, edge| Some(self.render_resize_handle(index, edge, rows.widths[index], cx)),
                 cx,

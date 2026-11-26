@@ -94,13 +94,14 @@ pub enum ColumnEdge {
 ///   `index` ([`ColumnEdge::End`], over its rule) and the start of the column after it
 ///   ([`ColumnEdge::Start`]). Each half is placed in its own header cell, which is
 ///   `relative()`, as the cell's **last** child: drawn over what the cell holds, so its line
-///   shows over a hover slot's fill. A press on it stops there, before the header cell around
-///   it hears it, so no header click (sort) or reorder drag starts; it blocks nothing else, so
-///   a column dragged onto the header to move it still drops there.
+///   shows over a hover slot's fill. A press of any button on it stops there, before the
+///   header cell around it hears it: no sort, no reorder drag, no column menu. It blocks nothing
+///   else, so a column dragged onto the header to move it still drops there.
 /// - Each half lights the line on its side of the rule, half of [`crate::ds::size::DRAG_LINE`]:
 ///   hovering either half lights one, a drag lights both, the whole line centred on the rule.
 /// - Controls stay out: a header cell's end control is a [`crate::ds::header_slot`], which
-///   stops short of the edge, so no control's hit area meets the handle's.
+///   stops short of the edge and is left out where it would reach the cell's start controls,
+///   so no control's hit area meets the handle's or another control's.
 /// - A press on the handle starts a resize and goes no further; a click on a control never
 ///   starts one, since the control is not on the edge. A drag that starts on the handle is the
 ///   handle's to its end: the button under the pointer when it is released was not pressed.
@@ -152,6 +153,10 @@ pub fn column_resize_handle(
             cx.stop_propagation();
             on_start(event, window, cx);
         })
+        // Every button's press on the edge is the edge's: a right press does not open the menu
+        // of the header under it, a middle one does nothing there.
+        .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+        .on_mouse_down(MouseButton::Middle, |_, _, cx| cx.stop_propagation())
         .on_click(move |event, window, cx| {
             cx.stop_propagation();
             if event.click_count() >= 2 {

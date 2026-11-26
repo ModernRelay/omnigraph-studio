@@ -10474,15 +10474,24 @@ impl TypeTable {
         // A rule on every header's right but the last column's: the grid's edge is its own.
         // The column's edge handle draws it (`ColumnEdge::End`), so the rule is the handle's.
         let last = self.columns.len().saturating_sub(1);
-        // How far the strip of unpinned columns is scrolled: a column's start half is drawn
-        // only where the column before it is in view against it, the key column against the
-        // first of them only at the strip's start.
-        let scrolled = -self
-            .table_state
-            .read(cx)
-            .horizontal_scroll_handle
-            .offset()
-            .x;
+        // How far the strip of unpinned columns is scrolled, as the columns drawn are picked
+        // (held within what it can scroll, as GPUI will hold it this frame): a column's start
+        // half is drawn only where the column before it is in view against it, the key column
+        // against the first of them only at the strip's start.
+        let scrolled = {
+            let strip = column_widths
+                .get(1..)
+                .unwrap_or_default()
+                .iter()
+                .fold(Pixels::ZERO, |sum, width| sum + *width);
+            let raw = -self
+                .table_state
+                .read(cx)
+                .horizontal_scroll_handle
+                .offset()
+                .x;
+            studio_ui::scrolled_within(raw, strip, window.viewport_size().width)
+        };
         let headers: Vec<AnyElement> = places
             .iter()
             .enumerate()
@@ -10560,7 +10569,7 @@ impl TypeTable {
                         }))
                         // A number's header sits at the cells' end, as its values do.
                         .when(column.align_right, |header| header.justify_end())
-                        .child(studio_ui::ds::header_slot(
+                        .children(studio_ui::ds::header_slot(
                             group,
                             studio_ui::ds::header_fill_opaque(sortable.is_some(), cx),
                             studio_ui::ds::cell_action(("column-menu", index), IconName::Ellipsis)
@@ -10575,6 +10584,13 @@ impl TypeTable {
                                         )
                                     },
                                 )),
+                            px(self.layout.width(column)),
+                            // The key column's select-all check at its start.
+                            if index == 0 {
+                                px(KEY_INSET + studio_ui::ds::size::CHECK)
+                            } else {
+                                Pixels::ZERO
+                            },
                         ))
                         .child(end)
                         .children(start);
@@ -15817,6 +15833,84 @@ mod tests {
         table.read_with(cx, |table, _| {
             assert!(table.header_menu.is_none(), "the drag opened the menu");
             assert!(table.layout.widths.contains_key("name"), "the drag resized");
+        });
+    }
+
+    /// Every button's press at a column's edge is the edge's: a right or middle press either
+    /// side of a rule opens no column menu and sorts nothing, while a right press on a header's
+    /// body still opens its menu. Before, only a left press was the edge's, so a right press
+    /// just right of a rule opened the next column's menu (review of #181).
+    #[gpui::test]
+    async fn every_button_at_an_edge_is_the_edges(cx: &mut TestAppContext) {
+        use studio_ui::ds::size::COLUMN_EDGE;
+        let session = session(PEOPLE, cx);
+        let (table, cx) = people_table(&session, cx);
+        let key = cx.debug_bounds("cell-0-0").expect("drawn");
+        let y = key.top() - px(studio_ui::HEADER_HEIGHT / 2.) - px(1.);
+        let none = gpui::Modifiers::default();
+        let press = |x: Pixels, button: MouseButton, cx: &mut VisualTestContext| {
+            table.update(cx, |table, cx| {
+                table.header_menu = None;
+                table.sort = None;
+                cx.notify();
+            });
+            cx.run_until_parked();
+            let at = point(x, y);
+            cx.simulate_mouse_move(at, None, none);
+            cx.simulate_mouse_down(at, button, none);
+            cx.simulate_mouse_up(at, button, none);
+            cx.run_until_parked();
+            table.read_with(cx, |table, _| {
+                (table.header_menu.is_some(), table.sort.is_some())
+            })
+        };
+        for dx in [-COLUMN_EDGE + 0.5, -0.5, 0.5, COLUMN_EDGE - 0.5] {
+            for button in [MouseButton::Right, MouseButton::Middle] {
+                assert_eq!(
+                    press(key.right() + px(dx), button, cx),
+                    (false, false),
+                    "{button:?} {dx} px from slug's rule"
+                );
+            }
+        }
+        // The name header's body, past the edge: its menu.
+        let body = key.right() + px(COLUMN_EDGE + 20.);
+        assert_eq!(press(body, MouseButton::Right, cx), (true, false));
+    }
+
+    /// A header's end control is drawn only where it fits between the cell's start controls and
+    /// its edge: at the narrowest key column (48 px) the column menu's button is left out and a
+    /// click on the select-all check selects every row. Before, the button covered the check
+    /// (review of #181).
+    #[gpui::test]
+    async fn the_select_all_check_is_not_under_the_menu_at_the_narrowest_key_column(
+        cx: &mut TestAppContext,
+    ) {
+        let session = session(PEOPLE, cx);
+        let (table, cx) = people_table(&session, cx);
+        table.update(cx, |table, cx| {
+            table
+                .layout
+                .set_width("slug", Some(studio_ui::COLUMN_MIN_WIDTH));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let check = cx.debug_bounds("all-rows-check").expect("drawn");
+        let none = gpui::Modifiers::default();
+        cx.simulate_mouse_move(check.center(), None, none);
+        cx.run_until_parked();
+        cx.simulate_click(check.center(), none);
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert!(
+                table.header_menu.is_none(),
+                "the click opened the column menu"
+            );
+            assert_eq!(
+                table.selection.len(),
+                table.rows.len(),
+                "every row selected"
+            );
         });
     }
 
