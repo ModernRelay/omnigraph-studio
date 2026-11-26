@@ -1,0 +1,20 @@
+test view::tests::views::a_new_result_closes_a_column_menu ... FAILED
+test view::tests::views::a_font_change_counts_wrapped_lines_again ... FAILED
+test view::tests::views::toggling_the_wrap_never_jumps_to_the_selection ... FAILED
+
+failures:
+
+--
+thread 'view::tests::views::a_new_result_closes_a_column_menu' (16916) panicked at crates/query_editor/src/view.rs:6999:17:
+the menu went with its result
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+--
+thread 'view::tests::views::a_font_change_counts_wrapped_lines_again' (16915) panicked at crates/query_editor/src/view.rs:6977:13:
+115px for 6 lines: 173px
+
+---- view::tests::views::toggling_the_wrap_never_jumps_to_the_selection stdout ----
+--
+thread 'view::tests::views::toggling_the_wrap_never_jumps_to_the_selection' (16917) panicked at crates/query_editor/src/view.rs:6915:17:
+assertion `left == right` failed: the first row stays, the selection is row 0
+  left: 0
