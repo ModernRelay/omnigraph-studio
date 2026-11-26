@@ -1227,7 +1227,7 @@ impl QueryEditor {
             resizing: None,
             header_menu: None,
             filled_example: false,
-            results_rows: GridRows::new(UniformListScrollHandle::new()),
+            results_rows: GridRows::new(UniformListScrollHandle::new(), px(ROW_HEIGHT)),
             results_hscroll: ScrollHandle::new(),
             results_focus: cx.focus_handle(),
             confirm_focus: cx.focus_handle(),

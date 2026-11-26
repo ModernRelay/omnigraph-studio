@@ -222,15 +222,19 @@ pub struct GridRows {
     pub measured: gpui::ListState,
     /// How many lines the grid holds, as last told ([`GridRows::sync`]).
     count: Rc<std::cell::Cell<usize>>,
+    /// How tall a cut line is, its rule included: the grid's own, given, never worked out from
+    /// a layout that may be a frame old.
+    cut_row: Pixels,
 }
 
 impl GridRows {
-    /// The rows of a grid whose cut rows scroll by `uniform`.
-    pub fn new(uniform: gpui::UniformListScrollHandle) -> Self {
+    /// The rows of a grid whose cut rows scroll by `uniform` and are each `cut_row` tall.
+    pub fn new(uniform: gpui::UniformListScrollHandle, cut_row: Pixels) -> Self {
         Self {
             uniform,
             measured: gpui::ListState::new(0, gpui::ListAlignment::Top, px(WRAPPED_DRAW_AHEAD)),
             count: Rc::default(),
+            cut_row,
         }
     }
 
@@ -258,18 +262,9 @@ impl GridRows {
         }
     }
 
-    /// A cut line's height, as the list last laid its lines out: GPUI's `last_item_size` holds
-    /// the list's own size as `item` and its lines' as `contents`.
+    /// A cut line's height: the grid's own ([`GridRows::new`]).
     pub fn cut_row_height(&self) -> Pixels {
-        let count = self.count.get();
-        self.uniform
-            .0
-            .borrow()
-            .last_item_size
-            .filter(|_| count > 0)
-            .map(|size| size.contents.height / count as f32)
-            .filter(|height| *height > Pixels::ZERO)
-            .unwrap_or(px(crate::ROW_HEIGHT))
+        self.cut_row
     }
 
     /// The first line in view, and how far into it the view starts.
@@ -318,17 +313,11 @@ impl GridRows {
     }
 
     /// Keeps the first line in view first when the grid turns from `from` to the other way of
-    /// drawing its rows (constitution V).
+    /// drawing its rows (constitution V): its start at the top, since a line's height differs
+    /// between the two and an offset into one is no offset into the other.
     pub fn switch(&self, from: CellWrap) {
-        let (line, offset) = self.first(from);
-        let to = from.toggled();
-        // A line's height differs between the two; its start stays.
-        let offset = if to == CellWrap::Wrap {
-            Pixels::ZERO
-        } else {
-            offset.min(self.cut_row_height())
-        };
-        self.scroll_to(to, line, offset);
+        let (line, _) = self.first(from);
+        self.scroll_to(from.toggled(), line, Pixels::ZERO);
     }
 
     /// The line under `position`, as the rows were last laid out and are scrolled now; `None`
@@ -555,6 +544,29 @@ mod tests {
         assert!(columns.change(ColumnChange::Reset, None, unmeasured));
         assert_eq!(columns.wrap(), CellWrap::Truncate);
         assert!(ColumnChange::Fit.is_to_a_column() && !ColumnChange::Reset.is_to_a_column());
+    }
+
+    /// Turning the wrap on or off keeps the first line in view first, from its start, and skips
+    /// none: a cut line is the grid's own height, whatever the last layout counted.
+    #[test]
+    fn switching_the_wrap_keeps_the_first_line() {
+        let rows = GridRows::new(gpui::UniformListScrollHandle::new(), px(29.));
+        rows.sync(40);
+        rows.scroll_to(CellWrap::Truncate, 7, px(20.));
+        assert_eq!(rows.first(CellWrap::Truncate), (7, px(20.)));
+        rows.switch(CellWrap::Truncate);
+        assert_eq!(rows.first(CellWrap::Wrap), (7, Pixels::ZERO));
+        rows.scroll_to(CellWrap::Wrap, 7, px(50.));
+        rows.switch(CellWrap::Wrap);
+        assert_eq!(
+            rows.first(CellWrap::Truncate),
+            (7, Pixels::ZERO),
+            "not the row after"
+        );
+        // Told of more lines, a cut line is still the grid's own height.
+        rows.sync(400);
+        rows.scroll_to(CellWrap::Truncate, 12, Pixels::ZERO);
+        assert_eq!(rows.first(CellWrap::Truncate), (12, Pixels::ZERO));
     }
 
     /// A row of one line is a row's height; more lines grow it by a line each, up to the most
