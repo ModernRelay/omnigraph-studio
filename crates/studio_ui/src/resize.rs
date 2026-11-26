@@ -5,7 +5,7 @@
 //! The grid owns the state: it records a [`ColumnResize`] when the pointer goes down on a
 //! handle, follows its own [`ColumnDrag`] moves over the whole grid with `on_drag_move`, and
 //! forgets the resize when the button comes up, by a drop or a click that dragged nothing.
-//! Clicking a handle twice fits its column again.
+//! Clicking a handle twice fits its column to its values (spec 049, [`crate::GridColumns::fit`]).
 
 use gpui::{
     App, ClickEvent, Div, DragMoveEvent, EntityId, MouseButton, MouseDownEvent, Pixels,
@@ -106,7 +106,7 @@ pub enum ColumnEdge {
 ///   starts one, since the control is not on the edge. A drag that starts on the handle is the
 ///   handle's to its end: the button under the pointer when it is released was not pressed.
 ///
-/// `on_start` runs when the pointer goes down on it, `on_reset` on a double click. `active`
+/// `on_start` runs when the pointer goes down on it, `on_fit` on a double click. `active`
 /// keeps the line shown while this column is dragged.
 pub fn column_resize_handle(
     owner: EntityId,
@@ -114,7 +114,7 @@ pub fn column_resize_handle(
     edge: ColumnEdge,
     active: bool,
     on_start: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
-    on_reset: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    on_fit: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     cx: &App,
 ) -> Stateful<Div> {
     use crate::ds::size::{COLUMN_EDGE, DRAG_LINE, HAIRLINE};
@@ -160,7 +160,7 @@ pub fn column_resize_handle(
         .on_click(move |event, window, cx| {
             cx.stop_propagation();
             if event.click_count() >= 2 {
-                on_reset(event, window, cx);
+                on_fit(event, window, cx);
             }
         })
         .on_drag(ColumnDrag { owner }, |drag, _, _, cx| cx.new(|_| *drag))

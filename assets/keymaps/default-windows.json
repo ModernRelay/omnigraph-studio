@@ -441,6 +441,16 @@
     }
   },
   {
+    "context": "(TypeTable && !editing) || QueryResults",
+    "bindings": {
+      "alt-shift-right": "studio_grid::WidenColumn",
+      "alt-shift-left": "studio_grid::NarrowColumn",
+      "alt-shift-f": "studio_grid::FitColumn",
+      "alt-shift-0": "studio_grid::ResetColumns",
+      "alt-z": "studio_grid::ToggleWrap"
+    }
+  },
+  {
     "context": "Review && !searching",
     "bindings": {
       "enter": "studio_review::EditChange",

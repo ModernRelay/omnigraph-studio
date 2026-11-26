@@ -11,6 +11,7 @@ pub use studio_theme::TypeTints;
 
 mod changes;
 pub mod ds;
+mod grid_columns;
 mod grid_places;
 pub mod motion;
 pub mod node_names;
@@ -27,6 +28,11 @@ pub use changes::{
     property_body, property_row,
 };
 pub use ds::cell_text::{CellText, cell_text, shown_part};
+pub use grid_columns::{
+    COLUMN_STEP, CellWrap, ColumnChange, FIT_ROWS, GridColumns, GridLayout, GridRows, WRAP_LINES,
+    WRAPPED_DRAW_AHEAD, WrapLines, cell_line_height, fitted_width, row_lines, widest_text,
+    wrap_key, wrapped_row_height, wrapping_cell,
+};
 pub use grid_places::{GridPlace, columns_in_view, grid_places, scrolled_within};
 pub use overlay_slot::{OverlaySlot, OverlaySlotElement};
 pub use resize::{
@@ -156,6 +162,11 @@ pub fn grid_cell(width: Pixels, align_right: bool) -> Div {
         .px(px(crate::ds::space::LG))
         .overflow_hidden()
         .when(align_right, |d| d.justify_end())
+}
+
+/// The room a cell `width` wide leaves its text: the column less its inset on both sides.
+pub fn cell_room(width: Pixels) -> Pixels {
+    (width - px(2. * crate::ds::space::LG)).max(px(1.))
 }
 
 /// `text` without the one stop that ends it, for a sentence that goes on after it: a message

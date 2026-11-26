@@ -969,6 +969,27 @@ pub mod query {
     );
 }
 
+/// What every grid does with its columns (spec 049): the type table and a query's results.
+pub mod grid {
+    use gpui::actions;
+
+    actions!(
+        studio_grid,
+        [
+            /// Make the selected column wider.
+            WidenColumn,
+            /// Make the selected column narrower.
+            NarrowColumn,
+            /// Make the selected column as wide as its widest value.
+            FitColumn,
+            /// Give every column back its own width, and the table its own wrap.
+            ResetColumns,
+            /// Wrap long values onto more lines, or cut them to one.
+            ToggleWrap,
+        ]
+    );
+}
+
 pub mod queries {
     use gpui::actions;
 

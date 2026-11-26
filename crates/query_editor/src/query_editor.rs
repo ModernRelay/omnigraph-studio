@@ -14,7 +14,6 @@ mod schema_view;
 mod syntax;
 mod view;
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use gpui::{App, AppContext as _, Context, Entity, Global, PathPromptOptions, Window};
@@ -157,14 +156,22 @@ pub(crate) fn open_stored(
     Some(editor)
 }
 
-/// The result columns' dragged widths a remembered tab had.
-fn saved_widths(data: &Value) -> BTreeMap<String, f32> {
-    data.get("widths")
-        .and_then(Value::as_object)
-        .into_iter()
-        .flatten()
-        .filter_map(|(name, width)| Some((name.clone(), width.as_f64()? as f32)))
-        .collect()
+/// The widths and wrap a remembered tab's results had (spec 049). A width saved as a fraction
+/// by an earlier Studio is taken to the nearest pixel.
+pub(crate) fn saved_layout(data: &Value) -> studio_ui::GridLayout {
+    studio_ui::GridLayout {
+        widths: data
+            .get("widths")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+            .filter_map(|(name, width)| Some((name.clone(), width.as_f64()?.round() as u32)))
+            .collect(),
+        wrap: data
+            .get("wrap")
+            .cloned()
+            .and_then(|wrap| serde_json::from_value(wrap).ok()),
+    }
 }
 
 /// Opens the schema tab, or activates it; with a type, shows its declaration.
@@ -211,7 +218,7 @@ pub fn init(cx: &mut App) {
             .get("at_commit")
             .and_then(|commit| commit.as_str())
             .map(str::to_owned);
-        let widths = saved_widths(data);
+        let layout = saved_layout(data);
         if let Some(path) = data.get("path").and_then(|path| path.as_str()) {
             // A file tab keeps its text with the hash of the file's text it was typed over,
             // and says whether it was the file's (`saved`): that is shown only when the file
@@ -237,7 +244,7 @@ pub fn init(cx: &mut App) {
                 open_file(workspace, PathBuf::from(path), draft, false, window, cx)
             {
                 editor.update(cx, |editor, cx| {
-                    editor.set_column_widths(widths);
+                    editor.set_grid_layout(layout);
                     if let Some(commit) = at_commit {
                         editor.pin_to(commit, cx);
                     }
@@ -253,7 +260,7 @@ pub fn init(cx: &mut App) {
         workspace.open_item(format!("query:{number}"), window, cx, |window, cx| {
             // Its text, even emptied, is the tab's: the example does not fill it again.
             let mut editor = QueryEditor::with_text(number, session, &text, window, cx);
-            editor.set_column_widths(widths);
+            editor.set_grid_layout(layout);
             if let Some(commit) = at_commit {
                 editor.pin_to(commit, cx);
             }
@@ -277,8 +284,8 @@ pub fn init(cx: &mut App) {
             cx,
         );
         if let Some(editor) = opened {
-            let widths = saved_widths(data);
-            editor.update(cx, |editor, _| editor.set_column_widths(widths));
+            let layout = saved_layout(data);
+            editor.update(cx, |editor, _| editor.set_grid_layout(layout));
         }
     });
     studio_workspace::register_item_kind(

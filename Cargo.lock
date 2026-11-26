@@ -9600,6 +9600,7 @@ dependencies = [
  "pulldown-cmark",
  "serde_json",
  "smallvec",
+ "studio_actions",
  "studio_settings",
  "studio_theme",
  "theme",
