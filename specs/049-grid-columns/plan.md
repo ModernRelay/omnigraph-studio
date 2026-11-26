@@ -84,8 +84,18 @@ type table's header edges (`edge-trace-main.txt` in the PR):
   "…" (`CellText::wrap`); a row is as tall as its tallest cell and a one-line row is as tall as a
   cut one. Cut rows draw through `uniform_list` as today; wrapped rows through GPUI's `list`,
   which measures a row as it draws it. `studio_ui::GridRows` answers the line under the pointer,
-  the first line in view and scrolling the same way for both.
-- Query results keep widths and wrap with the tab, as they kept widths.
+  the first line in view and scrolling the same way for both. Turning the wrap on or off keeps
+  the first line in view first and never moves the view to the selection. A wrapped row is as
+  tall as its text cell with the most lines, drawn or not (`row_lines`), so it keeps its height
+  while scrolled sideways. A value cut to what a cell keeps (512 characters) ends in "…".
+- **One rule forgets wrap measurements** (`studio_ui::WrapLines`): a row's line count, and every
+  height GPUI's list measured from it, holds for one measure, the frame's `wrap_key` (the cell
+  text's font, size, weight and line height, and each wrapping column's key and room). A frame
+  whose measure differs (a font size changed, a column shown, hidden, moved or resized) forgets
+  them all and measures the list again; a row whose text changed is forgotten alone; other rows
+  (a new result, a read) forget them all.
+- Query results keep widths and wrap with the tab, as they kept widths; a new result closes a
+  column menu opened on the last one.
 
 ### Step 3: the type table on the model
 
@@ -116,6 +126,7 @@ page). No engine change.
 | 2026-11-25 | The edge bug, as above | Probe on `main`: a click and a 40 px drag at every pixel from 30 px left to 4 px right of each header rule of `Person` (two columns), and sub-pixel presses | Handle −6 to −1 px, menu button −24 to −7, sort left of that; on the key column the rule pixel did nothing and +0.5 px sorted the next column; drags from the handle never opened the menu |
 | 2026-11-25 | The rule holds | `type_table` `a_column_edge_is_the_resize_handles_and_no_control_reaches_it`, `a_column_dropped_on_an_edge_moves`, `a_scrolled_strip_gives_no_edge_to_a_column_out_of_view`; `studio_ui` `a_press_at_a_rule_resizes_the_column_on_its_left` | Pass; the first fails on `main` at −0.5 px from the key column's rule. With the edge blocking the mouse (the first version of this fix), a column dropped on an edge did not move (review of #181) |
 | 2026-11-26 | Every button at an edge is the edge's; no end control over a start control | `type_table` `every_button_at_an_edge_is_the_edges`, `the_select_all_check_is_not_under_the_menu_at_the_narrowest_key_column`, both failing on `11942b0` | At `11942b0` a right press 3.5 px left of the key column's rule opened a menu, and at a 48 px key column the menu's button (16 to 34 px) covered the select-all check (16 to 30 px), so a click on the check opened the menu (Codex review of #181) |
+| 2026-11-26 | Toggling the wrap keeps the view; a font change counts lines again; a new result closes a column menu | `query_editor` `toggling_the_wrap_never_jumps_to_the_selection`, `a_font_change_counts_wrapped_lines_again`, `a_new_result_closes_a_column_menu`, all failing on `1ef16d0`; `the_keys_menu_and_edge_work_as_a_person_uses_them` | At `1ef16d0` the toggle moved the view from row 40 to the selected row 0; at a 24 px rem a 6-line row was drawn 115 px tall instead of 173 px; a menu outlived its result (Codex and Bugbot reviews of #180). ⌥Z from the query does nothing, from the results wraps; a right press on a header opens its menu; a double click on an edge fits |
 | 2026-11-25 | The edge shows its line | Offscreen snapshots of `Note`, the pointer 2 px left of slug's rule | `main`: the menu's button and no line, the slot's fill over it; now: the line, drawn over everything, and the button, which stops short of the edge |
 
 ## Corrections

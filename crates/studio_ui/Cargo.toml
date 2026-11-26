@@ -10,6 +10,7 @@ path = "src/studio_ui.rs"
 
 [dependencies]
 studio_settings = { workspace = true }
+studio_actions = { workspace = true }
 gpui = { workspace = true }
 menu = { workspace = true }
 ui = { workspace = true }

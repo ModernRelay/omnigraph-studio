@@ -37,6 +37,38 @@ impl ColumnChange {
     pub fn is_to_a_column(self) -> bool {
         !matches!(self, ColumnChange::Reset | ColumnChange::ToggleWrap)
     }
+
+    /// The action that makes the change, whose key a menu shows; Reset width has none.
+    pub fn action(self) -> Option<Box<dyn Action>> {
+        use studio_actions::grid::{
+            FitColumn, NarrowColumn, ResetColumns, ToggleWrap, WidenColumn,
+        };
+        Some(match self {
+            ColumnChange::Widen => Box::new(WidenColumn),
+            ColumnChange::Narrow => Box::new(NarrowColumn),
+            ColumnChange::Fit => Box::new(FitColumn),
+            ColumnChange::ResetWidth => return None,
+            ColumnChange::Reset => Box::new(ResetColumns),
+            ColumnChange::ToggleWrap => Box::new(ToggleWrap),
+        })
+    }
+
+    /// The change an action makes, for a grid that handles every grid action in one place.
+    pub fn of(action: &dyn Action) -> Option<Self> {
+        use studio_actions::grid::{
+            FitColumn, NarrowColumn, ResetColumns, ToggleWrap, WidenColumn,
+        };
+        let any = action.as_any();
+        [
+            (any.is::<WidenColumn>(), ColumnChange::Widen),
+            (any.is::<NarrowColumn>(), ColumnChange::Narrow),
+            (any.is::<FitColumn>(), ColumnChange::Fit),
+            (any.is::<ResetColumns>(), ColumnChange::Reset),
+            (any.is::<ToggleWrap>(), ColumnChange::ToggleWrap),
+        ]
+        .into_iter()
+        .find_map(|(is, change)| is.then_some(change))
+    }
 }
 
 /// How much wider or narrower one Widen or Narrow makes a column.
@@ -157,16 +189,16 @@ impl GridColumns {
     }
 
     /// A column's menu's entries for its width and the grid's wrap, after what the grid puts
-    /// first: Fit width, Reset width, then Wrap text and Reset widths and wrap. `key` is the column the
-    /// menu is for; `action` names the action whose key an entry shows, if it has one; `apply`
-    /// makes a change.
+    /// first: Fit width, Reset width, then Wrap text and Reset widths and wrap. `key` is the
+    /// column the menu is for; `apply` makes a change. The grid-wide entries show their keys
+    /// ([`ColumnChange::action`]).
     pub fn menu_entries(
         &self,
         menu: ContextMenu,
         key: &str,
-        action: impl Fn(ColumnChange) -> Option<Box<dyn Action>>,
         apply: impl Fn(ColumnChange, &mut Window, &mut App) + 'static,
     ) -> ContextMenu {
+        let action = ColumnChange::action;
         let apply = Rc::new(apply);
         let entry = |label: &'static str, change: ColumnChange| {
             let apply = apply.clone();
@@ -201,6 +233,86 @@ impl GridColumns {
                     .disabled(self.layout.is_default()),
             )
     }
+}
+
+/// What a grid knows of its rows' wrapped line counts, by row (`K`), and the one rule that
+/// forgets them (spec 049): every count, and every height GPUI's list measured from them,
+/// holds for one measure, the [`wrap_key`] of the frame that counted it: the cell text's font,
+/// size, weight and line height, and each column that wraps with its room. A frame whose
+/// measure differs (a font size changed, a column shown, hidden, moved or resized) forgets them
+/// all; a row whose text changed is forgotten alone ([`WrapLines::forget`]); a grid that holds
+/// other rows forgets them all ([`WrapLines::forget_all`]).
+pub struct WrapLines<K> {
+    measure: std::cell::Cell<Option<u64>>,
+    lines: std::cell::RefCell<std::collections::HashMap<K, usize>>,
+}
+
+impl<K> Default for WrapLines<K> {
+    fn default() -> Self {
+        Self {
+            measure: Default::default(),
+            lines: Default::default(),
+        }
+    }
+}
+
+impl<K: std::hash::Hash + Eq> WrapLines<K> {
+    /// Takes this frame's measure; `true` when it differs from the last and everything known
+    /// was forgotten, when the grid measures its rows again (`ListState::remeasure`).
+    pub fn measure_with(&self, measure: u64) -> bool {
+        if self.measure.replace(Some(measure)) == Some(measure) {
+            return false;
+        }
+        self.lines.borrow_mut().clear();
+        true
+    }
+
+    /// How many lines `row` takes: as last counted under this measure, else `count`ed now.
+    pub fn lines(&self, row: K, count: impl FnOnce() -> usize) -> usize {
+        if let Some(lines) = self.lines.borrow().get(&row) {
+            return *lines;
+        }
+        let lines = count();
+        self.lines.borrow_mut().insert(row, lines);
+        lines
+    }
+
+    /// Forgets one row's count: its text changed.
+    pub fn forget(&self, row: &K) {
+        self.lines.borrow_mut().remove(row);
+    }
+
+    /// Forgets every row's count: the grid holds other rows.
+    pub fn forget_all(&self) {
+        self.lines.borrow_mut().clear();
+    }
+}
+
+/// A frame's measure for wrapped rows ([`WrapLines`]): the cell text's font, size, weight and
+/// line height where it is drawn, and each wrapping column's key and the room its text has.
+pub fn wrap_key<'a>(
+    columns: impl IntoIterator<Item = (&'a str, Pixels)>,
+    window: &Window,
+    cx: &App,
+) -> u64 {
+    use gpui::Refineable as _;
+    use std::hash::{Hash, Hasher};
+
+    let mut text_style = window.text_style();
+    text_style.refine(&crate::cell_text("", cx).style);
+    let font_size = text_style.font_size.to_pixels(window.rem_size());
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text_style.font_family.hash(&mut hasher);
+    f32::from(font_size).to_bits().hash(&mut hasher);
+    text_style.font_weight.0.to_bits().hash(&mut hasher);
+    f32::from(cell_line_height(window, cx))
+        .to_bits()
+        .hash(&mut hasher);
+    for (key, room) in columns {
+        key.hash(&mut hasher);
+        f32::from(room).to_bits().hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 /// How far past the view a wrapped grid lays its rows out, above and below: GPUI's `list`
@@ -317,7 +429,12 @@ impl GridRows {
     /// between the two and an offset into one is no offset into the other.
     pub fn switch(&self, from: CellWrap) {
         let (line, _) = self.first(from);
-        self.scroll_to(from.toggled(), line, Pixels::ZERO);
+        let to = from.toggled();
+        if to == CellWrap::Wrap {
+            // No height the list measured before is known to hold now.
+            self.measured.reset(self.count.get());
+        }
+        self.scroll_to(to, line, Pixels::ZERO);
     }
 
     /// The line under `position`, as the rows were last laid out and are scrolled now; `None`
