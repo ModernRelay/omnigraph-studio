@@ -26,8 +26,8 @@ pub enum ReadView {
     Exploration,
     /// A node search: the command palette's, while it is open (spec 031).
     Search,
-    /// A type's gallery: its pages and its tiles' files (spec 035).
-    Gallery,
+    /// A type's cards: their pages and their covers' files (spec 048).
+    Cards,
     /// A node's history: its window's commit listing, change-feed pages and merges (spec 046).
     NodeHistory,
 }

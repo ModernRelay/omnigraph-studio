@@ -768,8 +768,8 @@ The first four record changes to the draft before it was built.
   saying so. Spec 048 replaces it with Cards, and the tables above now list Cards: what it holds, its
   place in the strip, what it starts from, the word, and the saved `gallery` tab. A set was "fixed at
   opening"; it is now "carried once", because a Cards tab keeps filters of its own after it opens.
-  None of this is built until spec 048's slices land; until then the strip's fourth entry is Gallery,
-  on types with a file.
+  Spec 048's slice 1 (2026-11-23) made the fourth entry Cards, still only on types with a file and
+  with the set fixed at opening; every node type has it from slice 2 and its own filters from slice 5.
 
 ## What this branch leaves open
 

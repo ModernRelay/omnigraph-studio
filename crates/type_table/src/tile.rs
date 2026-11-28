@@ -1,6 +1,7 @@
-//! What a gallery tile shows of a file (spec 035): its kind, size and shape from its first
-//! bytes, and a preview made off the main thread at most [`THUMB_EDGE`] pixels on its long side.
-//! Pure but for the decoded image, which the gallery holds and frees; no reads.
+//! What a card's cover shows of a file (spec 048, first spec 035's gallery tile): its kind and
+//! size from its first bytes, and a preview made off the main thread at most [`THUMB_EDGE`]
+//! pixels on its long side. Pure but for the decoded image, which the Cards tab holds and frees;
+//! no reads.
 
 use std::io::Cursor;
 
@@ -8,34 +9,19 @@ use gpui::{ImageFormat, SvgRenderer};
 
 use crate::blob::{IMAGE_MAX, KIND_PREFIX, ShownImage, ValueKind, text_prefix, value_kind};
 
-/// How much of a file a tile reads first: its kind, an image's header and a text's first lines
+/// How much of a file a cover reads first: its kind, an image's header and a text's first lines
 /// are in it, and most icons, diagrams and short texts are whole in it.
 pub const FIRST_READ: u64 = 64 * 1024;
-/// The long side of a tile's preview in pixels: twice the large tile, so it is sharp on a 2x
-/// display at every tile size and a size change needs no read.
-pub const THUMB_EDGE: u32 = (studio_ui::ds::size::TILE_LARGE * 2.) as u32;
-/// The most pixels an image may have to be decoded for a tile: past it, decoding would hold
-/// hundreds of megabytes for a moment, and the tile shows its kind and size.
+/// The long side of a cover's preview in pixels (spec 048, Reading): one preview serves every
+/// card size, so a size change needs no read. A small or medium card's cover is drawn from it
+/// at a 2x display's own pixels or more; a large card's is scaled up by about a third there.
+pub const THUMB_EDGE: u32 = 480;
+/// The most pixels an image may have to be decoded for a cover: past it, decoding would hold
+/// hundreds of megabytes for a moment, and the cover shows its kind's icon.
 pub const MAX_PIXELS: u64 = 40_000_000;
-/// How much of a text a tile shows.
+/// How much of a text a cover shows.
 const TEXT_SHOWN: usize = 600;
 const TEXT_LINES: usize = 12;
-
-/// The shapes a tile takes, as height over width, where its file's first bytes say none
-/// (spec 035): each kind one shape, so the tile is placed as soon as its kind is known.
-pub mod shape {
-    /// A row without a file, an empty value, an external reference or a cell that could not be
-    /// read: a short band, so it takes little room among pictures.
-    pub const NO_FILE: f32 = 0.5;
-    /// A PDF: a letter page upright.
-    pub const DOCUMENT: f32 = 11. / 8.5;
-    /// Text: a square, room for its first lines.
-    pub const TEXT: f32 = 1.;
-    /// Other bytes: a landscape card for its icon.
-    pub const BYTES: f32 = 0.75;
-    /// An image or SVG whose size is not in its first bytes.
-    pub const PICTURE: f32 = 1.;
-}
 
 /// What a file's first bytes say of it.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -66,23 +52,7 @@ impl Facts {
         }
     }
 
-    /// The tile's shape, height over width: an image's or a drawing's own, else its kind's
-    /// ([`shape`]).
-    pub fn shape(&self) -> f32 {
-        let own = match (self.pixels, self.drawing) {
-            (Some((w, h)), _) if w > 0 && h > 0 => Some(h as f32 / w as f32),
-            (_, Some((w, h))) if w > 0. && h > 0. => Some(h / w),
-            _ => None,
-        };
-        own.unwrap_or(match self.kind {
-            ValueKind::Image(_) | ValueKind::Svg => shape::PICTURE,
-            ValueKind::Pdf => shape::DOCUMENT,
-            ValueKind::Text => shape::TEXT,
-            ValueKind::Binary => shape::BYTES,
-        })
-    }
-
-    /// The kind in a word, as a tile's meta line starts.
+    /// The kind in a word, as a cover's line in its card's tooltip starts.
     pub fn kind_word(&self) -> &'static str {
         kind_word(self.kind)
     }
@@ -180,7 +150,7 @@ pub fn draws_whole(facts: &Facts, size: u64) -> bool {
     drawn && size <= IMAGE_MAX && pixels_fit
 }
 
-/// A tile's preview, made from what was read of its file.
+/// A cover's preview, made from what was read of its file.
 #[derive(Debug, Clone)]
 pub enum Look {
     /// Drawn: decoded and scaled, held until freed. `bytes` is what it holds.
@@ -197,7 +167,7 @@ pub enum Look {
 }
 
 impl Look {
-    /// The bytes the look holds, against the gallery's cap.
+    /// The bytes the look holds, against the Cards tab's cap.
     pub fn held(&self) -> usize {
         match self {
             Look::Image { bytes, .. } => *bytes,
@@ -269,7 +239,7 @@ fn thumbnail(format: ImageFormat, bytes: &[u8]) -> Option<(ShownImage, usize)> {
     ShownImage::from_rgba(width, height, rgba).map(|image| (image, held))
 }
 
-/// A text's first lines, as a tile shows them: at most [`TEXT_LINES`] lines and
+/// A text's first lines, as a cover shows them: at most [`TEXT_LINES`] lines and
 /// [`TEXT_SHOWN`] bytes, cut on a character's edge.
 fn first_lines(text: &str) -> String {
     let end = text.floor_char_boundary(TEXT_SHOWN);
@@ -280,8 +250,8 @@ fn first_lines(text: &str) -> String {
         .join("\n")
 }
 
-/// A tile's meta line for a managed file: its kind, an image's pixel size and its size
-/// ("PNG · 640 × 400 · 2.6 KB"); past what a tile draws, "open to see it".
+/// What a managed file is, in a line: its kind, an image's pixel size and its size
+/// ("PNG · 640 × 400 · 2.6 KB"); past what a cover draws, "open to see it".
 pub fn meta_line(facts: Option<&Facts>, size: u64) -> String {
     let size_text = studio_ui::format_bytes(size);
     // An empty value has no kind: its preview says it is empty.
@@ -322,7 +292,7 @@ mod tests {
     }
 
     /// An image's size is read from its first bytes, before it is decoded, and an image is
-    /// held at most [`THUMB_EDGE`] on its long side: a large picture costs a tile under a
+    /// held at most [`THUMB_EDGE`] on its long side: a large picture costs a cover under a
     /// megabyte, a small one its own pixels.
     #[test]
     fn an_image_is_judged_by_its_header_and_held_small() {
@@ -346,7 +316,7 @@ mod tests {
     /// Only the first bytes of a drawn kind show its icon, not a broken image; text shows its
     /// first lines; bytes and an empty value say what they are.
     #[test]
-    fn a_tile_shows_what_was_read_for_its_kind() {
+    fn a_cover_shows_what_was_read_for_its_kind() {
         let picture = png(300, 300);
         let size = picture.len() as u64;
         assert!(matches!(
@@ -399,10 +369,11 @@ mod tests {
         assert_eq!(meta_line(Some(&Facts::of(b"")), 0), "0 B");
     }
 
-    /// A tile's shape is its picture's own, read from a header in the first bytes (a JPEG's
-    /// past its metadata too), or a drawing's from its root element; other kinds take theirs.
+    /// A picture's size is read from a header in the first bytes (a JPEG's past its metadata
+    /// too), and a drawing's from its root element: what a cover fits inside its box, and what
+    /// says an image is too large to decode. Other kinds have none.
     #[test]
-    fn a_tiles_shape_comes_from_the_first_bytes_or_its_kind() {
+    fn a_pictures_size_comes_from_its_first_bytes() {
         let mut jpeg = Vec::new();
         image::codecs::jpeg::JpegEncoder::new(&mut jpeg)
             .encode_image(&image::RgbImage::from_pixel(
@@ -421,20 +392,19 @@ mod tests {
         // Its first bytes only, the frame header past 20 KB of metadata.
         let facts = Facts::of(&with_metadata[..comment.len() + 1_000]);
         assert_eq!(facts.pixels, Some((300, 450)));
-        assert_eq!(facts.shape(), 1.5);
         let png = png(400, 100);
-        assert_eq!(Facts::of(&png[..32]).shape(), 0.25);
+        assert_eq!(Facts::of(&png[..32]).pixels, Some((400, 100)));
 
         let drawing = br#"<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg" width="480" height="300" viewBox="0 0 960 600"><rect/></svg>"#;
         assert_eq!(Facts::of(drawing).drawing, Some((960., 600.)));
-        assert_eq!(Facts::of(drawing).shape(), 0.625);
         let sized = br#"<svg xmlns="http://www.w3.org/2000/svg" width="40px" height='80'></svg>"#;
-        assert_eq!(Facts::of(sized).shape(), 2.);
+        assert_eq!(Facts::of(sized).drawing, Some((40., 80.)));
         let no_size = br#"<svg xmlns="http://www.w3.org/2000/svg" width="100%"></svg>"#;
-        assert_eq!(Facts::of(no_size).shape(), shape::PICTURE);
+        assert_eq!(Facts::of(no_size).drawing, None);
 
-        assert_eq!(Facts::of(b"%PDF-1.4\n").shape(), shape::DOCUMENT);
-        assert_eq!(Facts::of(b"some text").shape(), shape::TEXT);
-        assert_eq!(Facts::of(&[0, 1, 2, 255]).shape(), shape::BYTES);
+        for other in [&b"%PDF-1.4\n"[..], b"some text", &[0, 1, 2, 255]] {
+            let facts = Facts::of(other);
+            assert_eq!((facts.pixels, facts.drawing), (None, None));
+        }
     }
 }

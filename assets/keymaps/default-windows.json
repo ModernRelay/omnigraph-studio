@@ -231,25 +231,32 @@
     }
   },
   {
-    "context": "Gallery",
+    "context": "Cards",
     "bindings": {
-      "left": "studio_gallery::MoveLeft",
-      "right": "studio_gallery::MoveRight",
-      "up": "studio_gallery::MoveUp",
-      "down": "studio_gallery::MoveDown",
-      "home": "studio_gallery::MoveToFirst",
-      "end": "studio_gallery::MoveToLast",
+      "left": "studio_cards::MoveLeft",
+      "right": "studio_cards::MoveRight",
+      "up": "studio_cards::MoveUp",
+      "down": "studio_cards::MoveDown",
+      "home": "studio_cards::MoveToFirst",
+      "end": "studio_cards::MoveToLast",
+      "enter": "studio_cards::OpenPage",
+      "ctrl-enter": "studio_cards::OpenPage",
+      "alt-enter": "studio_cards::OpenCover",
+      "ctrl-a": "studio_cards::PickAll",
+      "escape": "studio_cards::Cancel",
+      "ctrl-c": "studio_cards::CopyIds",
+      "ctrl-r": "studio_cards::Refresh"
+    }
+  },
+  {
+    "context": "Cards && !editing",
+    "bindings": {
       "space": "studio::ToggleInspector",
-      "enter": "studio_gallery::OpenFile",
-      "ctrl-enter": "studio_gallery::OpenRowPage",
-      "x": "studio_gallery::TogglePick",
-      "ctrl-a": "studio_gallery::PickAll",
-      "escape": "studio_gallery::ClearPicks",
-      "ctrl-c": "studio_gallery::CopyIds",
-      "f": "studio_gallery::ShowNextFile",
-      "=": "studio_gallery::LargerTiles",
-      "-": "studio_gallery::SmallerTiles",
-      "ctrl-r": "studio_gallery::Refresh"
+      "g": "studio_cards::ShowOnCanvas",
+      "x": "studio_cards::TogglePick",
+      "f": "studio_cards::ShowNextCover",
+      "=": "studio_cards::LargerCards",
+      "-": "studio_cards::SmallerCards"
     }
   },
   {

@@ -281,15 +281,14 @@ pub mod size {
     pub const ACCENT_LINE: f32 = 2.;
     /// The tallest a preview (an image, a document's first page) shows before it opens.
     pub const PREVIEW_MAX_HEIGHT: f32 = 240.;
-    /// A gallery column's width at each tile size (spec 035), the narrowest the columns grow
-    /// from to fill the gallery.
-    pub const TILE_SMALL: f32 = 128.;
-    pub const TILE: f32 = 176.;
-    pub const TILE_LARGE: f32 = 240.;
-    /// A gallery tile's caption under its preview: a name line and a meta line.
-    pub const TILE_CAPTION: f32 = 44.;
-    /// The band at the end of a gallery's columns while rows wait to be placed.
-    pub const TILE_BAND: f32 = 48.;
+    /// A card's width at each card size (spec 048), the narrowest a Cards tab's columns grow
+    /// from to fill it. Chosen so the three sizes give three column counts in a 1440 px window:
+    /// 4, 3 and 2 between the sidebar and the inspector, 6, 4 and 3 with the inspector closed.
+    pub const CARD_SMALL: f32 = 180.;
+    pub const CARD: f32 = 240.;
+    pub const CARD_LARGE: f32 = 340.;
+    /// A card's title line under its cover: one line of body text and the space above it.
+    pub const CARD_TITLE: f32 = 28.;
     /// A short label before a value ("From", "To").
     pub const SHORT_LABEL: f32 = 40.;
     /// The tallest a modal grows before its body scrolls.
@@ -1164,8 +1163,8 @@ pub mod icon {
         Icon::new(name).size(IconSize::XSmall).color(Color::Muted)
     }
 
-    /// An icon standing for a file a gallery tile does not draw (spec 035), 32 px: muted.
-    pub fn tile(name: IconName) -> Icon {
+    /// An icon standing for a file a card's cover does not draw (spec 048), 32 px: muted.
+    pub fn cover(name: IconName) -> Icon {
         Icon::new(name)
             .size(IconSize::Custom(rems_from_px(
                 size::ICON_TILE + space::MD + space::XS,
@@ -2422,6 +2421,12 @@ pub fn check_box(id: impl Into<ElementId>, state: ui::ToggleState, cx: &App) -> 
     check_mark(state, cx).id(id.into()).cursor_pointer()
 }
 
+/// A [`check_box`]'s mark, checked, where it only says that something is picked and takes no
+/// click of its own (a picked card's corner, whose card takes the click): no element id.
+pub fn picked_mark(cx: &App) -> Div {
+    check_mark(ui::ToggleState::Selected, cx)
+}
+
 fn check_mark(state: ui::ToggleState, cx: &App) -> Div {
     let ink = cx.theme().colors().text;
     let mark = div()
@@ -2974,8 +2979,8 @@ pub fn code_block(code: impl Into<SharedString>, cx: &App) -> Div {
         .child(code.into())
 }
 
-/// The first lines of a text file, as a gallery tile shows them in its preview (spec 035): the
-/// code face at the meta size, muted, from the top-left and cut at the tile's edge.
+/// The first lines of a text file, as a card shows them in its cover (spec 048): the code face
+/// at the meta size, muted, from the top-left and cut at the cover's edge.
 pub fn preview_text(text: impl Into<SharedString>, cx: &App) -> Div {
     div()
         .size_full()

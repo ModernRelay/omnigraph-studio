@@ -63,7 +63,7 @@ says who set it.
 - **Studio before this spec:** History listed a branch's commits; `change_cards` drew a change's
   rows only from a folded review; the node page's view strip had Page, Tree and Canvas; ⌘⌥4 was
   bound on every platform to `OpenViewAt { index: 3 }`, which reached a type table's Gallery
-  (spec 035) and nothing on a node.
+  (spec 035; Cards since spec 048's slice 1) and nothing on a node.
 - **#146** (`feat/ux-p5-node-history`): its tab, its cached rows and `own_words` are reused here;
   its feed-based read is not.
 
@@ -79,7 +79,8 @@ says who set it.
 | Tree and canvas of a node | History as their fourth view, of the root | None |
 
 ⌘⌥4 is `OpenViewAt { index: 3 }`. On a node's page, tree and canvas the fourth place was empty
-and is now History. On a type table with files it stays Gallery (spec 035): this spec takes no
+and is now History. On a type table with files it stays the table's fourth view, which was
+Gallery (spec 035) and is Cards since spec 048's slice 1 (2026-11-23): this spec takes no
 key from another view. A page held at a commit offers History too; it reads at the branch head.
 
 ### The tab
@@ -218,7 +219,7 @@ The rows are a cached view of their own (`NodeHistoryRows`), made with the tab, 
 | A first window of 50 commits | 200, as the later windows | A full window of 200 on a person with 4 groups is 1,006 requests, 11 to 18 s against a local server (validation log), and longer remotely; 50 is about a quarter of that and holds most recent changes |
 | A schema change ends the history | Read past it with a query of the older schema | The node's query is built from the schema Studio holds; across E52 Studio has no other |
 | A merge is credited "via merge of *branch*" | Walking the merged branch for who made it (study) | The point reads see the change land on the branch read; who made it on the other branch is the next step, and E62's job |
-| ⌘⌥4 keeps meaning "the fourth view" | A History key of its own | It is bound already; on a node the fourth place was empty, and a table's Gallery keeps it |
+| ⌘⌥4 keeps meaning "the fourth view" | A History key of its own | It is bound already; on a node the fourth place was empty, and a table's fourth view (Gallery then, Cards since spec 048's slice 1) keeps it |
 | The page's line in its meta line, only for the head the history read | Under the properties (study sketch); always | #161 made the meta line the page's quiet facts; a line from another commit would describe a node the page does not show |
 | History from a page held at a commit reads at the head | Disabled (#146); marking the held commit (study) | It answers H1 from anywhere; the marker is a next step |
 | Agent named only from an `agent/` branch, Studio only from this session's outcome log | A person otherwise (study) | "Person" would be a guess; an unnamed actor is just its id |

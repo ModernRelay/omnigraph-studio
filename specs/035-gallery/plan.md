@@ -1,11 +1,13 @@
 # 035: A gallery of a type's files
 
 Status: superseded 2026-11-23 by [048](../048-cards/plan.md), which replaces Gallery with Cards (a
-file becomes a card's cover); the gallery stays in the app until 048's slice 1 lands · was: draft;
-step 1 (the gallery tab, which writes nothing itself) built as a prototype
+file becomes a card's cover); the gallery is gone from the app as of 048's slice 1, built
+2026-11-23: `gallery.rs` became `cards.rs`, `masonry.rs` was deleted, `tile.rs` makes a cover's
+preview, a saved `gallery` tab restores as Cards and the `studio_gallery::…` action names are
+aliases · was: draft; step 1 (the gallery tab, which writes nothing itself) built as a prototype
 2026-11-18 as a uniform grid, reworked 2026-11-19 as a masonry (`crates/type_table/src/gallery.rs`,
 `masonry.rs`, `tile.rs`) · drafted 2026-11-18, claims checked against Studio `50a495c` and
-Omnigraph `v0.15.0` the same day
+Omnigraph `v0.15.0` the same day. What follows describes the gallery as it was
 
 ## Problem
 
