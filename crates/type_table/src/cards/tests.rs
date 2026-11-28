@@ -7,10 +7,12 @@ use gpui::{Bounds, KeyBinding, Modifiers, MouseButton, MouseDownEvent, MouseUpEv
 use gpui::{TestAppContext, VisualTestContext};
 use serde_json::json;
 
+use studio_actions::table::{SelectNextSuggestion, SelectPreviousSuggestion};
 use studio_settings::CardCover;
 
 use super::*;
-use crate::test_support::session_with_files;
+use crate::test_support::{changed, session_served, session_with_files};
+use gq_language::FilterOp;
 
 const NOTES: &str =
     "node Note {\n  slug: String @key\n  title: String\n  attachment: Blob?\n  scan: Blob?\n}\n";
@@ -64,22 +66,45 @@ fn init(cx: &mut TestAppContext) {
         studio_settings::keep_changes_in_memory(cx);
         editor::init(cx);
         cx.bind_keys([
-            KeyBinding::new("left", MoveLeft, Some("Cards")),
-            KeyBinding::new("right", MoveRight, Some("Cards")),
-            KeyBinding::new("up", MoveUp, Some("Cards")),
-            KeyBinding::new("down", MoveDown, Some("Cards")),
-            KeyBinding::new("home", MoveToFirst, Some("Cards")),
-            KeyBinding::new("end", MoveToLast, Some("Cards")),
-            KeyBinding::new("enter", OpenPage, Some("Cards")),
-            KeyBinding::new("cmd-enter", OpenPage, Some("Cards")),
-            KeyBinding::new("alt-enter", OpenCover, Some("Cards")),
+            // As the keymaps bind them (spec 048, slice 5): a key that would act on the cards
+            // while a person writes a filter is bound only while no field has the keyboard.
+            KeyBinding::new("left", MoveLeft, Some("Cards && !editing")),
+            KeyBinding::new("right", MoveRight, Some("Cards && !editing")),
+            KeyBinding::new("up", MoveUp, Some("Cards && !editing")),
+            KeyBinding::new("down", MoveDown, Some("Cards && !editing")),
+            KeyBinding::new("home", MoveToFirst, Some("Cards && !editing")),
+            KeyBinding::new("end", MoveToLast, Some("Cards && !editing")),
+            KeyBinding::new("enter", OpenPage, Some("Cards && !editing")),
+            KeyBinding::new("cmd-enter", OpenPage, Some("Cards && !editing")),
+            KeyBinding::new("alt-enter", OpenCover, Some("Cards && !editing")),
+            KeyBinding::new("cmd-a", PickAll, Some("Cards && !editing")),
+            KeyBinding::new("cmd-c", CopyIds, Some("Cards && !editing")),
             KeyBinding::new("g", ShowOnCanvas, Some("Cards && !editing")),
             KeyBinding::new("x", TogglePick, Some("Cards && !editing")),
-            KeyBinding::new("cmd-a", PickAll, Some("Cards")),
-            KeyBinding::new("escape", Cancel, Some("Cards")),
             KeyBinding::new("f", ShowNextCover, Some("Cards && !editing")),
             KeyBinding::new("=", LargerCards, Some("Cards && !editing")),
             KeyBinding::new("-", SmallerCards, Some("Cards && !editing")),
+            KeyBinding::new("escape", Cancel, Some("Cards")),
+            KeyBinding::new("cmd-r", Refresh, Some("Cards")),
+            KeyBinding::new("cmd-f", AddFilter, Some("Cards")),
+            KeyBinding::new("cmd-alt-backspace", ClearFilters, Some("Cards")),
+            KeyBinding::new("enter", ConfirmEdit, Some("Cards && editing")),
+            // The value field's own keys: its offers, and the text's, as Zed's keymap binds
+            // them in an editor.
+            KeyBinding::new("up", SelectPreviousSuggestion, Some("FilterValue > Editor")),
+            KeyBinding::new("down", SelectNextSuggestion, Some("FilterValue > Editor")),
+            KeyBinding::new("left", editor::actions::MoveLeft, Some("Editor")),
+            KeyBinding::new(
+                "home",
+                editor::actions::MoveToBeginningOfLine {
+                    stop_at_soft_wraps: true,
+                    stop_at_indent: false,
+                },
+                Some("Editor"),
+            ),
+            KeyBinding::new("cmd-a", editor::actions::SelectAll, Some("Editor")),
+            KeyBinding::new("cmd-c", editor::actions::Copy, Some("Editor")),
+            KeyBinding::new("escape", editor::actions::Cancel, Some("Editor")),
             // As a person's keymap written for the gallery has it.
             KeyBinding::new("ctrl-shift-e", MoveToLast, Some("Gallery")),
         ]);
@@ -2050,4 +2075,1140 @@ async fn a_format_change_draws_the_cards_once(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     assert_eq!(grid_renders(&cards, cx), before);
+}
+
+// ---- filters and order (spec 048, slice 5) ----
+
+/// As [`notes_answering`], under what a page asks: a text its first filter holds narrows the
+/// notes to those whose title or slug holds it, and an order by title descending turns them
+/// around. One page: the tests that use it hold fewer notes than a page reads.
+fn notes_under(total: usize) -> impl Fn(&Value) -> Value + Send + Sync + 'static {
+    move |request: &Value| {
+        let holds = request["params"]["f0"].as_str().map(str::to_owned);
+        let mut notes: Vec<usize> = (0..total)
+            .filter(|i| {
+                holds.as_ref().is_none_or(|text| {
+                    format!("Note {i}").contains(text.as_str())
+                        || format!("n{i:03}").contains(text.as_str())
+                })
+            })
+            .collect();
+        if request["query"]
+            .as_str()
+            .is_some_and(|text| text.contains("title desc"))
+        {
+            notes.reverse();
+        }
+        match request["name"].as_str().unwrap_or_default() {
+            "studio_count" => json!([{ "n": notes.len() }]),
+            "studio_page" if request["params"]["after"].is_null() => {
+                Value::from(notes.into_iter().map(note).collect::<Vec<_>>())
+            }
+            "studio_nodes_by_id" => Value::from(
+                request["params"]["ids"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|id| id.as_str()?.trim_start_matches('n').parse::<usize>().ok())
+                    .filter(|&i| i < total)
+                    .map(note)
+                    .collect::<Vec<_>>(),
+            ),
+            _ => json!([]),
+        }
+    }
+}
+
+/// Writes a filter through the bar as a person does: ⌘F opens the draft, its key and its test
+/// are set as their menus set them, the value is typed and ↵ applies it. A test that takes no
+/// value ("today", "is empty") has no field to type in, and ↵ adds it all the same.
+fn write_filter(
+    cards: &Entity<TypeCards>,
+    property: &str,
+    op: FilterOp,
+    text: &str,
+    cx: &mut VisualTestContext,
+) {
+    cx.simulate_keystrokes("cmd-f");
+    cx.run_until_parked();
+    cards.update_in(cx, |cards, window, cx| {
+        assert!(cards.bar().draft.is_some(), "⌘F opens a filter to write");
+        cards.set_draft_property(property.into(), window, cx);
+        cards.set_draft_op(op, window, cx);
+    });
+    cx.run_until_parked();
+    if op.takes_value() {
+        cx.simulate_input(text);
+        cx.run_until_parked();
+    }
+    cx.simulate_keystrokes("enter");
+    settle(cx);
+}
+
+/// Another writer commits `commit` on the branch and the session's head watch finds it: the
+/// head is past the commit the cards show, and they offer Refresh.
+fn head_moves_to(
+    commit: &str,
+    session: &Entity<GraphSession>,
+    writer: &crate::test_support::Writer,
+    cards: &Entity<TypeCards>,
+    cx: &mut VisualTestContext,
+) {
+    writer.commit(commit, vec![changed("node", "Note", "n001", None)]);
+    session.update(cx, |session, cx| session.check_heads(cx));
+    cx.run_until_parked();
+    cards.read_with(cx, |cards, _| {
+        assert!(cards.newer, "Refresh is offered");
+        assert_ne!(cards.paging.pinned.as_deref(), Some(commit));
+    });
+}
+
+fn row_ids(cards: &Entity<TypeCards>, cx: &mut VisualTestContext) -> Vec<String> {
+    cards.read_with(cx, |cards, _| {
+        cards.rows.iter().map(|row| row.id.clone()).collect()
+    })
+}
+
+fn field_text(cards: &Entity<TypeCards>, cx: &mut VisualTestContext) -> String {
+    cards.read_with(cx, |cards, cx| cards.bar().editor.read(cx).text(cx))
+}
+
+/// Clicks the middle of what `selector` names in the last frame.
+fn click(selector: &'static str, cx: &mut VisualTestContext) {
+    let bounds = cx
+        .debug_bounds(selector)
+        .unwrap_or_else(|| panic!("{selector} is not drawn"));
+    cx.simulate_click(bounds.center(), Modifiers::none());
+    cx.run_until_parked();
+}
+
+/// A filter written in the bar reads the set again from its first page at the commit the tab
+/// shows, not at the head another writer moved meanwhile (constitution II). The cursor goes to
+/// the first card; the picks stay by id, as a table's selection does through a filter change,
+/// and the card a range of picks would start from goes. The tab's title and its key follow the
+/// filters, and ⌘⌥⌫ clears them, at the pin again.
+#[gpui::test]
+async fn a_filter_reads_again_at_the_pin_and_not_at_the_head(cx: &mut TestAppContext) {
+    init(cx);
+    let (session, writer, served) = session_served(NOTES, notes_under(12), cx);
+    let (cards, cx) = open(session.clone(), opening("Note"), cx);
+    cards.update_in(cx, |cards, window, cx| {
+        assert_eq!(cards.paging.pinned.as_deref(), Some("c1"));
+        assert_eq!(cards.rows.len(), 12);
+        assert_eq!(Item::tab_title(cards, cx), "Cards: Note");
+        assert!(cards.render_filter_bar(window, cx).is_none(), "no bar yet");
+    });
+    let first = served.sent("studio_page");
+    assert_eq!(first.len(), 1);
+    assert_eq!(
+        first[0]["snapshot"],
+        Value::Null,
+        "the tab opened at the head"
+    );
+    let key = cards.read_with(cx, Item::dedupe_key);
+
+    // Another writer commits: the head is past the commit the cards show.
+    head_moves_to("c2", &session, &writer, &cards, cx);
+    cx.simulate_keystrokes("right right x right x");
+    cards.read_with(cx, |cards, _| {
+        assert_eq!(cards.cursor, Some(3));
+        assert_eq!(cards.picks.len(), 2);
+        assert!(cards.pick_anchor.is_some());
+    });
+
+    write_filter(&cards, "title", FilterOp::Contains, "1", cx);
+    let pages = served.sent("studio_page");
+    assert_eq!(pages.len(), 2, "one read for the filter");
+    assert_eq!(pages[1]["snapshot"], json!("c1"), "asked at the pin");
+    assert_eq!(pages[1]["at"], json!("c1"), "and answered there");
+    assert_eq!(pages[1]["params"]["f0"], json!("1"));
+    assert_eq!(pages[1]["params"].get("after"), None, "from the first page");
+    assert_eq!(row_ids(&cards, cx), ["n001", "n010", "n011"]);
+    cards.update_in(cx, |cards, window, cx| {
+        assert_eq!(cards.paging.pinned.as_deref(), Some("c1"), "the pin holds");
+        assert!(cards.newer, "and Refresh is still offered");
+        assert_eq!(
+            cards.filters,
+            [Filter {
+                property: "title".into(),
+                op: FilterOp::Contains,
+                value: json!("1"),
+            }]
+        );
+        assert_eq!(cards.cursor, Some(0), "the cursor is on the first card");
+        assert_eq!(cards.count, Loadable::Loaded(3));
+        // As the table's selection: kept by id, shown or not; the range's start goes.
+        assert_eq!(
+            cards.picks.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["n002", "n003"]
+        );
+        assert_eq!(cards.pick_anchor, None);
+        assert!(cards.bar().draft.is_none());
+        assert!(
+            cards.focus_handle.is_focused(window),
+            "the keyboard is the cards'"
+        );
+        assert!(
+            cards.render_filter_bar(window, cx).is_some(),
+            "its pill shows"
+        );
+        assert_eq!(Item::tab_title(cards, cx), "Cards: Note, 1");
+        assert_ne!(
+            Item::dedupe_key(cards, cx),
+            key,
+            "the key is the set read now"
+        );
+        assert_eq!(
+            Item::dedupe_key(cards, cx),
+            Some(crate::cards_key(&cards.opening()).into())
+        );
+    });
+
+    // A second filter narrows what the first left; clearing them reads every note, at the pin.
+    write_filter(&cards, "title", FilterOp::Contains, "Note 1", cx);
+    cards.read_with(cx, |cards, cx| {
+        assert_eq!(cards.filters.len(), 2);
+        assert_eq!(Item::tab_title(cards, cx), "Cards: Note, 1, Note 1");
+    });
+    let pages = served.sent("studio_page");
+    assert_eq!((pages.len(), &pages[2]["snapshot"]), (3, &json!("c1")));
+    cx.simulate_keystrokes("cmd-alt-backspace");
+    settle(cx);
+    // The session holds what it read of every note at this commit, which never changes: the
+    // server is asked nothing, and no read of the head stands in for it.
+    assert_eq!(served.sent("studio_page").len(), 3);
+    cards.read_with(cx, |cards, cx| {
+        assert!(cards.filters.is_empty());
+        assert_eq!(cards.rows.len(), 12);
+        assert_eq!(cards.cursor, Some(0));
+        assert_eq!(cards.paging.pinned.as_deref(), Some("c1"));
+        assert!(cards.newer);
+        assert_eq!(Item::tab_title(cards, cx), "Cards: Note");
+        assert_eq!(Item::dedupe_key(cards, cx), key);
+    });
+
+    // Refresh is what reads the head.
+    cx.simulate_keystrokes("cmd-r");
+    settle(cx);
+    cards.read_with(cx, |cards, _| {
+        assert_eq!(cards.paging.pinned.as_deref(), Some("c2"));
+        assert!(!cards.newer);
+    });
+}
+
+/// The Sort chip's menu orders the cards by a property, and its direction turns them: each
+/// reads the set again from its first page at the pin, the cursor on the first card. The chip's
+/// × puts them back in the order of their ids.
+#[gpui::test]
+async fn sort_orders_the_cards_and_reads_at_the_pin(cx: &mut TestAppContext) {
+    init(cx);
+    let (session, writer, served) = session_served(NOTES, notes_under(8), cx);
+    let (cards, cx) = open(session.clone(), opening("Note"), cx);
+    head_moves_to("c2", &session, &writer, &cards, cx);
+    cx.simulate_keystrokes("right right");
+    cards.read_with(cx, |cards, _| {
+        assert_eq!(cards.cursor, Some(2));
+        assert_eq!(
+            crate::model::sort_choices(&cards.all_columns),
+            [("title".to_owned(), "title".to_owned())],
+            "what the menu lists: the properties rows can be ordered by, and no file"
+        );
+    });
+
+    // The menu, as a click on the chip opens it: no order, title, then the direction.
+    let menu = cards.read_with(cx, |cards, _| cards.sort_menu.clone());
+    cx.update(|window, cx| menu.show(window, cx));
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        window.simulate_next_frame(cx);
+        window.simulate_next_frame(cx);
+    });
+    for _ in 0..2 {
+        cx.dispatch_action(menu::SelectNext);
+    }
+    cx.dispatch_action(menu::Confirm);
+    settle(cx);
+    cards.read_with(cx, |cards, cx| {
+        assert_eq!(
+            cards.sort,
+            Some(Sort {
+                property: "title".into(),
+                descending: false,
+            })
+        );
+        assert_eq!(cards.cursor, Some(0));
+        assert_eq!(cards.paging.pinned.as_deref(), Some("c1"));
+        assert_eq!(
+            Item::tab_title(cards, cx),
+            "Cards: Note",
+            "an order is no filter"
+        );
+    });
+    let pages = served.sent("studio_page");
+    assert_eq!(pages.len(), 2);
+    assert_eq!(pages[1]["snapshot"], json!("c1"));
+    assert!(
+        pages[1]["query"].as_str().unwrap().contains("$n.title asc"),
+        "{}",
+        pages[1]["query"]
+    );
+
+    cx.simulate_keystrokes("right");
+    cards.update(cx, |cards, cx| {
+        cards.set_sort(
+            Some(Sort {
+                property: "title".into(),
+                descending: true,
+            }),
+            cx,
+        )
+    });
+    settle(cx);
+    let pages = served.sent("studio_page");
+    assert_eq!(pages.len(), 3);
+    assert_eq!(pages[2]["snapshot"], json!("c1"));
+    assert!(
+        pages[2]["query"]
+            .as_str()
+            .unwrap()
+            .contains("$n.title desc")
+    );
+    assert_eq!(row_ids(&cards, cx)[0], "n007", "in the order read");
+    cards.read_with(cx, |cards, _| assert_eq!(cards.cursor, Some(0)));
+
+    // The same order again reads nothing; one the type cannot give is left.
+    cards.update(cx, |cards, cx| {
+        let same = cards.sort.clone();
+        cards.set_sort(same, cx);
+        cards.set_sort(
+            Some(Sort {
+                property: "attachment".into(),
+                descending: false,
+            }),
+            cx,
+        );
+    });
+    settle(cx);
+    assert_eq!(served.sent("studio_page").len(), 3);
+
+    // The chip's ×: the order of their ids, which the session read at this commit when the
+    // tab opened, so the server is asked nothing.
+    let clear = cx.debug_bounds("chip-clear").expect("a set chip has its ×");
+    cx.simulate_click(clear.center(), Modifiers::none());
+    settle(cx);
+    assert_eq!(served.sent("studio_page").len(), 3);
+    cards.read_with(cx, |cards, _| {
+        assert_eq!(cards.sort, None);
+        assert_eq!(cards.paging.pinned.as_deref(), Some("c1"));
+        assert_eq!(cards.rows.len(), 8);
+    });
+    assert_eq!(row_ids(&cards, cx)[0], "n000");
+}
+
+/// A date preset is kept as the preset: each read is sent the days it means on the day of the
+/// read, and the tab saves "today", not a date. So a tab left open, or restored, does not show
+/// the day it was opened.
+#[gpui::test]
+async fn a_date_preset_is_resolved_at_each_read_and_saved_as_itself(cx: &mut TestAppContext) {
+    init(cx);
+    let (session, _, served) = session_served(TASKS, tasks_answering(6), cx);
+    let (cards, cx) = open(session, opening("Task"), cx);
+    let before = chrono::Local::now();
+    write_filter(&cards, "due", FilterOp::Today, "", cx);
+    let preset = Filter {
+        property: "due".into(),
+        op: FilterOp::Today,
+        value: Value::Null,
+    };
+    cards.read_with(cx, |cards, cx| {
+        assert_eq!(
+            cards.filters,
+            std::slice::from_ref(&preset),
+            "kept as the preset"
+        );
+        let saved = Item::serialize(cards, cx).expect("saved");
+        assert_eq!(
+            saved.data["filters"],
+            json!([{ "property": "due", "op": "Today", "value": null }]),
+            "and saved as it"
+        );
+        assert_eq!(cards.opening().filters, saved.data.get("filters").cloned());
+    });
+    // The days of the read: today's, whichever side of midnight the test ran.
+    let days = |now| crate::model::preset_range(FilterOp::Today, Some(ScalarKind::Date), now);
+    let sent = |read: &Value| json!([read["params"]["f0"], read["params"]["f0_end"]]);
+    let today = [days(before), days(chrono::Local::now())];
+    let pages = served.sent("studio_page");
+    assert_eq!(pages.len(), 2);
+    assert!(today.contains(&sent(&pages[1])), "{}", pages[1]["params"]);
+
+    // Read again, the preset is resolved again: the tab holds no date to send.
+    cx.simulate_keystrokes("cmd-r");
+    settle(cx);
+    let pages = served.sent("studio_page");
+    assert_eq!(pages.len(), 3);
+    let today = [days(before), days(chrono::Local::now())];
+    assert!(today.contains(&sent(&pages[2])), "{}", pages[2]["params"]);
+    cards.read_with(cx, |cards, _| {
+        assert_eq!(cards.filters, std::slice::from_ref(&preset));
+    });
+}
+
+/// A filter on a property the schema no longer has is dropped when the tab takes the schema,
+/// with the test the table's schema load makes ([`filter_stands`]), and the bar says which:
+/// at opening, for a saved tab, and at a refresh after another writer changed the schema. An
+/// order by a property that is gone goes with it. The notice goes with the next change.
+#[gpui::test]
+async fn a_filter_the_schema_lost_is_dropped_and_said(cx: &mut TestAppContext) {
+    init(cx);
+    let (session, writer, served) = session_served(NOTES, notes_under(12), cx);
+    // A saved tab whose filter names a property the schema never had.
+    let mut saved = opening("Note");
+    saved.filters = Some(json!([
+        { "property": "topic", "op": "Eq", "value": "design" },
+        { "property": "title", "op": "Contains", "value": "1" },
+    ]));
+    saved.sort = Some(json!({ "property": "title", "descending": true }));
+    let (cards, cx) = open(session.clone(), saved, cx);
+    let title = Filter {
+        property: "title".into(),
+        op: FilterOp::Contains,
+        value: json!("1"),
+    };
+    cards.update_in(cx, |cards, window, cx| {
+        assert_eq!(
+            cards.filters,
+            std::slice::from_ref(&title),
+            "the one it can read under"
+        );
+        assert_eq!(cards.lost, ["topic"]);
+        assert!(cards.bar_note().is_some(), "and the bar says so");
+        assert!(cards.render_filter_bar(window, cx).is_some());
+        assert_eq!(Item::tab_title(cards, cx), "Cards: Note, 1");
+        assert!(!Item::keeps_preview(cards, cx), "not the person's change");
+    });
+    let pages = served.sent("studio_page");
+    assert_eq!(pages.len(), 1, "read once, without it");
+    assert_eq!(pages[0]["params"]["f0"], json!("1"));
+    assert_eq!(pages[0]["params"].get("f1"), None);
+    assert_eq!(row_ids(&cards, cx), ["n011", "n010", "n001"]);
+
+    // Another writer drops the title: the tab keeps what it shows until it is refreshed.
+    let untitled = "node Note {\n  slug: String @key\n  body: String?\n  attachment: Blob?\n  scan: Blob?\n}\n";
+    writer.set_schema(untitled);
+    writer.commit("c2", vec![changed("node", "Note", "n001", None)]);
+    session.update(cx, |session, cx| session.check_heads(cx));
+    cx.run_until_parked();
+    cards.read_with(cx, |cards, _| {
+        assert!(cards.newer, "Refresh is offered");
+        assert_eq!(cards.filters, std::slice::from_ref(&title));
+        assert!(cards.sort.is_some());
+    });
+    cx.simulate_keystrokes("cmd-r");
+    settle(cx);
+    cards.update_in(cx, |cards, window, cx| {
+        assert_eq!(&*cards.schema.as_ref().unwrap().source, untitled);
+        assert!(cards.filters.is_empty(), "the filter on the title went");
+        assert_eq!(cards.sort, None, "and the order by it");
+        assert_eq!(cards.lost, ["title"], "said in place of the last notice");
+        assert!(
+            cards.render_filter_bar(window, cx).is_some(),
+            "the bar shows for it"
+        );
+        assert_eq!(cards.rows.len(), 12);
+        assert_eq!(Item::tab_title(cards, cx), "Cards: Note");
+        // The menus follow the schema.
+        assert!(
+            !cards
+                .filter_choices()
+                .iter()
+                .any(|(key, _, _)| key == "title")
+        );
+    });
+    let last = served.sent("studio_page").pop().unwrap();
+    assert_eq!(last["params"].get("f0"), None);
+    assert!(!last["query"].as_str().unwrap().contains("title"));
+
+    // The next change of the filters takes the notice with it.
+    write_filter(&cards, "body", FilterOp::Contains, "n00", cx);
+    cards.update_in(cx, |cards, window, cx| {
+        assert!(cards.lost.is_empty() && cards.bar_note().is_none());
+        assert_eq!(cards.filters.len(), 1);
+        assert!(cards.render_filter_bar(window, cx).is_some(), "its pill");
+    });
+}
+
+/// A tab of rows selected in a table says so in a pill before any filter, and its Filters and
+/// Sort chips are off, each saying why: its rows are the ones listed. Clearing the pill shows
+/// the type's rows with no filter, at the commit the tab shows, and the chips work.
+#[gpui::test]
+async fn a_tab_of_selected_rows_says_so_until_its_pill_is_cleared(cx: &mut TestAppContext) {
+    init(cx);
+    let (session, writer, served) = session_served(NOTES, notes_under(12), cx);
+    let mut listed = opening("Note");
+    listed.title = "Note, 3 selected rows".into();
+    listed.ids = Some(vec!["n003".into(), "n001".into(), "n002".into()]);
+    let (cards, cx) = open(session.clone(), listed, cx);
+    head_moves_to("c2", &session, &writer, &cards, cx);
+    assert_eq!(row_ids(&cards, cx), ["n003", "n001", "n002"]);
+    cards.update_in(cx, |cards, window, cx| {
+        assert_eq!(Item::tab_title(cards, cx), "Cards: Note, 3 selected rows");
+        assert_eq!(
+            cards.listed_note().as_deref(),
+            Some("Showing 3 selected rows. Clear the pill to filter Note")
+        );
+        let status = Item::status(cards, window, cx).expect("a status");
+        assert!(
+            !status.keys.iter().any(|key| key.label == "Add a filter"),
+            "the status bar offers no key that would do nothing"
+        );
+    });
+    assert!(
+        cx.debug_bounds("cards-listed").is_some(),
+        "the pill is drawn"
+    );
+
+    // ⌘F, the Filters chip and the Sort chip do nothing meanwhile.
+    cx.simulate_keystrokes("cmd-f cmd-alt-backspace");
+    click("cards-filters", cx);
+    click("cards-sort", cx);
+    cards.update(cx, |cards, cx| {
+        cards.set_sort(
+            Some(Sort {
+                property: "title".into(),
+                descending: true,
+            }),
+            cx,
+        )
+    });
+    settle(cx);
+    cards.read_with(cx, |cards, _| {
+        assert!(cards.bar().draft.is_none(), "no filter is written");
+        assert!(!cards.sort_menu.is_deployed(), "no order is offered");
+        assert_eq!(cards.sort, None);
+        assert_eq!(cards.rows.len(), 3);
+    });
+    assert_eq!(
+        served.sent("studio_page").len(),
+        0,
+        "listed rows are read by id"
+    );
+
+    // The pill's ×.
+    click("set-pill-clear", cx);
+    settle(cx);
+    let pages = served.sent("studio_page");
+    assert_eq!(pages.len(), 1);
+    assert_eq!(
+        pages[0]["snapshot"],
+        json!("c1"),
+        "at the commit the tab shows"
+    );
+    assert_eq!(pages[0]["params"].get("f0"), None, "under no filter");
+    cards.read_with(cx, |cards, cx| {
+        assert_eq!(cards.ids, None);
+        assert_eq!(cards.rows.len(), 12);
+        assert_eq!(cards.count, Loadable::Loaded(12));
+        assert_eq!(cards.cursor, Some(0));
+        assert_eq!(cards.listed_note(), None);
+        assert_eq!(Item::tab_title(cards, cx), "Cards: Note");
+        assert!(Item::keeps_preview(cards, cx), "the person changed the set");
+        let saved = Item::serialize(cards, cx).expect("saved");
+        assert_eq!(
+            saved.data["ids"],
+            Value::Null,
+            "and it is saved as the type's"
+        );
+    });
+    assert!(
+        cx.debug_bounds("cards-listed").is_none(),
+        "the pill is gone"
+    );
+
+    // The chips are the type's now.
+    click("cards-filters", cx);
+    cards.update_in(cx, |cards, window, cx| {
+        assert!(
+            cards.bar().draft.is_some(),
+            "Filters opens a filter to write"
+        );
+        assert!(cards.bar().editor.focus_handle(cx).is_focused(window));
+    });
+    cx.simulate_keystrokes("escape");
+    click("cards-sort", cx);
+    cards.read_with(cx, |cards, _| assert!(cards.sort_menu.is_deployed()));
+}
+
+/// While the filter's value field has the keyboard its keys are the text's: the arrows and
+/// Home move in it, ⌘A selects it, ⌘C copies it and a letter is typed, and none of them moves
+/// the cursor, picks a card or opens anything. ↵ applies the filter and opens no page; the
+/// next ↵, the cards', opens the page of the first card.
+#[gpui::test]
+async fn keys_typed_in_the_value_field_are_the_texts(cx: &mut TestAppContext) {
+    init(cx);
+    let (session, _, _) = session_served(NOTES, notes_under(12), cx);
+    let heard: Rc<RefCell<Vec<String>>> = Rc::default();
+    cx.update(|cx| {
+        let log = heard.clone();
+        cx.on_action(move |open: &OpenNodePage, _| log.borrow_mut().push(open.id.clone()));
+        let log = heard.clone();
+        cx.on_action(move |show: &ShowNodeOnCanvas, _| {
+            log.borrow_mut().push(format!("canvas {}", show.id));
+        });
+    });
+    let (cards, cx) = open(session, opening("Note"), cx);
+    cx.simulate_keystrokes("right x");
+    cx.simulate_keystrokes("cmd-f");
+    cx.run_until_parked();
+    cards.update_in(cx, |cards, window, cx| {
+        cards.set_draft_op(FilterOp::Contains, window, cx);
+        assert!(cards.bar().editor.focus_handle(cx).is_focused(window));
+    });
+    cx.run_until_parked();
+    let state = |cx: &mut VisualTestContext| {
+        cards.read_with(cx, |cards, _| {
+            (cards.cursor, cards.picks.len(), cards.format.size)
+        })
+    };
+    let before = state(cx);
+    assert_eq!(before, (Some(1), 1, CardSize::Medium));
+
+    cx.simulate_input("ab");
+    // ← moves the caret, so the next letter lands before the last.
+    cx.simulate_keystrokes("left");
+    cx.simulate_input("X");
+    assert_eq!(field_text(&cards, cx), "aXb");
+    cx.simulate_keystrokes("home");
+    cx.simulate_input("H");
+    assert_eq!(field_text(&cards, cx), "HaXb");
+    // The cards' other arrows and End have nothing to move in a field of one line.
+    cx.simulate_keystrokes("right down up end");
+    assert_eq!(state(cx), before, "no arrow moved the cursor");
+    // ⌘A selects the text, not every card; ⌘C copies it, not an id.
+    cx.simulate_keystrokes("cmd-a cmd-c");
+    assert_eq!(state(cx), before, "⌘A picked cards");
+    assert_eq!(
+        cx.read_from_clipboard()
+            .and_then(|item| item.text())
+            .as_deref(),
+        Some("HaXb")
+    );
+    // The letters the cards act on are typed: over the selection, then after it.
+    cx.simulate_keystrokes("g x f = - space");
+    assert_eq!(field_text(&cards, cx), "gxf=- ");
+    assert_eq!(state(cx), before, "a letter acted on the cards");
+    assert!(heard.borrow().is_empty(), "{:?}", heard.borrow());
+
+    cx.simulate_keystrokes("cmd-a");
+    cx.simulate_input("Note 1");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    settle(cx);
+    assert!(heard.borrow().is_empty(), "↵ in the field opened a page");
+    cards.update_in(cx, |cards, window, _| {
+        assert_eq!(
+            cards.filters,
+            [Filter {
+                property: "title".into(),
+                op: FilterOp::Contains,
+                value: json!("Note 1"),
+            }]
+        );
+        assert!(cards.bar().draft.is_none());
+        assert!(cards.focus_handle.is_focused(window));
+    });
+    assert_eq!(row_ids(&cards, cx), ["n001", "n010", "n011"]);
+    // The keyboard is the cards' again.
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(*heard.borrow(), ["n001"]);
+    cx.simulate_keystrokes("right");
+    cards.read_with(cx, |cards, _| assert_eq!(cards.cursor, Some(1)));
+}
+
+/// Esc closes the filter being written and leaves the picks; with no draft it takes the picks
+/// out.
+#[gpui::test]
+async fn esc_closes_the_draft_first_and_clears_the_picks_second(cx: &mut TestAppContext) {
+    init(cx);
+    let (session, _, served) = session_served(NOTES, notes_under(12), cx);
+    let (cards, cx) = open(session, opening("Note"), cx);
+    cx.simulate_keystrokes("x right x");
+    cx.simulate_keystrokes("cmd-f");
+    cx.run_until_parked();
+    cx.simulate_input("des");
+    cards.update_in(cx, |cards, window, cx| {
+        assert_eq!(cards.picks.len(), 2);
+        assert!(cards.bar().draft.is_some());
+        assert!(cards.bar().editor.focus_handle(cx).is_focused(window));
+    });
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cards.update_in(cx, |cards, window, _| {
+        assert!(cards.bar().draft.is_none(), "Esc closed the draft");
+        assert_eq!(cards.picks.len(), 2, "and left the picks");
+        assert!(cards.filters.is_empty(), "nothing was filtered");
+        assert!(cards.focus_handle.is_focused(window));
+    });
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cards.read_with(cx, |cards, _| assert!(cards.picks.is_empty()));
+    assert_eq!(served.sent("studio_page").len(), 1, "no read for either");
+
+    // A draft closed under its field, here by ⌘⌥⌫ over a filter and a draft, leaves the
+    // keyboard with the cards: the next key is theirs.
+    write_filter(&cards, "title", FilterOp::Contains, "Note", cx);
+    cx.simulate_keystrokes("cmd-f");
+    cx.run_until_parked();
+    cards.update_in(cx, |cards, window, cx| {
+        assert!(cards.bar().editor.focus_handle(cx).is_focused(window));
+    });
+    cx.simulate_keystrokes("cmd-alt-backspace");
+    settle(cx);
+    cards.update_in(cx, |cards, window, _| {
+        assert!(cards.bar().draft.is_none() && cards.filters.is_empty());
+        assert!(
+            cards.focus_handle.is_focused(window),
+            "the cards have the keyboard"
+        );
+        assert_eq!(cards.cursor, Some(0));
+    });
+    cx.simulate_keystrokes("right");
+    cards.read_with(cx, |cards, _| assert_eq!(cards.cursor, Some(1)));
+}
+
+/// A key typed in the filter's value field, and a move through the values it offers, draw the
+/// cards no times: the field is what changed, and the cards are a cached view beside it
+/// (`docs/drawing.md`). A filter applied draws them once, without their rows, and once for
+/// each read that lands: the page, then the count.
+#[gpui::test]
+async fn typing_a_filter_draws_the_cards_no_times(cx: &mut TestAppContext) {
+    init(cx);
+    // More tasks than a first page holds, so their count is a read of its own.
+    let answer = |request: &Value| {
+        let limit = request["query"]
+            .as_str()
+            .and_then(|text| text.split("limit ").nth(1))
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|n| n.parse::<usize>().ok())
+            .unwrap_or(300);
+        match request["name"].as_str().unwrap_or_default() {
+            "studio_count" => json!([{ "n": 300 }]),
+            "studio_page" => {
+                let from = request["params"]["after"].as_str().map_or(0, |after| {
+                    after.trim_start_matches('t').parse::<usize>().unwrap_or(0) + 1
+                });
+                Value::from((from..300).take(limit).map(task).collect::<Vec<_>>())
+            }
+            _ => json!([]),
+        }
+    };
+    let (session, _, served) = session_served(TASKS, answer, cx);
+    // No cover: the only reads are the rows'.
+    let format = CardFormat {
+        cover: CardCover::None,
+        ..CardFormat::default()
+    };
+    let (cards, cx) = open_with(session, opening("Task"), Some(format), cx);
+    // The first key switches GPUI to keyboard input, which draws the window once.
+    cx.simulate_keystrokes("right");
+    cx.simulate_keystrokes("cmd-f");
+    cx.run_until_parked();
+    cards.update_in(cx, |cards, window, cx| {
+        cards.set_draft_property("name".into(), window, cx);
+        cards.set_draft_op(FilterOp::Contains, window, cx);
+    });
+    cx.run_until_parked();
+
+    let before = grid_renders(&cards, cx);
+    for key in ["T", "a", "s", "k"] {
+        cx.simulate_input(key);
+        cx.run_until_parked();
+    }
+    cx.simulate_keystrokes("left home");
+    cx.run_until_parked();
+    assert_eq!(field_text(&cards, cx), "Task");
+    assert_eq!(grid_renders(&cards, cx), before, "typing drew the cards");
+
+    // An enum's field offers its members: ↓ and ↑ highlight one, and draw only the offers.
+    cards.update_in(cx, |cards, window, cx| {
+        cards.set_draft_property("state".into(), window, cx);
+        cards.set_draft_op(FilterOp::Eq, window, cx);
+    });
+    cx.run_until_parked();
+    let before = grid_renders(&cards, cx);
+    let highlighted = |cx: &mut VisualTestContext| {
+        cards.read_with(cx, |cards, _| {
+            let offers = &cards.bar().draft.as_ref().unwrap().offers;
+            (offers.len(), offers.highlighted())
+        })
+    };
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    assert_eq!(highlighted(cx), (2, Some(0)));
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    assert_eq!(highlighted(cx), (2, Some(1)));
+    cx.simulate_keystrokes("up");
+    cx.run_until_parked();
+    assert_eq!(highlighted(cx), (2, Some(0)));
+    cards.read_with(cx, |cards, _| {
+        assert_eq!(
+            cards.cursor,
+            Some(1),
+            "↓ moved in the offers, not the cards"
+        );
+    });
+    assert_eq!(
+        grid_renders(&cards, cx),
+        before,
+        "a move in the offers drew the cards"
+    );
+
+    // ↵ takes the highlighted member and filters: the cards are drawn once without their
+    // rows, then once as the page lands and once as the count does.
+    let page = served.hold(|read| read["name"] == "studio_page");
+    let count = served.hold(|read| read["name"] == "studio_count");
+    let before = grid_renders(&cards, cx);
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    cards.read_with(cx, |cards, _| {
+        assert_eq!(cards.filters.len(), 1, "the filter is applied");
+        assert!(matches!(cards.first_page, Loadable::Loading));
+    });
+    assert_eq!(grid_renders(&cards, cx), before + 1, "one draw to apply it");
+    page.send(()).unwrap();
+    cx.run_until_parked();
+    cards.read_with(cx, |cards, _| {
+        assert_eq!(cards.rows.len(), 200);
+        assert_eq!(cards.count, Loadable::Loading);
+    });
+    assert_eq!(grid_renders(&cards, cx), before + 2, "one for the page");
+    count.send(()).unwrap();
+    cx.run_until_parked();
+    cards.read_with(cx, |cards, _| {
+        assert_eq!(cards.count, Loadable::Loaded(300))
+    });
+    assert_eq!(grid_renders(&cards, cx), before + 3, "one for the count");
+    settle(cx);
+    assert_eq!(grid_renders(&cards, cx), before + 3, "and no more");
+}
+
+/// A preview tab is replaced by the next preview until the person changes its filters, its
+/// order or its format: then it is theirs, and the next preview opens beside it (spec 020).
+#[gpui::test]
+async fn a_preview_tab_the_person_changed_is_kept(cx: &mut TestAppContext) {
+    init(cx);
+    cx.update(crate::init);
+    let (session, _) = session_with_files(NOTES, notes_under(12), None, cx);
+    cx.run_until_parked();
+    let (workspace, cx) = cx.add_window_view(Workspace::new);
+    workspace.update_in(cx, |workspace, window, cx| {
+        // The tabs another test of this binary left open for the graph are not this one's.
+        workspace.start_with_no_saved_tabs();
+        workspace.set_session(session.clone(), window, cx)
+    });
+    cx.run_until_parked();
+    let preview = |ids: Option<Vec<String>>, cx: &mut VisualTestContext| {
+        let opening = ShowSetInCards {
+            ids,
+            preview: true,
+            ..opening("Note")
+        };
+        let cards = workspace
+            .update_in(cx, |workspace, window, cx| {
+                crate::open_cards(workspace, opening, None, window, cx)
+            })
+            .expect("a Cards tab opens");
+        settle(cx);
+        cards
+    };
+    let tabs = |cx: &mut VisualTestContext| {
+        workspace.read_with(cx, |workspace, _| {
+            (workspace.items().len(), workspace.active_tab_is_preview())
+        })
+    };
+    let listed = |id: &str| Some(vec![id.to_owned()]);
+
+    // Untouched, a preview gives its place to the next.
+    let first = preview(None, cx);
+    assert_eq!(tabs(cx), (1, true));
+    first.read_with(cx, |cards, cx| assert!(!Item::keeps_preview(cards, cx)));
+    let second = preview(listed("n001"), cx);
+    assert_eq!(tabs(cx), (1, true), "the preview was replaced");
+
+    // An order, a filter and a format each keep the tab they were made in.
+    type Change = fn(&mut TypeCards, &mut Context<TypeCards>);
+    let changes: [(&str, Change); 3] = [
+        ("an order", |cards, cx| {
+            cards.set_sort(
+                Some(Sort {
+                    property: "title".into(),
+                    descending: true,
+                }),
+                cx,
+            )
+        }),
+        ("a filter", |cards, cx| {
+            cards.filters.push(Filter {
+                property: "title".into(),
+                op: FilterOp::Contains,
+                value: json!("1"),
+            });
+            cards.filters_changed(cx);
+        }),
+        ("a format", |cards, cx| cards.set_size(CardSize::Large, cx)),
+    ];
+    drop(second);
+    for (count, (what, change)) in changes.into_iter().enumerate() {
+        let cards = preview(None, cx);
+        assert_eq!(tabs(cx), (count + 1, true), "{what}: a preview opens");
+        cards.update(cx, change);
+        settle(cx);
+        cards.read_with(cx, |cards, cx| {
+            assert!(Item::keeps_preview(cards, cx), "{what} keeps the tab");
+        });
+        assert_eq!(tabs(cx), (count + 1, false), "{what}: the tab is kept");
+        // The next preview opens beside it.
+        preview(listed("n002"), cx);
+        assert_eq!(
+            tabs(cx),
+            (count + 2, true),
+            "{what}: the next opens beside it"
+        );
+    }
+}
+
+/// A saved tab comes back with its filters, a date preset still a preset, its order and its
+/// format, reads its rows under them, and names itself by them.
+#[gpui::test]
+async fn a_saved_tab_comes_back_with_its_filters_order_and_format(cx: &mut TestAppContext) {
+    init(cx);
+    cx.update(crate::init);
+    let (session, _, served) = session_served(TASKS, tasks_answering(6), cx);
+    let (cards, cx) = open(session.clone(), opening("Task"), cx);
+    write_filter(&cards, "name", FilterOp::Contains, "Task", cx);
+    write_filter(&cards, "due", FilterOp::ThisWeek, "", cx);
+    cards.update(cx, |cards, cx| {
+        cards.set_sort(
+            Some(Sort {
+                property: "points".into(),
+                descending: true,
+            }),
+            cx,
+        );
+        cards.set_size(CardSize::Large, cx);
+        cards.hide_field("notes", cx);
+    });
+    settle(cx);
+    let (saved, filters, format, title) = cards.read_with(cx, |cards, cx| {
+        (
+            Item::serialize(cards, cx).expect("saved"),
+            cards.filters.clone(),
+            cards.format.clone(),
+            Item::tab_title(cards, cx),
+        )
+    });
+    assert_eq!(saved.kind, "cards");
+    assert_eq!(
+        saved.data["filters"],
+        json!([
+            { "property": "name", "op": "Contains", "value": "Task" },
+            { "property": "due", "op": "ThisWeek", "value": null },
+        ])
+    );
+    assert_eq!(
+        saved.data["sort"],
+        json!({ "property": "points", "descending": true })
+    );
+    assert_eq!(saved.data["format"]["size"], json!("large"));
+    assert_eq!(title, "Cards: Task, Task, due is this week");
+
+    // In another window, as the next launch restores it.
+    let (workspace, cx) = cx.add_window_view(Workspace::new);
+    workspace.update_in(cx, |workspace, window, cx| {
+        // The tabs another test of this binary left open for the graph are not this one's.
+        workspace.start_with_no_saved_tabs();
+        workspace.set_session(session.clone(), window, cx)
+    });
+    cx.run_until_parked();
+    let read_before = served.sent("studio_page").len();
+    let opened = workspace.update_in(cx, |workspace, window, cx| {
+        workspace.reopen_saved(&saved, window, cx)
+    });
+    settle(cx);
+    assert!(opened);
+    let back = workspace
+        .read_with(cx, |workspace, _| {
+            workspace
+                .active_item()
+                .and_then(|item| item.to_any().downcast::<TypeCards>().ok())
+        })
+        .expect("a Cards tab is open");
+    assert_ne!(back.entity_id(), cards.entity_id());
+    back.read_with(cx, |back, cx| {
+        assert_eq!(back.filters, filters, "its filters, the preset a preset");
+        assert_eq!(
+            back.sort,
+            Some(Sort {
+                property: "points".into(),
+                descending: true,
+            })
+        );
+        assert_eq!(back.format, format);
+        assert!(!field_names(back).contains(&"notes"));
+        assert_eq!(Item::tab_title(back, cx), title);
+        assert_eq!(back.rows.len(), 6, "and it read its rows");
+        assert!(!Item::keeps_preview(back, cx), "restored, not changed");
+    });
+    let pages = served.sent("studio_page");
+    let page = &pages[read_before];
+    assert_eq!(page["params"]["f0"], json!("Task"));
+    assert!(page["params"]["f1"].is_string(), "the week's days: {page}");
+    assert!(page["query"].as_str().unwrap().contains("$n.points desc"));
+}
+
+/// A filter keeps what was read at the commit it stays at. The cover of a card it still shows
+/// is not read again. On a branch its marks stay, the rows the branch removed stand first
+/// again, and the cursor is on the first card the branch still has. A preview kept of a row
+/// the filter no longer shows is let go past the cap, as one scrolled far away is.
+#[gpui::test]
+async fn a_filter_keeps_the_covers_and_the_branchs_marks(cx: &mut TestAppContext) {
+    init(cx);
+    let note_type = json!({ "id": "Note", "name": "Note" });
+    let changes = json!([
+        { "kind": "node", "type": note_type, "id": "n001", "op": "insert",
+          "before": null, "after": { "properties": { "slug": "n001", "title": "Note 1" } } },
+        { "kind": "node", "type": note_type, "id": "n900", "op": "delete",
+          "before": { "properties": { "slug": "n900", "title": "Gone" } }, "after": null },
+    ]);
+    let (session, blobs) = session_with_files(NOTES, notes_under(12), Some(changes), cx);
+    for i in 0..12 {
+        blobs.set(&format!("Note/n{i:03}/attachment"), &png(40, 30, false));
+    }
+    cx.run_until_parked();
+    session.update(cx, |session, cx| session.set_branch("fix".into(), cx));
+    let (cards, cx) = open(session, opening("Note"), cx);
+    cards.read_with(cx, |cards, _| {
+        assert_eq!(cards.rows.len(), 13);
+        assert_eq!(cards.rows[0].id, "n900");
+        for row in 0..12 {
+            assert!(
+                matches!(cards.covers[&cover_key(row)].look, Loadable::Loaded(_)),
+                "cover {row}"
+            );
+        }
+    });
+    blobs.reads.lock().unwrap().clear();
+    let diffs = cards.read_with(cx, |cards, _| cards.diff.clone().map(|diff| diff.counts()));
+
+    write_filter(&cards, "title", FilterOp::Contains, "1", cx);
+    assert_eq!(row_ids(&cards, cx), ["n900", "n001", "n010", "n011"]);
+    cards.update(cx, |cards, cx| {
+        assert_eq!(cards.cursor, Some(1), "the first card the branch still has");
+        assert_eq!(cards.selected_row_id(), Some("n001"));
+        assert_eq!(cards.change_of("n001"), Some(NetChange::Added));
+        assert!(cards.is_removed("n900"));
+        assert_eq!(cards.diff.as_ref().map(|diff| diff.counts()), diffs);
+        assert!(!cards.diff_pending);
+        assert!(matches!(
+            cards.covers[&cover_key(1)].look,
+            Loadable::Loaded(Look::Image { .. })
+        ));
+        // Past the cap, what the filter no longer shows is let go; what it shows is laid out
+        // and stays.
+        let hidden = [0, 2, 3, 4, 5, 6, 7, 8, 9].map(cover_key);
+        for key in &hidden {
+            assert!(cards.covers[key].held() > 0, "kept through the filter");
+        }
+        cards.held = 2 * PREVIEWS_HELD;
+        cards.let_go_past_cap(cx);
+        for key in &hidden {
+            assert_eq!(cards.covers[key].held(), 0, "{key:?} is still held");
+        }
+        for shown in [1, 10, 11] {
+            assert!(cards.covers[&cover_key(shown)].held() > 0);
+        }
+    });
+    assert!(
+        blobs.reads.lock().unwrap().is_empty(),
+        "a file was read again: {:?}",
+        blobs.reads.lock().unwrap()
+    );
+}
+
+/// A test that takes no value ("is today", "is empty") has no value field, so its draft is
+/// written with the cards' keyboard: ↵ adds it and opens no page, Esc closes it and leaves the
+/// picks, and the keys that act on cards wait for one of them. The field, which is not drawn,
+/// does not keep the keyboard where no key would reach the tab.
+#[gpui::test]
+async fn a_draft_with_no_value_field_takes_enter_and_esc(cx: &mut TestAppContext) {
+    init(cx);
+    let (session, _, served) = session_served(TASKS, tasks_answering(6), cx);
+    let heard: Rc<RefCell<Vec<String>>> = Rc::default();
+    cx.update(|cx| {
+        let log = heard.clone();
+        cx.on_action(move |open: &OpenNodePage, _| log.borrow_mut().push(open.id.clone()));
+    });
+    let (cards, cx) = open(session, opening("Task"), cx);
+    cx.simulate_keystrokes("right x");
+    let no_field = |cards: &Entity<TypeCards>, cx: &mut VisualTestContext| {
+        cx.simulate_keystrokes("cmd-f");
+        cx.run_until_parked();
+        cards.update_in(cx, |cards, window, cx| {
+            // As the key menu's "due" and the test menu's "is empty" leave it.
+            cards.set_draft_property("due".into(), window, cx);
+            cards.set_draft_op(FilterOp::IsEmpty, window, cx);
+        });
+        cx.run_until_parked();
+        cards.update_in(cx, |cards, window, cx| {
+            let draft = cards.bar().draft.as_ref().expect("a draft is open");
+            assert!(!draft.op.takes_value(), "its test takes no value");
+            assert!(
+                !cards.bar().editor.focus_handle(cx).is_focused(window),
+                "a field that is not drawn has the keyboard"
+            );
+            assert!(cards.focus_handle.is_focused(window), "the cards have it");
+        });
+    };
+
+    no_field(&cards, cx);
+    // The cards' keys wait: the draft is what is being written.
+    cx.simulate_keystrokes("right down x g");
+    cards.read_with(cx, |cards, _| {
+        assert_eq!((cards.cursor, cards.picks.len()), (Some(1), 1));
+        assert!(cards.bar().draft.is_some());
+    });
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cards.read_with(cx, |cards, _| {
+        assert!(cards.bar().draft.is_none(), "Esc closed it");
+        assert_eq!(cards.picks.len(), 1, "and left the picks");
+        assert!(cards.filters.is_empty());
+    });
+    cx.simulate_keystrokes("right");
+    cards.read_with(cx, |cards, _| assert_eq!(cards.cursor, Some(2)));
+
+    no_field(&cards, cx);
+    cx.simulate_keystrokes("enter");
+    settle(cx);
+    assert!(heard.borrow().is_empty(), "↵ opened a page");
+    cards.update_in(cx, |cards, window, _| {
+        assert_eq!(
+            cards.filters,
+            [Filter {
+                property: "due".into(),
+                op: FilterOp::IsEmpty,
+                value: Value::Null,
+            }],
+            "↵ added it"
+        );
+        assert!(cards.bar().draft.is_none());
+        assert!(cards.focus_handle.is_focused(window));
+    });
+    assert_eq!(served.sent("studio_page").len(), 2);
+    // With no draft, ↵ is the cards' again.
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(heard.borrow().len(), 1);
 }

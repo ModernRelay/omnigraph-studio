@@ -6,7 +6,7 @@
 //! holds it: the view keeps its filters and reads its rows again when they change, and all the
 //! bar does is the trait's provided methods, so every host has the same bar.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -393,6 +393,51 @@ pub(crate) fn filter_menu(
     entries
 }
 
+/// Whether the filter `f` of `type_name`'s rows stays under `schema`, whose columns for the type
+/// are named `names`: what it tests is still in the schema, be it its column, its relationship,
+/// or the neighbours' property it reaches through one. A condition stays whatever it names: the
+/// next read judges it against this schema, and says why it cannot run. A host drops the others
+/// when it takes a schema (the table's schema load, a Cards tab's read from the start).
+pub(crate) fn filter_stands(
+    schema: &SchemaModel,
+    type_name: &str,
+    names: &HashSet<&str>,
+    f: &Filter,
+) -> bool {
+    if f.op == FilterOp::Expr || f.property == builder::ID_FILTER {
+        return true;
+    }
+    // A group stays while it can still be built against this schema.
+    if f.op == FilterOp::Where {
+        return builder::node_page(
+            schema,
+            type_name,
+            std::slice::from_ref(f),
+            None,
+            &PageStart::First,
+            1,
+        )
+        .is_ok();
+    }
+    match builder::parse_group_key(&f.property) {
+        builder::GroupKey::Relationship(_, edge) => schema.edge(edge).is_some(),
+        builder::GroupKey::NeighbourProperty {
+            direction,
+            edge,
+            property,
+        } => schema.relationships_of(type_name).iter().any(|group| {
+            group.direction == direction
+                && group.edge == edge
+                && schema
+                    .node(&group.other_type)
+                    .is_some_and(|other| other.property(property).is_some())
+        }),
+        builder::GroupKey::Property(_) | builder::GroupKey::EndpointProperty { .. } => {
+            names.contains(f.property.as_str())
+        }
+    }
+}
+
 /// What the filter bar asks of the view that holds it. The view keeps its own filters and reads
 /// its rows again when they change ([`Self::filters_changed`]), and holds the bar's state
 /// ([`FilterBar`]); what the bar does is the provided methods, the same for every host.
@@ -434,6 +479,13 @@ pub(crate) trait FilterHost: Sized + 'static {
 
     /// A note the host puts in the bar, after the pills; the bar shows for it alone.
     fn bar_note(&self) -> Option<Label> {
+        None
+    }
+
+    /// What the host puts in the bar before the pills: what its rows are when they are not
+    /// the type's under filters (a Cards tab of rows selected in a table). The bar shows for it
+    /// alone.
+    fn bar_lead(&self, _cx: &mut Context<Self>) -> Option<AnyElement> {
         None
     }
 
@@ -724,6 +776,49 @@ pub(crate) trait FilterHost: Sized + 'static {
                 draft.op = op;
             }
         }
+        self.focus_filter_draft(window, cx);
+    }
+
+    /// Whether the draft takes the keyboard: its value field has it, or its test takes no
+    /// value ("is today", "is empty", "has any"), so it has no field, and the host has it. The
+    /// host's own keys wait meanwhile (it adds `editing` to its key context from this), ↵ adds
+    /// the draft ([`Self::confirm_filter_draft`]) and Esc closes it.
+    fn filter_draft_takes_keys(&self, window: &Window, cx: &App) -> bool {
+        let Some(draft) = &self.bar().draft else {
+            return false;
+        };
+        self.bar().editor.focus_handle(cx).is_focused(window)
+            || (!draft.op.takes_value() && self.host_focus().is_focused(window))
+    }
+
+    /// Puts the keyboard where the draft takes it: in its value field, or with the host while
+    /// its test takes no value and no field is drawn.
+    fn focus_filter_draft(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let has_field = self
+            .bar()
+            .draft
+            .as_ref()
+            .is_some_and(|draft| draft.op.takes_value());
+        if has_field {
+            window.focus(&self.bar().editor.focus_handle(cx), cx);
+        } else {
+            window.focus(&self.host_focus(), cx);
+        }
+    }
+
+    /// The value field was given the keyboard and is no longer drawn: its draft closed under
+    /// it (the filters cleared, or replaced by the host), or its test now takes no value. A
+    /// field that is not drawn passes no key on, so the host takes the keyboard back. Run as
+    /// the bar is drawn, so it holds whatever closed the draft.
+    fn keep_filter_keys(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let has_field = self
+            .bar()
+            .draft
+            .as_ref()
+            .is_some_and(|draft| draft.op.takes_value());
+        if !has_field && self.bar().editor.focus_handle(cx).is_focused(window) {
+            window.focus(&self.host_focus(), cx);
+        }
     }
 
     fn set_draft_property(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -746,7 +841,7 @@ pub(crate) trait FilterHost: Sized + 'static {
             editor.set_text("", window, cx);
             editor.set_placeholder_text(filter_placeholder(op), window, cx);
         });
-        window.focus(&self.bar().editor.focus_handle(cx), cx);
+        self.focus_filter_draft(window, cx);
         self.refresh_suggestions(cx);
         cx.notify();
     }
@@ -917,6 +1012,7 @@ pub(crate) trait FilterHost: Sized + 'static {
                 s.select_ranges(vec![end..end])
             });
         });
+        self.focus_filter_draft(window, cx);
         self.refresh_suggestions(cx);
         cx.notify();
     }
@@ -937,9 +1033,7 @@ pub(crate) trait FilterHost: Sized + 'static {
         self.bar().editor.update(cx, |editor, cx| {
             editor.set_placeholder_text(filter_placeholder(op), window, cx)
         });
-        if op.takes_value() {
-            window.focus(&self.bar().editor.focus_handle(cx), cx);
-        }
+        self.focus_filter_draft(window, cx);
         self.refresh_suggestions(cx);
         cx.notify();
     }
@@ -1025,6 +1119,9 @@ pub(crate) trait FilterHost: Sized + 'static {
             self.bar_mut().draft = None;
             window.focus(&self.host_focus(), cx);
             self.filters_changed(cx);
+            // The draft is gone from the bar and from the host's keys, which a host that
+            // already had the keyboard (a draft with no value field) would not draw otherwise.
+            cx.notify();
             return;
         }
         let filter = if builder::is_deep_path(&key) {
@@ -1050,12 +1147,14 @@ pub(crate) trait FilterHost: Sized + 'static {
         }
         window.focus(&self.host_focus(), cx);
         self.filters_changed(cx);
+        cx.notify();
     }
 
-    /// ↵ for the draft, and whether the key was its: a draft is open and its value field has
-    /// the keyboard. The host's own ↵ calls this before it does anything else of its own.
+    /// ↵ for the draft, and whether the key was its: a draft is open and takes the keyboard
+    /// ([`Self::filter_draft_takes_keys`]), with a value field or without one. The host's own
+    /// ↵ calls this before it does anything else of its own.
     fn confirm_filter_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if !(self.bar().draft.is_some() && self.bar().editor.focus_handle(cx).is_focused(window)) {
+        if !self.filter_draft_takes_keys(window, cx) {
             return false;
         }
         // ↵ picks the highlighted offer, unless it is just what is typed. While the nodes
@@ -1460,9 +1559,15 @@ pub(crate) trait FilterHost: Sized + 'static {
         cx.notify();
     }
 
-    fn render_filter_bar(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_filter_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        self.keep_filter_keys(window, cx);
         let note = self.bar_note();
-        if self.filters().is_empty() && self.bar().draft.is_none() && note.is_none() {
+        let lead = self.bar_lead(cx);
+        if self.filters().is_empty()
+            && self.bar().draft.is_none()
+            && note.is_none()
+            && lead.is_none()
+        {
             return None;
         }
         let mut bar = h_flex()
@@ -1473,7 +1578,8 @@ pub(crate) trait FilterHost: Sized + 'static {
             .gap(px(space::SM))
             .items_center()
             .border_b_1()
-            .border_color(studio_ui::ds::surface::rule(cx));
+            .border_color(studio_ui::ds::surface::rule(cx))
+            .children(lead);
         // The filter being edited shows as the draft, after the others.
         let editing = self
             .bar()
@@ -1794,7 +1900,7 @@ mod tests {
 
     use gpui::{Render, TestAppContext, VisualTestContext};
     use serde_json::json;
-    use studio_actions::table::{Cancel, ConfirmEdit};
+    use studio_actions::table::{Cancel, ConfirmEdit, MoveDown};
 
     use super::*;
     use crate::model::node_columns;
@@ -1817,6 +1923,9 @@ mod tests {
         focus: FocusHandle,
         /// How often the bar said the filters changed.
         changed: usize,
+        /// How often a key of the host's own acted (`MoveDown`, bound while it is not
+        /// `editing`).
+        own_keys: usize,
     }
 
     impl Probe {
@@ -1835,6 +1944,7 @@ mod tests {
                 pinned: None,
                 focus: cx.focus_handle(),
                 changed: 0,
+                own_keys: 0,
             };
             probe.rebuild_filter_choices();
             probe
@@ -1893,9 +2003,17 @@ mod tests {
 
     impl Render for Probe {
         fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            // As a host does: its own keys wait while the bar's draft takes the keyboard.
+            let mut context = gpui::KeyContext::default();
+            context.add("Probe");
+            if self.filter_draft_takes_keys(window, cx) {
+                context.add("editing");
+            }
             div()
+                .key_context(context)
                 .track_focus(&self.focus)
                 .size_full()
+                .on_action(cx.listener(|this, _: &MoveDown, _, _| this.own_keys += 1))
                 // ↵ and Esc are the host's keys: it asks the bar first.
                 .on_action(cx.listener(|this, _: &ConfirmEdit, window, cx| {
                     this.confirm_filter_draft(window, cx);
@@ -2226,5 +2344,160 @@ mod tests {
                 Some("ACME Corp")
             );
         });
+    }
+
+    /// The probe's keys bound as a host's are in the keymaps: ↵ applies while a filter is being
+    /// written, Esc is the host's in both, and J is a key of its own.
+    fn bind_probe_keys(cx: &mut VisualTestContext) {
+        cx.update(|_, cx| {
+            cx.bind_keys([
+                gpui::KeyBinding::new("enter", ConfirmEdit, Some("Probe && editing")),
+                gpui::KeyBinding::new("escape", Cancel, Some("Probe")),
+                gpui::KeyBinding::new("j", MoveDown, Some("Probe && !editing")),
+            ]);
+        });
+    }
+
+    /// A draft on the probe's relationship, as its key menu leaves it: "has any", a test that
+    /// takes no value, so no value field is drawn and the host has the keyboard.
+    fn open_a_draft_with_no_value_field(probe: &Entity<Probe>, cx: &mut VisualTestContext) {
+        let key = probe.read_with(cx, |probe, _| {
+            builder::relationship_key(&probe.schema.relationships_of("Person")[0])
+        });
+        probe.update_in(cx, |probe, window, cx| {
+            window.focus(&probe.focus, cx);
+            probe.set_draft_property(key.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        probe.update_in(cx, |probe, window, cx| {
+            let draft = probe.bar().draft.as_ref().expect("a draft is open");
+            assert_eq!(draft.op, FilterOp::HasAny);
+            assert!(
+                !probe.bar().editor.focus_handle(cx).is_focused(window),
+                "a field that is not drawn has the keyboard"
+            );
+            assert!(probe.focus.is_focused(window), "the host has it");
+            assert!(probe.filter_draft_takes_keys(window, cx));
+        });
+    }
+
+    /// A draft whose test takes no value takes ↵ in a second host: the filter is added, the
+    /// host told once, and its own key, which waited, acts again.
+    #[gpui::test]
+    async fn a_second_hosts_draft_with_no_value_field_takes_enter(cx: &mut TestAppContext) {
+        let (probe, cx) = probe(cx);
+        bind_probe_keys(cx);
+        open_a_draft_with_no_value_field(&probe, cx);
+        cx.simulate_keystrokes("j");
+        cx.run_until_parked();
+        probe.read_with(cx, |probe, _| {
+            assert_eq!(probe.own_keys, 0, "the host's key waits")
+        });
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        probe.update_in(cx, |probe, window, cx| {
+            assert_eq!(probe.filters.len(), 1, "↵ added it");
+            assert_eq!(probe.filters[0].op, FilterOp::HasAny);
+            assert_eq!(probe.changed, 1);
+            assert!(probe.bar().draft.is_none());
+            assert!(probe.focus.is_focused(window));
+            assert!(!probe.filter_draft_takes_keys(window, cx));
+        });
+        cx.simulate_keystrokes("j");
+        cx.run_until_parked();
+        probe.read_with(cx, |probe, _| assert_eq!(probe.own_keys, 1));
+    }
+
+    /// The same draft takes Esc: it closes, nothing is filtered, and the host's key acts. A
+    /// test chosen from the menu over a draft with a field leaves the keyboard with the host
+    /// too: "is empty" after "is".
+    #[gpui::test]
+    async fn a_second_hosts_draft_with_no_value_field_takes_esc(cx: &mut TestAppContext) {
+        let (probe, cx) = probe(cx);
+        bind_probe_keys(cx);
+        open_a_draft_with_no_value_field(&probe, cx);
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        probe.update_in(cx, |probe, window, _| {
+            assert!(probe.bar().draft.is_none(), "Esc closed it");
+            assert!(probe.filters.is_empty());
+            assert_eq!(probe.changed, 0);
+            assert!(probe.focus.is_focused(window));
+        });
+        cx.simulate_keystrokes("j");
+        cx.run_until_parked();
+        probe.read_with(cx, |probe, _| assert_eq!(probe.own_keys, 1));
+
+        // A draft with a field, then a test without one, taken from the test menu.
+        probe.update_in(cx, |probe, window, cx| {
+            probe.set_draft_property("city".into(), window, cx);
+            assert!(probe.bar().editor.focus_handle(cx).is_focused(window));
+        });
+        cx.run_until_parked();
+        let at = probe.read_with(cx, |probe, _| {
+            let draft = probe.bar().draft.as_ref().unwrap();
+            let ops = probe.draft_ops(draft);
+            ops.iter()
+                .position(|op| *op == FilterOp::IsEmpty)
+                .expect("a nullable text can be empty")
+        });
+        pick_from_menu(&probe, 1, at + 1, cx);
+        probe.update_in(cx, |probe, window, cx| {
+            assert_eq!(probe.bar().draft.as_ref().unwrap().op, FilterOp::IsEmpty);
+            assert!(!probe.bar().editor.focus_handle(cx).is_focused(window));
+            assert!(probe.focus.is_focused(window), "the host has the keyboard");
+            assert!(probe.filter_draft_takes_keys(window, cx));
+        });
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        probe.read_with(cx, |probe, _| {
+            assert_eq!(
+                probe.filters,
+                [Filter {
+                    property: "city".into(),
+                    op: FilterOp::IsEmpty,
+                    value: Value::Null,
+                }]
+            );
+        });
+    }
+
+    /// The filters cleared while one is being written close the draft under its value field:
+    /// the host takes the keyboard back, and its key acts.
+    #[gpui::test]
+    async fn clearing_a_second_hosts_filters_gives_it_the_keys_back(cx: &mut TestAppContext) {
+        let (probe, cx) = probe(cx);
+        bind_probe_keys(cx);
+        probe.update_in(cx, |probe, window, cx| {
+            probe.filters = vec![Filter {
+                property: "name".into(),
+                op: FilterOp::Eq,
+                value: json!("Ada"),
+            }];
+            probe.open_filter_draft(window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input("Gr");
+        cx.simulate_keystrokes("j");
+        cx.run_until_parked();
+        probe.update_in(cx, |probe, window, cx| {
+            assert!(probe.bar().editor.focus_handle(cx).is_focused(window));
+            assert_eq!(probe.own_keys, 0, "J is typed, not the host's");
+            assert_eq!(probe.bar().editor.read(cx).text(cx), "Grj");
+        });
+        // As "Clear all" calls it.
+        probe.update(cx, |probe, cx| probe.clear_filters(cx));
+        cx.run_until_parked();
+        probe.update_in(cx, |probe, window, cx| {
+            assert!(probe.bar().draft.is_none() && probe.filters.is_empty());
+            assert!(
+                !probe.bar().editor.focus_handle(cx).is_focused(window),
+                "the field, no longer drawn, kept the keyboard"
+            );
+            assert!(probe.focus.is_focused(window), "the host has it");
+        });
+        cx.simulate_keystrokes("j");
+        cx.run_until_parked();
+        probe.read_with(cx, |probe, _| assert_eq!(probe.own_keys, 1));
     }
 }

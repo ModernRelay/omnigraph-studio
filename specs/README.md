@@ -68,7 +68,7 @@ Add tasks, contracts or data-model files only for large features.
 | 035 | [A gallery of a type's files](035-gallery/plan.md) | superseded by 048; out of the app since 048's slice 1 (2026-11-23) |
 | 046 | [A node's history](046-node-history/plan.md) | step 1 built 2026-11-20 |
 | 047 | [Studio without Omnigraph Cloud, and the Cloud waitlist](047-cloud-onboarding/plan.md) | built 2026-11-21 |
-| 048 | [Cards, a view of a type's nodes](048-cards/plan.md) | accepted 2026-11-23; slices 1 and 2 of 7 built 2026-11-23 |
+| 048 | [Cards, a view of a type's nodes](048-cards/plan.md) | accepted 2026-11-23; slices 1 to 5 of 7 built 2026-11-23 |
 
 Each plan's first line holds its full status. 012 is not scheduled: it records every Omnigraph change Studio would use, what Studio does
 without it, and which plan waits on it. Each feature plan's Deferred section names its IDs.

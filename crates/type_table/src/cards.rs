@@ -1,7 +1,9 @@
 //! A type's nodes as cards (spec 048): a grid of columns of one width and cards of one size,
 //! each its cover (one of the node's files, fitted inside a box of one shape, when the format
 //! has one), its title and a line a field, placed in row order and never moved, one tab per
-//! set, read a page at a time at one commit. What a card shows is the tab's format
+//! set, read a page at a time at one commit. The tab keeps filters and an order of its own
+//! after it opens, with the table's filter bar (`filter_bar`): a change reads the set again at
+//! the commit the tab shows. What a card shows is the tab's format
 //! (`card_format`): the tab saves it, and a change is kept as the type's in the settings. Each
 //! card's cover is read on its own through the Blob route once scrolling pauses, at most four
 //! at once, only for the cards a frame lays out, and drawn from a preview decoded and scaled
@@ -33,20 +35,24 @@ use studio_actions::cards::{
 use studio_actions::graph::{
     OpenBlob, OpenNodePage, OpenType, ResultNode, ShowNodeOnCanvas, ShowSetInCards, ShowSetInTree,
 };
+use studio_actions::table::{AddFilter, ClearFilters, ConfirmEdit};
 use studio_actions::workspace::ToggleInspector;
 use studio_actions::{ViewKind, ViewLink};
 use studio_settings::{CardFormat, CardSize, StudioSettings};
 use studio_ui::ds::menu::{ContextMenu, ContextMenuEntry};
 use studio_ui::ds::{Tipped, space};
 use studio_ui::{ChangeKind, plural};
-use studio_workspace::{Inspected, Item, ItemEvent, ItemStatus, KeyHint, SavedItem, Workspace};
+use studio_workspace::{
+    Inspected, Item, ItemEvent, ItemStatus, KeyHint, SavedItem, ToastKind, Workspace,
+};
 use ui::prelude::*;
 use ui::{PopoverMenu, PopoverMenuHandle};
 
 use crate::branch_diff::{BranchDiff, TARGET};
 use crate::card_format::{self, CardFace};
 use crate::card_grid::{COVER_RATIO, CardGrid, Step};
-use crate::model::{Paging, Row, field_rows, node_rows};
+use crate::filter_bar::{FilterBar, FilterHost, filter_stands};
+use crate::model::{ColumnSpec, Paging, Row, TableKind, field_rows, node_columns, node_rows};
 use crate::peek::{NodePeek, PeekSubject};
 use crate::tile::{self, FIRST_READ, Facts, Look};
 
@@ -206,15 +212,32 @@ pub struct TypeCards {
     workspace: WeakEntity<Workspace>,
     session: Entity<GraphSession>,
     type_name: String,
-    /// The set in words, as the tab names it.
+    /// A listed set in words, as the tab that opened it named it ("Note, 3 selected rows");
+    /// a set under filters is worded from the filters it has now ([`Self::words`]).
     title: String,
     branch: String,
     /// The commit the cards are held at, read-only; `None` follows the branch.
     at_commit: Option<String>,
     /// The commit the table it came from read, which its first page is pinned to.
     opened_at: Option<String>,
+    /// The filters and the order the rows are read under: the tab's own once it is open. A
+    /// date preset is kept as the preset and resolved at each read
+    /// ([`FilterHost::resolved_filters`]).
     filters: Vec<Filter>,
     sort: Option<Sort>,
+    /// The filter bar's state (spec 048, "Filters and order"): the table's bar, from the same
+    /// code ([`FilterHost`]).
+    filter_bar: FilterBar,
+    /// Every column the schema gives the type: what a filter can test and an order can be by.
+    all_columns: Vec<ColumnSpec>,
+    /// The filters left out when the schema was last taken, in words: it no longer has what
+    /// they test. Said in the bar until the filters next change or the set is refreshed.
+    lost: Vec<String>,
+    /// The person changed the tab's filters, order or format: a preview tab is then kept
+    /// ([`Item::keeps_preview`], spec 020).
+    changed: bool,
+    /// The Sort menu, so its chip says what it is only while the menu is closed.
+    sort_menu: PopoverMenuHandle<ContextMenu>,
     /// The rows it holds, when listed rather than read; how many of them were read.
     ids: Option<Vec<String>>,
     listed_asked: usize,
@@ -364,6 +387,11 @@ impl TypeCards {
             opened_at: opening.snapshot,
             filters,
             sort,
+            filter_bar: FilterBar::new(window, cx),
+            all_columns: Vec::new(),
+            lost: Vec::new(),
+            changed: false,
+            sort_menu: PopoverMenuHandle::default(),
             ids: opening.ids,
             listed_asked: 0,
             absent: HashMap::new(),
@@ -426,7 +454,7 @@ impl TypeCards {
     /// card shows is the tab's format, saved beside it ([`Item::serialize`]).
     pub(crate) fn opening(&self) -> ShowSetInCards {
         ShowSetInCards {
-            title: self.title.clone(),
+            title: self.words(),
             type_name: self.type_name.clone(),
             filters: (!self.filters.is_empty())
                 .then(|| serde_json::to_value(&self.filters).ok())
@@ -476,6 +504,7 @@ impl TypeCards {
         self.schema = self.session.read(cx).schema_model();
         self.field_text.borrow_mut().clear();
         self.read_format();
+        self.take_schema();
         if self.schema.is_none() {
             // The schema is read with the session; its event reads the set then.
             cx.notify();
@@ -524,7 +553,7 @@ impl TypeCards {
             None if without.is_empty() => builder::node_page(
                 &schema,
                 &self.type_name,
-                &self.filters,
+                &self.resolved_filters(),
                 self.sort.as_ref(),
                 &self.paging.start,
                 size,
@@ -534,7 +563,7 @@ impl TypeCards {
             None => builder::node_page_fields(
                 &schema,
                 &self.type_name,
-                &self.filters,
+                &self.resolved_filters(),
                 self.sort.as_ref(),
                 &self.paging.start,
                 size,
@@ -699,7 +728,9 @@ impl TypeCards {
     fn find_cursor_row(&mut self) {
         let Some(id) = self.select_on_load.clone() else {
             if self.cursor.is_none() && !self.rows.is_empty() {
-                self.cursor = Some(0);
+                // The first row the branch still has: rows it removed are shown before it.
+                let first = self.rows.iter().position(|row| !self.is_removed(&row.id));
+                self.cursor = Some(first.unwrap_or(0));
             }
             return;
         };
@@ -781,10 +812,11 @@ impl TypeCards {
             self.count = Loadable::Loaded(self.rows.len() as i64);
             return;
         }
+        let filters = self.resolved_filters();
         let Some(query) = self
             .schema
             .as_ref()
-            .and_then(|schema| builder::node_count(schema, &self.type_name, &self.filters).ok())
+            .and_then(|schema| builder::node_count(schema, &self.type_name, &filters).ok())
         else {
             return;
         };
@@ -974,7 +1006,155 @@ impl TypeCards {
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
+        // What the last schema left out is said once; this read says it again if it still does.
+        self.lost.clear();
         self.read_from_start(cx);
+    }
+
+    // ---- filters and order ----
+
+    /// The set in words, as the tab names it and a view opened from it is told: a listed set
+    /// as it was named when it opened, else its type and the filters it has now ("Note",
+    /// "Note, design").
+    fn words(&self) -> String {
+        if self.ids.is_some() {
+            return self.title.clone();
+        }
+        crate::model::set_title(
+            &self.type_name,
+            &crate::model::filters_summary(&self.filters),
+        )
+    }
+
+    /// Takes the schema as the session has it now: the type's columns, what the Filter menu
+    /// offers, and the filters and the order it can still read under. A filter that tests what
+    /// the schema no longer has is left out, by the table's test ([`filter_stands`]), and said
+    /// ([`Self::lost`]). An order by a property that is gone or cannot order rows is left out
+    /// unsaid, as the table leaves it out.
+    fn take_schema(&mut self) {
+        let Some(schema) = self.schema.clone() else {
+            return;
+        };
+        let Some(node) = schema.node(&self.type_name) else {
+            // The read says the type is gone; nothing can be filtered meanwhile.
+            self.all_columns.clear();
+            self.bar_mut().clear_choices();
+            return;
+        };
+        self.all_columns = node_columns(node, schema.relationships_of(&self.type_name));
+        self.rebuild_filter_choices();
+        let names: HashSet<&str> = self.all_columns.iter().map(|c| c.key.as_str()).collect();
+        let (kept, lost): (Vec<Filter>, Vec<Filter>) = std::mem::take(&mut self.filters)
+            .into_iter()
+            .partition(|filter| filter_stands(&schema, &self.type_name, &names, filter));
+        if !lost.is_empty() {
+            // A draft over a filter that is gone would put it back.
+            self.bar_mut().draft = None;
+            self.lost = lost
+                .iter()
+                .map(|filter| crate::model::filter_parts(filter).0)
+                .collect();
+        }
+        self.filters = kept;
+        if self
+            .sort
+            .as_ref()
+            .is_some_and(|sort| !crate::model::can_sort_by(&self.all_columns, sort))
+        {
+            self.sort = None;
+        }
+    }
+
+    /// A filter, the order or the listed set changed: reads the set again from its first page
+    /// at the commit the tab shows, its pin (constitution II), and not at the head. The cursor
+    /// goes to the first card. The picks stay, by id, as a table's selection does through a
+    /// filter change; the card a range of picks starts from is a place in the old order, and
+    /// goes. Covers read at this commit are kept.
+    fn read_again(&mut self, cx: &mut Context<Self>) {
+        if self.schema.is_none() {
+            return;
+        }
+        let pin = self
+            .paging
+            .pinned
+            .clone()
+            .or_else(|| self.first_snapshot.clone());
+        self.generation += 1;
+        // A read the commit refuses for a property it lacks starts again, at this commit too.
+        self.first_snapshot = pin.clone();
+        self.cursor = None;
+        self.select_on_load = None;
+        self.scroll_owed = false;
+        self.pick_anchor = None;
+        self.rows.clear();
+        self.field_text.borrow_mut().clear();
+        self.paging.restart();
+        self.listed_asked = 0;
+        self.first_page = Loadable::Loading;
+        self.loading_more = false;
+        self.more_error = None;
+        self.count = Loadable::NotLoaded;
+        self._count = None;
+        // The reads out are for cards that may not be shown again; what has landed stands.
+        self.cover_tasks.clear();
+        self.cover_queue.clear();
+        for cover in self.covers.values_mut() {
+            if matches!(cover.look, Loadable::Loading) {
+                cover.look = Loadable::NotLoaded;
+            }
+        }
+        self.span_read = None;
+        self.scroll.set_offset(point(px(0.), px(0.)));
+        self.read_page(pin, true, cx);
+        // A diff still being read was for the reads before: it is asked for again.
+        if self.diff_pending {
+            self.read_diff(cx);
+        }
+        cx.notify();
+    }
+
+    /// The person changed what the tab shows: its title and its key follow, and a preview tab
+    /// is kept ([`Item::keeps_preview`]).
+    fn person_changed(&mut self, cx: &mut Context<Self>) {
+        self.changed = true;
+        cx.emit(ItemEvent::UpdateTab);
+    }
+
+    /// Orders the rows by `sort`, or by their ids with `None`, and reads them again at the pin.
+    /// An order the type's columns cannot give is left as it is.
+    pub(crate) fn set_sort(&mut self, sort: Option<Sort>, cx: &mut Context<Self>) {
+        let allowed = sort
+            .as_ref()
+            .is_none_or(|sort| crate::model::can_sort_by(&self.all_columns, sort));
+        if !allowed || sort == self.sort || self.ids.is_some() {
+            return;
+        }
+        self.sort = sort;
+        self.read_again(cx);
+        self.person_changed(cx);
+    }
+
+    /// Lets the listed rows go: the tab shows the type's rows, with no filter, at the commit it
+    /// shows, and its filters and order can be set.
+    pub(crate) fn clear_listed(&mut self, cx: &mut Context<Self>) {
+        if self.ids.take().is_none() {
+            return;
+        }
+        self.bar_mut().draft = None;
+        self.filters.clear();
+        self.sort = None;
+        self.read_again(cx);
+        self.person_changed(cx);
+    }
+
+    /// Why the Filters and Sort chips are off, when they are: the tab holds listed rows.
+    fn listed_note(&self) -> Option<String> {
+        let ids = self.ids.as_ref()?;
+        Some(format!(
+            "Showing {}. Clear the pill to filter {}",
+            plural(ids.len(), "selected row", "selected rows"),
+            self.type_name
+        ))
     }
 
     // ---- cards and their covers ----
@@ -1298,7 +1478,9 @@ impl TypeCards {
     /// Frees the previews of the cards farthest from the span shown while they hold more than
     /// [`PREVIEWS_HELD`]; each is read again if its card comes back into view. The cards laid
     /// out keep theirs, so a screen that alone holds more is not read again and again. A
-    /// preview of a file that is no longer the cover goes first.
+    /// preview of a file that is no longer the cover goes first, and so does one of a row the
+    /// filters no longer show (kept through the change: it is the same file at the same
+    /// commit if the row comes back).
     fn let_go_past_cap(&mut self, cx: &mut App) {
         if self.held <= PREVIEWS_HELD {
             return;
@@ -1320,7 +1502,9 @@ impl TypeCards {
                 if self.cover.as_ref() != Some(&key.1) {
                     return Some((f32::MAX, key.clone()));
                 }
-                let row = place.get(key.0.as_str()).copied()?;
+                let Some(row) = place.get(key.0.as_str()).copied() else {
+                    return Some((f32::MAX, key.clone()));
+                };
                 if shown.contains(&row) {
                     return None;
                 }
@@ -1472,8 +1656,12 @@ impl TypeCards {
         cx.notify();
     }
 
-    /// Esc: takes every pick out.
-    fn cancel(&mut self, cx: &mut Context<Self>) {
+    /// Esc: closes the filter being written; else takes every pick out.
+    fn cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.bar().draft.is_some() {
+            self.cancel_filter_draft(window, cx);
+            return;
+        }
         if self.picks.is_empty() {
             return;
         }
@@ -1621,7 +1809,7 @@ impl TypeCards {
             self.read_covers(cx);
         }
         self.keep_format(cx);
-        cx.emit(ItemEvent::UpdateTab);
+        self.person_changed(cx);
         cx.notify();
     }
 
@@ -1818,8 +2006,115 @@ impl TypeCards {
                 studio_ui::ds::toolbar_actions()
                     .gap(px(space::SM))
                     .child(self.render_fields_menu(cx))
-                    .child(self.render_sizes(cx)),
+                    .child(
+                        div()
+                            .debug_selector(|| "cards-sort".into())
+                            .child(self.render_sort_menu(cx)),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| "cards-filters".into())
+                            .child(self.render_filters_chip(cx)),
+                    )
+                    .child(self.render_sizes(cx))
+                    .child(
+                        studio_ui::ds::icon_button("cards-refresh", IconName::RotateCw)
+                            .tip(studio_ui::ds::tooltip_for_action_in(
+                                "Refresh", &Refresh, &focus,
+                            ))
+                            .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                    ),
             )
+    }
+
+    /// The Sort chip, with the table's menu: the properties the rows can be ordered by, then
+    /// the direction. Off while the tab holds listed rows, which keep the order they were
+    /// listed in.
+    fn render_sort_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let choices = crate::model::sort_choices(&self.all_columns);
+        let current = self.sort.clone();
+        let current_label = current
+            .as_ref()
+            .map(|sort| SharedString::from(crate::model::sort_label(&choices, sort)));
+        let sorted = current.is_some();
+        let listed = self.listed_note();
+        let cards = cx.entity().downgrade();
+        let open = self.sort_menu.is_deployed();
+        let menu = PopoverMenu::new("cards-sort-menu")
+            .anchor(gpui::Anchor::TopRight)
+            .with_handle(self.sort_menu.clone())
+            .trigger(
+                studio_ui::ds::chip_button(
+                    "cards-sort",
+                    IconName::ChevronUpDown,
+                    "Sort",
+                    current_label,
+                )
+                .disabled(choices.is_empty() || listed.is_some())
+                .when(!open, |button| {
+                    // Off, it says why rather than what it would do (constitution VI).
+                    let about = match &listed {
+                        Some(listed) => listed.clone(),
+                        None if choices.is_empty() => format!(
+                            "{} has no property its rows can be ordered by",
+                            self.type_name
+                        ),
+                        None => "Order the cards by a property".to_owned(),
+                    };
+                    button.tip(studio_ui::ds::tooltip(about))
+                }),
+            )
+            .menu(move |window, cx| {
+                let (cards, current, choices) = (cards.clone(), current.clone(), choices.clone());
+                let set: studio_ui::ds::SetSort = Rc::new(move |sort, cx| {
+                    let sort = sort.map(|(property, descending)| Sort {
+                        property,
+                        descending,
+                    });
+                    cards.update(cx, |cards, cx| cards.set_sort(sort, cx)).ok();
+                });
+                let current = current
+                    .as_ref()
+                    .map(|sort| (sort.property.clone(), sort.descending));
+                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                    studio_ui::ds::sort_menu(menu, &choices, current.clone(), set.clone())
+                }))
+            });
+        studio_ui::ds::control_chip("cards-sort-chip", menu).when(sorted, |chip| {
+            chip.on_clear(
+                "Stop ordering the cards: they follow their ids",
+                cx.listener(|this, _, _, cx| this.set_sort(None, cx)),
+            )
+        })
+    }
+
+    /// The Filters chip, as the table's: a click opens a filter to write, it says how many
+    /// there are, and its × clears them. Off while the tab holds listed rows.
+    fn render_filters_chip(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let listed = self.listed_note();
+        let focus = self.focus_handle.clone();
+        studio_ui::ds::control_chip(
+            "cards-filter-chip",
+            studio_ui::ds::chip_button(
+                "cards-add-filter",
+                IconName::Filter,
+                "Filters",
+                (!self.filters.is_empty())
+                    .then(|| studio_ui::group_count(self.filters.len() as i64).into()),
+            )
+            .disabled(listed.is_some())
+            .tip(match listed {
+                Some(listed) => studio_ui::ds::tooltip(listed),
+                None => studio_ui::ds::tooltip_for_action_in("Add a filter", &AddFilter, &focus),
+            })
+            .on_click(cx.listener(|this, _, window, cx| this.open_filter_draft(window, cx))),
+        )
+        .when(!self.filters.is_empty(), |chip| {
+            chip.on_clear(
+                "Clear the filters",
+                cx.listener(|this, _, _, cx| this.clear_filters(cx)),
+            )
+        })
     }
 
     fn render_diff_counts(&self) -> Option<AnyElement> {
@@ -2452,6 +2747,102 @@ async fn read_bytes(
     Ok(bytes)
 }
 
+/// The filter bar is the table's ([`FilterHost`]): the tab keeps its own filters, answers what
+/// the bar asks, and reads its rows again at its pin when they change.
+impl FilterHost for TypeCards {
+    fn bar(&self) -> &FilterBar {
+        &self.filter_bar
+    }
+
+    fn bar_mut(&mut self) -> &mut FilterBar {
+        &mut self.filter_bar
+    }
+
+    fn filters(&self) -> &[Filter] {
+        &self.filters
+    }
+
+    fn filters_mut(&mut self) -> &mut Vec<Filter> {
+        &mut self.filters
+    }
+
+    fn schema(&self) -> Option<&Arc<SchemaModel>> {
+        self.schema.as_ref()
+    }
+
+    fn type_name(&self) -> &str {
+        &self.type_name
+    }
+
+    fn kind(&self) -> TableKind {
+        TableKind::Node
+    }
+
+    fn all_columns(&self) -> &[ColumnSpec] {
+        &self.all_columns
+    }
+
+    fn session(&self) -> &Entity<GraphSession> {
+        &self.session
+    }
+
+    fn pinned(&self) -> Option<String> {
+        self.paging.pinned.clone()
+    }
+
+    fn host_focus(&self) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+
+    /// The bar changed the filters: the set is read again at the pin, and the tab's title
+    /// follows.
+    fn filters_changed(&mut self, cx: &mut Context<Self>) {
+        self.lost.clear();
+        self.read_again(cx);
+        self.person_changed(cx);
+    }
+
+    /// The filters the schema no longer reads, left out when it was taken.
+    fn bar_note(&self) -> Option<Label> {
+        let note = match self.lost.as_slice() {
+            [] => return None,
+            [one] => format!("The schema no longer has {one}: its filter was left out"),
+            many => format!(
+                "The schema no longer has {}: their filters were left out",
+                many.join(", ")
+            ),
+        };
+        Some(studio_ui::ds::text::muted(note))
+    }
+
+    /// A tab of rows selected in a table says so before any filter, in the words its title
+    /// has ("3 selected rows"): its rows are those listed, until the pill is cleared.
+    fn bar_lead(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let ids = self.ids.as_ref()?;
+        Some(
+            studio_ui::ds::set_pill(
+                "cards-listed",
+                IconName::ListTodo,
+                plural(ids.len(), "selected row", "selected rows"),
+                format!("Show every {} row", self.type_name),
+                cx.listener(|this, _, _, cx| this.clear_listed(cx)),
+                cx,
+            )
+            .debug_selector(|| "cards-listed".into())
+            .into_any_element(),
+        )
+    }
+
+    fn nothing_to_filter(&self, cx: &mut Context<Self>) {
+        if let Some(workspace) = self.workspace.upgrade() {
+            let message = format!("{} has no property to filter by.", self.type_name);
+            workspace.update(cx, |workspace, cx| {
+                workspace.show_toast(ToastKind::Info, message, cx)
+            });
+        }
+    }
+}
+
 /// What the Fields menu lists ([`TypeCards::field_choices`]).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct FieldChoices {
@@ -2621,7 +3012,7 @@ impl Item for TypeCards {
                 separate: false,
             })),
             ViewKind::Tree => Some(Box::new(ShowSetInTree {
-                title: self.title.clone(),
+                title: self.words(),
                 type_name: Some(self.type_name.clone()),
                 filters: self.filters_value(),
                 nodes: self.picked_nodes().or_else(|| {
@@ -2721,7 +3112,7 @@ impl Item for TypeCards {
     }
 
     fn tab_title(&self, _cx: &App) -> SharedString {
-        let title = format!("Cards: {}", self.title);
+        let title = format!("Cards: {}", self.words());
         match &self.at_commit {
             Some(commit) => format!("{title} @ {}", studio_ui::short_commit_id(commit)).into(),
             None => title.into(),
@@ -2758,6 +3149,12 @@ impl Item for TypeCards {
 
     fn is_stale(&self, _cx: &App) -> bool {
         self.newer
+    }
+
+    /// A preview tab whose filters, order or format the person changed is theirs: the next
+    /// preview opens beside it (spec 020).
+    fn keeps_preview(&self, _cx: &App) -> bool {
+        self.changed
     }
 
     /// The cards' part of the status bar: a page or covers being read, a Retry when the next
@@ -2809,6 +3206,13 @@ impl Item for TypeCards {
         if !self.files.is_empty() {
             keys.push(key("Next cover", &ShowNextCover));
         }
+        // Listed rows take no filter until their pill is cleared.
+        if self.ids.is_none() {
+            keys.push(key("Add a filter", &AddFilter));
+            if !self.filters.is_empty() {
+                keys.push(key("Clear the filters", &ClearFilters));
+            }
+        }
         keys.extend([
             key("Larger cards", &LargerCards),
             key("Smaller cards", &SmallerCards),
@@ -2823,7 +3227,7 @@ impl Item for TypeCards {
 }
 
 impl Render for TypeCards {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         #[cfg(test)]
         {
             self.renders += 1;
@@ -2832,6 +3236,13 @@ impl Render for TypeCards {
         context.add("Cards");
         // The gallery's context too (spec 035), so the bindings a person wrote for it still act.
         context.add("Gallery");
+        // Keys typed into the filter's value field are text, not the cards'; a draft with no
+        // field takes ↵ and Esc all the same, and the keys that act on cards wait for one of
+        // them. The bar says which (`FilterHost::filter_draft_takes_keys`), as for the table.
+        if self.filter_draft_takes_keys(window, cx) {
+            context.add("editing");
+        }
+        let filter_bar = self.render_filter_bar(window, cx);
         let grid = self.grid.clone();
         v_flex()
             .key_context(context)
@@ -2855,7 +3266,19 @@ impl Render for TypeCards {
                 }
             }))
             .on_action(cx.listener(|this, _: &PickAll, _, cx| this.pick_all(cx)))
-            .on_action(cx.listener(|this, _: &Cancel, _, cx| this.cancel(cx)))
+            .on_action(cx.listener(|this, _: &Cancel, window, cx| this.cancel(window, cx)))
+            // The filter bar's keys (spec 048): ↵ applies the filter being written, and is
+            // bound only while one is (`editing`); listed rows take no filter.
+            .on_action(cx.listener(|this, _: &ConfirmEdit, window, cx| {
+                this.confirm_filter_draft(window, cx);
+            }))
+            .when(self.ids.is_none(), |cards| {
+                cards
+                    .on_action(cx.listener(|this, _: &AddFilter, window, cx| {
+                        this.open_filter_draft(window, cx)
+                    }))
+                    .on_action(cx.listener(|this, _: &ClearFilters, _, cx| this.clear_filters(cx)))
+            })
             .on_action(cx.listener(|this, _: &CopyIds, _, cx| this.copy_ids(cx)))
             .when(!self.files.is_empty(), |cards| {
                 cards.on_action(
@@ -2872,11 +3295,19 @@ impl Render for TypeCards {
             }))
             .on_action(cx.listener(|this, _: &Refresh, _, cx| this.refresh(cx)))
             .child(self.render_toolbar(cx))
+            .children(filter_bar)
             .child(
                 div()
                     .flex_1()
                     .min_h_0()
                     .child(AnyView::from(grid).cached(StyleRefinement::default().size_full())),
+            )
+            // A group pill's menu (spec 025), where it was opened.
+            .children(
+                self.bar()
+                    .group_menu
+                    .as_ref()
+                    .map(|(menu, position, _)| studio_ui::ds::menu_at(menu.clone(), *position)),
             )
     }
 }

@@ -69,9 +69,9 @@ use crate::grouping::{GROUP_LIMIT, Grouping, Line, Lines, SECTION_FIRST_PAGE};
 use crate::model::{
     ColumnLayout, ColumnRole, ColumnSpec, Notice, Paging, RELATION_CHIPS_SHOWN,
     RELATION_SAMPLE_BUDGET, Row, SaveResult, TableKind, Tone, changed_elsewhere, chips_that_fit,
-    display_value, edge_columns, edge_rows, edit_text, edited, field_rows, filter_parts,
-    insert_position, node_columns, node_rows, parse_input, published, reads_as_markdown,
-    relation_sample, row_matches,
+    display_value, edge_columns, edge_rows, edit_text, edited, field_rows, insert_position,
+    node_columns, node_rows, parse_input, published, reads_as_markdown, relation_sample,
+    row_matches,
 };
 use crate::peek::{
     KnownRelation, NEIGHBOUR_LIMIT, Neighbour, NodePeek, PeekSubject, TableBlobs, TableWrote,
@@ -1601,45 +1601,11 @@ impl TypeTable {
         };
         self.missing = false;
         let names: HashSet<&str> = columns.iter().map(|c| c.key.as_str()).collect();
-        // A filter stays while what it tests is still in the schema: its column, its
-        // relationship, or the neighbours' property it reaches through one. A condition stays
-        // whatever it names: the next read judges it against this schema, and says why it
-        // cannot run.
+        // A filter stays while what it tests is still in the schema
+        // ([`crate::filter_bar::filter_stands`]).
         let type_name = self.type_name.clone();
-        self.filters.retain(|f| {
-            if f.op == FilterOp::Expr || f.property == builder::ID_FILTER {
-                return true;
-            }
-            // A group stays while it can still be built against this schema.
-            if f.op == FilterOp::Where {
-                return builder::node_page(
-                    &schema,
-                    &type_name,
-                    std::slice::from_ref(f),
-                    None,
-                    &PageStart::First,
-                    1,
-                )
-                .is_ok();
-            }
-            match builder::parse_group_key(&f.property) {
-                builder::GroupKey::Relationship(_, edge) => schema.edge(edge).is_some(),
-                builder::GroupKey::NeighbourProperty {
-                    direction,
-                    edge,
-                    property,
-                } => schema.relationships_of(&type_name).iter().any(|group| {
-                    group.direction == direction
-                        && group.edge == edge
-                        && schema
-                            .node(&group.other_type)
-                            .is_some_and(|other| other.property(property).is_some())
-                }),
-                builder::GroupKey::Property(_) | builder::GroupKey::EndpointProperty { .. } => {
-                    names.contains(f.property.as_str())
-                }
-            }
-        });
+        self.filters
+            .retain(|f| crate::filter_bar::filter_stands(&schema, &type_name, &names, f));
         self.all_columns = columns;
         self.show_columns(cx);
         self.schema = Some(schema);
@@ -3328,27 +3294,11 @@ impl TypeTable {
     /// The toolbar's Sort menu: the properties the rows can be ordered by, then the direction.
     /// A column header's menu orders by its column as well.
     fn render_sort_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let choices: Vec<(String, String)> = self
-            .all_columns
-            .iter()
-            .filter_map(|column| {
-                column
-                    .property()
-                    .filter(|property| Sort::allowed(property))
-                    .map(|property| (property.name.clone(), column.title.clone()))
-            })
-            .collect();
+        let choices = crate::model::sort_choices(&self.all_columns);
         let current = self.sort.clone();
-        let current_label = current.as_ref().map(|sort| {
-            let title = choices
-                .iter()
-                .find(|(name, _)| *name == sort.property)
-                .map_or(sort.property.as_str(), |(_, title)| title.as_str());
-            SharedString::from(format!(
-                "{title} {}",
-                if sort.descending { "↓" } else { "↑" }
-            ))
-        });
+        let current_label = current
+            .as_ref()
+            .map(|sort| SharedString::from(crate::model::sort_label(&choices, sort)));
         let sorted = current.is_some();
         let table = cx.entity().downgrade();
         let open = self.toolbar_menus[3].is_deployed();
@@ -3518,10 +3468,7 @@ impl TypeTable {
     }
 
     fn can_sort_by(&self, sort: &Sort) -> bool {
-        self.all_columns
-            .iter()
-            .filter_map(ColumnSpec::property)
-            .any(|p| p.name == sort.property && Sort::allowed(p))
+        crate::model::can_sort_by(&self.all_columns, sort)
     }
 
     /// The count of the table's rows, through its filters (`filtered`) or of every row; `None`
@@ -7785,7 +7732,7 @@ impl TypeTable {
 
     /// Tab: save the open edit, if any, and move to the next cell in the row.
     fn tab(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
-        if self.bar().draft.is_some() && self.bar().editor.focus_handle(cx).is_focused(window) {
+        if self.filter_draft_takes_keys(window, cx) {
             return;
         }
         if self.editing.is_some() {
@@ -7921,21 +7868,9 @@ impl TypeTable {
         });
         let summary = match &nodes {
             Some(nodes) => studio_ui::plural(nodes.len(), "selected row", "selected rows"),
-            None => self
-                .filters
-                .iter()
-                .map(|filter| {
-                    let (property, op, value) = filter_parts(filter);
-                    value.unwrap_or_else(|| format!("{property} {op}"))
-                })
-                .collect::<Vec<_>>()
-                .join(", "),
+            None => crate::model::filters_summary(&self.filters),
         };
-        let title = if summary.is_empty() {
-            self.type_name.clone()
-        } else {
-            format!("{}, {summary}", self.type_name)
-        };
+        let title = crate::model::set_title(&self.type_name, &summary);
         let total = match &self.count {
             Loadable::Loaded(count) if !picked => Some((*count).max(0) as u64),
             _ => None,
@@ -7956,8 +7891,10 @@ impl TypeTable {
 
     /// What Cards opens from this table (spec 048): the selected rows, listed, or the rows
     /// under the filters and in the table's order, at the commit the table read, the cursor's
-    /// row under the cursor. What a card shows is the type's format, not the table's to say:
-    /// the file under the cursor is no longer handed over as the cover.
+    /// row under the cursor. The filters go as the table keeps them, a date preset still a
+    /// preset: the tab resolves it at each read of its own, so "today" is the day it reads.
+    /// What a card shows is the type's format, not the table's to say: the file under the
+    /// cursor is no longer handed over as the cover.
     fn cards_action(&self) -> Option<Box<dyn gpui::Action>> {
         if self.kind != TableKind::Node {
             return None;
@@ -7969,28 +7906,17 @@ impl TypeTable {
                 .map(|row| row.id.clone())
                 .collect::<Vec<_>>()
         });
-        let filters = self.resolved_filters();
+        let filters = &self.filters;
         let summary = match &ids {
             Some(ids) => studio_ui::plural(ids.len(), "selected row", "selected rows"),
-            None => filters
-                .iter()
-                .map(|filter| {
-                    let (property, op, value) = filter_parts(filter);
-                    value.unwrap_or_else(|| format!("{property} {op}"))
-                })
-                .collect::<Vec<_>>()
-                .join(", "),
+            None => crate::model::filters_summary(filters),
         };
-        let title = if summary.is_empty() {
-            self.type_name.clone()
-        } else {
-            format!("{}, {summary}", self.type_name)
-        };
+        let title = crate::model::set_title(&self.type_name, &summary);
         Some(Box::new(studio_actions::graph::ShowSetInCards {
             title,
             type_name: self.type_name.clone(),
             filters: (ids.is_none() && !filters.is_empty())
-                .then(|| serde_json::to_value(&filters).ok())
+                .then(|| serde_json::to_value(filters).ok())
                 .flatten(),
             sort: self.sort.as_ref().filter(|_| ids.is_none()).map(|sort| {
                 serde_json::json!({"property": sort.property, "descending": sort.descending})
@@ -8474,6 +8400,9 @@ impl TypeTable {
             draft.offers.set(offers, true);
             draft.answers = Some(name);
         }
+        // The keyboard goes where the name is, to pick with: the relationship's own first
+        // test takes no value, and a draft of that has the host's keyboard.
+        self.focus_filter_draft(window, cx);
         self.redraw_offers(cx);
         cx.notify();
         true
@@ -11050,7 +10979,7 @@ impl Render for TypeTable {
         // Keys typed into a field are text, not the table's: the cell editor, the filter
         // value and the bulk value alike.
         let typing = self.editing.is_some()
-            || self.bar().editor.focus_handle(cx).is_focused(window)
+            || self.filter_draft_takes_keys(window, cx)
             || self.bulk_editor.focus_handle(cx).is_focused(window)
             || self.words_editor.focus_handle(cx).is_focused(window)
             || self.fill_editor.focus_handle(cx).is_focused(window);
@@ -11325,6 +11254,7 @@ mod tests {
     use super::*;
     use gpui::{TestAppContext, VisualTestContext};
 
+    use crate::model::filter_parts;
     use crate::test_support::{PEOPLE, changed, session, session_followed};
 
     fn grid_renders(table: &Entity<TypeTable>, cx: &mut VisualTestContext) -> usize {
@@ -17071,6 +17001,26 @@ mod tests {
             )
         });
         cx.run_until_parked();
+        // Cards is handed the preset, not the days it means now (spec 048): the tab resolves
+        // it at each read of its own, as the table does.
+        table.read_with(cx, |table, _| {
+            assert!(
+                table.resolved_filters()[0].value.is_array(),
+                "the table reads under its days"
+            );
+            let cards = table.cards_action().expect("a node table opens Cards");
+            let cards = cards
+                .as_any()
+                .downcast_ref::<studio_actions::graph::ShowSetInCards>()
+                .expect("the Cards action");
+            assert_eq!(
+                cards.filters,
+                Some(serde_json::json!([
+                    { "property": "born", "op": "Today", "value": null }
+                ]))
+            );
+            assert_eq!(cards.title, "Person, born is today");
+        });
         type_in_name(&table, "Ada Lovelace", cx);
         table.update_in(cx, |table, window, cx| table.confirm_edit(window, cx));
         cx.run_until_parked();
@@ -18502,5 +18452,237 @@ mod tests {
         assert_eq!(values.len(), sent, "each section read once");
         // More sections came into view than may read at once, and every one of them read.
         assert!(sent > SECTION_READS_OUT, "{sent}");
+    }
+
+    /// A Person table with a Date column, its keys bound as the keymaps bind them, the cursor
+    /// on the date of the first row.
+    fn born_table(cx: &mut TestAppContext) -> (Entity<TypeTable>, &mut VisualTestContext) {
+        const BORN: &str = "node Person {\n  slug: String @key\n  name: String\n  born: Date?\n}\n";
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+            cx.bind_keys([
+                gpui::KeyBinding::new("down", MoveDown, Some("TypeTable && !editing")),
+                gpui::KeyBinding::new("j", MoveDown, Some("TypeTable && !editing")),
+                gpui::KeyBinding::new("enter", EditCell, Some("TypeTable && !editing")),
+                gpui::KeyBinding::new("enter", ConfirmEdit, Some("TypeTable && editing")),
+                gpui::KeyBinding::new("escape", Cancel, Some("TypeTable")),
+                gpui::KeyBinding::new("cmd-f", AddFilter, Some("TypeTable")),
+                gpui::KeyBinding::new("tab", menu::SelectNext, Some("TypeTable")),
+            ]);
+        });
+        let session = session(BORN, cx);
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session,
+                "Person".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        table.update_in(cx, |table, window, cx| {
+            let col = table.column_index("born").expect("the date's column");
+            table.cursor = Some(Cursor { row: 0, col });
+            window.focus(&table.focus_handle, cx);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        (table, cx)
+    }
+
+    /// The draft ⌘F opens on a date: "born is today", a test that takes no value, so no value
+    /// field is drawn, and the table has the keyboard, not a field nobody can see.
+    fn open_a_draft_with_no_value_field(table: &Entity<TypeTable>, cx: &mut VisualTestContext) {
+        cx.simulate_keystrokes("cmd-f");
+        cx.run_until_parked();
+        table.update_in(cx, |table, window, cx| {
+            let draft = table.bar().draft.as_ref().expect("⌘F opens a draft");
+            assert_eq!(
+                (draft.property.as_str(), draft.op),
+                ("born", FilterOp::Today)
+            );
+            assert!(
+                !table.bar().editor.focus_handle(cx).is_focused(window),
+                "a field that is not drawn has the keyboard"
+            );
+            assert!(table.focus_handle.is_focused(window), "the table has it");
+            assert!(table.filter_draft_takes_keys(window, cx));
+        });
+    }
+
+    /// A draft whose test takes no value takes ↵: opened on a date, it adds "is today". The
+    /// table's own keys wait meanwhile, as they do while a value field has the keyboard: ↓, J
+    /// and Tab move no cursor and ↵ edits no cell. Once it is added they are the table's again.
+    #[gpui::test]
+    async fn a_draft_with_no_value_field_takes_enter(cx: &mut TestAppContext) {
+        let (table, cx) = born_table(cx);
+        let cursor = table.read_with(cx, |table, _| table.cursor);
+        open_a_draft_with_no_value_field(&table, cx);
+        cx.simulate_keystrokes("down j tab");
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert_eq!(table.cursor, cursor, "the table's keys wait");
+            assert!(table.bar().draft.is_some());
+        });
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        table.update_in(cx, |table, window, _| {
+            assert_eq!(
+                table.filters,
+                [Filter {
+                    property: "born".into(),
+                    op: FilterOp::Today,
+                    value: Value::Null,
+                }],
+                "↵ added it"
+            );
+            assert!(table.bar().draft.is_none());
+            assert!(table.editing.is_none(), "↵ opened no cell");
+            assert!(table.focus_handle.is_focused(window));
+        });
+        // The cursor went with the rows read again; the keys are the table's.
+        cx.simulate_keystrokes("down down");
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert_eq!(table.cursor.map(|cursor| cursor.row), Some(1));
+        });
+    }
+
+    /// The same draft takes Esc: it closes, no filter is added, and the table's keys act.
+    #[gpui::test]
+    async fn a_draft_with_no_value_field_takes_esc(cx: &mut TestAppContext) {
+        let (table, cx) = born_table(cx);
+        open_a_draft_with_no_value_field(&table, cx);
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        table.update_in(cx, |table, window, _| {
+            assert!(table.bar().draft.is_none(), "Esc closed it");
+            assert!(table.filters.is_empty());
+            assert!(table.focus_handle.is_focused(window));
+            assert_eq!(table.cursor.map(|cursor| cursor.row), Some(0));
+        });
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert_eq!(table.cursor.map(|cursor| cursor.row), Some(1));
+        });
+    }
+
+    /// "Clear all" while a filter is being written closes the draft under its value field:
+    /// the table takes the keyboard back, and its keys act.
+    #[gpui::test]
+    async fn clear_all_with_a_draft_open_gives_the_table_its_keys(cx: &mut TestAppContext) {
+        let (table, cx) = born_table(cx);
+        table.update_in(cx, |table, window, cx| {
+            table.filters = vec![Filter {
+                property: "name".into(),
+                op: FilterOp::Contains,
+                value: serde_json::json!("a"),
+            }];
+            let col = table.column_index("name").expect("the name's column");
+            table.cursor = Some(Cursor { row: 0, col });
+            table.open_filter_draft(window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input("Ad");
+        table.update_in(cx, |table, window, cx| {
+            let draft = table.bar().draft.as_ref().expect("a draft is open");
+            assert!(draft.op.takes_value());
+            assert!(table.bar().editor.focus_handle(cx).is_focused(window));
+            assert!(table.filter_draft_takes_keys(window, cx));
+        });
+        // As the bar's "Clear all" and the toolbar chip's × call it.
+        table.update(cx, |table, cx| table.clear_filters(cx));
+        cx.run_until_parked();
+        table.update_in(cx, |table, window, cx| {
+            assert!(table.bar().draft.is_none() && table.filters.is_empty());
+            assert!(
+                !table.bar().editor.focus_handle(cx).is_focused(window),
+                "the field, no longer drawn, kept the keyboard"
+            );
+            assert!(table.focus_handle.is_focused(window), "the table has it");
+            assert!(!table.filter_draft_takes_keys(window, cx));
+            table.cursor = Some(Cursor { row: 0, col: 0 });
+        });
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert_eq!(table.cursor.map(|cursor| cursor.row), Some(1));
+        });
+    }
+
+    /// The draft a sentence opens to pick among the nodes a name matches has the keyboard in
+    /// its value field, where the name is: ↵ takes the node offered first. The relationship's
+    /// own first test takes no value, and a draft of that has the table's keyboard, so the
+    /// keyboard is placed again once the test is "is related to".
+    #[gpui::test]
+    async fn a_pick_among_several_nodes_has_the_keyboard_in_its_field(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+            cx.bind_keys([gpui::KeyBinding::new(
+                "enter",
+                ConfirmEdit,
+                Some("TypeTable && editing"),
+            )]);
+        });
+        let schema = "node Person {\n  slug: String @key\n  name: String\n}\n\
+            node Org {\n  slug: String @key\n  name: String\n}\n\
+            edge WorksAt: Person -> Org\n";
+        let session = session(schema, cx);
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session,
+                "Person".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let key = table.read_with(cx, |table, _| {
+            let schema = table.schema.clone().unwrap();
+            builder::relationship_key(&schema.relationships_of("Person")[0])
+        });
+        let offers = vec![
+            suggest::Suggestion {
+                value: "acme.com".into(),
+                label: Some("ACME Corp".into()),
+            },
+            suggest::Suggestion {
+                value: "acme-labs.ai".into(),
+                label: Some("Acme Labs".into()),
+            },
+        ];
+        table.update_in(cx, |table, window, cx| {
+            window.focus(&table.focus_handle, cx);
+            assert!(table.ask_to_pick(key.clone(), "Acme".into(), offers.clone(), window, cx));
+        });
+        cx.run_until_parked();
+        table.update_in(cx, |table, window, cx| {
+            assert!(
+                table.bar().editor.focus_handle(cx).is_focused(window),
+                "the value field has the keyboard"
+            );
+            assert!(table.filter_draft_takes_keys(window, cx));
+        });
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert_eq!(
+                table.filters,
+                [Filter {
+                    property: key.clone(),
+                    op: FilterOp::RelatedTo,
+                    value: serde_json::json!("acme.com"),
+                }],
+                "↵ took the node offered first"
+            );
+            assert!(table.bar().draft.is_none());
+        });
     }
 }
