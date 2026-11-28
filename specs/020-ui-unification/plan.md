@@ -146,7 +146,7 @@ Every interaction answers four questions, and each answer has one home.
 |---|---|---|---|
 | **Which?** | Server, graph, branch | Top bar | The person, rarely |
 | **What?** | Schema, type, node, query, branch | Left sidebar | The person, constantly |
-| **How?** | Table, Tree, Canvas, Page, Map | The view strip, which opens a tab | The person |
+| **How?** | Table, Tree, Canvas, Cards, Page, Map | The view strip, which opens a tab | The person |
 | **Where?** | Region: center, right, bottom | Fixed by the rule below | Nobody |
 | | Pane: this one or beside it | Same pane by default | The person |
 
@@ -183,7 +183,7 @@ are rules, not five new Rust types.
 |---|---|---|
 | **Subject** | The schema, type, node, edge, query or branch being viewed | Sets the view strip. A view that needs one node narrows a type to that node, and the tab's title says so |
 | **Read context** | The session and branch, and either "head" or a held commit | Always carried to the destination, and part of a tab's identity. A held view is read-only |
-| **Set** | A type's rows under filters, or nodes listed | Fixed at opening: what a tree reads. Never follows its source |
+| **Set** | A type's rows under filters, or nodes listed | Carried once, at opening, and never follows its source. A tree reads it as it was; a Cards tab then keeps filters and an order of its own (spec 048) |
 | **Tab identity** | The key that decides whether an open tab is reused | Subject, view and read context; for a set, also what it reads |
 | **Shared walk** | The expansion, selection and commit behind a Tree and a Canvas | One per session, root and read context. Refreshes together |
 
@@ -194,13 +194,14 @@ Each view answers one question, and holds only what can answer it.
 | View | Question | Holds |
 |---|---|---|
 | Table | Which of these? | A set |
+| Cards | What are these, each as a thing? | A set |
 | Tree | What are these connected to? | A set, or one node |
 | Canvas | What's around this one? | One node |
 | Page | What is this one? | One node |
 
 If a view can't hold what the tab has, it narrows to the selected node. With nothing selected it's
-disabled, with the reason. So the strip follows the subject: a set has `Table · Tree · Canvas` and a
-node has `Page · Tree · Canvas`. Canvas never draws a set or the whole graph; Map is the overview.
+disabled, with the reason. So the strip follows the subject: a set has `Table · Tree · Canvas · Cards`
+and a node has `Page · Tree · Canvas`. Canvas never draws a set or the whole graph; Map is the overview.
 
 ### Objects and their views
 
@@ -209,7 +210,7 @@ The first view is what a pick opens.
 | What | Listed in | Opens as | View strip |
 |---|---|---|---|
 | Schema | Data | Map | Map · Source |
-| Node type, or a set of its rows | Data | Table | Table · Tree · Canvas |
+| Node type, or a set of its rows | Data | Table | Table · Tree · Canvas · Cards |
 | Edge type | Data | Table | None |
 | Node | Nowhere; reached from a row, a link or ⌘P | Page | Page · Tree · Canvas |
 | Query | Queries | Editor with results | None; results offer Tree, and Graph when they link |
@@ -281,8 +282,13 @@ link's tooltip says what it will open: "Walk from Radia Knuth", "Show the 5 sele
 |---|---|---|---|
 | Table | Tree | The selected rows; with none, the rows under the filters, read a page at a time | Disabled with no rows: "No rows to show" |
 | Table | Canvas | A walk from the row under the cursor; rows ticked don't change that | Disabled with no row: "Select a row to walk from it" |
+| Table | Cards | The selected rows; with none, the rows under the filters, in the table's order (spec 048) | Always available |
+| Cards | Table | The type's table: its open tab as it stands, or a new one with the tab's filters | Always available |
+| Cards | Tree | The picked cards; with none, the rows under the tab's filters | Disabled with no rows: "No rows to show" |
+| Cards | Canvas | A walk from the cursor's card; cards picked don't change that | Disabled with no card: "Select a card to walk from it" |
 | Tree of a set | Table | The type's table: its open tab as it stands, or a new one with these filters | Always available |
 | Tree of a set | Canvas | A walk from the selected node, or from the node a selected relationship belongs to | Disabled with none: "Select a node to walk from it" |
+| Tree of a set | Cards | The set as the tree holds it, when it is of one type | Always available |
 | Tree of one node | Canvas | The same walk | Always available |
 | Tree of one node, Canvas | Page | The selected node, else the root | Always available |
 | Canvas | Tree | The same walk | Always available |
@@ -526,7 +532,8 @@ Use this test for any new "how" control:
 | Source | The schema's text | Schema, as a tab name |
 | Node type, edge type | Sidebar headings | Types, Relationships |
 | Node, edge | Records | "Row", except a table's literal row |
-| Table, Tree, Canvas, Page | Views | Explore (the word goes), Nodes |
+| Table, Tree, Canvas, Cards, Page | Views | Explore (the word goes), Nodes, Gallery (spec 035) |
+| Card | A node in the Cards view. A review's entry for a changed node is a "change card" | Tile (spec 035) |
 | Data | The sidebar panel | Graph, as a panel name |
 | Graph | The thing you open | Panel, menu and command names |
 | Server | Where a graph lives | CLI target, environment |
@@ -545,6 +552,7 @@ A restored session mustn't lose tabs, lose work or show errors.
 |---|---|
 | `ontology` tab | Map tab, with its focus |
 | `schema` tab | Source tab |
+| `gallery` tab (spec 035) | Cards tab of the same set, with that file as its cover (spec 048) |
 | `canvas` tab with pins and no root | No tab; its positions move to the per-graph store |
 | `explore` or `history` panel | Falls back as any unknown panel id does |
 
@@ -594,6 +602,7 @@ bar, environment marking and the message ladder.
 | No movable panels | Zed's `set_position` | A fixed region is what makes a result predictable. Deliberate deviation |
 | Keep Tree in the center | Zed's Outline pattern, a side panel that follows | The person's direction. ⌥-click gives the same arrangement when wanted |
 | Keys by strip position | One letter per view | `cmd-alt-t` is taken, and the digits are free on all three platforms. A digit's view varies by thing, but the strip shows it |
+| Cards is last in a set's strip, and keeps its own filters once open (2026-11-23, spec 048) | Second, beside Table; a set fixed at opening, as a tree's is | Tree and Canvas keep ⌘⌥2 and ⌘⌥3 on a set as on a node. Cards has the table's filter bar, which a set fixed at opening could not have; it still never follows the tab it came from |
 
 ## Order of work
 
@@ -755,6 +764,12 @@ The first four record changes to the draft before it was built.
   asks at every draw, and a set's action copies every loaded row.
 - 2026-11-01 · A key is not strictly unique in the window, since a split copies its tab, so the
   decision against per-pane reuse rests on opening never making a second copy.
+- 2026-11-23 · Gallery (spec 035) joined a set's strip on 2026-11-20 without the tables of this plan
+  saying so. Spec 048 replaces it with Cards, and the tables above now list Cards: what it holds, its
+  place in the strip, what it starts from, the word, and the saved `gallery` tab. A set was "fixed at
+  opening"; it is now "carried once", because a Cards tab keeps filters of its own after it opens.
+  None of this is built until spec 048's slices land; until then the strip's fourth entry is Gallery,
+  on types with a file.
 
 ## What this branch leaves open
 
