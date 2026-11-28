@@ -67,15 +67,13 @@ use crate::filter_bar::{
 };
 use crate::grouping::{GROUP_LIMIT, Grouping, Line, Lines, SECTION_FIRST_PAGE};
 use crate::model::{
-    ColumnLayout, ColumnRole, ColumnSpec, Notice, Paging, RELATION_CHIPS_SHOWN,
-    RELATION_SAMPLE_BUDGET, Row, SaveResult, TableKind, Tone, changed_elsewhere, chips_that_fit,
-    display_value, edge_columns, edge_rows, edit_text, edited, field_rows, insert_position,
-    node_columns, node_rows, parse_input, published, reads_as_markdown, relation_sample,
+    ColumnLayout, ColumnRole, ColumnSpec, Notice, Paging, Row, SaveResult, TableKind, Tone,
+    changed_elsewhere, display_value, edge_columns, edge_rows, edit_text, edited, field_rows,
+    insert_position, node_columns, node_rows, parse_input, published, reads_as_markdown,
     row_matches,
 };
-use crate::peek::{
-    KnownRelation, NEIGHBOUR_LIMIT, Neighbour, NodePeek, PeekSubject, TableBlobs, TableWrote,
-};
+use crate::peek::{KnownRelation, Neighbour, NodePeek, PeekSubject, TableBlobs, TableWrote};
+use crate::relations::{CellMap, RELATION_READ_CHUNK, RelationHost, Relations};
 use crate::suggest;
 use crate::words;
 use crate::write::{self, Bound};
@@ -86,10 +84,6 @@ use crate::filter_bar::{DraftTarget, FilterMenuEntry, filter_menu};
 use gq_language::builder::Quantifier;
 #[cfg(test)]
 use studio_actions::table::{SelectNextSuggestion, SelectPreviousSuggestion};
-
-/// Rows per neighbour read when a relationship column comes into view: a page's worth, as the
-/// page reads do.
-const RELATION_READ_CHUNK: usize = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cursor {
@@ -559,97 +553,6 @@ fn words_placeholder(needs_key: bool) -> &'static str {
 
 use studio_workspace::property_icon;
 
-/// One row's neighbours through one relationship: how many, and the first few by id (as many
-/// as the peek shows; the cell shows `RELATION_CHIPS_SHOWN`). `whole` when the row's whole list
-/// was read, so these are its first ones and the peek needs no read.
-struct Relation {
-    count: Result<i64, String>,
-    neighbours: NeighbourList,
-    whole: bool,
-}
-
-/// Neighbours by id, each with its label when the other type has one.
-type NeighbourList = Vec<(String, Option<String>)>;
-
-/// A `page_neighbours` answer by row: how many neighbours it lists for each, and the first
-/// [`NEIGHBOUR_LIMIT`] of them, by id.
-struct NeighbourLists(HashMap<String, (i64, NeighbourList)>);
-
-impl NeighbourLists {
-    fn read(rows: &Value) -> Self {
-        let mut lists: HashMap<String, (i64, NeighbourList)> = HashMap::new();
-        for (id, other, label) in relation_samples(rows) {
-            let (listed, first) = lists.entry(id).or_default();
-            *listed += 1;
-            if first.len() < NEIGHBOUR_LIMIT as usize {
-                first.push((other, label));
-            }
-        }
-        Self(lists)
-    }
-
-    /// Rows `ids` split by whether the answer lists every neighbour `degrees` counts for them:
-    /// those it does with their first neighbours, and the rest, in the order given. A list the
-    /// read's limit cut short, or none, is not the row's.
-    fn split(
-        mut self,
-        ids: Vec<String>,
-        degrees: &HashMap<String, i64>,
-    ) -> (Vec<(String, NeighbourList)>, Vec<String>) {
-        let mut whole = Vec::new();
-        let mut rest = Vec::new();
-        for id in ids {
-            let degree = degrees.get(&id).copied().unwrap_or(0);
-            match self.0.remove(&id) {
-                Some((listed, first)) if listed == degree => whole.push((id, first)),
-                _ => rest.push(id),
-            }
-        }
-        (whole, rest)
-    }
-}
-
-/// Values by row id and column, looked up without copying either key: every cell drawn asks
-/// for its own.
-struct CellMap<V>(HashMap<String, HashMap<String, V>>);
-
-impl<V> Default for CellMap<V> {
-    fn default() -> Self {
-        Self(HashMap::new())
-    }
-}
-
-impl<V> CellMap<V> {
-    fn get(&self, row: &str, column: &str) -> Option<&V> {
-        self.0.get(row)?.get(column)
-    }
-
-    fn get_mut(&mut self, row: &str, column: &str) -> Option<&mut V> {
-        self.0.get_mut(row)?.get_mut(column)
-    }
-
-    fn contains(&self, row: &str, column: &str) -> bool {
-        self.get(row, column).is_some()
-    }
-
-    fn insert(&mut self, row: String, column: String, value: V) {
-        self.0.entry(row).or_default().insert(column, value);
-    }
-
-    fn remove(&mut self, row: &str, column: &str) -> Option<V> {
-        let cells = self.0.get_mut(row)?;
-        let removed = cells.remove(column);
-        if cells.is_empty() {
-            self.0.remove(row);
-        }
-        removed
-    }
-
-    fn clear(&mut self) {
-        self.0.clear();
-    }
-}
-
 /// What a cell shows, made the first time it is drawn ([`TypeTable::cell_text`]): its text,
 /// and a date's or time's exact value, its tooltip. A date or a time reads relative to now, so
 /// it is made again in a later minute than the one it was made in (`minute`).
@@ -658,21 +561,6 @@ struct CellText {
     shown: SharedString,
     exact: Option<SharedString>,
     minute: Option<i64>,
-}
-
-/// `(id, other, label)` from a `page_neighbours` result.
-fn relation_samples(rows: &Value) -> Vec<(String, String, Option<String>)> {
-    rows.as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|row| {
-            Some((
-                row.get("id")?.as_str()?.to_owned(),
-                row.get("other")?.as_str()?.to_owned(),
-                row.get("label").and_then(Value::as_str).map(str::to_owned),
-            ))
-        })
-        .collect()
 }
 
 /// What the Group menu offers for a table's columns, built once with them
@@ -856,18 +744,13 @@ pub struct TypeTable {
     /// Files still being stored to a branch the table left, by that branch: shown there again,
     /// and holding a second write of their cell back, when the table comes back to it.
     blob_edits_left: HashMap<String, HashMap<(String, String), BlobEdit>>,
-    /// Each row's neighbours in the relationship columns, by row id and relationship key;
-    /// read for each page at the page's commit.
-    relations: CellMap<Relation>,
-    /// Relationship reads out, each taking itself out when done; a reload drops them all.
-    relation_tasks: HashMap<u64, Task<()>>,
-    next_relation_task: u64,
+    /// Each row's neighbours in the relationship columns, by row id and relationship key,
+    /// read for each page at the page's commit; the reads out, and what was asked for
+    /// ([`RelationHost`]).
+    relations: Relations,
     /// The relationship columns rows drew in the last frame, by key. Only these read their
     /// neighbours: a type with dozens of relationships reads the few on screen (spec 015).
     relations_drawn: HashSet<String>,
-    /// Rows and relationship keys whose read is out or done, so a column scrolled back into
-    /// view is not asked again.
-    relations_asked: HashSet<(String, String)>,
     /// The lines the last frame drew, first to last: a relationship column reads the rows of
     /// the lines near them, not every row read so far. Ungrouped, a line is a row; grouped, a
     /// folded section's rows are on no line ([`Self::rows_of_lines`]).
@@ -964,6 +847,54 @@ impl EventEmitter<ItemEvent> for TypeTable {}
 impl Focusable for TypeTable {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+/// The relationship columns' reads are [`RelationHost`]'s: the table says which rows and
+/// columns to read ([`TypeTable::load_shown_relations`]) and holds what they answer.
+impl RelationHost for TypeTable {
+    fn relations(&self) -> &Relations {
+        &self.relations
+    }
+
+    fn relations_mut(&mut self) -> &mut Relations {
+        &mut self.relations
+    }
+
+    fn relation_rows(&self) -> Option<(Arc<SchemaModel>, &str)> {
+        let schema = self.schema.clone()?;
+        (self.kind == TableKind::Node).then_some((schema, self.type_name.as_str()))
+    }
+
+    fn relation_pin(&self) -> Option<String> {
+        self.paging.pinned.clone()
+    }
+
+    fn read_relations(
+        &self,
+        query: &BuiltQuery,
+        snapshot: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<ReadOutput, ReadError>> {
+        self.read_shown(query, snapshot, cx)
+    }
+
+    /// When the schema names the neighbours' type otherwise since they were read (spec 002,
+    /// "Node names"), their names are read again under it.
+    fn neighbours_shown(
+        &mut self,
+        read_under: &Arc<SchemaModel>,
+        key: &str,
+        rows: &[String],
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(now) = self.schema.clone()
+            && !Arc::ptr_eq(&now, read_under)
+            && now.source == read_under.source
+        {
+            let renamed = now.renamed_since(read_under);
+            self.rename_relations(&renamed, Some((key, rows)), cx);
+        }
     }
 }
 
@@ -1373,11 +1304,8 @@ impl TypeTable {
             blob_queue: Default::default(),
             blob_edits: HashMap::new(),
             blob_edits_left: HashMap::new(),
-            relations: CellMap::default(),
-            relation_tasks: HashMap::new(),
-            next_relation_task: 0,
+            relations: Relations::default(),
             relations_drawn: HashSet::new(),
-            relations_asked: HashSet::new(),
             lines_drawn: 0..0,
             relation_lines: None,
             frame_line_range: None,
@@ -1566,8 +1494,6 @@ impl TypeTable {
             });
             if by_neighbours {
                 self.relations.clear();
-                self.relation_tasks.clear();
-                self.relations_asked.clear();
                 self.relation_lines = None;
                 // Its sections are read again; the open edit's text stays, as the cell's draft.
                 if let Some(editing) = self.editing.take() {
@@ -1711,7 +1637,7 @@ impl TypeTable {
                     .iter()
                     .filter_map(|&ix| self.rows.get(ix))
                     .map(|row| (row.id.clone(), key.clone()))
-                    .filter(|asked| !self.relations_asked.contains(asked))
+                    .filter(|asked| !self.relations.asked.contains(asked))
                     .map(|(id, _)| id)
                     .collect();
                 (group, missing)
@@ -1719,9 +1645,7 @@ impl TypeTable {
             .filter(|(_, missing): &(RelationshipGroup, Vec<String>)| !missing.is_empty())
             .collect();
         for (group, ids) in groups {
-            for chunk in ids.chunks(RELATION_READ_CHUNK) {
-                self.load_relation_groups(vec![group.clone()], chunk.to_vec(), cx);
-            }
+            self.read_relations_of(&group, &ids, cx);
         }
     }
 
@@ -3631,8 +3555,6 @@ impl TypeTable {
         // A file still being stored stays shown as going; why one did not land goes.
         self.blob_edits.retain(|_, edit| edit.is_saving());
         self.relations.clear();
-        self.relation_tasks.clear();
-        self.relations_asked.clear();
     }
 
     /// The connection's token changed ([`SessionEvent::CredentialChanged`]): the new one may
@@ -4742,7 +4664,8 @@ impl TypeTable {
         let missing = rows.iter().filter_map(|&ix| self.rows.get(ix)).any(|row| {
             keys.iter().any(|key| {
                 !self
-                    .relations_asked
+                    .relations
+                    .asked
                     .contains(&(row.id.clone(), key.clone()))
             })
         });
@@ -4786,175 +4709,6 @@ impl TypeTable {
         }
     }
 
-    fn load_relation_groups(
-        &mut self,
-        groups: Vec<RelationshipGroup>,
-        ids: Vec<String>,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(schema) = self.schema.clone() else {
-            return;
-        };
-        if ids.is_empty() || self.kind != TableKind::Node {
-            return;
-        }
-        let snapshot = self.paging.pinned.clone();
-        for group in groups {
-            let key = builder::relationship_key(&group);
-            // Rows whose relationship was read at this commit, or is being read, need no read.
-            let ids: Vec<String> = ids
-                .iter()
-                .filter(|id| {
-                    !self.relations.contains(id, &key)
-                        && !self.relations_asked.contains(&((*id).clone(), key.clone()))
-                })
-                .cloned()
-                .collect();
-            if ids.is_empty() {
-                continue;
-            }
-            self.relations_asked
-                .extend(ids.iter().map(|id| (id.clone(), key.clone())));
-            let Ok(degrees) = builder::page_degrees(&schema, &self.type_name, &group, &ids) else {
-                continue;
-            };
-            let degrees = self.read_shown(&degrees, snapshot.clone(), cx);
-            // The neighbours go out with the degrees, not after them: every neighbour of the
-            // rows, by row then neighbour, up to the budget. Most pages' rows are all in it.
-            // The degrees, in first, show the counts; the rows the answer holds whole show
-            // their chips as it lands; the rows it cut short (a hub, or rows after one that
-            // spent the budget) are read again, sized by their counts, so a hub never leaves
-            // the rows after it bare.
-            let first = builder::page_neighbours(
-                &schema,
-                &self.type_name,
-                &group,
-                &ids,
-                RELATION_SAMPLE_BUDGET as u32,
-            )
-            .ok()
-            .map(|query| self.read_shown(&query, snapshot.clone(), cx));
-            let ids = ids.clone();
-            let schema = schema.clone();
-            let type_name = self.type_name.clone();
-            let snapshot = snapshot.clone();
-            self.next_relation_task += 1;
-            let task_id = self.next_relation_task;
-            let task = cx.spawn(async move |this, cx| {
-                // How many neighbours each row has. An answer whose rows cannot be read fails
-                // the column's counts, as a failed read does, rather than counting such a row as
-                // having none.
-                let counts: Result<HashMap<String, i64>, String> = match degrees.await {
-                    Ok(output) => graph_store::page_counts(&output.rows)
-                        .map(|counts| {
-                            counts
-                                .into_iter()
-                                .map(|(id, n)| (id, i64::try_from(n).unwrap_or(i64::MAX)))
-                                .collect()
-                        })
-                        .ok_or_else(|| "The neighbour counts could not be read".to_owned()),
-                    Err(error) => Err(error.to_string()),
-                };
-                let shown = this.update(cx, |this, cx| {
-                    for id in &ids {
-                        let count = match &counts {
-                            Ok(counts) => Ok(counts.get(id).copied().unwrap_or(0)),
-                            Err(error) => Err(error.clone()),
-                        };
-                        let relation = Relation {
-                            count,
-                            neighbours: Vec::new(),
-                            whole: false,
-                        };
-                        this.relations.insert(id.clone(), key.clone(), relation);
-                    }
-                    if counts.is_err() {
-                        this.relation_tasks.remove(&task_id);
-                    }
-                    cx.notify();
-                });
-                let (Ok(counts), Ok(())) = (counts, shown) else {
-                    return;
-                };
-                // The rows that show chips: each whole list in page order while the budget
-                // lasts, none of more than a hub's.
-                let (sampled, _) = relation_sample(&ids, &counts);
-                let output = match first {
-                    Some(read) if !sampled.is_empty() => read.await.ok(),
-                    _ => None,
-                };
-                // Neither read nor wanted: the counts show alone, as a failed read leaves them.
-                let Some(output) = output else {
-                    this.update(cx, |this, _| this.relation_tasks.remove(&task_id))
-                        .ok();
-                    return;
-                };
-                let (whole, rest) = NeighbourLists::read(&output.rows).split(sampled, &counts);
-                let shown = this.update(cx, |this, cx| {
-                    this.show_neighbours(&schema, &key, whole, cx);
-                    if rest.is_empty() {
-                        this.relation_tasks.remove(&task_id);
-                    }
-                    cx.notify();
-                });
-                if rest.is_empty() || shown.is_err() {
-                    return;
-                }
-                let (rest, total) = relation_sample(&rest, &counts);
-                let read =
-                    builder::page_neighbours(&schema, &type_name, &group, &rest, total as u32)
-                        .ok()
-                        .and_then(|query| {
-                            this.update(cx, |this, cx| {
-                                this.read_shown(&query, snapshot.clone(), cx)
-                            })
-                            .ok()
-                        });
-                let output = match read {
-                    Some(read) => read.await.ok(),
-                    None => None,
-                };
-                this.update(cx, |this, cx| {
-                    this.relation_tasks.remove(&task_id);
-                    // A row this read does not hold whole either shows its count alone.
-                    if let Some(output) = output {
-                        let (whole, _) = NeighbourLists::read(&output.rows).split(rest, &counts);
-                        this.show_neighbours(&schema, &key, whole, cx);
-                        cx.notify();
-                    }
-                })
-                .ok();
-            });
-            self.relation_tasks.insert(task_id, task);
-        }
-    }
-
-    /// Shows the chips of rows whose whole lists of neighbours through relationship `key` were
-    /// read under `read_under`; their counts show already. When the schema names their type
-    /// otherwise since (spec 002, "Node names"), their names are read again under it.
-    fn show_neighbours(
-        &mut self,
-        read_under: &Arc<SchemaModel>,
-        key: &str,
-        whole: Vec<(String, NeighbourList)>,
-        cx: &mut Context<Self>,
-    ) {
-        let rows: Vec<String> = whole.iter().map(|(id, _)| id.clone()).collect();
-        for (id, neighbours) in whole {
-            if let Some(relation) = self.relations.get_mut(&id, key) {
-                relation.neighbours = neighbours;
-                relation.whole = true;
-            }
-        }
-        if let Some(now) = self.schema.clone()
-            && !Arc::ptr_eq(&now, read_under)
-            && now.source == read_under.source
-        {
-            let renamed = now.renamed_since(read_under);
-            self.rename_relations(&renamed, Some((key, &rows)), cx);
-        }
-    }
-
     /// The node type at the other end of relationship column `key`.
     fn relation_type<'a>(&self, schema: &'a SchemaModel, key: &str) -> Option<&'a str> {
         let (direction, edge) = builder::parse_relationship_key(key)?;
@@ -4982,7 +4736,7 @@ impl TypeTable {
         };
         let mut ends: Vec<(String, String)> = Vec::new();
         let mut seen: HashSet<(String, String)> = HashSet::new();
-        for (row, cells) in &self.relations.0 {
+        for (row, cells) in &self.relations.cells.0 {
             for (key, relation) in cells {
                 if only.is_some_and(|(column, rows)| column != key || !rows.contains(row)) {
                     continue;
@@ -5007,15 +4761,14 @@ impl TypeTable {
             let read = self.session.update(cx, |session, cx| {
                 session.node_names(chunk.to_vec(), snapshot.clone(), cx)
             });
-            self.next_relation_task += 1;
-            let task_id = self.next_relation_task;
+            let task_id = self.relations.next_task();
             // The schema the names are read under: a read that lands after another choice names
             // nothing of a type named otherwise since.
             let read_under = schema.clone();
             let task = cx.spawn(async move |this, cx| {
                 let (names, answered) = read.await;
                 this.update(cx, |this, cx| {
-                    this.relation_tasks.remove(&task_id);
+                    this.relations.tasks.remove(&task_id);
                     let Some(schema) = this.schema.clone() else {
                         return;
                     };
@@ -5025,7 +4778,7 @@ impl TypeTable {
                             .and_then(|node| node.label_property())
                             .map(str::to_owned)
                     };
-                    let mut cells = std::mem::take(&mut this.relations.0);
+                    let mut cells = std::mem::take(&mut this.relations.cells.0);
                     for row in cells.values_mut() {
                         for (key, relation) in row.iter_mut() {
                             let Some(other) = this.relation_type(&schema, key) else {
@@ -5049,12 +4802,12 @@ impl TypeTable {
                             }
                         }
                     }
-                    this.relations.0 = cells;
+                    this.relations.cells.0 = cells;
                     cx.notify();
                 })
                 .ok();
             });
-            self.relation_tasks.insert(task_id, task);
+            self.relations.tasks.insert(task_id, task);
         }
     }
 
@@ -5758,8 +5511,6 @@ impl TypeTable {
         // A deleted node took its relationships with it: the rows still shown read their
         // relationship chips again at the new commit, rather than listing it.
         self.relations.clear();
-        self.relation_tasks.clear();
-        self.relations_asked.clear();
         self.relation_lines = None;
         self.load_shown_relations(cx);
         self.recount(behind, -rows, -matching, cx);
@@ -9946,30 +9697,11 @@ impl TypeTable {
                 .color(Color::Disabled.color(cx))
                 .into_any_element();
         }
-        let labels: Vec<&str> = relation
-            .neighbours
-            .iter()
-            .take(RELATION_CHIPS_SHOWN)
-            .map(|(id, label)| label.as_deref().unwrap_or(id))
-            .collect();
-        let fit = chips_that_fit(&labels, count, available);
-        let more = count - fit as i64;
-        // The count stays in view; the tags give way, whole. One element lays out and paints
-        // them all: as boxes, each tag was two layout nodes and the cell three more, in every
-        // relationship cell of every frame.
-        let cell = studio_ui::tags(
-            labels[..fit]
-                .iter()
-                .map(|label| SharedString::from(label.to_string())),
-            (more > 0).then(|| {
-                SharedString::from(if fit == 0 {
-                    studio_ui::group_count(count)
-                } else {
-                    format!("+{}", studio_ui::group_count(more))
-                })
-            }),
-            cx,
-        );
+        // The count stays in view; the tags give way, whole ([`Relation::chips`]). One element
+        // lays out and paints them all: as boxes, each tag was two layout nodes and the cell
+        // three more, in every relationship cell of every frame.
+        let (chips, more) = relation.chips(count, available);
+        let cell = studio_ui::tags(chips, more, cx);
         if self.frame_pointer != Some((ix, col)) {
             return cell.into_any_element();
         }
@@ -14496,7 +14228,8 @@ mod tests {
         let read_for = |cx: &mut gpui::VisualTestContext| {
             table.read_with(cx, |table, _| {
                 let mut keys: Vec<String> = table
-                    .relations_asked
+                    .relations
+                    .asked
                     .iter()
                     .map(|(_, key)| key.clone())
                     .collect();
@@ -14535,10 +14268,11 @@ mod tests {
                 })
                 .collect();
             table.lines_drawn = 500..520;
-            table.relations_asked.clear();
+            table.relations.asked.clear();
             table.load_shown_relations(cx);
             let asked: HashSet<&str> = table
-                .relations_asked
+                .relations
+                .asked
                 .iter()
                 .map(|(id, _)| id.as_str())
                 .collect();
@@ -15059,7 +14793,7 @@ mod tests {
             let grace = table.relations.get("p2", &key).unwrap();
             assert_eq!(grace.neighbours.len(), 1);
             assert!(grace.whole);
-            assert!(table.relation_tasks.is_empty());
+            assert!(table.relations.tasks.is_empty());
         });
         assert_eq!(
             served.sent("studio_page_neighbours").len(),
@@ -15166,7 +14900,7 @@ mod tests {
             let grace = table.relations.get("p2", &key).unwrap();
             assert_eq!(grace.neighbours.len(), 3);
             assert!(grace.whole);
-            assert!(table.relation_tasks.is_empty());
+            assert!(table.relations.tasks.is_empty());
         });
     }
 
@@ -17850,8 +17584,8 @@ mod tests {
             table.blobs.clear();
             table.blob_tasks.clear();
             table.relations.clear();
-            table.relation_tasks.clear();
-            table.relations_asked.clear();
+            table.relations.tasks.clear();
+            table.relations.asked.clear();
             table.relation_lines = None;
             table.blob_lines = None;
             cx.notify();
@@ -17869,12 +17603,13 @@ mod tests {
             let blob_reads: HashSet<String> = table.blobs.0.keys().cloned().collect();
             assert_eq!(blob_reads, shown, "Blob cells read");
             let related: HashSet<String> = table
-                .relations_asked
+                .relations
+                .asked
                 .iter()
                 .map(|(id, _)| id.clone())
                 .collect();
             assert_eq!(related, shown, "relationships read");
-            let asked = table.relations_asked.len();
+            let asked = table.relations.asked.len();
             assert_eq!(asked, shown.len() * table.relations_drawn.len());
         });
     }
@@ -18213,14 +17948,14 @@ mod tests {
             table.blobs.clear();
             table.blob_tasks.clear();
             table.relations.clear();
-            table.relation_tasks.clear();
-            table.relations_asked.clear();
+            table.relations.tasks.clear();
+            table.relations.asked.clear();
             table.lines_moved();
             cx.notify();
         });
         settle(cx);
         let read = |table: &TypeTable, id: &str| {
-            let related = table.relations_asked.iter().any(|(row, _)| row == id);
+            let related = table.relations.asked.iter().any(|(row, _)| row == id);
             (table.blobs.contains(id, "doc"), related)
         };
         let drawn = table.read_with(cx, |table, _| {

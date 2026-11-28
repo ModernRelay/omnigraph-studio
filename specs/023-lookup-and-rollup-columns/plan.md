@@ -47,7 +47,8 @@ Studio at `77ca3964`; Omnigraph `v0.14.0` compiler (`Cargo.lock`), and the CLI
 - **Relationship cells read only rows near the screen.** `want_relations` and
   `want_row_relations` record what the grid drew; `load_shown_relations` reads those lines and
   100 rows on each side (`RELATION_READ_CHUNK`), skipping pairs already asked
-  (`table.rs:1585`, `:4456`, `:4497`). `relation_sample` gives each row its whole list while a
+  (`table.rs:1585`, `:4456`, `:4497`; the read itself, `RelationHost::load_relation_groups`,
+  is in `relations.rs` since spec 048's slice 6). `relation_sample` gives each row its whole list while a
   budget of 2,000 neighbour rows per read and 200 per row lasts (`model.rs:1081-1087`).
 - **Their queries:** `page_degrees` returns `{ $n.@id as id, count($m) as n }` over
   `$n.@id in $ids`; `page_neighbours` returns `id`, `other` and `$m.<label> as label`, ordered by
@@ -55,7 +56,8 @@ Studio at `77ca3964`; Omnigraph `v0.14.0` compiler (`Cargo.lock`), and the CLI
   `Depends::EdgesAt`, which carries their answers across commits that change no such edge
   (`crates/graph_store/src/carry.rs:207-235`).
 - **Cache and drawing:** `relations: CellMap<Relation>` by (row id, relationship key), kept
-  while a reload keeps its pin (`table.rs:892`, `:3320`); `render_relation_cell` draws "…",
+  while a reload keeps its pin (`table.rs:892`, `:3320`; since spec 048's slice 6 a
+  `Relations`, in `relations.rs`, which holds the cells); `render_relation_cell` draws "…",
   "?", "—", up to two chips that fit, then "+N" (`table.rs:9830`).
 - **Neighbour property keys** already exist: `out:WorksAt.city` parses as
   `GroupKey::NeighbourProperty` (`builder.rs:437`, `:455`, `:484`). A filter on one is an

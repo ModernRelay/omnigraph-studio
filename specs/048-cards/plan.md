@@ -1,11 +1,12 @@
 # 048: Cards, a view of a type's nodes
 
-Status: accepted 2026-11-23 · slices 1 to 5 built 2026-11-23 (1: Gallery is Cards: the names
+Status: accepted 2026-11-23 · slices 1 to 6 built 2026-11-23 (1: Gallery is Cards: the names
 and their aliases, a saved `gallery` tab restored, the uniform grid, ↵, ⌥↵ and G. 2: a card
 shows fields under its title, the format with its Fields menu, kept by tab and by type; Cards
 for every node type and from a tree of a set. 3 and 4: the table's filter bar in a file of its
 own, behind `FilterHost`. 5: that bar and a Sort chip in Cards, a change read at the commit the
-tab shows); slices 6 and 7 not built · supersedes
+tab shows. 6: a relationship as a card's field, read by the table's relationship reads, moved
+to a module both tabs call); slice 7 not built · supersedes
 [035](../035-gallery/plan.md), whose Gallery left the app with slice 1 · Studio's claims checked
 against `7f3e7e92` on 2026-11-23; Omnigraph's are spec 035's, checked against `v0.15.0` on
 2026-11-18 and not rechecked
@@ -154,7 +155,7 @@ configuration describes a view, a layout or a card.
 │ Harbour at dusk          │  title: the node's name (`NodeType::label_property`), else its key
 │ body     Cover image fo… │  fields: the property's name, muted, then its value; one line each
 │ written  2026-11-02      │
-│ filedUnder  Design       │  a relationship is a field too (slice 6): its neighbours as tags
+│ filedUnder → Design      │  a relationship is a field too (slice 6): its neighbours as tags
 └──────────────────────────┘
 ```
 
@@ -343,7 +344,17 @@ filter's field, and a move through its suggestions, draws it no times.
   takes no value, with the host (`focus_filter_draft`), takes it back from a field no longer
   drawn as it draws (`keep_filter_keys`), and tells a host when its own keys wait
   (`filter_draft_takes_keys`, each host's `editing`).
-- **Relationship reads** move out of `TypeTable` into `relations.rs`, which both tabs call.
+- **Relationship reads** move out of `TypeTable` into `relations.rs`, which both tabs call. As
+  built (slice 6): a `Relations` each host holds (what was read by row and relationship key,
+  the reads out, what was asked for) and a `RelationHost` trait, on the pattern of the filter
+  bar. A host answers five things (its `Relations`, mutably too, the schema and node type of
+  its rows, their commit, and how it reads a query) and says which rows to read
+  (`read_relations_of`); the reads, moved as they were, fill its `Relations`. Two hooks have
+  defaults: `relations_landed`, a redraw, which Cards overrides to draw what lands together
+  once, and `neighbours_shown`, nothing, which the table overrides with its check that the
+  schema still names the neighbours' type the same way. Which columns the grid drew and which
+  lines stay the table's. What a row's neighbours show in a given width (`Relation::chips`)
+  is one function for the table's cell and a card's line.
 - **Names.** Old names keep working:
 
   | Was | Becomes | Kept working by |
@@ -428,8 +439,8 @@ Each slice is a pull request that stands alone.
 | 2026-11-23 | A saved view's shape is never read; a results canvas is not saved | Read `studio_settings.rs`, `type_table.rs` (`open_saved_view`), `graph_canvas.rs` (`serialize`) | Confirmed by reading |
 
 Slices 1, 2 and 5 have their rows below. Slices 3 and 4 were built on branches of their own
-and reached this log's branch by a merge; their rows are theirs to add. Slices 6 and 7 are
-not built.
+and reached this log's branch by a merge; their rows are theirs to add. Slice 6 has its rows
+below. Slice 7 is not built.
 
 ### Slice 1 (2026-11-23)
 
@@ -534,6 +545,35 @@ Built on `feat/cards-filters`, on `10949470`. The same machine and toolchain.
 | 2026-11-23 | One word for the rows a tab holds | `a_tab_of_selected_rows_says_so_until_its_pill_is_cleared`, renamed, its tooltip's words changed | Pass: "Showing 3 selected rows. Clear the pill to filter Note" |
 | 2026-11-23 | The table in the app, before and after | The offscreen snapshot tool on the Note table of the `notes` graph, through Studio's keymap: `written`, "is today"; ↓ and J; Esc; the draft again; ↵. Then Cards: a preset and ↵; three listed notes | Before (slice 5's row): the draft stays open after ↵ and Esc. After: the draft "written · is today" open with 13 rows; ↓ and J put no cursor on a row; Esc closes it; ↵ adds the pill "written is today" and the table reads "0 of 13". Cards as in slice 5, its pill "3 selected rows ×" under the title "Cards: Note, 3 selected rows" |
 | 2026-11-23 | The workspace's checks | The same seven commands | All pass. Tests: 1,778 passed, 0 failed, 9 ignored in the 54 harnessed binaries (`type_table` 340 and 1 ignored), and the 7 checks of `keymaps`. `layers ok: 24 crates; 64 UI tools in their crate`, `design tokens ok`, `brand ok: 546 files`, 8 release-file tests OK |
+
+### Slice 6 (2026-11-23)
+
+Built on `feat/cards-relationships`, on `0949b8fa`. The same machine and toolchain.
+
+Part A, the move:
+
+| Date | Claim | Check | Result |
+|---|---|---|---|
+| 2026-11-23 | The table's relationship reads moved and the table behaves as before | `cargo test -p type_table`, its names and results listed before any change and after the move alone, and compared | The same 341 names, each with the same result (340 passed, 1 ignored). `git diff` of `table.rs` for the move: 84 lines added, 330 removed |
+| 2026-11-23 | No relationship test asserts anything else | The tests of `table.rs` the move touched, read: `relationship_columns_read_while_drawn`, `relationship_counts_show_before_the_neighbours_asked_for_with_them`, `a_row_a_hub_left_bare_is_read_again_sized_by_its_count`, `a_grouped_frame_reads_only_the_rows_its_lines_show`, `folding_a_section_reads_the_cells_of_the_rows_it_brings_into_view` | 12 lines in the 5: `table.relations_asked` reads `table.relations.asked` and `table.relation_tasks` `table.relations.tasks`, the state being one struct now. Nothing they assert changed |
+
+Part B, relationship fields:
+
+| Date | Claim | Check | Result |
+|---|---|---|---|
+| 2026-11-23 | A relationship is a field a format names by its key | `card_format::tests` `a_relationship_is_a_field_by_its_key`: Note with `out:FiledUnder` and `in:Wrote`; the choices, the default, the titles against `model::node_columns`, show, move, hide, reset, a ninth field, one the schema lacks, one named twice | Pass: the properties then the relationships; none by default; "filedUnder →" and "← wrote", the columns' titles; shown last, moved and hidden as any field; refused past eight; the lost one left out and the format not changed by being read. The four tests there before are unedited |
+| 2026-11-23 | The key round-trips through the settings | `studio_settings` `a_card_format_keeps_a_relationship_by_its_key`: written to text and read back | Pass: `"fields": ["body", "out:FiledUnder", "in:Wrote"]` |
+| 2026-11-23 | A card shows a relationship's neighbours | `cards::tests` `a_card_shows_a_relationships_neighbours`: 12 notes filed under none, one, two and three topics; what a line of 300, 90 and 20 px shows of each | Pass: a dash for none; "Topic 0"; "Topic 0" "Topic 1"; the two and "+1"; one tag and "+2" in 90 px; "3" alone in 20; nothing before the read, and "?" for a count that could not be read. The Fields menu's choices end with the relationship, titled "filedUnder →" |
+| 2026-11-23 | Two reads a relationship a hundred cards, and none unless one is shown | `relationship_fields_cost_two_reads_a_hundred_cards`: 400 notes, the fake server's log; the default card scrolled to its end and back; then Small, no cover and the field shown | Pass: no `studio_page_degrees` or `studio_page_neighbours` until the field is shown; then 180 cards laid out read in two reads of each, none of more than 100 rows, each card once |
+| 2026-11-23 | Only the cards near the view are read, and none twice | `only_the_cards_near_the_view_read_their_relationships`: 400 notes with covers; the start, the end, the start again | Pass: the rows asked for are the cards laid out, fewer than the 200 read; the last row read shows nothing; the scroll to the end reads the cards it brings near; back at the start nothing is asked, and no row is in two reads |
+| 2026-11-23 | A relationship field added reads at the pin, and what is held is not asked for again | `a_relationship_field_added_reads_at_the_pin`: the head moved to `c2`; the field shown as the menu's row calls it; an order, a filter, the field hidden and shown; ⌘R | Pass: one read of each, asked with `snapshot: c1` and answered there; kept as the type's format; nothing read for the order, the filter or the field shown again; after ⌘R one more, answered at `c2`. With the reads made at the head, the test fails |
+| 2026-11-23 | Cards keep their height and place as the answers land, which draw the grid once | `relationship_fields_land_in_place_and_draw_the_cards_once`: 60 notes, no cover, the two reads held; the drawn bounds of eight cards before and after; the draws of `CardsGrid`; six keys | Pass: every card `card_height` before and the same bounds after; no draw as the counts and the neighbours land, one `LANDING_DELAY` after; one draw a key. With a redraw a landing, the test fails |
+| 2026-11-23 | A saved tab keeps a relationship field, and one the schema lost is left out | `a_saved_tab_keeps_its_relationship_fields`: a format naming `title`, `out:Gone` and `out:FiledUnder`; saved; reopened in another window; another writer drops the edge; refresh | Pass: the two it has are shown and one relationship read; the format saved as written; the reopened tab shows and reads it; after the refresh the card has `title` alone, the menu no such choice, nothing is read, and the format is still as written |
+| 2026-11-23 | Relationship fields in the app | Offscreen snapshots at 1440 × 900 against `script/dev-server` on a port of its own (`omnigraph` 0.15.0), formats written in a settings file of the run, read: Note with `written` and `filedUnder →`; Topic with `← filedUnder`; Person of the `knowledge` graph with `title`, `worksAt →` and `contributes →`; the Fields menu on Note and on Person; the dark theme twice | Notes with one or two topics as tags; topics with their first note and "+6", "+3", "+1", "+2", as the inspector counts them; people with a company, a project and "+1" or "+2", and a dash where they have none; names in one column, values on one edge, every card one height. The menu lists the relationships shown among Fields and the others after the properties |
+| 2026-11-23 | The workspace's checks | The same seven commands | All pass. Tests: 1,786 passed, 0 failed, 9 ignored in the 54 harnessed binaries (`type_table` 347 and 1 ignored, `studio_settings` 51), and the 7 checks of `keymaps`. `layers ok: 24 crates; 64 UI tools in their crate`, `design tokens ok`, `brand ok: 546 files` (the new file not yet tracked), 8 release-file tests OK |
+
+`type_table` after the slice: the 341 names of before, each with the result it had, and 7 new.
+`cards::tests` holds 48 tests, none of the 42 edited.
 
 ## Corrections
 
@@ -652,3 +692,29 @@ Slice 5, follow-up:
 - 2026-11-23 · **The rows a tab holds are "selected" in its pill and its tooltip too**, the
   word its title has from the table. The plan said "3 picked rows"; "picked" stays the word
   for cards picked in the tab.
+
+Slice 6:
+
+- 2026-11-23 · **A card's line shows two neighbours at most**, then "+N", as the table's cell
+  does (`RELATION_CHIPS_SHOWN`), and how many fit is the table's estimate of a tag's width
+  (`model::chips_that_fit`), since a line is laid out before its text is measured. A card of
+  the default width often has room for one name and the count.
+- 2026-11-23 · **A relationship is titled as the table's column is**: "filedUnder →" out of a
+  node, "← filedUnder" into it. The drawing of a card above showed the name alone.
+- 2026-11-23 · **Before its read a line is empty; the table's cell shows "…".** A count that
+  could not be read shows "?" in the warning colour, as the cell does, without the cell's
+  tooltip: a field has no handler.
+- 2026-11-23 · **A row the branch removed reads no relationship**: it is no row at the
+  branch's commit, and its line stays empty.
+- 2026-11-23 · **A page's cards read their relationships with the page**, as they read their
+  covers; the 120 ms pause is a scroll's.
+- 2026-11-23 · **Relationship reads out are let run through a filter or order change**: they
+  are of rows at the same commit, which may be shown again, and a row is asked for once. A
+  read from the start (⌘R, another branch, a new token) drops them and what they read.
+- 2026-11-23 · **When the property that names a type changes, the table renames the
+  neighbours it shows in place; a Cards tab offers Refresh**, as it does for every schema
+  change, and shows the names it read meanwhile.
+- 2026-11-23 · **`Relation::chips` is one function for the table's cell and a card's line.**
+  The table's cell called `chips_that_fit` and worded "+N" itself; it now calls the function
+  the lines moved into. Part A's comparison was made before this, and the whole of it again
+  after.

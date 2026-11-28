@@ -1,20 +1,88 @@
 //! What a type's cards show (spec 048, "Format"): the default rule, a kept format read against
-//! the schema as it is now, and the changes the Fields menu makes to one. Pure: no GPUI, no
-//! reads. The format itself is `studio_settings::CardFormat`, which the settings file keeps by
-//! graph and type and a Cards tab saves with itself.
+//! the schema as it is now, and the changes the Fields menu makes to one. A field is one of the
+//! type's properties or one of its relationships, which shows a node's neighbours. Pure: no
+//! GPUI, no reads. The format itself is `studio_settings::CardFormat`, which the settings file
+//! keeps by graph and type and a Cards tab saves with itself.
 
-use gq_language::{NodeType, Property, ScalarKind};
+use gq_language::{NodeType, Property, RelationshipGroup, ScalarKind, builder};
 use studio_settings::{CardCover, CardFormat};
 
 /// How many fields the default card shows.
 const DEFAULT_FIELDS: usize = 3;
 
+/// A node type as a card sees it: its properties, and the relationships its nodes have, as a
+/// table of the type has a column for each ([`crate::model::node_columns`]). A type alone
+/// (`&NodeType`) is one with no relationship.
+#[derive(Debug, Clone, Copy)]
+pub struct CardType<'a> {
+    pub node: &'a NodeType,
+    pub relationships: &'a [RelationshipGroup],
+}
+
+impl<'a> From<&'a NodeType> for CardType<'a> {
+    fn from(node: &'a NodeType) -> Self {
+        Self {
+            node,
+            relationships: &[],
+        }
+    }
+}
+
+impl CardType<'_> {
+    /// The relationship a format names by `key` (`out:FiledUnder`), when the type has it.
+    fn relationship(&self, key: &str) -> Option<&RelationshipGroup> {
+        self.relationships
+            .iter()
+            .find(|group| builder::relationship_key(group) == key)
+    }
+
+    /// Whether `name` can be a card's field: a property that can, or a relationship.
+    fn has_field(&self, name: &str) -> bool {
+        self.node.property(name).is_some_and(can_be_field) || self.relationship(name).is_some()
+    }
+}
+
+/// What a card's field is of.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FieldOf {
+    /// A property: the row's value.
+    Property(Property),
+    /// A relationship: the row's neighbours through it, read apart from the row.
+    Relationship(RelationshipGroup),
+}
+
+/// One field of a card.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CardField {
+    /// How a format names it: the property's name, or the relationship's key
+    /// (`out:FiledUnder`), which no property's name can be.
+    pub name: String,
+    /// What a card says before its value: the property's name, or the relationship as a table
+    /// titles its column (`filedUnder →`).
+    pub title: String,
+    pub of: FieldOf,
+}
+
+impl CardField {
+    pub fn relationship(&self) -> Option<&RelationshipGroup> {
+        match &self.of {
+            FieldOf::Relationship(group) => Some(group),
+            FieldOf::Property(_) => None,
+        }
+    }
+}
+
+/// How a card titles the relationship `key`: as the table's column of it is titled.
+pub fn relationship_title(key: &str) -> String {
+    builder::relationship_label(key).unwrap_or_else(|| key.to_owned())
+}
+
 /// What a card of one type shows under a format: resolved against the schema.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CardFace {
-    /// The fields in card order: properties the type has, at most
+    /// The fields in card order: properties and relationships the type has, at most
     /// [`CardFormat::MOST_FIELDS`].
-    pub fields: Vec<Property>,
+    pub fields: Vec<CardField>,
     /// The file property shown as the cover; `None` when the format says none or the type has
     /// no file.
     pub cover: Option<String>,
@@ -26,11 +94,17 @@ fn can_be_field(property: &Property) -> bool {
     !matches!(property.kind, ScalarKind::Blob | ScalarKind::Vector)
 }
 
-/// The properties a card's field can be, in schema order.
-pub fn field_choices(node: &NodeType) -> Vec<&Property> {
-    node.properties
+/// What a card's field can be, by the name a format gives it: the properties, in schema order,
+/// then the relationships, in the order a table has their columns. No relationship is a field
+/// until it is chosen: each costs reads.
+pub fn field_choices<'a>(of: impl Into<CardType<'a>>) -> Vec<String> {
+    let of = of.into();
+    of.node
+        .properties
         .iter()
         .filter(|property| can_be_field(property))
+        .map(|property| property.name.clone())
+        .chain(of.relationships.iter().map(builder::relationship_key))
         .collect()
 }
 
@@ -57,19 +131,21 @@ pub fn default_fields(node: &NodeType) -> Vec<String> {
         .collect()
 }
 
-/// The names of the fields a format shows on `node`, in card order: its own, or the default
-/// rule's when it names none. A field the schema no longer has, or one named twice, is left
-/// out, and no more than [`CardFormat::MOST_FIELDS`] are kept.
-pub fn shown_fields(format: &CardFormat, node: &NodeType) -> Vec<String> {
+/// The names of the fields a format shows on a type, in card order: its own, or the default
+/// rule's when it names none. A field the schema no longer has (a property, or a
+/// relationship), or one named twice, is left out, and no more than
+/// [`CardFormat::MOST_FIELDS`] are kept.
+pub fn shown_fields<'a>(format: &CardFormat, of: impl Into<CardType<'a>>) -> Vec<String> {
+    let of = of.into();
     let Some(named) = &format.fields else {
-        return default_fields(node);
+        return default_fields(of.node);
     };
     let mut shown: Vec<String> = Vec::new();
     for name in named {
         if shown.len() == CardFormat::MOST_FIELDS {
             break;
         }
-        if node.property(name).is_some_and(can_be_field) && !shown.contains(name) {
+        if of.has_field(name) && !shown.contains(name) {
             shown.push(name.clone());
         }
     }
@@ -88,14 +164,28 @@ pub fn shown_cover(format: &CardFormat, node: &NodeType) -> Option<String> {
     }
 }
 
-/// What a card of `node` shows under `format`.
-pub fn face(format: &CardFormat, node: &NodeType) -> CardFace {
+/// What a card of a type shows under `format`.
+pub fn face<'a>(format: &CardFormat, of: impl Into<CardType<'a>>) -> CardFace {
+    let of = of.into();
     CardFace {
-        fields: shown_fields(format, node)
-            .iter()
-            .filter_map(|name| node.property(name).cloned())
+        fields: shown_fields(format, of)
+            .into_iter()
+            .filter_map(|name| {
+                let (title, field) = match of.node.property(&name) {
+                    Some(property) => (name.clone(), FieldOf::Property(property.clone())),
+                    None => (
+                        relationship_title(&name),
+                        FieldOf::Relationship(of.relationship(&name)?.clone()),
+                    ),
+                };
+                Some(CardField {
+                    name,
+                    title,
+                    of: field,
+                })
+            })
             .collect(),
-        cover: shown_cover(format, node),
+        cover: shown_cover(format, of.node),
     }
 }
 
@@ -108,41 +198,52 @@ fn with_fields(format: &CardFormat, node: &NodeType, fields: Vec<String>) -> Car
     }
 }
 
-/// `format` with the field `name` shown, last. `None` when it is shown already, cannot be a
-/// field, or the card is full.
-pub fn with_field_shown(format: &CardFormat, node: &NodeType, name: &str) -> Option<CardFormat> {
-    let mut fields = shown_fields(format, node);
+/// `format` with the field `name` shown, last: a property, or a relationship by its key.
+/// `None` when it is shown already, cannot be a field, or the card is full.
+pub fn with_field_shown<'a>(
+    format: &CardFormat,
+    of: impl Into<CardType<'a>>,
+    name: &str,
+) -> Option<CardFormat> {
+    let of = of.into();
+    let mut fields = shown_fields(format, of);
     if fields.len() >= CardFormat::MOST_FIELDS
         || fields.iter().any(|field| field == name)
-        || !node.property(name).is_some_and(can_be_field)
+        || !of.has_field(name)
     {
         return None;
     }
     fields.push(name.to_owned());
-    Some(with_fields(format, node, fields))
+    Some(with_fields(format, of.node, fields))
 }
 
 /// `format` without the field `name`. `None` when it is not shown.
-pub fn with_field_hidden(format: &CardFormat, node: &NodeType, name: &str) -> Option<CardFormat> {
-    let mut fields = shown_fields(format, node);
+pub fn with_field_hidden<'a>(
+    format: &CardFormat,
+    of: impl Into<CardType<'a>>,
+    name: &str,
+) -> Option<CardFormat> {
+    let of = of.into();
+    let mut fields = shown_fields(format, of);
     let at = fields.iter().position(|field| field == name)?;
     fields.remove(at);
-    Some(with_fields(format, node, fields))
+    Some(with_fields(format, of.node, fields))
 }
 
 /// `format` with the field `name` moved `by` places in card order (−1 up, 1 down). `None` when
 /// it is not shown or is at that end already.
-pub fn with_field_moved(
+pub fn with_field_moved<'a>(
     format: &CardFormat,
-    node: &NodeType,
+    of: impl Into<CardType<'a>>,
     name: &str,
     by: isize,
 ) -> Option<CardFormat> {
-    let mut fields = shown_fields(format, node);
+    let of = of.into();
+    let mut fields = shown_fields(format, of);
     let at = fields.iter().position(|field| field == name)?;
     let to = at.checked_add_signed(by).filter(|&to| to < fields.len())?;
     fields.swap(at, to);
-    Some(with_fields(format, node, fields))
+    Some(with_fields(format, of.node, fields))
 }
 
 /// `format` with `cover` as its cover: one of the type's files, or none. The type's first file
@@ -175,12 +276,13 @@ pub fn with_next_cover(format: &CardFormat, node: &NodeType) -> Option<CardForma
     with_cover(format, node, next.map(String::as_str))
 }
 
-/// Whether `format` shows another card than the default one on `node`: other fields, another
+/// Whether `format` shows another card than the default one on a type: other fields, another
 /// order, or another cover. Its size is not the card's: the size control says it.
-pub fn is_changed(format: &CardFormat, node: &NodeType) -> bool {
+pub fn is_changed<'a>(format: &CardFormat, of: impl Into<CardType<'a>>) -> bool {
+    let of = of.into();
     let default = CardFormat::default();
-    shown_fields(format, node) != default_fields(node)
-        || shown_cover(format, node) != shown_cover(&default, node)
+    shown_fields(format, of) != default_fields(of.node)
+        || shown_cover(format, of.node) != shown_cover(&default, of.node)
 }
 
 /// `format` showing the default card, at the size it has.
@@ -431,5 +533,149 @@ mod tests {
             !is_changed(&with_cover(&first, &topic, None).unwrap(), &topic),
             "no file either way"
         );
+    }
+
+    /// A relationship is a field a format names by its key. The choices list the type's
+    /// relationships after its properties; none is a field by default; a card titles one as
+    /// the table titles its column; they count toward the eight; and the rules that show,
+    /// hide, move and reset fields cover them. One the schema lost is left out, and the format
+    /// is kept as it was written.
+    #[test]
+    fn a_relationship_is_a_field_by_its_key() {
+        const FILED: &str = "node Note {\n  slug: String @key\n  title: String\n  body: String?\n  \
+            written: Date?\n  attachment: Blob?\n}\nnode Topic {\n  slug: String @key\n  \
+            name: String\n}\nnode Person {\n  slug: String @key\n  name: String\n}\n\
+            edge FiledUnder: Note -> Topic @card(0..)\nedge Wrote: Person -> Note @card(0..)\n";
+        let schema = SchemaModel::parse(FILED).expect("the schema parses");
+        let note = CardType {
+            node: schema.node("Note").unwrap(),
+            relationships: schema.relationships_of("Note"),
+        };
+        let keys: Vec<String> = note
+            .relationships
+            .iter()
+            .map(builder::relationship_key)
+            .collect();
+        assert_eq!(keys, ["out:FiledUnder", "in:Wrote"]);
+        assert_eq!(
+            field_choices(note),
+            [
+                "slug",
+                "title",
+                "body",
+                "written",
+                "out:FiledUnder",
+                "in:Wrote"
+            ],
+            "the properties, then the relationships"
+        );
+        // As the table titles their columns.
+        let columns = crate::model::node_columns(note.node, note.relationships);
+        for key in &keys {
+            let column = columns.iter().find(|column| column.key == *key).unwrap();
+            assert_eq!(relationship_title(key), column.title);
+        }
+        assert_eq!(
+            (
+                relationship_title("out:FiledUnder").as_str(),
+                relationship_title("in:Wrote").as_str()
+            ),
+            ("filedUnder →", "← wrote")
+        );
+
+        // No relationship is a field until it is chosen.
+        let default = CardFormat::default();
+        assert_eq!(names(&face(&default, note)), ["body", "written"]);
+        assert!(!is_changed(&default, note));
+
+        // Shown last, by its key; moved, hidden and reset as any field.
+        let shown = with_field_shown(&default, note, "out:FiledUnder").expect("it can be shown");
+        assert_eq!(
+            shown.fields.as_deref(),
+            Some(
+                &[
+                    "body".to_owned(),
+                    "written".to_owned(),
+                    "out:FiledUnder".to_owned()
+                ][..]
+            )
+        );
+        assert!(is_changed(&shown, note));
+        assert!(
+            with_field_shown(&shown, note, "out:FiledUnder").is_none(),
+            "shown already"
+        );
+        assert!(
+            with_field_shown(&shown, note, "out:Wrote").is_none(),
+            "no such relationship"
+        );
+        let card = face(&shown, note);
+        assert_eq!(names(&card), ["body", "written", "out:FiledUnder"]);
+        let field = &card.fields[2];
+        assert_eq!(field.title, "filedUnder →");
+        assert_eq!(field.relationship(), Some(&note.relationships[0]));
+        assert_eq!(card.fields[0].relationship(), None);
+        assert_eq!(card.fields[0].title, "body");
+        let moved = with_field_moved(&shown, note, "out:FiledUnder", -1).unwrap();
+        assert_eq!(
+            names(&face(&moved, note)),
+            ["body", "out:FiledUnder", "written"]
+        );
+        let hidden = with_field_hidden(&moved, note, "out:FiledUnder").unwrap();
+        assert_eq!(hidden.fields, None, "the default card again");
+        assert_eq!(reset(&moved).fields, None);
+
+        // They count toward the eight.
+        let full = CardFormat {
+            fields: Some(
+                [
+                    "slug",
+                    "title",
+                    "body",
+                    "written",
+                    "out:FiledUnder",
+                    "in:Wrote",
+                ]
+                .map(String::from)
+                .to_vec(),
+            ),
+            ..CardFormat::default()
+        };
+        assert_eq!(face(&full, note).fields.len(), 6);
+        let wide = node(
+            "node Wide {\n  id: String @key\n  a: String?\n  b: String?\n  c: String?\n  \
+             d: String?\n  e: String?\n  f: String?\n  g: String?\n}\n",
+            "Wide",
+        );
+        let eight = CardFormat {
+            fields: Some(
+                ["id", "a", "b", "c", "d", "e", "f", "g"]
+                    .map(String::from)
+                    .to_vec(),
+            ),
+            ..CardFormat::default()
+        };
+        let wide = CardType {
+            node: &wide,
+            relationships: note.relationships,
+        };
+        assert!(
+            with_field_shown(&eight, wide, "out:FiledUnder").is_none(),
+            "the card is full"
+        );
+
+        // A relationship the schema lost is left out, and one named twice shown once; the
+        // format is not changed by being read. A type seen alone has no relationship.
+        let kept = CardFormat {
+            fields: Some(
+                ["out:Gone", "title", "out:FiledUnder", "out:FiledUnder"]
+                    .map(String::from)
+                    .to_vec(),
+            ),
+            ..CardFormat::default()
+        };
+        assert_eq!(names(&face(&kept, note)), ["title", "out:FiledUnder"]);
+        assert_eq!(names(&face(&kept, note.node)), ["title"]);
+        assert_eq!(kept.fields.as_ref().map(Vec::len), Some(4));
     }
 }
