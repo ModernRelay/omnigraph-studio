@@ -24,7 +24,7 @@ use graph_store::{
 };
 use smallvec::SmallVec;
 use studio_actions::graph::OpenType;
-use studio_actions::graph::{ShowNodeInTree, ShowNodeOnCanvas, ShowSetInTree};
+use studio_actions::graph::{ShowNodeInTree, ShowNodeOnCanvas, ShowSetInCards, ShowSetInTree};
 use studio_actions::tree::{
     ClearFilter, Collapse, CollapseAll, Expand, ExpandAll, OpenPage, OpenSelected, OpenTable,
     RerootHere, SelectNext, SelectPrevious, ShowOnCanvas, ToggleEmptyGroups,
@@ -386,7 +386,8 @@ impl Item for RelationshipTree {
         }
     }
 
-    /// A node's views, or a set's: a set's Canvas walks from the row selected in it.
+    /// A node's views, or a set's: a set's Canvas walks from the row selected in it, and a set
+    /// of one type has that type's Table and Cards (spec 048), the strip a node table has.
     fn views(&self, cx: &App) -> Vec<ViewLink> {
         match &self.subject {
             Subject::Node(_) => vec![
@@ -406,16 +407,22 @@ impl Item for RelationshipTree {
                         "Select a node to walk from it",
                     ),
                 };
-                set.type_name
-                    .iter()
-                    .map(|_| ViewLink::to(ViewKind::Table))
+                let of_one_type = set.type_name.is_some();
+                of_one_type
+                    .then(|| ViewLink::to(ViewKind::Table))
+                    .into_iter()
                     .chain([ViewLink::current(ViewKind::Tree), canvas])
+                    .chain(
+                        of_one_type.then(|| {
+                            ViewLink::to(ViewKind::Cards).saying("Show these rows as cards")
+                        }),
+                    )
                     .collect()
             }
         }
     }
 
-    fn view_action(&self, kind: ViewKind, _cx: &App) -> Option<Box<dyn gpui::Action>> {
+    fn view_action(&self, kind: ViewKind, cx: &App) -> Option<Box<dyn gpui::Action>> {
         let at_commit = self.at_commit.clone();
         match (&self.subject, kind) {
             (Subject::Node(root), ViewKind::Page) => {
@@ -460,6 +467,39 @@ impl Item for RelationshipTree {
                 filters: set.filters.clone(),
                 separate: false,
             })),
+            // The set as the tree holds it, as cards (spec 048): its listed nodes, or the
+            // type's rows under its filters, read at the commit the tree shows.
+            (Subject::Set(set), ViewKind::Cards) => {
+                let type_name = set.type_name.clone()?;
+                let ids: Option<Vec<String>> = set.nodes.as_ref().map(|nodes| {
+                    nodes
+                        .iter()
+                        .filter(|node| node.type_name == type_name)
+                        .map(|node| node.id.clone())
+                        .collect()
+                });
+                let select = self
+                    .selected_node()
+                    .filter(|node| node.type_name == type_name)
+                    .map(|node| node.id);
+                Some(Box::new(ShowSetInCards {
+                    title: set.title.clone(),
+                    filters: set.filters.clone().filter(|_| ids.is_none()),
+                    sort: None,
+                    ids,
+                    cover: None,
+                    snapshot: self
+                        .exploration
+                        .read(cx)
+                        .pin()
+                        .filter(|_| at_commit.is_none())
+                        .map(str::to_owned),
+                    at_commit,
+                    select,
+                    preview: true,
+                    type_name,
+                }))
+            }
             _ => None,
         }
     }
@@ -2129,7 +2169,8 @@ mod tests {
 
     /// A tree of a set holds the type's rows under the filters, each closed: it asks for nothing
     /// below a row until the row opens. Its Canvas waits for a selected node, walks from that one
-    /// alone, and its Table goes back with the filters (spec 020).
+    /// alone, its Table goes back with the filters (spec 020), and its Cards, last in the strip,
+    /// show the same set (spec 048).
     /// The row a set's tree opened to is selected once its page brings it, unless a row was
     /// selected meanwhile: then the selection stands and the row owed is forgotten.
     #[gpui::test]
@@ -2256,8 +2297,37 @@ mod tests {
         tree.read_with(cx, |tree, cx| {
             let views = Item::views(tree, cx);
             let kinds: Vec<_> = views.iter().map(|link| link.kind).collect();
-            assert_eq!(kinds, [ViewKind::Table, ViewKind::Tree, ViewKind::Canvas]);
+            assert_eq!(
+                kinds,
+                [
+                    ViewKind::Table,
+                    ViewKind::Tree,
+                    ViewKind::Canvas,
+                    ViewKind::Cards
+                ]
+            );
             assert_eq!(views[2].says.as_deref(), Some("Walk from Grace"));
+            assert_eq!(views[3].says.as_deref(), Some("Show these rows as cards"));
+            assert!(views[3].disabled.is_none() && !views[3].current);
+            // The set as the tree holds it: the type's rows under its filters, at the commit
+            // the tree read, the selected row under the cursor.
+            let cards = Item::view_action(tree, ViewKind::Cards, cx).expect("its cards");
+            assert!(cards.partial_eq(&ShowSetInCards {
+                title: "Person, Berlin".into(),
+                type_name: "Person".into(),
+                filters: person_set(None).filters,
+                sort: None,
+                ids: None,
+                cover: None,
+                at_commit: None,
+                snapshot: tree.exploration.read(cx).pin().map(str::to_owned),
+                select: Some("p2".into()),
+                preview: true,
+            }));
+            assert!(
+                tree.exploration.read(cx).pin().is_some(),
+                "read at a commit"
+            );
             let action = Item::view_action(tree, ViewKind::Canvas, cx).expect("a walk");
             assert!(action.partial_eq(&ShowNodeOnCanvas {
                 type_name: "Person".into(),
@@ -2354,6 +2424,17 @@ mod tests {
             let back: ShowSetInTree =
                 serde_json::from_value(saved.data["set"].clone()).expect("it reads back");
             assert_eq!(back, listed);
+            // Its Cards hold the nodes listed, in their order, not the type's rows.
+            let cards = Item::view_action(tree, ViewKind::Cards, cx).expect("its cards");
+            let cards = cards
+                .as_any()
+                .downcast_ref::<ShowSetInCards>()
+                .expect("the cards' action");
+            assert_eq!(cards.ids, Some(vec!["p7".to_owned(), "p9".to_owned()]));
+            assert_eq!(
+                (cards.filters.as_ref(), cards.type_name.as_str()),
+                (None, "Person")
+            );
         });
         tree.update(cx, |tree, cx| {
             tree.exploration.update(cx, |e, cx| e.refresh(cx));

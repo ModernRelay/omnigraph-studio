@@ -448,7 +448,11 @@ Its action is not registered, so the palette and the keyboard button's list leav
     `<server url>/<graph id>`, which Studio no longer reads, and no conversion moves it; before
     then, `<server name>/<graph id>`, the graph's again where that name is its target's), holds
     a graph's own values for the settings marked `x-per-graph` (table and relationship page
-    sizes, canvas node limit).
+    sizes, canvas node limit). Beside them it keeps what is the graph's alone and has no
+    shared value: its saved views (`views`, spec 004), its node names (`labels`, below) and
+    what each type's cards show (`cards`, by type: `{"Note": {"fields": ["body", "written"],
+    "cover": {"property": "attachment"}, "size": "large"}}`, written when a Cards tab's
+    format is changed and left out for the default card; spec 048, "Format").
     With a graph open, the tab's scope switch ("All graphs" | the graph) shows only those,
     writes the graph's own value, and Reset removes it; an own value's description names the
     shared one. The switch is drawn only where it changes something: on a section with such a

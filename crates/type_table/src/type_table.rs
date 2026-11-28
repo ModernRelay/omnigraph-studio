@@ -7,6 +7,7 @@ mod blob;
 mod blob_view;
 mod blob_write;
 mod branch_diff;
+mod card_format;
 mod card_grid;
 mod cards;
 mod cell_select;
@@ -37,11 +38,12 @@ use studio_actions::graph::{
     OpenBlob, OpenNode, OpenNodePage, OpenSavedView, OpenTextEditor, OpenType, RestoreSavedView,
     ShowSetInCards, UndoDelete,
 };
+use studio_settings::{CardCover, CardFormat};
 use studio_workspace::{PanelPosition, ToastKind, Workspace};
 use ui::IconName;
 
 use blob_view::BlobView;
-use cards::{CardSize, TypeCards};
+use cards::TypeCards;
 use node_page::NodePage;
 use peek::{NodePeek, PeekSubject};
 use table::{Opening, TypeTable};
@@ -129,7 +131,8 @@ pub fn init(cx: &mut App) {
             restore_saved_view(workspace, action, cx);
         });
         workspace.register_action(|workspace, action: &ShowSetInCards, window, cx| {
-            open_cards(workspace, action.clone(), CardSize::default(), window, cx);
+            // A new tab: it starts from the type's format in the settings.
+            open_cards(workspace, action.clone(), None, window, cx);
         });
         workspace.register_action(|workspace, action: &OpenBlob, window, cx| {
             open_blob(workspace, action, None, window, cx);
@@ -253,17 +256,30 @@ fn open_type(
 pub(crate) const CARDS_KIND: &str = "cards";
 pub(crate) const GALLERY_KIND: &str = "gallery";
 
-/// A Cards tab as it was saved: the set it holds and the file that is its cover, and its card
-/// size. A gallery's saved tab is read the same: its `property` is the cover
-/// (`ShowSetInCards::cover`), and its `size` names the same three sizes.
-pub(crate) fn saved_cards(data: &Value) -> Option<(ShowSetInCards, CardSize)> {
-    let opening = serde_json::from_value::<ShowSetInCards>(data.clone()).ok()?;
-    let size = data
-        .get("size")
-        .cloned()
-        .and_then(|size| serde_json::from_value(size).ok())
-        .unwrap_or_default();
-    Some((opening, size))
+/// A Cards tab as it was saved: the set it holds, and its format (spec 048), which the tab
+/// keeps whatever the type's is by now. A tab saved before formats kept its cover and its size
+/// beside the set, the gallery its cover as `property`
+/// (`ShowSetInCards::cover` reads both): they come back with that cover and that size, and the
+/// default fields. `None` for the format when the tab kept none that reads: it then opens as a
+/// new tab does.
+pub(crate) fn saved_cards(data: &Value) -> Option<(ShowSetInCards, Option<CardFormat>)> {
+    let mut opening = serde_json::from_value::<ShowSetInCards>(data.clone()).ok()?;
+    let format = match data.get("format") {
+        Some(format) => serde_json::from_value(format.clone()).ok(),
+        None => Some(CardFormat {
+            fields: None,
+            cover: match opening.cover.take() {
+                Some(property) => CardCover::Property(property),
+                None => CardCover::First,
+            },
+            size: data
+                .get("size")
+                .cloned()
+                .and_then(|size| serde_json::from_value(size).ok())
+                .unwrap_or_default(),
+        }),
+    };
+    Some((opening, format))
 }
 
 /// Opens a saved Cards tab again ([`saved_cards`]).
@@ -273,16 +289,17 @@ fn restore_cards(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    if let Some((opening, size)) = saved_cards(data) {
-        open_cards(workspace, opening, size, window, cx);
+    if let Some((opening, format)) = saved_cards(data) {
+        open_cards(workspace, opening, format, window, cx);
     }
 }
 
-/// Opens a set's cards (spec 048), or activates their tab when it is open.
+/// Opens a set's cards (spec 048), or activates their tab when it is open. `format` is what a
+/// saved tab kept; a new tab (`None`) takes the type's from the settings.
 fn open_cards(
     workspace: &mut Workspace,
     opening: ShowSetInCards,
-    size: CardSize,
+    format: Option<CardFormat>,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Option<Entity<TypeCards>> {
@@ -301,12 +318,12 @@ fn open_cards(
     let key = cards_key(&opening);
     let preview = opening.preview;
     workspace.open_item_with::<TypeCards>(key, preview, window, cx, move |window, cx| {
-        TypeCards::new(handle, session, opening, size, window, cx)
+        TypeCards::new(handle, session, opening, format, window, cx)
     })
 }
 
 /// A Cards tab's key: its type, the commit it holds, and the set it reads (spec 020, "Tab
-/// identity"); not its cover or its size, which a person changes in the tab.
+/// identity"); not its format, which a person changes in the tab.
 pub(crate) fn cards_key(opening: &ShowSetInCards) -> String {
     let set = serde_json::json!({
         "filters": opening.filters,

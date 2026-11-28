@@ -261,6 +261,21 @@ pub(crate) fn shape_line(
     )
 }
 
+/// How wide [`cell_text`] draws `text` when it has the room: what a view asks to give several
+/// lines' labels one width, so the values after them line up (a card's fields). The line is
+/// shaped as a cell's is, so the frames after the first take it from GPUI's cache.
+pub fn cell_text_width(text: impl Into<SharedString>, window: &Window, cx: &App) -> Pixels {
+    use gpui::Refineable as _;
+
+    let cell = cell_text(text, cx);
+    // The style in effect where the caller draws, with the cell's own over it: what the cell
+    // is shaped in when it is laid out there.
+    let mut text_style = window.text_style();
+    text_style.refine(&cell.style);
+    let font_size = text_style.font_size.to_pixels(window.rem_size());
+    cell.shape(&text_style, font_size, window).width
+}
+
 /// `text` cut to `width` at its end, "…" taking the place of what does not show, in the text
 /// style in effect.
 pub(crate) fn cut_line(
@@ -342,5 +357,37 @@ mod tests {
         assert!(std::mem::size_of::<Shaped>() <= 16);
         assert!(std::mem::size_of::<Option<Fitted>>() <= 16);
         assert!(std::mem::size_of::<CellText>() <= 256);
+    }
+
+    /// A text's width is what a cell that hugs it is laid out at: a view that gives several
+    /// labels the widest one's width cuts none of them.
+    #[gpui::test]
+    fn a_texts_width_is_what_a_hugging_cell_takes(cx: &mut gpui::TestAppContext) {
+        use gpui::{InteractiveElement as _, ParentElement as _, Styled as _, div};
+
+        struct Probe;
+        impl gpui::Render for Probe {
+            fn render(&mut self, _: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+                div().flex().child(
+                    div()
+                        .debug_selector(|| "hugging".into())
+                        .child(cell_text("estimate", cx).hug()),
+                )
+            }
+        }
+        cx.update(studio_theme::init_test);
+        let (_, cx) = cx.add_window_view(|_, _| Probe);
+        let drawn = cx.debug_bounds("hugging").expect("drawn").size.width;
+        let (wide, narrow, none) = cx.update(|window, cx| {
+            (
+                cell_text_width("estimate", window, cx),
+                cell_text_width("due", window, cx),
+                cell_text_width("", window, cx),
+            )
+        });
+        assert!(wide > narrow && narrow > px(0.), "{wide:?} {narrow:?}");
+        assert_eq!(none, px(0.));
+        // The hugging cell is laid out up to a whole device pixel wider than its line.
+        assert!(drawn >= wide && drawn - wide < px(1.), "{drawn:?} {wide:?}");
     }
 }

@@ -1,11 +1,13 @@
-//! The cards' keys, paging, reads and drawing, against the fake server (spec 048; they began as
-//! the tests of spec 035's gallery).
+//! The cards' keys, paging, reads, format and drawing, against the fake server (spec 048; they
+//! began as the tests of spec 035's gallery).
 
 use std::cell::RefCell;
 
 use gpui::{Bounds, KeyBinding, Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, Pixels};
 use gpui::{TestAppContext, VisualTestContext};
 use serde_json::json;
+
+use studio_settings::CardCover;
 
 use super::*;
 use crate::test_support::session_with_files;
@@ -57,6 +59,9 @@ fn notes_answering(total: usize) -> impl Fn(&Value) -> Value + Send + Sync + 'st
 fn init(cx: &mut TestAppContext) {
     cx.update(|cx| {
         studio_theme::init_test(cx);
+        // A change to a card's format is kept as the type's in the settings, held in memory.
+        studio_settings::init_test(cx);
+        studio_settings::keep_changes_in_memory(cx);
         editor::init(cx);
         cx.bind_keys([
             KeyBinding::new("left", MoveLeft, Some("Cards")),
@@ -96,10 +101,21 @@ fn opening(type_name: &str) -> ShowSetInCards {
     }
 }
 
-/// The cards of `opening` in a window, their schema read first, focused, settled.
+/// The cards of `opening` in a window, as a new tab opens them: their schema read first,
+/// focused, settled.
 fn open(
     session: Entity<GraphSession>,
     opening: ShowSetInCards,
+    cx: &mut TestAppContext,
+) -> (Entity<TypeCards>, &mut VisualTestContext) {
+    open_with(session, opening, None, cx)
+}
+
+/// As [`open`], with the format a restored tab kept, or `None` for a new tab's.
+fn open_with(
+    session: Entity<GraphSession>,
+    opening: ShowSetInCards,
+    format: Option<CardFormat>,
     cx: &mut TestAppContext,
 ) -> (Entity<TypeCards>, &mut VisualTestContext) {
     cx.run_until_parked();
@@ -108,7 +124,7 @@ fn open(
             WeakEntity::new_invalid(),
             session,
             opening,
-            CardSize::Medium,
+            format,
             window,
             cx,
         )
@@ -185,11 +201,12 @@ fn cover_key(row: usize) -> CoverKey {
 
 /// The columns fill the tab's width: as many of at least the card size as fit, with the edges
 /// and gaps kept, and one when the width is narrower than a card. A card's height is its
-/// cover's box, 4 by 3 across it, and its title line.
+/// cover's box, 4 by 3 across it, its title line and a line a field: with no cover it has no
+/// box, and with no field no line.
 #[test]
 fn the_columns_fill_the_width() {
     let edge = studio_ui::ds::size::CARD;
-    let grid = grid_for(1200., edge);
+    let grid = grid_for(1200., edge, true, 0);
     assert_eq!(grid.columns(), 4);
     let columns = grid.columns() as f32;
     let used = columns * grid.width() + (columns - 1.) * space::LG + 2. * space::EDGE;
@@ -199,10 +216,28 @@ fn the_columns_fill_the_width() {
     let inner = grid.width() - 2. * card_inset();
     assert!((cover - inner * 3. / 4.).abs() <= 0.5, "{cover} of {inner}");
     assert_eq!(cover.fract(), 0., "on whole pixels");
-    let narrow = grid_for(100., edge);
+    let narrow = grid_for(100., edge, true, 0);
     assert_eq!((narrow.columns(), narrow.width()), (1, edge));
-    assert!(grid_for(1200., studio_ui::ds::size::CARD_LARGE).columns() < 4);
-    assert!(grid_for(1200., studio_ui::ds::size::CARD_SMALL).columns() > 4);
+    assert!(grid_for(1200., studio_ui::ds::size::CARD_LARGE, true, 0).columns() < 4);
+    assert!(grid_for(1200., studio_ui::ds::size::CARD_SMALL, true, 0).columns() > 4);
+    // The same columns whatever a card holds; each field is one line more, and the cover's box
+    // is there or not.
+    let (title, line) = (
+        studio_ui::ds::size::CARD_TITLE,
+        studio_ui::ds::size::CARD_LINE,
+    );
+    let bare = grid_for(1200., edge, false, 0);
+    assert_eq!(bare.columns(), 4);
+    assert_eq!(bare.card_height(), 2. * card_inset() + title);
+    assert_eq!(grid.card_height() - bare.card_height(), cover);
+    let three = grid_for(1200., edge, false, 3);
+    let eight = grid_for(1200., edge, false, 8);
+    assert_eq!(eight.card_height() - three.card_height(), 5. * line);
+    assert!(three.card_height() - bare.card_height() >= 3. * line);
+    assert_eq!(
+        grid_for(1200., edge, true, 3).card_height() - three.card_height(),
+        cover
+    );
 }
 
 /// Every card is one size, whatever its cover holds: a tall picture, a wide one, a page and no
@@ -327,7 +362,7 @@ async fn the_arrows_move_in_row_order_and_by_lines(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("- -");
     settle(cx);
     cards.read_with(cx, |cards, _| {
-        assert_eq!(cards.size, CardSize::Small);
+        assert_eq!(cards.format.size, CardSize::Small);
         assert!(
             cards.card_grid().columns() > columns,
             "narrower columns, more of them"
@@ -337,18 +372,32 @@ async fn the_arrows_move_in_row_order_and_by_lines(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("= =");
     settle(cx);
     cards.read_with(cx, |cards, _| {
-        assert_eq!(cards.size, CardSize::Large);
+        assert_eq!(cards.format.size, CardSize::Large);
         assert!(cards.card_grid().columns() < columns);
     });
     let reads = blobs.reads.lock().unwrap().clone();
     let once: HashSet<&String> = reads.iter().collect();
     assert_eq!(once.len(), reads.len(), "a cover was read twice: {reads:?}");
 
+    // F goes round the type's files, then no cover, then the first file again.
+    let with_cover = cards.read_with(cx, |c, _| c.card_grid().card_height());
     cx.simulate_keystrokes("f");
     cards.read_with(cx, |c, _| assert_eq!(c.cover.as_deref(), Some("scan")));
     cx.simulate_keystrokes("f");
     cards.read_with(cx, |c, _| {
-        assert_eq!(c.cover.as_deref(), Some("attachment"))
+        assert_eq!(c.cover, None, "after the last file, none");
+        assert_eq!(c.format.cover, CardCover::None);
+        assert!(
+            c.card_grid().card_height() < with_cover,
+            "no card has the box"
+        );
+        assert!(c.wanted().is_empty(), "and no file is read");
+    });
+    cx.simulate_keystrokes("f");
+    cards.read_with(cx, |c, _| {
+        assert_eq!(c.cover.as_deref(), Some("attachment"));
+        assert_eq!(c.format.cover, CardCover::First, "the default again");
+        assert_eq!(c.card_grid().card_height(), with_cover);
     });
 }
 
@@ -881,15 +930,13 @@ async fn a_click_selects_and_a_second_opens_the_page(cx: &mut TestAppContext) {
 /// A tab the gallery saved comes back as Cards (spec 048): its kind `gallery` is still
 /// registered, to the opener Cards has, and its data is read as it was written, so the tab
 /// holds the same set, shows that file as its cover and has that size. Saved again, it is a
-/// `cards` tab. A kind nothing registers is dropped, which is why the old one is kept.
+/// `cards` tab. A kind nothing registers is dropped, which is why the old one is kept. A tab
+/// saved by Cards before a card had a format (its cover and size beside the set) comes back
+/// with that cover and size too.
 #[gpui::test]
 async fn a_saved_gallery_tab_comes_back_as_cards(cx: &mut TestAppContext) {
     init(cx);
-    cx.update(|cx| {
-        studio_settings::init_test(cx);
-        studio_settings::keep_changes_in_memory(cx);
-        crate::init(cx);
-    });
+    cx.update(crate::init);
     let (session, _) = session_with_files(NOTES, notes_answering(5), None, cx);
     cx.run_until_parked();
     let (workspace, cx) = cx.add_window_view(Workspace::new);
@@ -956,7 +1003,16 @@ async fn a_saved_gallery_tab_comes_back_as_cards(cx: &mut TestAppContext) {
             Some("scan"),
             "that file is the cover"
         );
-        assert_eq!(cards.size, CardSize::Large, "that size");
+        assert_eq!(cards.format.size, CardSize::Large, "that size");
+        assert_eq!(
+            cards.format,
+            CardFormat {
+                fields: None,
+                cover: CardCover::Property("scan".into()),
+                size: CardSize::Large,
+            },
+            "and the default fields"
+        );
         assert_eq!(
             cards.filters,
             [Filter {
@@ -977,9 +1033,14 @@ async fn a_saved_gallery_tab_comes_back_as_cards(cx: &mut TestAppContext) {
         Item::serialize(cards, cx).expect("it is saved")
     });
     assert_eq!(saved.kind, "cards", "saved as Cards from now on");
-    assert_eq!(saved.data["cover"], json!("scan"));
-    assert_eq!(saved.data.get("property"), None);
-    assert_eq!(saved.data["size"], json!("large"));
+    assert_eq!(
+        saved.data["format"],
+        json!({ "cover": { "property": "scan" }, "size": "large" }),
+        "with its format"
+    );
+    for old in ["property", "cover", "size"] {
+        assert_eq!(saved.data.get(old), None, "`{old}` is the format's now");
+    }
     assert_eq!(saved.data["filters"], filtered.data["filters"]);
     assert_eq!(saved.data["sort"], filtered.data["sort"]);
     // What it saves opens the tab it is, not another.
@@ -1001,7 +1062,7 @@ async fn a_saved_gallery_tab_comes_back_as_cards(cx: &mut TestAppContext) {
             "Cards: Note, 2 selected rows @ c0"
         );
         assert_eq!(cards.cover.as_deref(), Some("attachment"));
-        assert_eq!(cards.size, CardSize::Small);
+        assert_eq!(cards.format.size, CardSize::Small);
         assert_eq!(
             cards.ids,
             Some(vec!["n003".to_owned(), "n001".to_owned()]),
@@ -1020,12 +1081,53 @@ async fn a_saved_gallery_tab_comes_back_as_cards(cx: &mut TestAppContext) {
     let (opened, _) = reopen(&unknown, cx);
     assert!(!opened);
     workspace.read_with(cx, |workspace, _| assert_eq!(workspace.items().len(), 2));
-    // The data alone, as the opener reads it.
-    let (opening, size) = crate::saved_cards(&filtered.data).expect("read");
+    // A tab Cards saved before a card had a format (spec 048's slice 1, in no release): its
+    // cover and its size beside the set. That cover, that size.
+    let slice_one = SavedItem {
+        kind: "cards".into(),
+        data: json!({
+            "title": "Note, one row",
+            "type_name": "Note",
+            "filters": null,
+            "sort": null,
+            "ids": ["n002"],
+            "cover": "scan",
+            "at_commit": null,
+            "snapshot": null,
+            "select": null,
+            "preview": false,
+            "size": "small",
+        }),
+    };
+    let (opened, cards) = reopen(&slice_one, cx);
+    assert!(opened);
+    let cards = cards.expect("a third Cards tab");
+    workspace.read_with(cx, |workspace, _| assert_eq!(workspace.items().len(), 3));
+    cards.read_with(cx, |cards, _| {
+        assert_eq!(cards.cover.as_deref(), Some("scan"));
+        assert_eq!(
+            cards.format,
+            CardFormat {
+                fields: None,
+                cover: CardCover::Property("scan".into()),
+                size: CardSize::Small,
+            }
+        );
+        assert_eq!(cards.rows.len(), 1);
+    });
+    // The data alone, as the opener reads it: an old tab's cover and size are its format.
+    let (opening, format) = crate::saved_cards(&filtered.data).expect("read");
+    assert_eq!(opening.cover, None, "the format's, not the set's");
     assert_eq!(
-        (opening.cover.as_deref(), size),
-        (Some("scan"), CardSize::Large)
+        format,
+        Some(CardFormat {
+            fields: None,
+            cover: CardCover::Property("scan".into()),
+            size: CardSize::Large,
+        })
     );
+    let (_, bare) = crate::saved_cards(&json!({ "title": "Note", "type_name": "Note" })).unwrap();
+    assert_eq!(bare, Some(CardFormat::default()), "an old tab with neither");
     assert_eq!(crate::CARDS_KIND, "cards");
     assert_eq!(crate::GALLERY_KIND, "gallery");
 }
@@ -1418,4 +1520,534 @@ async fn retry_with_no_row_shown_reads_the_page_again_at_the_pin(cx: &mut TestAp
         "the failed page asked again: {last:?}"
     );
     assert_eq!(last.1, json!("c0"), "at the pin: {asked:?}");
+}
+
+// ---- the format: fields, the cover and where they are kept (spec 048, slice 2) ----
+
+/// A type with every kind of value a field shows, a file, and more properties than a card has
+/// room for: eleven that can be fields.
+const TASKS: &str = "node Task {\n  id: String @key\n  name: String\n  notes: String?\n  \
+    state: enum(open, done)?\n  tags: [String]?\n  due: Date?\n  points: I32?\n  \
+    owner: String?\n  link: String?\n  area: String?\n  team: String?\n  shot: Blob?\n}\n";
+
+/// Task `i`: an even one holds a value of every kind, its note far longer than a line and on
+/// two lines; an odd one holds none.
+fn task(i: usize) -> Value {
+    let id = format!("t{i:03}");
+    let full = i.is_multiple_of(2);
+    let text = |text: &str| if full { json!(text) } else { Value::Null };
+    json!({"n": {
+        "@id": id, "id": id, "name": format!("Task {i}"),
+        "notes": if full {
+            json!(format!("{}\nand a second line", "A long note. ".repeat(80)))
+        } else {
+            Value::Null
+        },
+        "state": text("open"),
+        "tags": if full { json!(["a", "b", "c", "d", "e"]) } else { Value::Null },
+        "due": text("2020-02-03"),
+        "points": if full { json!(i) } else { Value::Null },
+        "owner": text("Ada"), "link": text("https://example.com/a"),
+        "area": text("north"), "team": text("core"),
+    }})
+}
+
+/// Answers the cards' reads of `total` tasks, as [`notes_answering`] does of notes.
+fn tasks_answering(total: usize) -> impl Fn(&Value) -> Value + Send + Sync + 'static {
+    move |request: &Value| match request["name"].as_str().unwrap_or_default() {
+        "studio_count" => json!([{ "n": total }]),
+        "studio_page" => {
+            let from = request["params"]["after"].as_str().map_or(0, |after| {
+                after.trim_start_matches('t').parse::<usize>().unwrap_or(0) + 1
+            });
+            Value::from((from..total).map(task).collect::<Vec<_>>())
+        }
+        _ => json!([]),
+    }
+}
+
+fn field_names(cards: &TypeCards) -> Vec<&str> {
+    cards
+        .fields
+        .iter()
+        .map(|property| property.name.as_str())
+        .collect()
+}
+
+/// The type's format as the settings keep it for the session's graph.
+fn kept_format(
+    session: &Entity<GraphSession>,
+    type_name: &str,
+    cx: &mut VisualTestContext,
+) -> Option<CardFormat> {
+    let graph = session.read_with(cx, |session, _| session.overrides_key());
+    cx.update(|_, cx| StudioSettings::get(cx).card_format(&graph, type_name))
+}
+
+/// Every card of a tab is one height, whatever its values hold: a text far longer than a line,
+/// a list, an enum's member, a date, a number and no value at all are each one line, as the
+/// table's cell shows them. The height is the cover's box, the title and a line a field: more
+/// fields make every card taller, no cover takes the box from every card, and no file is read
+/// then. What a row's fields show is made once, not again each frame.
+#[gpui::test]
+async fn every_card_is_one_height_with_fields_whatever_they_hold(cx: &mut TestAppContext) {
+    init(cx);
+    let (session, blobs) = session_with_files(TASKS, tasks_answering(12), None, cx);
+    blobs.set("Task/t000/shot", &png(300, 200, false));
+    let (cards, cx) = open(session, opening("Task"), cx);
+    let line = studio_ui::ds::size::CARD_LINE;
+    let heights = |cx: &mut VisualTestContext| {
+        let said = cards.read_with(cx, |cards, _| cards.card_grid().card_height());
+        for ix in 0..12 {
+            let bounds = card_bounds(ix, cx).expect("drawn");
+            assert_eq!(f32::from(bounds.size.height), said, "card {ix}");
+        }
+        said
+    };
+    // The default card: the first three properties that are not the key, the name or a file.
+    let default = cards.read_with(cx, |cards, _| {
+        assert_eq!(field_names(cards), ["notes", "state", "tags"]);
+        assert_eq!(cards.cover.as_deref(), Some("shot"));
+        let now = chrono::Local::now();
+        let (full, temporal) = fields_shown(&cards.fields, &cards.rows[0], now);
+        let FieldShown::Text(note) = &full[0] else {
+            panic!("a text: {full:?}");
+        };
+        assert!(note.starts_with("A long note. A long note."), "{note}");
+        assert!(!note.contains("second line"), "its first line");
+        assert!(note.chars().count() <= 512, "and no more than a line shows");
+        assert_eq!(
+            full[1..],
+            [
+                FieldShown::Member("open".into()),
+                FieldShown::Text("a, b, c +2".into())
+            ]
+        );
+        assert!(!temporal);
+        let (empty, _) = fields_shown(&cards.fields, &cards.rows[1], now);
+        assert_eq!(empty, vec![FieldShown::Null; 3]);
+        let width = cards.card_grid().width();
+        assert_eq!(cards.card_grid().card_height(), card_height(width, true, 3));
+        cards.card_grid().card_height()
+    });
+    assert_eq!(heights(cx), default);
+    assert!(
+        blobs
+            .reads
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|read| read.starts_with("HEAD Task/t000/shot")),
+        "the cover is read"
+    );
+
+    // What a row shows is made once: a key draws the cards again from what was made.
+    let made = |cx: &mut VisualTestContext| {
+        cards.read_with(cx, |cards, _| cards.field_text.borrow()["t000"].clone())
+    };
+    let first = made(cx);
+    cx.simulate_keystrokes("right left");
+    assert!(Rc::ptr_eq(&first, &made(cx)), "formatted again for a key");
+
+    // Eight fields: a date, a number and plain text among them, each a line more.
+    cards.update(cx, |cards, cx| {
+        for name in ["due", "points", "owner", "link", "area"] {
+            cards.show_field(name, cx);
+        }
+        assert_eq!(cards.fields.len(), 8);
+        let now = chrono::Local::now();
+        let (full, temporal) = fields_shown(&cards.fields, &cards.rows[2], now);
+        assert_eq!(
+            full[3..5],
+            [
+                FieldShown::Text("2020-02-03".into()),
+                FieldShown::Text("2".into())
+            ]
+        );
+        assert!(temporal, "a date is made again in a later minute");
+    });
+    cx.run_until_parked();
+    assert_eq!(heights(cx), default + 5. * line);
+    assert!(!Rc::ptr_eq(&first, &made(cx)), "other fields: made again");
+
+    // No cover: no card has the box, and no file is read.
+    blobs.reads.lock().unwrap().clear();
+    cards.update(cx, |cards, cx| cards.show_cover(None, cx));
+    settle(cx);
+    let bare = heights(cx);
+    cards.read_with(cx, |cards, _| {
+        let width = cards.card_grid().width();
+        assert_eq!(bare, card_height(width, false, 8));
+        assert!(cards.wanted().is_empty() && cards.cover_tasks.is_empty());
+    });
+    scroll_to_end(&cards, cx);
+    assert!(blobs.reads.lock().unwrap().is_empty(), "a file was read");
+}
+
+/// The Fields menu's choices and what each does: a property chosen is shown last, a field
+/// hidden leaves, one moved swaps with its neighbour; the ninth is refused and the menu says a
+/// card is full; reset shows the default card at the size the tab has. The menu stays open
+/// while it is used, and lists the card as it is now.
+#[gpui::test]
+async fn the_fields_menu_shows_hides_moves_and_resets(cx: &mut TestAppContext) {
+    init(cx);
+    let (session, _) = session_with_files(TASKS, tasks_answering(6), None, cx);
+    let (cards, cx) = open(session, opening("Task"), cx);
+    let choices =
+        |cx: &mut VisualTestContext| cards.read_with(cx, |cards, _| cards.field_choices());
+    assert_eq!(
+        choices(cx),
+        FieldChoices {
+            shown: ["notes", "state", "tags"].map(String::from).to_vec(),
+            hidden: [
+                "id", "name", "due", "points", "owner", "link", "area", "team"
+            ]
+            .map(String::from)
+            .to_vec(),
+            full: false,
+            files: vec!["shot".into()],
+            cover: Some("shot".into()),
+            changed: false,
+        },
+        "the fields in card order, the rest in schema order, files apart"
+    );
+
+    // The menu, open: a property not shown is shown last when it is chosen, and the menu is
+    // still open, built again with it.
+    // Opened as its chip opens it: outside the tab's own update, since it reads the tab.
+    let menu = cards.read_with(cx, |cards, _| cards.fields_menu.clone());
+    cx.update(|window, cx| menu.show(window, cx));
+    cx.run_until_parked();
+    let row = cx.debug_bounds("MENU_ITEM-due").expect("due is offered");
+    cx.simulate_click(row.center(), Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(choices(cx).shown, ["notes", "state", "tags", "due"]);
+    assert!(choices(cx).changed);
+    cards.read_with(cx, |cards, _| {
+        assert!(cards.fields_menu.is_deployed(), "it stays open while used");
+    });
+    assert!(
+        cx.debug_bounds("MENU_ITEM-due").is_none(),
+        "due is a field now, not an offer"
+    );
+    // The cover, in the same menu: none, and the file again.
+    let none = cx
+        .debug_bounds("MENU_ITEM-None")
+        .expect("a type with a file");
+    cx.simulate_click(none.center(), Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(choices(cx).cover, None);
+    let file = cx.debug_bounds("MENU_ITEM-shot").expect("its file");
+    cx.simulate_click(file.center(), Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(choices(cx).cover.as_deref(), Some("shot"));
+
+    // Move up, Move down and Hide, as a field's submenu does them.
+    cards.update(cx, |cards, cx| {
+        cards.move_field("due", -1, cx);
+        assert_eq!(field_names(cards), ["notes", "state", "due", "tags"]);
+        cards.move_field("due", -1, cx);
+        cards.move_field("due", -1, cx);
+        assert_eq!(field_names(cards), ["due", "notes", "state", "tags"]);
+        cards.move_field("due", -1, cx);
+        assert_eq!(field_names(cards)[0], "due", "the first stays");
+        cards.move_field("due", 1, cx);
+        assert_eq!(field_names(cards), ["notes", "due", "state", "tags"]);
+        cards.move_field("tags", 1, cx);
+        assert_eq!(field_names(cards)[3], "tags", "the last stays");
+        cards.hide_field("state", cx);
+        assert_eq!(field_names(cards), ["notes", "due", "tags"]);
+        cards.hide_field("state", cx);
+        assert_eq!(cards.fields.len(), 3, "hidden already");
+    });
+
+    // Eight is a card's most: the ninth is refused, from the menu too.
+    cards.update(cx, |cards, cx| {
+        for name in ["id", "name", "points", "owner", "link"] {
+            cards.show_field(name, cx);
+        }
+    });
+    cx.run_until_parked();
+    let full = choices(cx);
+    assert_eq!(full.shown.len(), 8);
+    assert!(full.full);
+    assert_eq!(full.hidden, ["state", "area", "team"]);
+    assert_eq!(CARD_FULL, "A card shows at most 8 fields");
+    cards.update(cx, |cards, cx| cards.show_field("team", cx));
+    assert_eq!(choices(cx).shown.len(), 8, "the ninth is refused");
+    cx.update(|window, cx| {
+        menu.hide(cx);
+        menu.show(window, cx);
+    });
+    cx.run_until_parked();
+    let offer = cx.debug_bounds("MENU_ITEM-team").expect("listed, off");
+    cx.simulate_click(offer.center(), Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(choices(cx).shown.len(), 8, "and its row does nothing");
+
+    // Reset, from the menu: the default card, at the size the tab has.
+    cx.simulate_keystrokes("=");
+    let reset = cx
+        .debug_bounds("MENU_ITEM-Reset to the default")
+        .expect("reset is offered");
+    cx.simulate_click(reset.center(), Modifiers::none());
+    cx.run_until_parked();
+    cards.read_with(cx, |cards, _| {
+        assert_eq!(field_names(cards), ["notes", "state", "tags"]);
+        assert_eq!(cards.cover.as_deref(), Some("shot"));
+        assert_eq!(
+            cards.format,
+            CardFormat {
+                size: CardSize::Large,
+                ..CardFormat::default()
+            },
+            "the size is not the card's"
+        );
+        assert!(!cards.format_changed());
+    });
+}
+
+/// Where a format is kept (spec 048): a new tab starts from the type's format in the settings,
+/// else from the default card; a tab that comes back keeps its own, whatever the type's is by
+/// then; and a change made in a tab is written as the type's, so the next new tab opens the
+/// same way. A format that names what the schema no longer has shows the rest, and is not
+/// written again for that.
+#[gpui::test]
+async fn a_new_tab_takes_the_types_format_and_a_restored_tab_keeps_its_own(
+    cx: &mut TestAppContext,
+) {
+    init(cx);
+    let (session, _) = session_with_files(TASKS, tasks_answering(6), None, cx);
+    cx.run_until_parked();
+    let graph = session.read_with(cx, |session, _| session.overrides_key());
+    // With nothing kept, the default card.
+    let (cards, visual) = open(session.clone(), opening("Task"), cx);
+    cards.read_with(visual, |cards, cx| {
+        assert_eq!(cards.format, CardFormat::default());
+        let saved = Item::serialize(cards, cx).expect("saved");
+        assert_eq!(saved.data["format"], json!({}), "the default, as its own");
+    });
+    assert_eq!(
+        kept_format(&session, "Task", visual),
+        None,
+        "opening writes nothing"
+    );
+
+    // The type's format, some of it gone from the schema since: a field and the cover.
+    let kept = CardFormat {
+        fields: Some(vec!["gone".into(), "points".into(), "owner".into()]),
+        cover: CardCover::Property("thumbnail".into()),
+        size: CardSize::Large,
+    };
+    let written = (graph.clone(), kept.clone());
+    cx.update(|cx| {
+        studio_settings::update(cx, move |settings| {
+            settings.set_card_format(&written.0, "Task", Some(written.1))
+        })
+    });
+    let (fresh, visual) = open(session.clone(), opening("Task"), cx);
+    fresh.read_with(visual, |cards, _| {
+        assert_eq!(cards.format, kept, "a new tab takes the type's");
+        assert_eq!(
+            field_names(cards),
+            ["points", "owner"],
+            "what is left of it"
+        );
+        assert_eq!(cards.cover, None, "its cover is gone: none is shown");
+        assert_eq!(cards.format.size, CardSize::Large);
+    });
+    assert_eq!(
+        kept_format(&session, "Task", visual),
+        Some(kept.clone()),
+        "and the settings keep it as it was written"
+    );
+    // The first tab, open since before, keeps the card it has.
+    cards.read_with(visual, |cards, _| {
+        assert_eq!(cards.format, CardFormat::default())
+    });
+
+    // A tab that comes back keeps its own.
+    let own = CardFormat {
+        fields: Some(vec!["due".into()]),
+        cover: CardCover::None,
+        size: CardSize::Small,
+    };
+    let saved = json!({ "title": "Task", "type_name": "Task", "format": own });
+    let (opening_back, format_back) = crate::saved_cards(&saved).expect("it reads");
+    assert_eq!(format_back, Some(own.clone()));
+    let (restored, visual) = open_with(session.clone(), opening_back, format_back, cx);
+    restored.read_with(visual, |cards, cx| {
+        assert_eq!(cards.format, own, "not the type's");
+        assert_eq!(field_names(cards), ["due"]);
+        let saved = Item::serialize(cards, cx).expect("saved");
+        assert_eq!(
+            saved.data["format"],
+            json!({ "fields": ["due"], "cover": "none", "size": "small" })
+        );
+        assert_eq!(saved.kind, "cards");
+    });
+    assert_eq!(kept_format(&session, "Task", visual), Some(kept));
+
+    // A change in a tab is written as the type's: the next new tab opens the same way.
+    restored.update(visual, |cards, cx| cards.show_field("points", cx));
+    let changed = CardFormat {
+        fields: Some(vec!["due".into(), "points".into()]),
+        ..own
+    };
+    restored.read_with(visual, |cards, _| assert_eq!(cards.format, changed));
+    assert_eq!(kept_format(&session, "Task", visual), Some(changed.clone()));
+    let (next, visual) = open(session.clone(), opening("Task"), cx);
+    next.read_with(visual, |cards, _| {
+        assert_eq!(cards.format, changed);
+        assert_eq!(field_names(cards), ["due", "points"]);
+    });
+    // The other tabs open keep theirs.
+    fresh.read_with(visual, |cards, _| {
+        assert_eq!(field_names(cards), ["points", "owner"])
+    });
+
+    // The size and the cover are the format's too; the default card is no entry.
+    next.update_in(visual, |cards, window, cx| {
+        window.focus(&cards.focus_handle, cx)
+    });
+    visual.simulate_keystrokes("= = f");
+    let larger = kept_format(&session, "Task", visual).expect("kept");
+    assert_eq!(larger.size, CardSize::Large, "two sizes up from Small");
+    assert_eq!(
+        larger.cover,
+        CardCover::First,
+        "F from none: the first file"
+    );
+    next.update(visual, |cards, cx| {
+        cards.reset_format(cx);
+        cards.set_size(CardSize::Medium, cx);
+    });
+    assert_eq!(kept_format(&session, "Task", visual), None);
+    visual.update(|_, cx| {
+        assert!(!StudioSettings::get(cx).graphs.contains_key(&graph));
+    });
+
+    // An action written for the gallery names the file to show: that one, for that tab,
+    // over the type's; nothing is written for it.
+    let (old, visual) = open(
+        session.clone(),
+        ShowSetInCards {
+            cover: Some("shot".into()),
+            ..opening("Task")
+        },
+        cx,
+    );
+    old.read_with(visual, |cards, _| {
+        assert_eq!(cards.format.cover, CardCover::Property("shot".into()));
+        assert_eq!(cards.cover.as_deref(), Some("shot"));
+    });
+    assert_eq!(kept_format(&session, "Task", visual), None);
+}
+
+/// A type with no file has cards too: its title and its fields, no cover's box, no file read,
+/// and no cover to choose. Before, the tab said the type had no files.
+#[gpui::test]
+async fn a_type_with_no_file_has_cards_without_a_cover(cx: &mut TestAppContext) {
+    init(cx);
+    let schema = "node Topic {\n  slug: String @key\n  name: String\n  about: String?\n}\n";
+    let topics = |request: &Value| match request["name"].as_str().unwrap_or_default() {
+        "studio_count" => json!([{ "n": 3 }]),
+        "studio_page" => json!([
+            { "n": { "@id": "a", "slug": "a", "name": "Graphs", "about": "Nodes and edges" } },
+            { "n": { "@id": "b", "slug": "b", "name": "Rust", "about": null } },
+            { "n": { "@id": "c", "slug": "c", "name": "Design", "about": "How it looks" } },
+        ]),
+        _ => json!([]),
+    };
+    let (session, blobs) = session_with_files(schema, topics, None, cx);
+    let (cards, cx) = open(session, opening("Topic"), cx);
+    cards.update_in(cx, |cards, window, cx| {
+        assert_eq!(cards.placed(), 3);
+        assert_eq!(field_names(cards), ["about"]);
+        assert_eq!((cards.cover.as_deref(), cards.files.len()), (None, 0));
+        let width = cards.card_grid().width();
+        assert_eq!(
+            cards.card_grid().card_height(),
+            card_height(width, false, 1)
+        );
+        let choices = cards.field_choices();
+        assert!(choices.files.is_empty() && !choices.changed);
+        assert_eq!(choices.hidden, ["slug", "name"]);
+        // The status bar lists no key for a cover.
+        let status = Item::status(cards, window, cx).expect("its keys");
+        let keys: Vec<String> = status
+            .keys
+            .iter()
+            .map(|key| key.label.to_string())
+            .collect();
+        assert!(keys.contains(&"Open page".to_owned()), "{keys:?}");
+        assert!(
+            !keys.iter().any(|key| key.contains("cover")),
+            "no cover to open or to change: {keys:?}"
+        );
+    });
+    for ix in 0..3 {
+        assert!(card_bounds(ix, cx).is_some(), "card {ix} is drawn");
+    }
+    // F is not this tab's key: nothing changes.
+    cx.simulate_keystrokes("f");
+    cards.read_with(cx, |cards, _| {
+        assert_eq!(cards.format, CardFormat::default())
+    });
+    assert!(blobs.reads.lock().unwrap().is_empty(), "no file is read");
+    // Picked, a card with no cover carries its check all the same.
+    cx.simulate_keystrokes("x");
+    cards.read_with(cx, |cards, _| assert_eq!(cards.picks.len(), 1));
+}
+
+/// A change to the format draws the cards once, and with fields shown an arrow key still draws
+/// them once (`docs/drawing.md`): a field has no view of its own and nothing of it is read.
+#[gpui::test]
+async fn a_format_change_draws_the_cards_once(cx: &mut TestAppContext) {
+    init(cx);
+    let (session, _) = session_with_files(TASKS, tasks_answering(40), None, cx);
+    let (cards, cx) = open(session, opening("Task"), cx);
+    // The first key switches GPUI to keyboard input, which draws the window once.
+    cx.simulate_keystrokes("right");
+    cx.run_until_parked();
+    cards.read_with(cx, |cards, _| assert_eq!(cards.fields.len(), 3));
+    for key in ["down", "up", "left", "right", "end", "home"] {
+        let before = grid_renders(&cards, cx);
+        cx.simulate_keystrokes(key);
+        cx.run_until_parked();
+        assert_eq!(grid_renders(&cards, cx), before + 1, "one draw for {key}");
+    }
+    type Change = fn(&mut TypeCards, &mut Context<TypeCards>);
+    let changes: [(&str, Change); 6] = [
+        ("a field shown", |cards, cx| cards.show_field("due", cx)),
+        ("a field moved", |cards, cx| cards.move_field("due", -1, cx)),
+        ("a field hidden", |cards, cx| cards.hide_field("notes", cx)),
+        ("another size", |cards, cx| {
+            cards.set_size(CardSize::Small, cx)
+        }),
+        ("no cover", |cards, cx| cards.show_cover(None, cx)),
+        ("the default card", |cards, cx| cards.reset_format(cx)),
+    ];
+    for (what, change) in changes {
+        let (before, format) = (
+            grid_renders(&cards, cx),
+            cards.read_with(cx, |cards, _| cards.format.clone()),
+        );
+        cards.update(cx, change);
+        cx.run_until_parked();
+        assert_ne!(
+            cards.read_with(cx, |cards, _| cards.format.clone()),
+            format,
+            "{what}"
+        );
+        assert_eq!(grid_renders(&cards, cx), before + 1, "one draw for {what}");
+    }
+    // A change that changes nothing draws nothing.
+    let before = grid_renders(&cards, cx);
+    cards.update(cx, |cards, cx| {
+        cards.hide_field("team", cx);
+        cards.reset_format(cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(grid_renders(&cards, cx), before);
 }

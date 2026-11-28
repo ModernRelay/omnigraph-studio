@@ -9,7 +9,9 @@
 //! keyboard-highlighted row on a faint ink fill, quiet group headers and hairline separators. Its
 //! behaviour — keyboard navigation, submenus, actions and accessibility — is Zed's, unchanged;
 //! only the drawing is Studio's (`MenuRow`, `menu_header`, `menu_separator` and the container in
-//! `render`).
+//! `render`). One behaviour is Studio's: a menu that stays open while it is used
+//! ([`ContextMenu::build_persistent`]) stays open when the choice is made in one of its
+//! submenus too, and is built again to show it (`create_submenu`; spec 048's Fields menu).
 
 // Zed's code is kept as written, so the lints Zed's workspace allows are allowed here.
 #![allow(
@@ -618,15 +620,28 @@ impl ContextMenu {
     ) -> (Entity<ContextMenu>, Subscription) {
         let submenu = Self::build_submenu(builder, parent_entity, parent_depth, window, cx);
 
-        let dismiss_subscription = cx.subscribe(&submenu, |this, submenu, _: &DismissEvent, cx| {
-            let should_dismiss_parent = submenu.read(cx).clicked;
+        let dismiss_subscription = cx.subscribe_in(
+            &submenu,
+            window,
+            |this, submenu, _: &DismissEvent, window, cx| {
+                let should_dismiss_parent = submenu.read(cx).clicked;
 
-            this.close_submenu(false, cx);
+                this.close_submenu(false, cx);
 
-            if should_dismiss_parent {
-                cx.emit(DismissEvent);
-            }
-        });
+                if should_dismiss_parent {
+                    // Studio's: a menu that stays open while it is used stays open after a
+                    // choice in its submenu, shows what the choice changed, and has the
+                    // keyboard again.
+                    if this.keep_open_on_confirm && this.builder.is_some() {
+                        this.ignore_blur_until = Some(Instant::now() + Duration::from_millis(200));
+                        window.focus(&this.focus_handle, cx);
+                        this.rebuild(window, cx);
+                    } else {
+                        cx.emit(DismissEvent);
+                    }
+                }
+            },
+        );
 
         (submenu, dismiss_subscription)
     }
@@ -1814,6 +1829,101 @@ mod tests {
                 assert_eq!(submenu.top(), trigger.top());
                 assert!(submenu.left() >= px(8.));
                 assert!(submenu.right() <= px(692.));
+            });
+        }
+    }
+
+    /// A menu that stays open while it is used stays open when an entry of its submenu is
+    /// chosen, by click or by key, and is built again to show what the choice changed; a menu
+    /// that closes on a choice closes on a submenu's too, as Zed's does.
+    #[gpui::test]
+    fn a_persistent_menu_stays_open_after_a_choice_in_its_submenu(cx: &mut TestAppContext) {
+        cx.update(studio_theme::init_test);
+        for persistent in [true, false] {
+            let chosen = Rc::new(Cell::new(0_usize));
+            let dismissed = Rc::new(Cell::new(false));
+            let (count, gone) = (chosen.clone(), dismissed.clone());
+            let window = cx.open_window(size(px(700.), px(400.)), move |window, cx| {
+                let build =
+                    move |menu: ContextMenu, _: &mut Window, _: &mut Context<ContextMenu>| {
+                        let (shown, count) = (count.get(), count.clone());
+                        menu.submenu(format!("Chosen {shown}"), move |menu, _, _| {
+                            let count = count.clone();
+                            menu.entry("Choose", None, move |_, _| count.set(count.get() + 1))
+                        })
+                    };
+                let menu = if persistent {
+                    ContextMenu::build_persistent(window, cx, build)
+                } else {
+                    ContextMenu::build(window, cx, build)
+                };
+                cx.subscribe(&menu, move |_, _, _: &DismissEvent, _| gone.set(true))
+                    .detach();
+                SubmenuTestView {
+                    menu,
+                    left: px(40.),
+                }
+            });
+            cx.run_until_parked();
+            let menu = window
+                .update(cx, |view, _, _| view.menu.clone())
+                .expect("the menu's window");
+            let mut visual = VisualTestContext::from_window(window.into(), cx);
+            let label = |menu: &Entity<ContextMenu>, visual: &VisualTestContext| {
+                menu.read_with(visual, |menu, _| match menu.items.first() {
+                    Some(ContextMenuItem::Submenu { label, .. }) => label.to_string(),
+                    _ => panic!("the submenu's row"),
+                })
+            };
+            // By click: the pointer opens the submenu, and its entry is clicked.
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            let trigger = menu.read_with(&visual, |menu, _| {
+                menu.submenu_trigger_bounds
+                    .borrow()
+                    .get(&0)
+                    .copied()
+                    .expect("trigger bounds")
+            });
+            visual.simulate_mouse_move(trigger.center(), None, Modifiers::default());
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            let entry = visual
+                .debug_bounds("MENU_ITEM-Choose")
+                .expect("the submenu's entry is drawn");
+            visual.simulate_click(entry.center(), Modifiers::default());
+            visual.run_until_parked();
+            assert_eq!(chosen.get(), 1, "the entry ran");
+            assert_eq!(dismissed.get(), !persistent, "persistent: {persistent}");
+            if !persistent {
+                continue;
+            }
+            assert_eq!(label(&menu, &visual), "Chosen 1", "built again");
+            menu.read_with(&visual, |menu, _| {
+                assert!(matches!(menu.submenu_state, SubmenuState::Closed));
+            });
+            // By key: → opens the submenu, ↵ chooses, and the menu has the keyboard after.
+            focus_menu(&menu, &mut visual);
+            menu.update_in(&mut visual, |menu, window, cx| {
+                menu.select_first(&SelectFirst, window, cx);
+                menu.select_submenu_child(&SelectChild, window, cx);
+            });
+            visual.run_until_parked();
+            let child = menu.read_with(&visual, |menu, _| match &menu.submenu_state {
+                SubmenuState::Open(open_submenu) => open_submenu.entity.clone(),
+                SubmenuState::Closed => panic!("the submenu is open"),
+            });
+            child.update_in(&mut visual, |child, window, cx| {
+                child.select_first(&SelectFirst, window, cx);
+                child.confirm(&menu::Confirm, window, cx);
+            });
+            visual.run_until_parked();
+            assert_eq!(chosen.get(), 2);
+            assert!(!dismissed.get(), "still open");
+            assert_eq!(label(&menu, &visual), "Chosen 2");
+            visual.update(|window, cx| {
+                assert!(
+                    menu.focus_handle(cx).is_focused(window),
+                    "it has the keyboard"
+                );
             });
         }
     }

@@ -477,8 +477,10 @@ pub mod graph {
         /// The rows it holds, by id, when they are listed rather than read.
         #[serde(default)]
         pub ids: Option<Vec<String>>,
-        /// The Blob property its cards show as their cover; the type's first when `None`. Read
-        /// from `property` too, as a gallery's saved tab and its action named it.
+        /// The Blob property its cards show as their cover. Kept so tabs saved before a card
+        /// had a format, and actions written for them or for the gallery (which named it
+        /// `property`), still load: Studio leaves it `None`, and the cover is the format's
+        /// (spec 048).
         #[serde(default, alias = "property")]
         pub cover: Option<String>,
         /// Read held at this commit, read-only; `None` follows the branch head.

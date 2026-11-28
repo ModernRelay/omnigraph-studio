@@ -289,6 +289,8 @@ pub mod size {
     pub const CARD_LARGE: f32 = 340.;
     /// A card's title line under its cover: one line of body text and the space above it.
     pub const CARD_TITLE: f32 = 28.;
+    /// One field's line on a card: its name, then its value, a [`TAG`] high at most.
+    pub const CARD_LINE: f32 = 22.;
     /// A short label before a value ("From", "To").
     pub const SHORT_LABEL: f32 = 40.;
     /// The tallest a modal grows before its body scrolls.
