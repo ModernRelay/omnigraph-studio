@@ -3,7 +3,9 @@
 //! has one), its title and a line a field, placed in row order and never moved, one tab per
 //! set, read a page at a time at one commit. The tab keeps filters and an order of its own
 //! after it opens, with the table's filter bar (`filter_bar`): a change reads the set again at
-//! the commit the tab shows. A field is a property of the row or one of its relationships,
+//! the commit the tab shows, and so does an answer to a sentence written in the toolbar's
+//! "Filter in words" field, which is the table's too (`words_field`): in Cards it sets the
+//! filters and the order. A field is a property of the row or one of its relationships,
 //! whose neighbours are read as a table's relationship column reads them (`relations`), for
 //! the cards near the view. What a card shows is the tab's format
 //! (`card_format`): the tab saves it, and a change is kept as the type's in the settings. Each
@@ -37,7 +39,7 @@ use studio_actions::cards::{
 use studio_actions::graph::{
     OpenBlob, OpenNodePage, OpenType, ResultNode, ShowNodeOnCanvas, ShowSetInCards, ShowSetInTree,
 };
-use studio_actions::table::{AddFilter, ClearFilters, ConfirmEdit};
+use studio_actions::table::{AddFilter, ClearFilters, ConfirmEdit, FilterInWords};
 use studio_actions::workspace::ToggleInspector;
 use studio_actions::{ViewKind, ViewLink};
 use studio_settings::{CardFormat, CardSize, StudioSettings};
@@ -58,6 +60,8 @@ use crate::model::{ColumnSpec, Paging, Row, TableKind, field_rows, node_columns,
 use crate::peek::{NodePeek, PeekSubject};
 use crate::relations::{Relation, RelationHost, Relations};
 use crate::tile::{self, FIRST_READ, Facts, Look};
+use crate::words;
+use crate::words_field::{WordsField, WordsHost};
 
 /// How long scrolling rests before the covers of the cards laid out are read, as the table's
 /// Blob cells wait.
@@ -99,6 +103,13 @@ pub(crate) fn grid_for(width: f32, edge: f32, cover: bool, fields: usize) -> Car
         card_height(width, cover, fields)
     })
 }
+
+/// The tab width under which the toolbar's chips are their icons alone
+/// ([`TypeCards::compact_toolbar`]), as a table's are in a narrow tab. With every label, the
+/// toolbar of a type with a short name and nothing set takes about 880 px with the sentence
+/// field at its least: beside the inspector in a window of the default size, where the tab is
+/// about 840 px wide, its last control was cut off.
+const COMPACT_TOOLBAR_BELOW: f32 = 960.;
 
 /// How far a card's cover sits inside its edge: the cursor's ring and [`space::XS`].
 fn card_inset() -> f32 {
@@ -268,6 +279,9 @@ pub struct TypeCards {
     /// The filter bar's state (spec 048, "Filters and order"): the table's bar, from the same
     /// code ([`FilterHost`]).
     filter_bar: FilterBar,
+    /// Filter in words (spec 019): the toolbar's sentence field, what its call is doing and
+    /// the filters its last answer made ([`WordsHost`]).
+    words: WordsField,
     /// The neighbours of the rows through the relationships the format shows as fields, read
     /// for the cards near the view at the commit the rows were ([`RelationHost`]).
     relations: Relations,
@@ -431,6 +445,7 @@ impl TypeCards {
             filters,
             sort,
             filter_bar: FilterBar::new(window, cx),
+            words: WordsField::new(window, cx),
             relations: Relations::default(),
             all_columns: Vec::new(),
             lost: Vec::new(),
@@ -1745,8 +1760,12 @@ impl TypeCards {
         cx.notify();
     }
 
-    /// Esc: closes the filter being written; else takes every pick out.
+    /// Esc: leaves the sentence field and clears what it said; else closes the filter being
+    /// written; else takes every pick out.
     fn cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.leave_words(window, cx) {
+            return;
+        }
         if self.bar().draft.is_some() {
             self.cancel_filter_draft(window, cx);
             return;
@@ -2104,6 +2123,11 @@ impl TypeCards {
                 )
             })
             .child(div().flex_1())
+            // The sentence field, where the table has it; rows listed take no filter, and the
+            // Filters chip beside it says why.
+            .when(self.ids.is_none(), |bar| {
+                bar.child(self.render_words_field(cx))
+            })
             .child(
                 studio_ui::ds::toolbar_actions()
                     .gap(px(space::SM))
@@ -2129,6 +2153,24 @@ impl TypeCards {
             )
     }
 
+    /// Whether the toolbar leaves its chips' labels out: in a tab too narrow for them all, as
+    /// beside the inspector in a window of the default size. The sentence field gives way
+    /// first, down to its least; then the chips are their icons, what each is set to still
+    /// showing, and their tooltips name them. Not before the tab is measured.
+    fn compact_toolbar(&self) -> bool {
+        let width = self.width.get();
+        width > 0. && width < COMPACT_TOOLBAR_BELOW
+    }
+
+    /// A toolbar chip's tooltip: what the chip does, after its name while its label is left out.
+    fn chip_tip(&self, name: &str, about: &str) -> String {
+        if self.compact_toolbar() {
+            format!("{name} · {about}")
+        } else {
+            about.to_owned()
+        }
+    }
+
     /// The Sort chip, with the table's menu: the properties the rows can be ordered by, then
     /// the direction. Off while the tab holds listed rows, which keep the order they were
     /// listed in.
@@ -2152,6 +2194,7 @@ impl TypeCards {
                     "Sort",
                     current_label,
                 )
+                .label_hidden(self.compact_toolbar())
                 .disabled(choices.is_empty() || listed.is_some())
                 .when(!open, |button| {
                     // Off, it says why rather than what it would do (constitution VI).
@@ -2163,7 +2206,7 @@ impl TypeCards {
                         ),
                         None => "Order the cards by a property".to_owned(),
                     };
-                    button.tip(studio_ui::ds::tooltip(about))
+                    button.tip(studio_ui::ds::tooltip(self.chip_tip("Sort", &about)))
                 }),
             )
             .menu(move |window, cx| {
@@ -2204,10 +2247,15 @@ impl TypeCards {
                 (!self.filters.is_empty())
                     .then(|| studio_ui::group_count(self.filters.len() as i64).into()),
             )
+            .label_hidden(self.compact_toolbar())
             .disabled(listed.is_some())
             .tip(match listed {
-                Some(listed) => studio_ui::ds::tooltip(listed),
-                None => studio_ui::ds::tooltip_for_action_in("Add a filter", &AddFilter, &focus),
+                Some(listed) => studio_ui::ds::tooltip(self.chip_tip("Filters", &listed)),
+                None => studio_ui::ds::tooltip_for_action_in(
+                    self.chip_tip("Filters", "Add a filter"),
+                    &AddFilter,
+                    &focus,
+                ),
             })
             .on_click(cx.listener(|this, _, window, cx| this.open_filter_draft(window, cx))),
         )
@@ -2293,10 +2341,12 @@ impl TypeCards {
                     "Fields",
                     changed.then(|| format!("{shown} shown").into()),
                 )
+                .label_hidden(self.compact_toolbar())
                 .when(!open, |button| {
-                    button.tip(studio_ui::ds::tooltip(
+                    button.tip(studio_ui::ds::tooltip(self.chip_tip(
+                        "Fields",
                         "Choose what a card shows: its fields, their order and its cover",
-                    ))
+                    )))
                 }),
             )
             .menu(move |window, cx| {
@@ -2881,6 +2931,41 @@ async fn read_bytes(
     Ok(bytes)
 }
 
+/// "Filter in words" is the table's ([`WordsHost`]): the same field, question and model. A
+/// Cards tab has an order and no grouping or columns, so a sentence is offered the orders
+/// alone, and an answer that names a grouping or a column all the same is told it could not
+/// be used, in the bar's note, as the table tells what it could not use.
+impl WordsHost for TypeCards {
+    fn words(&self) -> &WordsField {
+        &self.words
+    }
+
+    fn words_mut(&mut self) -> &mut WordsField {
+        &mut self.words
+    }
+
+    fn view_choices(&self) -> words::ViewChoices {
+        words::ViewChoices {
+            sorts: crate::model::sort_choices(&self.all_columns)
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect(),
+            ..words::ViewChoices::default()
+        }
+    }
+
+    /// Takes the answer's order; the filters are set and the set is read again, once, by the
+    /// caller. Judged as it lands: the schema can change while the model answers.
+    fn apply_words_view(&mut self, view: words::View, _cx: &mut Context<Self>) {
+        if let Some(sort) = view
+            .sort
+            .filter(|sort| crate::model::can_sort_by(&self.all_columns, sort))
+        {
+            self.sort = Some(sort);
+        }
+    }
+}
+
 /// The relationship fields' reads are the table's relationship columns' ([`RelationHost`]):
 /// the tab says which rows to read ([`TypeCards::read_relationship_fields`]) and draws what
 /// lands with what else lands meanwhile.
@@ -2972,8 +3057,12 @@ impl FilterHost for TypeCards {
         self.person_changed(cx);
     }
 
-    /// The filters the schema no longer reads, left out when it was taken.
+    /// What "Filter in words" could not use, or why its call failed; else the filters the
+    /// schema no longer reads, left out when it was taken.
     fn bar_note(&self) -> Option<Label> {
+        if let Some(note) = self.words_note() {
+            return Some(note);
+        }
         let note = match self.lost.as_slice() {
             [] => return None,
             [one] => format!("The schema no longer has {one}: its filter was left out"),
@@ -3383,6 +3472,7 @@ impl Item for TypeCards {
         // Listed rows take no filter until their pill is cleared.
         if self.ids.is_none() {
             keys.push(key("Add a filter", &AddFilter));
+            keys.push(key("Filter in words", &FilterInWords));
             if !self.filters.is_empty() {
                 keys.push(key("Clear the filters", &ClearFilters));
             }
@@ -3410,10 +3500,11 @@ impl Render for TypeCards {
         context.add("Cards");
         // The gallery's context too (spec 035), so the bindings a person wrote for it still act.
         context.add("Gallery");
-        // Keys typed into the filter's value field are text, not the cards'; a draft with no
-        // field takes ↵ and Esc all the same, and the keys that act on cards wait for one of
-        // them. The bar says which (`FilterHost::filter_draft_takes_keys`), as for the table.
-        if self.filter_draft_takes_keys(window, cx) {
+        // Keys typed into the filter's value field or the sentence field are text, not the
+        // cards'; a draft with no field takes ↵ and Esc all the same, and the keys that act on
+        // cards wait for one of them. The bar says which
+        // (`FilterHost::filter_draft_takes_keys`), as for the table.
+        if self.filter_draft_takes_keys(window, cx) || self.words_field_focused(window, cx) {
             context.add("editing");
         }
         let filter_bar = self.render_filter_bar(window, cx);
@@ -3441,15 +3532,22 @@ impl Render for TypeCards {
             }))
             .on_action(cx.listener(|this, _: &PickAll, _, cx| this.pick_all(cx)))
             .on_action(cx.listener(|this, _: &Cancel, window, cx| this.cancel(window, cx)))
-            // The filter bar's keys (spec 048): ↵ applies the filter being written, and is
-            // bound only while one is (`editing`); listed rows take no filter.
+            // ↵ while something is being written (`editing`): in the sentence field it asks
+            // the model, else it applies the filter being written. Listed rows take no filter.
             .on_action(cx.listener(|this, _: &ConfirmEdit, window, cx| {
+                if this.words_field_focused(window, cx) {
+                    this.run_words(window, cx);
+                    return;
+                }
                 this.confirm_filter_draft(window, cx);
             }))
             .when(self.ids.is_none(), |cards| {
                 cards
                     .on_action(cx.listener(|this, _: &AddFilter, window, cx| {
                         this.open_filter_draft(window, cx)
+                    }))
+                    .on_action(cx.listener(|this, _: &FilterInWords, window, cx| {
+                        this.open_words(window, cx)
                     }))
                     .on_action(cx.listener(|this, _: &ClearFilters, _, cx| this.clear_filters(cx)))
             })

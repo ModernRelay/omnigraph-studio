@@ -217,8 +217,9 @@ fn every_keymap_binding_names_a_studio_action(cx: &mut HeadlessAppContext) {
     }
 }
 
-/// A Cards tab's keys, while its cards have the keyboard and while its filter's value field
-/// does (`editing`, spec 048's slice 5). A key that types a character (G, X, F, = and −, and
+/// A Cards tab's keys, while its cards have the keyboard and while one of its two fields does
+/// (`editing`): its filter's value field (spec 048's slice 5) and its sentence field, "Filter
+/// in words" (slice 7), which take the same keys. A key that types a character (G, X, F, = and −, and
 /// Space) is text in the field. So is every key that would act on the cards while a person
 /// writes: the arrows, Home and End move in the text, ⌘A selects it and ⌘C copies it, and ↵
 /// there applies the filter and opens no page. Esc, Refresh and the filter's two keys act in
@@ -229,6 +230,13 @@ fn the_cards_letter_keys_are_text_in_a_field(cx: &mut HeadlessAppContext) {
     let in_field = [
         context("Workspace"),
         context("Cards editing"),
+        context("Editor mode=single_line"),
+    ];
+    // The sentence field, in the toolbar: its own context around its editor.
+    let in_words_field = [
+        context("Workspace"),
+        context("Cards editing"),
+        context("FilterWords"),
         context("Editor mode=single_line"),
     ];
     // The same places in another tab: a binding that acts there is not the Cards tab's own.
@@ -263,6 +271,12 @@ fn the_cards_letter_keys_are_text_in_a_field(cx: &mut HeadlessAppContext) {
             if !on && !field {
                 continue;
             }
+            assert_eq!(
+                predicate.depth_of(&in_words_field).is_some(),
+                predicate.depth_of(&in_field).is_some(),
+                "{platform}: `{}` acts in one of a Cards tab's fields and not the other",
+                stroke.key()
+            );
             let held = stroke.modifiers();
             let types = !held.control
                 && !held.alt
@@ -336,6 +350,7 @@ fn the_cards_letter_keys_are_text_in_a_field(cx: &mut HeadlessAppContext) {
                 ("escape", "studio_cards::Cancel"),
                 ("mod-r", "studio_cards::Refresh"),
                 ("mod-f", "studio_table::AddFilter"),
+                ("mod-shift-f", "studio_table::FilterInWords"),
                 ("mod-alt-backspace", "studio_table::ClearFilters"),
             ]),
             "{platform}: the Cards keys that act while a field has the keyboard too"

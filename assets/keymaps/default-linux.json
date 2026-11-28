@@ -236,6 +236,7 @@
       "escape": "studio_cards::Cancel",
       "ctrl-r": "studio_cards::Refresh",
       "ctrl-f": "studio_table::AddFilter",
+      "ctrl-shift-f": "studio_table::FilterInWords",
       "ctrl-alt-backspace": "studio_table::ClearFilters"
     }
   },

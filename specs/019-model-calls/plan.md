@@ -309,7 +309,9 @@ filter box, since the key is the person's own and the settings row already says 
 
 ### First uses
 
-**Table filter from a sentence** (`type_table`). The table's toolbar holds a search field,
+**Table filter from a sentence** (`type_table`). A Cards tab holds the same field since spec
+048's slice 7 (2026-11-23), by the same code (`words_field.rs`): there the answer sets the
+filters and the order, and a sentence is offered no grouping or column. The table's toolbar holds a search field,
 "Filter in words…", always shown, before the control chips: a pill on the chips' height
 (`ds::pill_field`) with the model's mark where the search field has its glass, its spinner while a call is out,
 and its red line when one failed, with why in its tooltip (`studio_table::FilterInWords`,
@@ -443,6 +445,9 @@ stored.
 
 ## Corrections
 
+- 2026-11-23: "Table filter from a sentence" named the table alone. A Cards tab has the field
+  too (spec 048, slice 7): the field, the question and the call are `type_table`'s
+  `words_field.rs`, which the table and Cards both hold, and ⌘⇧F opens it in either.
 - 2026-11-16: "Haiku was right on every filter" stood in this plan and in the fast model's
   description in Settings as the reason for the default. It came from eight requests on one
   type. On 73 labelled sentences Haiku was right on 58. The filter has its own model now, and

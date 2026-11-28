@@ -62,9 +62,7 @@ use crate::dialogs::{
     DeleteRowModal, DeleteTarget, InsertEdgeModal, InsertRowModal, SaveViewModal, TableLink, Told,
 };
 use crate::fill;
-use crate::filter_bar::{
-    FilterBar, FilterHost, direction_icon, filter_placeholder, floating_under,
-};
+use crate::filter_bar::{FilterBar, FilterHost, direction_icon, floating_under};
 use crate::grouping::{GROUP_LIMIT, Grouping, Line, Lines, SECTION_FIRST_PAGE};
 use crate::model::{
     ColumnLayout, ColumnRole, ColumnSpec, Notice, Paging, Row, SaveResult, TableKind, Tone,
@@ -74,12 +72,14 @@ use crate::model::{
 };
 use crate::peek::{KnownRelation, Neighbour, NodePeek, PeekSubject, TableBlobs, TableWrote};
 use crate::relations::{CellMap, RELATION_READ_CHUNK, RelationHost, Relations};
-use crate::suggest;
 use crate::words;
+use crate::words_field::{WordsField, WordsHost};
 use crate::write::{self, Bound};
 
 #[cfg(test)]
-use crate::filter_bar::{DraftTarget, FilterMenuEntry, filter_menu};
+use crate::filter_bar::{DraftTarget, FilterMenuEntry, filter_menu, filter_placeholder};
+#[cfg(test)]
+use crate::suggest;
 #[cfg(test)]
 use gq_language::builder::Quantifier;
 #[cfg(test)]
@@ -123,14 +123,6 @@ struct Editing {
 struct SelectEdit {
     view: Entity<CellSelect>,
     _blur: Subscription,
-}
-
-/// The sentence field's state (spec 019): idle, with what the last answer could not use;
-/// calling; or failed, with why.
-enum WordsState {
-    Typing(Option<String>),
-    Running { _call: Task<()> },
-    Failed(String),
 }
 
 /// A row to fill: its id, what its target cell shows, and its source cells by column title.
@@ -538,19 +530,6 @@ const KEY_TEXT_INSET: f32 = KEY_INSET + studio_ui::ds::size::CHECK + KEY_INSET;
 /// a tab narrower than this cuts its last controls off, as beside the inspector in a window of
 /// the default size, where the tab is about 840 px wide.
 const COMPACT_TOOLBAR_BELOW: f32 = 1000.;
-/// The least the toolbar's sentence field is squeezed to before the chips after it are cut.
-const WORDS_FIELD_MIN: f32 = 140.;
-
-/// What the sentence field shows while it is empty: its name, or, while no OpenRouter key is
-/// stored, that it needs one, so nobody types a sentence to learn it (spec 019).
-fn words_placeholder(needs_key: bool) -> &'static str {
-    if needs_key {
-        models::WORDS_NEED_KEY
-    } else {
-        "Filter in words…"
-    }
-}
-
 use studio_workspace::property_icon;
 
 /// What a cell shows, made the first time it is drawn ([`TypeTable::cell_text`]): its text,
@@ -698,14 +677,10 @@ pub struct TypeTable {
     toolbar_width: Rc<Cell<f32>>,
     /// The filter bar's own state: the filter being written, its value field and its menus.
     filter_bar: FilterBar,
-    /// Filter in words (spec 019): the toolbar's sentence field, what its call is doing, and
-    /// the filters its last answer made, which the next answer replaces.
-    words_editor: Entity<Editor>,
-    words: WordsState,
-    words_made: Vec<Filter>,
-    /// No OpenRouter key is stored: the sentence field and the fill say so before they are
-    /// used, and follow the key when one is stored or removed.
-    needs_key: bool,
+    /// Filter in words (spec 019): the toolbar's sentence field, what its call is doing, the
+    /// filters its last answer made, which the next answer replaces, and whether an OpenRouter
+    /// key is stored, which the fill asks of it too ([`WordsHost`]).
+    words: WordsField,
     /// Fill a column (spec 019): the instruction field and the fill under way, in the bulk bar.
     fill_editor: Entity<Editor>,
     fill: Option<FillState>,
@@ -850,6 +825,77 @@ impl Focusable for TypeTable {
     }
 }
 
+/// "Filter in words" is [`WordsHost`]'s: the table says what a sentence may order, group and
+/// show its rows by, and takes what an answer sets of them.
+impl WordsHost for TypeTable {
+    fn words(&self) -> &WordsField {
+        &self.words
+    }
+
+    fn words_mut(&mut self) -> &mut WordsField {
+        &mut self.words
+    }
+
+    /// What a sentence may order, group and show the rows by: the properties that can order
+    /// the table, what the Group menu offers, and the columns.
+    fn view_choices(&self) -> words::ViewChoices {
+        words::ViewChoices {
+            sorts: self
+                .all_columns
+                .iter()
+                .filter_map(ColumnSpec::property)
+                .filter(|property| Sort::allowed(property))
+                .map(|property| property.name.clone())
+                .collect(),
+            groups: self
+                .group_choices()
+                .iter()
+                .map(|(key, _)| key.clone())
+                .collect(),
+            columns: self
+                .all_columns
+                .iter()
+                .map(|column| column.key.clone())
+                .collect(),
+        }
+    }
+
+    /// Takes a sentence's order, grouping and columns ([`words::view`], checked against
+    /// [`Self::view_choices`]): each it sets replaces the table's, the columns as a saved view's
+    /// do, those named shown in the order named and the rest hidden. The caller reads the table
+    /// again.
+    fn apply_words_view(&mut self, view: words::View, cx: &mut Context<Self>) {
+        // Judged again as it lands: the schema can change while the model answers, and an
+        // order or a grouping by a property it no longer has would fail the read.
+        if let Some(sort) = view.sort.filter(|sort| self.can_sort_by(sort)) {
+            self.sort = Some(sort);
+        }
+        if let Some(key) = view.group_by.filter(|key| self.can_group_by(key))
+            && self.grouping.as_ref().map(|grouping| &grouping.property) != Some(&key)
+        {
+            self.grouping = Some(Grouping::new(key));
+        }
+        if let Some(shown) = view.columns {
+            // The pinned column always shows, first, as when a column is hidden by hand.
+            let pinned = self.all_columns.first().map(|column| column.key.clone());
+            let hidden = self
+                .all_columns
+                .iter()
+                .map(|column| column.key.clone())
+                .filter(|key| !shown.contains(key) && Some(key) != pinned.as_ref())
+                .collect();
+            let order = shown
+                .into_iter()
+                .filter(|key| Some(key) != pinned.as_ref())
+                .collect();
+            let widths = std::mem::take(&mut self.layout.widths);
+            self.layout = ColumnLayout::new(hidden, order);
+            self.layout.widths = widths;
+            self.show_columns(cx);
+        }
+    }
+}
+
 /// The relationship columns' reads are [`RelationHost`]'s: the table says which rows and
 /// columns to read ([`TypeTable::load_shown_relations`]) and holds what they answer.
 impl RelationHost for TypeTable {
@@ -956,11 +1002,7 @@ impl FilterHost for TypeTable {
 
     /// What "Filter in words" could not use, or why its call failed (spec 019).
     fn bar_note(&self) -> Option<Label> {
-        match &self.words {
-            WordsState::Typing(Some(note)) => Some(studio_ui::ds::text::muted(note.clone())),
-            WordsState::Failed(why) => Some(studio_ui::ds::text::error(why.clone())),
-            _ => None,
-        }
+        self.words_note()
     }
 
     fn nothing_to_filter(&self, cx: &mut Context<Self>) {
@@ -1178,13 +1220,7 @@ impl TypeTable {
         let cell_editor = cx.new(|cx| Editor::single_line(window, cx));
         let cell_editor_events = cx.subscribe_in(&cell_editor, window, Self::on_cell_editor_event);
         let filter_bar = FilterBar::new(window, cx);
-        let needs_key = Models::needs_key(cx);
-        let words_editor = cx.new(|cx| {
-            let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text(words_placeholder(needs_key), window, cx);
-            editor.set_text_style_refinement(studio_ui::ds::field_text(cx));
-            editor
-        });
+        let words = WordsField::new(window, cx);
         let fill_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
             editor.set_placeholder_text(
@@ -1202,7 +1238,7 @@ impl TypeTable {
             editor
         });
         let grid = TableGrid::new(cx);
-        let mut subscriptions = vec![
+        let subscriptions = vec![
             // The inspector shows the row under the cursor (spec 020): the workspace is told
             // when that is another row, however the cursor or the rows came to change.
             cx.observe_self(|this, cx| this.report_selection(cx)),
@@ -1222,12 +1258,6 @@ impl TypeTable {
                 }
             }),
         ];
-        // The sentence field says whether a key is stored, and follows the key.
-        if let Some(models) = Models::try_global(cx) {
-            subscriptions.push(cx.observe_in(&models, window, |this, _, window, cx| {
-                this.key_changed(window, cx)
-            }));
-        }
         let branch = session.read(cx).branch.clone();
         let table_state = cx.new(|cx| TableInteractionState::new(cx));
         let scope = at_commit.is_none().then(|| new_scope(&session, cx));
@@ -1280,10 +1310,7 @@ impl TypeTable {
             toolbar_menus: Default::default(),
             toolbar_width: Rc::default(),
             filter_bar,
-            words_editor,
-            words: WordsState::Typing(None),
-            needs_key,
-            words_made: Vec::new(),
+            words,
             fill_editor,
             fill: None,
             selection: IndexSet::default(),
@@ -2786,7 +2813,7 @@ impl TypeTable {
                         format!("Fill {}", studio_ui::plural(count, "row", "rows")),
                     )
                     .style(ButtonStyle::Tinted(TintColor::Accent))
-                    .tip(studio_ui::ds::tooltip(if self.needs_key {
+                    .tip(studio_ui::ds::tooltip(if self.words.needs_key {
                         models::needs_key_tip("Fill with a model")
                     } else {
                         format!(
@@ -6296,7 +6323,7 @@ impl TypeTable {
     }
 
     fn confirm_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.words_editor.focus_handle(cx).is_focused(window) {
+        if self.words_field_focused(window, cx) {
             self.run_words(window, cx);
             return;
         }
@@ -7448,12 +7475,7 @@ impl TypeTable {
     fn on_cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
         // Esc leaves the sentence field and clears what it said; a call under way is dropped,
         // and the filters it made stay as pills.
-        if self.words_editor.focus_handle(cx).is_focused(window)
-            || !matches!(self.words, WordsState::Typing(None))
-        {
-            self.words = WordsState::Typing(None);
-            window.focus(&self.focus_handle, cx);
-            cx.notify();
+        if self.leave_words(window, cx) {
             return;
         }
         // Esc closes the fill; a fill under way stops, and the drafts it made stay.
@@ -7864,351 +7886,6 @@ impl TypeTable {
 
     // ---- filter in words (spec 019) ----
 
-    fn open_words(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        window.focus(&self.words_editor.focus_handle(cx), cx);
-        cx.notify();
-    }
-
-    /// What a sentence may order, group and show the rows by: the properties that can order
-    /// the table, what the Group menu offers, and the columns.
-    fn view_choices(&self) -> words::ViewChoices {
-        words::ViewChoices {
-            sorts: self
-                .all_columns
-                .iter()
-                .filter_map(ColumnSpec::property)
-                .filter(|property| Sort::allowed(property))
-                .map(|property| property.name.clone())
-                .collect(),
-            groups: self
-                .group_choices()
-                .iter()
-                .map(|(key, _)| key.clone())
-                .collect(),
-            columns: self
-                .all_columns
-                .iter()
-                .map(|column| column.key.clone())
-                .collect(),
-        }
-    }
-
-    /// Takes a sentence's order, grouping and columns ([`words::view`], checked against
-    /// [`Self::view_choices`]): each it sets replaces the table's, the columns as a saved view's
-    /// do, those named shown in the order named and the rest hidden. The caller reads the table
-    /// again.
-    fn apply_words_view(&mut self, view: words::View, cx: &mut Context<Self>) {
-        // Judged again as it lands: the schema can change while the model answers, and an
-        // order or a grouping by a property it no longer has would fail the read.
-        if let Some(sort) = view.sort.filter(|sort| self.can_sort_by(sort)) {
-            self.sort = Some(sort);
-        }
-        if let Some(key) = view.group_by.filter(|key| self.can_group_by(key))
-            && self.grouping.as_ref().map(|grouping| &grouping.property) != Some(&key)
-        {
-            self.grouping = Some(Grouping::new(key));
-        }
-        if let Some(shown) = view.columns {
-            // The pinned column always shows, first, as when a column is hidden by hand.
-            let pinned = self.all_columns.first().map(|column| column.key.clone());
-            let hidden = self
-                .all_columns
-                .iter()
-                .map(|column| column.key.clone())
-                .filter(|key| !shown.contains(key) && Some(key) != pinned.as_ref())
-                .collect();
-            let order = shown
-                .into_iter()
-                .filter(|key| Some(key) != pinned.as_ref())
-                .collect();
-            let widths = std::mem::take(&mut self.layout.widths);
-            self.layout = ColumnLayout::new(hidden, order);
-            self.layout.widths = widths;
-            self.show_columns(cx);
-        }
-    }
-
-    /// The keys the filter menu offers, with their operators and properties, for the model.
-    fn words_choices(&self) -> Vec<words::Choice> {
-        self.filter_choices()
-            .iter()
-            .cloned()
-            .map(|(key, label, _)| words::Choice {
-                ops: self.ops_for(&key),
-                property: self.property_for_key(&key),
-                other_type: self.related_type(&key),
-                traversal: builder::relationship_traversal(&key, builder::NODE_VAR, "$r"),
-                key,
-                label,
-            })
-            .collect()
-    }
-
-    /// ↵ in the sentence field: the sentence goes to the model, once the task is allowed.
-    fn run_words(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let sentence = self.words_editor.read(cx).text(cx).trim().to_owned();
-        if sentence.is_empty() || matches!(self.words, WordsState::Running { .. }) {
-            return;
-        }
-        let Some(models) = Models::try_global(cx) else {
-            self.words = WordsState::Failed(ModelError::NoKey.to_string());
-            cx.notify();
-            return;
-        };
-        self.start_words(models, sentence, window, cx);
-    }
-
-    fn start_words(
-        &mut self,
-        models: Entity<Models>,
-        sentence: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let choices = self.words_choices();
-        let offered = self.view_choices();
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-        // A node table's sentence may test one related record several ways, a relationship's
-        // own properties and further hops, as groups (spec 025).
-        let schema = self.schema.clone().filter(|_| self.kind == TableKind::Node);
-        let type_name = self.type_name.clone();
-        let reach = schema.as_deref().map(|schema| words::Reach {
-            schema,
-            type_name: &type_name,
-        });
-        let request = ModelRequest {
-            task: &words::TASK,
-            instructions: words::INSTRUCTIONS,
-            input: words::input_with(
-                &self.type_name,
-                &choices,
-                &offered,
-                &today,
-                &sentence,
-                reach,
-            ),
-            schema: words::schema_with(&choices, &offered, reach),
-        };
-        let call = models.read(cx).call::<words::Answer>(request, cx);
-        let task = cx.spawn_in(window, async move |this, cx| {
-            let answer = match call.await {
-                Ok(answer) => answer,
-                Err(error) => {
-                    this.update(cx, |this, cx| {
-                        this.words = WordsState::Failed(error.to_string());
-                        cx.notify();
-                    })
-                    .ok();
-                    return;
-                }
-            };
-            let (view, mut refused) = words::view(&answer.value, &offered);
-            let reach = schema.as_deref().map(|schema| words::Reach {
-                schema,
-                type_name: &type_name,
-            });
-            let (mut filters, filters_refused) = words::filters_with(answer.value, &choices, reach);
-            refused.extend(filters_refused);
-            // A `related_to` names a record; the name becomes its id through the node search
-            // the filter's own value field uses, only when one node is named (spec 031): the
-            // only match, or the only one the name is exactly. When several are, the person
-            // picks among them in the filter's value field; when none, the sentence says so.
-            let mut labels: Vec<(String, String)> = Vec::new();
-            let mut to_pick: Option<(String, String, String, Vec<suggest::Suggestion>)> = None;
-            for filter in &mut filters {
-                if filter.op != FilterOp::RelatedTo {
-                    continue;
-                }
-                let Some(name) = filter.value.as_str().map(str::to_owned) else {
-                    continue;
-                };
-                let other = choices
-                    .iter()
-                    .find(|choice| choice.key == filter.property)
-                    .and_then(|choice| choice.other_type.clone());
-                let search = this
-                    .read_with(cx, |this, cx| {
-                        let other = other.as_deref()?;
-                        Some(suggest::search_nodes(
-                            &this.session,
-                            other,
-                            &name,
-                            this.paging.pinned.clone(),
-                            cx,
-                        ))
-                    })
-                    .ok()
-                    .flatten();
-                let other = other.unwrap_or_default();
-                let named = match search {
-                    Some(search) => search.await.map(|hits| suggest::named(&hits)),
-                    None => Ok(suggest::Named::None),
-                };
-                filter.value = Value::Null;
-                match named {
-                    Ok(suggest::Named::One(node)) => {
-                        if let Some(label) = node.label {
-                            labels.push((node.value.clone(), label));
-                        }
-                        filter.value = Value::String(node.value);
-                    }
-                    Ok(suggest::Named::None) => {
-                        refused.push(format!("no {other} matching \"{name}\""));
-                    }
-                    Ok(suggest::Named::Several(offers)) if to_pick.is_none() => {
-                        to_pick = Some((filter.property.clone(), name.clone(), other, offers));
-                    }
-                    Ok(suggest::Named::Several(offers)) => {
-                        refused.push(suggest::pick_note(false, &other, &name, &offers));
-                    }
-                    Err(error) => {
-                        refused.push(format!("{other} could not be searched ({error})"));
-                    }
-                }
-            }
-            filters.retain(|filter| filter.op != FilterOp::RelatedTo || !filter.value.is_null());
-            // A condition the model wrote is judged as a typed one is: by the compiler, before
-            // any read; one it refuses is dropped and the diagnostic named.
-            let mut judged = Vec::with_capacity(filters.len());
-            for filter in filters {
-                if filter.op == FilterOp::Expr {
-                    let text = filter.value.as_str().unwrap_or_default().to_owned();
-                    match this
-                        .read_with(cx, |this, _| this.check_condition(&text))
-                        .unwrap_or_else(|_| Err("The table was closed.".to_owned()))
-                    {
-                        Ok(()) => judged.push(filter),
-                        Err(why) => refused.push(format!("condition: {why}")),
-                    }
-                } else {
-                    judged.push(filter);
-                }
-            }
-            let filters = judged;
-            this.update_in(cx, |this, window, cx| {
-                this.bar_mut().node_labels.extend(labels);
-                // The last sentence's filters go; ones added by hand stay.
-                let made = std::mem::take(&mut this.words_made);
-                this.filters.retain(|filter| !made.contains(filter));
-                this.words_made = filters.clone();
-                this.filters.extend(filters);
-                // What the sentence says of the order, the grouping and the columns replaces
-                // the table's; what it does not say stays as it is.
-                this.apply_words_view(view, cx);
-                let mut note =
-                    (!refused.is_empty()).then(|| format!("Could not use: {}", refused.join("; ")));
-                if let Some((key, name, other, offers)) = to_pick {
-                    // The note says what the person sees: the choices in the filter when it
-                    // opened, else the choices themselves and what to do instead.
-                    let opened = this.ask_to_pick(key, name.clone(), offers.clone(), window, cx);
-                    let ask = suggest::pick_note(opened, &other, &name, &offers);
-                    note = Some(match note {
-                        Some(note) => format!("{ask} {note}"),
-                        None => ask,
-                    });
-                }
-                this.words = WordsState::Typing(note);
-                this.reload(true, cx);
-                cx.notify();
-            })
-            .ok();
-        });
-        self.words = WordsState::Running { _call: task };
-        cx.notify();
-    }
-
-    /// A sentence's "related to" named several nodes (spec 031): its filter opens as a draft,
-    /// the name in its value field and the nodes it names offered, best first, for the person
-    /// to pick one. Nothing is filtered by it until they do. Whether the draft opened: a key
-    /// the filter bar cannot test "related to" on (one reached through a relationship's
-    /// group) opens none, and the caller says so.
-    fn ask_to_pick(
-        &mut self,
-        key: String,
-        name: String,
-        offers: Vec<suggest::Suggestion>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        if !self.ops_for(&key).contains(&FilterOp::RelatedTo) {
-            return false;
-        }
-        self.set_draft_property(key.clone(), window, cx);
-        if self
-            .bar()
-            .draft
-            .as_ref()
-            .is_none_or(|draft| draft.property != key)
-        {
-            return false;
-        }
-        self.bar().editor.update(cx, |editor, cx| {
-            editor.set_text(name.clone(), window, cx);
-            editor.set_placeholder_text(filter_placeholder(FilterOp::RelatedTo), window, cx);
-        });
-        if let Some(draft) = &mut self.bar_mut().draft {
-            draft.op = FilterOp::RelatedTo;
-            draft.offers.set(offers, true);
-            draft.answers = Some(name);
-        }
-        // The keyboard goes where the name is, to pick with: the relationship's own first
-        // test takes no value, and a draft of that has the host's keyboard.
-        self.focus_filter_draft(window, cx);
-        self.redraw_offers(cx);
-        cx.notify();
-        true
-    }
-
-    /// A key was stored or removed, or the keychain answered: the sentence field says whether
-    /// it can be used, and the table draws again only when that changed.
-    fn key_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let needs_key = Models::needs_key(cx);
-        if needs_key == self.needs_key {
-            return;
-        }
-        self.needs_key = needs_key;
-        self.words_editor.update(cx, |editor, cx| {
-            editor.set_placeholder_text(words_placeholder(needs_key), window, cx)
-        });
-        cx.notify();
-    }
-
-    /// What the sentence field's tooltip says: why the last call failed, else that the field
-    /// needs a key while none is stored, else what a sentence sends and to which model.
-    fn words_about(&self, cx: &App) -> String {
-        match &self.words {
-            WordsState::Failed(why) => why.clone(),
-            _ if self.needs_key => models::needs_key_tip("Filter in words"),
-            _ => format!(
-                "Filter in words (↵): {} go to {}",
-                words::TASK.sends,
-                Models::model_for(words::TASK.tier, cx)
-            ),
-        }
-    }
-
-    /// The toolbar's sentence field (spec 019): a search field with the model's mark, its
-    /// spinner while the call is out, and the field's red line when the call failed; the
-    /// answer's filters are the bar's pills. ↵ asks, Esc leaves. Without a key it says so,
-    /// empty, and in its tooltip, before a sentence is typed.
-    fn render_words_field(&self, cx: &mut Context<Self>) -> AnyElement {
-        let running = matches!(self.words, WordsState::Running { .. });
-        let failed = matches!(self.words, WordsState::Failed(_));
-        let about = self.words_about(cx);
-        studio_ui::ds::pill_field("filter-words", failed, cx)
-            .key_context("FilterWords")
-            // As wide as a search field where there is room, and the first to give way where
-            // there is not, so the controls after it are not cut off.
-            .w(px(studio_ui::ds::size::FIELD_WIDE))
-            .min_w(px(WORDS_FIELD_MIN))
-            .flex_shrink(1.)
-            .tip(studio_ui::ds::tooltip(about))
-            .child(studio_ui::ds::icon::meta(IconName::ZedAssistant))
-            .child(studio_ui::ds::field_input(self.words_editor.clone()))
-            .when(running, |field| field.child(studio_ui::ds::spinner()))
-            .into_any_element()
-    }
-
     fn filter_by_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(cursor) = self.cursor else {
             return;
@@ -8257,7 +7934,7 @@ impl TypeTable {
 
     /// Whether the toolbar leaves its chips' labels out: in a tab too narrow for them all, as
     /// beside the inspector in a window of the default size. The sentence field gives way
-    /// first, down to [`WORDS_FIELD_MIN`]; then the chips are their icons, what each is set to
+    /// first, down to [`crate::words_field::WORDS_FIELD_MIN`]; then the chips are their icons, what each is set to
     /// still showing, and their tooltips name them.
     fn compact_toolbar(&self) -> bool {
         let width = self.toolbar_width.get();
@@ -10713,7 +10390,7 @@ impl Render for TypeTable {
         let typing = self.editing.is_some()
             || self.filter_draft_takes_keys(window, cx)
             || self.bulk_editor.focus_handle(cx).is_focused(window)
-            || self.words_editor.focus_handle(cx).is_focused(window)
+            || self.words_field_focused(window, cx)
             || self.fill_editor.focus_handle(cx).is_focused(window);
         let mut context = KeyContext::new_with_defaults(cx.platform_info().os);
         context.add("TypeTable");
@@ -11767,7 +11444,8 @@ mod tests {
         let says = |cx: &mut VisualTestContext| {
             table.update(cx, |table, cx| {
                 let empty = table
-                    .words_editor
+                    .words
+                    .editor
                     .update(cx, |editor, cx| editor.placeholder_text(cx));
                 (empty.unwrap_or_default(), table.words_about(cx))
             })

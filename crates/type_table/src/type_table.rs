@@ -28,6 +28,7 @@ mod test_support;
 mod text_editor;
 mod tile;
 mod types_list;
+mod words_field;
 use filter_words as words;
 mod write;
 
